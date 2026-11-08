@@ -1,5 +1,6 @@
 import {
 	getEffectiveSessionProvider,
+	isAiProviderConnected,
 	resolveSessionModelForProvider,
 } from '@studio/agent/protocol/providers';
 import { getErrorMessage } from '@studio/common/lib/error-formatting';
@@ -75,9 +76,10 @@ export function useSetupPrompt( { enabled = true, busy = false } = {} ) {
 	const { data: user } = useAuthUser();
 	const provider = getEffectiveSessionProvider( [], settings );
 	const notice = useComposerNotice( provider );
-	const providerConnected = provider === 'wpcom' ? !! user : !! settings?.hasAnthropicApiKey;
+	const providerConnected = isAiProviderConnected( provider, { hasWpcomAuth: !! user, settings } );
 	const model = resolveSessionModelForProvider( [], provider, {
 		canUsePaidModels: canUsePaidAiModels( quota, user?.email ),
+		openAiDefaultModel: settings?.openAi.defaultModel,
 	} );
 	const openSite = ( siteId: string ) =>
 		navigate( { to: '/sites/$siteId/new', params: { siteId } } );
@@ -89,7 +91,15 @@ export function useSetupPrompt( { enabled = true, busy = false } = {} ) {
 		try {
 			chatId ??= ( await openNewSession( { connector, queryClient }, created.siteId ) ).id;
 			setCreatedSite( { ...created, chatId } );
-			await connector.setSessionProvider( chatId, provider, model );
+			if ( provider === 'openai-api-key' && settings ) {
+				await connector.setSessionOpenAiSelection( chatId, {
+					model: settings.openAi.defaultModel,
+					reasoningEffort: settings.openAi.defaultReasoningEffort,
+					reasoningMode: settings.openAi.defaultReasoningMode,
+				} );
+			} else {
+				await connector.setSessionProvider( chatId, provider, model );
+			}
 			queryClient.setQueryData(
 				[ ...SESSIONS_QUERY_KEY, chatId ],
 				await connector.getSession( chatId )

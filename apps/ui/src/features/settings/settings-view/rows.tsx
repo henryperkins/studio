@@ -224,7 +224,8 @@ export function SettingsSelect< TValue extends string >( {
 }: {
 	label: string;
 	value: TValue;
-	options: Array< { value: TValue; label: string } >;
+	// A disabled option stays listed, so it can say why it can't be chosen.
+	options: Array< { value: TValue; label: string; disabled?: boolean } >;
 	disabled?: boolean;
 	onChange: ( value: TValue ) => void;
 } ) {
@@ -245,7 +246,7 @@ export function SettingsSelect< TValue extends string >( {
 			</SelectTrigger>
 			<SelectContent>
 				{ options.map( ( option ) => (
-					<SelectItem key={ option.value } value={ option.value }>
+					<SelectItem key={ option.value } value={ option.value } disabled={ option.disabled }>
 						{ option.label }
 					</SelectItem>
 				) ) }

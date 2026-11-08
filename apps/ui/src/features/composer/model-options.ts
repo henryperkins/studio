@@ -17,6 +17,14 @@ export function getModelDescription( id: AiModelId ): string {
 		case 'strong':
 		case 'claude-opus-5':
 			return __( 'Plan complex builds and solve harder problems' );
+		case 'gpt-6-astra':
+			return __( 'The hardest builds and problems, at a higher cost' );
+		case 'gpt-6.1-sol':
+			return __( 'Build features, style pages, and fix bugs' );
+		case 'gpt-6.1-terra':
+			return __( 'Fast work with images, layouts, and writing' );
+		case 'gpt-6-luna':
+			return __( 'Quick fixes and questions' );
 		default:
 			return '';
 	}

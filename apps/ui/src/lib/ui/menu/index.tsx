@@ -132,6 +132,14 @@ export function ContextPopup( { children, className, ...props }: ContextPopupPro
 	);
 }
 
+/** Names a `Group`, as the first child inside it. */
+export function GroupLabel( {
+	className,
+	...props
+}: ComponentPropsWithoutRef< typeof BaseMenu.GroupLabel > ) {
+	return <BaseMenu.GroupLabel className={ clsx( surface.groupLabel, className ) } { ...props } />;
+}
+
 export function ItemLabel( { className, ...props }: ComponentPropsWithoutRef< 'span' > ) {
 	return <span className={ clsx( styles.itemLabel, className ) } { ...props } />;
 }

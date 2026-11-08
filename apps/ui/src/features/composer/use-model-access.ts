@@ -1,5 +1,9 @@
-import { aiModelRequiresPaidCredits } from '@studio/agent/protocol/models';
-import { AI_PROVIDER_IDS, getEffectiveSessionProvider } from '@studio/agent/protocol/providers';
+import { aiModelRequiresPaidCredits, getAiModelFamily } from '@studio/agent/protocol/models';
+import {
+	AI_PROVIDER_IDS,
+	getEffectiveSessionProvider,
+	isAiProviderConnected,
+} from '@studio/agent/protocol/providers';
 import { canUsePaidAiModels } from '@studio/common/lib/studio-assistant-quota';
 import { useCallback, useMemo } from 'react';
 import { useAiSettings } from '@/data/queries/use-ai-settings';
@@ -7,6 +11,10 @@ import { useStudioAssistantQuota } from '@/data/queries/use-assistant-quota';
 import { useAuthUser } from '@/data/queries/use-auth-user';
 import type { AiModelId, SessionEntry } from '@/data/core';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
+
+// Why a listed model can't be picked: the paid WordPress.com tiers before any
+// credits were bought, or an OpenAI model the project's model list lacks.
+export type ModelLockReason = 'credits' | 'not-in-project';
 
 // The provider the chat is on, the providers it can use, and which models are
 // out of reach.
@@ -32,14 +40,31 @@ export function useModelAccess( {
 	// Connected providers are available in saved chats and site drafts.
 	const providers = AI_PROVIDER_IDS.filter(
 		( id ) =>
-			( id === 'wpcom' ? !! authUser : aiSettings?.hasAnthropicApiKey ) &&
+			isAiProviderConnected( id, { hasWpcomAuth: !! authUser, settings: aiSettings } ) &&
 			( !! sessionId || !! provider || id === sessionProvider )
 	);
 	const canUsePaidTiers = canUsePaidAiModels( quota, authUser?.email );
+	const availableOpenAiModels = aiSettings?.openAi.models.availableModelIds;
+	const getModelLockReason = useCallback(
+		( id: AiModelId ): ModelLockReason | undefined => {
+			if ( aiModelRequiresPaidCredits( id ) && ! canUsePaidTiers ) {
+				return 'credits';
+			}
+			if (
+				getAiModelFamily( id ) === 'openai' &&
+				availableOpenAiModels &&
+				! ( availableOpenAiModels as readonly string[] ).includes( id )
+			) {
+				return 'not-in-project';
+			}
+			return undefined;
+		},
+		[ availableOpenAiModels, canUsePaidTiers ]
+	);
 	const isModelLocked = useCallback(
-		( id: AiModelId ) => aiModelRequiresPaidCredits( id ) && ! canUsePaidTiers,
-		[ canUsePaidTiers ]
+		( id: AiModelId ) => getModelLockReason( id ) !== undefined,
+		[ getModelLockReason ]
 	);
 
-	return { sessionProvider, providers, isModelLocked };
+	return { sessionProvider, providers, isModelLocked, getModelLockReason };
 }

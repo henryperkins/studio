@@ -259,6 +259,12 @@ function getStudioSections( signedIn: boolean ): Section[] {
 				),
 				setting(
 					'navigate',
+					__( 'OpenAI' ),
+					__( 'Use GPT models with your own API key.' ),
+					'openai-provider'
+				),
+				setting(
+					'navigate',
 					__( 'Default provider' ),
 					__( 'The provider new chats use.' ),
 					'default-provider'

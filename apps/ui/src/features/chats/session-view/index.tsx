@@ -1,3 +1,4 @@
+import { isOpenAiModelId } from '@studio/agent/protocol/openai-models';
 import {
 	getEffectiveSessionProvider,
 	resolveSessionModelForProvider,
@@ -60,6 +61,7 @@ import {
 	ComposerSkeleton,
 	pendingPromptSlot,
 	useComposerNotice,
+	useOpenAiConversation,
 	type ComposerHandle,
 } from '@/features/composer';
 import { PreviewParticles, StoppedSitePreview } from '@/features/sites';
@@ -149,23 +151,48 @@ function SessionViewContent( {
 		( ! sessionId && draft.provider ) ||
 		getEffectiveSessionProvider( data?.entries ?? [], aiSettings );
 	const isWpcom = sessionProvider === 'wpcom';
-	const notice = useComposerNotice( sessionProvider, ownerSite?.id );
 	// A fresh wpcom session defaults to balanced when the paid tiers are
-	// unlocked, fast otherwise.
+	// unlocked, fast otherwise; an OpenAI one to the model chosen in Settings.
 	const defaultModel = useMemo(
 		() =>
 			resolveSessionModelForProvider( data?.entries ?? [], sessionProvider, {
 				canUsePaidModels: canUsePaidAiModels( quota, authUser?.email ),
+				openAiDefaultModel: aiSettings?.openAi.defaultModel,
 			} ),
-		[ data?.entries, sessionProvider, quota, authUser?.email ]
+		[ data?.entries, sessionProvider, quota, authUser?.email, aiSettings?.openAi.defaultModel ]
 	);
-	const currentModel = ( ! sessionId && draft.model ) || defaultModel;
+	const draftModel = ( ! sessionId && draft.model ) || defaultModel;
+	const openAi = useOpenAiConversation( {
+		provider: sessionProvider,
+		sessionId,
+		entries: data?.entries,
+		model: draftModel,
+		draft,
+		onDraftChange: updateDraft,
+	} );
+	// An OpenAI chat shows the model it recorded, even one it can't use yet.
+	const openAiModel = openAi?.selection.model;
+	const currentModel = openAiModel && isOpenAiModelId( openAiModel ) ? openAiModel : draftModel;
+	const notice = useComposerNotice( sessionProvider, ownerSite?.id ) ?? openAi?.notice;
+	const openAiSelection = openAi?.settings;
 	const sendMessage = useCallback(
 		( prompt: string, options?: Parameters< typeof sendSessionMessage >[ 1 ] ) =>
 			sessionId
 				? sendSessionMessage( prompt, options )
-				: sendDraft( prompt, options, sessionProvider, currentModel ),
-		[ sessionId, sendSessionMessage, sendDraft, sessionProvider, currentModel ]
+				: sendDraft(
+						prompt,
+						options,
+						sessionProvider,
+						currentModel,
+						openAiSelection
+							? {
+									model: openAiSelection.model,
+									reasoningEffort: openAiSelection.reasoningEffort,
+									reasoningMode: openAiSelection.reasoningMode,
+							  }
+							: undefined
+				  ),
+		[ sessionId, sendSessionMessage, sendDraft, sessionProvider, currentModel, openAiSelection ]
 	);
 	const pendingQuestionTexts = useMemo(
 		() => new Set( pendingQuestions.map( ( q ) => q.question ) ),
@@ -530,6 +557,7 @@ function SessionViewContent( {
 						dropTarget={ frameNode }
 						annotationSiteId={ annotationSiteId }
 						notice={ notice }
+						openAi={ openAi }
 					/>
 				</div>
 			}

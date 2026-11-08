@@ -78,3 +78,19 @@
 .dialogDescription {
 	text-wrap: pretty;
 }
+
+.reasoningMenu {
+	min-width: 220px;
+}
+
+.reasoningOption {
+	display: flex;
+	flex-direction: column;
+	gap: var( --space-0_5 );
+	min-width: 0;
+}
+
+.reasoningHint {
+	color: var( --muted-foreground );
+	font-weight: var( --font-weight-normal );
+}

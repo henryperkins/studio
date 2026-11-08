@@ -351,3 +351,8 @@
 	align-items: center;
 	width: 100%;
 }
+
+.tokenLimitInput {
+	max-inline-size: 140px;
+	font-variant-numeric: tabular-nums;
+}

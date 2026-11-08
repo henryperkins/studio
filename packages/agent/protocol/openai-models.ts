@@ -354,43 +354,79 @@ function listLabels< T extends string >( values: readonly T[], label: ( value: T
 	return values.map( label ).join( ', ' );
 }
 
-/** What went wrong and how to fix it, for the composer and the CLI. */
-export function describeOpenAiSettingsProblem( problem: OpenAiSettingsProblem ): string {
+/**
+ * What went wrong and how to fix it. `brief` drops the list of choices, for
+ * the composer, whose pickers and fix button already offer them.
+ */
+export function describeOpenAiSettingsProblem(
+	problem: OpenAiSettingsProblem,
+	{ brief = false }: { brief?: boolean } = {}
+): string {
 	switch ( problem.code ) {
 		case 'unknown-model':
-			return sprintf(
-				/* translators: %s: an OpenAI model id Studio does not support. */
-				__( 'Studio doesn’t support the OpenAI model “%s”. Choose another model to continue.' ),
-				problem.model
-			);
+			return brief
+				? sprintf(
+						/* translators: %s: an OpenAI model id Studio does not support. */
+						__( 'Studio doesn’t support the OpenAI model “%s”.' ),
+						problem.model
+				  )
+				: sprintf(
+						/* translators: %s: an OpenAI model id Studio does not support. */
+						__( 'Studio doesn’t support the OpenAI model “%s”. Choose another model to continue.' ),
+						problem.model
+				  );
 		case 'model-not-available':
-			return sprintf(
-				/* translators: %s: OpenAI model name. */
-				__(
-					'%s isn’t in your OpenAI project’s model list. Choose another model, or refresh the list in Settings.'
-				),
-				getModelLabel( problem.model )
-			);
-		case 'unsupported-effort':
-			return sprintf(
-				/* translators: 1: OpenAI model name, 2: the requested reasoning effort, 3: comma-separated list of supported efforts. */
-				__( '%1$s doesn’t support “%2$s” reasoning. Choose one of: %3$s.' ),
-				getModelLabel( problem.model ),
-				isOpenAiReasoningEffort( problem.effort )
-					? getOpenAiReasoningEffortLabel( problem.effort )
-					: problem.effort,
-				listLabels( problem.supported, getOpenAiReasoningEffortLabel )
-			);
-		case 'unsupported-mode':
-			return sprintf(
-				/* translators: 1: OpenAI model name, 2: the requested reasoning mode, 3: comma-separated list of supported modes. */
-				__( '%1$s doesn’t support the “%2$s” reasoning mode. Choose one of: %3$s.' ),
-				getModelLabel( problem.model ),
-				isOpenAiReasoningMode( problem.mode )
-					? getOpenAiReasoningModeLabel( problem.mode )
-					: problem.mode,
-				listLabels( problem.supported, getOpenAiReasoningModeLabel )
-			);
+			return brief
+				? sprintf(
+						/* translators: %s: OpenAI model name. */
+						__( '%s isn’t in your OpenAI project’s model list.' ),
+						getModelLabel( problem.model )
+				  )
+				: sprintf(
+						/* translators: %s: OpenAI model name. */
+						__(
+							'%s isn’t in your OpenAI project’s model list. Choose another model, or refresh the list in Settings.'
+						),
+						getModelLabel( problem.model )
+				  );
+		case 'unsupported-effort': {
+			const effort = isOpenAiReasoningEffort( problem.effort )
+				? getOpenAiReasoningEffortLabel( problem.effort )
+				: problem.effort;
+			return brief
+				? sprintf(
+						/* translators: 1: OpenAI model name, 2: the requested reasoning effort. */
+						__( '%1$s doesn’t support “%2$s” reasoning.' ),
+						getModelLabel( problem.model ),
+						effort
+				  )
+				: sprintf(
+						/* translators: 1: OpenAI model name, 2: the requested reasoning effort, 3: comma-separated list of supported efforts. */
+						__( '%1$s doesn’t support “%2$s” reasoning. Choose one of: %3$s.' ),
+						getModelLabel( problem.model ),
+						effort,
+						listLabels( problem.supported, getOpenAiReasoningEffortLabel )
+				  );
+		}
+		case 'unsupported-mode': {
+			const mode = isOpenAiReasoningMode( problem.mode )
+				? getOpenAiReasoningModeLabel( problem.mode )
+				: problem.mode;
+			return brief
+				? sprintf(
+						/* translators: 1: OpenAI model name, 2: the requested reasoning mode. */
+						__( '%1$s doesn’t support the “%2$s” reasoning mode.' ),
+						getModelLabel( problem.model ),
+						mode
+				  )
+				: sprintf(
+						/* translators: 1: OpenAI model name, 2: the requested reasoning mode, 3: comma-separated list of supported modes. */
+						__( '%1$s doesn’t support the “%2$s” reasoning mode. Choose one of: %3$s.' ),
+						getModelLabel( problem.model ),
+						mode,
+						listLabels( problem.supported, getOpenAiReasoningModeLabel )
+				  );
+		}
 		case 'invalid-max-output-tokens':
 			return sprintf(
 				/* translators: 1: OpenAI model name, 2: minimum token count, 3: maximum token count. */

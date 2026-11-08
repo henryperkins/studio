@@ -6,8 +6,8 @@ import {
 } from '@studio/agent/protocol/providers';
 import { getStudioCodeAiAccessState } from '@studio/common/lib/studio-assistant-quota';
 import { __, sprintf } from '@wordpress/i18n';
-import { PlugIcon } from 'lucide-react';
-import { useRef, useState, type RefObject } from 'react';
+import { PlugIcon, SparklesIcon } from 'lucide-react';
+import { useRef, useState, type RefObject, ComponentType } from 'react';
 import { useStudioAssistantQuota } from '@/data/queries/use-assistant-quota';
 import { useUserPreferences } from '@/data/queries/use-user-preferences';
 import { useOpenSettings } from '@/data/use-open-settings';
@@ -15,6 +15,14 @@ import { getCreditsLabel, getModelDescription } from '@/features/composer/model-
 import { PlusIcon, ChevronDownIcon, ClaudeIcon, WordPressIcon } from '@/lib/icons';
 import { Button, CommandSheet, Popover, type Command, type CommandGroup } from '@/lib/ui';
 import type { AiModelId } from '@/data/core';
+import type { ModelLockReason } from '@/features/composer/use-model-access';
+
+// Brand names, not translated.
+const PROVIDER_BRANDS: Record< AiProviderId, { name: string; icon: ComponentType } > = {
+	wpcom: { name: 'WordPress', icon: WordPressIcon },
+	'anthropic-api-key': { name: 'Claude', icon: ClaudeIcon },
+	'openai-api-key': { name: 'OpenAI', icon: SparklesIcon },
+};
 
 interface ModelPickerProps {
 	open: boolean;
@@ -23,7 +31,7 @@ interface ModelPickerProps {
 	// The providers this chat can use, and the one it is on.
 	providers: AiProviderId[];
 	sessionProvider: AiProviderId;
-	isModelLocked: ( id: AiModelId ) => boolean;
+	getModelLockReason: ( id: AiModelId ) => ModelLockReason | undefined;
 	disabled: boolean;
 	anchor: HTMLElement | null;
 	onChange: ( provider: AiProviderId, model: AiModelId ) => void;
@@ -36,7 +44,7 @@ export function ModelPicker( {
 	model,
 	providers,
 	sessionProvider,
-	isModelLocked,
+	getModelLockReason,
 	disabled,
 	anchor,
 	onChange,
@@ -89,17 +97,22 @@ export function ModelPicker( {
 					const description = sprintf(
 						/* translators: 1: the model's provider, 2: what the model is good at. */
 						__( '%1$s · %2$s' ),
-						provider === 'wpcom' ? 'WordPress' : 'Claude',
+						PROVIDER_BRANDS[ provider ].name,
 						getModelDescription( id )
 					);
+					const lockReason = getModelLockReason( id );
 					return {
 						value: id,
 						label: getAiModelLabel( id ),
-						description: isModelLocked( id )
-							? `${ description } · ${ __( 'Purchased credits required' ) }`
+						description: lockReason
+							? `${ description } · ${
+									lockReason === 'credits'
+										? __( 'Purchased credits required' )
+										: __( 'Not in your OpenAI project' )
+							  }`
 							: description,
-						icon: provider === 'wpcom' ? WordPressIcon : ClaudeIcon,
-						disabled: isModelLocked( id ),
+						icon: PROVIDER_BRANDS[ provider ].icon,
+						disabled: !! lockReason,
 					};
 				} )
 			),

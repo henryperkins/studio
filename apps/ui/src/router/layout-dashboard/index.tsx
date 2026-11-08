@@ -83,7 +83,8 @@ function DashboardLayout() {
 	const { data: authUser } = useAuthUser();
 	const { data: aiSettings } = useAiSettings();
 	const [ providerPromptOpen, setProviderPromptOpen ] = useState( false );
-	const hasProvider = !! authUser || !! aiSettings?.hasAnthropicApiKey;
+	const hasProvider =
+		!! authUser || !! aiSettings?.hasAnthropicApiKey || !! aiSettings?.hasOpenAiApiKey;
 	useEffect( () => {
 		if ( hasProvider ) setProviderPromptOpen( false );
 	}, [ hasProvider ] );

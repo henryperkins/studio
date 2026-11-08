@@ -1,11 +1,18 @@
 import { skipToken, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCallback } from 'react';
 import type { AiModelId } from '@/data/core';
+import type {
+	OpenAiReasoningEffort,
+	OpenAiReasoningMode,
+} from '@studio/agent/protocol/openai-models';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
 
 interface SiteChatDraft {
 	model?: AiModelId;
 	provider?: AiProviderId;
+	// The reasoning an OpenAI draft starts with, when the user changed it.
+	reasoningEffort?: OpenAiReasoningEffort;
+	reasoningMode?: OpenAiReasoningMode;
 	activeEnvironment: 'local' | 'live';
 	lastSelectedWpcomSiteId?: number;
 	sessionId?: string;
