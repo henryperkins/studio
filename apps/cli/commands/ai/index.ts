@@ -19,11 +19,7 @@ import {
 } from '@studio/agent/protocol/chat-files';
 import { type StudioChatImage } from '@studio/agent/protocol/chat-images';
 import { getAgentEndFailure } from '@studio/agent/protocol/json-events';
-import {
-	getAiModelFamily,
-	readRecordedSessionModel,
-	type AiModelId,
-} from '@studio/agent/protocol/models';
+import { getAiModelFamily, type AiModelId } from '@studio/agent/protocol/models';
 import {
 	describeOpenAiSettingsProblem,
 	resolveOpenAiSessionSelection,
@@ -383,18 +379,9 @@ export async function runCommand( options: {
 		if ( options.resumeSession ) {
 			session = await agent.sessions.open( options.resumeSession.summary.filePath );
 		} else if ( resumedById ) {
+			// Its recorded model was adopted at startup; adopting it again here, on
+			// the first write, would undo a /model pick made before it.
 			session = resumedById;
-			// Adopt the recorded model only when the provider still serves it;
-			// otherwise keep the (quota-based) default.
-			const sessionModel = readRecordedSessionModel( resumedById.getEntries() );
-			if (
-				sessionModel &&
-				getAiProviderDefinition( currentProvider ).supportsModel( sessionModel )
-			) {
-				quotaDefaultApplicable = false;
-				currentModel = sessionModel;
-				ui.currentModel = currentModel;
-			}
 		} else {
 			session = await agent.sessions.create();
 		}

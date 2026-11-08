@@ -5,6 +5,7 @@ import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAgent } from '@studio/agent/node/agent';
 import { OPENAI_MODEL_CAPABILITIES } from '@studio/agent/protocol/openai-models';
+import { readLastReplyProvider } from '@studio/agent/protocol/providers';
 import { createFakeHost } from '../../tests/fake-host';
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
 import type {
@@ -231,6 +232,8 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 		const first = await runTurn( undefined, 'What is the database name?', 'medium' );
 
 		expect( first.error ).toBeUndefined();
+		// The provider pi records on the replies is the one Studio reads them by.
+		expect( readLastReplyProvider( first.entries ) ).toBe( 'openai-api-key' );
 		expect( requests ).toHaveLength( 2 );
 		for ( const request of requests ) {
 			expect( request.reasoning ).toEqual( { effort: 'medium' } );

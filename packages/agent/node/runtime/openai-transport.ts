@@ -20,6 +20,7 @@ import {
 	type OpenAiReasoningEffort,
 	type OpenAiTurnSettings,
 } from '@studio/agent/protocol/openai-models';
+import { OPENAI_PI_PROVIDER } from '@studio/agent/protocol/providers';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import type { AiModelId } from '@studio/agent/protocol/models';
 
@@ -27,7 +28,7 @@ type ProviderConfigInput = Parameters< ModelRuntime[ 'registerProvider' ] >[ 1 ]
 
 // Not pi's built-in `openai` provider: that one reads keys from the
 // environment and treats keys without `sk-` as ChatGPT sign-in tokens.
-export const STUDIO_OPENAI_PROVIDER = 'studio-openai';
+export const STUDIO_OPENAI_PROVIDER = OPENAI_PI_PROVIDER;
 const OPENAI_ORIGIN = new URL( OPENAI_API_BASE_URL ).origin;
 // Compaction keeps context under this, far below every GPT-6 model's 922,000
 // input-token limit, and below the 272,000-token mark past which input costs

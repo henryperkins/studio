@@ -59,6 +59,7 @@ import {
 	resolveOpenAiTurnSettings,
 	type OpenAiTurnSettings,
 } from '@studio/agent/protocol/openai-models';
+import { ANTHROPIC_PI_PROVIDER } from '@studio/agent/protocol/providers';
 import { findLastAssistant, isEmptyStop } from '@studio/agent/protocol/session-events';
 import { getFileToolPrompt } from './file-tool-prompts';
 import { withLeakedToolCallMarkupRemoved } from './leaked-tool-call-markup';
@@ -257,7 +258,7 @@ function syntheticErrorAgentEnd(
 				role: 'assistant',
 				content: errorMessage ? [ { type: 'text', text: errorMessage } ] : [],
 				api: 'anthropic-messages',
-				provider: 'anthropic',
+				provider: ANTHROPIC_PI_PROVIDER,
 				model: '',
 				usage: {
 					input: 0,
@@ -551,7 +552,7 @@ function buildModel(
 	return {
 		...common,
 		api: 'anthropic-messages',
-		provider: 'anthropic',
+		provider: ANTHROPIC_PI_PROVIDER,
 		reasoning: true,
 		// contextWindow/maxTokens intentionally stay below the catalog values.
 		contextWindow: 200_000,

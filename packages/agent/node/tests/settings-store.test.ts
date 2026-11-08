@@ -145,6 +145,23 @@ describe( 'ai settings store', () => {
 		expect( written ).toMatchObject( { aiProvider: 'wpcom', locale: 'es' } );
 	} );
 
+	it( 'keeps OpenAI the default when the Anthropic key is cleared', async () => {
+		fs.writeFileSync(
+			sharedConfigPath(),
+			JSON.stringify( {
+				version: 1,
+				anthropicApiKey: 'sk-ant-api03-testkey-abcd1234',
+				aiProvider: 'openai-api-key',
+			} )
+		);
+
+		const settings = await saveAnthropicApiKey( null );
+
+		expect( settings ).toMatchObject( { provider: 'openai-api-key', hasAnthropicApiKey: false } );
+		expect( readShared() ).toMatchObject( { aiProvider: 'openai-api-key' } );
+		expect( readShared().anthropicApiKey ).toBeUndefined();
+	} );
+
 	it( 'trims the key and treats a blank one as cleared', async () => {
 		const settings = await saveAnthropicApiKey( '  sk-ant-api03-testkey-abcd1234  ' );
 		expect( settings.anthropicApiKeyPreview ).toBe( 'sk-ant-api03-tes...1234' );

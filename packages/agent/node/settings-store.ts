@@ -357,7 +357,8 @@ async function updateAiProviderConfig( update: AiProviderConfig ): Promise< AiSe
 /**
  * Stores or clears the Anthropic API key. A key Anthropic rejects is not
  * stored; an unverifiable one (offline, Anthropic outage) is. Clearing the key
- * falls back to WordPress.com, since the Anthropic provider needs one.
+ * falls back to WordPress.com, since the Anthropic provider needs one, unless
+ * OpenAI is the default: it doesn't.
  */
 export async function saveAnthropicApiKey( key: string | null ): Promise< AiSettings > {
 	const trimmed = key === null ? null : key.trim();
@@ -367,13 +368,17 @@ export async function saveAnthropicApiKey( key: string | null ): Promise< AiSett
 		if ( validation.status === 'invalid' ) {
 			throw new InvalidAnthropicApiKeyError( validation.message );
 		}
+		return updateAiProviderConfig( { anthropicApiKey: trimmed } );
 	}
 
-	return updateAiProviderConfig(
-		trimmed
-			? { anthropicApiKey: trimmed }
-			: { anthropicApiKey: undefined, aiProvider: DEFAULT_AI_PROVIDER }
-	);
+	// In order with provider switches, so a newer choice isn't overwritten.
+	return serializeOpenAiChange( async () => {
+		const { aiProvider } = await readAiProviderConfig();
+		return updateAiProviderConfig( {
+			anthropicApiKey: undefined,
+			...( aiProvider === 'openai-api-key' ? {} : { aiProvider: DEFAULT_AI_PROVIDER } ),
+		} );
+	} );
 }
 
 /**

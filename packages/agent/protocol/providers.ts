@@ -144,10 +144,10 @@ export function resolveSessionProvider( entries: SessionEntry[] ): AiProviderId 
 	return undefined;
 }
 
-// The pi provider ids Studio's runtime registers for OpenAI and Anthropic
-// (`runtime/openai-transport.ts`, `runtime/index.ts`).
-const OPENAI_PI_PROVIDER = 'studio-openai';
-const ANTHROPIC_PI_PROVIDER = 'anthropic';
+// The pi provider ids of Studio's OpenAI and Anthropic models. The runtime
+// takes them from here, so the replies it records always match this reader.
+export const OPENAI_PI_PROVIDER = 'studio-openai';
+export const ANTHROPIC_PI_PROVIDER = 'anthropic';
 
 /**
  * The provider a conversation's latest reply came from, read from the pi

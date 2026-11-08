@@ -204,6 +204,11 @@ describe( 'AI runCommand — resume by id restores session model', () => {
 
 		( listStudioSessionFiles as Mock ).mockResolvedValue( [ '/sessions/session-1.jsonl' ] );
 		( openStudioSession as Mock ).mockResolvedValue( mockSm );
+		// The run reads the recorded model from the session's context when it starts.
+		const { resolveResumeSessionContext: readContext } = await vi.importActual<
+			typeof import('@studio/agent/node/sessions/context')
+		>( '@studio/agent/node/sessions/context' );
+		( resolveResumeSessionContext as Mock ).mockImplementationOnce( readContext );
 
 		await runCommand( {
 			adapter: new JsonAdapter(),
