@@ -211,7 +211,9 @@ interface CredentialRecord {
 type RecordRead =
 	| { status: 'ok'; record: CredentialRecord }
 	| { status: 'missing' }
-	| { status: 'unusable' };
+	| { status: 'unusable' }
+	// Written by a newer version of Studio: kept for it, never cleared.
+	| { status: 'newer' };
 
 type Renewal =
 	| { status: 'renewed'; record: CredentialRecord }
@@ -303,30 +305,35 @@ function sealRecord( key: Buffer, record: CredentialRecord ): string {
 	} );
 }
 
-// Null for anything but an intact record sealed for this registration under this key.
+// Only an intact record sealed for this registration under this key opens.
 function openRecord(
-	key: Buffer,
+	key: Buffer | null,
 	registrationId: string,
 	sealed: string
-): CredentialRecord | null {
+): Exclude< RecordRead, { status: 'missing' } > {
+	const unusable = { status: 'unusable' } as const;
 	try {
 		const envelope: unknown = JSON.parse( sealed );
 		if ( typeof envelope !== 'object' || envelope === null ) {
-			return null;
+			return unusable;
 		}
 		const { version, iv, tag, ciphertext } = envelope as Record< string, unknown >;
+		if ( typeof version === 'number' && version > RECORD_VERSION ) {
+			return { status: 'newer' };
+		}
 		if (
+			! key ||
 			version !== RECORD_VERSION ||
 			typeof iv !== 'string' ||
 			typeof tag !== 'string' ||
 			typeof ciphertext !== 'string'
 		) {
-			return null;
+			return unusable;
 		}
 		const ivBytes = Buffer.from( iv, 'base64' );
 		const tagBytes = Buffer.from( tag, 'base64' );
 		if ( ivBytes.length !== IV_BYTES || tagBytes.length !== AUTH_TAG_BYTES ) {
-			return null;
+			return unusable;
 		}
 		const decipher = createDecipheriv( 'aes-256-gcm', key, ivBytes, {
 			authTagLength: AUTH_TAG_BYTES,
@@ -338,9 +345,11 @@ function openRecord(
 			decipher.final(),
 		] );
 		const record: unknown = JSON.parse( plaintext.toString( 'utf8' ) );
-		return isCredentialRecord( record ) && record.registrationId === registrationId ? record : null;
+		return isCredentialRecord( record ) && record.registrationId === registrationId
+			? { status: 'ok', record }
+			: unusable;
 	} catch {
-		return null;
+		return unusable;
 	}
 }
 
@@ -556,12 +565,15 @@ export function createChatGptCredentialBroker(
 		if ( sealed === null ) {
 			return { status: 'missing' };
 		}
-		const record = key ? openRecord( key, account.registrationId, sealed ) : null;
+		const opened = openRecord( key, account.registrationId, sealed );
 		// A record for another client or account than its registration's is never used.
-		if ( ! record || record.clientId !== account.clientId || record.subject !== account.subject ) {
+		if (
+			opened.status === 'ok' &&
+			( opened.record.clientId !== account.clientId || opened.record.subject !== account.subject )
+		) {
 			return { status: 'unusable' };
 		}
-		return { status: 'ok', record };
+		return opened;
 	}
 
 	const writeSealedRecord = ( registrationId: string, sealed: string ) =>
@@ -688,6 +700,9 @@ export function createChatGptCredentialBroker(
 				key = await getWrappingKey( false );
 				read = await readRecord( key, current );
 			}
+			if ( read.status === 'newer' ) {
+				throw new ChatGptConnectionError( 'newer-format' );
+			}
 			if ( read.status !== 'ok' || ! key ) {
 				await clearUnusable( current );
 				throw new ChatGptConnectionError( 'needs-sign-in' );
@@ -718,6 +733,9 @@ export function createChatGptCredentialBroker(
 	async function getVaultAccessToken( account: ChatGptAccount ): Promise< string > {
 		const key = await getWrappingKey( false );
 		const read = await readRecord( key, account );
+		if ( read.status === 'newer' ) {
+			throw new ChatGptConnectionError( 'newer-format' );
+		}
 		if ( read.status === 'ok' && isFresh( read.record.expiresAt ) ) {
 			return read.record.accessToken;
 		}

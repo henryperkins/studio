@@ -38,7 +38,7 @@ import { createHttpTokenClient } from './fixtures/http-token-client';
 import { startMockTokenService } from './fixtures/mock-token-service';
 
 const systemKeychain = vi.hoisted( () => ( { current: null as FakeCredentialStore | null } ) );
-const lockRace = vi.hoisted( () => ( { refusals: 0 } ) );
+const lockRace = vi.hoisted( () => ( { refusals: 0, attempts: 0 } ) );
 
 // Windows refuses to open a lockfile while another program still has the old
 // one open as it is deleted; a test makes it happen on demand.
@@ -47,6 +47,7 @@ vi.mock( '@studio/common/lib/lockfile', async ( importOriginal ) => {
 	return {
 		...actual,
 		lockFileAsync: async ( ...args: Parameters< typeof actual.lockFileAsync > ) => {
+			lockRace.attempts++;
 			if ( lockRace.refusals > 0 ) {
 				lockRace.refusals--;
 				throw Object.assign( new Error( 'EPERM: operation not permitted, open' ), {
@@ -280,6 +281,7 @@ describe( 'ChatGPT credential broker', () => {
 		systemKeychain.current = keychain;
 		service = createFakeTokenService();
 		lockRace.refusals = 0;
+		lockRace.attempts = 0;
 	} );
 
 	afterEach( () => {
@@ -536,6 +538,45 @@ describe( 'ChatGPT credential broker', () => {
 			await expect( startBroker().getAccessToken( second.registrationId ) ).resolves.toBe(
 				'test-access-token-1'
 			);
+		} );
+
+		const NEWER_RECORD = JSON.stringify( { version: 2, sealed: 'by a newer version of Studio' } );
+
+		it( 'refuses a record a newer Studio wrote, keeping it and the registration as they are', async () => {
+			const broker = startBroker();
+			const account = await broker.saveSignIn( signIn() );
+			fs.writeFileSync( vaultPath( account.registrationId ), NEWER_RECORD );
+
+			for ( const reader of [ broker, startBroker() ] ) {
+				await expect( reader.getAccessToken( account.registrationId ) ).rejects.toMatchObject( {
+					code: 'newer-format',
+				} );
+			}
+			await expect( broker.readIdTokenHint( account.registrationId ) ).resolves.toBeNull();
+			expect( fs.readFileSync( vaultPath( account.registrationId ), 'utf8' ) ).toBe( NEWER_RECORD );
+			expect( await readChatGptAccounts() ).toEqual( [ account ] );
+			expect( service.refreshes ).toEqual( [] );
+		} );
+
+		it( 'refuses a newer record it finds once the refresh lock is free, rather than clear it', async () => {
+			const broker = startBroker();
+			const account = await broker.saveSignIn( signIn( { tokens: expiring() } ) );
+			const refresh = deferred< ChatGptTokenServiceResult< ChatGptTokenSet > >();
+			service.answerRefresh( () => refresh.promise );
+			const holding = broker.getAccessToken( account.registrationId );
+			await vi.waitFor( () => expect( service.refreshes ).toHaveLength( 1 ) );
+			// Another process reads the expiring record, then waits for the lock.
+			const attempts = lockRace.attempts;
+			const waiting = startBroker().getAccessToken( account.registrationId );
+			await vi.waitFor( () => expect( lockRace.attempts ).toBeGreaterThan( attempts ) );
+
+			fs.writeFileSync( vaultPath( account.registrationId ), NEWER_RECORD );
+			refresh.resolve( { ok: false, error: { kind: 'transient', status: 503 } } );
+
+			await expect( holding ).rejects.toMatchObject( { code: 'refresh-failed' } );
+			await expect( waiting ).rejects.toMatchObject( { code: 'newer-format' } );
+			expect( fs.readFileSync( vaultPath( account.registrationId ), 'utf8' ) ).toBe( NEWER_RECORD );
+			expect( await readChatGptAccounts() ).toEqual( [ account ] );
 		} );
 
 		it( 'reads the keychain again before giving up on a record its key can’t open', async () => {

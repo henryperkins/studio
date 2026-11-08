@@ -88,7 +88,8 @@ export type ChatGptConnectionErrorCode =
 	| 'refresh-failed'
 	| 'identity-mismatch'
 	| 'invalid-sign-in'
-	| 'accounts-unreadable';
+	| 'accounts-unreadable'
+	| 'newer-format';
 
 function describeChatGptConnectionError(
 	code: ChatGptConnectionErrorCode,
@@ -132,6 +133,10 @@ function describeChatGptConnectionError(
 		case 'accounts-unreadable':
 			return __(
 				'Studio couldn’t read its list of ChatGPT accounts. It may have been written by a newer version of Studio.'
+			);
+		case 'newer-format':
+			return __(
+				'Your ChatGPT sign-in was saved by a newer version of Studio. Update Studio to use it here.'
 			);
 	}
 }
