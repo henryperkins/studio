@@ -54,16 +54,27 @@ vi.mock( 'node:fs', async ( importOriginal ) => {
 	} ) as typeof actual.watch;
 	return { ...actual, default: { ...actual, watch }, watch };
 } );
-const lockRace = vi.hoisted( () => ( { refusals: 0, attempts: 0 } ) );
+const lockRace = vi.hoisted( () => ( {
+	refusals: 0,
+	attempts: 0,
+	pause: null as { lockName: string; reached: () => void; release: Promise< void > } | null,
+} ) );
 
 // Windows refuses to open a lockfile while another program still has the old
-// one open as it is deleted; a test makes it happen on demand.
+// one open as it is deleted; a test makes it happen on demand. A test can also
+// hold the next taking of one lockfile, to interleave two operations exactly.
 vi.mock( '@studio/common/lib/lockfile', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('@studio/common/lib/lockfile') >();
 	return {
 		...actual,
 		lockFileAsync: async ( ...args: Parameters< typeof actual.lockFileAsync > ) => {
 			lockRace.attempts++;
+			const pause = lockRace.pause;
+			if ( pause && args[ 0 ].endsWith( pause.lockName ) ) {
+				lockRace.pause = null;
+				pause.reached();
+				await pause.release;
+			}
 			if ( lockRace.refusals > 0 ) {
 				lockRace.refusals--;
 				throw Object.assign( new Error( 'EPERM: operation not permitted, open' ), {
@@ -138,6 +149,21 @@ function deferred< T >() {
 }
 
 const sleep = ( ms: number ) => new Promise( ( resolve ) => setTimeout( resolve, ms ) );
+
+// Holds whatever next takes the lockfile named `lockName` until `release`.
+function pauseNextLock( lockName: string ) {
+	const reached = deferred< void >();
+	const release = deferred< void >();
+	lockRace.pause = { lockName, reached: () => reached.resolve(), release: release.promise };
+	return { reached: reached.promise, release: () => release.resolve() };
+}
+
+// A promise's outcome as a value, so a rejection is never left unhandled.
+const settled = ( promise: Promise< unknown > ) =>
+	promise.then(
+		( value ) => ( { value } ),
+		( error: unknown ) => ( { error } )
+	);
 
 // The token service, scripted per test: by default every refresh succeeds with
 // fresh tokens and every revocation is confirmed.
@@ -298,6 +324,7 @@ describe( 'ChatGPT credential broker', () => {
 		service = createFakeTokenService();
 		lockRace.refusals = 0;
 		lockRace.attempts = 0;
+		lockRace.pause = null;
 		fileWatching.refused = false;
 	} );
 
@@ -976,6 +1003,56 @@ describe( 'ChatGPT credential broker', () => {
 					'test-refresh-token-1',
 					'test-refresh-token-2',
 				] )
+			);
+		} );
+	} );
+
+	describe( 'a sign-in and a sign-out at once', () => {
+		it( 'refuses a sign-in that a sign-out overtook, leaving no record and the account signed out', async () => {
+			const broker = startBroker();
+			const { registrationId } = await broker.saveSignIn( signIn() );
+			// The sign-in has written its record and waits to update the account list.
+			const accountList = pauseNextLock( 'chatgpt-accounts.json.lock' );
+			const signingIn = settled(
+				broker.saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) )
+			);
+			await accountList.reached;
+			// Another process signs out meanwhile, then waits for the sign-in's refresh lock.
+			const signingOut = startBroker().signOut( registrationId );
+			await vi.waitFor( async () =>
+				expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+					state: 'signed-out',
+					logoutGeneration: 1,
+				} )
+			);
+			accountList.release();
+
+			expect( await signingIn ).toEqual( {
+				error: expect.objectContaining( { code: 'signed-out' } ),
+			} );
+			await expect( signingOut ).resolves.toEqual( {
+				localCleared: true,
+				remoteRevocationConfirmed: true,
+			} );
+			expect( vaultFiles() ).toEqual( [] );
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				state: 'signed-out',
+				logoutGeneration: 1,
+			} );
+			// The sign-out revoked the tokens it ended; the refused sign-in's aren't left valid.
+			await vi.waitFor( () =>
+				expect( service.revocations.map( ( request ) => request.refreshToken ).sort() ).toEqual( [
+					'test-refresh-token-1',
+					'test-refresh-token-2',
+				] )
+			);
+
+			// A sign-in after the sign-out is saved as usual.
+			await expect(
+				broker.saveSignIn( signIn( { registrationId, tokens: tokens( 3 ) } ) )
+			).resolves.toMatchObject( { state: 'signed-in', logoutGeneration: 1 } );
+			await expect( startBroker().getAccessToken( registrationId ) ).resolves.toBe(
+				'test-access-token-3'
 			);
 		} );
 	} );

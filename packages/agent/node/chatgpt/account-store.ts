@@ -486,17 +486,22 @@ export function createChatGptAccount(
 }
 
 /**
- * Records a sign-in again to an existing registration. Only the same identity
- * may sign in to it; a new issued client starts a new revision.
+ * Records a sign-in again to an existing registration, which began at its
+ * `logoutGeneration`. Only the same identity may sign in to it, and never over
+ * a sign-out that began since; a new issued client starts a new revision.
  */
 export function updateChatGptAccountSignIn(
 	registrationId: string,
-	signIn: ChatGptAccountSignIn
+	signIn: ChatGptAccountSignIn,
+	logoutGeneration: number
 ): Promise< ChatGptAccount > {
 	return updateIndex( ( index ) => {
 		const account = findAccount( index, registrationId );
 		if ( ! isSameChatGptIdentity( account, signIn ) ) {
 			throw new ChatGptConnectionError( 'identity-mismatch' );
+		}
+		if ( account.logoutGeneration !== logoutGeneration ) {
+			throw new ChatGptConnectionError( 'signed-out' );
 		}
 		if ( account.clientId !== signIn.clientId ) {
 			account.clientId = signIn.clientId;

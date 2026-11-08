@@ -888,6 +888,8 @@ export function createChatGptCredentialBroker(
 	async function saveSignIn( signIn: ChatGptSignIn ): Promise< ChatGptAccount > {
 		const tokens = readSignInTokens( signIn );
 		const existing = signIn.registrationId;
+		// Where this sign-in begins: a sign-out started since then wins over it.
+		let logoutGeneration = 0;
 		if ( existing !== undefined ) {
 			const account = await readChatGptAccount( existing );
 			if ( ! account ) {
@@ -896,6 +898,7 @@ export function createChatGptCredentialBroker(
 			if ( ! isSameChatGptIdentity( account, signIn ) ) {
 				throw new ChatGptConnectionError( 'identity-mismatch' );
 			}
+			logoutGeneration = account.logoutGeneration;
 		}
 		const registrationId = existing ?? createChatGptRegistrationId();
 		const now = Date.now();
@@ -931,14 +934,18 @@ export function createChatGptCredentialBroker(
 			let account: ChatGptAccount;
 			try {
 				account = existing
-					? await updateChatGptAccountSignIn( registrationId, accountSignIn )
+					? await updateChatGptAccountSignIn( registrationId, accountSignIn, logoutGeneration )
 					: await createChatGptAccount( registrationId, accountSignIn );
 			} catch ( error ) {
-				// A sign-in that couldn't be recorded leaves the registration's tokens as they were.
+				// A sign-in that couldn't be recorded leaves the registration's tokens
+				// as they were, for a sign-out that overtook it to clear.
 				if ( previous !== null ) {
 					await writeSealedRecord( registrationId, previous );
 				} else if ( key ) {
 					await removeRecord( registrationId );
+				}
+				if ( error instanceof ChatGptConnectionError && error.code === 'signed-out' ) {
+					revokeQuietly( signIn.clientId, tokens.refreshToken );
 				}
 				throw error;
 			}
