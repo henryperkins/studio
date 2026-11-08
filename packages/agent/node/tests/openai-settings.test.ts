@@ -621,6 +621,43 @@ describe( 'OpenAI settings', () => {
 			);
 		} );
 
+		it( 'keeps a default another app changed while this change waited to be written', async () => {
+			const { settings } = await load();
+			let resume!: () => void;
+			sharedConfigWrite.hold = new Promise< void >( ( resolve ) => ( resume = resolve ) );
+
+			// The reasoning is changed in one app and the model in another at the same time.
+			const choosingEffort = settings.setOpenAiDefaults( { reasoningEffort: 'high' } );
+			await vi.waitFor( () => expect( sharedConfigWrite.hold ).toBeNull() );
+			await settings.setOpenAiDefaults( { model: 'gpt-6-astra' } );
+			resume();
+			await choosingEffort;
+
+			expect( readShared() ).toMatchObject( {
+				openaiDefaultModel: 'gpt-6-astra',
+				openaiDefaultReasoningEffort: 'high',
+			} );
+		} );
+
+		it( 'checks a change against the defaults another app saved while it waited', async () => {
+			const { settings } = await load();
+			await settings.setOpenAiDefaults( { model: 'gpt-6-luna' } );
+			let resume!: () => void;
+			sharedConfigWrite.hold = new Promise< void >( ( resolve ) => ( resume = resolve ) );
+
+			// “None” suits the model shown when it was chosen, not the one saved meanwhile.
+			const choosingEffort = settings.setOpenAiDefaults( { reasoningEffort: 'none' } );
+			await vi.waitFor( () => expect( sharedConfigWrite.hold ).toBeNull() );
+			await settings.setOpenAiDefaults( { model: 'gpt-6-astra', reasoningEffort: 'high' } );
+			resume();
+			await expect( choosingEffort ).rejects.toThrow( /doesn’t support “None” reasoning/ );
+
+			expect( readShared() ).toMatchObject( {
+				openaiDefaultModel: 'gpt-6-astra',
+				openaiDefaultReasoningEffort: 'high',
+			} );
+		} );
+
 		it( 'reads values another build wrote as the built-in defaults', async () => {
 			fs.writeFileSync(
 				sharedConfigPath(),

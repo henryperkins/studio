@@ -229,11 +229,7 @@ describe( 'OpenAI settings', () => {
 
 		await choose( 'Default OpenAI model', 'GPT-6 Astra' );
 		await waitFor( () =>
-			expect( connector.setOpenAiDefaults ).toHaveBeenCalledWith( {
-				model: 'gpt-6-astra',
-				reasoningEffort: 'medium',
-				reasoningMode: 'standard',
-			} )
+			expect( connector.setOpenAiDefaults ).toHaveBeenCalledWith( { model: 'gpt-6-astra' } )
 		);
 
 		// Astra has no "None" effort.
@@ -249,6 +245,56 @@ describe( 'OpenAI settings', () => {
 		await choose( 'Reasoning mode', 'Pro' );
 		await waitFor( () =>
 			expect( connector.setOpenAiDefaults ).toHaveBeenLastCalledWith( { reasoningMode: 'pro' } )
+		);
+	} );
+
+	it( 'keeps an effort another app saved when only the model changes here', async () => {
+		const { connector } = await openProviders();
+		await enterKey();
+		const effort = await screen.findByRole( 'combobox', { name: 'Reasoning effort' } );
+		expect( effort ).toHaveTextContent( 'Medium' );
+
+		// Another app saves High while this one still shows Medium.
+		await connector.setOpenAiDefaults( { reasoningEffort: 'high' } );
+		await choose( 'Default OpenAI model', 'GPT-6 Astra' );
+
+		await waitFor( () =>
+			expect( screen.getByRole( 'combobox', { name: 'Default OpenAI model' } ) ).toHaveTextContent(
+				'GPT-6 Astra'
+			)
+		);
+		expect( screen.getByRole( 'combobox', { name: 'Reasoning effort' } ) ).toHaveTextContent(
+			'High'
+		);
+	} );
+
+	it( 'gives a new model its starting effort when it lacks the saved one', async () => {
+		const { connector } = await openProviders();
+		await enterKey();
+		await choose( 'Default OpenAI model', 'GPT-6 Luna' );
+		await waitFor( () =>
+			expect( screen.getByRole( 'combobox', { name: 'Default OpenAI model' } ) ).toHaveTextContent(
+				'GPT-6 Luna'
+			)
+		);
+		await choose( 'Reasoning effort', 'None' );
+		await waitFor( () =>
+			expect( screen.getByRole( 'combobox', { name: 'Reasoning effort' } ) ).toHaveTextContent(
+				'None'
+			)
+		);
+
+		await choose( 'Default OpenAI model', 'GPT-6 Astra' );
+		await waitFor( () =>
+			expect( connector.setOpenAiDefaults ).toHaveBeenLastCalledWith( {
+				model: 'gpt-6-astra',
+				reasoningEffort: 'medium',
+			} )
+		);
+		await waitFor( () =>
+			expect( screen.getByRole( 'combobox', { name: 'Reasoning effort' } ) ).toHaveTextContent(
+				'Medium'
+			)
 		);
 	} );
 

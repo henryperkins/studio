@@ -522,27 +522,31 @@ export function refreshOpenAiModels(): Promise< AiSettings > {
 /**
  * Changes the defaults for new OpenAI conversations. The resulting
  * combination must be one the model supports; nothing is adjusted to fit.
+ * It is worked out from the defaults saved when shared.json is locked, so a
+ * default another app changed meanwhile is kept.
  */
 export async function setOpenAiDefaults( update: OpenAiDefaultsUpdate ): Promise< AiSettings > {
-	const { openAi } = await readAiSettings();
-	const next = {
-		model: update.model ?? openAi.defaultModel,
-		reasoningEffort: update.reasoningEffort ?? openAi.defaultReasoningEffort,
-		reasoningMode: update.reasoningMode ?? openAi.defaultReasoningMode,
-		maxOutputTokens: update.maxOutputTokens ?? openAi.maxOutputTokens,
-	};
-	const result = resolveOpenAiTurnSettings( {
-		...next,
-		availableModelIds: openAi.models.availableModelIds,
-	} );
-	if ( ! result.ok ) {
-		throw new OpenAiSettingsError( describeOpenAiSettingsProblem( result.problem ) );
-	}
-	await updateSharedConfig( {
-		openaiDefaultModel: result.settings.model,
-		openaiDefaultReasoningEffort: result.settings.reasoningEffort,
-		openaiDefaultReasoningMode: result.settings.reasoningMode,
-		openaiMaxOutputTokens: result.settings.maxOutputTokens,
+	// A keychain that can't be read right now reads as no key, as in readAiSettings.
+	const openAiKey = await readOpenAiKeySource().catch( () => null );
+	await updateSharedConfigFrom( ( config ) => {
+		const models = readStoredAvailability( config.openaiModels, openAiKey?.key );
+		const current = readOpenAiDefaults( config, models );
+		const result = resolveOpenAiTurnSettings( {
+			model: update.model ?? current.defaultModel,
+			reasoningEffort: update.reasoningEffort ?? current.defaultReasoningEffort,
+			reasoningMode: update.reasoningMode ?? current.defaultReasoningMode,
+			maxOutputTokens: update.maxOutputTokens ?? current.maxOutputTokens,
+			availableModelIds: models.availableModelIds,
+		} );
+		if ( ! result.ok ) {
+			throw new OpenAiSettingsError( describeOpenAiSettingsProblem( result.problem ) );
+		}
+		return {
+			openaiDefaultModel: result.settings.model,
+			openaiDefaultReasoningEffort: result.settings.reasoningEffort,
+			openaiDefaultReasoningMode: result.settings.reasoningMode,
+			openaiMaxOutputTokens: result.settings.maxOutputTokens,
+		};
 	} );
 	return readAiSettings();
 }

@@ -255,16 +255,17 @@ export function OpenAiSettingsGroup() {
 
 	const changeModel = ( model: OpenAiModelId ) => {
 		const next = getOpenAiModelCapabilities( model )!;
-		// The effort and mode stay when the new model has them; otherwise the form
-		// shows the model's starting values with the change.
+		// The effort and mode stay when the new model has them, so only the model
+		// is sent and a change another app saved meanwhile is kept; otherwise the
+		// form shows the model's starting values with the change.
 		setDefaults.mutate( {
 			model,
-			reasoningEffort: next.reasoningEfforts.includes( openAi.defaultReasoningEffort )
-				? openAi.defaultReasoningEffort
-				: getInitialOpenAiReasoningEffort( model ),
-			reasoningMode: next.reasoningModes.includes( openAi.defaultReasoningMode )
-				? openAi.defaultReasoningMode
-				: OPENAI_DEFAULT_REASONING_MODE,
+			...( next.reasoningEfforts.includes( openAi.defaultReasoningEffort )
+				? {}
+				: { reasoningEffort: getInitialOpenAiReasoningEffort( model ) } ),
+			...( next.reasoningModes.includes( openAi.defaultReasoningMode )
+				? {}
+				: { reasoningMode: OPENAI_DEFAULT_REASONING_MODE } ),
 		} );
 	};
 
