@@ -17,7 +17,7 @@ The rejected alternatives are Codex App Server for ChatGPT (unneeded for the sel
 - A model family is descriptive, not sufficient to choose credentials or billing. A selection includes provider, connection, model identifier and configuration revision.
 - ChatGPT accounts are keyed by registration and verified identity, not email or a rotating token fingerprint.
 - Existing Pi session files remain readable. Claude native history belongs to Claude; Studio retains a display journal and the explicit native session ID. It must not claim that the display journal can replace native resume state.
-- The first version starts a new conversation when changing backend or billing connection. An explicit, user-reviewed context summary may be copied; opaque reasoning/history is not transferred.
+- The first version starts a new conversation when a conversation moves to or from a subscription connection (`chatgpt-oauth` or `claude-code`), or between subscription accounts. Switches among the existing WordPress.com and API-key providers keep today's behavior, so those integrations are preserved. An explicit, user-reviewed context summary may be copied; opaque reasoning/history is not transferred.
 - Preserve `session-setting-changes.ts`: settings chosen after Send apply to the next turn; pending writes and failures must not produce a mismatch between displayed and executed settings.
 
 ## ChatGPT connection
