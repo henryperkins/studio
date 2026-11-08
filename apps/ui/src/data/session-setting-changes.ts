@@ -17,8 +17,9 @@ import type { QueryClient } from '@tanstack/react-query';
  * the failed ones are gone, so the chat shows what its file holds.
  *
  * A change made after a message is sent is written once that message's turn
- * ends. The turn reads the chat's settings when it starts and then records
- * them, so a change written in between could run in it or be overwritten.
+ * ends. The turn reads the chat's settings when it starts and records them
+ * afterwards; written any earlier, the change could end up in that turn or be
+ * overwritten by its record.
  */
 
 interface Change {
