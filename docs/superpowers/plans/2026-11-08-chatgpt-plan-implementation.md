@@ -39,9 +39,9 @@ Use a feature branch in Henry's fork, not Automattic. Recheck the base and repos
 **Create:** `packages/agent/node/chatgpt/oauth.ts`, `credential-broker.ts`, `account-store.ts`, `tests/oauth.test.ts`, `tests/credential-broker.test.ts`.
 **Reuse:** OS credential storage and the repository's cross-process lock/atomic-write conventions; do not weaken the existing string-secret validation.
 
-**Interfaces:** `beginChatGptSignIn(registrationId?: string)` returns an attempt ID and the official authorization URL only; `cancelChatGptSignIn(attemptId)` invalidates the attempt; `getChatGptAccessToken(connectionId)` resolves a current token inside backend code; `signOutChatGpt(connectionId)` ends every active turn on that connection before it returns (its stream is aborted and no pending tool call executes afterwards), then returns `{ localCleared, remoteRevocationConfirmed }`. No renderer method returns tokens. Define pending-attempt and registration schemas with versioning and validated identity.
+**Interfaces:** `beginChatGptSignIn(registrationId?: string)` opens the official authorization URL in the system browser from the backend and returns an attempt ID only. That URL can carry the retained ID token as `id_token_hint`, so it never reaches a renderer, log or diagnostic; renderers see only the attempt ID and non-secret status. `cancelChatGptSignIn(attemptId)` invalidates the attempt; `getChatGptAccessToken(connectionId)` resolves a current token inside backend code; `signOutChatGpt(connectionId)` ends every active turn on that connection before it returns (its stream is aborted and no pending tool call executes afterwards), then returns `{ localCleared, remoteRevocationConfirmed }`. No renderer method returns tokens. Define pending-attempt and registration schemas with versioning and validated identity.
 
-- [ ] First write tests for invalid/replayed state, nonce/signature/audience failure, denial, wrong returning client/subject, missing inference permission, callback-port collision, cancellation and bounded timeout. No failure may replace the active account.
+- [ ] First write tests for invalid/replayed state, nonce/signature/audience failure, denial, wrong returning client/subject, missing inference permission, callback-port collision, cancellation and bounded timeout. No failure may replace the active account. Add a returning-sign-in test asserting that no return value, outcome, error or log contains the authorization URL or the ID token.
 - [ ] Run `npx vitest run packages/agent/node/chatgpt/tests/oauth.test.ts` and retain the expected failing baseline.
 - [ ] Implement the current official public-client flow, with a stable host ID, system-browser navigation, loopback listener, issued-client handling, PKCE and verified ID token. Use discovery for trusted metadata, never callback-supplied remote endpoints.
 - [ ] Test rotating refresh using two real local processes and a mocked token service: one refresh wins; both consumers use the committed record. Test logout generation against a delayed refresh and app termination during a vault write. Test sign-out during a streaming turn and while a tool call is pending: nothing more is streamed or executed on that connection after sign-out.
@@ -51,7 +51,7 @@ Use a feature branch in Henry's fork, not Automattic. Recheck the base and repos
 ## Task 3: ChatGPT model discovery and transport
 
 **Create:** `packages/agent/node/chatgpt/models.ts`, `runtime/chatgpt-transport.ts`, `chatgpt/tests/models.test.ts`, `runtime/tests/chatgpt-transport.test.ts`, `runtime/tests/chatgpt-session.test.ts`.
-**Modify:** `packages/agent/node/runtime/index.ts` at provider registration only; keep `openai-transport.ts` API behavior intact.
+**Modify:** `packages/agent/node/runtime/index.ts` to carry the validated connection selection through turn configuration, credential resolution, model construction, session creation, and provider registration. Preserve existing API-provider behavior and keep `openai-transport.ts` API behavior intact.
 
 **Interfaces:** `fetchChatGptModels(connectionId, signal?)` returns provider-qualified catalog entries or a typed failure; `createChatGptProviderConfig(model, connectionId, turnSnapshot)` returns the Pi registration configuration. Turn snapshots carry no refresh token. Implement an explicit typed request serializer, not a cast of the paid API request.
 
@@ -60,13 +60,17 @@ Use a feature branch in Henry's fork, not Automattic. Recheck the base and repos
 - [ ] Implement the serializer and tool representation using the current SIWC limitations. Prefer a developer `additional_tools` input item for the first implementation to retain flat Studio tool names; validate against the current schema. Preserve IDs and replay order. Do not enable Responses tool_search or hosted MCP.
 - [ ] Add failure fixtures for HTTP detail-only errors, authorization failure, policy denial, transient unavailability, partial text followed by failure/incomplete, missing completion and cancellation. Never silently downgrade effort or switch billing.
 - [ ] Drive the actual Pi loop with a file-backed session, real bounded tool execution and mocked HTTP: tool continuation, restart, compaction and changed effort. Keep image-generation behavior separate.
+- [ ] Add whole-loop regressions:
+  - a connected ChatGPT account runs a turn with no OpenAI API key saved;
+  - when both connections exist and expose the same model slug, the selected connection alone determines credentials, transport and settings;
+  - a disconnected ChatGPT connection fails explicitly even when a usable API key is saved.
 - [ ] Run targeted tests and existing OpenAI API runtime regressions; commit only after passing. Live acceptance remains a separate gate.
 
 ## Task 4: UI, application connectors and qualification
 
 **Modify:** `apps/ui/src/data/core/types.ts`, both `connectors/ipc/` and `connectors/local/`, settings and composer components, `apps/local/src/index.ts`, `apps/studio/src/modules/user-settings/lib/ipc-handlers.ts`, `apps/studio/src/preload.ts`, CLI auth/slash-command handling, and `apps/ui/src/data/session-setting-changes.ts` only where necessary.
 
-- [ ] First add UI tests for sign-in pending/cancelled/denied, an identity-only grant, account picker, reauthentication, sign-out and unsupported controls. Test connection changes with delayed writes, mixed failure/success saves and stale refetches.
+- [ ] First add UI tests for sign-in pending/cancelled/denied, an identity-only grant, account picker, reauthentication, sign-out and unsupported controls. Test connection changes with delayed writes, mixed failure/success saves and stale refetches. For a returning sign-in, assert that renderer responses (IPC and the `studio ui` HTTP routes) and diagnostics never contain the authorization URL or the ID token.
 - [ ] Changing an existing conversation's connection (to or from a ChatGPT connection, or between ChatGPT accounts) starts a new conversation in the UI and the CLI instead of re-pinning the current one; per the spec, only an explicit, user-reviewed summary may carry over. Test that moving to or from a ChatGPT connection, or between ChatGPT accounts, never sends the previous conversation's history to the new connection. Switching among WordPress.com and the API-key providers keeps today's behavior.
 - [ ] Implement named settings actions: Start sign-in, Cancel, Refresh models, Sign out and Select saved account. Keep the existing system-browser opener, origin checks and IPC sender validation. For `studio ui`, refuse to advertise local OAuth support when the browser is not on the callback host.
 - [ ] Hide the server output-cap field for this provider; show the selected registration and billing route. Keep unsupported modes unavailable. Do not relabel it Codex.
