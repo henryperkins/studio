@@ -1650,12 +1650,34 @@ describe( 'ChatGPT credential broker', () => {
 		} );
 	} );
 
+	describe( 'the process harness', () => {
+		it( 'keeps a line the test sends before the process reads it', async () => {
+			const other = startBrokerProcess( [ 'echo-late-line', 'unused', 'unused' ] );
+			other.child.stdin.write( 'sent at once\n' );
+
+			const report = await other.waitForLine( ( line ) => line.startsWith( '{' ), 15_000 );
+			expect( JSON.parse( report ) ).toEqual( { ok: true, value: 'sent at once' } );
+		}, 30_000 );
+
+		it( 'fails, rather than waits forever, when no line comes', async () => {
+			const other = startBrokerProcess( [ 'echo-late-line', 'unused', 'unused' ], {
+				STUDIO_TEST_LINE_TIMEOUT_MS: '300',
+			} );
+
+			const report = await other.waitForLine( ( line ) => line.startsWith( '{' ), 15_000 );
+			expect( JSON.parse( report ) ).toEqual( { ok: false, code: 'no-line' } );
+		}, 30_000 );
+	} );
+
 	// One Studio process running the broker from the sources.
-	function startBrokerProcess( args: string[] ) {
+	function startBrokerProcess( args: string[], env: Record< string, string > = {} ) {
 		const child = spawn(
 			process.execPath,
 			[ path.join( import.meta.dirname, 'fixtures', 'broker-process.ts' ), ...args ],
-			{ env: { ...process.env, DEV_CONFIG_DIR: configDir }, stdio: [ 'pipe', 'pipe', 'pipe' ] }
+			{
+				env: { ...process.env, DEV_CONFIG_DIR: configDir, ...env },
+				stdio: [ 'pipe', 'pipe', 'pipe' ],
+			}
 		);
 		let stdout = '';
 		let stderr = '';

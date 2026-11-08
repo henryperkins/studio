@@ -8,9 +8,38 @@ import readline from 'node:readline';
  * types Node strips. It reports one JSON line on stdout.
  */
 const [ command, keychainFile, serviceUrl, registrationId ] = process.argv.slice( 2 );
+// How long to wait for a line from the test, so a lost one fails the test rather than hanging it.
+const LINE_TIMEOUT_MS = Number( process.env.STUDIO_TEST_LINE_TIMEOUT_MS ) || 20_000;
 
-const lines = readline.createInterface( { input: process.stdin } );
-const nextLine = () => new Promise< string >( ( resolve ) => lines.once( 'line', resolve ) );
+// Every line is kept from the moment it arrives, whether or not anything waits for one yet.
+const received: string[] = [];
+const readers: Array< ( line: string ) => void > = [];
+readline.createInterface( { input: process.stdin } ).on( 'line', ( line ) => {
+	const reader = readers.shift();
+	if ( reader ) {
+		reader( line );
+	} else {
+		received.push( line );
+	}
+} );
+
+function nextLine(): Promise< string > {
+	const line = received.shift();
+	if ( line !== undefined ) {
+		return Promise.resolve( line );
+	}
+	return new Promise( ( resolve, reject ) => {
+		const reader = ( value: string ) => {
+			clearTimeout( timer );
+			resolve( value );
+		};
+		const timer = setTimeout( () => {
+			readers.splice( readers.indexOf( reader ), 1 );
+			reject( Object.assign( new Error( 'No line came from the test.' ), { code: 'no-line' } ) );
+		}, LINE_TIMEOUT_MS );
+		readers.push( reader );
+	} );
+}
 
 function finish( result: unknown ): void {
 	process.stdout.write( `${ JSON.stringify( result ) }\n`, () => process.exit( 0 ) );
@@ -78,9 +107,15 @@ async function main(): Promise< void > {
 			}, 200 );
 		} );
 		console.log( 'streaming' );
+	} else if ( command === 'echo-late-line' ) {
+		// Starts reading only after the test's line has arrived.
+		await new Promise( ( resolve ) => setTimeout( resolve, 300 ) );
+		await report( () => nextLine() );
 	} else {
 		finish( { ok: false, code: 'unknown-command' } );
 	}
 }
 
-void main();
+main().catch( ( error: unknown ) =>
+	finish( { ok: false, code: ( error as { code?: unknown } ).code ?? 'fixture-failed' } )
+);
