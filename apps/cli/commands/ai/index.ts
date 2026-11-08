@@ -17,6 +17,11 @@ import {
 	type StudioChatFileAttachment,
 } from '@studio/agent/protocol/chat-files';
 import { type StudioChatImage } from '@studio/agent/protocol/chat-images';
+import {
+	describeConnectionSelectionError,
+	resolveConnectionSelection,
+	type ConnectionSelection,
+} from '@studio/agent/protocol/connections';
 import { getAgentEndFailure } from '@studio/agent/protocol/json-events';
 import { getAiModelFamily, type AiModelId } from '@studio/agent/protocol/models';
 import {
@@ -59,6 +64,7 @@ import {
 	AI_PROVIDERS,
 	DEFAULT_AI_PROVIDER,
 	getAiProviderDefinition,
+	readConnectionRegistry,
 	readOpenAiKeyForTurn,
 	type AiProviderId,
 } from 'cli/ai/providers';
@@ -152,27 +158,35 @@ async function resolveWpcomDefaultModel(): Promise< AiModelId > {
 
 /**
  * The provider this run uses for a resumed (or new) conversation. An OpenAI
- * conversation stays on OpenAI even without a key — its turn then fails as
- * disconnected — and a conversation that ran elsewhere keeps its provider when
- * OpenAI becomes the default. The WordPress.com and Anthropic rules are
- * unchanged.
+ * or ChatGPT conversation stays put without its key or connection — its turn
+ * then fails as disconnected — and a conversation that ran elsewhere keeps its
+ * provider when OpenAI becomes the default. Only a ChatGPT record puts a
+ * conversation on ChatGPT. The WordPress.com and Anthropic rules are unchanged.
  */
 async function resolveRunProvider(
 	resumeContext: ReturnType< typeof resolveResumeSessionContext >
 ): Promise< AiProviderId > {
 	const pinned = resumeContext.provider;
+	if ( pinned === 'chatgpt-oauth' ) {
+		return pinned;
+	}
 	const recordedProvider = resumeContext.model
 		? getAiModelFamilyProvider( getAiModelFamily( resumeContext.model ) )
 		: undefined;
+	// Only a ChatGPT record names a connection to run on: a reply alone reads as
+	// one from any provider but OpenAI's or Anthropic's does, as WordPress.com's.
+	const lastReplyProvider =
+		resumeContext.lastReplyProvider === 'chatgpt-oauth'
+			? DEFAULT_AI_PROVIDER
+			: resumeContext.lastReplyProvider;
 	if (
 		pinned === 'openai-api-key' ||
 		( ! pinned &&
-			( recordedProvider === 'openai-api-key' ||
-				resumeContext.lastReplyProvider === 'openai-api-key' ) )
+			( recordedProvider === 'openai-api-key' || lastReplyProvider === 'openai-api-key' ) )
 	) {
 		return 'openai-api-key';
 	}
-	const ranOn = recordedProvider ?? resumeContext.lastReplyProvider;
+	const ranOn = recordedProvider ?? lastReplyProvider;
 	if ( ! pinned && ranOn && ( await readSelectedAiProvider() ) === 'openai-api-key' ) {
 		return ranOn === 'anthropic-api-key' && ! ( await isAiProviderReady( 'anthropic-api-key' ) )
 			? DEFAULT_AI_PROVIDER
@@ -240,6 +254,21 @@ async function resolveOpenAiTurn(
 		settings: result.settings,
 		needsPin: ! recorded.model || ! recorded.reasoningEffort || ! recorded.reasoningMode,
 	};
+}
+
+/** The ChatGPT connection a conversation's turn runs on, or why it can't run. */
+async function resolveChatGptConnection( sm: SessionManager ): Promise< ConnectionSelection > {
+	const result = resolveConnectionSelection( sm.getEntries(), await readConnectionRegistry() );
+	if ( ! result.ok ) {
+		throw new LoggerError( describeConnectionSelectionError( result.error ) );
+	}
+	// On ChatGPT without a ChatGPT record (cleared, say): nothing names its connection.
+	if ( result.selection.model.providerId !== 'chatgpt-oauth' ) {
+		throw new LoggerError(
+			describeConnectionSelectionError( { code: 'unsupported', providerId: 'chatgpt-oauth' } )
+		);
+	}
+	return result.selection;
 }
 
 export async function runCommand( options: {
@@ -571,8 +600,12 @@ export async function runCommand( options: {
 		showCapabilitiesOnConnect = false;
 	}
 
-	// Choosing how to connect would re-pin the conversation; one on OpenAI stays there.
-	if ( showCapabilitiesOnConnect && currentProvider === 'openai-api-key' ) {
+	// Choosing how to connect would re-pin the conversation; one on OpenAI or
+	// ChatGPT stays there.
+	if (
+		showCapabilitiesOnConnect &&
+		( currentProvider === 'openai-api-key' || currentProvider === 'chatgpt-oauth' )
+	) {
 		showCapabilitiesOnConnect = false;
 	}
 
@@ -723,6 +756,9 @@ export async function runCommand( options: {
 		if ( openAiTurn ) {
 			currentModel = openAiTurn.settings.model;
 			ui.currentModel = currentModel;
+		}
+		if ( currentProvider === 'chatgpt-oauth' ) {
+			await resolveChatGptConnection( sm );
 		}
 		const env = await resolveAiEnvironment( currentProvider, {
 			sessionId,

@@ -11,6 +11,10 @@ import {
 	readOpenAiApiKey,
 	saveOpenAiApiKey,
 } from '@studio/agent/node/settings-store';
+import {
+	describeConnectionSelectionError,
+	type ConnectionRegistry,
+} from '@studio/agent/protocol/connections';
 import { DEFAULT_MODEL, type AiModelId } from '@studio/agent/protocol/models';
 import {
 	AI_PROVIDER_IDS,
@@ -30,6 +34,7 @@ export const AI_PROVIDERS: Record< AiProviderId, string > = {
 	wpcom: 'WordPress.com',
 	'anthropic-api-key': 'Anthropic · API key',
 	'openai-api-key': 'OpenAI · API key',
+	'chatgpt-oauth': 'ChatGPT',
 };
 
 export type { AiProviderId };
@@ -340,8 +345,37 @@ const AI_PROVIDER_DEFINITIONS: Record< AiProviderId, AiProviderDefinition > = {
 			return env;
 		},
 	} ),
+	// Never offered, never chosen for the user and never a fallback: only a
+	// ChatGPT record, naming its connection, puts a conversation here, and
+	// without a usable connection its turns fail rather than run elsewhere.
+	'chatgpt-oauth': defineProvider( {
+		id: 'chatgpt-oauth',
+		autoFallbackWhenUnavailable: false,
+		autoSelectable: false,
+		isVisible: async () => false,
+		isReady: async () => false,
+		prepare: async () => {
+			throw new LoggerError(
+				describeConnectionSelectionError( { code: 'disconnected', providerId: 'chatgpt-oauth' } )
+			);
+		},
+		resolveEnv: async () => {
+			throw new LoggerError(
+				describeConnectionSelectionError( { code: 'disconnected', providerId: 'chatgpt-oauth' } )
+			);
+		},
+	} ),
 };
 
 export function getAiProviderDefinition( provider: AiProviderId ): AiProviderDefinition {
 	return AI_PROVIDER_DEFINITIONS[ provider ];
+}
+
+/**
+ * The connections a ChatGPT conversation's turn is checked against. Studio
+ * keeps no ChatGPT connections yet, so every ChatGPT turn fails as
+ * disconnected.
+ */
+export async function readConnectionRegistry(): Promise< ConnectionRegistry > {
+	return { connections: [] };
 }
