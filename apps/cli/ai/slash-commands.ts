@@ -282,19 +282,20 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 				}
 				const replace = __( 'Enter a new key' );
 				const remove = __( 'Remove the key' );
-				const choice = hasOpenAiApiKey || openAi.keyError
-					? ( Object.values(
-							await ctx.ui.askUser( [
-								{
-									question: __( 'What do you want to do with the OpenAI API key?' ),
-									options: [
-										{ label: replace, description: 'replace' },
-										{ label: remove, description: 'remove' },
-									],
-								},
-							] )
-					  )[ 0 ] as string )
-					: replace;
+				const choice =
+					hasOpenAiApiKey || openAi.keyError
+						? ( Object.values(
+								await ctx.ui.askUser( [
+									{
+										question: __( 'What do you want to do with the OpenAI API key?' ),
+										options: [
+											{ label: replace, description: 'replace' },
+											{ label: remove, description: 'remove' },
+										],
+									},
+								] )
+						  )[ 0 ] as string )
+						: replace;
 				// Closing the menu answers nothing: leave the key as it is.
 				if ( choice !== replace && choice !== remove ) {
 					ctx.ui.showInfo( __( 'API key update canceled.' ) );

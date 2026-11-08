@@ -308,8 +308,9 @@ describe( 'OpenAI settings', () => {
 		} );
 
 		const row = await openAiRow();
-		expect( await within( row ).findByText( /couldn’t read the key from the system keychain/ ) )
-			.toHaveTextContent( reason );
+		expect(
+			await within( row ).findByText( /couldn’t read the key from the system keychain/ )
+		).toHaveTextContent( reason );
 		fireEvent.click( within( row ).getByRole( 'button', { name: 'Manage' } ) );
 		fireEvent.click( await screen.findByRole( 'button', { name: 'Remove key' } ) );
 
