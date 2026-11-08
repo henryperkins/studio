@@ -14,7 +14,10 @@ import {
 	readSelectedAiProvider,
 	saveOpenAiApiKey,
 } from '@studio/agent/node/settings-store';
-import { SecureStorageError } from '@studio/common/lib/os-credential-store';
+import {
+	createOsCredentialStore,
+	SecureStorageError,
+} from '@studio/common/lib/os-credential-store';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { vi } from 'vitest';
 import {
@@ -34,6 +37,20 @@ vi.mock( '@inquirer/prompts', () => ( {
 
 vi.mock( '@studio/common/lib/shared-config', () => ( {
 	readAuthToken: vi.fn(),
+} ) );
+
+// Never the real system keychain from a unit test.
+vi.mock( '@studio/common/lib/os-credential-store', async ( importOriginal ) => ( {
+	...( await importOriginal< typeof import('@studio/common/lib/os-credential-store') >() ),
+	createOsCredentialStore: vi.fn( () => {
+		const items = new Map< string, string >();
+		return {
+			check: async () => ( { available: true } ),
+			get: async ( account: string ) => items.get( account ) ?? null,
+			set: async ( account: string, secret: string ) => void items.set( account, secret ),
+			delete: async ( account: string ) => void items.delete( account ),
+		};
+	} ),
 } ) );
 
 vi.mock( '@studio/agent/node/openai-credentials', async ( importOriginal ) => ( {
@@ -378,7 +395,8 @@ describe( 'AI auth helpers', () => {
 				}
 				fs.rmSync( configDir, { recursive: true, force: true } );
 			} );
-			// Kept for this session only, so no keychain is involved.
+			// The app's broker can only reach a stand-in for the system keychain.
+			expect( vi.isMockFunction( createOsCredentialStore ) ).toBe( true );
 			const account = await saveChatGptSignIn( {
 				issuer: 'https://auth.openai.com',
 				subject: 'test-subject-1',
