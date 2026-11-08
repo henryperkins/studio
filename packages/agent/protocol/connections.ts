@@ -116,11 +116,12 @@ const LEGACY_CONNECTION_REVISION = 0;
  * The connection, model and revision a conversation runs on, or why it can't
  * run.
  *
- * Only a ChatGPT record, a pin or per-turn record naming its connection, puts
- * a conversation on ChatGPT, and one that has one never moves: a connection
- * that is missing, signed out or changed is an error, never a fallback. Its
- * connection and model come from the latest ChatGPT record alone; entries
- * that name no provider don't speak for ChatGPT.
+ * A conversation on ChatGPT (see `getEffectiveSessionProvider`) never moves:
+ * a connection that is missing, signed out or changed is an error, never a
+ * fallback, and so is a conversation no ChatGPT record names a connection
+ * for, such as one with only a reply from ChatGPT. Its connection and model
+ * come from the latest ChatGPT record alone; entries that name no provider
+ * don't speak for ChatGPT.
  *
  * Every other conversation resolves as `getEffectiveSessionProvider` does, to
  * its provider's implicit connection, with the model today's readers give:
@@ -154,7 +155,7 @@ function resolveChatGptConnection(
 	connections: readonly ConnectionRegistryEntry[]
 ): ConnectionSelectionResult {
 	const providerId = 'chatgpt-oauth';
-	const connectionId = record?.connectionId;
+	const connectionId = record?.provider === providerId ? record.connectionId : undefined;
 	const revision = record?.revision;
 	const modelId = record?.model;
 	if ( typeof connectionId !== 'string' || ! connectionId ) {

@@ -304,14 +304,29 @@ describe( 'a reply without a pin', () => {
 		);
 	} );
 
-	it( 'never runs a conversation on ChatGPT on a reply alone', () => {
-		const entries = [ message( 'user' ), message( 'assistant', 'studio-chatgpt' ) ];
-		// No record names its connection, and it ran elsewhere than OpenAI's API.
-		for ( const saved of [ settings( 'openai-api-key' ), settings( 'wpcom' ), null ] ) {
-			expect( getEffectiveSessionProvider( entries, saved ) ).toBe( 'wpcom' );
-			expect( resolveConnectionSelection( entries, registry( { settings: saved } ) ) ).toEqual(
-				legacy( 'wpcom', 'fast' )
-			);
+	it( 'keeps a conversation that ran on ChatGPT there with no record, and fails it', () => {
+		const unsupported = { ok: false, error: { code: 'unsupported', providerId: 'chatgpt-oauth' } };
+		for ( const entries of [
+			[ message( 'user' ), message( 'assistant', 'studio-chatgpt' ) ],
+			// Nor does a record of an OpenAI model take it to the API key.
+			[
+				contextEntry( { model: 'gpt-6.1-sol' } ),
+				message( 'user' ),
+				message( 'assistant', 'studio-chatgpt' ),
+			],
+		] ) {
+			for ( const saved of [
+				settings( 'openai-api-key', true ),
+				settings( 'anthropic-api-key', true ),
+				settings( 'wpcom' ),
+				null,
+			] ) {
+				expect( getEffectiveSessionProvider( entries, saved ) ).toBe( 'chatgpt-oauth' );
+				// A connected ChatGPT connection doesn't help: no record names it.
+				expect( resolveConnectionSelection( entries, registry( { settings: saved } ) ) ).toEqual(
+					unsupported
+				);
+			}
 		}
 	} );
 } );
@@ -399,15 +414,19 @@ describe( 'ChatGPT records', () => {
 	} );
 
 	it( 'follows an explicit switch to another provider', () => {
-		const entries = [
-			chatGptRecord(),
+		const switched = [
 			message( 'user' ),
 			message( 'assistant', 'studio-chatgpt' ),
 			contextEntry( { provider: 'anthropic-api-key', model: 'claude-sonnet-5' } ),
 		];
-		expect(
-			resolveConnectionSelection( entries, registry( { settings: settings( 'wpcom', true ) } ) )
-		).toEqual( legacy( 'anthropic-api-key', 'claude-sonnet-5' ) );
+		const withKey = registry( { settings: settings( 'wpcom', true ) } );
+		expect( resolveConnectionSelection( [ chatGptRecord(), ...switched ], withKey ) ).toEqual(
+			legacy( 'anthropic-api-key', 'claude-sonnet-5' )
+		);
+		// Also from a conversation that ran on ChatGPT with no record.
+		expect( resolveConnectionSelection( switched, withKey ) ).toEqual(
+			legacy( 'anthropic-api-key', 'claude-sonnet-5' )
+		);
 	} );
 
 	it( 'explains each failure under the ChatGPT name', () => {

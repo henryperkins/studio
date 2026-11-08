@@ -346,8 +346,8 @@ const AI_PROVIDER_DEFINITIONS: Record< AiProviderId, AiProviderDefinition > = {
 		},
 	} ),
 	// Never offered, never chosen for the user and never a fallback: only a
-	// ChatGPT record, naming its connection, puts a conversation here, and
-	// without a usable connection its turns fail rather than run elsewhere.
+	// conversation pinned to ChatGPT or last run there is here, and without a
+	// usable connection its turns fail rather than run elsewhere.
 	'chatgpt-oauth': defineProvider( {
 		id: 'chatgpt-oauth',
 		autoFallbackWhenUnavailable: false,

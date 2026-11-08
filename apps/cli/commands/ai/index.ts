@@ -158,35 +158,33 @@ async function resolveWpcomDefaultModel(): Promise< AiModelId > {
 
 /**
  * The provider this run uses for a resumed (or new) conversation. An OpenAI
- * or ChatGPT conversation stays put without its key or connection — its turn
- * then fails as disconnected — and a conversation that ran elsewhere keeps its
- * provider when OpenAI becomes the default. Only a ChatGPT record puts a
- * conversation on ChatGPT. The WordPress.com and Anthropic rules are unchanged.
+ * or ChatGPT conversation, pinned there or unpinned and last run there, stays
+ * put without its key or connection — its turn then fails — and a
+ * conversation that ran elsewhere keeps its provider when OpenAI becomes the
+ * default. The WordPress.com and Anthropic rules are unchanged.
  */
 async function resolveRunProvider(
 	resumeContext: ReturnType< typeof resolveResumeSessionContext >
 ): Promise< AiProviderId > {
 	const pinned = resumeContext.provider;
-	if ( pinned === 'chatgpt-oauth' ) {
-		return pinned;
+	if (
+		pinned === 'chatgpt-oauth' ||
+		( ! pinned && resumeContext.lastReplyProvider === 'chatgpt-oauth' )
+	) {
+		return 'chatgpt-oauth';
 	}
 	const recordedProvider = resumeContext.model
 		? getAiModelFamilyProvider( getAiModelFamily( resumeContext.model ) )
 		: undefined;
-	// Only a ChatGPT record names a connection to run on: a reply alone reads as
-	// one from any provider but OpenAI's or Anthropic's does, as WordPress.com's.
-	const lastReplyProvider =
-		resumeContext.lastReplyProvider === 'chatgpt-oauth'
-			? DEFAULT_AI_PROVIDER
-			: resumeContext.lastReplyProvider;
 	if (
 		pinned === 'openai-api-key' ||
 		( ! pinned &&
-			( recordedProvider === 'openai-api-key' || lastReplyProvider === 'openai-api-key' ) )
+			( recordedProvider === 'openai-api-key' ||
+				resumeContext.lastReplyProvider === 'openai-api-key' ) )
 	) {
 		return 'openai-api-key';
 	}
-	const ranOn = recordedProvider ?? lastReplyProvider;
+	const ranOn = recordedProvider ?? resumeContext.lastReplyProvider;
 	if ( ! pinned && ranOn && ( await readSelectedAiProvider() ) === 'openai-api-key' ) {
 		return ranOn === 'anthropic-api-key' && ! ( await isAiProviderReady( 'anthropic-api-key' ) )
 			? DEFAULT_AI_PROVIDER
@@ -592,9 +590,14 @@ export async function runCommand( options: {
 	let showCapabilitiesOnConnect = ( await readSelectedAiProvider() ) === undefined;
 
 	// Studio Code Desktop defaults to WordPress.com provider — unless the
-	// session is pinned, which must survive the run untouched, or ran on OpenAI.
+	// session is pinned, which must survive the run untouched, or ran on OpenAI
+	// or ChatGPT.
 	if ( isJsonMode && showCapabilitiesOnConnect ) {
-		if ( ! resumeContext.provider && currentProvider !== 'openai-api-key' ) {
+		if (
+			! resumeContext.provider &&
+			currentProvider !== 'openai-api-key' &&
+			currentProvider !== 'chatgpt-oauth'
+		) {
 			await switchProvider( 'wpcom', false );
 		}
 		showCapabilitiesOnConnect = false;

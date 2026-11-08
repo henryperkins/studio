@@ -1061,27 +1061,36 @@ describe( 'AI runCommand — ChatGPT conversations', () => {
 		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
 	} );
 
-	it( 'keeps a chat whose ChatGPT reply has no record off ChatGPT, as before', async () => {
-		entries = [];
-		( readSelectedAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
-		( resolveInitialAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
-		( resolveResumeSessionContext as Mock ).mockReturnValueOnce( {
-			provider: undefined,
-			model: undefined,
-			lastReplyProvider: 'chatgpt-oauth',
-		} );
+	// Undefined: no provider was ever saved, a first run, which would otherwise
+	// pin the chat to WordPress.com.
+	it.each( [ 'wpcom', 'openai-api-key', undefined ] )(
+		'fails a chat that ran on ChatGPT with no record, rather than run it elsewhere (saved: %s)',
+		async ( saved ) => {
+			entries = [
+				{ type: 'message', message: { role: 'user', content: 'Hello', timestamp: 0 } },
+				{
+					type: 'message',
+					message: { role: 'assistant', content: [], provider: 'studio-chatgpt', timestamp: 0 },
+				},
+			];
+			( readSelectedAiProvider as Mock ).mockResolvedValue( saved );
+			( resolveInitialAiProvider as Mock ).mockResolvedValue( saved ?? 'wpcom' );
+			( isAiProviderReady as Mock ).mockResolvedValue( true );
+			await readOwnContext();
+			const adapter = new JsonAdapter();
+			const showError = vi.spyOn( adapter, 'showError' );
 
-		await runCommand( {
-			adapter: new JsonAdapter(),
-			initialMessage: 'hello',
-			resumeSession: resumeSession(),
-		} );
+			await runCommand( { adapter, initialMessage: 'hello', resumeSession: resumeSession() } );
 
-		// Nothing names a connection, and it never moves onto the OpenAI default.
-		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'wpcom', expect.anything() );
-		expect( resolveAiEnvironment ).not.toHaveBeenCalledWith( 'chatgpt-oauth', expect.anything() );
-		expect( resolveAiEnvironment ).not.toHaveBeenCalledWith( 'openai-api-key', expect.anything() );
-	} );
+			expect( showError ).toHaveBeenCalledWith(
+				'This chat doesn’t name a ChatGPT connection Studio can use, so it can’t continue. Start a new chat.'
+			);
+			expect( resolveAiEnvironment ).not.toHaveBeenCalled();
+			expect( runStudioAgentTurn ).not.toHaveBeenCalled();
+			expect( appendCustomEntry ).not.toHaveBeenCalled();
+			expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
+		}
+	);
 
 	it( 'doesn’t ask how to connect when a terminal first resumes a ChatGPT conversation', async () => {
 		// No provider was ever saved: a terminal's first run.

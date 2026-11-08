@@ -220,27 +220,28 @@ export interface ConversationProviderInput {
 /**
  * The provider a conversation runs on.
  *
- * OpenAI and ChatGPT never fall back: a conversation pinned to either stays
- * there when its key or connection is missing (and shows as disconnected).
- * The OpenAI default applies only to conversations that haven't run on
- * another provider yet. Nothing reaches ChatGPT but a ChatGPT record, which
- * names the connection: not the saved default, and not a reply alone.
+ * OpenAI and ChatGPT never fall back: a conversation pinned to either, or
+ * unpinned and last run there, stays there when its key or connection is
+ * missing (and shows as disconnected). The OpenAI default applies only to
+ * conversations that haven't run on another provider yet. Nothing else puts
+ * a conversation on ChatGPT: not the saved default, and not a model's family.
  *
  * Otherwise the pre-existing rules hold: the pin, then the saved global
  * selection, with WordPress.com whenever no Anthropic key is saved.
  */
 export function resolveConversationProvider( input: ConversationProviderInput ): AiProviderId {
-	const { pinnedProvider, recordedModel, hasAnthropicApiKey } = input;
+	const { pinnedProvider, recordedModel, lastReplyProvider, hasAnthropicApiKey } = input;
 	if ( pinnedProvider === 'openai-api-key' || pinnedProvider === 'chatgpt-oauth' ) {
 		return pinnedProvider;
 	}
-	// Only a ChatGPT record names a connection to run on: as the saved default
-	// ChatGPT reads as unset, and a reply alone reads as one from any provider
-	// but OpenAI's or Anthropic's does, as WordPress.com's.
+	// One that ran on ChatGPT stays there even when no record names its
+	// connection: its turns then fail, rather than move.
+	if ( ! pinnedProvider && lastReplyProvider === 'chatgpt-oauth' ) {
+		return lastReplyProvider;
+	}
+	// As the saved default, ChatGPT reads as unset.
 	const globalProvider =
 		input.globalProvider === 'chatgpt-oauth' ? undefined : input.globalProvider;
-	const lastReplyProvider =
-		input.lastReplyProvider === 'chatgpt-oauth' ? DEFAULT_AI_PROVIDER : input.lastReplyProvider;
 	const recordedProvider = recordedModel
 		? getAiModelFamilyProvider( getAiModelFamily( recordedModel ) )
 		: undefined;
