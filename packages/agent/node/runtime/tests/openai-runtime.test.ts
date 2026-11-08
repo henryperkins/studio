@@ -12,7 +12,7 @@ import {
 	type OpenAiTurnSettings,
 } from '@studio/agent/protocol/openai-models';
 import { createFakeHost } from '../../tests/fake-host';
-import { toPiThinkingLevel } from '../openai-transport';
+import { applyOpenAiTurnSettings, toPiThinkingLevel } from '../openai-transport';
 import type {
 	AssistantMessage,
 	Context,
@@ -743,5 +743,20 @@ describe( 'toPiThinkingLevel', () => {
 		[ 'max', 'max' ],
 	] as const )( 'maps %s to %s', ( effort, level ) => {
 		expect( toPiThinkingLevel( effort ) ).toBe( level );
+	} );
+} );
+
+describe( 'applyOpenAiTurnSettings', () => {
+	// Without an effort, OpenAI applies the model's default (Medium for Terra),
+	// so a missing field must not pass for "none".
+	it( 'refuses a request that carries no reasoning effort', () => {
+		const none = settingsFor( 'gpt-6.1-terra', 'none' );
+		expect( () => applyOpenAiTurnSettings( { reasoning: {} }, none ) ).toThrow(
+			/would have used the default reasoning instead of the selected none/
+		);
+		expect( () => applyOpenAiTurnSettings( {}, none ) ).toThrow( /instead of the selected none/ );
+		expect( applyOpenAiTurnSettings( { reasoning: { effort: 'none' } }, none ).reasoning ).toEqual(
+			{ effort: 'none' }
+		);
 	} );
 } );

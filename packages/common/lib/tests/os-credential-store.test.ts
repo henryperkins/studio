@@ -220,9 +220,17 @@ describe.each( [ 'darwin', 'linux', 'win32' ] as const )( 'system keychain on %s
 		const keychain = createFakeKeychain( platform );
 		const store = createOsCredentialStore( { platform, run: keychain.run } );
 
-		await expect( store.set( 'openai-api-key', 'sk-with space' ) ).rejects.toBeInstanceOf(
-			SecureStorageError
-		);
+		for ( const secret of [
+			'sk-with space',
+			'sk-tab\tend',
+			'sk-ctrl\u0001x',
+			'sk-“quoted”',
+			'',
+		] ) {
+			await expect( store.set( 'openai-api-key', secret ) ).rejects.toBeInstanceOf(
+				SecureStorageError
+			);
+		}
 		await expect( store.set( 'bad name', SECRET ) ).rejects.toThrow( /Invalid keychain item/ );
 		expect( keychain.calls ).toHaveLength( 0 );
 	} );

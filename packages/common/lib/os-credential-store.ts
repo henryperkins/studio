@@ -358,8 +358,9 @@ export function createOsCredentialStore( {
 		},
 		async set( account, secret ) {
 			assertItemName( account );
-			if ( ! secret || /[\s"'\\]/.test( secret ) ) {
-				// Every tool above would need the secret escaped otherwise.
+			// Printable ASCII without spaces, quotes or backslashes: every tool above
+			// would need anything else escaped, and `security -i` reads a command line.
+			if ( ! /^[\x21-\x7e]+$/.test( secret ) || /["'\\]/.test( secret ) ) {
 				throw new SecureStorageError( 'This secret contains characters the keychain can’t store.' );
 			}
 			await adapter.set( account, secret );

@@ -828,8 +828,9 @@ function buildAgentTools(
 	return [ ...studioTools, ...askUserTool, ...designOptionsTool, ...skillTool, ...piTools ];
 }
 
-// Model provider keys the agent's shell has no use for. WordPress.com tokens
-// stay: Studio's own CLI, which the agent runs, reads them.
+// Model provider keys the agent's shell has no use for, including
+// STUDIO_WPCOM_API_KEY, the WordPress.com models' copy of the access token.
+// STUDIO_WPCOM_TOKEN stays: Studio's own CLI, which the agent runs, logs in with it.
 const PROVIDER_SECRET_VARIABLES = [
 	'OPENAI_API_KEY',
 	'STUDIO_OPENAI_API_KEY',
