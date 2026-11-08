@@ -376,6 +376,53 @@ describe( 'OpenAI chats', () => {
 		);
 	} );
 
+	it( 'keeps a reasoning change made after sending out of the turn it sent', async () => {
+		const { connector, input } = await setupChat( [ pin( MEDIUM ) ] );
+		const chat = persistedChat( connector );
+		let finishHigh: ( () => void ) | undefined;
+		connector.setSessionOpenAiSelection
+			.mockImplementationOnce(
+				( _id, selection ) =>
+					new Promise< void >( ( resolve ) => {
+						finishHigh = () => {
+							chat.persist( selection );
+							resolve();
+						};
+					} )
+			)
+			.mockImplementation( async ( _id, selection ) => chat.persist( selection ) );
+
+		// High is still saving when the message is sent; Low is picked before its turn starts.
+		await chooseEffort( 'High' );
+		send( input );
+		await chooseEffort( 'Low' );
+		act( () => finishHigh!() );
+		await waitFor( () => expect( chat.efforts ).toEqual( [ 'high' ] ) );
+		await settle();
+		expect( connector.setSessionOpenAiSelection ).toHaveBeenCalledTimes( 1 );
+		expect( reasoningButton() ).toHaveTextContent( 'Low' );
+
+		// Low is written once that turn ends, and the next message uses it.
+		act( () =>
+			connector.emit( 'onAgentEvent', {
+				sessionId: 'chat',
+				runId: 'run-1',
+				event: {
+					type: 'run.exited',
+					timestamp: new Date().toISOString(),
+					status: 'success',
+					code: 0,
+				},
+			} )
+		);
+		await waitFor( () => expect( connector.setSessionOpenAiSelection ).toHaveBeenCalledTimes( 2 ) );
+		expect( connector.setSessionOpenAiSelection.mock.calls[ 1 ][ 1 ] ).toMatchObject( {
+			reasoningEffort: 'low',
+		} );
+		send( input, 'And the footer' );
+		await waitFor( () => expect( chat.efforts ).toEqual( [ 'high', 'low' ] ) );
+	} );
+
 	it( 'stays on OpenAI, visibly disconnected, after its key is removed', async () => {
 		const { connector, input } = await setupChat(
 			[ pin( { model: 'gpt-6.1-sol', reasoningEffort: 'medium', reasoningMode: 'standard' } ) ],

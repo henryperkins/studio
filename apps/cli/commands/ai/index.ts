@@ -565,16 +565,16 @@ export async function runCommand( options: {
 	let showCapabilitiesOnConnect = ( await readSelectedAiProvider() ) === undefined;
 
 	// Studio Code Desktop defaults to WordPress.com provider — unless the
-	// session is pinned, which must survive the run untouched.
+	// session is pinned, which must survive the run untouched, or ran on OpenAI.
 	if ( isJsonMode && showCapabilitiesOnConnect ) {
-		if ( ! resumeContext.provider ) {
+		if ( ! resumeContext.provider && currentProvider !== 'openai-api-key' ) {
 			await switchProvider( 'wpcom', false );
 		}
 		showCapabilitiesOnConnect = false;
 	}
 
 	// Choosing how to connect would re-pin the conversation; one on OpenAI stays there.
-	if ( showCapabilitiesOnConnect && resumeContext.provider === 'openai-api-key' ) {
+	if ( showCapabilitiesOnConnect && currentProvider === 'openai-api-key' ) {
 		showCapabilitiesOnConnect = false;
 	}
 

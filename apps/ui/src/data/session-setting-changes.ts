@@ -15,6 +15,10 @@ import type { QueryClient } from '@tanstack/react-query';
  * Once every change made together has settled, and no reload that might have
  * read the file before them is under way, the written ones join the cache and
  * the failed ones are gone, so the chat shows what its file holds.
+ *
+ * A change made after a message is sent is written once that message's turn
+ * ends. The turn reads the chat's settings when it starts and then records
+ * them, so a change written in between could run in it or be overwritten.
  */
 
 interface Change {
@@ -33,6 +37,8 @@ interface SessionChanges {
 const NO_ENTRIES: SessionEntry[] = [];
 const sessions = new Map< string, SessionChanges >();
 const listeners = new Set< () => void >();
+// Per chat, the end of the turn last sent; later changes are written after it.
+const holds = new Map< string, Promise< void > >();
 
 function notify(): void {
 	for ( const listener of listeners ) {
@@ -130,8 +136,10 @@ export function saveSessionSettingChange( {
 	const change: Change = { entry, status: 'saving' };
 	state.changes.push( change );
 	update( state );
+	const hold = holds.get( sessionId );
 	const save = state.tail
 		.catch( () => undefined )
+		.then( () => hold )
 		.then( async () => {
 			await write();
 		} );
@@ -188,6 +196,25 @@ export function waitForSessionSettingChanges( sessionId: string ): Promise< void
 	} );
 }
 
+/**
+ * Holds the chat's changes made from now on until `turnEnded` settles. Call it
+ * when a message is sent, after `waitForSessionSettingChanges`.
+ */
+export function holdSessionSettingChanges( sessionId: string, turnEnded: Promise< void > ): void {
+	const previous = holds.get( sessionId );
+	const hold = previous
+		? Promise.all( [ previous, turnEnded ] ).then( () => undefined )
+		: turnEnded;
+	holds.set( sessionId, hold );
+	const forget = () => {
+		if ( holds.get( sessionId ) === hold ) {
+			holds.delete( sessionId );
+		}
+	};
+	hold.then( forget, forget );
+}
+
 export function resetSessionSettingChangesForTests(): void {
 	sessions.clear();
+	holds.clear();
 }

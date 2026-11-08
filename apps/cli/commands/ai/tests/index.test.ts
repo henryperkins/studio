@@ -725,6 +725,25 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 		expect( turnConfig()?.openAi ).toMatchObject( { model: 'gpt-6-luna' } );
 	} );
 
+	it( 'keeps a chat that ran on OpenAI there on the app’s first run, pin or not', async () => {
+		( readSelectedAiProvider as Mock ).mockResolvedValue( undefined );
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: undefined,
+			model: undefined,
+			lastReplyProvider: 'openai-api-key',
+		} );
+		entries.push( contextEntry( { model: 'gpt-6.1-sol', reasoningEffort: 'medium' } ) );
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'hello', resumeSession } );
+
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'openai-api-key', expect.anything() );
+		expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
+		expect( appendCustomEntry ).not.toHaveBeenCalledWith(
+			'studio.session_context',
+			expect.objectContaining( { provider: 'wpcom' } )
+		);
+	} );
+
 	it( 'stays on OpenAI without a key, failing the turn as disconnected', async () => {
 		( isAiProviderReady as Mock ).mockResolvedValue( false );
 		( resolveAiEnvironment as Mock ).mockRejectedValue( new Error( 'OpenAI isn’t connected' ) );

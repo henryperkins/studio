@@ -9,7 +9,10 @@ import { dismissToast, toast } from '@/data/app-messages';
 import { useConnector } from '@/data/core';
 import { ASSISTANT_QUOTA_QUERY_KEY } from '@/data/queries/use-assistant-quota';
 import { SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
-import { waitForSessionSettingChanges } from '@/data/session-setting-changes';
+import {
+	holdSessionSettingChanges,
+	waitForSessionSettingChanges,
+} from '@/data/session-setting-changes';
 import { AgentRunContext, type AgentRunStore } from './context';
 import { QueueDispatchers } from './queue-dispatchers';
 import {
@@ -17,6 +20,7 @@ import {
 	initialAgentRunState,
 	type AgentRunAction,
 	type SendMessageOptions,
+	type SessionStateStore,
 } from './store';
 import { streamingReplyEntry, type StreamingReply } from './streaming-reply';
 import type {
@@ -47,6 +51,23 @@ function replaceEntry( entries: SessionEntry[], entry: SessionEntry ): SessionEn
 function getTimestampMs( timestamp: string ): number {
 	const parsed = Date.parse( timestamp );
 	return Number.isNaN( parsed ) ? Date.now() : parsed;
+}
+
+// Settles once the session's run ends, however it ends: the send about to be
+// dispatched takes it out of idle, and every ending brings it back.
+function whenRunEnds( stateStore: SessionStateStore, sessionId: string ): Promise< void > {
+	return new Promise( ( resolve ) => {
+		let started = false;
+		const unsubscribe = stateStore.subscribe( () => {
+			const { phase } = stateStore.getState()[ sessionId ] ?? initialAgentRunState;
+			if ( phase !== 'idle' ) {
+				started = true;
+			} else if ( started ) {
+				unsubscribe();
+				resolve();
+			}
+		} );
+	} );
 }
 
 export function AgentRunProvider( { children }: PropsWithChildren ) {
@@ -402,9 +423,10 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 	const startRun = useCallback(
 		async ( sessionId: string, prompt: string, options: SendMessageOptions = {} ) => {
 			// Taken now: the turn runs with the model and reasoning the composer
-			// showed at send.
+			// showed at send, and changes made after it wait for the turn to end.
 			const settingsSaved = waitForSessionSettingChanges( sessionId );
 			settingsSaved.catch( () => undefined );
+			holdSessionSettingChanges( sessionId, whenRunEnds( stateStore, sessionId ) );
 			const ownerSiteId = queryClient.getQueryData< LoadedAiSession >( [
 				...SESSIONS_QUERY_KEY,
 				sessionId,
@@ -493,7 +515,7 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 				throw err;
 			}
 		},
-		[ connector, dispatchSession, queryClient, updateCache ]
+		[ connector, dispatchSession, queryClient, stateStore, updateCache ]
 	);
 
 	const interrupt = useCallback(

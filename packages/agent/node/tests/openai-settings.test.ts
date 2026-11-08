@@ -16,6 +16,22 @@ vi.mock( '@studio/common/lib/os-credential-store', async ( importOriginal ) => (
 	createOsCredentialStore: () => keychain.current!.store,
 } ) );
 
+// Lets a test hold the next write to shared.json until it says so.
+const sharedConfigWrite = vi.hoisted( () => ( { hold: null as Promise< void > | null } ) );
+
+vi.mock( '@studio/common/lib/shared-config', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('@studio/common/lib/shared-config') >();
+	return {
+		...actual,
+		updateSharedConfig: async ( update: Parameters< typeof actual.updateSharedConfig >[ 0 ] ) => {
+			const hold = sharedConfigWrite.hold;
+			sharedConfigWrite.hold = null;
+			await hold;
+			return actual.updateSharedConfig( update );
+		},
+	};
+} );
+
 const modelList = ( ...ids: string[] ) =>
 	new Response( JSON.stringify( { object: 'list', data: ids.map( ( id ) => ( { id } ) ) } ), {
 		status: 200,
@@ -56,6 +72,7 @@ describe( 'OpenAI settings', () => {
 		previousDevConfigDir = process.env.DEV_CONFIG_DIR;
 		process.env.DEV_CONFIG_DIR = configDir;
 		keychain.current = createFakeCredentialStore();
+		sharedConfigWrite.hold = null;
 		fetchMock = vi.fn().mockResolvedValue( modelList( 'gpt-6.1-sol', 'gpt-6-luna' ) );
 		vi.stubGlobal( 'fetch', fetchMock );
 	} );
@@ -703,6 +720,28 @@ describe( 'OpenAI settings', () => {
 			await expect( settings.readAiSettings() ).resolves.toMatchObject( {
 				provider: 'wpcom',
 				hasOpenAiApiKey: false,
+			} );
+		} );
+
+		it( 'never lets an Anthropic key save put back the OpenAI default a removal cleared', async () => {
+			const { settings } = await load();
+			await settings.saveOpenAiApiKey( KEY );
+			await settings.setAiProvider( 'openai-api-key' );
+			fetchMock.mockImplementation( async () => new Response( '{}', { status: 200 } ) );
+			let resume!: () => void;
+			sharedConfigWrite.hold = new Promise< void >( ( resolve ) => ( resume = resolve ) );
+
+			// The Anthropic save has read the settings and waits to write; the OpenAI key goes meanwhile.
+			const saving = settings.saveAnthropicApiKey( 'sk-ant-TESTONLY_cccccccccccccccccccc' );
+			await vi.waitFor( () => expect( sharedConfigWrite.hold ).toBeNull() );
+			await settings.removeOpenAiApiKey();
+			resume();
+			await saving;
+
+			await expect( settings.readAiSettings() ).resolves.toMatchObject( {
+				provider: 'wpcom',
+				hasOpenAiApiKey: false,
+				hasAnthropicApiKey: true,
 			} );
 		} );
 	} );

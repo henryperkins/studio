@@ -343,9 +343,14 @@ export async function readAiSettings(): Promise< AiSettings > {
 
 async function updateAiProviderConfig( update: AiProviderConfig ): Promise< AiSettings > {
 	// Carry the legacy cli.json values over on first write so a partial update
-	// (e.g. only aiProvider) doesn't orphan the other field there.
-	const config = { ...( await readAiProviderConfig() ), ...update };
-	await updateSharedConfig( config );
+	// (e.g. only aiProvider) doesn't orphan the other field there. After that,
+	// write only the fields that change: a copy of the other could be stale.
+	const { aiProvider, anthropicApiKey } = await readSharedConfig();
+	const legacy =
+		aiProvider === undefined && anthropicApiKey === undefined
+			? await readLegacyCliConfigFields()
+			: {};
+	await updateSharedConfig( { ...legacy, ...update } );
 	return readAiSettings();
 }
 
