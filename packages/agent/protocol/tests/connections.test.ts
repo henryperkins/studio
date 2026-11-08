@@ -240,6 +240,17 @@ describe( 'a connection that is gone', () => {
 		).toEqual( disconnected );
 	} );
 
+	it( 'fails one whose connection claims to be connected without a verified identity', () => {
+		for ( const identity of [ null, { subject: '' } ] ) {
+			expect(
+				resolveConnectionSelection(
+					[ chatGptRecord() ],
+					registry( { connections: [ chatGptConnection( { identity } ) ] } )
+				)
+			).toEqual( disconnected );
+		}
+	} );
+
 	it( 'fails one whose connection changed since it last ran', () => {
 		expect(
 			resolveConnectionSelection(

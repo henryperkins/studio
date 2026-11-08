@@ -1,4 +1,5 @@
 import { getWpcomAiGatewayBaseUrl } from '@studio/agent/node';
+import { listChatGptConnections } from '@studio/agent/node/chatgpt/credential-broker';
 import {
 	getSecureStorageStatus,
 	OpenAiSessionKeyUnavailableError,
@@ -372,10 +373,10 @@ export function getAiProviderDefinition( provider: AiProviderId ): AiProviderDef
 }
 
 /**
- * The connections a ChatGPT conversation's turn is checked against. Studio
- * keeps no ChatGPT connections yet, so every ChatGPT turn fails as
- * disconnected.
+ * The connections a ChatGPT conversation's turn is checked against: the
+ * ChatGPT accounts signed in on this host. Only ChatGPT turns are checked,
+ * and the saved default never routes those, so no settings are read.
  */
 export async function readConnectionRegistry(): Promise< ConnectionRegistry > {
-	return { connections: [] };
+	return { connections: await listChatGptConnections(), settings: null };
 }

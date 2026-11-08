@@ -61,6 +61,7 @@ export interface ConnectionRegistryEntry {
 	revision: number;
 	/** Null until the connection has verified who it signs in as. */
 	identity: ConnectionIdentity | null;
+	/** Read as disconnected without a verified identity. */
 	authStatus: ConnectionAuthStatus;
 }
 
@@ -73,8 +74,8 @@ export interface ConnectionRegistryEntry {
 export interface ConnectionRegistry {
 	/** Connections with a sign-in of their own, such as ChatGPT accounts. */
 	connections: readonly ConnectionRegistryEntry[];
-	/** The saved default provider and whether an Anthropic key is saved; missing reads as neither. */
-	settings?: Pick< AiSettings, 'provider' | 'hasAnthropicApiKey' > | null;
+	/** The saved default provider and whether an Anthropic key is saved; null reads as neither. */
+	settings: Pick< AiSettings, 'provider' | 'hasAnthropicApiKey' > | null;
 }
 
 export type ConnectionSelectionError =
@@ -189,7 +190,7 @@ function resolveChatGptConnection(
 			},
 		};
 	}
-	if ( connection.authStatus !== 'connected' ) {
+	if ( connection.authStatus !== 'connected' || ! connection.identity?.subject ) {
 		return { ok: false, error: { code: 'disconnected', providerId, connectionId } };
 	}
 	return { ok: true, selection: { connectionId, model: { providerId, modelId }, revision } };

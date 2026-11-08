@@ -57,7 +57,7 @@ vi.mock( 'cli/ai/providers', () => ( {
 		defaultModel: 'claude-sonnet-5',
 	} ),
 	getStudioUserAgent: () => 'WordPressStudio',
-	readConnectionRegistry: vi.fn( async () => ( { connections: [] } ) ),
+	readConnectionRegistry: vi.fn( async () => ( { connections: [], settings: null } ) ),
 	readOpenAiKeyForTurn: vi.fn( async () => null ),
 } ) );
 vi.mock( '@studio/agent/node/settings-store', () => ( {
@@ -1044,10 +1044,11 @@ describe( 'AI runCommand — ChatGPT conversations', () => {
 					providerId: 'chatgpt-oauth',
 					backend: 'pi',
 					revision: 2,
-					identity: null,
+					identity: { subject: 'test-subject-1' },
 					authStatus: 'connected',
 				},
 			],
+			settings: null,
 		} );
 		const adapter = new JsonAdapter();
 		const showError = vi.spyOn( adapter, 'showError' );

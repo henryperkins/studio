@@ -1,4 +1,8 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { password } from '@inquirer/prompts';
+import { saveChatGptSignIn } from '@studio/agent/node/chatgpt/credential-broker';
 import {
 	getSecureStorageStatus,
 	OpenAiSessionKeyUnavailableError,
@@ -21,7 +25,7 @@ import {
 	resolveInitialAiProvider,
 	resolveUnavailableAiProvider,
 } from 'cli/ai/auth';
-import { getAiProviderDefinition } from 'cli/ai/providers';
+import { getAiProviderDefinition, readConnectionRegistry } from 'cli/ai/providers';
 import { LoggerError } from 'cli/logger';
 
 vi.mock( '@inquirer/prompts', () => ( {
@@ -359,6 +363,56 @@ describe( 'AI auth helpers', () => {
 			// A logged-out WordPress.com conversation doesn't move to ChatGPT…
 			await expect( resolveUnavailableAiProvider( 'wpcom' ) ).resolves.toBeUndefined();
 			// …and a first run doesn't start on it.
+			await expect( resolveInitialAiProvider() ).resolves.toBe( 'wpcom' );
+		} );
+
+		it( 'checks turns against the ChatGPT accounts signed in here, and still never offers ChatGPT', async () => {
+			const configDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-cli-chatgpt-' ) );
+			const previousConfigDir = process.env.DEV_CONFIG_DIR;
+			process.env.DEV_CONFIG_DIR = configDir;
+			onTestFinished( () => {
+				if ( previousConfigDir === undefined ) {
+					delete process.env.DEV_CONFIG_DIR;
+				} else {
+					process.env.DEV_CONFIG_DIR = previousConfigDir;
+				}
+				fs.rmSync( configDir, { recursive: true, force: true } );
+			} );
+			// Kept for this session only, so no keychain is involved.
+			const account = await saveChatGptSignIn( {
+				issuer: 'https://auth.openai.com',
+				subject: 'test-subject-1',
+				email: 'someone@example.com',
+				clientId: 'test-issued-client-1',
+				storage: 'session',
+				tokens: {
+					accessToken: 'test-access-token-1',
+					refreshToken: 'test-refresh-token-1',
+					idToken: 'test-id-token-1',
+					tokenType: 'Bearer',
+					expiresIn: 3600,
+					scope: 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct',
+				},
+			} );
+
+			await expect( readConnectionRegistry() ).resolves.toEqual( {
+				connections: [
+					{
+						connectionId: account.registrationId,
+						providerId: 'chatgpt-oauth',
+						backend: 'pi',
+						revision: 1,
+						identity: { subject: 'test-subject-1', email: 'someone@example.com' },
+						authStatus: 'connected',
+					},
+				],
+				settings: null,
+			} );
+			makeReady( {} );
+			vi.mocked( readSelectedAiProvider ).mockResolvedValue( undefined );
+			await expect( isAiProviderReady( 'chatgpt-oauth' ) ).resolves.toBe( false );
+			await expect( getAvailableAiProviders() ).resolves.not.toContain( 'chatgpt-oauth' );
+			await expect( resolveUnavailableAiProvider( 'wpcom' ) ).resolves.toBeUndefined();
 			await expect( resolveInitialAiProvider() ).resolves.toBe( 'wpcom' );
 		} );
 
