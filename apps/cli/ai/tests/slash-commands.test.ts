@@ -507,6 +507,75 @@ describe( '/provider slash command', () => {
 		expect( ctx.clearSession ).toHaveBeenCalledTimes( 1 );
 		expect( ctx.ui.showInfo ).toHaveBeenCalledWith( expect.stringMatching( /model families/ ) );
 	} );
+
+	describe( 'when a subscription connection is involved', () => {
+		function logCalls( ctx: SlashCommandContext ) {
+			const calls: string[] = [];
+			vi.mocked( ctx.prepareProviderSelection ).mockImplementation( async () => {
+				calls.push( 'prepare' );
+			} );
+			vi.mocked( ctx.clearSession ).mockImplementation( async () => {
+				calls.push( 'clear' );
+			} );
+			vi.mocked( ctx.switchProvider ).mockImplementation( async () => {
+				calls.push( 'switch' );
+			} );
+			return calls;
+		}
+
+		it.each( [
+			[ 'chatgpt-oauth', 'WordPress.com' ],
+			[ 'wpcom', 'ChatGPT' ],
+		] as const )(
+			'clears the session before the new pin is written when moving from %s to %s',
+			async ( currentProvider, targetLabel ) => {
+				const ctx = buildProviderCtx( { currentProvider, currentModel: 'fast', targetLabel } );
+				const calls = logCalls( ctx );
+
+				await handler?.( '', ctx );
+
+				expect( calls ).toEqual( [ 'prepare', 'clear', 'switch' ] );
+			}
+		);
+
+		it( 'clears nothing when the provider setup is canceled', async () => {
+			const ctx = buildProviderCtx( {
+				currentProvider: 'chatgpt-oauth',
+				currentModel: 'fast',
+				targetLabel: 'WordPress.com',
+			} );
+			vi.mocked( ctx.prepareProviderSelection ).mockRejectedValue(
+				Object.assign( new Error( 'canceled' ), { name: 'ExitPromptError' } )
+			);
+
+			await expect( handler?.( '', ctx ) ).resolves.toBe( 'continue' );
+
+			expect( ctx.clearSession ).not.toHaveBeenCalled();
+			expect( ctx.switchProvider ).not.toHaveBeenCalled();
+		} );
+	} );
+
+	it( 'keeps the switch-then-clear order on a legacy family change', async () => {
+		const ctx = buildProviderCtx( {
+			currentProvider: 'wpcom',
+			currentModel: 'fast',
+			targetLabel: 'Anthropic · API key',
+			modelAfterSwitch: 'claude-sonnet-5',
+		} );
+		const calls: string[] = [];
+		const switchImpl = vi.mocked( ctx.switchProvider ).getMockImplementation()!;
+		vi.mocked( ctx.switchProvider ).mockImplementation( async ( ...args ) => {
+			calls.push( 'switch' );
+			await switchImpl( ...args );
+		} );
+		vi.mocked( ctx.clearSession ).mockImplementation( async () => {
+			calls.push( 'clear' );
+		} );
+
+		await handler?.( '', ctx );
+
+		expect( calls ).toEqual( [ 'switch', 'clear' ] );
+	} );
 } );
 
 describe( '/reasoning slash command', () => {
