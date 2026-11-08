@@ -636,6 +636,7 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 		} );
 		( readAuthToken as Mock ).mockResolvedValue( null );
 		( readSelectedAiProvider as Mock ).mockResolvedValue( 'wpcom' );
+		( resolveInitialAiProvider as Mock ).mockResolvedValue( 'wpcom' );
 		( readAiSettings as Mock ).mockResolvedValue( openAiSettings() );
 		( isAiProviderReady as Mock ).mockResolvedValue( true );
 		( resolveAiEnvironment as Mock ).mockResolvedValue( { STUDIO_OPENAI_API_KEY: 'sk-test' } );
@@ -769,5 +770,53 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 
 		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'wpcom', expect.anything() );
 		expect( turnConfig()?.openAi ).toBeUndefined();
+	} );
+
+	it( 'doesn’t ask how to connect when a terminal first resumes an OpenAI conversation', async () => {
+		// No provider was ever saved: a terminal's first run.
+		( readSelectedAiProvider as Mock ).mockResolvedValue( undefined );
+		entries.push( contextEntry( { provider: 'openai-api-key', model: 'gpt-6.1-sol' } ) );
+		const json = new JsonAdapter();
+		const askUser = vi
+			.spyOn( json, 'askUser' )
+			.mockResolvedValue( { connect: 'WordPress.com (recommended)' } );
+		// An interactive adapter: anything but the JSON one.
+		const terminal = new Proxy( json, { getPrototypeOf: () => Object.prototype } );
+
+		// The turn runs; only then would the chat loop need the real terminal UI.
+		await expect(
+			runCommand( { adapter: terminal, initialMessage: 'hello', resumeSession } )
+		).rejects.toThrow( 'Interactive mode requires AiChatUI adapter' );
+
+		expect( askUser ).not.toHaveBeenCalled();
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'openai-api-key', expect.anything() );
+		expect(
+			appendCustomEntry.mock.calls.some(
+				( [ type, data ] ) => type === 'studio.session_context' && data.provider === 'wpcom'
+			)
+		).toBe( false );
+	} );
+
+	it( 'keeps an old conversation whose model Studio no longer offers off OpenAI', async () => {
+		( readSelectedAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
+		// As it resolves with OpenAI saved as the default.
+		( resolveInitialAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: undefined,
+			model: undefined,
+			hasHistory: true,
+		} );
+		( resolveAiEnvironment as Mock ).mockResolvedValue( {} );
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'hello', resumeSession } );
+
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'wpcom', expect.anything() );
+		expect( turnConfig()?.openAi ).toBeUndefined();
+		expect(
+			appendCustomEntry.mock.calls.some(
+				( [ type, data ] ) =>
+					type === 'studio.session_context' && data.provider === 'openai-api-key'
+			)
+		).toBe( false );
 	} );
 } );

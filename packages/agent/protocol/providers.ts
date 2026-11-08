@@ -2,6 +2,7 @@ import {
 	AI_MODELS,
 	DEFAULT_MODEL,
 	getAiModelFamily,
+	hasConversationHistory,
 	PAID_DEFAULT_MODEL,
 	readRecordedSessionModel,
 	resolveSessionModel,
@@ -149,6 +150,11 @@ export interface ConversationProviderInput {
 	pinnedProvider?: AiProviderId;
 	/** The latest model the conversation recorded that Studio still offers. */
 	recordedModel?: AiModelId;
+	/**
+	 * Whether the conversation already ran, even on a model Studio no longer
+	 * offers (see `hasConversationHistory`). A recorded model implies it.
+	 */
+	hasHistory?: boolean;
 	/** The provider new conversations use. */
 	globalProvider?: AiProviderId;
 	hasAnthropicApiKey: boolean;
@@ -169,20 +175,23 @@ export function resolveConversationProvider( input: ConversationProviderInput ):
 	if ( pinnedProvider === 'openai-api-key' ) {
 		return pinnedProvider;
 	}
-	if ( ! pinnedProvider && recordedModel ) {
-		const recordedProvider = getAiModelFamilyProvider( getAiModelFamily( recordedModel ) );
-		if ( recordedProvider === 'openai-api-key' ) {
-			return recordedProvider;
-		}
-		if ( globalProvider === 'openai-api-key' ) {
-			// A conversation that already ran elsewhere keeps its provider.
-			return recordedProvider === 'anthropic-api-key' && ! hasAnthropicApiKey
-				? DEFAULT_AI_PROVIDER
-				: recordedProvider;
-		}
+	const recordedProvider = recordedModel
+		? getAiModelFamilyProvider( getAiModelFamily( recordedModel ) )
+		: undefined;
+	if ( ! pinnedProvider && recordedProvider === 'openai-api-key' ) {
+		return recordedProvider;
 	}
 	if ( ! pinnedProvider && globalProvider === 'openai-api-key' ) {
-		return globalProvider;
+		if ( ! recordedProvider && ! input.hasHistory ) {
+			return globalProvider;
+		}
+		// A conversation that already ran elsewhere keeps its provider, or goes
+		// to WordPress.com when Studio no longer offers its model: it never moves
+		// to OpenAI on its own.
+		return ! recordedProvider ||
+			( recordedProvider === 'anthropic-api-key' && ! hasAnthropicApiKey )
+			? DEFAULT_AI_PROVIDER
+			: recordedProvider;
 	}
 	if ( ! hasAnthropicApiKey ) {
 		return DEFAULT_AI_PROVIDER;
@@ -202,6 +211,7 @@ export function getEffectiveSessionProvider(
 	return resolveConversationProvider( {
 		pinnedProvider: resolveSessionProvider( entries ),
 		recordedModel: readRecordedSessionModel( entries ),
+		hasHistory: hasConversationHistory( entries ),
 		globalProvider: settings?.provider,
 		hasAnthropicApiKey: settings?.hasAnthropicApiKey ?? false,
 	} );

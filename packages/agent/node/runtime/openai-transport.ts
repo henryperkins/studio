@@ -136,6 +136,11 @@ interface OpenAiExchange {
  * The fetch the OpenAI client uses: only to the OpenAI API, never following a
  * redirect (which could carry the key elsewhere), recording each failure so
  * the error can be classified by status and code rather than by text.
+ *
+ * Each request carries Studio's key and no organization or project. The
+ * OpenAI SDK would otherwise add what it finds in the process environment:
+ * `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`, and `OPENAI_CUSTOM_HEADERS`, which
+ * can even replace the `Authorization` header.
  */
 function createOpenAiExchange( apiKey: string ): OpenAiExchange {
 	let failure: OpenAiErrorSummary | undefined;
@@ -144,9 +149,15 @@ function createOpenAiExchange( apiKey: string ): OpenAiExchange {
 		if ( url.origin !== OPENAI_ORIGIN ) {
 			throw new Error( `Studio sends OpenAI requests only to ${ OPENAI_ORIGIN }.` );
 		}
+		const headers = new Headers(
+			init?.headers ?? ( input instanceof Request ? input.headers : {} )
+		);
+		headers.delete( 'openai-organization' );
+		headers.delete( 'openai-project' );
+		headers.set( 'authorization', `Bearer ${ apiKey }` );
 		let response: Response;
 		try {
-			response = await fetch( input, { ...init, redirect: 'error' } );
+			response = await fetch( input, { ...init, headers, redirect: 'error' } );
 		} catch ( error ) {
 			if ( ! init?.signal?.aborted ) {
 				failure = summarizeOpenAiNetworkFailure( error, [ apiKey ] );

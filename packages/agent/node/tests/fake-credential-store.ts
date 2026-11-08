@@ -3,15 +3,26 @@ import { SecureStorageError, type OsCredentialStore } from '@studio/common/lib/o
 /** An in-memory stand-in for the system keychain, with switchable availability. */
 export function createFakeCredentialStore() {
 	const items = new Map< string, string >();
-	const state = { available: true, reason: 'There is no keychain on this machine.' };
+	const state = {
+		available: true,
+		// Unavailable because the machine has no keychain at all, not because it can't be reached.
+		absent: false,
+		reason: 'The keychain can’t be reached.',
+	};
 	const ensureAvailable = () => {
 		if ( ! state.available ) {
 			throw new SecureStorageError( state.reason );
 		}
 	};
 	const store: OsCredentialStore = {
-		check: async () =>
-			state.available ? { available: true } : { available: false, reason: state.reason },
+		check: async () => {
+			if ( state.available ) {
+				return { available: true };
+			}
+			return state.absent
+				? { available: false, reason: state.reason, absent: true }
+				: { available: false, reason: state.reason };
+		},
 		get: async ( account ) => {
 			ensureAvailable();
 			return items.get( account ) ?? null;

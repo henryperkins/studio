@@ -217,7 +217,7 @@ function resolveCredentials(
 			return {
 				ok: false,
 				reason:
-					'OpenAI isn’t connected: add an OpenAI API key in Settings → AI, or with /provider in Studio Code. (STUDIO_OPENAI_API_KEY is not set.)',
+					'OpenAI isn’t connected: add an OpenAI API key in Settings → AI, or with /openai-key in Studio Code. (STUDIO_OPENAI_API_KEY is not set.)',
 			};
 		}
 		return { ok: true, creds: { apiKey, baseURL: OPENAI_API_BASE_URL } };
@@ -833,7 +833,6 @@ function buildAgentTools(
 const PROVIDER_SECRET_VARIABLES = [
 	'OPENAI_API_KEY',
 	'STUDIO_OPENAI_API_KEY',
-	'STUDIO_OPENAI_SESSION_API_KEY',
 	'ANTHROPIC_API_KEY',
 	'ANTHROPIC_AUTH_TOKEN',
 	'STUDIO_WPCOM_API_KEY',

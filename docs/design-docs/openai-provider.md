@@ -20,7 +20,7 @@ Effort and mode are sent as `reasoning.effort` and, for Pro, `reasoning.mode`. R
 
 ## No silent fallback
 
-An OpenAI conversation stays on OpenAI. Without a key, its turns fail with a disconnected error and the composer says so; the conversation is never sent to another provider. The reverse also holds: Studio never moves a conversation to OpenAI on its own, whether on a first run or when WordPress.com becomes unavailable (`autoSelectable` in the CLI's provider definitions). The rules for WordPress.com and Anthropic are unchanged.
+An OpenAI conversation stays on OpenAI. Without a key, its turns fail with a disconnected error and the composer says so; the conversation is never sent to another provider. The reverse also holds: Studio never moves a conversation to OpenAI on its own, whether on a first run or when WordPress.com becomes unavailable (`autoSelectable` in the CLI's provider definitions). Making OpenAI the default affects only conversations that haven't run yet: one with any history keeps its provider, or goes to WordPress.com when Studio no longer offers the model it recorded (`hasConversationHistory`). The rules for WordPress.com and Anthropic are unchanged.
 
 Errors are classified by HTTP status and OpenAI error code (authentication, permission, unavailable model, invalid request, rate limit, quota, server, network, cancelled, interrupted stream) and explained without the WordPress.com usage-cap wording. Each explanation carries an untranslated marker that keeps pi's retry decision independent of the user's language: rate limits, server errors, network failures and interrupted streams retry, the rest don't.
 
@@ -28,13 +28,15 @@ Errors are classified by HTTP status and OpenAI error code (authentication, perm
 
 The key is kept in the system keychain: macOS Keychain through `security`, the Secret Service through `secret-tool` on Linux, and Credential Manager through PowerShell on Windows. It reaches those tools over stdin, never as a command-line argument. Studio's settings files hold only non-secret choices; responses to the UI carry where the key is kept and its last four characters.
 
-When a machine has no usable keychain, saving to it fails with an explicit error instead of falling back to a file. The user can instead keep a key for the current session: it lives in the memory of the process that owns settings (the desktop app's main process or the `studio ui` server) and reaches each forked CLI turn through the `STUDIO_OPENAI_SESSION_API_KEY` variable, which the CLI removes from its environment before it starts anything.
+When a machine has no usable keychain, saving to it fails with an explicit error instead of falling back to a file. The user can instead keep a key for the current session: it lives in the memory of the process that owns settings (the desktop app's main process or the `studio ui` server). A forked CLI turn that needs it asks for it over the Node IPC channel; the fork's environment only says that a key is on offer (`STUDIO_OPENAI_SESSION_KEY_OFFERED`). The key never goes into a child's environment or arguments, which other programs running as the user can read: on Linux, `/proc/<pid>/environ` keeps a process's starting environment even after it deletes a variable.
 
-The runtime receives the key in its provider environment, apart from the environment the agent's tools run in. The Bash tool's environment is stripped of model provider keys, so neither Studio's key nor an `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` the user exported reaches commands the agent runs.
+Removing the key clears the session key and deletes the keychain item, checking the keychain afresh. If the machine has a keychain this process can't reach (a locked keychain, or `studio ui` over SSH without a session bus), the removal fails and says so, since a key saved there would come back once the keychain is reachable again.
+
+The runtime receives the key in its provider environment, apart from the environment the agent's tools run in. The Bash tool's environment is stripped of model provider keys, so neither Studio's key nor an `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` the user exported reaches commands the agent runs. Requests carry Studio's key and no organization or project, whatever `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID` or `OPENAI_CUSTOM_HEADERS` hold: the OpenAI SDK reads those from the process environment, and a custom `Authorization` header would otherwise replace the key.
 
 ### What this does not protect against
 
-Keychain storage protects the key at rest. The agent can run commands as the user, and any program running as the user can ask the keychain for the same item, and may be able to read the memory of the process that holds a session key. This change does not isolate the key from those programs and is not a sandbox.
+Keychain storage protects the key at rest. The agent can run commands as the user, and any program running as the user can ask the keychain for the same item. On macOS the item is created through `/usr/bin/security`, which its access list then trusts, so `security find-generic-password -w` reads it without a prompt; on Linux, `secret-tool lookup` reads it from an unlocked keyring. A program running as the user may also be able to read the memory of the process that holds a session key. Stripping provider keys from the Bash tool's environment keeps them out of commands' output by accident; it doesn't stop a command that goes looking. This change does not isolate the key from such programs and is not a sandbox.
 
 ## Image generation
 

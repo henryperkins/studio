@@ -97,9 +97,18 @@ function createFakeKeychain( platform: 'darwin' | 'linux' | 'win32' ) {
 			}
 			const key = keyOf( match[ 1 ], match[ 2 ] );
 			if ( script.includes( '$vault.Add(' ) ) {
+				// A replace removes the previous credential before adding the new one,
+				// and only a script that puts it back keeps it when the add fails.
+				const previous = items.get( key );
+				if ( script.includes( '$vault.Remove(' ) ) {
+					items.delete( key );
+				}
 				if ( failNextWrite ) {
 					const failure = failNextWrite;
 					failNextWrite = null;
+					if ( previous !== undefined && script.includes( '$vault.Add($previous)' ) ) {
+						items.set( key, previous );
+					}
 					return failure;
 				}
 				if ( ! dropWrites ) {
@@ -185,6 +194,18 @@ describe.each( [ 'darwin', 'linux', 'win32' ] as const )( 'system keychain on %s
 		expect( keychain.items.size ).toBe( 0 );
 	} );
 
+	it( 'keeps the previous secret when saving a new one fails', async () => {
+		const keychain = createFakeKeychain( platform );
+		const store = createOsCredentialStore( { platform, run: keychain.run } );
+		await store.set( 'openai-api-key', SECRET );
+		keychain.failNextWrite( { code: 1, stdout: '', stderr: 'refused' } );
+
+		await expect( store.set( 'openai-api-key', `${ SECRET }2` ) ).rejects.toBeInstanceOf(
+			SecureStorageError
+		);
+		await expect( store.get( 'openai-api-key' ) ).resolves.toBe( SECRET );
+	} );
+
 	it( 'reports a save the keychain silently dropped', async () => {
 		const keychain = createFakeKeychain( platform );
 		const store = createOsCredentialStore( { platform, run: keychain.run } );
@@ -221,6 +242,7 @@ describe( 'an unavailable system keychain', () => {
 		await expect( store.check() ).resolves.toEqual( {
 			available: false,
 			reason: expect.stringMatching( /libsecret-tools/ ),
+			absent: true,
 		} );
 	} );
 
@@ -248,7 +270,7 @@ describe( 'an unavailable system keychain', () => {
 				throw new Error( 'must not run anything' );
 			},
 		} );
-		await expect( store.check() ).resolves.toMatchObject( { available: false } );
+		await expect( store.check() ).resolves.toMatchObject( { available: false, absent: true } );
 		await expect( store.set( 'openai-api-key', SECRET ) ).rejects.toBeInstanceOf(
 			SecureStorageError
 		);

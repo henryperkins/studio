@@ -418,6 +418,26 @@ describe( 'OpenAI turns', () => {
 			expect( JSON.stringify( body.input ) ).not.toContain( 'configuration_update' );
 		} );
 
+		it( 'sends only Studio’s key, whatever OPENAI_* variables the environment holds', async () => {
+			process.env.OPENAI_ORG_ID = 'org-ambient';
+			process.env.OPENAI_PROJECT_ID = 'proj_ambient';
+			process.env.OPENAI_CUSTOM_HEADERS = `Authorization: Bearer ${ AMBIENT_KEY }\nX-Team: web`;
+			const { options } = await runTurn( {
+				prompt: 'hi',
+				model: 'gpt-6.1-sol',
+				env: { STUDIO_OPENAI_API_KEY: KEY },
+			} );
+			const http = captureFetch( () => sseResponse( TEXT_EVENTS( 'Done.' ) ) );
+
+			const reply = await stream( options!, { messages: [ userMessage( 'hello' ) ] } );
+
+			expect( reply.stopReason ).toBe( 'stop' );
+			const { headers } = http.request();
+			expect( headers.get( 'authorization' ) ).toBe( `Bearer ${ KEY }` );
+			expect( headers.has( 'openai-organization' ) ).toBe( false );
+			expect( headers.has( 'openai-project' ) ).toBe( false );
+		} );
+
 		it( 'refuses to send an effort other than the chosen one', async () => {
 			const { options } = await runTurn( {
 				prompt: 'hi',
@@ -687,7 +707,6 @@ describe( 'OpenAI turns', () => {
 	describe( 'tool environment', () => {
 		it( 'runs Bash without any provider key, whatever the parent process holds', async () => {
 			process.env.OPENAI_API_KEY = AMBIENT_KEY;
-			process.env.STUDIO_OPENAI_SESSION_API_KEY = AMBIENT_KEY;
 			process.env.ANTHROPIC_API_KEY = 'sk-ant-TESTONLY';
 			const { options } = await runTurn( {
 				prompt: 'hi',
@@ -711,9 +730,7 @@ describe( 'OpenAI turns', () => {
 			for ( const leaked of [ KEY, AMBIENT_KEY, 'sk-ant-TESTONLY' ] ) {
 				expect( output ).not.toContain( leaked );
 			}
-			expect( output ).not.toMatch(
-				/\b(OPENAI_API_KEY|STUDIO_OPENAI_API_KEY|STUDIO_OPENAI_SESSION_API_KEY|ANTHROPIC_API_KEY)=/
-			);
+			expect( output ).not.toMatch( /\b(OPENAI_API_KEY|STUDIO_OPENAI_API_KEY|ANTHROPIC_API_KEY)=/ );
 		} );
 	} );
 } );

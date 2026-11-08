@@ -107,6 +107,24 @@ describe( 'resolveConversationProvider', () => {
 		).toBe( 'wpcom' );
 	} );
 
+	it( 'keeps an old conversation off OpenAI when Studio no longer offers its model', () => {
+		const global = settings( 'openai-api-key', { hasOpenAiApiKey: true } );
+		expect(
+			getEffectiveSessionProvider( [ contextEntry( { model: 'claude-retired-4' } ) ], global )
+		).toBe( 'wpcom' );
+		// Messages, but no model record at all.
+		const message = {
+			type: 'message',
+			id: 'm1',
+			parentId: null,
+			timestamp: new Date( 0 ).toISOString(),
+			message: { role: 'user', content: 'Hello', timestamp: 0 },
+		} as unknown as SessionEntry;
+		expect( getEffectiveSessionProvider( [ message ], global ) ).toBe( 'wpcom' );
+		// Nothing has run yet: the OpenAI default applies.
+		expect( getEffectiveSessionProvider( [], global ) ).toBe( 'openai-api-key' );
+	} );
+
 	it( 'keeps the existing WordPress.com and Anthropic rules', () => {
 		const pinnedAnthropic = [
 			contextEntry( { provider: 'anthropic-api-key', model: 'claude-sonnet-5' } ),

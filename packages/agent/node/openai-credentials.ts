@@ -4,6 +4,7 @@ import {
 	type CredentialStoreStatus,
 	type OsCredentialStore,
 } from '@studio/common/lib/os-credential-store';
+import { __, sprintf } from '@wordpress/i18n';
 import type { OpenAiKeyStorage } from '@studio/agent/protocol/providers';
 
 /**
@@ -12,17 +13,26 @@ import type { OpenAiKeyStorage } from '@studio/agent/protocol/providers';
  *
  * The key goes to the system keychain. When this machine has none, the user
  * can keep a key for the current app session instead: it stays in this
- * process's memory and is handed to each forked CLI turn, never written down.
+ * process's memory, never written down, and a forked CLI turn that needs it
+ * asks for it over the Node IPC channel. It never travels in a child's
+ * environment or arguments, which other programs running as the user can read
+ * (on Linux, `/proc/<pid>/environ` keeps the starting environment even after
+ * the process deletes a variable).
  */
 
 const KEYCHAIN_ACCOUNT = 'openai-api-key';
-// How a session-only key reaches a forked CLI turn. The CLI removes it from its
-// environment on startup, before anything it spawns could inherit it.
-export const OPENAI_SESSION_KEY_ENV = 'STUDIO_OPENAI_SESSION_API_KEY';
+// Set to "1" on a forked CLI turn's environment when the app keeps a session
+// key, so the turn knows it may ask. It carries no secret.
+const OPENAI_SESSION_KEY_OFFER_ENV = 'STUDIO_OPENAI_SESSION_KEY_OFFERED';
+const SESSION_KEY_REQUEST = 'studio.openai-session-key.request';
+const SESSION_KEY_REPLY = 'studio.openai-session-key';
+const SESSION_KEY_REPLY_TIMEOUT_MS = 10_000;
 const UNAVAILABLE_RECHECK_MS = 30_000;
 
 let store: OsCredentialStore | undefined;
 let sessionKey: string | null = null;
+// In a forked CLI turn: asks the app that started it for its session key.
+let requestParentSessionKey: ( () => Promise< string | null > ) | null = null;
 let cachedStatus: { status: CredentialStoreStatus; checkedAt: number } | undefined;
 let pending: Promise< unknown > = Promise.resolve();
 
@@ -71,6 +81,10 @@ export async function readOpenAiKeySource(): Promise< OpenAiKeySource | null > {
 	if ( sessionKey ) {
 		return { key: sessionKey, storage: 'session' };
 	}
+	const parentSessionKey = await requestParentSessionKey?.();
+	if ( parentSessionKey ) {
+		return { key: parentSessionKey, storage: 'session' };
+	}
 	if ( ! ( await getSecureStorageStatus() ).available ) {
 		return null;
 	}
@@ -87,6 +101,7 @@ export function storeOpenAiKey( key: string, storage: OpenAiKeyStorage ): Promis
 	return serialize( async () => {
 		if ( storage === 'session' ) {
 			sessionKey = key;
+			requestParentSessionKey = null;
 			return;
 		}
 		const status = await getSecureStorageStatus();
@@ -101,32 +116,135 @@ export function storeOpenAiKey( key: string, storage: OpenAiKeyStorage ): Promis
 			throw error;
 		}
 		sessionKey = null;
+		requestParentSessionKey = null;
 	} );
 }
 
-/** Forgets the session key and removes the keychain's copy. */
+/**
+ * Forgets the session key and removes the keychain's copy. Fails when the
+ * machine has a keychain this process can't reach: a key saved there would
+ * otherwise come back once it can.
+ */
 export function deleteOpenAiKey(): Promise< void > {
 	return serialize( async () => {
+		const hadSessionKey = Boolean( sessionKey || requestParentSessionKey );
 		sessionKey = null;
-		if ( ( await getSecureStorageStatus() ).available ) {
+		requestParentSessionKey = null;
+		// Checked afresh: a status cached before the keychain went away mustn't
+		// turn a failed removal into a quiet success.
+		cachedStatus = undefined;
+		const status = await getSecureStorageStatus();
+		if ( ! status.available ) {
+			if ( status.absent ) {
+				return;
+			}
+			throw new SecureStorageError(
+				hadSessionKey
+					? sprintf(
+							/* translators: %s: why the system keychain can't be reached. */
+							__(
+								'Studio stopped using the key for this session, but couldn’t reach the system keychain to remove a key saved there. %s If one is saved there, Studio will use it again once the keychain is available; remove it then.'
+							),
+							status.reason
+					  )
+					: sprintf(
+							/* translators: %s: why the system keychain can't be reached. */
+							__( 'Studio couldn’t reach the system keychain to remove the key. %s' ),
+							status.reason
+					  )
+			);
+		}
+		try {
 			await getStore().delete( KEYCHAIN_ACCOUNT );
+		} catch ( error ) {
+			cachedStatus = undefined;
+			throw error;
 		}
 	} );
 }
 
-/** The environment that hands this process's session-only key to a forked CLI. */
-export function getOpenAiSessionKeyEnvironment(): Record< string, string > {
-	return sessionKey ? { [ OPENAI_SESSION_KEY_ENV ]: sessionKey } : {};
+function isMessageOfType( message: unknown, type: string ): boolean {
+	return (
+		typeof message === 'object' &&
+		message !== null &&
+		( message as { type?: unknown } ).type === type
+	);
 }
 
 /**
- * Takes over a session-only key a parent process handed down, and removes it
- * from the environment so no process started from here inherits it.
+ * The environment a forked CLI turn gets from this process: an offer of the
+ * session key when there is one, never the key itself.
  */
-export function adoptOpenAiSessionKey( env: NodeJS.ProcessEnv = process.env ): void {
-	const key = env[ OPENAI_SESSION_KEY_ENV ]?.trim();
-	delete env[ OPENAI_SESSION_KEY_ENV ];
-	if ( key ) {
-		sessionKey = key;
+export function getOpenAiSessionKeyForkEnvironment(): Record< string, string > {
+	return sessionKey ? { [ OPENAI_SESSION_KEY_OFFER_ENV ]: '1' } : {};
+}
+
+/**
+ * Answers a forked CLI turn that asks for this process's session key, through
+ * `reply` (the child's IPC channel). False for any other message.
+ */
+export function answerOpenAiSessionKeyRequest(
+	message: unknown,
+	reply: ( message: { type: string; key: string | null } ) => void
+): boolean {
+	if ( ! isMessageOfType( message, SESSION_KEY_REQUEST ) ) {
+		return false;
 	}
+	reply( { type: SESSION_KEY_REPLY, key: sessionKey } );
+	return true;
+}
+
+/** The IPC channel to the app that forked this process: `process` in a forked CLI. */
+export interface ParentChannel {
+	send?: ( message: unknown, callback: ( error: Error | null ) => void ) => unknown;
+	on( event: 'message', listener: ( message: unknown ) => void ): unknown;
+	off( event: 'message', listener: ( message: unknown ) => void ): unknown;
+}
+
+function askParentForSessionKey( channel: ParentChannel ): Promise< string | null > {
+	return new Promise( ( resolve ) => {
+		const finish = ( key: string | null ) => {
+			clearTimeout( timer );
+			channel.off( 'message', onMessage );
+			resolve( key );
+		};
+		const onMessage = ( message: unknown ) => {
+			if ( isMessageOfType( message, SESSION_KEY_REPLY ) ) {
+				const { key } = message as { key?: unknown };
+				finish( typeof key === 'string' && key.trim() ? key.trim() : null );
+			}
+		};
+		// An app that never answers leaves the turn on the keychain, not stuck.
+		const timer = setTimeout( () => finish( null ), SESSION_KEY_REPLY_TIMEOUT_MS );
+		channel.on( 'message', onMessage );
+		try {
+			// With a callback, a closed channel reports here instead of as an
+			// 'error' event nobody listens to.
+			channel.send?.( { type: SESSION_KEY_REQUEST }, ( error ) => {
+				if ( error ) {
+					finish( null );
+				}
+			} );
+		} catch {
+			finish( null );
+		}
+	} );
+}
+
+/**
+ * In a CLI turn forked by a Studio app that keeps a session key: lets the
+ * turn ask the app for it, once, the first time it needs the key. Call at
+ * startup; it does nothing in a process nobody offered a key to.
+ */
+export function acceptOpenAiSessionKeyFromParent(
+	channel: ParentChannel = process as unknown as ParentChannel,
+	env: NodeJS.ProcessEnv = process.env
+): void {
+	const offered = env[ OPENAI_SESSION_KEY_OFFER_ENV ] === '1';
+	delete env[ OPENAI_SESSION_KEY_OFFER_ENV ];
+	if ( ! offered || typeof channel.send !== 'function' ) {
+		return;
+	}
+	let request: Promise< string | null > | undefined;
+	requestParentSessionKey = () => ( request ??= askParentForSessionKey( channel ) );
 }

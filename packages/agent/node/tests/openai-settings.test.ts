@@ -1,3 +1,4 @@
+import { EventEmitter } from 'events';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -182,7 +183,7 @@ describe( 'OpenAI settings', () => {
 		expect( result.openAi.models.availableModelIds ).toEqual( [ 'gpt-6-astra' ] );
 	} );
 
-	it( 'applies concurrent saves one at a time, keeping key and model list together', async () => {
+	it( 'applies concurrent saves in one process one at a time, keeping key and model list together', async () => {
 		const { settings } = await load();
 		let releaseFirst!: () => void;
 		fetchMock
@@ -231,6 +232,7 @@ describe( 'OpenAI settings', () => {
 	describe( 'without a system keychain', () => {
 		beforeEach( () => {
 			keychain.current!.state.available = false;
+			keychain.current!.state.absent = true;
 		} );
 
 		it( 'says so, and refuses to save the key anywhere else', async () => {
@@ -247,7 +249,7 @@ describe( 'OpenAI settings', () => {
 			expectNoKeyOutsideKeychain( after );
 		} );
 
-		it( 'keeps a session-only key in memory, handed only to forked turns', async () => {
+		it( 'keeps a session-only key in memory, and gives it to a forked turn only when asked', async () => {
 			const { settings, credentials } = await load();
 
 			const result = await settings.saveOpenAiApiKey( KEY, { storage: 'session' } );
@@ -257,10 +259,21 @@ describe( 'OpenAI settings', () => {
 				openAi: { keyStorage: 'session', secureStorage: 'unavailable' },
 			} );
 			expectNoKeyOutsideKeychain( result );
-			expect( credentials.getOpenAiSessionKeyEnvironment() ).toEqual( {
-				STUDIO_OPENAI_SESSION_API_KEY: KEY,
+			// A forked turn's environment says a key is offered, never what it is.
+			expect( credentials.getOpenAiSessionKeyForkEnvironment() ).toEqual( {
+				STUDIO_OPENAI_SESSION_KEY_OFFERED: '1',
 			} );
-			expect( process.env.STUDIO_OPENAI_SESSION_API_KEY ).toBeUndefined();
+			const reply = vi.fn();
+			expect(
+				credentials.answerOpenAiSessionKeyRequest(
+					{ type: 'studio.openai-session-key.request' },
+					reply
+				)
+			).toBe( true );
+			expect( reply ).toHaveBeenCalledWith( { type: 'studio.openai-session-key', key: KEY } );
+			expect( credentials.answerOpenAiSessionKeyRequest( { type: 'interrupt' }, reply ) ).toBe(
+				false
+			);
 
 			// A restarted app has no key.
 			const restarted = await load();
@@ -270,16 +283,148 @@ describe( 'OpenAI settings', () => {
 		} );
 	} );
 
-	it( 'adopts a session key handed to a forked turn and scrubs it from the environment', async () => {
-		const { credentials } = await load();
-		const env: NodeJS.ProcessEnv = { STUDIO_OPENAI_SESSION_API_KEY: KEY, PATH: '/bin' };
+	it( 'removes a session key on a machine with no keychain to clean up', async () => {
+		keychain.current!.state.available = false;
+		keychain.current!.state.absent = true;
+		const { settings } = await load();
+		await settings.saveOpenAiApiKey( KEY, { storage: 'session' } );
 
-		credentials.adoptOpenAiSessionKey( env );
+		await expect( settings.removeOpenAiApiKey() ).resolves.toMatchObject( {
+			hasOpenAiApiKey: false,
+		} );
+	} );
 
-		expect( env ).toEqual( { PATH: '/bin' } );
-		await expect( credentials.readOpenAiKeySource() ).resolves.toEqual( {
-			key: KEY,
-			storage: 'session',
+	describe( 'with a keychain this process can’t reach', () => {
+		it( 'won’t report a removal while a key saved there may come back', async () => {
+			// Saved earlier, e.g. from the desktop session; now Studio runs over SSH.
+			keychain.current!.items.set( 'openai-api-key', OTHER_KEY );
+			keychain.current!.state.available = false;
+			const { settings, storage } = await load();
+			await settings.saveOpenAiApiKey( KEY, { storage: 'session' } );
+
+			const removal = settings.removeOpenAiApiKey();
+
+			await expect( removal ).rejects.toBeInstanceOf( storage.SecureStorageError );
+			await expect( removal ).rejects.toThrow(
+				/stopped using the key for this session, but couldn’t reach the system keychain/
+			);
+			await expect( settings.readAiSettings() ).resolves.toMatchObject( {
+				hasOpenAiApiKey: false,
+			} );
+			expect( keychain.current!.items.get( 'openai-api-key' ) ).toBe( OTHER_KEY );
+
+			keychain.current!.state.available = true;
+			await settings.removeOpenAiApiKey();
+
+			expect( keychain.current!.items.has( 'openai-api-key' ) ).toBe( false );
+			await expect( settings.readAiSettings() ).resolves.toMatchObject( {
+				hasOpenAiApiKey: false,
+			} );
+		} );
+
+		it( 'checks the keychain again instead of trusting a failure it cached', async () => {
+			keychain.current!.items.set( 'openai-api-key', KEY );
+			keychain.current!.state.available = false;
+			const { settings } = await load();
+			await settings.readAiSettings();
+			keychain.current!.state.available = true;
+
+			await settings.removeOpenAiApiKey();
+
+			expect( keychain.current!.items.has( 'openai-api-key' ) ).toBe( false );
+		} );
+	} );
+
+	describe( 'in a turn forked by an app', () => {
+		// The turn's end of the IPC channel; `answer` plays the app.
+		function parentChannel( answer: ( request: unknown ) => unknown ) {
+			const events = new EventEmitter();
+			const send = vi.fn( ( message: unknown ) => {
+				const reply = answer( message );
+				if ( reply !== undefined ) {
+					setImmediate( () => events.emit( 'message', reply ) );
+				}
+			} );
+			return Object.assign( events, { send } );
+		}
+		const OFFER = 'STUDIO_OPENAI_SESSION_KEY_OFFERED';
+
+		it( 'asks the app for its session key once, the first time it needs one', async () => {
+			const { credentials } = await load();
+			const channel = parentChannel( () => ( { type: 'studio.openai-session-key', key: KEY } ) );
+			const env: NodeJS.ProcessEnv = { [ OFFER ]: '1', PATH: '/bin' };
+
+			credentials.acceptOpenAiSessionKeyFromParent( channel, env );
+
+			expect( env ).toEqual( { PATH: '/bin' } );
+			expect( channel.send ).not.toHaveBeenCalled();
+			for ( let attempt = 0; attempt < 2; attempt++ ) {
+				await expect( credentials.readOpenAiKeySource() ).resolves.toEqual( {
+					key: KEY,
+					storage: 'session',
+				} );
+			}
+			expect( channel.send ).toHaveBeenCalledTimes( 1 );
+			expect( channel.send ).toHaveBeenCalledWith(
+				{ type: 'studio.openai-session-key.request' },
+				expect.any( Function )
+			);
+			expect( channel.listenerCount( 'message' ) ).toBe( 0 );
+		} );
+
+		it( 'uses the keychain when the app no longer has a session key', async () => {
+			keychain.current!.items.set( 'openai-api-key', OTHER_KEY );
+			const { credentials } = await load();
+			const channel = parentChannel( () => ( { type: 'studio.openai-session-key', key: null } ) );
+
+			credentials.acceptOpenAiSessionKeyFromParent( channel, { [ OFFER ]: '1' } );
+
+			await expect( credentials.readOpenAiKeySource() ).resolves.toEqual( {
+				key: OTHER_KEY,
+				storage: 'keychain',
+			} );
+		} );
+
+		it( 'doesn’t wait for an app that never answers', async () => {
+			keychain.current!.items.set( 'openai-api-key', OTHER_KEY );
+			const { credentials } = await load();
+			const channel = parentChannel( () => undefined );
+			credentials.acceptOpenAiSessionKeyFromParent( channel, { [ OFFER ]: '1' } );
+			vi.useFakeTimers();
+			try {
+				const source = credentials.readOpenAiKeySource();
+				await vi.advanceTimersByTimeAsync( 10_000 );
+				await expect( source ).resolves.toEqual( { key: OTHER_KEY, storage: 'keychain' } );
+			} finally {
+				vi.useRealTimers();
+			}
+			expect( channel.listenerCount( 'message' ) ).toBe( 0 );
+		} );
+
+		it( 'uses the keychain when the channel to the app has closed', async () => {
+			keychain.current!.items.set( 'openai-api-key', OTHER_KEY );
+			const { credentials } = await load();
+			const channel = Object.assign( new EventEmitter(), {
+				send: vi.fn( ( _message: unknown, callback: ( error: Error | null ) => void ) =>
+					setImmediate( () => callback( new Error( 'Channel closed' ) ) )
+				),
+			} );
+			credentials.acceptOpenAiSessionKeyFromParent( channel, { [ OFFER ]: '1' } );
+
+			await expect( credentials.readOpenAiKeySource() ).resolves.toEqual( {
+				key: OTHER_KEY,
+				storage: 'keychain',
+			} );
+		} );
+
+		it( 'never asks an app that offered no key', async () => {
+			const { credentials } = await load();
+			const channel = parentChannel( () => ( { type: 'studio.openai-session-key', key: KEY } ) );
+
+			credentials.acceptOpenAiSessionKeyFromParent( channel, { PATH: '/bin' } );
+
+			await expect( credentials.readOpenAiKeySource() ).resolves.toBeNull();
+			expect( channel.send ).not.toHaveBeenCalled();
 		} );
 	} );
 

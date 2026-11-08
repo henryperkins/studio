@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import { updateSharedSession } from '@studio/common/lib/shared-config';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { adoptOpenAiSessionKey, deleteOpenAiKey } from '@studio/agent/node/openai-credentials';
+import { deleteOpenAiKey, storeOpenAiKey } from '@studio/agent/node/openai-credentials';
 import { createAgentRunManager } from '@studio/agent/node/run-manager';
 
 vi.mock( 'node:child_process', () => {
@@ -106,45 +106,47 @@ describe( 'createAgentRunManager fork environment', () => {
 
 describe( 'createAgentRunManager OpenAI session keys', () => {
 	const KEY = 'sk-proj-TESTONLY_session_dddddddddddddddddddddddd';
+	const REQUEST = { type: 'studio.openai-session-key.request' };
+
+	function startRun() {
+		const child = Object.assign( createChild(), { connected: true } );
+		mockFork.mockImplementation( () => child as never );
+		const emit = vi.fn();
+		const manager = createAgentRunManager( { cliBinary: '/cli.mjs', surface: 'desktop', emit } );
+		manager.startAgentRun( { sessionId: 'session-1', prompt: 'hello' } );
+		return { child, emit };
+	}
 
 	beforeEach( () => {
 		vi.clearAllMocks();
 		mockFork.mockReset();
-		mockFork.mockImplementation( () => createChild() as never );
 	} );
 
 	afterEach( async () => {
 		await deleteOpenAiKey();
-		delete process.env.STUDIO_OPENAI_SESSION_API_KEY;
 	} );
 
-	it( 'hands a session-only key to the forked turn and nowhere else', () => {
-		// As the CLI does on startup with a key its parent handed down.
-		adoptOpenAiSessionKey( { STUDIO_OPENAI_SESSION_API_KEY: KEY } );
-		const manager = createAgentRunManager( {
-			cliBinary: '/cli.mjs',
-			surface: 'desktop',
-			emit: vi.fn(),
-		} );
+	it( 'gives a session-only key to the forked turn over IPC, never in its environment or arguments', async () => {
+		await storeOpenAiKey( KEY, 'session' );
+		const { child, emit } = startRun();
 
-		manager.startAgentRun( { sessionId: 'session-1', prompt: 'hello' } );
-
-		expect( getForkEnv().STUDIO_OPENAI_SESSION_API_KEY ).toBe( KEY );
-		expect( process.env.STUDIO_OPENAI_SESSION_API_KEY ).toBeUndefined();
-		// Never on the command line.
+		expect( getForkEnv().STUDIO_OPENAI_SESSION_KEY_OFFERED ).toBe( '1' );
+		expect( JSON.stringify( getForkEnv() ) ).not.toContain( KEY );
 		expect( JSON.stringify( mockFork.mock.calls[ 0 ][ 1 ] ) ).not.toContain( KEY );
+
+		child.emit( 'message', REQUEST );
+
+		expect( child.send ).toHaveBeenCalledWith( { type: 'studio.openai-session-key', key: KEY } );
+		// The request is between the app and its turn; the UI never sees it.
+		expect( JSON.stringify( emit.mock.calls ) ).not.toContain( 'openai-session-key' );
 	} );
 
-	it( 'passes nothing when the key lives in the keychain', () => {
-		const manager = createAgentRunManager( {
-			cliBinary: '/cli.mjs',
-			surface: 'desktop',
-			emit: vi.fn(),
-		} );
+	it( 'offers nothing when the key lives in the keychain, and answers a request with none', () => {
+		const { child } = startRun();
 
-		manager.startAgentRun( { sessionId: 'session-1', prompt: 'hello' } );
-
-		expect( getForkEnv() ).not.toHaveProperty( 'STUDIO_OPENAI_SESSION_API_KEY' );
+		expect( getForkEnv() ).not.toHaveProperty( 'STUDIO_OPENAI_SESSION_KEY_OFFERED' );
+		child.emit( 'message', REQUEST );
+		expect( child.send ).toHaveBeenCalledWith( { type: 'studio.openai-session-key', key: null } );
 	} );
 } );
 

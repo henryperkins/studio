@@ -179,6 +179,26 @@ describe( 'OpenAI settings', () => {
 		expect( screen.queryByRole( 'button', { name: 'Refresh' } ) ).not.toBeInTheDocument();
 	} );
 
+	it( 'shows why a key couldn’t be removed, and reloads what is left', async () => {
+		const { connector } = await openProviders();
+		await enterKey();
+		await screen.findByRole( 'button', { name: 'Refresh' } );
+		connector.removeOpenAiApiKey.mockRejectedValueOnce(
+			new Error(
+				'Studio couldn’t reach the system keychain to remove the key. Couldn’t open the system keychain: locked'
+			)
+		);
+		const reads = connector.getAiSettings.mock.calls.length;
+
+		fireEvent.click( await within( await openAiRow() ).findByRole( 'button', { name: 'Manage' } ) );
+		fireEvent.click( await screen.findByRole( 'button', { name: 'Remove key' } ) );
+
+		expect( await screen.findByText( /couldn’t reach the system keychain/ ) ).toBeVisible();
+		await waitFor( () =>
+			expect( connector.getAiSettings.mock.calls.length ).toBeGreaterThan( reads )
+		);
+	} );
+
 	it( 'explains a key that can’t list models, and refreshes the list', async () => {
 		const { connector } = await openProviders( {
 			getAiSettings: async () =>

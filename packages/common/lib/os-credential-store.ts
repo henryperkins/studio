@@ -12,7 +12,17 @@ import { spawn } from 'node:child_process';
  * running as the same user, which can ask the keychain for it too.
  */
 
-export type CredentialStoreStatus = { available: true } | { available: false; reason: string };
+export type CredentialStoreStatus =
+	| { available: true }
+	| {
+			available: false;
+			reason: string;
+			/**
+			 * True when this machine has no keychain Studio can use at all, as opposed
+			 * to one it can't reach right now (locked, or no session bus over SSH).
+			 */
+			absent?: true;
+	  };
 
 export interface OsCredentialStore {
 	/** Whether the keychain can keep secrets on this machine. */
@@ -179,6 +189,7 @@ function createLinuxAdapter( run: CommandRunner, service: string ): PlatformAdap
 					available: false,
 					reason:
 						'secret-tool is not installed. Install libsecret-tools and a Secret Service keyring such as GNOME Keyring.',
+					absent: true,
 				};
 			}
 			if ( result.code === 0 || ( result.code === 1 && ! result.stderr.trim() ) ) {
@@ -270,11 +281,25 @@ $credential.RetrievePassword()
 			}
 			return result.stdout;
 		},
+		// PasswordVault has no documented replace, so the previous credential is
+		// removed first and put back if adding the new one fails.
 		async set( account, secret ) {
 			const result = await runScript(
 				`$secret = [Console]::In.ReadToEnd()
-try { $vault.Remove($vault.Retrieve('${ service }', '${ account }')) } catch {}
-$vault.Add((New-Object Windows.Security.Credentials.PasswordCredential('${ service }', '${ account }', $secret)))`,
+$previous = $null
+try {
+	$existing = $vault.Retrieve('${ service }', '${ account }')
+	$existing.RetrievePassword()
+	$previous = $existing
+} catch {}
+if ($previous) { $vault.Remove($previous) }
+try {
+	$vault.Add((New-Object Windows.Security.Credentials.PasswordCredential('${ service }', '${ account }', $secret)))
+} catch {
+	$failure = $_
+	if ($previous) { try { $vault.Add($previous) } catch {} }
+	throw $failure
+}`,
 				secret
 			);
 			if ( result.code !== 0 ) {
@@ -299,7 +324,7 @@ function createUnsupportedAdapter( platform: string ): PlatformAdapter {
 		throw new SecureStorageError( reason );
 	};
 	return {
-		check: async () => ( { available: false, reason } ),
+		check: async () => ( { available: false, reason, absent: true } ),
 		get: fail,
 		set: fail,
 		delete: fail,

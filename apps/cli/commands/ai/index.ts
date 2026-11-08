@@ -171,9 +171,15 @@ async function resolveRunProvider(
 	if ( pinned === 'openai-api-key' || ( ! pinned && recordedProvider === 'openai-api-key' ) ) {
 		return 'openai-api-key';
 	}
-	if ( ! pinned && recordedProvider && ( await readSelectedAiProvider() ) === 'openai-api-key' ) {
-		return recordedProvider === 'anthropic-api-key' &&
-			! ( await isAiProviderReady( 'anthropic-api-key' ) )
+	if (
+		! pinned &&
+		( recordedProvider || resumeContext.hasHistory ) &&
+		( await readSelectedAiProvider() ) === 'openai-api-key'
+	) {
+		// Ran before, on a model Studio may no longer offer: never moved to OpenAI.
+		return ! recordedProvider ||
+			( recordedProvider === 'anthropic-api-key' &&
+				! ( await isAiProviderReady( 'anthropic-api-key' ) ) )
 			? DEFAULT_AI_PROVIDER
 			: recordedProvider;
 	}
@@ -545,6 +551,11 @@ export async function runCommand( options: {
 		if ( ! resumeContext.provider ) {
 			await switchProvider( 'wpcom', false );
 		}
+		showCapabilitiesOnConnect = false;
+	}
+
+	// Choosing how to connect would re-pin the conversation; one on OpenAI stays there.
+	if ( showCapabilitiesOnConnect && resumeContext.provider === 'openai-api-key' ) {
 		showCapabilitiesOnConnect = false;
 	}
 

@@ -66,6 +66,10 @@ export function useRemoveOpenAiApiKey() {
 		onSuccess: ( settings ) => {
 			queryClient.setQueryData< AiSettings >( AI_SETTINGS_QUERY_KEY, settings );
 		},
+		// A removal can fail after the session key is already gone.
+		onError: () => {
+			void queryClient.invalidateQueries( { queryKey: AI_SETTINGS_QUERY_KEY } );
+		},
 	} );
 }
 

@@ -195,7 +195,6 @@ function createBaseEnvironment(): Record< string, string > {
 	delete env.OPENAI_API_KEY;
 	delete env.OPENAI_BASE_URL;
 	delete env.STUDIO_OPENAI_API_KEY;
-	delete env.STUDIO_OPENAI_SESSION_API_KEY;
 	delete env.STUDIO_WPCOM_API_KEY;
 	delete env.STUDIO_WPCOM_BASE_URL;
 	delete env.STUDIO_WPCOM_DEFAULT_HEADERS;
