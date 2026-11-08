@@ -98,6 +98,11 @@ describe( 'Signing in to ChatGPT', () => {
 	const logged: unknown[][] = [];
 	// Each sign-in the test flows asked the broker to save.
 	const saves: ChatGptSignIn[] = [];
+	// The system browser: each URL a test flow sent it to, in order.
+	const opened: string[] = [];
+	const openBrowser = async ( url: string ) => {
+		opened.push( url );
+	};
 
 	const credentialsDir = () => path.join( configDir, 'chatgpt-credentials' );
 	const vaultFiles = () =>
@@ -126,6 +131,7 @@ describe( 'Signing in to ChatGPT', () => {
 				},
 				readIdTokenHint: ( registrationId ) => broker.readIdTokenHint( registrationId ),
 			},
+			openBrowser,
 			...options,
 		} );
 		flows.push( created );
@@ -137,9 +143,13 @@ describe( 'Signing in to ChatGPT', () => {
 		options?: ChatGptSignInOptions,
 		using: ChatGptSignInFlow = flow
 	) {
-		const start = await using.begin( registrationId, options );
-		begun.push( start.attemptId );
-		return start;
+		const before = opened.length;
+		const started = await using.begin( registrationId, options );
+		begun.push( started.attemptId );
+		// The caller gets the attempt id alone; the URL went to the browser.
+		expect( started ).toEqual( { attemptId: expect.stringMatching( UUID ) } );
+		expect( opened ).toHaveLength( before + 1 );
+		return { attemptId: started.attemptId, url: opened[ before ] };
 	}
 
 	// The browser at the authorize page: ChatGPT sends it back to the callback.
@@ -165,7 +175,7 @@ describe( 'Signing in to ChatGPT', () => {
 		using: ChatGptSignInFlow = flow
 	) {
 		const start = await begin( registrationId, options, using );
-		const callbackUrl = await authorize( start.authorizationUrl );
+		const callbackUrl = await authorize( start.url );
 		const delivery = await deliver( callbackUrl );
 		const outcome = await using.wait( start.attemptId );
 		return { start, callbackUrl, delivery, outcome };
@@ -234,6 +244,7 @@ describe( 'Signing in to ChatGPT', () => {
 		keychain = createFakeCredentialStore();
 		systemKeychain.current = keychain;
 		saves.splice( 0 );
+		opened.splice( 0 );
 		fake = await startFakeAuthorizationServer( signingKey );
 		broker = startBroker();
 		flow = startFlow();
@@ -284,7 +295,7 @@ describe( 'Signing in to ChatGPT', () => {
 				code_challenge: expect.stringMatching( /^[\w-]{43}$/ ),
 			} );
 			expect( await getChatGptHostId() ).toMatch( /^urn:uuid:/ );
-			const authorizationUrl = new URL( start.authorizationUrl );
+			const authorizationUrl = new URL( start.url );
 			expect( `${ authorizationUrl.origin }${ authorizationUrl.pathname }` ).toBe(
 				`${ fake.url }/api/accounts/authorize`
 			);
@@ -422,7 +433,7 @@ describe( 'Signing in to ChatGPT', () => {
 		it( 'refuses a callback whose state isn’t the attempt’s, and keeps waiting for the real one', async () => {
 			const existing = await signInExisting();
 			const start = await begin();
-			const callbackUrl = await authorize( start.authorizationUrl );
+			const callbackUrl = await authorize( start.url );
 			const forged = new URL( callbackUrl );
 			forged.searchParams.set( 'state', 'test-forged-state' );
 			const missing = new URL( callbackUrl );
@@ -445,7 +456,7 @@ describe( 'Signing in to ChatGPT', () => {
 
 		it( 'completes an attempt once, so a replayed callback exchanges nothing', async () => {
 			const start = await begin();
-			const callbackUrl = await authorize( start.authorizationUrl );
+			const callbackUrl = await authorize( start.url );
 
 			const deliveries = await Promise.all( [ deliver( callbackUrl ), deliver( callbackUrl ) ] );
 
@@ -712,11 +723,7 @@ describe( 'Signing in to ChatGPT', () => {
 					{ port: 0, host: '127.0.0.1' },
 				] );
 				const ports = [ first, second ].map( ( start ) =>
-					Number(
-						CALLBACK.exec(
-							new URL( start.authorizationUrl ).searchParams.get( 'redirect_uri' )!
-						)![ 1 ]
-					)
+					Number( CALLBACK.exec( new URL( start.url ).searchParams.get( 'redirect_uri' )! )![ 1 ] )
 				);
 				expect( new Set( [ ...ports, busyPort ] ).size ).toBe( 3 );
 				expect( await deliver( `http://[::1]:${ ports[ 0 ] }/auth/callback` ) ).toEqual( {
@@ -724,7 +731,7 @@ describe( 'Signing in to ChatGPT', () => {
 					page: '',
 				} );
 				for ( const start of [ first, second ] ) {
-					await deliver( await authorize( start.authorizationUrl ) );
+					await deliver( await authorize( start.url ) );
 					expect( ( await flow.wait( start.attemptId ) ).ok ).toBe( true );
 				}
 			} finally {
@@ -759,7 +766,7 @@ describe( 'Signing in to ChatGPT', () => {
 
 		it( 'answers only a GET of its callback path, addressed to 127.0.0.1, and goes on waiting', async () => {
 			const start = await begin();
-			const callbackUrl = new URL( await authorize( start.authorizationUrl ) );
+			const callbackUrl = new URL( await authorize( start.url ) );
 			const otherPath = new URL( callbackUrl );
 			otherPath.pathname = '/callback';
 			const rebound = await new Promise< number >( ( resolve, reject ) => {
@@ -786,7 +793,7 @@ describe( 'Signing in to ChatGPT', () => {
 		it( 'closes when an attempt is cancelled, and changes nothing', async () => {
 			const existing = await signInExisting();
 			const start = await begin();
-			const callbackUrl = await authorize( start.authorizationUrl );
+			const callbackUrl = await authorize( start.url );
 
 			expect( flow.cancel( start.attemptId ) ).toBe( true );
 
@@ -801,7 +808,7 @@ describe( 'Signing in to ChatGPT', () => {
 			const existing = await signInExisting();
 			fake.script.tokenDelayMs = 300;
 			const start = await begin();
-			const delivered = deliver( await authorize( start.authorizationUrl ) );
+			const delivered = deliver( await authorize( start.url ) );
 			await until( () => fake.tokenRequests.length === 2 );
 
 			expect( flow.cancel( start.attemptId ) ).toBe( true );
@@ -822,7 +829,7 @@ describe( 'Signing in to ChatGPT', () => {
 			fake.signingKey = rotated;
 			fake.script.jwksDelayMs = 300;
 			const start = await begin();
-			const delivered = deliver( await authorize( start.authorizationUrl ) );
+			const delivered = deliver( await authorize( start.url ) );
 			await until( () => fake.counts.jwks === 2 );
 
 			expect( flow.cancel( start.attemptId ) ).toBe( true );
@@ -837,7 +844,7 @@ describe( 'Signing in to ChatGPT', () => {
 			const existing = await signInExisting();
 			const quick = startFlow( { timeoutMs: 150 } );
 			const waiting = await begin( undefined, undefined, quick );
-			const waitingCallback = await authorize( waiting.authorizationUrl );
+			const waitingCallback = await authorize( waiting.url );
 			const started = Date.now();
 
 			expect( await quick.wait( waiting.attemptId ) ).toEqual( failed( 'timed-out' ) );
@@ -847,7 +854,7 @@ describe( 'Signing in to ChatGPT', () => {
 
 			fake.script.tokenDelayMs = 500;
 			const exchanging = await begin( undefined, undefined, quick );
-			void deliver( await authorize( exchanging.authorizationUrl ) );
+			void deliver( await authorize( exchanging.url ) );
 			expect( await quick.wait( exchanging.attemptId ) ).toEqual( failed( 'timed-out' ) );
 			await sleep( 600 );
 			await expectUntouched( existing );
@@ -856,6 +863,126 @@ describe( 'Signing in to ChatGPT', () => {
 		it( 'reports an attempt it doesn’t know', async () => {
 			expect( await flow.wait( 'test-unknown-attempt' ) ).toEqual( failed( 'unknown-attempt' ) );
 			expect( flow.cancel( 'test-unknown-attempt' ) ).toBe( false );
+		} );
+	} );
+
+	describe( 'the system browser', () => {
+		it( 'is sent the URL, which, with the ID token it carries, reaches nothing returned, thrown or shown', async () => {
+			const existing = await signInExisting();
+
+			const signedIn = await signIn( existing.registrationId );
+			fake.script.callback = ( params ) => ( { state: params.state, error: 'access_denied' } );
+			const denied = await signIn( existing.registrationId );
+			const refusing = startFlow( {
+				openBrowser: async ( url ) => {
+					opened.push( url );
+					throw new Error( `test-opener-failure ${ url }` );
+				},
+			} );
+			const error = await refusing.begin( existing.registrationId ).catch( ( e ) => e );
+
+			const urls = opened.slice( -3 );
+			expect( urls.map( ( url ) => new URL( url ).searchParams.get( 'id_token_hint' ) ) ).toEqual( [
+				fake.issued[ 0 ].idToken,
+				fake.issued[ 1 ].idToken,
+				fake.issued[ 1 ].idToken,
+			] );
+			expect( error ).toBeInstanceOf( ChatGptSignInError );
+			expect( error.code ).toBe( 'browser-unavailable' );
+			const caught = [
+				signedIn.outcome,
+				signedIn.delivery.page,
+				denied.outcome,
+				denied.delivery.page,
+				error,
+			];
+			expectNoSecrets( ...caught );
+			for ( const value of caught ) {
+				const text =
+					value instanceof Error
+						? `${ value.message }\n${ value.stack }\n${ JSON.stringify( value ) }`
+						: JSON.stringify( value );
+				for ( const url of urls ) {
+					expect( text ).not.toContain( url );
+				}
+			}
+		} );
+
+		it( 'fails an attempt whose browser can’t be opened, closing its listener, and changes nothing', async () => {
+			const existing = await signInExisting();
+			let sentTo = '';
+			const refusing = startFlow( {
+				openBrowser: async ( url ) => {
+					sentTo = url;
+					throw new Error( 'test-no-browser' );
+				},
+			} );
+
+			const error = await refusing.begin().catch( ( e ) => e );
+
+			expect( error ).toBeInstanceOf( ChatGptSignInError );
+			expect( error.code ).toBe( 'browser-unavailable' );
+			expect( await deliver( await authorize( sentTo ) ) ).toEqual( { status: 0, page: '' } );
+			expect( fake.tokenRequests ).toHaveLength( 1 );
+			await expectUntouched( existing );
+		} );
+
+		it( 'won’t begin, listen or ask for discovery without a browser to open, and opens the one installed', async () => {
+			// A fresh module, as in an app before its startup installs the opener.
+			vi.resetModules();
+			const app = await import( '@studio/agent/node/chatgpt/oauth' );
+			const listen = vi.spyOn( http.Server.prototype, 'listen' );
+			const appFlow = app.createChatGptSignInFlow( {
+				discoveryUrl: fake.discoveryUrl,
+				credentials: broker,
+			} );
+			flows.push( appFlow );
+
+			const error = await appFlow.begin().catch( ( e ) => e );
+
+			expect( error ).toBeInstanceOf( app.ChatGptSignInError );
+			expect( error.code ).toBe( 'browser-unavailable' );
+			expect( listen ).not.toHaveBeenCalled();
+			expect( fake.counts.discovery ).toBe( 0 );
+
+			const installed: string[] = [];
+			app.setChatGptBrowserOpener( async ( url ) => {
+				installed.push( url );
+			} );
+			const { attemptId } = await appFlow.begin();
+			begun.push( attemptId );
+			expect( installed ).toHaveLength( 1 );
+			await deliver( await authorize( installed[ 0 ] ) );
+			expect( ( await appFlow.wait( attemptId ) ).ok ).toBe( true );
+		} );
+
+		it( 'goes on with an attempt whose callback came before the opener reported failing', async () => {
+			fake.script.tokenDelayMs = 200;
+			const late = startFlow( {
+				openBrowser: async ( url ) => {
+					void deliver( await authorize( url ) );
+					await until( () => fake.tokenRequests.length === 1 );
+					throw new Error( 'test-late-opener-failure' );
+				},
+			} );
+
+			const { attemptId } = await late.begin();
+			begun.push( attemptId );
+
+			expect( ( await late.wait( attemptId ) ).ok ).toBe( true );
+		} );
+
+		it( 'returns once the attempt has ended when the browser never answers', async () => {
+			const hanging = startFlow( {
+				timeoutMs: 150,
+				openBrowser: () => new Promise< void >( () => undefined ),
+			} );
+
+			const started = await hanging.begin();
+			begun.push( started.attemptId );
+
+			expect( started ).toEqual( { attemptId: expect.stringMatching( UUID ) } );
+			expect( await hanging.wait( started.attemptId ) ).toEqual( failed( 'timed-out' ) );
 		} );
 	} );
 

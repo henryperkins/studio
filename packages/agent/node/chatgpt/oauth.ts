@@ -32,8 +32,10 @@ import type { AddressInfo } from 'node:net';
  * document names. Nothing an attempt receives is saved until every check has
  * passed, so no failure changes or clears a registration.
  *
- * The caller opens the authorization URL in the system browser and waits for
- * the outcome, which never carries a secret.
+ * The backend opens the authorization page in the system browser itself: its
+ * URL can carry the account's ID token, so no caller, renderer or log ever
+ * sees it. Callers get the attempt's id and wait for its outcome, which never
+ * carries a secret.
  */
 
 /** How long a sign-in waits for ChatGPT to send the browser back. */
@@ -77,6 +79,7 @@ export type ChatGptSignInFailureCode =
 	| 'accounts-unreadable'
 	| 'discovery-failed'
 	| 'callback-unavailable'
+	| 'browser-unavailable'
 	| 'cancelled'
 	| 'timed-out'
 	| 'denied'
@@ -103,14 +106,13 @@ export interface ChatGptSignInOptions {
 	storage?: ChatGptCredentialStorage;
 }
 
+/** A sign-in under way, whose page is open in the system browser. */
 export interface ChatGptSignInStart {
 	attemptId: string;
-	/**
-	 * The page to open in the system browser. Signing in again, it carries the
-	 * account's ID token as `id_token_hint`: never log it or send it to a renderer.
-	 */
-	authorizationUrl: string;
 }
+
+/** Opens a URL in the system browser; rejects when it can't. */
+export type ChatGptBrowserOpener = ( url: string ) => Promise< void >;
 
 export interface ChatGptSignInFlowOptions {
 	/** Replaced only by tests, with a local stand-in for OpenAI's. */
@@ -119,6 +121,8 @@ export interface ChatGptSignInFlowOptions {
 	timeoutMs?: number;
 	/** The broker sign-ins are saved through: the app's by default. */
 	credentials?: Pick< ChatGptCredentialBroker, 'saveSignIn' | 'readIdTokenHint' >;
+	/** The system browser: the opener installed with `setChatGptBrowserOpener` by default. */
+	openBrowser?: ChatGptBrowserOpener;
 }
 
 export interface ChatGptSignInFlow {
@@ -145,6 +149,8 @@ function describeSignInFailure( code: ChatGptSignInFailureCode ): string {
 			return __(
 				'Studio couldn’t open a local port to receive ChatGPT’s answer. Try signing in again.'
 			);
+		case 'browser-unavailable':
+			return __( 'Studio couldn’t open your web browser to sign in to ChatGPT. Try again.' );
 		case 'cancelled':
 			return __( 'Signing in to ChatGPT was cancelled.' );
 		case 'timed-out':
@@ -325,6 +331,16 @@ async function openCallbackListener(
 		server.on( 'error', () => undefined );
 		return { server, port: ( server.address() as AddressInfo ).port };
 	}
+}
+
+let installedBrowserOpener: ChatGptBrowserOpener | null = null;
+
+/**
+ * How this process opens the system browser for a sign-in, installed once at
+ * startup like the token client. Sign-in URLs go there and nowhere else.
+ */
+export function setChatGptBrowserOpener( open: ChatGptBrowserOpener ): void {
+	installedBrowserOpener = open;
 }
 
 /**
@@ -566,6 +582,10 @@ export function createChatGptSignInFlow(
 		registrationId?: string,
 		signInOptions: ChatGptSignInOptions = {}
 	): Promise< ChatGptSignInStart > {
+		const openBrowser = options.openBrowser ?? installedBrowserOpener;
+		if ( ! openBrowser ) {
+			throw new ChatGptSignInError( 'browser-unavailable' );
+		}
 		const account = registrationId === undefined ? null : await findRegistration( registrationId );
 		let hostId: string;
 		try {
@@ -651,7 +671,22 @@ export function createChatGptSignInFlow(
 			}, timeoutMs ),
 		};
 		attempts.set( attemptId, started );
-		return { attemptId, authorizationUrl: authorizationUrl.toString() };
+
+		// The URL goes to the browser alone, and the opener's error, which may quote it, nowhere.
+		const opening = Promise.resolve()
+			.then( () => openBrowser( authorizationUrl.toString() ) )
+			.then(
+				() => true,
+				() => false
+			);
+		// A browser that never answers holds this up only while the attempt lasts.
+		const opened = await Promise.race( [ opening, outcome.then( () => true ) ] );
+		// Once the callback has come, the browser plainly opened.
+		if ( ! opened && started.status === 'waiting' ) {
+			finish( started, failure( 'browser-unavailable' ) );
+			throw new ChatGptSignInError( 'browser-unavailable' );
+		}
+		return { attemptId };
 	}
 
 	function wait( attemptId: string ): Promise< ChatGptSignInOutcome > {
@@ -676,8 +711,9 @@ const getAppFlow = () => ( appFlow ??= createChatGptSignInFlow() );
 
 /**
  * Starts signing in to ChatGPT: a new registration, or `registrationId` again.
- * The callback listener is open before this returns. Open the authorization
- * URL in the system browser, then wait with `waitForChatGptSignIn`.
+ * Listens for the callback, opens the authorization page with the browser
+ * opener installed at startup, and returns the attempt's id; wait for it with
+ * `waitForChatGptSignIn`.
  */
 export function beginChatGptSignIn(
 	registrationId?: string,
