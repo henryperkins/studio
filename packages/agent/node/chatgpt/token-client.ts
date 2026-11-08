@@ -12,8 +12,8 @@ import {
  * Nothing here logs a token or puts one in an error.
  */
 
-/** The only issuer Studio accepts, for discovery and ID tokens alike. */
-export const CHATGPT_ISSUER = 'https://auth.openai.com';
+// The only issuer Studio accepts, for discovery and ID tokens alike.
+const CHATGPT_ISSUER = 'https://auth.openai.com';
 /** What ChatGPT plan tokens are for. */
 export const CHATGPT_RESOURCE = 'https://api.openai.com/v1';
 const DISCOVERY_URL = `${ CHATGPT_ISSUER }/.well-known/openid-configuration`;
@@ -84,7 +84,7 @@ export async function discoverChatGptAuthServer(
 	} );
 	const document = parseJson( await response.text() );
 	if ( response.status !== 200 || ! isRecord( document ) || document.issuer !== CHATGPT_ISSUER ) {
-		throw new Error( 'The discovery document isn’t OpenAI’s.' );
+		throw new Error( 'OpenAI’s discovery document couldn’t be read.' );
 	}
 	const { protocol } = new URL( discoveryUrl );
 	return {

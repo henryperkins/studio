@@ -321,7 +321,7 @@ async function openCallbackListener(
 			}
 			throw new ChatGptSignInError( 'callback-unavailable' );
 		}
-		// A failed connection is dropped; it never ends the attempt.
+		// Unheard, a later server error would crash the app; the attempt still ends by its callback, a cancel or the timeout.
 		server.on( 'error', () => undefined );
 		return { server, port: ( server.address() as AddressInfo ).port };
 	}

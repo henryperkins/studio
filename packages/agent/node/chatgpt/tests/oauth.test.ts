@@ -732,6 +732,31 @@ describe( 'Signing in to ChatGPT', () => {
 			}
 		} );
 
+		it( 'gives up listening after a few tries, its error holding nothing of the ID token it read', async () => {
+			const existing = await signInExisting();
+			const listen = vi.spyOn( http.Server.prototype, 'listen' );
+			listen.mockImplementation( function ( this: http.Server ) {
+				process.nextTick( () =>
+					this.emit(
+						'error',
+						Object.assign( new Error( 'listen EADDRINUSE' ), { code: 'EADDRINUSE' } )
+					)
+				);
+				return this;
+			} );
+
+			const error = await flow.begin( existing.registrationId ).catch( ( e ) => e );
+			const tries = listen.mock.calls.length;
+			listen.mockRestore();
+
+			expect( error ).toBeInstanceOf( ChatGptSignInError );
+			expect( error.code ).toBe( 'callback-unavailable' );
+			expect( tries ).toBe( 3 );
+			expect( fake.secrets() ).toContain( fake.issued[ 0 ].idToken );
+			expectNoSecrets( error );
+			await expectUntouched( existing );
+		} );
+
 		it( 'answers only a GET of its callback path, addressed to 127.0.0.1, and goes on waiting', async () => {
 			const start = await begin();
 			const callbackUrl = new URL( await authorize( start.authorizationUrl ) );
