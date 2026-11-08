@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { watch, type FSWatcher } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { LOCKFILE_STALE_TIME, LOCKFILE_WAIT_TIME } from '@studio/common/constants';
@@ -369,6 +370,61 @@ function distinctLabel( accounts: ChatGptAccount[], base: string ): string {
 		label = `${ base } (${ copy })`;
 	}
 	return label;
+}
+
+/**
+ * Runs `check` whenever the account list may have changed, in this process or
+ * another, and at least every `pollMs` in case watching misses a change or
+ * isn't available, until the returned function stops it. Checks never
+ * overlap; a failed one is left for the next.
+ */
+export function watchChatGptAccounts( check: () => Promise< void >, pollMs: number ): () => void {
+	const directory = getConfigDirectory();
+	let stopped = false;
+	let checking = false;
+	let again = false;
+	let watcher: FSWatcher | undefined;
+	const timer = setInterval( () => run(), pollMs );
+	timer.unref?.();
+	const stop = () => {
+		stopped = true;
+		clearInterval( timer );
+		watcher?.close();
+	};
+	const run = () => {
+		// A check reads the current config directory; once that isn't the one
+		// watched, its reads would go elsewhere.
+		if ( stopped || getConfigDirectory() !== directory ) {
+			stop();
+			return;
+		}
+		if ( checking ) {
+			again = true;
+			return;
+		}
+		checking = true;
+		void check()
+			.catch( () => undefined )
+			.finally( () => {
+				checking = false;
+				if ( again ) {
+					again = false;
+					run();
+				}
+			} );
+	};
+	try {
+		// The directory, not the file: every write renames a new file over it.
+		watcher = watch( directory, { persistent: false }, ( _event, fileName ) => {
+			if ( ! fileName || fileName.startsWith( ACCOUNTS_FILE ) ) {
+				run();
+			}
+		} );
+		watcher.on( 'error', () => watcher?.close() );
+	} catch {
+		// Polling alone keeps the bound.
+	}
+	return stop;
 }
 
 /**

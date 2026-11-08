@@ -23,6 +23,7 @@ import {
 	removeChatGptFile,
 	startChatGptSignOut,
 	updateChatGptAccountSignIn,
+	watchChatGptAccounts,
 	writeChatGptFileAtomically,
 	type ChatGptAccount,
 	type ChatGptAccountSignIn,
@@ -60,6 +61,12 @@ export const CHATGPT_TERMINAL_REFRESH_ERRORS: readonly string[] = [
 	'refresh_token_reused',
 ];
 
+/**
+ * The longest a turn in one process runs on after another process signs its
+ * connection out: the account list is watched, and read at least this often.
+ */
+export const CHATGPT_TURN_WATCH_POLL_MS = 2_000;
+
 const CREDENTIALS_DIRECTORY = 'chatgpt-credentials';
 const RECORD_VERSION = 1;
 const WRAPPING_KEY_ACCOUNT = 'chatgpt-vault-key';
@@ -90,6 +97,8 @@ export interface ChatGptBrokerTiming {
 	refreshLockStaleMs: number;
 	/** How long to wait for another process's refresh or sign-out. */
 	refreshLockWaitMs: number;
+	/** How often the account list is read in case watching it misses a change. */
+	accountsPollMs: number;
 }
 
 const DEFAULT_TIMING: ChatGptBrokerTiming = {
@@ -97,6 +106,7 @@ const DEFAULT_TIMING: ChatGptBrokerTiming = {
 	revokeRetryDelaysMs: [ 1_000, 3_000 ],
 	refreshLockStaleMs: 120_000,
 	refreshLockWaitMs: 60_000,
+	accountsPollMs: CHATGPT_TURN_WATCH_POLL_MS,
 };
 
 /** A token endpoint response, as the token client parses it. */
@@ -474,6 +484,7 @@ export function createChatGptCredentialBroker(
 	// Session-only tokens this app holds, with the logout generation they belong to.
 	const sessions = new Map< string, { record: CredentialRecord; logoutGeneration: number } >();
 	const sessionQueues = new Map< string, Promise< unknown > >();
+	let stopWatchingSessions: ( () => void ) | null = null;
 	// In a turn forked by an app holding session-only tokens: how to ask it for them.
 	let parent: {
 		channel: ParentChannel;
@@ -760,12 +771,56 @@ export function createChatGptCredentialBroker(
 		return next;
 	}
 
+	// While this app holds a session-only sign-in, it watches for a sign-out
+	// anywhere, so it stops holding and offering tokens nothing should use.
+	function holdSession(
+		registrationId: string,
+		session: { record: CredentialRecord; logoutGeneration: number }
+	): void {
+		sessions.set( registrationId, session );
+		stopWatchingSessions ??= watchChatGptAccounts( pruneSessions, timing.accountsPollMs );
+	}
+
+	function dropSession( registrationId: string ): void {
+		sessions.delete( registrationId );
+		if ( ! sessions.size && stopWatchingSessions ) {
+			stopWatchingSessions();
+			stopWatchingSessions = null;
+		}
+	}
+
+	// A held record goes once its registration was signed out, here or in
+	// another process, or keeps its tokens elsewhere now.
+	function pruneSession( registrationId: string ): Promise< void > {
+		return serializeSession( registrationId, async () => {
+			const held = sessions.get( registrationId );
+			if ( ! held ) {
+				return;
+			}
+			const account = await readChatGptAccount( registrationId );
+			if (
+				account?.state !== 'signed-in' ||
+				account.storage !== 'session' ||
+				account.logoutGeneration !== held.logoutGeneration
+			) {
+				dropSession( registrationId );
+			}
+		} );
+	}
+
+	async function pruneSessions(): Promise< void > {
+		await Promise.all( [ ...sessions.keys() ].map( pruneSession ) );
+	}
+
 	function renewSession( account: ChatGptAccount ): Promise< AccessToken > {
 		const { registrationId, logoutGeneration } = account;
 		return serializeSession( registrationId, async () => {
 			const current = await requireUnchanged( registrationId, logoutGeneration );
 			const held = sessions.get( registrationId );
 			if ( ! held || held.logoutGeneration !== logoutGeneration || current.storage !== 'session' ) {
+				if ( held ) {
+					dropSession( registrationId );
+				}
 				throw new ChatGptConnectionError( 'session-unavailable' );
 			}
 			if ( isFresh( held.record.expiresAt ) ) {
@@ -776,7 +831,7 @@ export function createChatGptCredentialBroker(
 				throw new ChatGptConnectionError( 'refresh-failed' );
 			}
 			if ( renewal.status === 'rejected' ) {
-				sessions.delete( registrationId );
+				dropSession( registrationId );
 				await markChatGptSignInNeeded( registrationId, logoutGeneration );
 				throw new ChatGptConnectionError( 'needs-sign-in' );
 			}
@@ -784,7 +839,7 @@ export function createChatGptCredentialBroker(
 				revokeQuietly( current.clientId, renewal.record.refreshToken );
 				throw new ChatGptConnectionError( 'signed-out' );
 			}
-			sessions.set( registrationId, { record: renewal.record, logoutGeneration } );
+			holdSession( registrationId, { record: renewal.record, logoutGeneration } );
 			return { accessToken: renewal.record.accessToken, expiresAt: renewal.record.expiresAt };
 		} );
 	}
@@ -889,9 +944,9 @@ export function createChatGptCredentialBroker(
 			}
 			await serializeSession( registrationId, async () => {
 				if ( key ) {
-					sessions.delete( registrationId );
+					dropSession( registrationId );
 				} else {
-					sessions.set( registrationId, { record, logoutGeneration: account.logoutGeneration } );
+					holdSession( registrationId, { record, logoutGeneration: account.logoutGeneration } );
 				}
 			} );
 			parent?.tokens.delete( registrationId );
@@ -921,10 +976,7 @@ export function createChatGptCredentialBroker(
 			return error;
 		};
 		// The registration as saved, which another process may have signed out.
-		const assertActive = async () => {
-			if ( controller.signal.aborted ) {
-				throw controller.signal.reason;
-			}
+		const check = async () => {
 			const current = await readChatGptAccount( connectionId );
 			if ( ! current || current.logoutGeneration !== logoutGeneration ) {
 				throw stop( 'signed-out' );
@@ -936,6 +988,16 @@ export function createChatGptCredentialBroker(
 				throw stop( 'changed' );
 			}
 		};
+		const assertActive = async () => {
+			if ( controller.signal.aborted ) {
+				throw controller.signal.reason;
+			}
+			await check();
+		};
+		// A sign-out in another process aborts the turn too, between requests
+		// or in the middle of one, within the watch's poll bound.
+		const stopWatching = watchChatGptAccounts( check, timing.accountsPollMs );
+		controller.signal.addEventListener( 'abort', stopWatching, { once: true } );
 		return {
 			connectionId,
 			signal: controller.signal,
@@ -949,6 +1011,7 @@ export function createChatGptCredentialBroker(
 				return token;
 			},
 			end() {
+				stopWatching();
 				if ( turns.delete( turn ) ) {
 					settle();
 				}
@@ -989,7 +1052,7 @@ export function createChatGptCredentialBroker(
 		parent?.tokens.delete( connectionId );
 		const session = await serializeSession( connectionId, async () => {
 			const held = sessions.get( connectionId );
-			sessions.delete( connectionId );
+			dropSession( connectionId );
 			return held;
 		} );
 		const key = await getWrappingKey( false ).catch( () => null );
@@ -1052,8 +1115,10 @@ export function createChatGptCredentialBroker(
 			// reads a stored one itself.
 			if ( typeof connectionId === 'string' && sessions.has( connectionId ) ) {
 				try {
-					const account = await requireSignedIn( connectionId );
-					token = account.storage === 'session' ? await renewSession( account ) : null;
+					await pruneSession( connectionId );
+					if ( sessions.has( connectionId ) ) {
+						token = await renewSession( await requireSignedIn( connectionId ) );
+					}
 				} catch {
 					token = null;
 				}

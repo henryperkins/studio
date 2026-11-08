@@ -20,6 +20,7 @@ import {
 } from '@studio/agent/node/chatgpt/account-store';
 import {
 	CHATGPT_TERMINAL_REFRESH_ERRORS,
+	CHATGPT_TURN_WATCH_POLL_MS,
 	createChatGptCredentialBroker,
 	type ChatGptCredentialBroker,
 	type ChatGptCredentialBrokerOptions,
@@ -38,6 +39,21 @@ import { createHttpTokenClient } from './fixtures/http-token-client';
 import { startMockTokenService } from './fixtures/mock-token-service';
 
 const systemKeychain = vi.hoisted( () => ( { current: null as FakeCredentialStore | null } ) );
+const fileWatching = vi.hoisted( () => ( { refused: false } ) );
+
+// Some platforms and file systems can't watch a directory; a test makes it so.
+vi.mock( 'node:fs', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('node:fs') >();
+	const watch = ( ( ...args: Parameters< typeof actual.watch > ) => {
+		if ( fileWatching.refused ) {
+			throw Object.assign( new Error( 'ENOSYS: function not implemented, watch' ), {
+				code: 'ENOSYS',
+			} );
+		}
+		return actual.watch( ...args );
+	} ) as typeof actual.watch;
+	return { ...actual, default: { ...actual, watch }, watch };
+} );
 const lockRace = vi.hoisted( () => ( { refusals: 0, attempts: 0 } ) );
 
 // Windows refuses to open a lockfile while another program still has the old
@@ -282,6 +298,7 @@ describe( 'ChatGPT credential broker', () => {
 		service = createFakeTokenService();
 		lockRace.refusals = 0;
 		lockRace.attempts = 0;
+		fileWatching.refused = false;
 	} );
 
 	afterEach( () => {
@@ -1116,6 +1133,48 @@ describe( 'ChatGPT credential broker', () => {
 			modelTurn.end();
 		} );
 
+		it( 'stops a turn streaming in another process within the watch bound, after which it sends nothing', async () => {
+			const keychainFile = path.join( configDir, 'test-keychain.json' );
+			const app = startBroker( { credentialStore: createFileCredentialStore( keychainFile ) } );
+			const { registrationId } = await app.saveSignIn( signIn() );
+			const turn = startBrokerProcess( [
+				'hold-turn',
+				keychainFile,
+				'http://127.0.0.1:9',
+				registrationId,
+			] );
+			await turn.waitForLine( ( line ) => line.startsWith( 'chunk' ), 30_000 );
+
+			const signingOut = Date.now();
+			await app.signOut( registrationId );
+			const aborted = await turn.waitForLine(
+				( line ) => line.startsWith( '{"aborted"' ),
+				CHATGPT_TURN_WATCH_POLL_MS + 3_000
+			);
+			const stoppedWithin = Date.now() - signingOut;
+			await turn.exited;
+
+			expect( JSON.parse( aborted ) ).toEqual( { aborted: 'signed-out' } );
+			expect( stoppedWithin ).toBeLessThan( CHATGPT_TURN_WATCH_POLL_MS + 1_000 );
+			const lines = turn.lines();
+			expect(
+				lines.slice( lines.indexOf( aborted ) + 1 ).filter( ( line ) => line.startsWith( 'chunk' ) )
+			).toEqual( [] );
+		}, 60_000 );
+
+		it( 'still stops a turn where the account list can’t be watched, by reading it within the poll bound', async () => {
+			fileWatching.refused = true;
+			const app = startBroker( { timing: { accountsPollMs: 100 } } );
+			const { registrationId } = await app.saveSignIn( signIn() );
+			const handle = await app.beginTurn( registrationId );
+
+			await startBroker().signOut( registrationId );
+
+			await vi.waitFor( () => expect( handle.signal.aborted ).toBe( true ), { timeout: 2_000 } );
+			expect( handle.signal.reason ).toMatchObject( { code: 'signed-out' } );
+			handle.end();
+		} );
+
 		it( 'stops a turn whose connection was signed in again under another client', async () => {
 			const broker = startBroker();
 			const { registrationId } = await broker.saveSignIn( signIn() );
@@ -1253,6 +1312,59 @@ describe( 'ChatGPT credential broker', () => {
 				code: 'signed-out',
 			} );
 		} );
+
+		it.each<
+			[ string, ( other: ChatGptCredentialBroker, registrationId: string ) => Promise< void > ]
+		>( [
+			[
+				'signs it out',
+				async ( other, registrationId ) => {
+					await other.signOut( registrationId );
+				},
+			],
+			[
+				'signs it out and in again',
+				async ( other, registrationId ) => {
+					await other.signOut( registrationId );
+					await other.saveSignIn(
+						signIn( { registrationId, storage: 'session', tokens: tokens( 2 ) } )
+					);
+				},
+			],
+		] )(
+			'drops a session-only sign-in, and stops offering it to forks, once another process %s',
+			async ( _label, change ) => {
+				const app = startBroker( { timing: { accountsPollMs: 100 } } );
+				const { registrationId } = await app.saveSignIn( signIn( { storage: 'session' } ) );
+				expect( app.getSessionForkEnvironment() ).toEqual( {
+					STUDIO_CHATGPT_SESSIONS_OFFERED: registrationId,
+				} );
+
+				await change( startBroker(), registrationId );
+
+				// No request is needed: the app notices from the account list.
+				await vi.waitFor( () => expect( app.getSessionForkEnvironment() ).toEqual( {} ), {
+					timeout: 2_000,
+				} );
+				const reply = vi.fn();
+				app.answerSessionTokenRequest(
+					{
+						type: 'studio.chatgpt-session-token.request',
+						requestId: 'request-1',
+						connectionId: registrationId,
+					},
+					reply
+				);
+				await vi.waitFor( () =>
+					expect( reply ).toHaveBeenCalledWith(
+						expect.objectContaining( { requestId: 'request-1', accessToken: null } )
+					)
+				);
+				expect( ( await app.listConnections() ).map( ( entry ) => entry.authStatus ) ).toEqual( [
+					'disconnected',
+				] );
+			}
+		);
 
 		it( 'fails a forked turn whose app no longer holds its session, rather than read a stored record', async () => {
 			const owner = startBroker();
@@ -1423,7 +1535,11 @@ describe( 'ChatGPT credential broker', () => {
 		);
 		const lines: string[] = [];
 		const waiting: Array< ( line: string ) => void > = [];
+		const everyLine: string[] = [];
+		const lineEvents = new EventEmitter();
 		readline.createInterface( { input: child.stdout } ).on( 'line', ( line ) => {
+			everyLine.push( line );
+			lineEvents.emit( 'line', line );
 			const reader = waiting.shift();
 			if ( reader ) {
 				reader( line );
@@ -1438,9 +1554,37 @@ describe( 'ChatGPT credential broker', () => {
 						waiting.push( resolve );
 						void exited.then( () => reject( new Error( `The process exited. ${ stderr }` ) ) );
 				  } );
+		// The first line, so far or to come, that `matches`.
+		const waitForLine = ( matches: ( line: string ) => boolean, timeoutMs: number ) =>
+			new Promise< string >( ( resolve, reject ) => {
+				const seen = everyLine.find( matches );
+				if ( seen !== undefined ) {
+					resolve( seen );
+					return;
+				}
+				const onLine = ( line: string ) => {
+					if ( matches( line ) ) {
+						clearTimeout( timer );
+						lineEvents.off( 'line', onLine );
+						resolve( line );
+					}
+				};
+				const timer = setTimeout( () => {
+					lineEvents.off( 'line', onLine );
+					reject( new Error( `No such line within ${ timeoutMs } ms. ${ stderr }` ) );
+				}, timeoutMs );
+				lineEvents.on( 'line', onLine );
+			} );
 		onTestFinished( () => {
 			child.kill();
 		} );
-		return { child, exited, nextLine, output: () => stdout };
+		return {
+			child,
+			exited,
+			nextLine,
+			waitForLine,
+			lines: () => [ ...everyLine ],
+			output: () => stdout,
+		};
 	}
 } );

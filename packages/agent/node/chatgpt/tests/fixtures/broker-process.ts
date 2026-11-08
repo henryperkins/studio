@@ -57,6 +57,27 @@ async function main(): Promise< void > {
 	} else if ( command === 'crash-before-vault-rename' ) {
 		const signIn = JSON.parse( await nextLine() );
 		await report( () => broker.saveSignIn( signIn ) );
+	} else if ( command === 'hold-turn' ) {
+		const handle = await broker.beginTurn( registrationId );
+		await handle.getAccessToken();
+		// A stream that runs until the turn's signal stops it, as the transport's will.
+		let chunks = 0;
+		const stream = setInterval( () => {
+			if ( ! handle.signal.aborted ) {
+				console.log( `chunk ${ ++chunks }` );
+			}
+		}, 20 );
+		handle.signal.addEventListener( 'abort', () => {
+			const reason = handle.signal.reason as { code?: unknown } | undefined;
+			console.log( JSON.stringify( { aborted: reason?.code ?? null } ) );
+			handle.end();
+			// Whatever the stream still sends after the abort shows up before the report.
+			setTimeout( () => {
+				clearInterval( stream );
+				finish( { ok: true, value: chunks } );
+			}, 200 );
+		} );
+		console.log( 'streaming' );
 	} else {
 		finish( { ok: false, code: 'unknown-command' } );
 	}
