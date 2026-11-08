@@ -72,6 +72,10 @@ No Claude OAuth implementation or token-file parsing in Studio. Do not modify ve
 - [ ] Qualify SDK/runtime version pair, native executable signing/provenance, x64/ARM64 as applicable, dependency bundling and ASAR/resource handling. Preserve a known-good runtime option instead of auto-updating user software during Studio startup.
 - [ ] Run type checks, modified-file lint, relevant and full tests, CLI/UI build, Electron launch and Windows package checks. Report any platform not run. Open a separate draft PR in Henry's fork; do not merge automatically.
 
-## Public distribution gate
+## Subscription sign-in gate
 
-Review the official runtime-hosting terms and the SDK quickstart's third-party-login warning before advertising a public subscription integration. This plan is native end-user sign-in to an unmodified runtime. It is not authorization to proxy Claude subscription credentials through Studio or provide shared usage. Preserve vendor authentication choices and branding requirements.
+Decide this before Task 1 starts. The Agent SDK docs say that, unless Anthropic has approved it beforehand, third-party products built on the SDK must not offer Claude.ai login or plan usage limits to their users and should use API keys. The legal and compliance page forbids third-party developers from offering Claude.ai login or routing requests through plan credentials, while an end user may still sign in to the unmodified Claude Code binary themselves. Anthropic's Help Center describes using the SDK with your own Claude plan.
+
+- The maintainer decides whether this connection is limited to the maintainer's own use of their own Claude Code sign-in, or offered to other Studio users.
+- Offering Claude.ai sign-in to other users (a default-on setting, release notes, or a published build that advertises it) requires Anthropic's prior approval, unless Anthropic confirms the integration is exempt. Until then the connection stays off by default and is not advertised.
+- This plan is native end-user sign-in to an unmodified runtime. It is not authorization to proxy Claude subscription credentials through Studio or provide shared usage. Preserve vendor authentication choices and branding requirements (no "Claude Code" in a product name).
