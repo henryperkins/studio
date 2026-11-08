@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { validateAnthropicApiKey } from '@studio/common/lib/anthropic-key';
 import { readCliConfigFileRaw } from '@studio/common/lib/cli-config-file';
 import { readSharedConfig, updateSharedConfig } from '@studio/common/lib/shared-config';
@@ -175,16 +176,27 @@ const NO_MODEL_LIST: OpenAiModelAvailability = {
 	lastError: null,
 };
 
-// A list checked against another catalog version can't speak for models added
-// since, so it reads as unknown until the next refresh.
-function readStoredAvailability( value: unknown ): OpenAiModelAvailability {
-	if ( ! value || typeof value !== 'object' ) {
+// Which key a stored model list came from, without storing the key: a short
+// SHA-256 digest that can't be turned back into it.
+function fingerprintOpenAiKey( key: string ): string {
+	return createHash( 'sha256' ).update( key ).digest( 'hex' ).slice( 0, 16 );
+}
+
+// The list another key produced says nothing about this key's project, and one
+// checked against another catalog version can't speak for models added since:
+// either reads as unknown until the next refresh.
+function readStoredAvailability(
+	value: unknown,
+	activeKey: string | null | undefined
+): OpenAiModelAvailability {
+	if ( ! value || typeof value !== 'object' || ! activeKey ) {
 		return NO_MODEL_LIST;
 	}
-	const { checkedAt, availableModelIds, catalogVersion, lastError } = value as Record<
-		string,
-		unknown
-	>;
+	const { checkedAt, availableModelIds, catalogVersion, lastError, keyFingerprint } =
+		value as Record< string, unknown >;
+	if ( keyFingerprint !== fingerprintOpenAiKey( activeKey ) ) {
+		return NO_MODEL_LIST;
+	}
 	const isCurrent = catalogVersion === OPENAI_MODEL_CATALOG_VERSION;
 	return {
 		checkedAt: typeof checkedAt === 'string' ? checkedAt : null,
@@ -198,15 +210,18 @@ function readStoredAvailability( value: unknown ): OpenAiModelAvailability {
 }
 
 /**
- * What a model-list result says about availability. A failure keeps the
- * previous list and records why; only a successful list replaces it.
+ * What a model-list result says about availability, stored with the
+ * fingerprint of the key it was read with. A failure keeps the previous list
+ * and records why; only a successful list replaces it.
  */
-function toAvailability(
+function toStoredAvailability(
 	result: OpenAiModelListResult,
-	previous: OpenAiModelAvailability
-): OpenAiModelAvailability {
+	previous: OpenAiModelAvailability,
+	key: string
+): OpenAiModelAvailability & { keyFingerprint: string } {
+	const keyFingerprint = fingerprintOpenAiKey( key );
 	if ( ! result.ok ) {
-		return { ...previous, lastError: result.error };
+		return { ...previous, lastError: result.error, keyFingerprint };
 	}
 	return {
 		checkedAt: new Date().toISOString(),
@@ -215,6 +230,7 @@ function toAvailability(
 		),
 		catalogVersion: OPENAI_MODEL_CATALOG_VERSION,
 		lastError: null,
+		keyFingerprint,
 	};
 }
 
@@ -278,7 +294,7 @@ function toAiSettings(
 	secureStorageAvailable: boolean
 ): AiSettings {
 	const key = config.anthropicApiKey;
-	const models = readStoredAvailability( openAiConfig.openaiModels );
+	const models = readStoredAvailability( openAiConfig.openaiModels, openAiKey?.key );
 	return {
 		provider:
 			config.aiProvider !== undefined && isAiProviderId( config.aiProvider )
@@ -441,7 +457,9 @@ export function saveOpenAiApiKey(
 		}
 		await storeOpenAiKey( trimmed, options.storage ?? 'keychain' );
 		// The previous key's list says nothing about this key's project.
-		await updateSharedConfig( { openaiModels: toAvailability( list, NO_MODEL_LIST ) } );
+		await updateSharedConfig( {
+			openaiModels: toStoredAvailability( list, NO_MODEL_LIST, trimmed ),
+		} );
 		return readAiSettings();
 	} );
 }
@@ -471,8 +489,13 @@ export function refreshOpenAiModels(): Promise< AiSettings > {
 			throw new OpenAiSettingsError( __( 'Add an OpenAI API key first.' ) );
 		}
 		const list = await fetchOpenAiModelList( source.key );
-		const previous = readStoredAvailability( ( await readOpenAiConfig() ).openaiModels );
-		await updateSharedConfig( { openaiModels: toAvailability( list, previous ) } );
+		const previous = readStoredAvailability(
+			( await readOpenAiConfig() ).openaiModels,
+			source.key
+		);
+		await updateSharedConfig( {
+			openaiModels: toStoredAvailability( list, previous, source.key ),
+		} );
 		return readAiSettings();
 	} );
 }

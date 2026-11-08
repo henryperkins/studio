@@ -73,16 +73,35 @@ export interface OpenAiKeySource {
 	storage: OpenAiKeyStorage;
 }
 
+/** A turn the app offered its session key to couldn't get that key. */
+export class OpenAiSessionKeyUnavailableError extends Error {
+	constructor() {
+		super(
+			__(
+				'Studio couldn’t get the OpenAI key kept for this session from the app, so this turn didn’t run. Try again; if it keeps happening, add the key again in Settings → AI.'
+			)
+		);
+		this.name = 'OpenAiSessionKeyUnavailableError';
+	}
+}
+
 /**
  * The key a turn uses: this session's key when there is one, else the
  * keychain's. Null when there is neither, or the keychain can't be read.
+ *
+ * A turn the app offered its session key to uses that key or nothing: the
+ * keychain may hold a key for another project, so failing to get the session
+ * key throws `OpenAiSessionKeyUnavailableError` rather than fall back.
  */
 export async function readOpenAiKeySource(): Promise< OpenAiKeySource | null > {
 	if ( sessionKey ) {
 		return { key: sessionKey, storage: 'session' };
 	}
-	const parentSessionKey = await requestParentSessionKey?.();
-	if ( parentSessionKey ) {
+	if ( requestParentSessionKey ) {
+		const parentSessionKey = await requestParentSessionKey();
+		if ( ! parentSessionKey ) {
+			throw new OpenAiSessionKeyUnavailableError();
+		}
 		return { key: parentSessionKey, storage: 'session' };
 	}
 	if ( ! ( await getSecureStorageStatus() ).available ) {
@@ -214,7 +233,7 @@ function askParentForSessionKey( channel: ParentChannel ): Promise< string | nul
 				finish( typeof key === 'string' && key.trim() ? key.trim() : null );
 			}
 		};
-		// An app that never answers leaves the turn on the keychain, not stuck.
+		// An app that never answers fails the turn rather than leave it stuck.
 		const timer = setTimeout( () => finish( null ), SESSION_KEY_REPLY_TIMEOUT_MS );
 		channel.on( 'message', onMessage );
 		try {

@@ -1,5 +1,8 @@
 import { getWpcomAiGatewayBaseUrl } from '@studio/agent/node';
-import { getSecureStorageStatus } from '@studio/agent/node/openai-credentials';
+import {
+	getSecureStorageStatus,
+	OpenAiSessionKeyUnavailableError,
+} from '@studio/agent/node/openai-credentials';
 import { fetchOpenAiModelList } from '@studio/agent/node/openai-model-list';
 import {
 	InvalidOpenAiApiKeyError,
@@ -283,7 +286,12 @@ const AI_PROVIDER_DEFINITIONS: Record< AiProviderId, AiProviderDefinition > = {
 			await resolveOpenAiApiKey( options );
 		},
 		resolveEnv: async () => {
-			const source = await readOpenAiApiKey().catch( () => null );
+			const source = await readOpenAiApiKey().catch( ( error: unknown ) => {
+				if ( error instanceof OpenAiSessionKeyUnavailableError ) {
+					throw new LoggerError( error.message );
+				}
+				return null;
+			} );
 			if ( ! source ) {
 				throw new LoggerError(
 					__(

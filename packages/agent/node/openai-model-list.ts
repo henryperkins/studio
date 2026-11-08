@@ -1,3 +1,4 @@
+import { __ } from '@wordpress/i18n';
 import {
 	classifyOpenAiHttpError,
 	summarizeOpenAiNetworkFailure,
@@ -41,20 +42,45 @@ export async function fetchOpenAiModelList(
 				: summarizeOpenAiNetworkFailure( error, [ key ] ),
 		};
 	}
-	const body: unknown = await response.json().catch( () => undefined );
 	if ( ! response.ok ) {
+		const body: unknown = await response.json().catch( () => undefined );
 		return { ok: false, error: classifyOpenAiHttpError( response.status, body, [ key ] ) };
 	}
-	const data =
-		body && typeof body === 'object' && 'data' in body ? ( body as { data: unknown } ).data : [];
-	const modelIds = Array.isArray( data )
-		? data
-				.map( ( model: unknown ) =>
-					model && typeof model === 'object' && 'id' in model
-						? ( model as { id: unknown } ).id
-						: null
-				)
-				.filter( ( id ): id is string => typeof id === 'string' )
-		: [];
+	// A list that arrives incomplete or in another shape is a failed refresh,
+	// never an empty one: that would mark every model unavailable.
+	let text: string;
+	try {
+		text = await response.text();
+	} catch {
+		return {
+			ok: false,
+			error: { kind: 'interrupted', detail: __( 'The model list stopped partway through.' ) },
+		};
+	}
+	const data = parseModelListData( text );
+	if ( ! data ) {
+		return {
+			ok: false,
+			error: { kind: 'unknown', detail: __( 'OpenAI’s model list couldn’t be read.' ) },
+		};
+	}
+	const modelIds = data
+		.map( ( model: unknown ) =>
+			model && typeof model === 'object' && 'id' in model ? ( model as { id: unknown } ).id : null
+		)
+		.filter( ( id ): id is string => typeof id === 'string' );
 	return { ok: true, modelIds };
+}
+
+/** The `data` array of a `GET /v1/models` body, or null when the body isn't one. */
+function parseModelListData( text: string ): unknown[] | null {
+	let body: unknown;
+	try {
+		body = JSON.parse( text );
+	} catch {
+		return null;
+	}
+	const data =
+		body && typeof body === 'object' && 'data' in body ? ( body as { data: unknown } ).data : null;
+	return Array.isArray( data ) ? data : null;
 }

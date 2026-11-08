@@ -372,20 +372,37 @@ describe( 'OpenAI settings', () => {
 			expect( channel.listenerCount( 'message' ) ).toBe( 0 );
 		} );
 
-		it( 'uses the keychain when the app no longer has a session key', async () => {
-			keychain.current!.items.set( 'openai-api-key', OTHER_KEY );
-			const { credentials } = await load();
-			const channel = parentChannel( () => ( { type: 'studio.openai-session-key', key: null } ) );
-
-			credentials.acceptOpenAiSessionKeyFromParent( channel, { [ OFFER ]: '1' } );
-
-			await expect( credentials.readOpenAiKeySource() ).resolves.toEqual( {
-				key: OTHER_KEY,
-				storage: 'keychain',
+		// The keychain may hold another project's key (A) while the app runs on a
+		// session key (B): a turn that can't get B must not run on A.
+		const closedChannel = () =>
+			Object.assign( new EventEmitter(), {
+				send: vi.fn( ( _message: unknown, callback: ( error: Error | null ) => void ) =>
+					setImmediate( () => callback( new Error( 'Channel closed' ) ) )
+				),
 			} );
+		it.each( [
+			[
+				'the app replies without a key',
+				() => parentChannel( () => ( { type: 'studio.openai-session-key', key: null } ) ),
+			],
+			[ 'the channel to the app has closed', closedChannel ],
+		] )( 'fails rather than use the keychain’s key when %s', async ( _case, channel ) => {
+			keychain.current!.items.set( 'openai-api-key', OTHER_KEY );
+			const { settings, credentials } = await load();
+			credentials.acceptOpenAiSessionKeyFromParent( channel(), { [ OFFER ]: '1' } );
+
+			await expect( credentials.readOpenAiKeySource() ).rejects.toBeInstanceOf(
+				credentials.OpenAiSessionKeyUnavailableError
+			);
+			await expect( settings.readOpenAiApiKey() ).rejects.toThrow(
+				/couldn’t get the OpenAI key kept for this session/
+			);
+			const shown = await settings.readAiSettings();
+			expect( shown.hasOpenAiApiKey ).toBe( false );
+			expect( JSON.stringify( shown ) ).not.toContain( OTHER_KEY.slice( -4 ) );
 		} );
 
-		it( 'doesn’t wait for an app that never answers', async () => {
+		it( 'fails rather than use the keychain’s key when the app never answers', async () => {
 			keychain.current!.items.set( 'openai-api-key', OTHER_KEY );
 			const { credentials } = await load();
 			const channel = parentChannel( () => undefined );
@@ -393,28 +410,15 @@ describe( 'OpenAI settings', () => {
 			vi.useFakeTimers();
 			try {
 				const source = credentials.readOpenAiKeySource();
+				const outcome = expect( source ).rejects.toBeInstanceOf(
+					credentials.OpenAiSessionKeyUnavailableError
+				);
 				await vi.advanceTimersByTimeAsync( 10_000 );
-				await expect( source ).resolves.toEqual( { key: OTHER_KEY, storage: 'keychain' } );
+				await outcome;
 			} finally {
 				vi.useRealTimers();
 			}
 			expect( channel.listenerCount( 'message' ) ).toBe( 0 );
-		} );
-
-		it( 'uses the keychain when the channel to the app has closed', async () => {
-			keychain.current!.items.set( 'openai-api-key', OTHER_KEY );
-			const { credentials } = await load();
-			const channel = Object.assign( new EventEmitter(), {
-				send: vi.fn( ( _message: unknown, callback: ( error: Error | null ) => void ) =>
-					setImmediate( () => callback( new Error( 'Channel closed' ) ) )
-				),
-			} );
-			credentials.acceptOpenAiSessionKeyFromParent( channel, { [ OFFER ]: '1' } );
-
-			await expect( credentials.readOpenAiKeySource() ).resolves.toEqual( {
-				key: OTHER_KEY,
-				storage: 'keychain',
-			} );
 		} );
 
 		it( 'never asks an app that offered no key', async () => {
@@ -429,6 +433,85 @@ describe( 'OpenAI settings', () => {
 	} );
 
 	describe( 'model refresh', () => {
+		// Each arrives with HTTP 200 but isn't a model list Studio can read.
+		const unreadable = () =>
+			new Response( '{"object":"list","data":[{"id":"gpt-6', { status: 200 } );
+		const brokenStream = () =>
+			new Response(
+				new ReadableStream( {
+					start( controller ) {
+						controller.enqueue( new TextEncoder().encode( '{"object":"list","da' ) );
+						controller.error( new Error( 'socket hang up' ) );
+					},
+				} ),
+				{ status: 200 }
+			);
+		const wrongShape = () =>
+			new Response( JSON.stringify( { models: [ { id: 'gpt-6.1-sol' } ] } ), { status: 200 } );
+
+		it.each( [
+			[ 'truncated JSON', unreadable, 'unknown' ],
+			[ 'a stream that breaks off', brokenStream, 'interrupted' ],
+			[ 'an unexpected envelope', wrongShape, 'unknown' ],
+		] )( 'keeps the previous list after %s', async ( _case, response, kind ) => {
+			const { settings } = await load();
+			await settings.saveOpenAiApiKey( KEY );
+			const before = ( await settings.readAiSettings() ).openAi.models;
+			expect( before.availableModelIds ).toEqual( [ 'gpt-6.1-sol', 'gpt-6-luna' ] );
+
+			fetchMock.mockResolvedValue( response() );
+			const after = await settings.refreshOpenAiModels();
+
+			expect( after.openAi.models.availableModelIds ).toEqual( before.availableModelIds );
+			expect( after.openAi.models.checkedAt ).toBe( before.checkedAt );
+			expect( after.openAi.models.lastError?.kind ).toBe( kind );
+		} );
+
+		it( 'never applies one key’s model list to another key', async () => {
+			// Key A, in the keychain, lists Sol and Luna.
+			await ( await load() ).settings.saveOpenAiApiKey( KEY );
+			// The keychain can't be reached; a session key for another project lists only Astra.
+			keychain.current!.state.available = false;
+			fetchMock.mockResolvedValue( modelList( 'gpt-6-astra' ) );
+			const withSessionKey = await (
+				await load()
+			).settings.saveOpenAiApiKey( OTHER_KEY, {
+				storage: 'session',
+			} );
+			expect( withSessionKey.openAi.models.availableModelIds ).toEqual( [ 'gpt-6-astra' ] );
+
+			// After a restart with the keychain back, A is in use again.
+			keychain.current!.state.available = true;
+			const restarted = await load();
+			const settings = await restarted.settings.readAiSettings();
+
+			expect( settings.openAi.keyHint ).toBe( '…wxyz' );
+			expect( settings.openAi.models ).toMatchObject( {
+				availableModelIds: null,
+				checkedAt: null,
+				lastError: null,
+			} );
+			expectNoKeyOutsideKeychain( settings );
+
+			fetchMock.mockResolvedValue( modelList( 'gpt-6.1-sol', 'gpt-6-luna' ) );
+			const refreshed = await restarted.settings.refreshOpenAiModels();
+			expect( refreshed.openAi.models.availableModelIds ).toEqual( [
+				'gpt-6.1-sol',
+				'gpt-6-luna',
+			] );
+		} );
+
+		it( 'accepts a list that is genuinely empty', async () => {
+			const { settings } = await load();
+			await settings.saveOpenAiApiKey( KEY );
+
+			fetchMock.mockResolvedValue( modelList() );
+			const after = await settings.refreshOpenAiModels();
+
+			expect( after.openAi.models.availableModelIds ).toEqual( [] );
+			expect( after.openAi.models.lastError ).toBeNull();
+		} );
+
 		it( 'keeps the previous list when a refresh fails', async () => {
 			const { settings } = await load();
 			await settings.saveOpenAiApiKey( KEY );
@@ -539,15 +622,16 @@ describe( 'OpenAI settings', () => {
 		} );
 
 		it( 'ignores a model list checked against another catalog version', async () => {
+			await ( await load() ).settings.saveOpenAiApiKey( KEY );
+			const shared = readShared();
 			fs.writeFileSync(
 				sharedConfigPath(),
 				JSON.stringify( {
-					version: 1,
+					...shared,
 					openaiModels: {
+						...shared.openaiModels,
 						checkedAt: '2026-01-01T00:00:00.000Z',
-						availableModelIds: [ 'gpt-6-luna' ],
 						catalogVersion: '2026-01-01',
-						lastError: null,
 					},
 				} )
 			);
@@ -555,6 +639,15 @@ describe( 'OpenAI settings', () => {
 			await expect( settings.readAiSettings() ).resolves.toMatchObject( {
 				openAi: { models: { availableModelIds: null, checkedAt: '2026-01-01T00:00:00.000Z' } },
 			} );
+		} );
+
+		it( 'keeps only a fingerprint of the key beside the list', async () => {
+			await ( await load() ).settings.saveOpenAiApiKey( KEY );
+
+			const stored = readShared().openaiModels;
+			expect( stored.keyFingerprint ).toMatch( /^[0-9a-f]{16}$/ );
+			expect( readSharedText() ).not.toContain( KEY );
+			expect( readSharedText() ).not.toContain( KEY.slice( 'sk-proj-'.length, 24 ) );
 		} );
 	} );
 

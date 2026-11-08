@@ -1,4 +1,5 @@
 import { password } from '@inquirer/prompts';
+import { OpenAiSessionKeyUnavailableError } from '@studio/agent/node/openai-credentials';
 import {
 	persistAnthropicApiKey,
 	readAnthropicApiKey,
@@ -199,6 +200,17 @@ describe( 'AI auth helpers', () => {
 
 			await expect( resolveAiEnvironment( 'openai-api-key' ) ).rejects.toThrow(
 				/OpenAI isn’t connected/
+			);
+		} );
+
+		it( 'fails a turn that can’t get the app’s session key, saying why', async () => {
+			vi.mocked( readOpenAiApiKey ).mockRejectedValue( new OpenAiSessionKeyUnavailableError() );
+
+			const resolving = resolveAiEnvironment( 'openai-api-key' );
+
+			await expect( resolving ).rejects.toBeInstanceOf( LoggerError );
+			await expect( resolving ).rejects.toThrow(
+				/couldn’t get the OpenAI key kept for this session/
 			);
 		} );
 

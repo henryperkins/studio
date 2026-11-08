@@ -3,8 +3,9 @@ import {
 	OPENAI_MODEL_IDS,
 } from '@studio/agent/protocol/openai-models';
 import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
+import { getVisibleToasts } from '@/data/app-messages';
 import { createFakeConnector, makeSession, makeSite } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { SessionEntry } from '@/data/core';
@@ -127,6 +128,86 @@ describe( 'OpenAI chats', () => {
 		);
 		expect( screen.getByRole( 'button', { name: 'Reasoning' } ) ).toHaveTextContent( 'Low · Pro' );
 		expect( connector.setAiProvider ).not.toHaveBeenCalled();
+	} );
+
+	async function chooseEffort( label: string ) {
+		fireEvent.click( screen.getByRole( 'button', { name: 'Reasoning' } ) );
+		fireEvent.click(
+			within( await screen.findByRole( 'group', { name: 'Reasoning effort' } ) ).getByRole(
+				'menuitemradio',
+				{ name: label }
+			)
+		);
+	}
+	const MEDIUM = { model: 'gpt-6.1-sol', reasoningEffort: 'medium', reasoningMode: 'standard' };
+
+	it( 'sends only once the reasoning change shown is saved', async () => {
+		const { connector, input } = await setupChat( [ pin( MEDIUM ) ] );
+		let finishSave!: () => void;
+		connector.setSessionOpenAiSelection.mockImplementationOnce(
+			() => new Promise< void >( ( resolve ) => ( finishSave = resolve ) )
+		);
+
+		await chooseEffort( 'High' );
+		await waitFor( () =>
+			expect( screen.getByRole( 'button', { name: 'Reasoning' } ) ).toHaveTextContent( 'High' )
+		);
+		send( input );
+
+		// Sent now, the turn would read the Medium still on disk.
+		await act( () => new Promise( ( resolve ) => setTimeout( resolve, 50 ) ) );
+		expect( connector.continueSession ).not.toHaveBeenCalled();
+
+		act( () => finishSave() );
+		await waitFor( () => expect( connector.continueSession ).toHaveBeenCalled() );
+	} );
+
+	it( 'doesn’t send when the reasoning change fails to save, and says so', async () => {
+		const { connector, input } = await setupChat( [ pin( MEDIUM ) ] );
+		connector.setSessionOpenAiSelection.mockRejectedValueOnce( new Error( 'Disk full.' ) );
+
+		await chooseEffort( 'High' );
+		send( input );
+
+		await waitFor( () =>
+			expect(
+				getVisibleToasts()
+					.filter( ( toast ) => toast.intent === 'error' )
+					.map( ( toast ) => toast.title )
+			).toContainEqual( expect.stringMatching( /reasoning change wasn’t saved.*Disk full/ ) )
+		);
+		expect( connector.continueSession ).not.toHaveBeenCalled();
+		// The picker shows what the chat still uses.
+		await waitFor( () =>
+			expect( screen.getByRole( 'button', { name: 'Reasoning' } ) ).toHaveTextContent( 'Medium' )
+		);
+	} );
+
+	it( 'saves reasoning changes one at a time, in the order they were made', async () => {
+		const { connector, input } = await setupChat( [ pin( MEDIUM ) ] );
+		const saves: Array< () => void > = [];
+		connector.setSessionOpenAiSelection.mockImplementation(
+			() => new Promise< void >( ( resolve ) => saves.push( resolve ) )
+		);
+
+		await chooseEffort( 'High' );
+		await chooseEffort( 'Low' );
+		send( input );
+
+		await waitFor( () => expect( connector.setSessionOpenAiSelection ).toHaveBeenCalledTimes( 1 ) );
+		// The second save waits for the first, so the older choice can't land last.
+		act( () => saves[ 0 ]() );
+		await waitFor( () => expect( connector.setSessionOpenAiSelection ).toHaveBeenCalledTimes( 2 ) );
+		expect( connector.setSessionOpenAiSelection.mock.calls[ 1 ][ 1 ] ).toMatchObject( {
+			reasoningEffort: 'low',
+		} );
+		expect( connector.continueSession ).not.toHaveBeenCalled();
+
+		act( () => saves[ 1 ]() );
+		await waitFor( () => expect( connector.continueSession ).toHaveBeenCalled() );
+		await waitFor( () =>
+			expect( screen.getByRole( 'button', { name: 'Reasoning' } ) ).toHaveTextContent( 'Low' )
+		);
 	} );
 
 	it( 'stays on OpenAI, visibly disconnected, after its key is removed', async () => {

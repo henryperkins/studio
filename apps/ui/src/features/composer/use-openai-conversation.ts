@@ -21,7 +21,9 @@ import {
 import { useQueryClient } from '@tanstack/react-query';
 import { __, sprintf } from '@wordpress/i18n';
 import { useCallback, useMemo } from 'react';
+import { toast } from '@/data/app-messages';
 import { useConnector } from '@/data/core';
+import { saveSessionOpenAiSelection } from '@/data/openai-selection-saves';
 import { useAiSettings } from '@/data/queries/use-ai-settings';
 import { SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
 import { useOpenSettings } from '@/data/use-open-settings';
@@ -151,16 +153,30 @@ export function useOpenAiConversation( {
 				return;
 			}
 			const queryKey = [ ...SESSIONS_QUERY_KEY, sessionId ];
+			const entry = createSelectionEntry( next );
 			queryClient.setQueryData< LoadedAiSession >( queryKey, ( previous ) =>
-				previous
-					? {
-							...previous,
-							entries: [ ...( previous.entries ?? [] ), createSelectionEntry( next ) ],
-					  }
-					: previous
+				previous ? { ...previous, entries: [ ...( previous.entries ?? [] ), entry ] } : previous
 			);
-			void connector.setSessionOpenAiSelection( sessionId, next ).catch( () => {
+			saveSessionOpenAiSelection( connector, sessionId, next ).catch( ( error: unknown ) => {
+				// Back to what the chat still uses, and say why.
+				queryClient.setQueryData< LoadedAiSession >( queryKey, ( previous ) =>
+					previous
+						? {
+								...previous,
+								entries: ( previous.entries ?? [] ).filter( ( item ) => item !== entry ),
+						  }
+						: previous
+				);
 				void queryClient.invalidateQueries( { queryKey } );
+				toast.error(
+					sprintf(
+						/* translators: %s: why saving the change failed. */
+						__( 'The reasoning change wasn’t saved. %s' ),
+						error instanceof Error ? error.message : String( error )
+					),
+					// Replaced by the send's own error when a message was waiting on it.
+					{ id: `chat-send-${ sessionId }` }
+				);
 			} );
 		},
 		[ connector, onDraftChange, queryClient, sessionId ]
