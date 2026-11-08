@@ -1,9 +1,16 @@
 import { password } from '@inquirer/prompts';
 import {
+	getSecureStorageStatus,
+	OpenAiSessionKeyUnavailableError,
+} from '@studio/agent/node/openai-credentials';
+import {
 	persistAnthropicApiKey,
 	readAnthropicApiKey,
+	readOpenAiApiKey,
 	readSelectedAiProvider,
+	saveOpenAiApiKey,
 } from '@studio/agent/node/settings-store';
+import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { vi } from 'vitest';
 import {
@@ -23,12 +30,22 @@ vi.mock( '@studio/common/lib/shared-config', () => ( {
 	readAuthToken: vi.fn(),
 } ) );
 
+vi.mock( '@studio/agent/node/openai-credentials', async ( importOriginal ) => ( {
+	...( await importOriginal< typeof import('@studio/agent/node/openai-credentials') >() ),
+	getSecureStorageStatus: vi.fn(),
+} ) );
+
 vi.mock( '@studio/agent/node/settings-store', () => ( {
 	readAnthropicApiKey: vi.fn(),
+	readOpenAiApiKey: vi.fn(),
 	readSelectedAiProvider: vi.fn(),
 	persistAnthropicApiKey: vi.fn(),
 	persistSelectedAiProvider: vi.fn(),
+	saveOpenAiApiKey: vi.fn(),
+	InvalidOpenAiApiKeyError: class InvalidOpenAiApiKeyError extends Error {},
 } ) );
+
+const OPENAI_KEY = 'sk-proj-TESTONLY_cli_cccccccccccccccccccccccccccccccc';
 
 describe( 'AI auth helpers', () => {
 	beforeEach( () => {
@@ -69,6 +86,20 @@ describe( 'AI auth helpers', () => {
 
 		expect( password ).toHaveBeenCalledOnce();
 		expect( persistAnthropicApiKey ).toHaveBeenCalledWith( 'prompted-key' );
+	} );
+
+	it( 'turns a keychain that fails while saving the OpenAI key into a message for the chat', async () => {
+		vi.mocked( readOpenAiApiKey ).mockResolvedValue( null );
+		vi.mocked( getSecureStorageStatus ).mockResolvedValue( { available: true } );
+		vi.mocked( password ).mockResolvedValue( OPENAI_KEY );
+		vi.mocked( saveOpenAiApiKey ).mockRejectedValue(
+			new SecureStorageError( 'Couldn’t open the system keychain: locked' )
+		);
+
+		const preparing = prepareAiProvider( 'openai-api-key', { force: true } );
+
+		await expect( preparing ).rejects.toBeInstanceOf( LoggerError );
+		await expect( preparing ).rejects.toThrow( 'Couldn’t open the system keychain: locked' );
 	} );
 
 	it( 'can force re-entering the API key even when one is already saved', async () => {
@@ -166,6 +197,106 @@ describe( 'AI auth helpers', () => {
 
 		vi.mocked( readAuthToken ).mockResolvedValue( null );
 		await expect( isAiProviderReady( 'wpcom' ) ).resolves.toBe( false );
+	} );
+
+	describe( 'OpenAI', () => {
+		afterEach( () => {
+			delete process.env.OPENAI_API_KEY;
+			delete process.env.STUDIO_OPENAI_API_KEY;
+		} );
+
+		it( 'hands the saved key to the runtime only, never to this process’s environment', async () => {
+			vi.mocked( readOpenAiApiKey ).mockResolvedValue( { key: OPENAI_KEY, storage: 'keychain' } );
+			process.env.OPENAI_API_KEY = 'sk-proj-TESTONLY_ambient';
+
+			const env = await resolveAiEnvironment( 'openai-api-key' );
+
+			expect( env.STUDIO_OPENAI_API_KEY ).toBe( OPENAI_KEY );
+			// An ambient key is dropped from the copy, not used.
+			expect( env.OPENAI_API_KEY ).toBeUndefined();
+			expect( env.ANTHROPIC_API_KEY ).toBeUndefined();
+			expect( process.env.STUDIO_OPENAI_API_KEY ).toBeUndefined();
+			expect( JSON.stringify( process.env ) ).not.toContain( OPENAI_KEY );
+		} );
+
+		it.each( [
+			[ 'a keychain without the key', { available: true } as const ],
+			[
+				'no keychain on this machine',
+				{ available: false, reason: 'none', absent: true } as const,
+			],
+		] )( 'fails a turn as disconnected with %s', async ( _case, keychain ) => {
+			vi.mocked( readOpenAiApiKey ).mockResolvedValue( null );
+			vi.mocked( getSecureStorageStatus ).mockResolvedValue( keychain );
+
+			await expect( resolveAiEnvironment( 'openai-api-key' ) ).rejects.toThrow(
+				/OpenAI isn’t connected/
+			);
+		} );
+
+		it( 'says so when the keychain that may hold the key can’t be reached', async () => {
+			vi.mocked( readOpenAiApiKey ).mockResolvedValue( null );
+			vi.mocked( getSecureStorageStatus ).mockResolvedValue( {
+				available: false,
+				reason: 'no D-Bus session',
+			} );
+
+			const resolving = resolveAiEnvironment( 'openai-api-key' );
+
+			await expect( resolving ).rejects.toBeInstanceOf( LoggerError );
+			await expect( resolving ).rejects.toThrow(
+				/couldn’t reach the system keychain to read the OpenAI API key \(no D-Bus session\)/
+			);
+		} );
+
+		it( 'passes on a keychain error rather than reporting no key', async () => {
+			vi.mocked( readOpenAiApiKey ).mockRejectedValue(
+				new SecureStorageError( 'Couldn’t read the system keychain: locked' )
+			);
+
+			const resolving = resolveAiEnvironment( 'openai-api-key' );
+
+			await expect( resolving ).rejects.toBeInstanceOf( LoggerError );
+			await expect( resolving ).rejects.toThrow( 'Couldn’t read the system keychain: locked' );
+		} );
+
+		it( 'fails a turn that can’t get the app’s session key, saying why', async () => {
+			vi.mocked( readOpenAiApiKey ).mockRejectedValue( new OpenAiSessionKeyUnavailableError() );
+
+			const resolving = resolveAiEnvironment( 'openai-api-key' );
+
+			await expect( resolving ).rejects.toBeInstanceOf( LoggerError );
+			await expect( resolving ).rejects.toThrow(
+				/couldn’t get the OpenAI key kept for this session/
+			);
+		} );
+
+		it( 'is ready with a key, and never falls back without one', async () => {
+			vi.mocked( readOpenAiApiKey ).mockResolvedValue( null );
+			vi.mocked( readAuthToken ).mockResolvedValue( null );
+			vi.mocked( readAnthropicApiKey ).mockResolvedValue( 'saved-key' );
+
+			await expect( isAiProviderReady( 'openai-api-key' ) ).resolves.toBe( false );
+			await expect( resolveUnavailableAiProvider( 'openai-api-key' ) ).resolves.toBeUndefined();
+
+			vi.mocked( readSelectedAiProvider ).mockResolvedValue( 'openai-api-key' );
+			await expect( resolveInitialAiProvider() ).resolves.toBe( 'openai-api-key' );
+
+			vi.mocked( readOpenAiApiKey ).mockResolvedValue( { key: OPENAI_KEY, storage: 'session' } );
+			await expect( isAiProviderReady( 'openai-api-key' ) ).resolves.toBe( true );
+		} );
+
+		it( 'is never picked for a conversation automatically', async () => {
+			vi.mocked( readOpenAiApiKey ).mockResolvedValue( { key: OPENAI_KEY, storage: 'keychain' } );
+			vi.mocked( readAuthToken ).mockResolvedValue( null );
+			vi.mocked( readAnthropicApiKey ).mockResolvedValue( undefined );
+			vi.mocked( readSelectedAiProvider ).mockResolvedValue( undefined );
+
+			// A logged-out WordPress.com conversation doesn't move to OpenAI…
+			await expect( resolveUnavailableAiProvider( 'wpcom' ) ).resolves.toBeUndefined();
+			// …and a first run doesn't start on it.
+			await expect( resolveInitialAiProvider() ).resolves.toBe( 'wpcom' );
+		} );
 	} );
 
 	it( 'resolves a fallback provider only for providers that auto-fallback', async () => {

@@ -8,6 +8,16 @@ import {
 	saveAnthropicApiKey,
 	setAiProvider,
 } from '@studio/agent/node/settings-store';
+import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
+import { createFakeCredentialStore } from './fake-credential-store';
+
+// Never the real system keychain from a unit test.
+vi.mock( '@studio/common/lib/os-credential-store', async ( importOriginal ) => ( {
+	...( await importOriginal< typeof import('@studio/common/lib/os-credential-store') >() ),
+	createOsCredentialStore: () => createFakeCredentialStore().store,
+} ) );
+
+const NO_OPENAI = { hasOpenAiApiKey: false, openAi: createDisconnectedOpenAiSettings() };
 
 describe( 'ai settings store', () => {
 	let configDir: string;
@@ -40,6 +50,7 @@ describe( 'ai settings store', () => {
 			provider: 'wpcom',
 			hasAnthropicApiKey: false,
 			anthropicApiKeyPreview: null,
+			...NO_OPENAI,
 		} );
 	} );
 
@@ -50,6 +61,7 @@ describe( 'ai settings store', () => {
 			provider: 'wpcom',
 			hasAnthropicApiKey: true,
 			anthropicApiKeyPreview: 'sk-ant-api03-tes...1234',
+			...NO_OPENAI,
 		} );
 		expect( readShared().anthropicApiKey ).toBe( 'sk-ant-api03-testkey-abcd1234' );
 		expect( fs.existsSync( cliConfigPath() ) ).toBe( false );
@@ -126,10 +138,28 @@ describe( 'ai settings store', () => {
 			provider: 'wpcom',
 			hasAnthropicApiKey: false,
 			anthropicApiKeyPreview: null,
+			...NO_OPENAI,
 		} );
 		const written = readShared();
 		expect( written.anthropicApiKey ).toBeUndefined();
 		expect( written ).toMatchObject( { aiProvider: 'wpcom', locale: 'es' } );
+	} );
+
+	it( 'keeps OpenAI the default when the Anthropic key is cleared', async () => {
+		fs.writeFileSync(
+			sharedConfigPath(),
+			JSON.stringify( {
+				version: 1,
+				anthropicApiKey: 'sk-ant-api03-testkey-abcd1234',
+				aiProvider: 'openai-api-key',
+			} )
+		);
+
+		const settings = await saveAnthropicApiKey( null );
+
+		expect( settings ).toMatchObject( { provider: 'openai-api-key', hasAnthropicApiKey: false } );
+		expect( readShared() ).toMatchObject( { aiProvider: 'openai-api-key' } );
+		expect( readShared().anthropicApiKey ).toBeUndefined();
 	} );
 
 	it( 'trims the key and treats a blank one as cleared', async () => {

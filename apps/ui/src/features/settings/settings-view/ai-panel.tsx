@@ -1,4 +1,4 @@
-import { AI_PROVIDER_LABELS } from '@studio/agent/protocol/providers';
+import { AI_PROVIDER_IDS, AI_PROVIDER_LABELS } from '@studio/agent/protocol/providers';
 import { __ } from '@wordpress/i18n';
 import { useEffect, useState } from 'react';
 import { getProviderIntent } from '@/data/account-analytics';
@@ -12,6 +12,7 @@ import { useAuthUser, useLogin } from '@/data/queries/use-auth-user';
 import { LearnMoreLink } from '@/features/onboarding';
 import { useOffline } from '@/lib/hooks';
 import { Button, Input } from '@/lib/ui';
+import { OpenAiProviderRow, OpenAiSettingsGroup } from './openai-settings';
 import { connectedBadge, SettingsGroup, SettingsRow, SettingsSelect } from './rows';
 import styles from './style.module.css';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
@@ -38,7 +39,15 @@ function ProvidersSection( { onManageCredits }: { onManageCredits: () => void } 
 	const [ keyFormOpen, setKeyFormOpen ] = useState( false );
 	const [ key, setKey ] = useState( '' );
 	const hasKey = !! settings.data?.hasAnthropicApiKey;
+	const hasOpenAiKey = !! settings.data?.hasOpenAiApiKey;
 	const pending = settings.isLoading || saveKey.isPending || setProvider.isPending;
+	// WordPress.com is always offered; the API providers once they have a key.
+	const defaultProviders = AI_PROVIDER_IDS.filter(
+		( provider ) =>
+			provider === 'wpcom' ||
+			( provider === 'anthropic-api-key' && hasKey ) ||
+			( provider === 'openai-api-key' && hasOpenAiKey )
+	);
 
 	// Connecting WordPress.com finishes once the sign-up lands.
 	const { mutate: selectProvider } = setProvider;
@@ -166,7 +175,8 @@ function ProvidersSection( { onManageCredits }: { onManageCredits: () => void } 
 					</SettingsRow>
 				</form>
 			) : null }
-			{ hasKey && settings.data ? (
+			<OpenAiProviderRow disabled={ setProvider.isPending } />
+			{ defaultProviders.length > 1 && settings.data ? (
 				<SettingsRow
 					title={ __( 'Default provider' ) }
 					description={ __( 'The provider new chats use.' ) }
@@ -176,7 +186,7 @@ function ProvidersSection( { onManageCredits }: { onManageCredits: () => void } 
 						label={ __( 'Default provider' ) }
 						value={ settings.data.provider }
 						disabled={ pending }
-						options={ ( [ 'wpcom', 'anthropic-api-key' ] as const ).map( ( provider ) => ( {
+						options={ defaultProviders.map( ( provider ) => ( {
 							value: provider,
 							label: AI_PROVIDER_LABELS[ provider ],
 						} ) ) }
@@ -205,6 +215,7 @@ export function AiPanel( { onManageCredits }: { onManageCredits: () => void } ) 
 				/>
 			</SettingsGroup>
 			<ProvidersSection onManageCredits={ onManageCredits } />
+			<OpenAiSettingsGroup />
 		</div>
 	);
 }

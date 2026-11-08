@@ -1,7 +1,11 @@
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { pendingPromptSlot } from '@/features/composer';
-import { createFakeConnector, type FakeConnectorInitialState } from '@/test/fake-connector';
+import {
+	createFakeConnector,
+	type FakeConnectorInitialState,
+	withoutOpenAi,
+} from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { Connector, SelectedSiteFolder } from '@/data/core';
 import type { AiSettings } from '@studio/agent/protocol/providers';
@@ -302,6 +306,7 @@ describe( 'Add site › blank setup', () => {
 			provider: 'wpcom',
 			hasAnthropicApiKey: false,
 			anthropicApiKeyPreview: null,
+			...withoutOpenAi(),
 		};
 		const { connector, dialog, history } = await setup(
 			{},

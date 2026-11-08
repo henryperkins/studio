@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { acceptOpenAiSessionKeyFromParent } from '@studio/agent/node/openai-credentials';
 import { suppressPunycodeWarning } from '@studio/common/lib/suppress-punycode-warning';
 import { __, sprintf } from '@wordpress/i18n';
 import semver from 'semver';
@@ -32,6 +33,9 @@ import { StudioArgv } from 'cli/types';
 
 const version = __STUDIO_CLI_VERSION__;
 
+// A Studio app that forked this process may keep an OpenAI key for its
+// session; this lets a turn ask for it over IPC when it needs it.
+acceptOpenAiSessionKeyFromParent();
 suppressPunycodeWarning();
 
 async function main() {

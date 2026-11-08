@@ -3,8 +3,14 @@
  */
 import crypto from 'node:crypto';
 import EventEmitter from 'node:events';
-import { InvalidAnthropicApiKeyError } from '@studio/agent/node/settings-store';
+import {
+	InvalidAnthropicApiKeyError,
+	InvalidOpenAiApiKeyError,
+	OpenAiSettingsError,
+} from '@studio/agent/node/settings-store';
+import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { createCliRunner } from '@studio/common/lib/cli-process';
+import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { listSites } from '@studio/common/sites/list';
 import nock from 'nock';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -18,6 +24,11 @@ const mocks = vi.hoisted( () => ( {
 	readAiSettings: vi.fn(),
 	saveAnthropicApiKey: vi.fn(),
 	setAiProvider: vi.fn(),
+	saveOpenAiApiKey: vi.fn(),
+	removeOpenAiApiKey: vi.fn(),
+	refreshOpenAiModels: vi.fn(),
+	setOpenAiDefaults: vi.fn(),
+	setSessionOpenAiSelection: vi.fn(),
 } ) );
 
 vi.mock( '@studio/common/lib/cli-process', async ( importOriginal ) => ( {
@@ -35,6 +46,13 @@ vi.mock( '@studio/agent/node/settings-store', async ( importOriginal ) => ( {
 	readAiSettings: mocks.readAiSettings,
 	saveAnthropicApiKey: mocks.saveAnthropicApiKey,
 	setAiProvider: mocks.setAiProvider,
+	saveOpenAiApiKey: mocks.saveOpenAiApiKey,
+	removeOpenAiApiKey: mocks.removeOpenAiApiKey,
+	refreshOpenAiModels: mocks.refreshOpenAiModels,
+	setOpenAiDefaults: mocks.setOpenAiDefaults,
+} ) );
+vi.mock( '@studio/agent/node/sessions/openai-selection', () => ( {
+	setSessionOpenAiSelection: mocks.setSessionOpenAiSelection,
 } ) );
 vi.mock( '@studio/agent/node/run-manager', () => ( {
 	createAgentRunManager: vi.fn( () => ( {
@@ -267,6 +285,127 @@ describe( 'local web server Connect contracts', () => {
 		);
 
 		expect( response.status ).toBe( 400 );
+	} );
+
+	describe( 'OpenAI', () => {
+		const KEY = 'sk-proj-TESTONLY_local_eeeeeeeeeeeeeeeeeeeeeeeeeeee';
+		const connected = {
+			provider: 'wpcom',
+			hasAnthropicApiKey: false,
+			anthropicApiKeyPreview: null,
+			hasOpenAiApiKey: true,
+			openAi: { ...createDisconnectedOpenAiSettings(), keyStorage: 'keychain', keyHint: '…eeee' },
+		};
+		const request = ( path: string, init: RequestInit = {} ) =>
+			fetch( `${ server.url.replace( 'localhost', '127.0.0.1' ) }/api${ path }`, {
+				...init,
+				headers: { 'Content-Type': 'application/json', ...init.headers },
+			} );
+
+		beforeEach( () => {
+			mocks.saveOpenAiApiKey.mockResolvedValue( connected );
+			mocks.removeOpenAiApiKey.mockResolvedValue( { ...connected, hasOpenAiApiKey: false } );
+			mocks.refreshOpenAiModels.mockResolvedValue( connected );
+			mocks.setOpenAiDefaults.mockResolvedValue( connected );
+			mocks.setSessionOpenAiSelection.mockResolvedValue( undefined );
+		} );
+
+		it( 'passes a key to the settings store and never sends it back', async () => {
+			const response = await request( '/ai-settings/openai-key', {
+				method: 'POST',
+				body: JSON.stringify( { key: KEY, storage: 'keychain' } ),
+			} );
+
+			expect( response.status ).toBe( 200 );
+			const text = await response.text();
+			expect( text ).not.toContain( KEY );
+			expect( JSON.parse( text ) ).toMatchObject( { hasOpenAiApiKey: true } );
+			expect( mocks.saveOpenAiApiKey ).toHaveBeenCalledWith( KEY, { storage: 'keychain' } );
+		} );
+
+		it.each( [
+			[ { key: 42, storage: 'keychain' } ],
+			[ { key: KEY, storage: 'plaintext-file' } ],
+			[ { key: KEY } ],
+		] )( 'rejects a malformed key request %j', async ( body ) => {
+			const response = await request( '/ai-settings/openai-key', {
+				method: 'POST',
+				body: JSON.stringify( body ),
+			} );
+
+			expect( response.status ).toBe( 400 );
+			expect( mocks.saveOpenAiApiKey ).not.toHaveBeenCalled();
+		} );
+
+		it.each( [
+			[ new InvalidOpenAiApiKeyError( 'OpenAI didn’t accept the API key.' ), 400 ],
+			[ new OpenAiSettingsError( 'Add an OpenAI API key first.' ), 400 ],
+			[ new SecureStorageError( 'There is no system keychain here.' ), 409 ],
+		] )( 'answers %s with status %i and its message', async ( error, status ) => {
+			mocks.saveOpenAiApiKey.mockRejectedValueOnce( error );
+
+			const response = await request( '/ai-settings/openai-key', {
+				method: 'POST',
+				body: JSON.stringify( { key: KEY, storage: 'keychain' } ),
+			} );
+
+			expect( response.status ).toBe( status );
+			await expect( response.json() ).resolves.toEqual( { error: error.message } );
+		} );
+
+		it( 'removes the key, refreshes models and saves defaults', async () => {
+			expect( ( await request( '/ai-settings/openai-key', { method: 'DELETE' } ) ).status ).toBe(
+				200
+			);
+			expect( mocks.removeOpenAiApiKey ).toHaveBeenCalled();
+
+			expect(
+				( await request( '/ai-settings/openai-models/refresh', { method: 'POST' } ) ).status
+			).toBe( 200 );
+			expect( mocks.refreshOpenAiModels ).toHaveBeenCalled();
+
+			const defaults = { model: 'gpt-6-luna', reasoningEffort: 'none' };
+			const response = await request( '/ai-settings/openai-defaults', {
+				method: 'PATCH',
+				body: JSON.stringify( defaults ),
+			} );
+			expect( response.status ).toBe( 200 );
+			expect( mocks.setOpenAiDefaults ).toHaveBeenCalledWith( defaults );
+		} );
+
+		it( 'pins a session to an OpenAI selection, and reports one it refuses', async () => {
+			const selection = { model: 'gpt-6-astra', reasoningEffort: 'max', reasoningMode: 'pro' };
+			const response = await request( '/sessions/chat-1/openai-selection', {
+				method: 'POST',
+				body: JSON.stringify( selection ),
+			} );
+			expect( response.status ).toBe( 204 );
+			expect( mocks.setSessionOpenAiSelection ).toHaveBeenCalledWith(
+				'/sessions',
+				'chat-1',
+				selection
+			);
+
+			mocks.setSessionOpenAiSelection.mockRejectedValueOnce(
+				new OpenAiSettingsError( 'GPT-6 Astra doesn’t support “None” reasoning.' )
+			);
+			const refused = await request( '/sessions/chat-1/openai-selection', {
+				method: 'POST',
+				body: JSON.stringify( { ...selection, reasoningEffort: 'none' } ),
+			} );
+			expect( refused.status ).toBe( 400 );
+		} );
+
+		it( 'refuses OpenAI requests from another website', async () => {
+			const response = await request( '/ai-settings/openai-key', {
+				method: 'POST',
+				headers: { Origin: 'https://attacker.example' },
+				body: JSON.stringify( { key: KEY, storage: 'keychain' } ),
+			} );
+
+			expect( response.status ).toBe( 403 );
+			expect( mocks.saveOpenAiApiKey ).not.toHaveBeenCalled();
+		} );
 	} );
 
 	it( 'delegates deletion to the CLI cascade', async () => {

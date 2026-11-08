@@ -7,7 +7,12 @@ import { rememberAccountJourney } from '@/data/account-analytics';
 import { createLocalConnector } from '@/data/core/connectors/local';
 import { ASSISTANT_QUOTA_QUERY_KEY } from '@/data/queries/use-assistant-quota';
 import { SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
-import { createFakeConnector, makeSession, type FakeConnector } from '@/test/fake-connector';
+import {
+	createFakeConnector,
+	type FakeConnector,
+	makeSession,
+	withoutOpenAi,
+} from '@/test/fake-connector';
 import { createTestQueryClient, renderWithProviders } from '@/test/render';
 import { useAgentRun, useSiteAgentActivity } from './use-agent-run';
 import type { AgentRunEvent, Connector, LoadedAiSession } from '@/data/core';
@@ -327,6 +332,7 @@ describe( 'useAgentRun queued handoff', () => {
 						provider,
 						hasAnthropicApiKey: true,
 						anthropicApiKeyPreview: 'test',
+						...withoutOpenAi(),
 					} ),
 				}
 			);

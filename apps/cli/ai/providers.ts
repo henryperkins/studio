@@ -1,5 +1,16 @@
 import { getWpcomAiGatewayBaseUrl } from '@studio/agent/node';
-import { persistAnthropicApiKey, readAnthropicApiKey } from '@studio/agent/node/settings-store';
+import {
+	getSecureStorageStatus,
+	OpenAiSessionKeyUnavailableError,
+} from '@studio/agent/node/openai-credentials';
+import { fetchOpenAiModelList } from '@studio/agent/node/openai-model-list';
+import {
+	InvalidOpenAiApiKeyError,
+	persistAnthropicApiKey,
+	readAnthropicApiKey,
+	readOpenAiApiKey,
+	saveOpenAiApiKey,
+} from '@studio/agent/node/settings-store';
 import { DEFAULT_MODEL, type AiModelId } from '@studio/agent/protocol/models';
 import {
 	AI_PROVIDER_IDS,
@@ -8,15 +19,17 @@ import {
 	type AiProviderId,
 } from '@studio/agent/protocol/providers';
 import { validateAnthropicApiKey } from '@studio/common/lib/anthropic-key';
+import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { getStudioUserAgent as buildStudioUserAgent } from '@studio/common/lib/user-agent';
-import { __ } from '@wordpress/i18n';
-import { password } from 'cli/lib/prompts';
+import { __, sprintf } from '@wordpress/i18n';
+import { confirm, password } from 'cli/lib/prompts';
 import { LoggerError } from 'cli/logger';
 
 export const AI_PROVIDERS: Record< AiProviderId, string > = {
 	wpcom: 'WordPress.com',
 	'anthropic-api-key': 'Anthropic · API key',
+	'openai-api-key': 'OpenAI · API key',
 };
 
 export type { AiProviderId };
@@ -38,6 +51,11 @@ export interface ResolveAiEnvironmentOptions {
 export interface AiProviderDefinition {
 	id: AiProviderId;
 	autoFallbackWhenUnavailable: boolean;
+	/**
+	 * Whether Studio may pick this provider without the user choosing it: on a
+	 * first run, or when another provider becomes unavailable mid-conversation.
+	 */
+	autoSelectable: boolean;
 	// Derived from the provider's model families (see
 	// `@studio/agent/protocol/providers`), kept on the definition so callers don't
 	// have to filter AI_MODELS themselves.
@@ -97,6 +115,99 @@ async function resolveAnthropicApiKey( options?: {
 	return trimmedKey;
 }
 
+/**
+ * The OpenAI key a turn uses, or null when none is saved. A keychain Studio
+ * can't reach, or can't read, is reported as such rather than as a missing
+ * key: the key may well be saved there.
+ */
+export async function readOpenAiKeyForTurn(): Promise<
+	Awaited< ReturnType< typeof readOpenAiApiKey > >
+> {
+	let source: Awaited< ReturnType< typeof readOpenAiApiKey > >;
+	try {
+		source = await readOpenAiApiKey();
+	} catch ( error ) {
+		if (
+			error instanceof OpenAiSessionKeyUnavailableError ||
+			error instanceof SecureStorageError
+		) {
+			throw new LoggerError( error.message );
+		}
+		throw error;
+	}
+	if ( source ) {
+		return source;
+	}
+	const keychain = await getSecureStorageStatus();
+	if ( ! keychain.available && ! keychain.absent ) {
+		throw new LoggerError(
+			sprintf(
+				/* translators: %s: why the system keychain can't be used. */
+				__(
+					'Studio couldn’t reach the system keychain to read the OpenAI API key (%s). Unlock it and try again, or use /openai-key to enter a key for this session.'
+				),
+				keychain.reason
+			)
+		);
+	}
+	return null;
+}
+
+/**
+ * The saved OpenAI key, or a prompt for one. The key goes to the system
+ * keychain; without one, the user may keep it for this session only. A key
+ * OpenAI rejects is never saved.
+ */
+async function resolveOpenAiApiKey( options?: { force?: boolean } ): Promise< void > {
+	const saved = await readOpenAiApiKey().catch( () => null );
+	if ( saved && ! options?.force ) {
+		const list = await fetchOpenAiModelList( saved.key );
+		if ( list.ok || list.error.kind !== 'authentication' ) {
+			return;
+		}
+	}
+
+	const secureStorage = await getSecureStorageStatus();
+	if ( ! secureStorage.available ) {
+		const useForSession = await confirm( {
+			message: sprintf(
+				/* translators: %s: why the system keychain can't be used. */
+				__(
+					'Studio can’t save the key to your system keychain (%s). Use a key for this session only? It is forgotten when Studio Code exits, and a key saved in the keychain earlier is used again.'
+				),
+				secureStorage.reason
+			),
+			default: false,
+		} );
+		if ( ! useForSession ) {
+			throw new LoggerError(
+				__(
+					'OpenAI needs an API key. Set up a system keychain, or use a key for this session only.'
+				)
+			);
+		}
+	}
+
+	const apiKey = await password( {
+		message: secureStorage.available
+			? __( 'Enter your OpenAI API key (saved to your system keychain):' )
+			: __( 'Enter your OpenAI API key (kept for this session only):' ),
+		mask: '*',
+		validate: ( value ) => ( value.trim() ? true : __( 'API key is required' ) ),
+	} );
+
+	try {
+		await saveOpenAiApiKey( apiKey, {
+			storage: secureStorage.available ? 'keychain' : 'session',
+		} );
+	} catch ( error ) {
+		if ( error instanceof InvalidOpenAiApiKeyError || error instanceof SecureStorageError ) {
+			throw new LoggerError( error.message );
+		}
+		throw error;
+	}
+}
+
 export function getStudioUserAgent(): string {
 	return buildStudioUserAgent(
 		typeof __STUDIO_CLI_VERSION__ === 'string' ? __STUDIO_CLI_VERSION__ : undefined
@@ -125,6 +236,7 @@ function createBaseEnvironment(): Record< string, string > {
 	delete env.ANTHROPIC_CUSTOM_HEADERS;
 	delete env.OPENAI_API_KEY;
 	delete env.OPENAI_BASE_URL;
+	delete env.STUDIO_OPENAI_API_KEY;
 	delete env.STUDIO_WPCOM_API_KEY;
 	delete env.STUDIO_WPCOM_BASE_URL;
 	delete env.STUDIO_WPCOM_DEFAULT_HEADERS;
@@ -136,6 +248,7 @@ const AI_PROVIDER_DEFINITIONS: Record< AiProviderId, AiProviderDefinition > = {
 	wpcom: defineProvider( {
 		id: 'wpcom',
 		autoFallbackWhenUnavailable: true,
+		autoSelectable: true,
 		isVisible: async () => true,
 		isReady: async () => hasInlineWpcomAuth() || ( await hasValidWpcomAuth() ),
 		prepare: async () => {
@@ -176,6 +289,7 @@ const AI_PROVIDER_DEFINITIONS: Record< AiProviderId, AiProviderDefinition > = {
 	'anthropic-api-key': defineProvider( {
 		id: 'anthropic-api-key',
 		autoFallbackWhenUnavailable: false,
+		autoSelectable: true,
 		isVisible: async () => true,
 		isReady: async () => {
 			return Boolean( await readAnthropicApiKey() );
@@ -195,6 +309,34 @@ const AI_PROVIDER_DEFINITIONS: Record< AiProviderId, AiProviderDefinition > = {
 
 			const env = createBaseEnvironment();
 			env.ANTHROPIC_API_KEY = apiKey;
+			return env;
+		},
+	} ),
+	// Never falls back: a conversation on OpenAI without a key fails its turn
+	// with a disconnected error rather than running somewhere else.
+	'openai-api-key': defineProvider( {
+		id: 'openai-api-key',
+		autoFallbackWhenUnavailable: false,
+		// A conversation's contents only go to OpenAI when the user chose it.
+		autoSelectable: false,
+		isVisible: async () => true,
+		isReady: async () => Boolean( await readOpenAiApiKey().catch( () => null ) ),
+		prepare: async ( options ) => {
+			await resolveOpenAiApiKey( options );
+		},
+		resolveEnv: async () => {
+			const source = await readOpenAiKeyForTurn();
+			if ( ! source ) {
+				throw new LoggerError(
+					__(
+						'OpenAI isn’t connected, so this chat can’t continue. Add an OpenAI API key in Settings → AI (or with /openai-key in Studio Code), or start a new chat with another provider.'
+					)
+				);
+			}
+			// Only the runtime's provider resolution reads this copy; the agent's
+			// tools run with the process environment, which never holds the key.
+			const env = createBaseEnvironment();
+			env.STUDIO_OPENAI_API_KEY = source.key;
 			return env;
 		},
 	} ),

@@ -20,6 +20,7 @@ import {
 	setSessionEnvironment,
 	updateHydratedAiSessionMetadata,
 } from '@studio/agent/node/sessions/manage';
+import { setSessionOpenAiSelection } from '@studio/agent/node/sessions/openai-selection';
 import { deleteAiSessionPlacement } from '@studio/agent/node/sessions/placement';
 import {
 	appendModelChangeEntry,
@@ -28,9 +29,15 @@ import {
 } from '@studio/agent/node/sessions/store';
 import {
 	InvalidAnthropicApiKeyError,
+	InvalidOpenAiApiKeyError,
+	OpenAiSettingsError,
 	readAiSettings,
+	refreshOpenAiModels,
+	removeOpenAiApiKey,
 	saveAnthropicApiKey,
+	saveOpenAiApiKey,
 	setAiProvider,
+	setOpenAiDefaults,
 } from '@studio/agent/node/settings-store';
 import { validateStudioChatFiles } from '@studio/agent/protocol/chat-files';
 import {
@@ -96,6 +103,7 @@ import { isErrnoException } from '@studio/common/lib/is-errno-exception';
 import { isMultisite } from '@studio/common/lib/is-multisite';
 import { isSupportedLocale } from '@studio/common/lib/locale';
 import { getAuthenticationUrl, getSignUpUrl, revokeAuthToken } from '@studio/common/lib/oauth';
+import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { decodePassword } from '@studio/common/lib/passwords';
 import {
 	getInstructionsLengthBucket,
@@ -845,6 +853,54 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 			const settings = await setAiProvider( provider );
 			res.json( settings );
 			trackAiSettingsChange( previous, settings );
+		} )
+	);
+
+	// --- OpenAI — the key goes to the system keychain (or, on request, this
+	// server's memory for the session) and never comes back: responses report
+	// only where it was kept and its last four characters.
+	api.post(
+		'/ai-settings/openai-key',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			const { key, storage } = ( req.body ?? {} ) as { key?: unknown; storage?: unknown };
+			if ( typeof key !== 'string' || ( storage !== 'keychain' && storage !== 'session' ) ) {
+				res.status( 400 ).json( {
+					error: 'key must be a string, and storage either "keychain" or "session"',
+				} );
+				return;
+			}
+			const previous = await readAiSettings();
+			const settings = await saveOpenAiApiKey( key, { storage } );
+			res.json( settings );
+			trackAiSettingsChange( previous, settings );
+		} )
+	);
+
+	api.delete(
+		'/ai-settings/openai-key',
+		asyncHandler( async ( _req: Request, res: Response ) => {
+			const previous = await readAiSettings();
+			const settings = await removeOpenAiApiKey();
+			res.json( settings );
+			trackAiSettingsChange( previous, settings );
+		} )
+	);
+
+	api.post(
+		'/ai-settings/openai-models/refresh',
+		asyncHandler( async ( _req: Request, res: Response ) => {
+			res.json( await refreshOpenAiModels() );
+		} )
+	);
+
+	api.patch(
+		'/ai-settings/openai-defaults',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			if ( ! req.body || typeof req.body !== 'object' ) {
+				res.status( 400 ).json( { error: 'OpenAI defaults must be an object' } );
+				return;
+			}
+			res.json( await setOpenAiDefaults( req.body ) );
 		} )
 	);
 
@@ -2246,6 +2302,14 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 	);
 
 	api.post(
+		'/sessions/:id/openai-selection',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			await setSessionOpenAiSelection( sessionsRoot, req.params.id, req.body ?? {} );
+			res.sendStatus( 204 );
+		} )
+	);
+
+	api.post(
 		'/sessions/:id/environment',
 		asyncHandler( async ( req: Request, res: Response ) => {
 			const { environment } = req.body as { environment?: string };
@@ -2461,8 +2525,18 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 	}
 
 	app.use( ( err: unknown, _req: Request, res: Response, _next: ( e?: unknown ) => void ) => {
-		if ( err instanceof InvalidAnthropicApiKeyError ) {
+		if (
+			err instanceof InvalidAnthropicApiKeyError ||
+			err instanceof InvalidOpenAiApiKeyError ||
+			err instanceof OpenAiSettingsError
+		) {
 			res.status( 400 ).json( { error: err.message } );
+			return;
+		}
+		// The system keychain refused or isn't there; the UI then offers a key
+		// for this session only.
+		if ( err instanceof SecureStorageError ) {
+			res.status( 409 ).json( { error: err.message } );
 			return;
 		}
 		const message = err instanceof Error ? err.message : String( err );

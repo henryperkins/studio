@@ -5,7 +5,12 @@ import {
 	listStudioSessionFiles,
 	openStudioSession,
 } from '@studio/agent/node/sessions/pi-session';
-import { readAnthropicApiKey, readSelectedAiProvider } from '@studio/agent/node/settings-store';
+import {
+	readAiSettings,
+	readAnthropicApiKey,
+	readSelectedAiProvider,
+} from '@studio/agent/node/settings-store';
+import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { fetchStudioAssistantQuota } from '@studio/common/lib/studio-assistant-quota';
 import { vi, type Mock } from 'vitest';
@@ -51,9 +56,12 @@ vi.mock( 'cli/ai/providers', () => ( {
 		defaultModel: 'claude-sonnet-5',
 	} ),
 	getStudioUserAgent: () => 'WordPressStudio',
+	readOpenAiKeyForTurn: vi.fn( async () => null ),
 } ) );
 vi.mock( '@studio/agent/node/settings-store', () => ( {
+	readAiSettings: vi.fn(),
 	readAnthropicApiKey: vi.fn(),
+	readOpenAiApiKey: vi.fn().mockResolvedValue( null ),
 	readSelectedAiProvider: vi.fn().mockResolvedValue( 'wpcom' ),
 } ) );
 vi.mock( 'cli/lib/cli-config/sites', () => ( {
@@ -197,6 +205,11 @@ describe( 'AI runCommand — resume by id restores session model', () => {
 
 		( listStudioSessionFiles as Mock ).mockResolvedValue( [ '/sessions/session-1.jsonl' ] );
 		( openStudioSession as Mock ).mockResolvedValue( mockSm );
+		// The run reads the recorded model from the session's context when it starts.
+		const { resolveResumeSessionContext: readContext } = await vi.importActual<
+			typeof import('@studio/agent/node/sessions/context')
+		>( '@studio/agent/node/sessions/context' );
+		( resolveResumeSessionContext as Mock ).mockImplementationOnce( readContext );
 
 		await runCommand( {
 			adapter: new JsonAdapter(),
@@ -207,6 +220,70 @@ describe( 'AI runCommand — resume by id restores session model', () => {
 		expect( runStudioAgentTurn ).toHaveBeenCalledTimes( 1 );
 		const callArgs = ( runStudioAgentTurn as Mock ).mock.calls[ 0 ][ 1 ] as { model: string };
 		expect( callArgs.model ).toBe( 'claude-opus-5' );
+	} );
+
+	it( 'chooses the provider from the conversation it names', async () => {
+		const sessionEntries = [
+			{
+				type: 'custom',
+				id: 'e1',
+				parentId: null,
+				timestamp: '2024-01-01T00:00:00Z',
+				customType: 'studio.session_context',
+				data: { provider: 'openai-api-key', model: 'gpt-6.1-sol' },
+			},
+		];
+		( listStudioSessionFiles as Mock ).mockResolvedValue( [ '/sessions/session-1.jsonl' ] );
+		( openStudioSession as Mock ).mockResolvedValue( {
+			appendCustomEntry: vi.fn( () => 'entry-id' ),
+			getSessionId: () => 'resume-id-123',
+			getEntries: () => sessionEntries,
+		} );
+		( resolveResumeSessionContext as Mock ).mockImplementationOnce(
+			( session?: { entries: unknown[] } ) =>
+				session?.entries === sessionEntries
+					? { provider: 'openai-api-key', model: 'gpt-6.1-sol' }
+					: { provider: undefined, model: undefined }
+		);
+		( readAiSettings as Mock ).mockResolvedValue( {
+			provider: 'wpcom',
+			hasAnthropicApiKey: false,
+			hasOpenAiApiKey: true,
+			openAi: { ...createDisconnectedOpenAiSettings(), keyStorage: 'keychain' },
+		} );
+		( isAiProviderReady as Mock ).mockResolvedValue( true );
+		( resolveAiEnvironment as Mock ).mockResolvedValue( { STUDIO_OPENAI_API_KEY: 'sk-test' } );
+
+		await runCommand( {
+			adapter: new JsonAdapter(),
+			initialMessage: 'hello',
+			resumeSessionId: 'resume-id-123',
+		} );
+
+		expect( resolveResumeSessionContext ).toHaveBeenCalledWith( {
+			summary: { id: 'resume-id-123' },
+			entries: sessionEntries,
+		} );
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'openai-api-key', expect.anything() );
+	} );
+
+	it( 'tells a JSON client when the conversation it names can’t be found', async () => {
+		( listStudioSessionFiles as Mock ).mockResolvedValue( [] );
+		const previousExitCode = process.exitCode;
+		onTestFinished( () => {
+			process.exitCode = previousExitCode;
+		} );
+
+		const adapter = new JsonAdapter();
+		const showError = vi.spyOn( adapter, 'showError' );
+		const emitTurnCompleted = vi.spyOn( adapter, 'emitTurnCompleted' );
+
+		await runCommand( { adapter, initialMessage: 'hello', resumeSessionId: 'missing-id' } );
+
+		expect( showError ).toHaveBeenCalledWith( expect.stringContaining( 'missing-id' ) );
+		expect( emitTurnCompleted ).toHaveBeenCalledWith( 'error', '' );
+		expect( process.exitCode ).toBe( 1 );
+		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
 	} );
 } );
 
@@ -586,5 +663,278 @@ describe( 'AI runCommand — pinned provider falls back when unusable', () => {
 		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'anthropic-api-key', expect.anything() );
 		// The Desktop wpcom default must not overwrite the pin on disk.
 		expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
+	} );
+} );
+
+describe( 'AI runCommand — OpenAI conversations', () => {
+	let stdoutSpy: ReturnType< typeof vi.spyOn >;
+	let entries: unknown[];
+	let appendCustomEntry: Mock;
+
+	const contextEntry = ( data: Record< string, unknown > ) => ( {
+		type: 'custom',
+		id: Math.random().toString( 36 ).slice( 2 ),
+		parentId: null,
+		timestamp: new Date( 0 ).toISOString(),
+		customType: 'studio.session_context',
+		data,
+	} );
+	const resumeSession = {
+		summary: { id: 'openai-session', filePath: '/sessions/openai.jsonl' },
+		entries: [],
+	} as never;
+	const openAiSettings = ( overrides: Record< string, unknown > = {} ) => ( {
+		provider: 'wpcom',
+		hasAnthropicApiKey: false,
+		anthropicApiKeyPreview: null,
+		hasOpenAiApiKey: true,
+		openAi: { ...createDisconnectedOpenAiSettings(), keyStorage: 'keychain', ...overrides },
+	} );
+	const turnConfig = () => ( runStudioAgentTurn as Mock ).mock.calls.at( -1 )?.[ 1 ];
+
+	beforeEach( () => {
+		vi.clearAllMocks();
+		entries = [];
+		appendCustomEntry = vi.fn( ( customType: string, data: unknown ) => {
+			entries.push( { type: 'custom', customType, data } );
+			return 'entry-id';
+		} );
+		( openStudioSession as Mock ).mockResolvedValue( {
+			appendCustomEntry,
+			getSessionId: () => 'openai-session',
+			getEntries: () => entries,
+		} );
+		( readAuthToken as Mock ).mockResolvedValue( null );
+		( readSelectedAiProvider as Mock ).mockResolvedValue( 'wpcom' );
+		( resolveInitialAiProvider as Mock ).mockResolvedValue( 'wpcom' );
+		( readAiSettings as Mock ).mockResolvedValue( openAiSettings() );
+		( isAiProviderReady as Mock ).mockResolvedValue( true );
+		( resolveAiEnvironment as Mock ).mockResolvedValue( { STUDIO_OPENAI_API_KEY: 'sk-test' } );
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: 'openai-api-key',
+			model: 'gpt-6.1-sol',
+		} );
+		stdoutSpy = vi.spyOn( process.stdout, 'write' ).mockImplementation( () => true );
+	} );
+
+	afterEach( () => {
+		stdoutSpy.mockRestore();
+		process.exitCode = undefined;
+	} );
+
+	it( 'starts a new OpenAI conversation on the model chosen in Settings', async () => {
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: undefined,
+			model: undefined,
+		} );
+		( resolveInitialAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
+		( readAiSettings as Mock ).mockResolvedValue(
+			openAiSettings( { defaultModel: 'gpt-6-luna' } )
+		);
+		( createStudioSession as Mock ).mockResolvedValue( {
+			appendCustomEntry,
+			getSessionId: () => 'new-session',
+			getEntries: () => entries,
+		} );
+		const adapter = new JsonAdapter();
+		const shown: unknown[] = [];
+		Object.defineProperty( adapter, 'currentModel', {
+			get: () => shown.at( -1 ),
+			set: ( model ) => shown.push( model ),
+		} );
+
+		await runCommand( { adapter, initialMessage: 'hello' } );
+
+		// Before the first turn too, so /reasoning and /clear record the right one.
+		expect( shown[ 0 ] ).toBe( 'gpt-6-luna' );
+		expect( turnConfig()?.openAi ).toMatchObject( { model: 'gpt-6-luna' } );
+	} );
+
+	it( 'keeps a chat that ran on OpenAI there on the app’s first run, pin or not', async () => {
+		( readSelectedAiProvider as Mock ).mockResolvedValue( undefined );
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: undefined,
+			model: undefined,
+			lastReplyProvider: 'openai-api-key',
+		} );
+		entries.push( contextEntry( { model: 'gpt-6.1-sol', reasoningEffort: 'medium' } ) );
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'hello', resumeSession } );
+
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'openai-api-key', expect.anything() );
+		expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
+		expect( appendCustomEntry ).not.toHaveBeenCalledWith(
+			'studio.session_context',
+			expect.objectContaining( { provider: 'wpcom' } )
+		);
+	} );
+
+	it( 'stays on OpenAI without a key, failing the turn as disconnected', async () => {
+		( isAiProviderReady as Mock ).mockResolvedValue( false );
+		( resolveAiEnvironment as Mock ).mockRejectedValue( new Error( 'OpenAI isn’t connected' ) );
+		entries.push( contextEntry( { provider: 'openai-api-key', model: 'gpt-6.1-sol' } ) );
+		const adapter = new JsonAdapter();
+		const showError = vi.spyOn( adapter, 'showError' );
+
+		await runCommand( { adapter, initialMessage: 'hello', resumeSession } );
+
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'openai-api-key', expect.anything() );
+		expect( resolveAiEnvironment ).not.toHaveBeenCalledWith( 'wpcom', expect.anything() );
+		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
+		expect( showError ).toHaveBeenCalledWith( 'OpenAI isn’t connected' );
+	} );
+
+	it( 'runs with the model, effort and mode the conversation recorded', async () => {
+		entries.push(
+			contextEntry( {
+				provider: 'openai-api-key',
+				model: 'gpt-6-astra',
+				reasoningEffort: 'xhigh',
+				reasoningMode: 'pro',
+			} )
+		);
+		( readAiSettings as Mock ).mockResolvedValue( openAiSettings( { maxOutputTokens: 64_000 } ) );
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'hello', resumeSession } );
+
+		expect( turnConfig() ).toMatchObject( {
+			model: 'gpt-6-astra',
+			openAi: {
+				model: 'gpt-6-astra',
+				apiModelId: 'gpt-6-astra',
+				reasoningEffort: 'xhigh',
+				reasoningMode: 'pro',
+				maxOutputTokens: 64_000,
+			},
+		} );
+		// Already pinned: the per-turn record carries only the model.
+		expect( appendCustomEntry ).toHaveBeenCalledWith( 'studio.session_context', {
+			model: 'gpt-6-astra',
+		} );
+	} );
+
+	it( 'pins the defaults on a conversation’s first OpenAI turn', async () => {
+		entries.push( contextEntry( { provider: 'openai-api-key', model: 'gpt-6.1-sol' } ) );
+		( readAiSettings as Mock ).mockResolvedValue(
+			openAiSettings( { defaultReasoningEffort: 'high' } )
+		);
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'hello', resumeSession } );
+
+		expect( turnConfig()?.openAi ).toMatchObject( {
+			reasoningEffort: 'high',
+			reasoningMode: 'standard',
+		} );
+		expect( appendCustomEntry ).toHaveBeenCalledWith( 'studio.session_context', {
+			provider: 'openai-api-key',
+			model: 'gpt-6.1-sol',
+			reasoningEffort: 'high',
+			reasoningMode: 'standard',
+		} );
+	} );
+
+	it( 'fixes the settings when the turn starts; a change made during it applies next turn', async () => {
+		entries.push(
+			contextEntry( {
+				provider: 'openai-api-key',
+				model: 'gpt-6-luna',
+				reasoningEffort: 'medium',
+				reasoningMode: 'standard',
+			} )
+		);
+		( runStudioAgentTurn as Mock ).mockImplementationOnce( () => {
+			// The user picks another effort while the turn runs.
+			entries.push(
+				contextEntry( { provider: 'openai-api-key', model: 'gpt-6-luna', reasoningEffort: 'none' } )
+			);
+			return { result: Promise.resolve(), interrupt: vi.fn(), hasTool: () => true };
+		} );
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'first', resumeSession } );
+		expect( turnConfig()?.openAi?.reasoningEffort ).toBe( 'medium' );
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'second', resumeSession } );
+		expect( turnConfig()?.openAi?.reasoningEffort ).toBe( 'none' );
+	} );
+
+	it.each( [
+		[
+			{ model: 'gpt-6-astra', reasoningEffort: 'none' },
+			/GPT-6 Astra doesn’t support “None” reasoning\. Choose one of: Low, Medium, High, Extra high, Max\./,
+		],
+		[ { model: 'gpt-5.6-sol' }, /doesn’t support the OpenAI model “gpt-5\.6-sol”/ ],
+	] )( 'blocks %j with a way to fix it, before contacting OpenAI', async ( data, message ) => {
+		entries.push( contextEntry( { provider: 'openai-api-key', ...data } ) );
+		const adapter = new JsonAdapter();
+		const showError = vi.spyOn( adapter, 'showError' );
+
+		await runCommand( { adapter, initialMessage: 'hello', resumeSession } );
+
+		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
+		expect( resolveAiEnvironment ).not.toHaveBeenCalled();
+		expect( showError ).toHaveBeenCalledWith( expect.stringMatching( message ) );
+	} );
+
+	it( 'keeps a conversation that ran on WordPress.com there when OpenAI is the default', async () => {
+		( readSelectedAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: undefined,
+			model: 'fast',
+		} );
+		( resolveAiEnvironment as Mock ).mockResolvedValue( {} );
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'hello', resumeSession } );
+
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'wpcom', expect.anything() );
+		expect( turnConfig()?.openAi ).toBeUndefined();
+	} );
+
+	it( 'doesn’t ask how to connect when a terminal first resumes an OpenAI conversation', async () => {
+		// No provider was ever saved: a terminal's first run.
+		( readSelectedAiProvider as Mock ).mockResolvedValue( undefined );
+		entries.push( contextEntry( { provider: 'openai-api-key', model: 'gpt-6.1-sol' } ) );
+		const json = new JsonAdapter();
+		const askUser = vi
+			.spyOn( json, 'askUser' )
+			.mockResolvedValue( { connect: 'WordPress.com (recommended)' } );
+		// An interactive adapter: anything but the JSON one.
+		const terminal = new Proxy( json, { getPrototypeOf: () => Object.prototype } );
+
+		// The turn runs; only then would the chat loop need the real terminal UI.
+		await expect(
+			runCommand( { adapter: terminal, initialMessage: 'hello', resumeSession } )
+		).rejects.toThrow( 'Interactive mode requires AiChatUI adapter' );
+
+		expect( askUser ).not.toHaveBeenCalled();
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'openai-api-key', expect.anything() );
+		expect(
+			appendCustomEntry.mock.calls.some(
+				( [ type, data ] ) => type === 'studio.session_context' && data.provider === 'wpcom'
+			)
+		).toBe( false );
+	} );
+
+	it( 'keeps an old conversation whose model Studio no longer offers off OpenAI', async () => {
+		( readSelectedAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
+		// As it resolves with OpenAI saved as the default.
+		( resolveInitialAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
+		// Its replies came from WordPress.com, on a model this build dropped.
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: undefined,
+			model: undefined,
+			lastReplyProvider: 'wpcom',
+		} );
+		( resolveAiEnvironment as Mock ).mockResolvedValue( {} );
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'hello', resumeSession } );
+
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'wpcom', expect.anything() );
+		expect( turnConfig()?.openAi ).toBeUndefined();
+		expect(
+			appendCustomEntry.mock.calls.some(
+				( [ type, data ] ) =>
+					type === 'studio.session_context' && data.provider === 'openai-api-key'
+			)
+		).toBe( false );
 	} );
 } );

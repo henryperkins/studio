@@ -1,6 +1,6 @@
 import { screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { createFakeConnector, makeSite } from '@/test/fake-connector';
+import { createFakeConnector, makeSite, withoutOpenAi } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { Connector } from '@/data/core';
 import type { AiSettings } from '@studio/agent/protocol/providers';
@@ -12,6 +12,7 @@ const withKey = ( provider: AiSettings[ 'provider' ] ): Partial< Connector > => 
 		provider,
 		hasAnthropicApiKey: true,
 		anthropicApiKeyPreview: 'test',
+		...withoutOpenAi(),
 	} ),
 } );
 

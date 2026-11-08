@@ -2,7 +2,13 @@ import type { ActiveAgentRun, AgentRunEvent } from '@studio/agent/protocol/agent
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type { AiModelId } from '@studio/agent/protocol/models';
-import type { AiProviderId, AiSettings } from '@studio/agent/protocol/providers';
+import type {
+	AiProviderId,
+	AiSettings,
+	OpenAiDefaultsUpdate,
+	OpenAiKeyStorage,
+	OpenAiSessionSelection,
+} from '@studio/agent/protocol/providers';
 import type {
 	AiSessionMetadata,
 	AiSessionSummary,
@@ -428,6 +434,13 @@ export interface Connector {
 		provider: AiProviderId,
 		model: AiModelId
 	): Promise< void >;
+	// Pin the session to OpenAI with a model, reasoning effort and mode, in one
+	// entry the CLI reads when the next turn starts. Rejects a combination the
+	// model doesn't support.
+	setSessionOpenAiSelection(
+		sessionId: string,
+		selection: OpenAiSessionSelection
+	): Promise< void >;
 	// Point the session's next turn at its local site or its connected live site.
 	setSessionEnvironment( sessionId: string, environment: 'local' | 'live' ): Promise< void >;
 	interruptAgentRun( runId: string ): Promise< void >;
@@ -484,6 +497,14 @@ export interface Connector {
 	saveAnthropicApiKey( key: string | null ): Promise< AiSettings >;
 	// The provider new conversations use.
 	setAiProvider( provider: AiProviderId ): Promise< AiSettings >;
+	// The OpenAI key goes to the system keychain — or, when there is none and the
+	// user chooses, the backend's memory for this app session — and never comes
+	// back. A keychain save on a machine without one rejects.
+	saveOpenAiApiKey( key: string, storage: OpenAiKeyStorage ): Promise< AiSettings >;
+	removeOpenAiApiKey(): Promise< AiSettings >;
+	// Reads the project's model list again; a failure keeps the previous list.
+	refreshOpenAiModels(): Promise< AiSettings >;
+	setOpenAiDefaults( update: OpenAiDefaultsUpdate ): Promise< AiSettings >;
 
 	// Apps detected on disk (editors + terminals). Options in the preferences
 	// form are filtered against this so users can't pick something that isn't

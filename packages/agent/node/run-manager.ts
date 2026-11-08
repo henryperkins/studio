@@ -8,6 +8,10 @@ import { captureException } from '@studio/common/lib/error-reporting';
 import { updateSharedSession } from '@studio/common/lib/shared-config';
 import { recordAgentRun, recordAgentSend, type AgentSurface } from '@studio/agent/node/agent-stats';
 import {
+	answerOpenAiSessionKeyRequest,
+	getOpenAiSessionKeyForkEnvironment,
+} from '@studio/agent/node/openai-credentials';
+import {
 	getCreatedSiteFromArtifact,
 	setAiSessionSitePlacement,
 	type AiSessionPlacementUpdatedEvent,
@@ -216,6 +220,9 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			env: {
 				...process.env,
 				...( getTracksOrigin ? { STUDIO_TRACKS_ORIGIN: getTracksOrigin() } : {} ),
+				// Tells the turn it may ask for an OpenAI key kept for this app
+				// session; the key itself only goes over the IPC channel.
+				...getOpenAiSessionKeyForkEnvironment(),
 			},
 		} );
 
@@ -240,6 +247,15 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 		} );
 
 		child.on( 'message', ( message ) => {
+			if (
+				answerOpenAiSessionKeyRequest( message, ( reply ) => {
+					if ( child.connected ) {
+						child.send( reply );
+					}
+				} )
+			) {
+				return;
+			}
 			// The CLI's `Logger` also writes to this IPC channel with a different
 			// shape (`{ action, status, message }`) on error paths. Forward only
 			// messages that look like the CLI JSON transport envelope.

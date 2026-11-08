@@ -31,6 +31,7 @@ import { FamilySwitchConfirmDialog } from '@/features/composer/family-switch-con
 import { ModeChip } from '@/features/composer/mode-chip';
 import { ModelPicker } from '@/features/composer/model-picker';
 import { NoticeTab, type ComposerNotice } from '@/features/composer/notice-tab';
+import { ReasoningPicker } from '@/features/composer/reasoning-picker';
 import { SendButton, StartButton, StopButton } from '@/features/composer/submit-button';
 import { useAddCredits } from '@/features/composer/use-add-credits';
 import { useCommandSheet } from '@/features/composer/use-command-sheet';
@@ -54,6 +55,7 @@ import {
 import styles from './style.module.css';
 import type { AiModelId, SessionEntry, StudioVisualAnnotationSummary } from '@/data/core';
 import type { ComposerAttachment, ComposerSendAttachments } from '@/data/use-composer-attachments';
+import type { OpenAiConversation } from '@/features/composer/use-openai-conversation';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
 
 /**
@@ -118,6 +120,8 @@ interface ComposerProps {
 	onModelChange?: ( model: AiModelId, provider: AiProviderId ) => void;
 	// Why the chat can't send right now; a send attempt shakes it.
 	notice?: ComposerNotice;
+	// The reasoning of a chat on OpenAI.
+	openAi?: OpenAiConversation;
 }
 
 function shouldShellFocusTextarea( target: EventTarget ) {
@@ -159,6 +163,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		annotationSiteId,
 		onModelChange,
 		notice: blockingNotice,
+		openAi,
 	},
 	ref
 ) {
@@ -195,7 +200,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 	const draftEffectInitializedRef = useRef( false );
 	const openSettings = useOpenSettings();
 
-	const { sessionProvider, providers, isModelLocked } = useModelAccess( {
+	const { sessionProvider, providers, isModelLocked, getModelLockReason } = useModelAccess( {
 		sessionId,
 		entries,
 		provider,
@@ -603,11 +608,21 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 									model={ model }
 									providers={ providers }
 									sessionProvider={ sessionProvider }
-									isModelLocked={ isModelLocked }
+									getModelLockReason={ getModelLockReason }
 									disabled={ busy }
 									anchor={ rootNode }
 									onChange={ changeModel }
 									onAddCredits={ openAddCredits }
+								/>
+							) : null }
+							{ openAi ? (
+								// Stays available during a turn: a change applies to the next one.
+								<ReasoningPicker
+									capabilities={ openAi.capabilities }
+									effort={ openAi.selection.reasoningEffort }
+									mode={ openAi.selection.reasoningMode }
+									disabled={ false }
+									onChange={ openAi.changeReasoning }
 								/>
 							) : null }
 							{ isField ? null : showStop ? (

@@ -1,3 +1,4 @@
+import { isOpenAiModelId } from '@studio/agent/protocol/openai-models';
 import {
 	getEffectiveSessionProvider,
 	resolveSessionModelForProvider,
@@ -40,6 +41,7 @@ import {
 	useStopSite,
 } from '@/data/queries/use-sites';
 import { useUserPreferences } from '@/data/queries/use-user-preferences';
+import { useEntriesWithSettingChanges } from '@/data/session-setting-changes';
 import { useSiteSelectionTime } from '@/data/use-open-site';
 import { SessionUIProvider, useOptionalSessionPreviewUI } from '@/data/use-session-ui';
 import { useStartSiteWithChat } from '@/data/use-start-site-with-chat';
@@ -60,6 +62,7 @@ import {
 	ComposerSkeleton,
 	pendingPromptSlot,
 	useComposerNotice,
+	useOpenAiConversation,
 	type ComposerHandle,
 } from '@/features/composer';
 import { PreviewParticles, StoppedSitePreview } from '@/features/sites';
@@ -145,27 +148,53 @@ function SessionViewContent( {
 	// back to pending; only the first check holds the chat back.
 	const isQuotaLoading = isQuotaPending && ! isQuotaFetched;
 	const { data: aiSettings } = useAiSettings();
+	// With the model, provider and reasoning changes still being written.
+	const entries = useEntriesWithSettingChanges( sessionId, data?.entries );
 	const sessionProvider =
-		( ! sessionId && draft.provider ) ||
-		getEffectiveSessionProvider( data?.entries ?? [], aiSettings );
+		( ! sessionId && draft.provider ) || getEffectiveSessionProvider( entries ?? [], aiSettings );
 	const isWpcom = sessionProvider === 'wpcom';
-	const notice = useComposerNotice( sessionProvider, ownerSite?.id );
 	// A fresh wpcom session defaults to balanced when the paid tiers are
-	// unlocked, fast otherwise.
+	// unlocked, fast otherwise; an OpenAI one to the model chosen in Settings.
 	const defaultModel = useMemo(
 		() =>
-			resolveSessionModelForProvider( data?.entries ?? [], sessionProvider, {
+			resolveSessionModelForProvider( entries ?? [], sessionProvider, {
 				canUsePaidModels: canUsePaidAiModels( quota, authUser?.email ),
+				openAiDefaultModel: aiSettings?.openAi.defaultModel,
 			} ),
-		[ data?.entries, sessionProvider, quota, authUser?.email ]
+		[ entries, sessionProvider, quota, authUser?.email, aiSettings?.openAi.defaultModel ]
 	);
-	const currentModel = ( ! sessionId && draft.model ) || defaultModel;
+	const draftModel = ( ! sessionId && draft.model ) || defaultModel;
+	const openAi = useOpenAiConversation( {
+		provider: sessionProvider,
+		sessionId,
+		entries,
+		model: draftModel,
+		draft,
+		onDraftChange: updateDraft,
+	} );
+	// An OpenAI chat shows the model it recorded, even one it can't use yet.
+	const openAiModel = openAi?.selection.model;
+	const currentModel = openAiModel && isOpenAiModelId( openAiModel ) ? openAiModel : draftModel;
+	const notice = useComposerNotice( sessionProvider, ownerSite?.id ) ?? openAi?.notice;
+	const openAiSelection = openAi?.settings;
 	const sendMessage = useCallback(
 		( prompt: string, options?: Parameters< typeof sendSessionMessage >[ 1 ] ) =>
 			sessionId
 				? sendSessionMessage( prompt, options )
-				: sendDraft( prompt, options, sessionProvider, currentModel ),
-		[ sessionId, sendSessionMessage, sendDraft, sessionProvider, currentModel ]
+				: sendDraft(
+						prompt,
+						options,
+						sessionProvider,
+						currentModel,
+						openAiSelection
+							? {
+									model: openAiSelection.model,
+									reasoningEffort: openAiSelection.reasoningEffort,
+									reasoningMode: openAiSelection.reasoningMode,
+							  }
+							: undefined
+				  ),
+		[ sessionId, sendSessionMessage, sendDraft, sessionProvider, currentModel, openAiSelection ]
 	);
 	const pendingQuestionTexts = useMemo(
 		() => new Set( pendingQuestions.map( ( q ) => q.question ) ),
@@ -499,7 +528,7 @@ function SessionViewContent( {
 							sessionId ? undefined : ( model, provider ) => updateDraft( { model, provider } )
 						}
 						autoFocus={ isEmpty }
-						entries={ data?.entries }
+						entries={ entries }
 						ownerSiteId={ ownerSite?.id }
 						onSwitchSession={ switchSession }
 						placeholder={ composerPlaceholder }
@@ -530,6 +559,7 @@ function SessionViewContent( {
 						dropTarget={ frameNode }
 						annotationSiteId={ annotationSiteId }
 						notice={ notice }
+						openAi={ openAi }
 					/>
 				</div>
 			}

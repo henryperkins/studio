@@ -224,13 +224,18 @@ export function SettingsSelect< TValue extends string >( {
 }: {
 	label: string;
 	value: TValue;
-	options: Array< { value: TValue; label: string } >;
+	// A disabled option stays listed, so it can say why it can't be chosen.
+	options: Array< { value: TValue; label: string; disabled?: boolean } >;
 	disabled?: boolean;
 	onChange: ( value: TValue ) => void;
 } ) {
 	const control = useContext( SettingsRowContext );
 	return (
 		<Select
+			// When the selected value leaves the list (another model's efforts, say),
+			// Base UI resets it to the value it mounted with and reports that as a
+			// change. A new list gets a new Select instead, so only the user changes it.
+			key={ options.map( ( option ) => option.value ).join( '\n' ) }
 			items={ options }
 			value={ options.some( ( option ) => option.value === value ) ? value : null }
 			disabled={ disabled }
@@ -245,7 +250,7 @@ export function SettingsSelect< TValue extends string >( {
 			</SelectTrigger>
 			<SelectContent>
 				{ options.map( ( option ) => (
-					<SelectItem key={ option.value } value={ option.value }>
+					<SelectItem key={ option.value } value={ option.value } disabled={ option.disabled }>
 						{ option.label }
 					</SelectItem>
 				) ) }

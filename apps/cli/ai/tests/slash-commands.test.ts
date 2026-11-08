@@ -1,3 +1,6 @@
+import { readAiSettings, removeOpenAiApiKey } from '@studio/agent/node/settings-store';
+import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
+import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { isAutomatticianFromToken, readAuthToken } from '@studio/common/lib/shared-config';
 import { fetchStudioAssistantQuota } from '@studio/common/lib/studio-assistant-quota';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +11,11 @@ vi.mock( 'cli/ai/auth', () => ( {
 	isAiProviderReady: vi.fn(),
 } ) );
 
+vi.mock( '@studio/agent/node/settings-store', async ( importOriginal ) => ( {
+	...( await importOriginal< typeof import('@studio/agent/node/settings-store') >() ),
+	readAiSettings: vi.fn(),
+	removeOpenAiApiKey: vi.fn(),
+} ) );
 vi.mock( 'cli/commands/auth/login', () => ( { runCommand: vi.fn() } ) );
 vi.mock( 'cli/commands/auth/logout', () => ( { runCommand: vi.fn() } ) );
 vi.mock( 'cli/commands/preview/create', () => ( { runCommand: vi.fn() } ) );
@@ -46,6 +54,8 @@ function buildModelCtx(
 		maybeAutoSwitchProvider: vi.fn().mockResolvedValue( undefined ),
 		persistSessionContext: persistMock,
 		clearSession: vi.fn().mockResolvedValue( undefined ),
+		getSessionEntries: vi.fn().mockResolvedValue( [] ),
+		persistOpenAiReasoning: vi.fn().mockResolvedValue( undefined ),
 	};
 	return { ctx, persistMock };
 }
@@ -202,6 +212,8 @@ describe( '/credits slash command', () => {
 			maybeAutoSwitchProvider: vi.fn().mockResolvedValue( undefined ),
 			persistSessionContext: vi.fn().mockResolvedValue( undefined ),
 			clearSession: vi.fn().mockResolvedValue( undefined ),
+			getSessionEntries: vi.fn().mockResolvedValue( [] ),
+			persistOpenAiReasoning: vi.fn().mockResolvedValue( undefined ),
 		};
 	}
 
@@ -343,5 +355,123 @@ describe( '/credits slash command', () => {
 		expect( m.browser.openBrowser ).not.toHaveBeenCalled();
 		expect( ui.showInfo ).toHaveBeenCalledWith( 'Canceled.' );
 		expect( result ).toBe( 'continue' );
+	} );
+} );
+
+describe( '/openai-key slash command', () => {
+	const handler = AI_CHAT_SLASH_COMMANDS.find( ( c ) => c.name === 'openai-key' )!.handler!;
+	const KEYCHAIN_DOWN = 'Couldn’t open the system keychain: no session bus.';
+
+	beforeEach( () => {
+		vi.mocked( readAiSettings ).mockResolvedValue( {
+			hasOpenAiApiKey: true,
+			openAi: createDisconnectedOpenAiSettings(),
+		} as never );
+	} );
+
+	it( 'says why the keychain couldn’t return the key, and still offers to remove it', async () => {
+		const reason = 'Couldn’t read from the system keychain: User interaction is not allowed.';
+		vi.mocked( readAiSettings ).mockResolvedValue( {
+			hasOpenAiApiKey: false,
+			openAi: { ...createDisconnectedOpenAiSettings(), keyError: reason },
+		} as never );
+		vi.mocked( removeOpenAiApiKey ).mockResolvedValue( {} as never );
+		const { ctx } = buildModelCtx( { askUserResponse: 'Remove the key' } );
+
+		await expect( handler( '', ctx ) ).resolves.toBe( 'continue' );
+
+		expect( ctx.ui.showError ).toHaveBeenCalledWith( expect.stringContaining( reason ) );
+		expect( removeOpenAiApiKey ).toHaveBeenCalled();
+		expect( ctx.prepareProviderSelection ).not.toHaveBeenCalled();
+	} );
+
+	it( 'keeps the chat open and says why when the key can’t be removed', async () => {
+		const { ctx } = buildModelCtx( { askUserResponse: 'Remove the key' } );
+		vi.mocked( removeOpenAiApiKey ).mockRejectedValue( new SecureStorageError( KEYCHAIN_DOWN ) );
+
+		await expect( handler( '', ctx ) ).resolves.toBe( 'continue' );
+
+		expect( ctx.ui.showError ).toHaveBeenCalledWith( KEYCHAIN_DOWN );
+		expect( ctx.ui.showInfo ).not.toHaveBeenCalledWith( expect.stringMatching( /removed/ ) );
+	} );
+
+	it( 'keeps the chat open and says why when a new key can’t be saved', async () => {
+		const { ctx } = buildModelCtx( { askUserResponse: 'Enter a new key' } );
+		vi.mocked( ctx.prepareProviderSelection ).mockRejectedValue(
+			new SecureStorageError( KEYCHAIN_DOWN )
+		);
+
+		await expect( handler( '', ctx ) ).resolves.toBe( 'continue' );
+
+		expect( ctx.ui.showError ).toHaveBeenCalledWith( KEYCHAIN_DOWN );
+		expect( ctx.ui.showInfo ).not.toHaveBeenCalledWith( expect.stringMatching( /updated/ ) );
+	} );
+
+	it( 'leaves the key alone when the menu is closed without a choice', async () => {
+		const { ctx } = buildModelCtx( { askUserResponse: '' } );
+		vi.mocked( ctx.ui.askUser ).mockResolvedValue( {} );
+
+		await expect( handler( '', ctx ) ).resolves.toBe( 'continue' );
+
+		expect( ctx.prepareProviderSelection ).not.toHaveBeenCalled();
+		expect( removeOpenAiApiKey ).not.toHaveBeenCalled();
+		expect( ctx.ui.showInfo ).toHaveBeenCalledWith( 'API key update canceled.' );
+	} );
+} );
+
+describe( '/reasoning slash command', () => {
+	const handler = AI_CHAT_SLASH_COMMANDS.find( ( c ) => c.name === 'reasoning' )!.handler!;
+	const pin = ( data: Record< string, unknown > ) =>
+		( {
+			type: 'custom',
+			id: 'pin',
+			parentId: null,
+			timestamp: new Date( 0 ).toISOString(),
+			customType: 'studio.session_context',
+			data: { provider: 'openai-api-key', ...data },
+		} ) as never;
+
+	function openAiCtx( entries: unknown[], currentModel: string ) {
+		const { ctx } = buildModelCtx( { askUserResponse: '' } );
+		Object.assign( ctx, { currentProvider: 'openai-api-key', currentModel } );
+		vi.mocked( ctx.getSessionEntries ).mockResolvedValue( entries as never );
+		vi.mocked( ctx.ui.askUser ).mockResolvedValue( {
+			'Reasoning effort': 'High',
+			'Reasoning mode': 'Standard',
+		} );
+		return ctx;
+	}
+
+	beforeEach( () => {
+		vi.mocked( readAiSettings ).mockResolvedValue( {
+			openAi: createDisconnectedOpenAiSettings(),
+		} as never );
+	} );
+
+	it( 'changes the reasoning of the conversation’s own model', async () => {
+		const ctx = openAiCtx(
+			[ pin( { model: 'gpt-6-luna', reasoningEffort: 'medium', reasoningMode: 'standard' } ) ],
+			'gpt-6-luna'
+		);
+
+		await expect( handler( '', ctx ) ).resolves.toBe( 'continue' );
+
+		expect( ctx.persistOpenAiReasoning ).toHaveBeenCalledWith( 'gpt-6-luna', 'high', 'standard' );
+	} );
+
+	it( 'won’t move a conversation off a model Studio dropped by changing its reasoning', async () => {
+		// The terminal shows the default model; the conversation recorded one Studio dropped.
+		const ctx = openAiCtx(
+			[ pin( { model: 'gpt-5.6-sol', reasoningEffort: 'medium', reasoningMode: 'standard' } ) ],
+			'gpt-6.1-sol'
+		);
+
+		await expect( handler( '', ctx ) ).resolves.toBe( 'continue' );
+
+		expect( ctx.ui.askUser ).not.toHaveBeenCalled();
+		expect( ctx.persistOpenAiReasoning ).not.toHaveBeenCalled();
+		expect( ctx.ui.showError ).toHaveBeenCalledWith(
+			expect.stringContaining( 'doesn’t support the OpenAI model “gpt-5.6-sol”' )
+		);
 	} );
 } );
