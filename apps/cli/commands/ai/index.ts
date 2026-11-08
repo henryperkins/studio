@@ -306,10 +306,21 @@ export async function runCommand( options: {
 	const agent = createAgent( { host } );
 	// `--resume-session <id>` names the conversation by id: open it now, so its
 	// pin and replies choose the provider as they do for any resumed one.
-	const resumedById =
-		! options.resumeSession && options.resumeSessionId
-			? await findSessionById( agent, options.resumeSessionId )
-			: undefined;
+	let resumedById: SessionManager | undefined;
+	if ( ! options.resumeSession && options.resumeSessionId ) {
+		try {
+			resumedById = await findSessionById( agent, options.resumeSessionId );
+		} catch ( error ) {
+			if ( ! ( ui instanceof JsonAdapter ) ) {
+				throw error;
+			}
+			// A JSON client hears of it the way it hears of a failed turn.
+			process.exitCode = 1;
+			ui.showError( error instanceof Error ? error.message : String( error ) );
+			ui.emitTurnCompleted( 'error', '' );
+			return;
+		}
+	}
 	const resumeContext = resolveResumeSessionContext(
 		options.resumeSession ??
 			( resumedById && {

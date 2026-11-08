@@ -266,6 +266,25 @@ describe( 'AI runCommand — resume by id restores session model', () => {
 		} );
 		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'openai-api-key', expect.anything() );
 	} );
+
+	it( 'tells a JSON client when the conversation it names can’t be found', async () => {
+		( listStudioSessionFiles as Mock ).mockResolvedValue( [] );
+		const previousExitCode = process.exitCode;
+		onTestFinished( () => {
+			process.exitCode = previousExitCode;
+		} );
+
+		const adapter = new JsonAdapter();
+		const showError = vi.spyOn( adapter, 'showError' );
+		const emitTurnCompleted = vi.spyOn( adapter, 'emitTurnCompleted' );
+
+		await runCommand( { adapter, initialMessage: 'hello', resumeSessionId: 'missing-id' } );
+
+		expect( showError ).toHaveBeenCalledWith( expect.stringContaining( 'missing-id' ) );
+		expect( emitTurnCompleted ).toHaveBeenCalledWith( 'error', '' );
+		expect( process.exitCode ).toBe( 1 );
+		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
+	} );
 } );
 
 describe( 'AI runCommand — active site banner running state', () => {
