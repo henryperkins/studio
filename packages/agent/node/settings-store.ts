@@ -41,6 +41,7 @@ import {
 	type OpenAiReasoningMode,
 } from '@studio/agent/protocol/openai-models';
 import {
+	applyOpenAiDefaultsUpdate,
 	DEFAULT_AI_PROVIDER,
 	isAiProviderId,
 	type AiProviderId,
@@ -295,6 +296,7 @@ function toAiSettings(
 	config: AiProviderConfig,
 	openAiConfig: OpenAiConfig,
 	openAiKey: OpenAiKeySource | null,
+	keyError: string | null,
 	secureStorageAvailable: boolean
 ): AiSettings {
 	const key = config.anthropicApiKey;
@@ -310,6 +312,7 @@ function toAiSettings(
 		openAi: {
 			keyStorage: openAiKey?.storage ?? null,
 			keyHint: openAiKey ? `…${ openAiKey.key.slice( -KEY_SUFFIX_LENGTH ) }` : null,
+			keyError,
 			secureStorage: secureStorageAvailable ? 'available' : 'unavailable',
 			...readOpenAiDefaults( openAiConfig, models ),
 			models,
@@ -339,10 +342,22 @@ export async function readAiSettings(): Promise< AiSettings > {
 		readAiProviderConfig(),
 		readOpenAiConfig(),
 		getSecureStorageStatus(),
-		// A keychain that can't be read right now reads as no key.
-		readOpenAiKeySource().catch( () => null ),
+		// A keychain that can't return its key right now is reported, not taken for no key.
+		readOpenAiKeySource().then(
+			( source ) => ( { source, error: null } ),
+			( error: unknown ) => ( {
+				source: null,
+				error: error instanceof Error ? error.message : String( error ),
+			} )
+		),
 	] );
-	return toAiSettings( config, openAiConfig, openAiKey, secureStorage.available );
+	return toAiSettings(
+		config,
+		openAiConfig,
+		openAiKey.source,
+		openAiKey.error,
+		secureStorage.available
+	);
 }
 
 async function updateAiProviderConfig( update: AiProviderConfig ): Promise< AiSettings > {
@@ -520,22 +535,19 @@ export function refreshOpenAiModels(): Promise< AiSettings > {
 }
 
 /**
- * Changes the defaults for new OpenAI conversations. The resulting
- * combination must be one the model supports; nothing is adjusted to fit.
- * It is worked out from the defaults saved when shared.json is locked, so a
- * default another app changed meanwhile is kept.
+ * Changes the defaults for new OpenAI conversations. A model change keeps the
+ * effort and mode when the model has them and otherwise takes its starting
+ * ones; a value given here is never adjusted, and the result must be a
+ * combination the model supports. It is worked out from the defaults saved
+ * when shared.json is locked, so a default another app changed meanwhile is kept.
  */
 export async function setOpenAiDefaults( update: OpenAiDefaultsUpdate ): Promise< AiSettings > {
-	// A keychain that can't be read right now reads as no key, as in readAiSettings.
+	// A keychain that can't return its key right now leaves the model list unknown.
 	const openAiKey = await readOpenAiKeySource().catch( () => null );
 	await updateSharedConfigFrom( ( config ) => {
 		const models = readStoredAvailability( config.openaiModels, openAiKey?.key );
-		const current = readOpenAiDefaults( config, models );
 		const result = resolveOpenAiTurnSettings( {
-			model: update.model ?? current.defaultModel,
-			reasoningEffort: update.reasoningEffort ?? current.defaultReasoningEffort,
-			reasoningMode: update.reasoningMode ?? current.defaultReasoningMode,
-			maxOutputTokens: update.maxOutputTokens ?? current.maxOutputTokens,
+			...applyOpenAiDefaultsUpdate( readOpenAiDefaults( config, models ), update ),
 			availableModelIds: models.availableModelIds,
 		} );
 		if ( ! result.ok ) {

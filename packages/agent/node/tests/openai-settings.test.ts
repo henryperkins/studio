@@ -348,6 +348,24 @@ describe( 'OpenAI settings', () => {
 			} );
 		} );
 
+		it( 'reports a key the keychain can’t return, rather than no key', async () => {
+			const { settings, storage } = await load();
+			await settings.saveOpenAiApiKey( KEY );
+			const reason = 'Couldn’t read from the system keychain: User interaction is not allowed.';
+			// The keychain answers, but can't return its item just now (a locked item, say).
+			keychain.current!.store.get = async () => {
+				throw new storage.SecureStorageError( reason );
+			};
+
+			const result = await settings.readAiSettings();
+
+			expect( result ).toMatchObject( {
+				hasOpenAiApiKey: false,
+				openAi: { keyStorage: null, keyError: reason, secureStorage: 'available' },
+			} );
+			expectNoKeyOutsideKeychain( result );
+		} );
+
 		it( 'checks the keychain again instead of trusting a failure it cached', async () => {
 			keychain.current!.items.set( 'openai-api-key', KEY );
 			keychain.current!.state.available = false;
@@ -637,6 +655,19 @@ describe( 'OpenAI settings', () => {
 				openaiDefaultModel: 'gpt-6-astra',
 				openaiDefaultReasoningEffort: 'high',
 			} );
+		} );
+
+		it( 'keeps the effort a new model has, and gives it its starting effort otherwise', async () => {
+			const { settings } = await load();
+			await settings.setOpenAiDefaults( { model: 'gpt-6-luna', reasoningEffort: 'high' } );
+			await expect( settings.setOpenAiDefaults( { model: 'gpt-6-astra' } ) ).resolves.toMatchObject(
+				{ openAi: { defaultModel: 'gpt-6-astra', defaultReasoningEffort: 'high' } }
+			);
+
+			await settings.setOpenAiDefaults( { model: 'gpt-6-luna', reasoningEffort: 'none' } );
+			await expect( settings.setOpenAiDefaults( { model: 'gpt-6-astra' } ) ).resolves.toMatchObject(
+				{ openAi: { defaultModel: 'gpt-6-astra', defaultReasoningEffort: 'medium' } }
+			);
 		} );
 
 		it( 'checks a change against the defaults another app saved while it waited', async () => {

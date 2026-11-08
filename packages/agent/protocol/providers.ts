@@ -9,10 +9,13 @@ import {
 	type AiModelId,
 } from '@studio/agent/protocol/models';
 import {
+	getInitialOpenAiReasoningEffort,
+	isOpenAiModelId,
 	OPENAI_DEFAULT_MAX_OUTPUT_TOKENS,
 	OPENAI_DEFAULT_MODEL,
 	OPENAI_DEFAULT_REASONING_MODE,
 	OPENAI_INITIAL_REASONING_EFFORT,
+	OPENAI_MODEL_CAPABILITIES,
 } from '@studio/agent/protocol/openai-models';
 import { isStudioCustomEntryOfType } from '@studio/agent/protocol/sessions/entry-types';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
@@ -284,6 +287,11 @@ export interface OpenAiProviderSettings {
 	keyStorage: OpenAiKeyStorage | null;
 	/** The key's last four characters, so the user can recognise it. */
 	keyHint: string | null;
+	/**
+	 * Why the keychain couldn't return its key just now (a locked item, say), or
+	 * null. A key may still be saved there, though none can be used.
+	 */
+	keyError: string | null;
 	/** Whether this machine's system keychain can keep a key. */
 	secureStorage: 'available' | 'unavailable';
 	/** Defaults for new OpenAI conversations. */
@@ -303,6 +311,40 @@ export interface OpenAiDefaultsUpdate {
 	maxOutputTokens?: number;
 }
 
+/**
+ * The defaults an update asks for, for `resolveOpenAiTurnSettings` to check.
+ * A model change keeps the current effort and mode when the model has them and
+ * otherwise takes the model's starting ones; a value the update gives is
+ * taken as given.
+ */
+export function applyOpenAiDefaultsUpdate(
+	current: Pick<
+		OpenAiProviderSettings,
+		'defaultModel' | 'defaultReasoningEffort' | 'defaultReasoningMode' | 'maxOutputTokens'
+	>,
+	update: OpenAiDefaultsUpdate
+): { model: string; reasoningEffort: string; reasoningMode: string; maxOutputTokens: number } {
+	const model = update.model ?? current.defaultModel;
+	let reasoningEffort: string = current.defaultReasoningEffort;
+	let reasoningMode: string = current.defaultReasoningMode;
+	// A model Studio doesn't know keeps them, for resolveOpenAiTurnSettings to refuse.
+	if ( isOpenAiModelId( model ) ) {
+		const capabilities = OPENAI_MODEL_CAPABILITIES[ model ];
+		if ( ! capabilities.reasoningEfforts.includes( current.defaultReasoningEffort ) ) {
+			reasoningEffort = getInitialOpenAiReasoningEffort( model );
+		}
+		if ( ! capabilities.reasoningModes.includes( current.defaultReasoningMode ) ) {
+			reasoningMode = OPENAI_DEFAULT_REASONING_MODE;
+		}
+	}
+	return {
+		model,
+		reasoningEffort: update.reasoningEffort ?? reasoningEffort,
+		reasoningMode: update.reasoningMode ?? reasoningMode,
+		maxOutputTokens: update.maxOutputTokens ?? current.maxOutputTokens,
+	};
+}
+
 /** The model, effort and mode one OpenAI conversation uses. */
 export interface OpenAiSessionSelection {
 	model: OpenAiModelId;
@@ -315,6 +357,7 @@ export function createDisconnectedOpenAiSettings(): OpenAiProviderSettings {
 	return {
 		keyStorage: null,
 		keyHint: null,
+		keyError: null,
 		secureStorage: 'available',
 		defaultModel: OPENAI_DEFAULT_MODEL,
 		defaultReasoningEffort: OPENAI_INITIAL_REASONING_EFFORT,

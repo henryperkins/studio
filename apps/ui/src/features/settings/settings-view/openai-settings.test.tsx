@@ -96,6 +96,18 @@ async function enterKey( saveLabel = 'Save', explanation?: RegExp ) {
 	return input as HTMLInputElement;
 }
 
+const modelMenu = () => screen.getByRole( 'combobox', { name: 'Default OpenAI model' } );
+const effortMenu = () => screen.getByRole( 'combobox', { name: 'Reasoning effort' } );
+
+// Connects a key and saves GPT-6 Luna with no reasoning, an effort GPT-6 Astra lacks.
+async function chooseLunaWithNoReasoning() {
+	await enterKey();
+	await choose( 'Default OpenAI model', 'GPT-6 Luna' );
+	await waitFor( () => expect( modelMenu() ).toHaveTextContent( 'GPT-6 Luna' ) );
+	await choose( 'Reasoning effort', 'None' );
+	await waitFor( () => expect( effortMenu() ).toHaveTextContent( 'None' ) );
+}
+
 describe( 'OpenAI settings', () => {
 	it( 'connects a key without WordPress.com, keeping only its last characters on screen', async () => {
 		const { connector } = await openProviders();
@@ -251,51 +263,57 @@ describe( 'OpenAI settings', () => {
 	it( 'keeps an effort another app saved when only the model changes here', async () => {
 		const { connector } = await openProviders();
 		await enterKey();
-		const effort = await screen.findByRole( 'combobox', { name: 'Reasoning effort' } );
-		expect( effort ).toHaveTextContent( 'Medium' );
+		expect( await screen.findByRole( 'combobox', { name: 'Reasoning effort' } ) ).toHaveTextContent(
+			'Medium'
+		);
 
 		// Another app saves High while this one still shows Medium.
 		await connector.setOpenAiDefaults( { reasoningEffort: 'high' } );
 		await choose( 'Default OpenAI model', 'GPT-6 Astra' );
 
-		await waitFor( () =>
-			expect( screen.getByRole( 'combobox', { name: 'Default OpenAI model' } ) ).toHaveTextContent(
-				'GPT-6 Astra'
-			)
-		);
-		expect( screen.getByRole( 'combobox', { name: 'Reasoning effort' } ) ).toHaveTextContent(
-			'High'
-		);
+		await waitFor( () => expect( modelMenu() ).toHaveTextContent( 'GPT-6 Astra' ) );
+		expect( effortMenu() ).toHaveTextContent( 'High' );
 	} );
 
 	it( 'gives a new model its starting effort when it lacks the saved one', async () => {
 		const { connector } = await openProviders();
-		await enterKey();
-		await choose( 'Default OpenAI model', 'GPT-6 Luna' );
-		await waitFor( () =>
-			expect( screen.getByRole( 'combobox', { name: 'Default OpenAI model' } ) ).toHaveTextContent(
-				'GPT-6 Luna'
-			)
-		);
-		await choose( 'Reasoning effort', 'None' );
-		await waitFor( () =>
-			expect( screen.getByRole( 'combobox', { name: 'Reasoning effort' } ) ).toHaveTextContent(
-				'None'
-			)
-		);
+		await chooseLunaWithNoReasoning();
 
 		await choose( 'Default OpenAI model', 'GPT-6 Astra' );
-		await waitFor( () =>
-			expect( connector.setOpenAiDefaults ).toHaveBeenLastCalledWith( {
-				model: 'gpt-6-astra',
-				reasoningEffort: 'medium',
-			} )
-		);
-		await waitFor( () =>
-			expect( screen.getByRole( 'combobox', { name: 'Reasoning effort' } ) ).toHaveTextContent(
-				'Medium'
-			)
-		);
+
+		await waitFor( () => expect( modelMenu() ).toHaveTextContent( 'GPT-6 Astra' ) );
+		expect( effortMenu() ).toHaveTextContent( 'Medium' );
+		expect( connector.setOpenAiDefaults ).toHaveBeenLastCalledWith( { model: 'gpt-6-astra' } );
+	} );
+
+	it( 'keeps an effort another app saved over the starting one this view would pick', async () => {
+		const { connector } = await openProviders();
+		await chooseLunaWithNoReasoning();
+
+		// Another app saves High, which Astra has, while this one still shows None, which it lacks.
+		await connector.setOpenAiDefaults( { reasoningEffort: 'high' } );
+		await choose( 'Default OpenAI model', 'GPT-6 Astra' );
+
+		await waitFor( () => expect( modelMenu() ).toHaveTextContent( 'GPT-6 Astra' ) );
+		expect( effortMenu() ).toHaveTextContent( 'High' );
+	} );
+
+	it( 'says why the keychain couldn’t return the key, and still offers to remove it', async () => {
+		const reason = 'Couldn’t read from the system keychain: User interaction is not allowed.';
+		const { connector } = await openProviders( {
+			getAiSettings: async () => ( {
+				...connectedSettings( { keyStorage: null, keyHint: null, keyError: reason } ),
+				hasOpenAiApiKey: false,
+			} ),
+		} );
+
+		const row = await openAiRow();
+		expect( await within( row ).findByText( /couldn’t read the key from the system keychain/ ) )
+			.toHaveTextContent( reason );
+		fireEvent.click( within( row ).getByRole( 'button', { name: 'Manage' } ) );
+		fireEvent.click( await screen.findByRole( 'button', { name: 'Remove key' } ) );
+
+		await waitFor( () => expect( connector.removeOpenAiApiKey ).toHaveBeenCalled() );
 	} );
 
 	it( 'keeps the output token limit within the model’s documented maximum', async () => {

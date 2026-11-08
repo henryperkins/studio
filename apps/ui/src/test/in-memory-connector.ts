@@ -4,7 +4,10 @@ import {
 	OPENAI_MODEL_IDS,
 	resolveOpenAiTurnSettings,
 } from '@studio/agent/protocol/openai-models';
-import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
+import {
+	applyOpenAiDefaultsUpdate,
+	createDisconnectedOpenAiSettings,
+} from '@studio/agent/protocol/providers';
 import { AGENT_APP_IDS } from '@studio/common/lib/agent-apps';
 import { SITE_EVENTS } from '@studio/common/lib/cli-events';
 import { SUPPORTED_EDITORS } from '@studio/common/lib/user-settings/editor';
@@ -349,6 +352,7 @@ export function createInMemoryConnector(
 					...openAi.openAi,
 					keyStorage: storage,
 					keyHint: `…${ key.trim().slice( -4 ) }`,
+					keyError: null,
 					models: {
 						checkedAt: '2026-11-07T00:00:00.000Z',
 						availableModelIds: [ ...OPENAI_MODEL_IDS ],
@@ -371,6 +375,7 @@ export function createInMemoryConnector(
 					...openAi.openAi,
 					keyStorage: null,
 					keyHint: null,
+					keyError: null,
 					models: createDisconnectedOpenAiSettings().models,
 				},
 			};
@@ -390,10 +395,7 @@ export function createInMemoryConnector(
 		setOpenAiDefaults: async ( update ) => {
 			const current = openAi.openAi;
 			const result = resolveOpenAiTurnSettings( {
-				model: update.model ?? current.defaultModel,
-				reasoningEffort: update.reasoningEffort ?? current.defaultReasoningEffort,
-				reasoningMode: update.reasoningMode ?? current.defaultReasoningMode,
-				maxOutputTokens: update.maxOutputTokens ?? current.maxOutputTokens,
+				...applyOpenAiDefaultsUpdate( current, update ),
 				availableModelIds: current.models.availableModelIds,
 			} );
 			if ( ! result.ok ) {

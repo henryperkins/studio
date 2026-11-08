@@ -1,11 +1,9 @@
 import { getAiModelLabel } from '@studio/agent/protocol/models';
 import { describeOpenAiError } from '@studio/agent/protocol/openai-errors';
 import {
-	getInitialOpenAiReasoningEffort,
 	getOpenAiModelCapabilities,
 	getOpenAiReasoningEffortLabel,
 	getOpenAiReasoningModeLabel,
-	OPENAI_DEFAULT_REASONING_MODE,
 	OPENAI_MIN_MAX_OUTPUT_TOKENS,
 	OPENAI_MODEL_IDS,
 	type OpenAiModelId,
@@ -43,6 +41,9 @@ export function OpenAiProviderRow( { disabled }: { disabled?: boolean } ) {
 	const [ key, setKey ] = useState( '' );
 	const openAi = settings.data?.openAi;
 	const hasKey = !! settings.data?.hasOpenAiApiKey;
+	const keyError = openAi?.keyError ?? null;
+	// A key may still be saved where it couldn't be read, so it can be replaced or removed.
+	const mayHaveKey = hasKey || keyError !== null;
 	const secureStorage = openAi?.secureStorage !== 'unavailable';
 	const pending = disabled || settings.isLoading || save.isPending || remove.isPending;
 
@@ -65,7 +66,7 @@ export function OpenAiProviderRow( { disabled }: { disabled?: boolean } ) {
 					// Like Anthropic, a first connection becomes the default for new
 					// chats. A session-only key doesn't, so a restart can't leave new
 					// chats on a provider with no key.
-					if ( ! hasKey && storage === 'keychain' ) {
+					if ( ! mayHaveKey && storage === 'keychain' ) {
 						setProvider.mutate( 'openai-api-key' );
 					}
 				},
@@ -101,6 +102,17 @@ export function OpenAiProviderRow( { disabled }: { disabled?: boolean } ) {
 						  )
 						: __( 'Use GPT models with your own API key.' )
 				}
+				error={
+					keyError
+						? sprintf(
+								/* translators: %s: why the keychain couldn't return the key. */
+								__(
+									'Studio couldn’t read the key from the system keychain, so OpenAI can’t be used for now. %s'
+								),
+								keyError
+						  )
+						: undefined
+				}
 			>
 				<Button
 					variant="outline"
@@ -108,7 +120,7 @@ export function OpenAiProviderRow( { disabled }: { disabled?: boolean } ) {
 					disabled={ pending }
 					onClick={ () => ( formOpen ? closeForm() : setFormOpen( true ) ) }
 				>
-					{ hasKey ? __( 'Manage' ) : __( 'Connect' ) }
+					{ mayHaveKey ? __( 'Manage' ) : __( 'Connect' ) }
 				</Button>
 			</SettingsRow>
 			{ formOpen ? (
@@ -148,7 +160,7 @@ export function OpenAiProviderRow( { disabled }: { disabled?: boolean } ) {
 							>
 								{ secureStorage ? __( 'Save' ) : __( 'Use for this session' ) }
 							</Button>
-							{ hasKey ? (
+							{ mayHaveKey ? (
 								<Button
 									variant="outline"
 									disabled={ pending }
@@ -253,21 +265,10 @@ export function OpenAiSettingsGroup() {
 	const capabilities = getOpenAiModelCapabilities( openAi.defaultModel );
 	const lastError = openAi.models.lastError;
 
-	const changeModel = ( model: OpenAiModelId ) => {
-		const next = getOpenAiModelCapabilities( model )!;
-		// The effort and mode stay when the new model has them, so only the model
-		// is sent and a change another app saved meanwhile is kept; otherwise the
-		// form shows the model's starting values with the change.
-		setDefaults.mutate( {
-			model,
-			...( next.reasoningEfforts.includes( openAi.defaultReasoningEffort )
-				? {}
-				: { reasoningEffort: getInitialOpenAiReasoningEffort( model ) } ),
-			...( next.reasoningModes.includes( openAi.defaultReasoningMode )
-				? {}
-				: { reasoningMode: OPENAI_DEFAULT_REASONING_MODE } ),
-		} );
-	};
+	// Only the model is sent: where the defaults are saved, the effort and mode
+	// stay when the model has them and otherwise become its starting ones, so a
+	// change another app saved meanwhile is kept. The form shows the result.
+	const changeModel = ( model: OpenAiModelId ) => setDefaults.mutate( { model } );
 
 	return (
 		<SettingsGroup

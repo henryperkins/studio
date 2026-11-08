@@ -232,6 +232,10 @@ export function SettingsSelect< TValue extends string >( {
 	const control = useContext( SettingsRowContext );
 	return (
 		<Select
+			// When the selected value leaves the list (another model's efforts, say),
+			// Base UI resets it to the value it mounted with and reports that as a
+			// change. A new list gets a new Select instead, so only the user changes it.
+			key={ options.map( ( option ) => option.value ).join( '\n' ) }
 			items={ options }
 			value={ options.some( ( option ) => option.value === value ) ? value : null }
 			disabled={ disabled }

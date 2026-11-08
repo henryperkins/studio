@@ -363,7 +363,26 @@ describe( '/openai-key slash command', () => {
 	const KEYCHAIN_DOWN = 'Couldn’t open the system keychain: no session bus.';
 
 	beforeEach( () => {
-		vi.mocked( readAiSettings ).mockResolvedValue( { hasOpenAiApiKey: true } as never );
+		vi.mocked( readAiSettings ).mockResolvedValue( {
+			hasOpenAiApiKey: true,
+			openAi: createDisconnectedOpenAiSettings(),
+		} as never );
+	} );
+
+	it( 'says why the keychain couldn’t return the key, and still offers to remove it', async () => {
+		const reason = 'Couldn’t read from the system keychain: User interaction is not allowed.';
+		vi.mocked( readAiSettings ).mockResolvedValue( {
+			hasOpenAiApiKey: false,
+			openAi: { ...createDisconnectedOpenAiSettings(), keyError: reason },
+		} as never );
+		vi.mocked( removeOpenAiApiKey ).mockResolvedValue( {} as never );
+		const { ctx } = buildModelCtx( { askUserResponse: 'Remove the key' } );
+
+		await expect( handler( '', ctx ) ).resolves.toBe( 'continue' );
+
+		expect( ctx.ui.showError ).toHaveBeenCalledWith( expect.stringContaining( reason ) );
+		expect( removeOpenAiApiKey ).toHaveBeenCalled();
+		expect( ctx.prepareProviderSelection ).not.toHaveBeenCalled();
 	} );
 
 	it( 'keeps the chat open and says why when the key can’t be removed', async () => {

@@ -269,10 +269,20 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 		description: __( 'Set, replace, or remove the OpenAI API key' ),
 		handler: async ( _prompt, ctx ) => {
 			try {
-				const { hasOpenAiApiKey } = await readAiSettings();
+				const { hasOpenAiApiKey, openAi } = await readAiSettings();
+				// A key may still be saved where it couldn't be read, so removing it stays on offer.
+				if ( openAi.keyError ) {
+					ctx.ui.showError(
+						sprintf(
+							/* translators: %s: why the keychain couldn't return the key. */
+							__( 'Studio couldn’t read the OpenAI API key from the system keychain. %s' ),
+							openAi.keyError
+						)
+					);
+				}
 				const replace = __( 'Enter a new key' );
 				const remove = __( 'Remove the key' );
-				const choice = hasOpenAiApiKey
+				const choice = hasOpenAiApiKey || openAi.keyError
 					? ( Object.values(
 							await ctx.ui.askUser( [
 								{
