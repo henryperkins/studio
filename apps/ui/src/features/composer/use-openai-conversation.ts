@@ -23,12 +23,11 @@ import { __, sprintf } from '@wordpress/i18n';
 import { useCallback, useMemo } from 'react';
 import { toast } from '@/data/app-messages';
 import { useConnector } from '@/data/core';
-import { saveSessionOpenAiSelection } from '@/data/openai-selection-saves';
 import { useAiSettings } from '@/data/queries/use-ai-settings';
-import { SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
+import { saveSessionSettingChange } from '@/data/session-setting-changes';
 import { useOpenSettings } from '@/data/use-open-settings';
 import type { ComposerNotice } from './notice-tab';
-import type { AiModelId, LoadedAiSession, SessionEntry } from '@/data/core';
+import type { AiModelId, SessionEntry } from '@/data/core';
 import type {
 	AiProviderId,
 	OpenAiProviderSettings,
@@ -152,22 +151,13 @@ export function useOpenAiConversation( {
 				} );
 				return;
 			}
-			const queryKey = [ ...SESSIONS_QUERY_KEY, sessionId ];
-			const entry = createSelectionEntry( next );
-			queryClient.setQueryData< LoadedAiSession >( queryKey, ( previous ) =>
-				previous ? { ...previous, entries: [ ...( previous.entries ?? [] ), entry ] } : previous
-			);
-			saveSessionOpenAiSelection( connector, sessionId, next ).catch( ( error: unknown ) => {
-				// Back to what the chat still uses, and say why.
-				queryClient.setQueryData< LoadedAiSession >( queryKey, ( previous ) =>
-					previous
-						? {
-								...previous,
-								entries: ( previous.entries ?? [] ).filter( ( item ) => item !== entry ),
-						  }
-						: previous
-				);
-				void queryClient.invalidateQueries( { queryKey } );
+			saveSessionSettingChange( {
+				queryClient,
+				sessionId,
+				entry: createSelectionEntry( next ),
+				write: () => connector.setSessionOpenAiSelection( sessionId, next ),
+			} ).catch( ( error: unknown ) => {
+				// The picker is back on what the chat still uses; say why.
 				toast.error(
 					sprintf(
 						/* translators: %s: why saving the change failed. */

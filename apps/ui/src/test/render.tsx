@@ -12,7 +12,7 @@ import { App } from '@/app';
 import { AppProviders } from '@/app/app-providers';
 import { resetAiCreditsNoticeForTests } from '@/data/ai-credits-notice';
 import { resetAppMessagesForTests } from '@/data/app-messages';
-import { resetOpenAiSelectionSavesForTests } from '@/data/openai-selection-saves';
+import { resetSessionSettingChangesForTests } from '@/data/session-setting-changes';
 import { createFakeConnector, type FakeConnector } from './fake-connector';
 import type { ReactNode } from 'react';
 
@@ -28,7 +28,7 @@ export function createTestQueryClient() {
 afterEach( () => {
 	resetAppMessagesForTests();
 	resetAiCreditsNoticeForTests();
-	resetOpenAiSelectionSavesForTests();
+	resetSessionSettingChangesForTests();
 } );
 
 interface RenderOptions {

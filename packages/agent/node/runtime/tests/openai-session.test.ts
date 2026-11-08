@@ -14,8 +14,10 @@ import type {
 
 /*
  * The real pi agent session — its agent loop, tools, session file and
- * compaction — with only OpenAI's HTTP endpoint replaced by recorded
- * Responses streams.
+ * compaction — with only OpenAI's HTTP endpoint replaced by Responses streams
+ * scripted here, and a fake Studio host. Each turn reopens the session file in
+ * a fresh agent, within this one process: the CLI isn't forked, and the
+ * reasoning each turn uses is passed in rather than read from settings.
  */
 
 // A test key only; nothing here reaches OpenAI.
@@ -190,8 +192,8 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 		fs.rmSync( paths.root, { recursive: true, force: true } );
 	} );
 
-	// Each turn runs in a fresh agent on the session file, as a Studio app's
-	// forked CLI does: every turn is a restart.
+	// Each turn runs in a fresh agent on the reopened session file, as each turn
+	// of a Studio app's forked CLI does.
 	async function runTurn(
 		sessionFile: string | undefined,
 		prompt: string,
@@ -223,7 +225,7 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 	const itemsOfType = ( request: RequestBody, type: string ) =>
 		request.input.filter( ( item ) => item.type === type );
 
-	it( 'keeps reasoning, tool calls and settings straight across tool use, restarts and compaction', async () => {
+	it( 'keeps reasoning, tool calls and settings straight across tool use, reopened sessions and compaction', async () => {
 		// Turn 1, Medium: the model reasons, reads a file, then answers.
 		replies.push( toolCallReply, () => textReply( 'DB_NAME is studio.' ) );
 		const first = await runTurn( undefined, 'What is the database name?', 'medium' );
@@ -253,7 +255,7 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 		expect( output.call_id ).toBe( READ_CALL.call_id );
 		expect( String( output.output ) ).toContain( "define( 'DB_NAME', 'studio' )" );
 
-		// Turn 2, after a restart and a change to High. Its reply reports a
+		// Turn 2, in a fresh agent, with High passed in. Its reply reports a
 		// context close to the budget, so the session compacts afterwards.
 		requests.length = 0;
 		// Long enough that what came before it is what compaction summarizes.
@@ -270,7 +272,7 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 		expect( requests.length ).toBeGreaterThanOrEqual( 2 );
 		const [ turnRequest, ...compactionRequests ] = requests;
 		expect( turnRequest.reasoning ).toEqual( { effort: 'high' } );
-		// The history from before the restart is all there, call ids included.
+		// The history from the earlier agent is all there, call ids included.
 		expect( itemsOfType( turnRequest, 'reasoning' ) ).toEqual( [
 			expect.objectContaining( { encrypted_content: REASONING.encrypted_content } ),
 		] );
@@ -286,7 +288,7 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 		}
 		expect( second.entries.some( ( entry ) => entry.type === 'compaction' ) ).toBe( true );
 
-		// Turn 3, after another restart: the summary stands in for the early turns.
+		// Turn 3, in another fresh agent: the summary stands in for the early turns.
 		requests.length = 0;
 		replies.push( () => textReply( 'Anything else?' ) );
 		const third = await runTurn( second.sessionFile, 'Thanks.', 'high' );

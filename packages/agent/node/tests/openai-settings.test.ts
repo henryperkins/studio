@@ -684,5 +684,26 @@ describe( 'OpenAI settings', () => {
 				hasOpenAiApiKey: true,
 			} );
 		} );
+
+		it( 'never leaves OpenAI the default once the key is removed during the switch', async () => {
+			const { settings } = await load();
+			await settings.saveOpenAiApiKey( KEY );
+			let answerList!: ( response: Response ) => void;
+			fetchMock.mockImplementationOnce(
+				() => new Promise< Response >( ( resolve ) => ( answerList = resolve ) )
+			);
+
+			// The switch checks the key with OpenAI; Remove key is pressed meanwhile.
+			const switching = settings.setAiProvider( 'openai-api-key' );
+			await vi.waitFor( () => expect( answerList ).toBeDefined() );
+			const removing = settings.removeOpenAiApiKey();
+			answerList( modelList( 'gpt-6.1-sol' ) );
+			await Promise.allSettled( [ switching, removing ] );
+
+			await expect( settings.readAiSettings() ).resolves.toMatchObject( {
+				provider: 'wpcom',
+				hasOpenAiApiKey: false,
+			} );
+		} );
 	} );
 } );

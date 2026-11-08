@@ -7,10 +7,10 @@ import {
 	createModelChangeEntry,
 	openNewSession,
 	primeSessionQueryData,
-	SESSIONS_QUERY_KEY,
 } from '@/data/queries/use-sessions';
+import { saveSessionSettingChange } from '@/data/session-setting-changes';
 import { saveComposerDraft } from '@/features/composer/draft-store';
-import type { AiModelId, LoadedAiSession, SessionEntry } from '@/data/core';
+import type { AiModelId, SessionEntry } from '@/data/core';
 import type { ComposerAttachment } from '@/data/use-composer-attachments';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
 
@@ -65,20 +65,19 @@ export function useModelSwitch( {
 	} | null >( null );
 	const [ familySwitchInFlight, setFamilySwitchInFlight ] = useState( false );
 
-	// Show the entry right away, then write it; refetch on write fail so the
-	// transcript falls back to what actually landed.
+	// Show the entry right away and write it after the chat's earlier changes;
+	// a failed write takes it back off.
 	const appendEntryOptimistically = useCallback(
 		( entry: SessionEntry, write: ( id: string ) => Promise< void > ) => {
 			if ( ! sessionId ) {
 				return;
 			}
-			const queryKey = [ ...SESSIONS_QUERY_KEY, sessionId ];
-			queryClient.setQueryData< LoadedAiSession >( queryKey, ( prev ) =>
-				prev ? { ...prev, entries: [ ...( prev.entries ?? [] ), entry ] } : prev
-			);
-			void write( sessionId ).catch( () => {
-				void queryClient.invalidateQueries( { queryKey } );
-			} );
+			saveSessionSettingChange( {
+				queryClient,
+				sessionId,
+				entry,
+				write: () => write( sessionId ),
+			} ).catch( () => undefined );
 		},
 		[ queryClient, sessionId ]
 	);

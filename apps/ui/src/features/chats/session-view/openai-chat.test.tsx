@@ -1,15 +1,25 @@
 import {
 	OPENAI_MODEL_CATALOG_VERSION,
 	OPENAI_MODEL_IDS,
+	resolveOpenAiSessionSelection,
 } from '@studio/agent/protocol/openai-models';
 import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { getVisibleToasts } from '@/data/app-messages';
-import { createFakeConnector, makeSession, makeSite } from '@/test/fake-connector';
+import {
+	createFakeConnector,
+	makeSession,
+	makeSite,
+	type FakeConnector,
+} from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { SessionEntry } from '@/data/core';
-import type { AiSettings, OpenAiProviderSettings } from '@studio/agent/protocol/providers';
+import type {
+	AiSettings,
+	OpenAiProviderSettings,
+	OpenAiSessionSelection,
+} from '@studio/agent/protocol/providers';
 
 vi.setConfig( { testTimeout: 30_000 } );
 
@@ -207,6 +217,162 @@ describe( 'OpenAI chats', () => {
 		await waitFor( () => expect( connector.continueSession ).toHaveBeenCalled() );
 		await waitFor( () =>
 			expect( screen.getByRole( 'button', { name: 'Reasoning' } ) ).toHaveTextContent( 'Low' )
+		);
+	} );
+
+	const reasoningButton = () => screen.getByRole( 'button', { name: 'Reasoning' } );
+	const settle = () => act( () => new Promise( ( resolve ) => setTimeout( resolve, 50 ) ) );
+
+	// The chat as the backend keeps it: a save appends its pin, a read returns
+	// what is on disk when it starts, and a turn runs with the latest pin.
+	function persistedChat( connector: FakeConnector ) {
+		const read = () => connector.state.sessions[ 0 ];
+		connector.getSession.mockImplementation( async () => ( {
+			...read(),
+			entries: [ ...read().entries ],
+		} ) );
+		const efforts: string[] = [];
+		connector.continueSession.mockImplementation( async () => {
+			efforts.push( resolveOpenAiSessionSelection( read().entries, MEDIUM ).reasoningEffort );
+			return { runId: `run-${ efforts.length }` };
+		} );
+		return {
+			read,
+			persist( selection: OpenAiSessionSelection ) {
+				connector.state.sessions[ 0 ] = {
+					...read(),
+					entries: [ ...read().entries, pin( { ...selection } ) ],
+				};
+			},
+			// The effort each turn ran with.
+			efforts,
+		};
+	}
+
+	it( 'keeps a newer choice when an older one fails and the chat reloads meanwhile', async () => {
+		const { connector, input, queryClient } = await setupChat( [ pin( MEDIUM ) ] );
+		const chat = persistedChat( connector );
+		const saves: Array< {
+			selection: OpenAiSessionSelection;
+			resolve: () => void;
+			reject: ( error: Error ) => void;
+		} > = [];
+		connector.setSessionOpenAiSelection.mockImplementation(
+			( _id, selection ) =>
+				new Promise< void >( ( resolve, reject ) => saves.push( { selection, resolve, reject } ) )
+		);
+
+		await chooseEffort( 'High' );
+		await chooseEffort( 'Low' );
+		await waitFor( () => expect( saves ).toHaveLength( 1 ) );
+		// High fails while Low waits, and a reload reads the Medium still on disk.
+		await act( async () => {
+			saves[ 0 ].reject( new Error( 'Disk full.' ) );
+			await queryClient.invalidateQueries( { queryKey: [ 'sessions', 'chat' ] } );
+		} );
+		expect( reasoningButton() ).toHaveTextContent( 'Low' );
+
+		await waitFor( () => expect( saves ).toHaveLength( 2 ) );
+		act( () => {
+			chat.persist( saves[ 1 ].selection );
+			saves[ 1 ].resolve();
+		} );
+		await settle();
+		expect( reasoningButton() ).toHaveTextContent( 'Low' );
+
+		send( input );
+		await waitFor( () => expect( chat.efforts ).toEqual( [ 'low' ] ) );
+		expect( reasoningButton() ).toHaveTextContent( 'Low' );
+	} );
+
+	it( 'keeps a saved choice when a reload that started before the save lands after it', async () => {
+		const { connector, input, queryClient } = await setupChat( [ pin( MEDIUM ) ] );
+		const chat = persistedChat( connector );
+		let finishSave: ( () => void ) | undefined;
+		connector.setSessionOpenAiSelection.mockImplementationOnce(
+			( _id, selection ) =>
+				new Promise< void >( ( resolve ) => {
+					finishSave = () => {
+						chat.persist( selection );
+						resolve();
+					};
+				} )
+		);
+		await chooseEffort( 'Low' );
+		await waitFor( () => expect( finishSave ).toBeDefined() );
+
+		// This reload reads Medium while Low saves, and lands after Low is saved.
+		let finishRead: ( () => void ) | undefined;
+		connector.getSession.mockImplementationOnce( async () => {
+			const onDisk = { ...chat.read(), entries: [ ...chat.read().entries ] };
+			await new Promise< void >( ( resolve ) => ( finishRead = resolve ) );
+			return onDisk;
+		} );
+		void queryClient.invalidateQueries( { queryKey: [ 'sessions', 'chat' ] } );
+		await waitFor( () => expect( finishRead ).toBeDefined() );
+		act( () => finishSave!() );
+		await settle();
+		act( () => finishRead!() );
+		await settle();
+		expect( reasoningButton() ).toHaveTextContent( 'Low' );
+
+		send( input );
+		await waitFor( () => expect( chat.efforts ).toEqual( [ 'low' ] ) );
+		// A later reload agrees with what was shown.
+		await act( () => queryClient.invalidateQueries( { queryKey: [ 'sessions', 'chat' ] } ) );
+		expect( reasoningButton() ).toHaveTextContent( 'Low' );
+	} );
+
+	it( 'falls back to the last saved choice when a newer one fails, during a reload', async () => {
+		const { connector, input, queryClient } = await setupChat( [ pin( MEDIUM ) ] );
+		const chat = persistedChat( connector );
+		connector.setSessionOpenAiSelection
+			.mockImplementationOnce( async ( _id, selection ) => chat.persist( selection ) )
+			.mockRejectedValueOnce( new Error( 'Disk full.' ) );
+		// A reload under way throughout, which the saved choice waits out.
+		let finishRead: ( () => void ) | undefined;
+		connector.getSession.mockImplementationOnce( async () => {
+			const onDisk = { ...chat.read(), entries: [ ...chat.read().entries ] };
+			await new Promise< void >( ( resolve ) => ( finishRead = resolve ) );
+			return onDisk;
+		} );
+		void queryClient.invalidateQueries( { queryKey: [ 'sessions', 'chat' ] } );
+		await waitFor( () => expect( finishRead ).toBeDefined() );
+
+		await chooseEffort( 'High' );
+		await chooseEffort( 'Low' );
+		await waitFor( () => expect( connector.setSessionOpenAiSelection ).toHaveBeenCalledTimes( 2 ) );
+		await settle();
+		expect( reasoningButton() ).toHaveTextContent( 'High' );
+
+		// The failure was shown and taken back, so it doesn't hold this message.
+		send( input );
+		await waitFor( () => expect( chat.efforts ).toEqual( [ 'high' ] ) );
+		act( () => finishRead!() );
+		await settle();
+		expect( reasoningButton() ).toHaveTextContent( 'High' );
+	} );
+
+	it( 'writes a model change made while a reasoning change saves after it', async () => {
+		const { connector } = await setupChat( [ pin( MEDIUM ) ] );
+		let finishSave: ( () => void ) | undefined;
+		connector.setSessionOpenAiSelection.mockImplementationOnce(
+			() => new Promise< void >( ( resolve ) => ( finishSave = resolve ) )
+		);
+
+		await chooseEffort( 'High' );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+		fireEvent.click( await screen.findByRole( 'option', { name: /GPT-6 Luna/ } ) );
+
+		// Shown at once, but written only after the change made before it.
+		await waitFor( () =>
+			expect( screen.getByRole( 'button', { name: 'Model' } ) ).toHaveTextContent( 'GPT-6 Luna' )
+		);
+		await settle();
+		expect( connector.setSessionModel ).not.toHaveBeenCalled();
+		act( () => finishSave!() );
+		await waitFor( () =>
+			expect( connector.setSessionModel ).toHaveBeenCalledWith( 'chat', 'gpt-6-luna' )
 		);
 	} );
 

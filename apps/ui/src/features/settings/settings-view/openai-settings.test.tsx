@@ -147,6 +147,10 @@ describe( 'OpenAI settings', () => {
 			expect( connector.saveOpenAiApiKey ).toHaveBeenCalledWith( KEY, 'session' )
 		);
 		expect( await within( await openAiRow() ).findByText( 'This session only' ) ).toBeVisible();
+		expect(
+			await screen.findByText( /keeps this key in memory until it quits.*doesn’t isolate the key/ )
+		).toBeVisible();
+		expect( screen.queryByText( /keeps your key in the system keychain/ ) ).not.toBeInTheDocument();
 		expectKeyNowhere();
 	} );
 

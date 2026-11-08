@@ -75,10 +75,12 @@ export function OpenAiProviderRow( { disabled }: { disabled?: boolean } ) {
 
 	const keyDescription = ! secureStorage
 		? __(
-				'Your system keychain isn’t available, so Studio can’t save the key. A key you enter here is kept only until Studio quits.'
+				'Your system keychain isn’t available, so Studio can’t save the key. A key you enter here is kept only until Studio quits; a key saved in the keychain earlier stays there, and Studio uses it again once the keychain is available.'
 		  )
 		: openAi?.keyStorage === 'session'
-		? __( 'This key is kept only until Studio quits. Usage is billed through your OpenAI account.' )
+		? __(
+				'This key is kept only until Studio quits. After that, Studio uses a key saved in the system keychain, if there is one. Usage is billed through your OpenAI account.'
+		  )
 		: __(
 				'Studio saves the key to your system keychain and never shows it again. Usage is billed through your OpenAI account.'
 		  );
@@ -269,9 +271,15 @@ export function OpenAiSettingsGroup() {
 	return (
 		<SettingsGroup
 			title={ __( 'OpenAI' ) }
-			description={ __(
-				'Studio keeps your key in the system keychain, out of its settings, chats and logs. Studio’s agent runs commands as your user account, so this protects the key at rest; it doesn’t isolate it from programs you run. Image generation in chats uses your WordPress.com connection, not OpenAI, and is off without one.'
-			) }
+			description={
+				openAi.keyStorage === 'session'
+					? __(
+							'Studio keeps this key in memory until it quits, out of its settings, chats and logs. Studio’s agent runs commands as your user account, and programs you run may be able to read Studio’s memory, so this doesn’t isolate the key from them. Image generation in chats uses your WordPress.com connection, not OpenAI, and is off without one.'
+					  )
+					: __(
+							'Studio keeps your key in the system keychain, out of its settings, chats and logs. Studio’s agent runs commands as your user account, so this protects the key at rest; it doesn’t isolate it from programs you run. Image generation in chats uses your WordPress.com connection, not OpenAI, and is off without one.'
+					  )
+			}
 		>
 			<SettingsRow
 				title={ __( 'Available models' ) }

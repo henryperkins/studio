@@ -19,6 +19,7 @@ import {
 	type AiProviderId,
 } from '@studio/agent/protocol/providers';
 import { validateAnthropicApiKey } from '@studio/common/lib/anthropic-key';
+import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { getStudioUserAgent as buildStudioUserAgent } from '@studio/common/lib/user-agent';
 import { __, sprintf } from '@wordpress/i18n';
@@ -134,7 +135,7 @@ async function resolveOpenAiApiKey( options?: { force?: boolean } ): Promise< vo
 			message: sprintf(
 				/* translators: %s: why the system keychain can't be used. */
 				__(
-					'Studio can’t save the key to your system keychain (%s). Use a key for this session only? It is forgotten when Studio Code exits.'
+					'Studio can’t save the key to your system keychain (%s). Use a key for this session only? It is forgotten when Studio Code exits, and a key saved in the keychain earlier is used again.'
 				),
 				secureStorage.reason
 			),
@@ -162,7 +163,7 @@ async function resolveOpenAiApiKey( options?: { force?: boolean } ): Promise< vo
 			storage: secureStorage.available ? 'keychain' : 'session',
 		} );
 	} catch ( error ) {
-		if ( error instanceof InvalidOpenAiApiKeyError ) {
+		if ( error instanceof InvalidOpenAiApiKeyError || error instanceof SecureStorageError ) {
 			throw new LoggerError( error.message );
 		}
 		throw error;

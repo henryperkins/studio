@@ -376,29 +376,33 @@ export async function saveAnthropicApiKey( key: string | null ): Promise< AiSett
  * refuses a key the provider rejects, but accepts an unverifiable one.
  * Existing sessions keep the provider recorded in their session context.
  */
-export async function setAiProvider( provider: AiProviderId ): Promise< AiSettings > {
-	if ( provider === 'openai-api-key' ) {
-		const source = await readOpenAiKeySource();
-		if ( ! source ) {
-			throw new OpenAiSettingsError( __( 'Add an OpenAI API key first.' ) );
+export function setAiProvider( provider: AiProviderId ): Promise< AiSettings > {
+	// In order with OpenAI key changes: a removal can't land between OpenAI's
+	// check and the write, and an earlier choice can't overwrite a later one.
+	return serializeOpenAiChange( async () => {
+		if ( provider === 'openai-api-key' ) {
+			const source = await readOpenAiKeySource();
+			if ( ! source ) {
+				throw new OpenAiSettingsError( __( 'Add an OpenAI API key first.' ) );
+			}
+			const list = await fetchOpenAiModelList( source.key );
+			if ( ! list.ok && list.error.kind === 'authentication' ) {
+				throw new InvalidOpenAiApiKeyError( describeOpenAiError( list.error ) );
+			}
 		}
-		const list = await fetchOpenAiModelList( source.key );
-		if ( ! list.ok && list.error.kind === 'authentication' ) {
-			throw new InvalidOpenAiApiKeyError( describeOpenAiError( list.error ) );
+		if ( provider === 'anthropic-api-key' ) {
+			const anthropicApiKey = await readAnthropicApiKey();
+			if ( ! anthropicApiKey ) {
+				throw new InvalidAnthropicApiKeyError( 'Add an Anthropic API key first.' );
+			}
+			const validation = await validateAnthropicApiKey( anthropicApiKey );
+			if ( validation.status === 'invalid' ) {
+				throw new InvalidAnthropicApiKeyError( validation.message );
+			}
 		}
-	}
-	if ( provider === 'anthropic-api-key' ) {
-		const anthropicApiKey = await readAnthropicApiKey();
-		if ( ! anthropicApiKey ) {
-			throw new InvalidAnthropicApiKeyError( 'Add an Anthropic API key first.' );
-		}
-		const validation = await validateAnthropicApiKey( anthropicApiKey );
-		if ( validation.status === 'invalid' ) {
-			throw new InvalidAnthropicApiKeyError( validation.message );
-		}
-	}
 
-	return updateAiProviderConfig( { aiProvider: provider } );
+		return updateAiProviderConfig( { aiProvider: provider } );
+	} );
 }
 
 /** Persists the provider without validation — for flows that already ran it. */

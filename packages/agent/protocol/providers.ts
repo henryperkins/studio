@@ -2,7 +2,6 @@ import {
 	AI_MODELS,
 	DEFAULT_MODEL,
 	getAiModelFamily,
-	hasConversationHistory,
 	PAID_DEFAULT_MODEL,
 	readRecordedSessionModel,
 	resolveSessionModel,
@@ -145,16 +144,42 @@ export function resolveSessionProvider( entries: SessionEntry[] ): AiProviderId 
 	return undefined;
 }
 
+// The pi provider ids Studio's runtime registers for OpenAI and Anthropic
+// (`runtime/openai-transport.ts`, `runtime/index.ts`).
+const OPENAI_PI_PROVIDER = 'studio-openai';
+const ANTHROPIC_PI_PROVIDER = 'anthropic';
+
+/**
+ * The provider a conversation's latest reply came from, read from the pi
+ * provider id pi records on it, so it holds even for a model Studio no longer
+ * offers. Undefined before the first reply. Any other provider reads as
+ * WordPress.com.
+ */
+export function readLastReplyProvider( entries: SessionEntry[] ): AiProviderId | undefined {
+	for ( let index = entries.length - 1; index >= 0; index -= 1 ) {
+		const entry = entries[ index ];
+		if ( entry.type !== 'message' ) {
+			continue;
+		}
+		const { role, provider } = entry.message as { role?: unknown; provider?: unknown };
+		if ( role !== 'assistant' ) {
+			continue;
+		}
+		if ( provider === OPENAI_PI_PROVIDER ) {
+			return 'openai-api-key';
+		}
+		return provider === ANTHROPIC_PI_PROVIDER ? 'anthropic-api-key' : DEFAULT_AI_PROVIDER;
+	}
+	return undefined;
+}
+
 export interface ConversationProviderInput {
 	/** The provider the conversation is pinned to, if any. */
 	pinnedProvider?: AiProviderId;
 	/** The latest model the conversation recorded that Studio still offers. */
 	recordedModel?: AiModelId;
-	/**
-	 * Whether the conversation already ran, even on a model Studio no longer
-	 * offers (see `hasConversationHistory`). A recorded model implies it.
-	 */
-	hasHistory?: boolean;
+	/** The provider the latest reply came from (see `readLastReplyProvider`). */
+	lastReplyProvider?: AiProviderId;
 	/** The provider new conversations use. */
 	globalProvider?: AiProviderId;
 	hasAnthropicApiKey: boolean;
@@ -178,20 +203,22 @@ export function resolveConversationProvider( input: ConversationProviderInput ):
 	const recordedProvider = recordedModel
 		? getAiModelFamilyProvider( getAiModelFamily( recordedModel ) )
 		: undefined;
-	if ( ! pinnedProvider && recordedProvider === 'openai-api-key' ) {
-		return recordedProvider;
+	// One that ran on OpenAI stays there, even on a model Studio dropped since:
+	// its turns then fail with a fix to apply, rather than move.
+	if (
+		! pinnedProvider &&
+		( recordedProvider === 'openai-api-key' || input.lastReplyProvider === 'openai-api-key' )
+	) {
+		return 'openai-api-key';
 	}
 	if ( ! pinnedProvider && globalProvider === 'openai-api-key' ) {
-		if ( ! recordedProvider && ! input.hasHistory ) {
+		// One that ran elsewhere keeps its provider: it never moves to OpenAI on
+		// its own. One without a reply yet starts on the default.
+		const ranOn = recordedProvider ?? input.lastReplyProvider;
+		if ( ! ranOn ) {
 			return globalProvider;
 		}
-		// A conversation that already ran elsewhere keeps its provider, or goes
-		// to WordPress.com when Studio no longer offers its model: it never moves
-		// to OpenAI on its own.
-		return ! recordedProvider ||
-			( recordedProvider === 'anthropic-api-key' && ! hasAnthropicApiKey )
-			? DEFAULT_AI_PROVIDER
-			: recordedProvider;
+		return ranOn === 'anthropic-api-key' && ! hasAnthropicApiKey ? DEFAULT_AI_PROVIDER : ranOn;
 	}
 	if ( ! hasAnthropicApiKey ) {
 		return DEFAULT_AI_PROVIDER;
@@ -211,7 +238,7 @@ export function getEffectiveSessionProvider(
 	return resolveConversationProvider( {
 		pinnedProvider: resolveSessionProvider( entries ),
 		recordedModel: readRecordedSessionModel( entries ),
-		hasHistory: hasConversationHistory( entries ),
+		lastReplyProvider: readLastReplyProvider( entries ),
 		globalProvider: settings?.provider,
 		hasAnthropicApiKey: settings?.hasAnthropicApiKey ?? false,
 	} );

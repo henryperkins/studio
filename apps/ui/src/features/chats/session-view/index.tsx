@@ -41,6 +41,7 @@ import {
 	useStopSite,
 } from '@/data/queries/use-sites';
 import { useUserPreferences } from '@/data/queries/use-user-preferences';
+import { useEntriesWithSettingChanges } from '@/data/session-setting-changes';
 import { useSiteSelectionTime } from '@/data/use-open-site';
 import { SessionUIProvider, useOptionalSessionPreviewUI } from '@/data/use-session-ui';
 import { useStartSiteWithChat } from '@/data/use-start-site-with-chat';
@@ -147,25 +148,26 @@ function SessionViewContent( {
 	// back to pending; only the first check holds the chat back.
 	const isQuotaLoading = isQuotaPending && ! isQuotaFetched;
 	const { data: aiSettings } = useAiSettings();
+	// With the model, provider and reasoning changes still being written.
+	const entries = useEntriesWithSettingChanges( sessionId, data?.entries );
 	const sessionProvider =
-		( ! sessionId && draft.provider ) ||
-		getEffectiveSessionProvider( data?.entries ?? [], aiSettings );
+		( ! sessionId && draft.provider ) || getEffectiveSessionProvider( entries ?? [], aiSettings );
 	const isWpcom = sessionProvider === 'wpcom';
 	// A fresh wpcom session defaults to balanced when the paid tiers are
 	// unlocked, fast otherwise; an OpenAI one to the model chosen in Settings.
 	const defaultModel = useMemo(
 		() =>
-			resolveSessionModelForProvider( data?.entries ?? [], sessionProvider, {
+			resolveSessionModelForProvider( entries ?? [], sessionProvider, {
 				canUsePaidModels: canUsePaidAiModels( quota, authUser?.email ),
 				openAiDefaultModel: aiSettings?.openAi.defaultModel,
 			} ),
-		[ data?.entries, sessionProvider, quota, authUser?.email, aiSettings?.openAi.defaultModel ]
+		[ entries, sessionProvider, quota, authUser?.email, aiSettings?.openAi.defaultModel ]
 	);
 	const draftModel = ( ! sessionId && draft.model ) || defaultModel;
 	const openAi = useOpenAiConversation( {
 		provider: sessionProvider,
 		sessionId,
-		entries: data?.entries,
+		entries,
 		model: draftModel,
 		draft,
 		onDraftChange: updateDraft,
@@ -526,7 +528,7 @@ function SessionViewContent( {
 							sessionId ? undefined : ( model, provider ) => updateDraft( { model, provider } )
 						}
 						autoFocus={ isEmpty }
-						entries={ data?.entries }
+						entries={ entries }
 						ownerSiteId={ ownerSite?.id }
 						onSwitchSession={ switchSession }
 						placeholder={ composerPlaceholder }

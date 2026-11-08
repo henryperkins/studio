@@ -1,11 +1,16 @@
 import { password } from '@inquirer/prompts';
-import { OpenAiSessionKeyUnavailableError } from '@studio/agent/node/openai-credentials';
+import {
+	getSecureStorageStatus,
+	OpenAiSessionKeyUnavailableError,
+} from '@studio/agent/node/openai-credentials';
 import {
 	persistAnthropicApiKey,
 	readAnthropicApiKey,
 	readOpenAiApiKey,
 	readSelectedAiProvider,
+	saveOpenAiApiKey,
 } from '@studio/agent/node/settings-store';
+import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { vi } from 'vitest';
 import {
@@ -23,6 +28,11 @@ vi.mock( '@inquirer/prompts', () => ( {
 
 vi.mock( '@studio/common/lib/shared-config', () => ( {
 	readAuthToken: vi.fn(),
+} ) );
+
+vi.mock( '@studio/agent/node/openai-credentials', async ( importOriginal ) => ( {
+	...( await importOriginal< typeof import('@studio/agent/node/openai-credentials') >() ),
+	getSecureStorageStatus: vi.fn(),
 } ) );
 
 vi.mock( '@studio/agent/node/settings-store', () => ( {
@@ -76,6 +86,20 @@ describe( 'AI auth helpers', () => {
 
 		expect( password ).toHaveBeenCalledOnce();
 		expect( persistAnthropicApiKey ).toHaveBeenCalledWith( 'prompted-key' );
+	} );
+
+	it( 'turns a keychain that fails while saving the OpenAI key into a message for the chat', async () => {
+		vi.mocked( readOpenAiApiKey ).mockResolvedValue( null );
+		vi.mocked( getSecureStorageStatus ).mockResolvedValue( { available: true } );
+		vi.mocked( password ).mockResolvedValue( OPENAI_KEY );
+		vi.mocked( saveOpenAiApiKey ).mockRejectedValue(
+			new SecureStorageError( 'Couldn’t open the system keychain: locked' )
+		);
+
+		const preparing = prepareAiProvider( 'openai-api-key', { force: true } );
+
+		await expect( preparing ).rejects.toBeInstanceOf( LoggerError );
+		await expect( preparing ).rejects.toThrow( 'Couldn’t open the system keychain: locked' );
 	} );
 
 	it( 'can force re-entering the API key even when one is already saved', async () => {

@@ -215,6 +215,51 @@ describe( 'AI runCommand — resume by id restores session model', () => {
 		const callArgs = ( runStudioAgentTurn as Mock ).mock.calls[ 0 ][ 1 ] as { model: string };
 		expect( callArgs.model ).toBe( 'claude-opus-5' );
 	} );
+
+	it( 'chooses the provider from the conversation it names', async () => {
+		const sessionEntries = [
+			{
+				type: 'custom',
+				id: 'e1',
+				parentId: null,
+				timestamp: '2024-01-01T00:00:00Z',
+				customType: 'studio.session_context',
+				data: { provider: 'openai-api-key', model: 'gpt-6.1-sol' },
+			},
+		];
+		( listStudioSessionFiles as Mock ).mockResolvedValue( [ '/sessions/session-1.jsonl' ] );
+		( openStudioSession as Mock ).mockResolvedValue( {
+			appendCustomEntry: vi.fn( () => 'entry-id' ),
+			getSessionId: () => 'resume-id-123',
+			getEntries: () => sessionEntries,
+		} );
+		( resolveResumeSessionContext as Mock ).mockImplementationOnce(
+			( session?: { entries: unknown[] } ) =>
+				session?.entries === sessionEntries
+					? { provider: 'openai-api-key', model: 'gpt-6.1-sol' }
+					: { provider: undefined, model: undefined }
+		);
+		( readAiSettings as Mock ).mockResolvedValue( {
+			provider: 'wpcom',
+			hasAnthropicApiKey: false,
+			hasOpenAiApiKey: true,
+			openAi: { ...createDisconnectedOpenAiSettings(), keyStorage: 'keychain' },
+		} );
+		( isAiProviderReady as Mock ).mockResolvedValue( true );
+		( resolveAiEnvironment as Mock ).mockResolvedValue( { STUDIO_OPENAI_API_KEY: 'sk-test' } );
+
+		await runCommand( {
+			adapter: new JsonAdapter(),
+			initialMessage: 'hello',
+			resumeSessionId: 'resume-id-123',
+		} );
+
+		expect( resolveResumeSessionContext ).toHaveBeenCalledWith( {
+			summary: { id: 'resume-id-123' },
+			entries: sessionEntries,
+		} );
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'openai-api-key', expect.anything() );
+	} );
 } );
 
 describe( 'AI runCommand — active site banner running state', () => {
@@ -652,6 +697,34 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 		process.exitCode = undefined;
 	} );
 
+	it( 'starts a new OpenAI conversation on the model chosen in Settings', async () => {
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: undefined,
+			model: undefined,
+		} );
+		( resolveInitialAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
+		( readAiSettings as Mock ).mockResolvedValue(
+			openAiSettings( { defaultModel: 'gpt-6-luna' } )
+		);
+		( createStudioSession as Mock ).mockResolvedValue( {
+			appendCustomEntry,
+			getSessionId: () => 'new-session',
+			getEntries: () => entries,
+		} );
+		const adapter = new JsonAdapter();
+		const shown: unknown[] = [];
+		Object.defineProperty( adapter, 'currentModel', {
+			get: () => shown.at( -1 ),
+			set: ( model ) => shown.push( model ),
+		} );
+
+		await runCommand( { adapter, initialMessage: 'hello' } );
+
+		// Before the first turn too, so /reasoning and /clear record the right one.
+		expect( shown[ 0 ] ).toBe( 'gpt-6-luna' );
+		expect( turnConfig()?.openAi ).toMatchObject( { model: 'gpt-6-luna' } );
+	} );
+
 	it( 'stays on OpenAI without a key, failing the turn as disconnected', async () => {
 		( isAiProviderReady as Mock ).mockResolvedValue( false );
 		( resolveAiEnvironment as Mock ).mockRejectedValue( new Error( 'OpenAI isn’t connected' ) );
@@ -801,10 +874,11 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 		( readSelectedAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
 		// As it resolves with OpenAI saved as the default.
 		( resolveInitialAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
+		// Its replies came from WordPress.com, on a model this build dropped.
 		( resolveResumeSessionContext as Mock ).mockReturnValue( {
 			provider: undefined,
 			model: undefined,
-			hasHistory: true,
+			lastReplyProvider: 'wpcom',
 		} );
 		( resolveAiEnvironment as Mock ).mockResolvedValue( {} );
 

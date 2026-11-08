@@ -145,16 +145,6 @@ export function readLatestRecordedModelId( entries: SessionEntry[] ): string | u
 }
 
 /**
- * Whether a conversation has already run somewhere: it holds messages, or
- * recorded a model (including one Studio no longer offers).
- */
-export function hasConversationHistory( entries: SessionEntry[] ): boolean {
-	return entries.some(
-		( entry ) => entry.type === 'message' || readEntryModelId( entry ) !== undefined
-	);
-}
-
-/**
  * The most recently recorded model still in `AI_MODELS`, or `undefined` when
  * the session never recorded one (or only models we no longer offer) — so
  * callers can apply their own default to both cases.

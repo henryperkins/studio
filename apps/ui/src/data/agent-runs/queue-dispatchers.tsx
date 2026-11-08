@@ -3,6 +3,7 @@ import { useEffect, useSyncExternalStore } from 'react';
 import { useAiSettings } from '@/data/queries/use-ai-settings';
 import { useIsOutOfAiCredits } from '@/data/queries/use-is-out-of-ai-credits';
 import { useSession } from '@/data/queries/use-sessions';
+import { useEntriesWithSettingChanges } from '@/data/session-setting-changes';
 import { useAgentRunStore } from './context';
 import { initialAgentRunState } from './store';
 
@@ -30,6 +31,7 @@ function QueueDispatcher( { sessionId }: { sessionId: string } ) {
 		() => stateStore.getState()[ sessionId ] ?? initialAgentRunState
 	);
 	const { data: session } = useSession( sessionId );
+	const entries = useEntriesWithSettingChanges( sessionId, session?.entries );
 	const { data: aiSettings, isPending: isAiSettingsPending } = useAiSettings();
 	const isOutOfCredits = useIsOutOfAiCredits();
 	// Holding rather than clearing: a balance spent mid-run leaves the queued
@@ -38,7 +40,7 @@ function QueueDispatcher( { sessionId }: { sessionId: string } ) {
 	const held =
 		! session ||
 		isAiSettingsPending ||
-		( isOutOfCredits && getEffectiveSessionProvider( session.entries, aiSettings ) === 'wpcom' );
+		( isOutOfCredits && getEffectiveSessionProvider( entries ?? [], aiSettings ) === 'wpcom' );
 	const next = state.phase === 'idle' && ! held ? state.queuedPrompts[ 0 ] : undefined;
 
 	useEffect( () => {

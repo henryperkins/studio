@@ -107,22 +107,60 @@ describe( 'resolveConversationProvider', () => {
 		).toBe( 'wpcom' );
 	} );
 
-	it( 'keeps an old conversation off OpenAI when Studio no longer offers its model', () => {
-		const global = settings( 'openai-api-key', { hasOpenAiApiKey: true } );
-		expect(
-			getEffectiveSessionProvider( [ contextEntry( { model: 'claude-retired-4' } ) ], global )
-		).toBe( 'wpcom' );
-		// Messages, but no model record at all.
-		const message = {
+	const message = ( role: 'user' | 'assistant', provider?: string ) =>
+		( {
 			type: 'message',
-			id: 'm1',
+			id: Math.random().toString( 36 ).slice( 2 ),
 			parentId: null,
 			timestamp: new Date( 0 ).toISOString(),
-			message: { role: 'user', content: 'Hello', timestamp: 0 },
-		} as unknown as SessionEntry;
-		expect( getEffectiveSessionProvider( [ message ], global ) ).toBe( 'wpcom' );
-		// Nothing has run yet: the OpenAI default applies.
+			message:
+				role === 'user'
+					? { role, content: 'Hello', timestamp: 0 }
+					: { role, content: [], provider, model: 'retired', timestamp: 0 },
+		} ) as unknown as SessionEntry;
+
+	it( 'keeps an old conversation off OpenAI when Studio no longer offers its model', () => {
+		const global = settings( 'openai-api-key', { hasOpenAiApiKey: true } );
+		// Replies came from Anthropic, on a Claude model Studio dropped since.
+		expect(
+			getEffectiveSessionProvider(
+				[
+					contextEntry( { model: 'claude-retired-4' } ),
+					message( 'user' ),
+					message( 'assistant', 'anthropic' ),
+				],
+				global
+			)
+		).toBe( 'wpcom' );
+		// WordPress.com replies, but no model record at all.
+		expect(
+			getEffectiveSessionProvider(
+				[ message( 'user' ), message( 'assistant', 'studio-wpcom' ) ],
+				global
+			)
+		).toBe( 'wpcom' );
+	} );
+
+	it( 'keeps a conversation that ran on OpenAI there after Studio drops its model', () => {
+		const entries = [
+			contextEntry( { model: 'gpt-5.6-sol' } ),
+			message( 'user' ),
+			message( 'assistant', 'studio-openai' ),
+		];
+		expect(
+			getEffectiveSessionProvider(
+				entries,
+				settings( 'openai-api-key', { hasOpenAiApiKey: true } )
+			)
+		).toBe( 'openai-api-key' );
+		expect( getEffectiveSessionProvider( entries, settings( 'wpcom' ) ) ).toBe( 'openai-api-key' );
+	} );
+
+	it( 'starts a conversation that has no reply yet on the OpenAI default', () => {
+		const global = settings( 'openai-api-key', { hasOpenAiApiKey: true } );
 		expect( getEffectiveSessionProvider( [], global ) ).toBe( 'openai-api-key' );
+		// A first turn that failed before any reply.
+		expect( getEffectiveSessionProvider( [ message( 'user' ) ], global ) ).toBe( 'openai-api-key' );
 	} );
 
 	it( 'keeps the existing WordPress.com and Anthropic rules', () => {

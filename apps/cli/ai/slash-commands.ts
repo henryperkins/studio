@@ -7,14 +7,18 @@ import {
 } from '@studio/agent/protocol/models';
 import {
 	OPENAI_REASONING_MODES,
+	describeOpenAiSettingsProblem,
 	getOpenAiModelCapabilities,
 	getOpenAiReasoningEffortLabel,
 	getOpenAiReasoningModeLabel,
+	isOpenAiModelId,
 	resolveOpenAiSessionSelection,
+	type OpenAiModelId,
 	type OpenAiReasoningEffort,
 	type OpenAiReasoningMode,
 } from '@studio/agent/protocol/openai-models';
 import { getAiSkillCommands } from '@studio/agent/protocol/slash-commands';
+import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { isAutomatticianFromToken, readAuthToken } from '@studio/common/lib/shared-config';
 import {
 	clampQuotaFraction,
@@ -59,6 +63,7 @@ export interface SlashCommandContext {
 	clearSession(): Promise< void >;
 	getSessionEntries(): Promise< SessionEntry[] >;
 	persistOpenAiReasoning(
+		model: OpenAiModelId,
 		reasoningEffort: OpenAiReasoningEffort,
 		reasoningMode: OpenAiReasoningMode
 	): Promise< void >;
@@ -280,6 +285,11 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 							] )
 					  )[ 0 ] as string )
 					: replace;
+				// Closing the menu answers nothing: leave the key as it is.
+				if ( choice !== replace && choice !== remove ) {
+					ctx.ui.showInfo( __( 'API key update canceled.' ) );
+					return 'continue';
+				}
 				if ( choice === remove ) {
 					await removeOpenAiApiKey();
 					ctx.ui.showInfo(
@@ -299,7 +309,8 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 					ctx.ui.showInfo( __( 'API key update canceled.' ) );
 					return 'continue';
 				}
-				if ( error instanceof LoggerError ) {
+				// A keychain that can't be reached is the user's to fix, not a reason to end the chat.
+				if ( error instanceof LoggerError || error instanceof SecureStorageError ) {
 					ctx.ui.showError( error.message );
 					return 'continue';
 				}
@@ -312,8 +323,7 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 		name: 'reasoning',
 		description: __( 'Choose the reasoning effort and mode for OpenAI models' ),
 		handler: async ( _prompt, ctx ) => {
-			const capabilities = getOpenAiModelCapabilities( ctx.currentModel );
-			if ( ctx.currentProvider !== 'openai-api-key' || ! capabilities ) {
+			if ( ctx.currentProvider !== 'openai-api-key' ) {
 				ctx.ui.showInfo(
 					__( 'Reasoning settings apply to OpenAI models. Use /provider to switch.' )
 				);
@@ -325,6 +335,14 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 				reasoningEffort: openAi.defaultReasoningEffort,
 				reasoningMode: openAi.defaultReasoningMode,
 			} );
+			// The conversation's own model: one Studio dropped is replaced with
+			// /model, never as a side effect of changing reasoning.
+			const model = current.model;
+			if ( ! isOpenAiModelId( model ) ) {
+				ctx.ui.showError( describeOpenAiSettingsProblem( { code: 'unknown-model', model } ) );
+				return 'continue';
+			}
+			const capabilities = getOpenAiModelCapabilities( model )!;
 			const effortByLabel = new Map< string, OpenAiReasoningEffort >();
 			const effortOptions = capabilities.reasoningEfforts.map( ( effort ) => {
 				const label =
@@ -364,7 +382,7 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 				if ( ! effort || ! mode ) {
 					return 'continue';
 				}
-				await ctx.persistOpenAiReasoning( effort, mode );
+				await ctx.persistOpenAiReasoning( model, effort, mode );
 				ctx.ui.showInfo(
 					sprintf(
 						/* translators: 1: reasoning effort, 2: reasoning mode. */
