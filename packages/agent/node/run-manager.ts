@@ -7,6 +7,7 @@ import { isDevRun } from '@studio/common/lib/dev-run';
 import { captureException } from '@studio/common/lib/error-reporting';
 import { updateSharedSession } from '@studio/common/lib/shared-config';
 import { recordAgentRun, recordAgentSend, type AgentSurface } from '@studio/agent/node/agent-stats';
+import { getOpenAiSessionKeyEnvironment } from '@studio/agent/node/openai-credentials';
 import {
 	getCreatedSiteFromArtifact,
 	setAiSessionSitePlacement,
@@ -216,6 +217,9 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			env: {
 				...process.env,
 				...( getTracksOrigin ? { STUDIO_TRACKS_ORIGIN: getTracksOrigin() } : {} ),
+				// An OpenAI key kept for this app session only; the CLI takes it out
+				// of its environment on startup.
+				...getOpenAiSessionKeyEnvironment(),
 			},
 		} );
 

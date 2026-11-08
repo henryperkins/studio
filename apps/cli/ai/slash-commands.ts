@@ -1,9 +1,19 @@
+import { readAiSettings, removeOpenAiApiKey } from '@studio/agent/node/settings-store';
 import {
 	aiModelRequiresPaidCredits,
 	getAiModelFamily,
 	getAiModelLabel,
 	type AiModelId,
 } from '@studio/agent/protocol/models';
+import {
+	OPENAI_REASONING_MODES,
+	getOpenAiModelCapabilities,
+	getOpenAiReasoningEffortLabel,
+	getOpenAiReasoningModeLabel,
+	resolveOpenAiSessionSelection,
+	type OpenAiReasoningEffort,
+	type OpenAiReasoningMode,
+} from '@studio/agent/protocol/openai-models';
 import { getAiSkillCommands } from '@studio/agent/protocol/slash-commands';
 import { isAutomatticianFromToken, readAuthToken } from '@studio/common/lib/shared-config';
 import {
@@ -31,6 +41,7 @@ import { getAppLocale } from 'cli/lib/i18n';
 import { getSnapshotLink, getSnapshotsFromConfig, isSnapshotExpired } from 'cli/lib/snapshots';
 import { fetchSyncableSites } from 'cli/lib/sync-api';
 import { Logger, LoggerError } from 'cli/logger';
+import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { AiChatUI } from 'cli/ai/ui';
 
 export interface SlashCommandContext {
@@ -46,6 +57,11 @@ export interface SlashCommandContext {
 	maybeAutoSwitchProvider(): Promise< void >;
 	persistSessionContext(): Promise< void >;
 	clearSession(): Promise< void >;
+	getSessionEntries(): Promise< SessionEntry[] >;
+	persistOpenAiReasoning(
+		reasoningEffort: OpenAiReasoningEffort,
+		reasoningMode: OpenAiReasoningMode
+	): Promise< void >;
 }
 
 type SlashCommandHandler = (
@@ -236,6 +252,129 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 				}
 				if ( error instanceof LoggerError ) {
 					ctx.ui.showError( error.message );
+					return 'continue';
+				}
+				throw error;
+			}
+			return 'continue';
+		},
+	},
+	{
+		name: 'openai-key',
+		description: __( 'Set, replace, or remove the OpenAI API key' ),
+		handler: async ( _prompt, ctx ) => {
+			try {
+				const { hasOpenAiApiKey } = await readAiSettings();
+				const replace = __( 'Enter a new key' );
+				const remove = __( 'Remove the key' );
+				const choice = hasOpenAiApiKey
+					? ( Object.values(
+							await ctx.ui.askUser( [
+								{
+									question: __( 'What do you want to do with the OpenAI API key?' ),
+									options: [
+										{ label: replace, description: 'replace' },
+										{ label: remove, description: 'remove' },
+									],
+								},
+							] )
+					  )[ 0 ] as string )
+					: replace;
+				if ( choice === remove ) {
+					await removeOpenAiApiKey();
+					ctx.ui.showInfo(
+						__( 'OpenAI API key removed. OpenAI chats stay on OpenAI until a key is added again.' )
+					);
+					return 'continue';
+				}
+				await ctx.prepareProviderSelection( 'openai-api-key', { force: true } );
+				ctx.ui.showInfo( __( 'OpenAI API key updated.' ) );
+				if ( ctx.showCapabilitiesOnConnect ) {
+					ctx.showCapabilitiesOnConnect = false;
+					await ctx.switchProvider( 'openai-api-key' );
+					ctx.ui.showCapabilities();
+				}
+			} catch ( error ) {
+				if ( isPromptAbortError( error ) ) {
+					ctx.ui.showInfo( __( 'API key update canceled.' ) );
+					return 'continue';
+				}
+				if ( error instanceof LoggerError ) {
+					ctx.ui.showError( error.message );
+					return 'continue';
+				}
+				throw error;
+			}
+			return 'continue';
+		},
+	},
+	{
+		name: 'reasoning',
+		description: __( 'Choose the reasoning effort and mode for OpenAI models' ),
+		handler: async ( _prompt, ctx ) => {
+			const capabilities = getOpenAiModelCapabilities( ctx.currentModel );
+			if ( ctx.currentProvider !== 'openai-api-key' || ! capabilities ) {
+				ctx.ui.showInfo(
+					__( 'Reasoning settings apply to OpenAI models. Use /provider to switch.' )
+				);
+				return 'continue';
+			}
+			const { openAi } = await readAiSettings();
+			const current = resolveOpenAiSessionSelection( await ctx.getSessionEntries(), {
+				model: ctx.currentModel,
+				reasoningEffort: openAi.defaultReasoningEffort,
+				reasoningMode: openAi.defaultReasoningMode,
+			} );
+			const effortByLabel = new Map< string, OpenAiReasoningEffort >();
+			const effortOptions = capabilities.reasoningEfforts.map( ( effort ) => {
+				const label =
+					effort === current.reasoningEffort
+						? sprintf(
+								/* translators: %s: reasoning effort, e.g. "Medium" */
+								__( '%s (current)' ),
+								getOpenAiReasoningEffortLabel( effort )
+						  )
+						: getOpenAiReasoningEffortLabel( effort );
+				effortByLabel.set( label, effort );
+				return { label, description: effort };
+			} );
+			const modeByLabel = new Map< string, OpenAiReasoningMode >();
+			const modeOptions = OPENAI_REASONING_MODES.filter( ( mode ) =>
+				capabilities.reasoningModes.includes( mode )
+			).map( ( mode ) => {
+				const label = getOpenAiReasoningModeLabel( mode );
+				modeByLabel.set( label, mode );
+				return {
+					label,
+					description:
+						mode === 'pro'
+							? __( 'More model work per answer: slower, and uses more tokens.' )
+							: __( 'The model’s usual execution.' ),
+				};
+			} );
+			try {
+				const effortQuestion = __( 'Reasoning effort' );
+				const modeQuestion = __( 'Reasoning mode' );
+				const answers = await ctx.ui.askUser( [
+					{ question: effortQuestion, options: effortOptions },
+					{ question: modeQuestion, options: modeOptions },
+				] );
+				const effort = effortByLabel.get( answers[ effortQuestion ] );
+				const mode = modeByLabel.get( answers[ modeQuestion ] );
+				if ( ! effort || ! mode ) {
+					return 'continue';
+				}
+				await ctx.persistOpenAiReasoning( effort, mode );
+				ctx.ui.showInfo(
+					sprintf(
+						/* translators: 1: reasoning effort, 2: reasoning mode. */
+						__( 'Reasoning set to %1$s, %2$s mode. It applies from your next message.' ),
+						getOpenAiReasoningEffortLabel( effort ),
+						getOpenAiReasoningModeLabel( mode )
+					)
+				);
+			} catch ( error ) {
+				if ( isPromptAbortError( error ) ) {
 					return 'continue';
 				}
 				throw error;

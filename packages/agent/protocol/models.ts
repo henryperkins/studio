@@ -2,7 +2,7 @@ import { __ } from '@wordpress/i18n';
 import { isStudioCustomEntryOfType } from '@studio/agent/protocol/sessions/entry-types';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 
-export type AiModelFamily = 'anthropic' | 'studio';
+export type AiModelFamily = 'anthropic' | 'studio' | 'openai';
 
 export interface AiModel {
 	/** Stable model id, kept in settings and session history. */
@@ -30,7 +30,8 @@ export interface AiModel {
 // The `studio` family are capability tiers, not concrete models: the wpcom
 // proxy's `studio-agent` lane resolves each alias to an upstream model
 // server-side, so the mapping can be retuned without a client release. The
-// `anthropic` family exists for the direct Anthropic · API key provider only.
+// `anthropic` and `openai` families exist for the direct API key providers
+// only; the OpenAI entries' capabilities live in `openai-models.ts`.
 export const AI_MODELS = [
 	{ id: 'fast', label: 'Fast', family: 'studio', supportsImages: false },
 	{
@@ -49,6 +50,10 @@ export const AI_MODELS = [
 	},
 	{ id: 'claude-sonnet-5', label: 'Sonnet 5', family: 'anthropic' },
 	{ id: 'claude-opus-5', label: 'Opus 5', family: 'anthropic' },
+	{ id: 'gpt-6.1-sol', label: 'GPT-6.1 Sol', family: 'openai' },
+	{ id: 'gpt-6-astra', label: 'GPT-6 Astra', family: 'openai' },
+	{ id: 'gpt-6.1-terra', label: 'GPT-6.1 Terra', family: 'openai' },
+	{ id: 'gpt-6-luna', label: 'GPT-6 Luna', family: 'openai' },
 ] as const satisfies readonly AiModel[];
 
 export type AiModelId = ( typeof AI_MODELS )[ number ][ 'id' ];
@@ -121,6 +126,20 @@ function readEntryModelId( entry: SessionEntry ): string | undefined {
 	if ( isStudioCustomEntryOfType( entry, 'studio.session_context' ) ) {
 		const model = entry.data?.model;
 		return typeof model === 'string' ? model : undefined;
+	}
+	return undefined;
+}
+
+/**
+ * The most recently recorded model id, verbatim — including one Studio no
+ * longer offers — or `undefined` when the session never recorded one.
+ */
+export function readLatestRecordedModelId( entries: SessionEntry[] ): string | undefined {
+	for ( let index = entries.length - 1; index >= 0; index -= 1 ) {
+		const recordedModel = readEntryModelId( entries[ index ] );
+		if ( recordedModel !== undefined ) {
+			return recordedModel;
+		}
 	}
 	return undefined;
 }

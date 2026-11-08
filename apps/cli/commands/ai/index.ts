@@ -6,7 +6,12 @@ import {
 	type StudioAgentHost,
 	AskUserQuestion,
 } from '@studio/agent/node';
-import { readAnthropicApiKey, readSelectedAiProvider } from '@studio/agent/node/settings-store';
+import {
+	readAiSettings,
+	readAnthropicApiKey,
+	readOpenAiApiKey,
+	readSelectedAiProvider,
+} from '@studio/agent/node/settings-store';
 import { buildChatAttachmentSummaries } from '@studio/agent/protocol/chat-attachments';
 import {
 	buildAttachedFilesPromptBlock,
@@ -19,7 +24,16 @@ import {
 	readRecordedSessionModel,
 	type AiModelId,
 } from '@studio/agent/protocol/models';
-import { getAiProviderDefaultModel } from '@studio/agent/protocol/providers';
+import {
+	describeOpenAiSettingsProblem,
+	resolveOpenAiSessionSelection,
+	resolveOpenAiTurnSettings,
+	type OpenAiTurnSettings,
+} from '@studio/agent/protocol/openai-models';
+import {
+	getAiModelFamilyProvider,
+	getAiProviderDefaultModel,
+} from '@studio/agent/protocol/providers';
 import { getAgentEndTurnResult } from '@studio/agent/protocol/session-events';
 import {
 	buildSkillInvocationPrompt,
@@ -140,6 +154,69 @@ async function resolveWpcomDefaultModel(): Promise< AiModelId > {
 	} );
 }
 
+/**
+ * The provider this run uses for a resumed (or new) conversation. An OpenAI
+ * conversation stays on OpenAI even without a key — its turn then fails as
+ * disconnected — and a conversation that ran elsewhere keeps its provider when
+ * OpenAI becomes the default. The WordPress.com and Anthropic rules are
+ * unchanged.
+ */
+async function resolveRunProvider(
+	resumeContext: ReturnType< typeof resolveResumeSessionContext >
+): Promise< AiProviderId > {
+	const pinned = resumeContext.provider;
+	const recordedProvider = resumeContext.model
+		? getAiModelFamilyProvider( getAiModelFamily( resumeContext.model ) )
+		: undefined;
+	if ( pinned === 'openai-api-key' || ( ! pinned && recordedProvider === 'openai-api-key' ) ) {
+		return 'openai-api-key';
+	}
+	if ( ! pinned && recordedProvider && ( await readSelectedAiProvider() ) === 'openai-api-key' ) {
+		return recordedProvider === 'anthropic-api-key' &&
+			! ( await isAiProviderReady( 'anthropic-api-key' ) )
+			? DEFAULT_AI_PROVIDER
+			: recordedProvider;
+	}
+	// A pin whose provider can't run (e.g. its key was removed) falls back to
+	// WordPress.com for this run only; the pin stays so a restored key revives it.
+	if ( pinned && pinned !== DEFAULT_AI_PROVIDER && ! ( await isAiProviderReady( pinned ) ) ) {
+		return DEFAULT_AI_PROVIDER;
+	}
+	return pinned ?? ( await resolveInitialAiProvider() );
+}
+
+/** The conversation's OpenAI settings for one turn, or why they can't run. */
+async function resolveOpenAiTurn(
+	sm: SessionManager
+): Promise< { settings: OpenAiTurnSettings; needsPin: boolean } > {
+	const { openAi } = await readAiSettings();
+	const entries = sm.getEntries();
+	const selection = resolveOpenAiSessionSelection( entries, {
+		model: openAi.defaultModel,
+		reasoningEffort: openAi.defaultReasoningEffort,
+		reasoningMode: openAi.defaultReasoningMode,
+	} );
+	const result = resolveOpenAiTurnSettings( {
+		...selection,
+		maxOutputTokens: openAi.maxOutputTokens,
+		availableModelIds: openAi.models.availableModelIds,
+	} );
+	if ( ! result.ok ) {
+		throw new LoggerError( describeOpenAiSettingsProblem( result.problem ) );
+	}
+	// A conversation that hasn't recorded its reasoning yet keeps the defaults
+	// it starts with, so a later change of default doesn't move it.
+	const recorded = resolveOpenAiSessionSelection( entries, {
+		model: '',
+		reasoningEffort: '',
+		reasoningMode: '',
+	} );
+	return {
+		settings: result.settings,
+		needsPin: ! recorded.model || ! recorded.reasoningEffort || ! recorded.reasoningMode,
+	};
+}
+
 export async function runCommand( options: {
 	adapter: AiOutputAdapter;
 	initialMessage?: string;
@@ -203,17 +280,7 @@ export async function runCommand( options: {
 	};
 	const agent = createAgent( { host } );
 	const resumeContext = resolveResumeSessionContext( options.resumeSession );
-	let currentProvider: AiProviderId =
-		resumeContext.provider ?? ( await resolveInitialAiProvider() );
-	// A pin whose provider can't run (e.g. its key was removed) falls back to
-	// WordPress.com for this run only; the pin stays so a restored key revives it.
-	if (
-		resumeContext.provider &&
-		resumeContext.provider !== DEFAULT_AI_PROVIDER &&
-		! ( await isAiProviderReady( resumeContext.provider ) )
-	) {
-		currentProvider = DEFAULT_AI_PROVIDER;
-	}
+	let currentProvider: AiProviderId = await resolveRunProvider( resumeContext );
 	// The recorded model only sticks when the provider still serves it — old
 	// wpcom sessions snap to the provider default instead.
 	const initialDefinition = getAiProviderDefinition( currentProvider );
@@ -341,6 +408,18 @@ export async function runCommand( options: {
 		);
 	}
 
+	// OpenAI never falls back, so its record can carry the provider safely.
+	async function persistOpenAiPin( settings: OpenAiTurnSettings ): Promise< void > {
+		await append( ( sm ) =>
+			appendStudioEntry( sm, 'studio.session_context', {
+				provider: 'openai-api-key',
+				model: settings.model,
+				reasoningEffort: settings.reasoningEffort,
+				reasoningMode: settings.reasoningMode,
+			} )
+		);
+	}
+
 	ui.onSiteSelected = ( site ) => {
 		void append( ( sm ) =>
 			appendStudioEntry( sm, 'studio.site_selected', {
@@ -395,7 +474,11 @@ export async function runCommand( options: {
 		const definition = getAiProviderDefinition( currentProvider );
 		if ( ! definition.supportsModel( currentModel ) ) {
 			currentModel =
-				currentProvider === DEFAULT_AI_PROVIDER ? wpcomDefaultModel : definition.defaultModel;
+				currentProvider === DEFAULT_AI_PROVIDER
+					? wpcomDefaultModel
+					: currentProvider === 'openai-api-key'
+					? ( await readAiSettings() ).openAi.defaultModel
+					: definition.defaultModel;
 			ui.currentModel = currentModel;
 		}
 
@@ -448,6 +531,9 @@ export async function runCommand( options: {
 
 		if ( currentProvider === 'anthropic-api-key' ) {
 			ui.showInfo( __( 'Use /api-key to update the Anthropic API key.' ) );
+		}
+		if ( currentProvider === 'openai-api-key' && ! isJsonMode ) {
+			ui.showInfo( __( 'Use /openai-key to update the OpenAI API key.' ) );
 		}
 	}
 
@@ -544,6 +630,11 @@ export async function runCommand( options: {
 		}
 	} else if ( currentProvider === 'anthropic-api-key' && ! ( await readAnthropicApiKey() ) ) {
 		ui.showInfo( __( 'No Anthropic API key saved. Use /api-key to enter one.' ) );
+	} else if (
+		currentProvider === 'openai-api-key' &&
+		! ( await readOpenAiApiKey().catch( () => null ) )
+	) {
+		ui.showInfo( __( 'OpenAI isn’t connected. Use /openai-key to enter an API key.' ) );
 	}
 
 	async function askUserAndPersistAnswers(
@@ -594,6 +685,13 @@ export async function runCommand( options: {
 		await maybeAutoSwitchProvider();
 		const sm = await ensureSession();
 		const sessionId = sm.getSessionId();
+		// Fixed for the whole turn: a change made while it runs applies to the next.
+		const openAiTurn =
+			currentProvider === 'openai-api-key' ? await resolveOpenAiTurn( sm ) : undefined;
+		if ( openAiTurn ) {
+			currentModel = openAiTurn.settings.model;
+			ui.currentModel = currentModel;
+		}
 		const env = await resolveAiEnvironment( currentProvider, {
 			sessionId,
 		} );
@@ -635,7 +733,11 @@ export async function runCommand( options: {
 			enrichedPrompt = `${ enrichedPrompt }${ buildAttachedFilesPromptBlock( files ) }`;
 		}
 
-		await persistSessionContext();
+		if ( openAiTurn?.needsPin ) {
+			await persistOpenAiPin( openAiTurn.settings );
+		} else {
+			await persistSessionContext();
+		}
 
 		// Sole emitter of the chat events: every surface forks this process, and only this layer holds
 		// the provider, model and outcome together. `channel` separates them.
@@ -679,6 +781,7 @@ export async function runCommand( options: {
 			images,
 			env,
 			model: currentModel,
+			openAi: openAiTurn?.settings,
 			session: sm,
 			activeSite: site,
 			onAskUser: ( questions ) => askUserAndPersistAnswers( questions ),
@@ -838,6 +941,19 @@ export async function runCommand( options: {
 		prepareProviderSelection,
 		maybeAutoSwitchProvider,
 		persistSessionContext,
+		async getSessionEntries() {
+			return ( await ensureSession() ).getEntries();
+		},
+		async persistOpenAiReasoning( reasoningEffort, reasoningMode ) {
+			await append( ( sm ) =>
+				appendStudioEntry( sm, 'studio.session_context', {
+					provider: 'openai-api-key',
+					model: currentModel,
+					reasoningEffort,
+					reasoningMode,
+				} )
+			);
+		},
 		async clearSession() {
 			session = await agent.sessions.create();
 			ui.clearTranscript();

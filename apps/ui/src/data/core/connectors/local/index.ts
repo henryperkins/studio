@@ -755,6 +755,12 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 				body: JSON.stringify( { provider, model } ),
 			} );
 		},
+		async setSessionOpenAiSelection( sessionId, selection ) {
+			await api( `/sessions/${ encodeURIComponent( sessionId ) }/openai-selection`, {
+				method: 'POST',
+				body: JSON.stringify( selection ),
+			} );
+		},
 		async setSessionEnvironment( sessionId, environment ) {
 			await api( `/sessions/${ encodeURIComponent( sessionId ) }/environment`, {
 				method: 'POST',
@@ -858,6 +864,24 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			return api< AiSettings >( '/ai-settings/provider', {
 				method: 'PUT',
 				body: JSON.stringify( { provider } ),
+			} );
+		},
+		async saveOpenAiApiKey( key, storage ): Promise< AiSettings > {
+			return api< AiSettings >( '/ai-settings/openai-key', {
+				method: 'POST',
+				body: JSON.stringify( { key, storage } ),
+			} );
+		},
+		async removeOpenAiApiKey(): Promise< AiSettings > {
+			return api< AiSettings >( '/ai-settings/openai-key', { method: 'DELETE' } );
+		},
+		async refreshOpenAiModels(): Promise< AiSettings > {
+			return api< AiSettings >( '/ai-settings/openai-models/refresh', { method: 'POST' } );
+		},
+		async setOpenAiDefaults( update ): Promise< AiSettings > {
+			return api< AiSettings >( '/ai-settings/openai-defaults', {
+				method: 'PATCH',
+				body: JSON.stringify( update ),
 			} );
 		},
 

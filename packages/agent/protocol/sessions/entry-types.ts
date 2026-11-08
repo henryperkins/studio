@@ -50,10 +50,15 @@ export interface StudioTurnClosedData {
 }
 
 // `provider` marks an explicit user pin; the CLI's per-turn records carry
-// only the model so a fallback run never rewrites the pin.
+// only the model so a fallback run never rewrites the pin. OpenAI never falls
+// back, so its per-turn records also carry the provider and the reasoning the
+// turn ran with. Reasoning fields are plain strings for the same reason as
+// `provider`: readers validate them against the model's capabilities.
 export interface StudioSessionContextData {
 	provider?: string;
 	model: string;
+	reasoningEffort?: string;
+	reasoningMode?: string;
 }
 
 // Lightweight attachment summaries persisted on a user-prompt entry so the

@@ -29,6 +29,7 @@ import {
 	setSessionEnvironment,
 	updateHydratedAiSessionMetadata,
 } from '@studio/agent/node/sessions/manage';
+import { setSessionOpenAiSelection } from '@studio/agent/node/sessions/openai-selection';
 import { appendModelChangeEntry, appendStudioEntry } from '@studio/agent/node/sessions/store';
 import { validateStudioChatFiles } from '@studio/agent/protocol/chat-files';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
@@ -241,11 +242,15 @@ export {
 	getOnboardingHints,
 	getUserPreferences,
 	getWapuuScore,
+	refreshOpenAiModels,
+	removeOpenAiApiKey,
 	saveAnthropicApiKey,
 	saveGlobalAgentInstructions,
 	saveOnboardingHints,
+	saveOpenAiApiKey,
 	saveWapuuScore,
 	setAiProvider,
+	setOpenAiDefaults,
 	setUserPreferences,
 } from 'src/modules/user-settings/lib/ipc-handlers';
 
@@ -383,6 +388,14 @@ export async function setAiSessionProvider(
 		provider,
 		model,
 	} );
+}
+
+export async function setAiSessionOpenAiSelection(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	selection: { model: unknown; reasoningEffort: unknown; reasoningMode: unknown }
+): Promise< void > {
+	await setSessionOpenAiSelection( getSessionsDirectory(), sessionId, selection );
 }
 
 export async function setAiSessionEnvironment(

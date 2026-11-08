@@ -11,6 +11,7 @@ export {
 	makeSession,
 	makeSite,
 	TEST_USER,
+	withoutOpenAi,
 	type FakeConnectorInitialState,
 	type FakeConnectorState,
 } from './in-memory-connector';

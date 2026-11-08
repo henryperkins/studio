@@ -11,7 +11,7 @@ import {
 	SIDEBAR_PANEL_STORAGE_KEY,
 } from '@/data/resizable-panels';
 import { applyColorTint, DEFAULT_COLOR_TINT } from '@/lib/theme';
-import { createFakeConnector, makeSite, TEST_USER } from '@/test/fake-connector';
+import { createFakeConnector, makeSite, TEST_USER, withoutOpenAi } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { Connector, UserPreferences } from '@/data/core';
 
@@ -39,6 +39,7 @@ async function setup( {
 		provider: 'wpcom' as const,
 		hasAnthropicApiKey: true,
 		anthropicApiKeyPreview: 'sk-…last',
+		...withoutOpenAi(),
 	};
 	let skills = [
 		{
@@ -68,6 +69,7 @@ async function setup( {
 					...connection,
 					hasAnthropicApiKey: !! key,
 					anthropicApiKeyPreview: key ? 'sk-…last' : ( null as never ),
+					...withoutOpenAi(),
 				};
 				return connection;
 			},
@@ -825,10 +827,16 @@ describe( 'WordPress Studio settings: AI, instructions, skills and MCP', () => {
 					provider: 'wpcom',
 					hasAnthropicApiKey: hasKey,
 					anthropicApiKeyPreview: null,
+					...withoutOpenAi(),
 				} ),
 				saveAnthropicApiKey: async () => {
 					hasKey = true;
-					return { provider: 'wpcom', hasAnthropicApiKey: true, anthropicApiKeyPreview: 'test' };
+					return {
+						provider: 'wpcom',
+						hasAnthropicApiKey: true,
+						anthropicApiKeyPreview: 'test',
+						...withoutOpenAi(),
+					};
 				},
 			},
 		} );

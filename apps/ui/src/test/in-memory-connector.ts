@@ -1,3 +1,10 @@
+import {
+	describeOpenAiSettingsProblem,
+	OPENAI_MODEL_CATALOG_VERSION,
+	OPENAI_MODEL_IDS,
+	resolveOpenAiTurnSettings,
+} from '@studio/agent/protocol/openai-models';
+import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { AGENT_APP_IDS } from '@studio/common/lib/agent-apps';
 import { SITE_EVENTS } from '@studio/common/lib/cli-events';
 import { SUPPORTED_EDITORS } from '@studio/common/lib/user-settings/editor';
@@ -13,6 +20,7 @@ import type {
 	SiteEmail,
 	UserPreferences,
 } from '@/data/core';
+import type { AiSettings } from '@studio/agent/protocol/providers';
 
 type Methods = {
 	[ K in keyof Connector as Required< Connector >[ K ] extends ( ...args: never[] ) => unknown
@@ -77,6 +85,11 @@ export function makeSession( overrides: Partial< AiSessionSummary > = {} ): AiSe
 let nextId = 1;
 
 export const TEST_USER: AuthUser = { id: 1, email: 'test@example.test', displayName: 'Test User' };
+
+/** The OpenAI half of `AiSettings` for a backend with no OpenAI key. */
+export function withoutOpenAi(): Pick< AiSettings, 'hasOpenAiApiKey' | 'openAi' > {
+	return { hasOpenAiApiKey: false, openAi: createDisconnectedOpenAiSettings() };
+}
 
 const defaultPreferences = (): UserPreferences => ( {
 	editor: 'vscode',
@@ -152,6 +165,7 @@ export function createInMemoryConnector(
 	};
 	let agentInstructions = '';
 	let agentInstructionsEnabled = true;
+	let openAi = withoutOpenAi();
 
 	const methods: Methods = {
 		init: async () => {},
@@ -284,6 +298,7 @@ export function createInMemoryConnector(
 		getActiveAgentRuns: async () => [],
 		setSessionModel: async () => {},
 		setSessionProvider: async () => {},
+		setSessionOpenAiSelection: async () => {},
 		setSessionEnvironment: async ( id, environment ) => {
 			const session = findSession( id );
 			session.summary = { ...session.summary, activeEnvironment: environment };
@@ -312,17 +327,95 @@ export function createInMemoryConnector(
 			provider: 'wpcom',
 			hasAnthropicApiKey: false,
 			anthropicApiKeyPreview: null,
+			...openAi,
 		} ),
 		saveAnthropicApiKey: async ( key ) => ( {
 			provider: 'wpcom',
 			hasAnthropicApiKey: !! key,
 			anthropicApiKeyPreview: key ? 'sk-ant-…test' : null,
+			...openAi,
 		} ),
 		setAiProvider: async ( provider ) => ( {
 			provider,
 			hasAnthropicApiKey: false,
 			anthropicApiKeyPreview: null,
+			...openAi,
 		} ),
+		// A key is accepted as it is; every catalog model counts as listed.
+		saveOpenAiApiKey: async ( key, storage ) => {
+			openAi = {
+				hasOpenAiApiKey: true,
+				openAi: {
+					...openAi.openAi,
+					keyStorage: storage,
+					keyHint: `…${ key.trim().slice( -4 ) }`,
+					models: {
+						checkedAt: '2026-11-07T00:00:00.000Z',
+						availableModelIds: [ ...OPENAI_MODEL_IDS ],
+						catalogVersion: OPENAI_MODEL_CATALOG_VERSION,
+						lastError: null,
+					},
+				},
+			};
+			return {
+				provider: 'wpcom',
+				hasAnthropicApiKey: false,
+				anthropicApiKeyPreview: null,
+				...openAi,
+			};
+		},
+		removeOpenAiApiKey: async () => {
+			openAi = {
+				hasOpenAiApiKey: false,
+				openAi: {
+					...openAi.openAi,
+					keyStorage: null,
+					keyHint: null,
+					models: createDisconnectedOpenAiSettings().models,
+				},
+			};
+			return {
+				provider: 'wpcom',
+				hasAnthropicApiKey: false,
+				anthropicApiKeyPreview: null,
+				...openAi,
+			};
+		},
+		refreshOpenAiModels: async () => ( {
+			provider: 'wpcom',
+			hasAnthropicApiKey: false,
+			anthropicApiKeyPreview: null,
+			...openAi,
+		} ),
+		setOpenAiDefaults: async ( update ) => {
+			const current = openAi.openAi;
+			const result = resolveOpenAiTurnSettings( {
+				model: update.model ?? current.defaultModel,
+				reasoningEffort: update.reasoningEffort ?? current.defaultReasoningEffort,
+				reasoningMode: update.reasoningMode ?? current.defaultReasoningMode,
+				maxOutputTokens: update.maxOutputTokens ?? current.maxOutputTokens,
+				availableModelIds: current.models.availableModelIds,
+			} );
+			if ( ! result.ok ) {
+				throw new Error( describeOpenAiSettingsProblem( result.problem ) );
+			}
+			openAi = {
+				...openAi,
+				openAi: {
+					...current,
+					defaultModel: result.settings.model,
+					defaultReasoningEffort: result.settings.reasoningEffort,
+					defaultReasoningMode: result.settings.reasoningMode,
+					maxOutputTokens: result.settings.maxOutputTokens,
+				},
+			};
+			return {
+				provider: 'wpcom',
+				hasAnthropicApiKey: false,
+				anthropicApiKeyPreview: null,
+				...openAi,
+			};
+		},
 		getInstalledApps: async () => installedApps(),
 		getAgentApps: async () =>
 			AGENT_APP_IDS.map( ( id ) => ( {

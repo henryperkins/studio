@@ -57,6 +57,14 @@ export const sharedConfigSchema = z
 		// parse; readers narrow with `isAiProviderId`.
 		aiProvider: z.string().optional(),
 		anthropicApiKey: z.string().optional(),
+		// OpenAI defaults and the last model-list check. Never the key, which
+		// lives in the system keychain (or only in memory for a session). Unknown
+		// so a bad value can't fail the whole parse; readers validate them.
+		openaiDefaultModel: z.unknown().optional(),
+		openaiDefaultReasoningEffort: z.unknown().optional(),
+		openaiDefaultReasoningMode: z.unknown().optional(),
+		openaiMaxOutputTokens: z.unknown().optional(),
+		openaiModels: z.unknown().optional(),
 		// Anonymous install identifier for Tracks analytics, shared by Studio and the Studio CLI.
 		// See `docs/design-docs/analytics-tracks.md`.
 		analyticsInstallId: z.string().optional(),

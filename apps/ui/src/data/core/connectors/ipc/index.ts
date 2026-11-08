@@ -584,6 +584,10 @@ export function createIpcConnector(): Connector {
 			await ipcApi.setAiSessionProvider( sessionId, provider, model );
 		},
 
+		async setSessionOpenAiSelection( sessionId, selection ) {
+			await unwrapIpcError( ipcApi.setAiSessionOpenAiSelection( sessionId, selection ) );
+		},
+
 		async setSessionEnvironment( sessionId, environment ) {
 			await ipcApi.setAiSessionEnvironment( sessionId, environment );
 		},
@@ -689,6 +693,18 @@ export function createIpcConnector(): Connector {
 		},
 		async setAiProvider( provider ): Promise< AiSettings > {
 			return unwrapIpcError( ipcApi.setAiProvider( provider ) );
+		},
+		async saveOpenAiApiKey( key, storage ): Promise< AiSettings > {
+			return unwrapIpcError( ipcApi.saveOpenAiApiKey( key, storage ) );
+		},
+		async removeOpenAiApiKey(): Promise< AiSettings > {
+			return unwrapIpcError( ipcApi.removeOpenAiApiKey() );
+		},
+		async refreshOpenAiModels(): Promise< AiSettings > {
+			return unwrapIpcError( ipcApi.refreshOpenAiModels() );
+		},
+		async setOpenAiDefaults( update ): Promise< AiSettings > {
+			return unwrapIpcError( ipcApi.setOpenAiDefaults( update ) );
 		},
 
 		async getInstalledApps(): Promise< InstalledApps > {

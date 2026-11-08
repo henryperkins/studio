@@ -15,7 +15,7 @@ import {
 } from '@/features/annotations';
 import { Composer, type ComposerHandle } from '@/features/composer';
 import { Button } from '@/lib/ui';
-import { createFakeConnector, makeSession, TEST_USER } from '@/test/fake-connector';
+import { createFakeConnector, makeSession, TEST_USER, withoutOpenAi } from '@/test/fake-connector';
 import { renderWithProviders } from '@/test/render';
 import { clearComposerDrafts, getComposerDraft, saveComposerDraft } from './draft-store';
 import type { LoadedAiSession, SessionEntry } from '@/data/core';
@@ -31,6 +31,7 @@ const ANTHROPIC_KEY = {
 	provider: 'wpcom' as const,
 	hasAnthropicApiKey: true,
 	anthropicApiKeyPreview: 'sk-ant-api03-tes...1234',
+	...withoutOpenAi(),
 };
 
 const OUT_OF_CREDITS = {

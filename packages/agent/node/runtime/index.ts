@@ -33,6 +33,7 @@ import { type TSchema } from 'typebox';
 import { withDesignSystemPreview } from '@studio/agent/node/chat-artifacts';
 import { readGlobalInstructions } from '@studio/agent/node/global-instructions';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
+import { OPENAI_API_BASE_URL } from '@studio/agent/node/openai-model-list';
 import { createResultNotes } from '@studio/agent/node/result-notes';
 import { buildSystemPrompt, type ToolPromptContribution } from '@studio/agent/node/system-prompt';
 import { resolveStudioTools } from '@studio/agent/node/tools';
@@ -45,12 +46,28 @@ import {
 	DEFAULT_MODEL,
 	getAiModel,
 	getAiModelFamily,
+	getAiModelLabel,
 	type AiModelFamily,
 	type AiModelId,
 } from '@studio/agent/protocol/models';
+import {
+	describeOpenAiSettingsProblem,
+	getInitialOpenAiReasoningEffort,
+	isOpenAiModelId,
+	OPENAI_DEFAULT_MAX_OUTPUT_TOKENS,
+	OPENAI_DEFAULT_REASONING_MODE,
+	resolveOpenAiTurnSettings,
+	type OpenAiTurnSettings,
+} from '@studio/agent/protocol/openai-models';
 import { findLastAssistant, isEmptyStop } from '@studio/agent/protocol/session-events';
 import { getFileToolPrompt } from './file-tool-prompts';
 import { withLeakedToolCallMarkupRemoved } from './leaked-tool-call-markup';
+import {
+	buildOpenAiModel,
+	createOpenAiProviderConfig,
+	STUDIO_OPENAI_PROVIDER,
+	toPiThinkingLevel,
+} from './openai-transport';
 import { getPendingWork, type PendingWork } from './pending-work';
 import { stripStaleImagesFromContext } from './strip-stale-images';
 import {
@@ -93,8 +110,18 @@ export interface StudioAgentTurnConfig {
 	prompt: string;
 	images?: StudioChatImage[];
 	session: SessionManager;
+	/**
+	 * Provider credentials for this turn, kept apart from the environment the
+	 * agent's tools run in: nothing here is passed to a spawned process.
+	 */
 	env?: Record< string, string >;
 	model?: AiModelId;
+	/**
+	 * The OpenAI model, effort, mode and output cap, fixed when the turn
+	 * starts. Every request in the turn — tool continuations and retries
+	 * included — uses these. Defaults to the model's initial settings.
+	 */
+	openAi?: OpenAiTurnSettings;
 	activeSite?: SiteInfo | null;
 	onAskUser?: AskUserHandler;
 	onEvent: ( event: AgentSessionEvent ) => void;
@@ -182,6 +209,20 @@ function resolveCredentials(
 		};
 	}
 
+	if ( family === 'openai' ) {
+		// Studio-namespaced so only Studio's saved key can satisfy it, never an
+		// OPENAI_API_KEY the user happens to have in their environment.
+		const apiKey = env.STUDIO_OPENAI_API_KEY?.trim();
+		if ( ! apiKey ) {
+			return {
+				ok: false,
+				reason:
+					'OpenAI isn’t connected: add an OpenAI API key in Settings → AI, or with /provider in Studio Code. (STUDIO_OPENAI_API_KEY is not set.)',
+			};
+		}
+		return { ok: true, creds: { apiKey, baseURL: OPENAI_API_BASE_URL } };
+	}
+
 	const apiKey = env.ANTHROPIC_API_KEY?.trim();
 	if ( ! apiKey ) {
 		return {
@@ -234,6 +275,33 @@ function syntheticErrorAgentEnd(
 	};
 }
 
+/**
+ * The turn's OpenAI settings, validated again here so a caller can't start a
+ * turn with a combination the model doesn't support. Frozen: nothing during
+ * the turn may change them.
+ */
+function resolveTurnOpenAiSettings(
+	config: ResolvedStudioAgentTurnConfig
+): { ok: true; settings: OpenAiTurnSettings } | { ok: false; reason: string } {
+	if ( ! isOpenAiModelId( config.model ) ) {
+		return { ok: false, reason: `Unknown OpenAI model: ${ config.model }` };
+	}
+	if ( config.openAi && config.openAi.model !== config.model ) {
+		return { ok: false, reason: 'The OpenAI settings name a different model than the turn.' };
+	}
+	const result = resolveOpenAiTurnSettings(
+		config.openAi ?? {
+			model: config.model,
+			reasoningEffort: getInitialOpenAiReasoningEffort( config.model ),
+			reasoningMode: OPENAI_DEFAULT_REASONING_MODE,
+			maxOutputTokens: OPENAI_DEFAULT_MAX_OUTPUT_TOKENS,
+		}
+	);
+	return result.ok
+		? { ok: true, settings: Object.freeze( { ...result.settings } ) }
+		: { ok: false, reason: describeOpenAiSettingsProblem( result.problem ) };
+}
+
 async function runAgentSessionTurn(
 	config: ResolvedStudioAgentTurnConfig,
 	controller: AbortController,
@@ -245,12 +313,27 @@ async function runAgentSessionTurn(
 		config.onEvent( syntheticErrorAgentEnd( 'error', resolved.reason ) );
 		return;
 	}
+	let openAiSettings: OpenAiTurnSettings | undefined;
+	if ( family === 'openai' ) {
+		const settings = resolveTurnOpenAiSettings( config );
+		if ( ! settings.ok ) {
+			config.onEvent( syntheticErrorAgentEnd( 'error', settings.reason ) );
+			return;
+		}
+		openAiSettings = settings.settings;
+	}
 
 	let session: AgentSession | undefined;
 	let unsubscribe: ( () => void ) | undefined;
 	const payloadGuardState: StudioToolPayloadGuardState = {};
 	try {
-		session = await createStudioAgentSession( config, family, resolved.creds, payloadGuardState );
+		session = await createStudioAgentSession(
+			config,
+			family,
+			resolved.creds,
+			payloadGuardState,
+			openAiSettings
+		);
 		setActiveSession( session );
 		let emptyStopContinues = 0;
 		let continueAfterEmptyStop = false;
@@ -326,9 +409,12 @@ async function createStudioAgentSession(
 	config: ResolvedStudioAgentTurnConfig,
 	family: AiModelFamily,
 	creds: ResolvedCredentials,
-	payloadGuardState: StudioToolPayloadGuardState
+	payloadGuardState: StudioToolPayloadGuardState,
+	openAiSettings?: OpenAiTurnSettings
 ): Promise< AgentSession > {
-	const model = buildModel( config.model, family, creds );
+	const model = openAiSettings
+		? buildOpenAiModel( openAiSettings, getAiModelLabel( openAiSettings.model ) )
+		: buildModel( config.model, family, creds );
 	const visionEnabled = aiModelSupportsImages( config.model );
 	const [ userInstructions, imageGenerationEnabled ] = await Promise.all( [
 		readGlobalInstructions(),
@@ -350,7 +436,7 @@ async function createStudioAgentSession(
 	const toolDefinitions = tools.map( ( tool ) =>
 		toToolDefinition( config.host, tool, payloadGuardState, pendingWork, resultNotes )
 	);
-	const modelRuntime = await createModelRuntime( model, family, creds );
+	const modelRuntime = await createModelRuntime( model, family, creds, openAiSettings );
 	const settingsManager = createSettingsManager( config.env );
 	const { sitesRoot } = config.host;
 	const resourceLoader = new DefaultResourceLoader( {
@@ -372,7 +458,8 @@ async function createStudioAgentSession(
 		agentDir: sitesRoot,
 		modelRuntime,
 		model,
-		thinkingLevel: 'medium',
+		// OpenAI turns use the chosen effort; the other providers keep medium.
+		thinkingLevel: openAiSettings ? toPiThinkingLevel( openAiSettings.reasoningEffort ) : 'medium',
 		sessionManager: config.session,
 		settingsManager,
 		resourceLoader,
@@ -516,12 +603,25 @@ class InMemoryCredentialStore implements CredentialStore {
 async function createModelRuntime(
 	model: StudioModel,
 	family: AiModelFamily,
-	creds: ResolvedCredentials
+	creds: ResolvedCredentials,
+	openAiSettings?: OpenAiTurnSettings
 ): Promise< ModelRuntime > {
 	const modelRuntime = await ModelRuntime.create( {
 		credentials: new InMemoryCredentialStore(),
 		modelsPath: null,
 	} );
+
+	if ( openAiSettings ) {
+		modelRuntime.registerProvider(
+			STUDIO_OPENAI_PROVIDER,
+			createOpenAiProviderConfig(
+				model as Model< 'openai-responses' >,
+				creds.apiKey,
+				openAiSettings
+			)
+		);
+		return modelRuntime;
+	}
 
 	if ( family === 'studio' ) {
 		modelRuntime.registerProvider(
@@ -714,7 +814,7 @@ function buildAgentTools(
 		renameTool( createReadTool( sitesRoot ), 'Read' ),
 		designSystemPreview( renameTool( createWriteTool( sitesRoot ), 'Write' ) ),
 		designSystemPreview( renameTool( createEditTool( sitesRoot ), 'Edit' ) ),
-		renameTool( createBashTool( sitesRoot ), 'Bash' ),
+		renameTool( createBashTool( sitesRoot, { spawnHook: withoutProviderSecrets } ), 'Bash' ),
 		renameTool( createGrepTool( sitesRoot ), 'Grep' ),
 		renameTool( createFindTool( sitesRoot ), 'Glob' ),
 		renameTool( createLsTool( sitesRoot ), 'Ls' ),
@@ -726,6 +826,26 @@ function buildAgentTools(
 		tracks,
 	} ) as unknown as AgentToolAny[];
 	return [ ...studioTools, ...askUserTool, ...designOptionsTool, ...skillTool, ...piTools ];
+}
+
+// Model provider keys the agent's shell has no use for. WordPress.com tokens
+// stay: Studio's own CLI, which the agent runs, reads them.
+const PROVIDER_SECRET_VARIABLES = [
+	'OPENAI_API_KEY',
+	'STUDIO_OPENAI_API_KEY',
+	'STUDIO_OPENAI_SESSION_API_KEY',
+	'ANTHROPIC_API_KEY',
+	'ANTHROPIC_AUTH_TOKEN',
+	'STUDIO_WPCOM_API_KEY',
+];
+
+/** Strips model provider keys from the environment a Bash tool command runs in. */
+function withoutProviderSecrets< T extends { env: NodeJS.ProcessEnv } >( context: T ): T {
+	const env = { ...context.env };
+	for ( const name of PROVIDER_SECRET_VARIABLES ) {
+		delete env[ name ];
+	}
+	return { ...context, env };
 }
 
 function parseJsonHeaderEnv(

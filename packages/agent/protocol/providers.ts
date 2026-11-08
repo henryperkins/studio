@@ -1,13 +1,27 @@
 import {
 	AI_MODELS,
 	DEFAULT_MODEL,
+	getAiModelFamily,
 	PAID_DEFAULT_MODEL,
+	readRecordedSessionModel,
 	resolveSessionModel,
 	type AiModelFamily,
 	type AiModelId,
 } from '@studio/agent/protocol/models';
+import {
+	OPENAI_DEFAULT_MAX_OUTPUT_TOKENS,
+	OPENAI_DEFAULT_MODEL,
+	OPENAI_DEFAULT_REASONING_MODE,
+	OPENAI_INITIAL_REASONING_EFFORT,
+} from '@studio/agent/protocol/openai-models';
 import { isStudioCustomEntryOfType } from '@studio/agent/protocol/sessions/entry-types';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import type { OpenAiErrorSummary } from '@studio/agent/protocol/openai-errors';
+import type {
+	OpenAiModelId,
+	OpenAiReasoningEffort,
+	OpenAiReasoningMode,
+} from '@studio/agent/protocol/openai-models';
 
 // The literal entries of AI_MODELS, so `id` stays the `AiModelId` union
 // instead of widening to `string` for callers that key off it.
@@ -16,7 +30,7 @@ type AiProviderModel = ( typeof AI_MODELS )[ number ];
 // Persisted in shared.json (`aiProvider`), so treat the list as append-only:
 // readers narrow with `isAiProviderId` and fall back to the default on values
 // they don't know.
-export const AI_PROVIDER_IDS = [ 'wpcom', 'anthropic-api-key' ] as const;
+export const AI_PROVIDER_IDS = [ 'wpcom', 'anthropic-api-key', 'openai-api-key' ] as const;
 
 export type AiProviderId = ( typeof AI_PROVIDER_IDS )[ number ];
 
@@ -26,6 +40,7 @@ export const DEFAULT_AI_PROVIDER: AiProviderId = 'wpcom';
 export const AI_PROVIDER_LABELS: Record< AiProviderId, string > = {
 	wpcom: 'WordPress.com',
 	'anthropic-api-key': 'Anthropic API',
+	'openai-api-key': 'OpenAI API',
 };
 
 // Which model families each provider can service. `wpcom` serves only the
@@ -34,7 +49,20 @@ export const AI_PROVIDER_LABELS: Record< AiProviderId, string > = {
 const PROVIDER_MODEL_FAMILIES: Record< AiProviderId, readonly AiModelFamily[] > = {
 	wpcom: [ 'studio' ],
 	'anthropic-api-key': [ 'anthropic' ],
+	'openai-api-key': [ 'openai' ],
 };
+
+/** The provider that serves a model family; each family has exactly one. */
+export function getAiModelFamilyProvider( family: AiModelFamily ): AiProviderId {
+	switch ( family ) {
+		case 'studio':
+			return 'wpcom';
+		case 'anthropic':
+			return 'anthropic-api-key';
+		case 'openai':
+			return 'openai-api-key';
+	}
+}
 
 // Precomputed so callers get a stable reference (the composer calls this per
 // render), mirroring MODEL_BY_ID in models.ts.
@@ -65,14 +93,18 @@ export function providerServesModel( provider: AiProviderId, model: AiModelId ):
 /**
  * The fallback when no model was chosen or the provider can't serve the
  * requested one. On wpcom, the balanced tier when the paid tiers are unlocked;
- * everyone else (including callers without quota data) gets fast.
+ * everyone else (including callers without quota data) gets fast. On OpenAI,
+ * the default saved in settings when the caller has it.
  */
 export function getAiProviderDefaultModel(
 	provider: AiProviderId,
-	options?: { canUsePaidModels?: boolean }
+	options?: { canUsePaidModels?: boolean; openAiDefaultModel?: OpenAiModelId }
 ): AiModelId {
 	if ( provider === 'wpcom' && options?.canUsePaidModels ) {
 		return PAID_DEFAULT_MODEL;
+	}
+	if ( provider === 'openai-api-key' ) {
+		return options?.openAiDefaultModel ?? OPENAI_DEFAULT_MODEL;
 	}
 	return getAiProviderModels( provider )[ 0 ]?.id ?? DEFAULT_MODEL;
 }
@@ -80,11 +112,13 @@ export function getAiProviderDefaultModel(
 /**
  * `resolveSessionModel` constrained to what the provider can serve: a
  * recorded model it no longer offers snaps to the provider's default.
+ * OpenAI conversations resolve through `resolveOpenAiSessionSelection`
+ * instead, which reports a dropped model rather than replacing it.
  */
 export function resolveSessionModelForProvider(
 	entries: SessionEntry[],
 	provider: AiProviderId,
-	options?: { canUsePaidModels?: boolean }
+	options?: { canUsePaidModels?: boolean; openAiDefaultModel?: OpenAiModelId }
 ): AiModelId {
 	const defaultModel = getAiProviderDefaultModel( provider, options );
 	const model = resolveSessionModel( entries, defaultModel );
@@ -110,29 +144,158 @@ export function resolveSessionProvider( entries: SessionEntry[] ): AiProviderId 
 	return undefined;
 }
 
+export interface ConversationProviderInput {
+	/** The provider the conversation is pinned to, if any. */
+	pinnedProvider?: AiProviderId;
+	/** The latest model the conversation recorded that Studio still offers. */
+	recordedModel?: AiModelId;
+	/** The provider new conversations use. */
+	globalProvider?: AiProviderId;
+	hasAnthropicApiKey: boolean;
+}
+
 /**
- * The provider a conversation effectively runs on: its pinned choice first,
- * then the saved global selection. Without a saved Anthropic key the pin is
- * unusable (as are missing/unloaded settings), so WordPress.com wins.
+ * The provider a conversation runs on.
+ *
+ * OpenAI never falls back: a conversation on OpenAI stays there when its key
+ * is missing (and shows as disconnected), and the OpenAI default applies only
+ * to conversations that haven't run on another provider yet.
+ *
+ * Otherwise the pre-existing rules hold: the pin, then the saved global
+ * selection, with WordPress.com whenever no Anthropic key is saved.
+ */
+export function resolveConversationProvider( input: ConversationProviderInput ): AiProviderId {
+	const { pinnedProvider, recordedModel, globalProvider, hasAnthropicApiKey } = input;
+	if ( pinnedProvider === 'openai-api-key' ) {
+		return pinnedProvider;
+	}
+	if ( ! pinnedProvider && recordedModel ) {
+		const recordedProvider = getAiModelFamilyProvider( getAiModelFamily( recordedModel ) );
+		if ( recordedProvider === 'openai-api-key' ) {
+			return recordedProvider;
+		}
+		if ( globalProvider === 'openai-api-key' ) {
+			// A conversation that already ran elsewhere keeps its provider.
+			return recordedProvider === 'anthropic-api-key' && ! hasAnthropicApiKey
+				? DEFAULT_AI_PROVIDER
+				: recordedProvider;
+		}
+	}
+	if ( ! pinnedProvider && globalProvider === 'openai-api-key' ) {
+		return globalProvider;
+	}
+	if ( ! hasAnthropicApiKey ) {
+		return DEFAULT_AI_PROVIDER;
+	}
+	return pinnedProvider ?? globalProvider ?? DEFAULT_AI_PROVIDER;
+}
+
+/**
+ * The provider a conversation effectively runs on (see
+ * `resolveConversationProvider`). Missing or unloaded settings read as
+ * WordPress.com, except for a conversation already on OpenAI.
  */
 export function getEffectiveSessionProvider(
 	entries: SessionEntry[],
 	settings?: Pick< AiSettings, 'provider' | 'hasAnthropicApiKey' > | null
 ): AiProviderId {
-	if ( ! settings?.hasAnthropicApiKey ) {
-		return DEFAULT_AI_PROVIDER;
+	return resolveConversationProvider( {
+		pinnedProvider: resolveSessionProvider( entries ),
+		recordedModel: readRecordedSessionModel( entries ),
+		globalProvider: settings?.provider,
+		hasAnthropicApiKey: settings?.hasAnthropicApiKey ?? false,
+	} );
+}
+
+/** Whether a provider has what it needs to run a turn. */
+export function isAiProviderConnected(
+	provider: AiProviderId,
+	options: {
+		hasWpcomAuth: boolean;
+		settings?: Pick< AiSettings, 'hasAnthropicApiKey' | 'hasOpenAiApiKey' > | null;
 	}
-	return resolveSessionProvider( entries ) ?? settings.provider;
+): boolean {
+	switch ( provider ) {
+		case 'wpcom':
+			return options.hasWpcomAuth;
+		case 'anthropic-api-key':
+			return options.settings?.hasAnthropicApiKey ?? false;
+		case 'openai-api-key':
+			return options.settings?.hasOpenAiApiKey ?? false;
+	}
+}
+
+/** Where an OpenAI key is kept: the system keychain, or this app session's memory. */
+export type OpenAiKeyStorage = 'keychain' | 'session';
+
+export interface OpenAiModelAvailability {
+	/** When the account's model list was last read successfully, or null. */
+	checkedAt: string | null;
+	/**
+	 * Catalog models that list included, or null while unknown — never read, or
+	 * the key can't list models. Inclusion doesn't prove a request will succeed.
+	 */
+	availableModelIds: OpenAiModelId[] | null;
+	/** The catalog version the list was checked against. */
+	catalogVersion: string | null;
+	/** Why the latest refresh failed. A failed refresh keeps the previous list. */
+	lastError: OpenAiErrorSummary | null;
+}
+
+export interface OpenAiProviderSettings {
+	/** Where the key is kept, or null when there is none. */
+	keyStorage: OpenAiKeyStorage | null;
+	/** The key's last four characters, so the user can recognise it. */
+	keyHint: string | null;
+	/** Whether this machine's system keychain can keep a key. */
+	secureStorage: 'available' | 'unavailable';
+	/** Defaults for new OpenAI conversations. */
+	defaultModel: OpenAiModelId;
+	defaultReasoningEffort: OpenAiReasoningEffort;
+	defaultReasoningMode: OpenAiReasoningMode;
+	/** The output cap for every OpenAI turn; reasoning tokens count toward it. */
+	maxOutputTokens: number;
+	models: OpenAiModelAvailability;
+}
+
+/** A change to the defaults for new OpenAI conversations; omitted fields stay. */
+export interface OpenAiDefaultsUpdate {
+	model?: string;
+	reasoningEffort?: string;
+	reasoningMode?: string;
+	maxOutputTokens?: number;
+}
+
+/** The model, effort and mode one OpenAI conversation uses. */
+export interface OpenAiSessionSelection {
+	model: OpenAiModelId;
+	reasoningEffort: OpenAiReasoningEffort;
+	reasoningMode: OpenAiReasoningMode;
+}
+
+/** OpenAI settings with no key saved and nothing chosen yet. */
+export function createDisconnectedOpenAiSettings(): OpenAiProviderSettings {
+	return {
+		keyStorage: null,
+		keyHint: null,
+		secureStorage: 'available',
+		defaultModel: OPENAI_DEFAULT_MODEL,
+		defaultReasoningEffort: OPENAI_INITIAL_REASONING_EFFORT,
+		defaultReasoningMode: OPENAI_DEFAULT_REASONING_MODE,
+		maxOutputTokens: OPENAI_DEFAULT_MAX_OUTPUT_TOKENS,
+		models: { checkedAt: null, availableModelIds: null, catalogVersion: null, lastError: null },
+	};
 }
 
 /**
- * The AI provider settings exposed to the settings UI. The Anthropic API key
- * itself never leaves the server — only its presence and a short suffix for
- * display.
+ * The AI provider settings exposed to the settings UI. API keys never leave
+ * the server — only their presence and a short hint for display.
  */
 export interface AiSettings {
 	provider: AiProviderId;
 	hasAnthropicApiKey: boolean;
 	/** Truncated key for display (`sk-ant-…abcd`), or null when none is saved. */
 	anthropicApiKeyPreview: string | null;
+	hasOpenAiApiKey: boolean;
+	openAi: OpenAiProviderSettings;
 }

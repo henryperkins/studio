@@ -7,12 +7,15 @@ import {
 	readAiSettings,
 	saveAnthropicApiKey as saveAnthropicApiKeyToConfig,
 } from '@studio/agent/node/settings-store';
+import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { vi } from 'vitest';
 import { recordTracksEvent, TRACKS_EVENTS } from 'src/lib/tracks';
 import {
 	saveGlobalAgentInstructions,
 	saveAnthropicApiKey,
 } from 'src/modules/user-settings/lib/ipc-handlers';
+
+const NO_OPENAI = { hasOpenAiApiKey: false, openAi: createDisconnectedOpenAiSettings() };
 
 vi.mock( 'electron', () => ( {
 	BrowserWindow: { fromWebContents: vi.fn() },
@@ -114,11 +117,13 @@ describe( 'AI provider settings', () => {
 		provider: 'wpcom',
 		hasAnthropicApiKey: false,
 		anthropicApiKeyPreview: null,
+		...NO_OPENAI,
 	} as const;
 	const anthropicWithKey = {
 		provider: 'anthropic-api-key',
 		hasAnthropicApiKey: true,
 		anthropicApiKeyPreview: keyPreview,
+		...NO_OPENAI,
 	} as const;
 
 	it( 'emits studio_setting_ai_provider_change when a key is added', async () => {
@@ -127,6 +132,7 @@ describe( 'AI provider settings', () => {
 			provider: 'wpcom',
 			hasAnthropicApiKey: true,
 			anthropicApiKeyPreview: keyPreview,
+			...NO_OPENAI,
 		} );
 
 		await saveAnthropicApiKey( event, 'sk-ant-api03-testkey-1234' );
@@ -168,6 +174,7 @@ describe( 'AI provider settings', () => {
 			provider: 'anthropic-api-key',
 			hasAnthropicApiKey: true,
 			anthropicApiKeyPreview: 'sk-ant-api03-tes...9999',
+			...NO_OPENAI,
 		} );
 
 		await saveAnthropicApiKey( event, 'sk-ant-api03-otherkey-9999' );

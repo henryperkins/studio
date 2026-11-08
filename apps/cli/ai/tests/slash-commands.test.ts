@@ -46,6 +46,8 @@ function buildModelCtx(
 		maybeAutoSwitchProvider: vi.fn().mockResolvedValue( undefined ),
 		persistSessionContext: persistMock,
 		clearSession: vi.fn().mockResolvedValue( undefined ),
+		getSessionEntries: vi.fn().mockResolvedValue( [] ),
+		persistOpenAiReasoning: vi.fn().mockResolvedValue( undefined ),
 	};
 	return { ctx, persistMock };
 }
@@ -202,6 +204,8 @@ describe( '/credits slash command', () => {
 			maybeAutoSwitchProvider: vi.fn().mockResolvedValue( undefined ),
 			persistSessionContext: vi.fn().mockResolvedValue( undefined ),
 			clearSession: vi.fn().mockResolvedValue( undefined ),
+			getSessionEntries: vi.fn().mockResolvedValue( [] ),
+			persistOpenAiReasoning: vi.fn().mockResolvedValue( undefined ),
 		};
 	}
 

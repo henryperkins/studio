@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { adoptOpenAiSessionKey } from '@studio/agent/node/openai-credentials';
 import { suppressPunycodeWarning } from '@studio/common/lib/suppress-punycode-warning';
 import { __, sprintf } from '@wordpress/i18n';
 import semver from 'semver';
@@ -32,6 +33,9 @@ import { StudioArgv } from 'cli/types';
 
 const version = __STUDIO_CLI_VERSION__;
 
+// A session-only OpenAI key the forking app handed down: taken out of the
+// environment before this process starts anything that could inherit it.
+adoptOpenAiSessionKey();
 suppressPunycodeWarning();
 
 async function main() {

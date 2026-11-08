@@ -132,6 +132,10 @@ const api: IpcApi = {
 	getAiSettings: () => ipcRendererInvoke( 'getAiSettings' ),
 	saveAnthropicApiKey: ( key ) => ipcRendererInvoke( 'saveAnthropicApiKey', key ),
 	setAiProvider: ( provider ) => ipcRendererInvoke( 'setAiProvider', provider ),
+	saveOpenAiApiKey: ( key, storage ) => ipcRendererInvoke( 'saveOpenAiApiKey', key, storage ),
+	removeOpenAiApiKey: () => ipcRendererInvoke( 'removeOpenAiApiKey' ),
+	refreshOpenAiModels: () => ipcRendererInvoke( 'refreshOpenAiModels' ),
+	setOpenAiDefaults: ( update ) => ipcRendererInvoke( 'setOpenAiDefaults', update ),
 	saveWapuuScore: ( score ) => ipcRendererInvoke( 'saveWapuuScore', score ),
 	getWapuuScore: () => ipcRendererInvoke( 'getWapuuScore' ),
 	getUserPreferences: () => ipcRendererInvoke( 'getUserPreferences' ),
@@ -179,6 +183,8 @@ const api: IpcApi = {
 		ipcRendererInvoke( 'setAiSessionModel', sessionId, model ),
 	setAiSessionProvider: ( sessionId, provider, model ) =>
 		ipcRendererInvoke( 'setAiSessionProvider', sessionId, provider, model ),
+	setAiSessionOpenAiSelection: ( sessionId, selection ) =>
+		ipcRendererInvoke( 'setAiSessionOpenAiSelection', sessionId, selection ),
 	setAiSessionEnvironment: ( sessionId, environment ) =>
 		ipcRendererInvoke( 'setAiSessionEnvironment', sessionId, environment ),
 	interruptAiAgentRun: ( runId ) => ipcRendererInvoke( 'interruptAiAgentRun', runId ),

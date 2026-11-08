@@ -5,8 +5,12 @@ import {
 } from '@studio/agent/node/global-instructions';
 import {
 	readAiSettings,
+	refreshOpenAiModels as refreshOpenAiModelsInConfig,
+	removeOpenAiApiKey as removeOpenAiApiKeyFromConfig,
 	saveAnthropicApiKey as saveAnthropicApiKeyToConfig,
+	saveOpenAiApiKey as saveOpenAiApiKeyToConfig,
 	setAiProvider as setAiProviderInConfig,
+	setOpenAiDefaults as setOpenAiDefaultsInConfig,
 } from '@studio/agent/node/settings-store';
 import { isAiProviderId } from '@studio/agent/protocol/providers';
 import { isAgentAppId, type AgentApp } from '@studio/common/lib/agent-apps';
@@ -36,7 +40,7 @@ import { recordTracksEvent, TRACKS_EVENTS } from 'src/lib/tracks';
 import { defaultSitePath, getBundledNodeBinaryPath, getCliPath } from 'src/storage/paths';
 import { OnboardingHintsState } from 'src/storage/storage-types';
 import { loadUserData, lockAppdata, saveUserData, unlockAppdata } from 'src/storage/user-data';
-import type { AiSettings } from '@studio/agent/protocol/providers';
+import type { AiSettings, OpenAiDefaultsUpdate } from '@studio/agent/protocol/providers';
 
 export async function getInstalledAppsAndTerminals(): Promise< InstalledApps > {
 	return detectInstalledAppsWithDefaultBrowser();
@@ -163,6 +167,46 @@ export async function setAiProvider( _event: IpcMainInvokeEvent, provider: strin
 	const settings = await setAiProviderInConfig( provider );
 	await recordAiSettingsChange( previous, settings );
 	return settings;
+}
+
+// The key crosses from the renderer once, here, and never travels back: the
+// result reports only where it was kept and its last four characters.
+export async function saveOpenAiApiKey(
+	_event: IpcMainInvokeEvent,
+	key: unknown,
+	storage: unknown
+): Promise< AiSettings > {
+	if ( typeof key !== 'string' ) {
+		throw new Error( 'The OpenAI API key must be a string.' );
+	}
+	if ( storage !== 'keychain' && storage !== 'session' ) {
+		throw new Error( `Unknown key storage: ${ String( storage ) }` );
+	}
+	const previous = await readAiSettings();
+	const settings = await saveOpenAiApiKeyToConfig( key, { storage } );
+	await recordAiSettingsChange( previous, settings );
+	return settings;
+}
+
+export async function removeOpenAiApiKey(): Promise< AiSettings > {
+	const previous = await readAiSettings();
+	const settings = await removeOpenAiApiKeyFromConfig();
+	await recordAiSettingsChange( previous, settings );
+	return settings;
+}
+
+export async function refreshOpenAiModels(): Promise< AiSettings > {
+	return refreshOpenAiModelsInConfig();
+}
+
+export async function setOpenAiDefaults(
+	_event: IpcMainInvokeEvent,
+	update: OpenAiDefaultsUpdate
+): Promise< AiSettings > {
+	if ( ! update || typeof update !== 'object' ) {
+		throw new Error( 'OpenAI defaults must be an object.' );
+	}
+	return setOpenAiDefaultsInConfig( update );
 }
 
 export async function saveGlobalAgentInstructions(

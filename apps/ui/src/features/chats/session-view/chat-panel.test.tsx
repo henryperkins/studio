@@ -10,7 +10,13 @@ import {
 	requestAnnotationSend,
 } from '@/features/annotations';
 import { clearComposerDrafts } from '@/features/composer';
-import { createFakeConnector, makeSession, makeSite, TEST_USER } from '@/test/fake-connector';
+import {
+	createFakeConnector,
+	makeSession,
+	makeSite,
+	TEST_USER,
+	withoutOpenAi,
+} from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { AgentRunEvent, SessionEntry } from '@/data/core';
 import type { AiSettings } from '@studio/agent/protocol/providers';
@@ -71,7 +77,7 @@ async function setupChat( {
 				if ( settingsError ) {
 					throw new Error( 'Connections unavailable' );
 				}
-				return { ...connected, anthropicApiKeyPreview: null };
+				return { ...connected, anthropicApiKeyPreview: null, ...withoutOpenAi() };
 			},
 			getStudioAssistantQuota: async () => {
 				if ( quotaError ) {
@@ -368,6 +374,7 @@ describe( 'Composer access notices', () => {
 						provider,
 						hasAnthropicApiKey: true,
 						anthropicApiKeyPreview: 'test',
+						...withoutOpenAi(),
 					} ),
 					getStudioAssistantQuota: async () => quota,
 				}
@@ -402,6 +409,7 @@ describe( 'Composer access notices', () => {
 				provider: 'wpcom',
 				hasAnthropicApiKey: saved,
 				anthropicApiKeyPreview: saved ? 'test' : null,
+				...withoutOpenAi(),
 			};
 			const site = makeSite( { id: 'one', path: '/sites/my-site' } );
 			const connector = createFakeConnector(
@@ -426,6 +434,7 @@ describe( 'Composer access notices', () => {
 							...connection,
 							hasAnthropicApiKey: true,
 							anthropicApiKeyPreview: 'test',
+							...withoutOpenAi(),
 						};
 						return connection;
 					},

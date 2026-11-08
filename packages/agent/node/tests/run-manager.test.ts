@@ -2,7 +2,8 @@ import { fork } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import { updateSharedSession } from '@studio/common/lib/shared-config';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { adoptOpenAiSessionKey, deleteOpenAiKey } from '@studio/agent/node/openai-credentials';
 import { createAgentRunManager } from '@studio/agent/node/run-manager';
 
 vi.mock( 'node:child_process', () => {
@@ -18,6 +19,19 @@ vi.mock( '@studio/agent/node/sessions/placement', () => ( {
 	setAiSessionSitePlacement: vi.fn(),
 } ) );
 vi.mock( '@studio/common/lib/error-reporting', () => ( { captureException: vi.fn() } ) );
+// Never the real system keychain from a unit test.
+vi.mock( '@studio/common/lib/os-credential-store', async ( importOriginal ) => {
+	const items = new Map< string, string >();
+	return {
+		...( await importOriginal< typeof import('@studio/common/lib/os-credential-store') >() ),
+		createOsCredentialStore: () => ( {
+			check: async () => ( { available: true } ),
+			get: async ( account: string ) => items.get( account ) ?? null,
+			set: async ( account: string, secret: string ) => void items.set( account, secret ),
+			delete: async ( account: string ) => void items.delete( account ),
+		} ),
+	};
+} );
 vi.mock( '@studio/common/lib/shared-config', () => ( {
 	updateSharedSession: vi.fn().mockResolvedValue( undefined ),
 } ) );
@@ -87,6 +101,50 @@ describe( 'createAgentRunManager fork environment', () => {
 		manager.startAgentRun( { sessionId: 'session-1', prompt: 'hello' } );
 
 		expect( getForkEnv().STUDIO_TRACKS_ORIGIN ).toBeUndefined();
+	} );
+} );
+
+describe( 'createAgentRunManager OpenAI session keys', () => {
+	const KEY = 'sk-proj-TESTONLY_session_dddddddddddddddddddddddd';
+
+	beforeEach( () => {
+		vi.clearAllMocks();
+		mockFork.mockReset();
+		mockFork.mockImplementation( () => createChild() as never );
+	} );
+
+	afterEach( async () => {
+		await deleteOpenAiKey();
+		delete process.env.STUDIO_OPENAI_SESSION_API_KEY;
+	} );
+
+	it( 'hands a session-only key to the forked turn and nowhere else', () => {
+		// As the CLI does on startup with a key its parent handed down.
+		adoptOpenAiSessionKey( { STUDIO_OPENAI_SESSION_API_KEY: KEY } );
+		const manager = createAgentRunManager( {
+			cliBinary: '/cli.mjs',
+			surface: 'desktop',
+			emit: vi.fn(),
+		} );
+
+		manager.startAgentRun( { sessionId: 'session-1', prompt: 'hello' } );
+
+		expect( getForkEnv().STUDIO_OPENAI_SESSION_API_KEY ).toBe( KEY );
+		expect( process.env.STUDIO_OPENAI_SESSION_API_KEY ).toBeUndefined();
+		// Never on the command line.
+		expect( JSON.stringify( mockFork.mock.calls[ 0 ][ 1 ] ) ).not.toContain( KEY );
+	} );
+
+	it( 'passes nothing when the key lives in the keychain', () => {
+		const manager = createAgentRunManager( {
+			cliBinary: '/cli.mjs',
+			surface: 'desktop',
+			emit: vi.fn(),
+		} );
+
+		manager.startAgentRun( { sessionId: 'session-1', prompt: 'hello' } );
+
+		expect( getForkEnv() ).not.toHaveProperty( 'STUDIO_OPENAI_SESSION_API_KEY' );
 	} );
 } );
 
