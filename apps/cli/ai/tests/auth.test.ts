@@ -14,12 +14,14 @@ import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { vi } from 'vitest';
 import {
+	getAvailableAiProviders,
 	isAiProviderReady,
 	prepareAiProvider,
 	resolveAiEnvironment,
 	resolveInitialAiProvider,
 	resolveUnavailableAiProvider,
 } from 'cli/ai/auth';
+import { getAiProviderDefinition } from 'cli/ai/providers';
 import { LoggerError } from 'cli/logger';
 
 vi.mock( '@inquirer/prompts', () => ( {
@@ -296,6 +298,79 @@ describe( 'AI auth helpers', () => {
 			await expect( resolveUnavailableAiProvider( 'wpcom' ) ).resolves.toBeUndefined();
 			// …and a first run doesn't start on it.
 			await expect( resolveInitialAiProvider() ).resolves.toBe( 'wpcom' );
+		} );
+	} );
+
+	describe( 'ChatGPT', () => {
+		const wpcomToken = () => ( {
+			accessToken: 'wpcom-token',
+			displayName: 'User',
+			email: 'user@example.com',
+			expiresIn: 3600,
+			expirationTime: Date.now() + 3600_000,
+			id: 1,
+		} );
+		const makeReady = ( { wpcom = false, anthropic = false } ) => {
+			vi.mocked( readAuthToken ).mockResolvedValue( wpcom ? wpcomToken() : null );
+			vi.mocked( readAnthropicApiKey ).mockResolvedValue( anthropic ? 'saved-key' : undefined );
+			vi.mocked( readOpenAiApiKey ).mockResolvedValue( null );
+		};
+
+		it.each( [ 'wpcom', 'anthropic-api-key' ] as const )(
+			'never falls back from a disconnected chat while %s is ready',
+			async ( ready ) => {
+				makeReady( { wpcom: ready === 'wpcom', anthropic: ready === 'anthropic-api-key' } );
+				await expect( isAiProviderReady( ready ) ).resolves.toBe( true );
+
+				await expect( isAiProviderReady( 'chatgpt-oauth' ) ).resolves.toBe( false );
+				await expect( resolveUnavailableAiProvider( 'chatgpt-oauth' ) ).resolves.toBeUndefined();
+			}
+		);
+
+		it.each( [
+			[ 'WordPress.com when it is ready', 'wpcom', { wpcom: true } ],
+			[ 'Anthropic when only its key is', 'anthropic-api-key', { anthropic: true } ],
+			[ 'WordPress.com when nothing is ready', 'wpcom', {} ],
+		] as const )(
+			'starts a chat on %s, never on a saved ChatGPT default',
+			async ( _label, expected, ready ) => {
+				makeReady( ready );
+				vi.mocked( readSelectedAiProvider ).mockResolvedValue( 'chatgpt-oauth' );
+
+				await expect( resolveInitialAiProvider() ).resolves.toBe( expected );
+			}
+		);
+
+		it( 'is never offered as a provider to choose', async () => {
+			await expect( getAvailableAiProviders() ).resolves.not.toContain( 'chatgpt-oauth' );
+		} );
+
+		it( 'is never picked for a conversation automatically, even once shown and ready', async () => {
+			const chatGpt = getAiProviderDefinition( 'chatgpt-oauth' );
+			const isVisible = vi.spyOn( chatGpt, 'isVisible' ).mockResolvedValue( true );
+			const isReady = vi.spyOn( chatGpt, 'isReady' ).mockResolvedValue( true );
+			onTestFinished( () => {
+				isVisible.mockRestore();
+				isReady.mockRestore();
+			} );
+			makeReady( {} );
+			vi.mocked( readSelectedAiProvider ).mockResolvedValue( undefined );
+
+			// A logged-out WordPress.com conversation doesn't move to ChatGPT…
+			await expect( resolveUnavailableAiProvider( 'wpcom' ) ).resolves.toBeUndefined();
+			// …and a first run doesn't start on it.
+			await expect( resolveInitialAiProvider() ).resolves.toBe( 'wpcom' );
+		} );
+
+		it( 'fails a turn as disconnected rather than run it', async () => {
+			makeReady( { wpcom: true, anthropic: true } );
+
+			const resolving = resolveAiEnvironment( 'chatgpt-oauth' );
+
+			await expect( resolving ).rejects.toBeInstanceOf( LoggerError );
+			await expect( resolving ).rejects.toThrow(
+				'ChatGPT isn’t connected, so this chat can’t continue. Start a new chat with another provider.'
+			);
 		} );
 	} );
 
