@@ -53,6 +53,14 @@ export const AI_PROVIDER_LABELS: Record< AiProviderId, string > = {
 	'chatgpt-oauth': 'ChatGPT',
 };
 
+/**
+ * Whether a provider is a subscription connection, which a conversation never
+ * moves to, from or between without starting a new one.
+ */
+export function isSubscriptionProvider( provider: AiProviderId ): boolean {
+	return provider === 'chatgpt-oauth';
+}
+
 // Which model families each provider can service. `wpcom` serves only the
 // studio capability tiers (resolved to upstream models by the proxy);
 // direct-API providers are restricted to their own family. ChatGPT serves
