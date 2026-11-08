@@ -832,19 +832,24 @@ function buildAgentTools(
 // Model provider keys the agent's shell has no use for, including
 // STUDIO_WPCOM_API_KEY, the WordPress.com models' copy of the access token.
 // STUDIO_WPCOM_TOKEN stays: Studio's own CLI, which the agent runs, logs in with it.
-const PROVIDER_SECRET_VARIABLES = [
+const PROVIDER_SECRET_VARIABLES = new Set( [
 	'OPENAI_API_KEY',
 	'STUDIO_OPENAI_API_KEY',
 	'ANTHROPIC_API_KEY',
 	'ANTHROPIC_AUTH_TOKEN',
 	'STUDIO_WPCOM_API_KEY',
-];
+] );
 
-/** Strips model provider keys from the environment a Bash tool command runs in. */
+/**
+ * Strips model provider keys from the environment a Bash tool command runs in,
+ * whatever their case: Windows reads `openai_api_key` as OPENAI_API_KEY.
+ */
 function withoutProviderSecrets< T extends { env: NodeJS.ProcessEnv } >( context: T ): T {
 	const env = { ...context.env };
-	for ( const name of PROVIDER_SECRET_VARIABLES ) {
-		delete env[ name ];
+	for ( const name of Object.keys( env ) ) {
+		if ( PROVIDER_SECRET_VARIABLES.has( name.toUpperCase() ) ) {
+			delete env[ name ];
+		}
 	}
 	return { ...context, env };
 }

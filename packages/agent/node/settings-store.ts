@@ -1,7 +1,11 @@
 import { createHash } from 'node:crypto';
 import { validateAnthropicApiKey } from '@studio/common/lib/anthropic-key';
 import { readCliConfigFileRaw } from '@studio/common/lib/cli-config-file';
-import { readSharedConfig, updateSharedConfig } from '@studio/common/lib/shared-config';
+import {
+	readSharedConfig,
+	updateSharedConfig,
+	updateSharedConfigFrom,
+} from '@studio/common/lib/shared-config';
 import { __ } from '@wordpress/i18n';
 import {
 	getSecureStorageStatus,
@@ -345,12 +349,13 @@ async function updateAiProviderConfig( update: AiProviderConfig ): Promise< AiSe
 	// Carry the legacy cli.json values over on first write so a partial update
 	// (e.g. only aiProvider) doesn't orphan the other field there. After that,
 	// write only the fields that change: a copy of the other could be stale.
-	const { aiProvider, anthropicApiKey } = await readSharedConfig();
-	const legacy =
-		aiProvider === undefined && anthropicApiKey === undefined
-			? await readLegacyCliConfigFields()
-			: {};
-	await updateSharedConfig( { ...legacy, ...update } );
+	// Whether it is the first write is decided under the shared.json lock, so a
+	// write landing meanwhile isn't overwritten with the legacy values.
+	const legacy = await readLegacyCliConfigFields();
+	await updateSharedConfigFrom( ( config ) => ( {
+		...( config.aiProvider === undefined && config.anthropicApiKey === undefined ? legacy : {} ),
+		...update,
+	} ) );
 	return readAiSettings();
 }
 

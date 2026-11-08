@@ -135,10 +135,20 @@ export async function unlockSharedConfig(): Promise< void > {
 }
 
 export async function updateSharedConfig( update: Partial< SharedConfig > ): Promise< void > {
+	return updateSharedConfigFrom( () => update );
+}
+
+/**
+ * Like `updateSharedConfig`, with the update decided from the config as it is
+ * under the lock.
+ */
+export async function updateSharedConfigFrom(
+	compute: ( config: SharedConfig ) => Partial< SharedConfig >
+): Promise< void > {
 	try {
 		await lockSharedConfig();
 		const config = await readSharedConfig();
-		const updated = { ...config, ...update };
+		const updated = { ...config, ...compute( config ) };
 		await saveSharedConfig( updated );
 	} finally {
 		await unlockSharedConfig();

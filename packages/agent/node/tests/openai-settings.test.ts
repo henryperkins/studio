@@ -21,13 +21,22 @@ const sharedConfigWrite = vi.hoisted( () => ( { hold: null as Promise< void > | 
 
 vi.mock( '@studio/common/lib/shared-config', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('@studio/common/lib/shared-config') >();
+	const held = async () => {
+		const hold = sharedConfigWrite.hold;
+		sharedConfigWrite.hold = null;
+		await hold;
+	};
 	return {
 		...actual,
 		updateSharedConfig: async ( update: Parameters< typeof actual.updateSharedConfig >[ 0 ] ) => {
-			const hold = sharedConfigWrite.hold;
-			sharedConfigWrite.hold = null;
-			await hold;
+			await held();
 			return actual.updateSharedConfig( update );
+		},
+		updateSharedConfigFrom: async (
+			compute: Parameters< typeof actual.updateSharedConfigFrom >[ 0 ]
+		) => {
+			await held();
+			return actual.updateSharedConfigFrom( compute );
 		},
 	};
 } );
@@ -720,6 +729,35 @@ describe( 'OpenAI settings', () => {
 			await expect( settings.readAiSettings() ).resolves.toMatchObject( {
 				provider: 'wpcom',
 				hasOpenAiApiKey: false,
+			} );
+		} );
+
+		it( 'never lets a first write put legacy settings back over one made meanwhile', async () => {
+			fs.writeFileSync(
+				path.join( configDir, 'cli.json' ),
+				JSON.stringify( {
+					version: 1,
+					sites: [],
+					snapshots: [],
+					aiProvider: 'anthropic-api-key',
+					anthropicApiKey: 'sk-ant-TESTONLY_legacy_dddddddddddd',
+				} )
+			);
+			const { settings } = await load();
+			fetchMock.mockImplementation( async () => new Response( '{}', { status: 200 } ) );
+			let resume!: () => void;
+			sharedConfigWrite.hold = new Promise< void >( ( resolve ) => ( resume = resolve ) );
+
+			// Both are first writes to shared.json; WordPress.com is chosen while the save waits.
+			const saving = settings.saveAnthropicApiKey( 'sk-ant-TESTONLY_new_eeeeeeeeeeeeeeee' );
+			await vi.waitFor( () => expect( sharedConfigWrite.hold ).toBeNull() );
+			await settings.setAiProvider( 'wpcom' );
+			resume();
+			await saving;
+
+			expect( readShared() ).toMatchObject( {
+				aiProvider: 'wpcom',
+				anthropicApiKey: 'sk-ant-TESTONLY_new_eeeeeeeeeeeeeeee',
 			} );
 		} );
 

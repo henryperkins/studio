@@ -9,7 +9,6 @@ import {
 import {
 	readAiSettings,
 	readAnthropicApiKey,
-	readOpenAiApiKey,
 	readSelectedAiProvider,
 } from '@studio/agent/node/settings-store';
 import { buildChatAttachmentSummaries } from '@studio/agent/protocol/chat-attachments';
@@ -60,6 +59,7 @@ import {
 	AI_PROVIDERS,
 	DEFAULT_AI_PROVIDER,
 	getAiProviderDefinition,
+	readOpenAiKeyForTurn,
 	type AiProviderId,
 } from 'cli/ai/providers';
 import { replaySessionHistory } from 'cli/ai/sessions/replay';
@@ -647,11 +647,15 @@ export async function runCommand( options: {
 		}
 	} else if ( currentProvider === 'anthropic-api-key' && ! ( await readAnthropicApiKey() ) ) {
 		ui.showInfo( __( 'No Anthropic API key saved. Use /api-key to enter one.' ) );
-	} else if (
-		currentProvider === 'openai-api-key' &&
-		! ( await readOpenAiApiKey().catch( () => null ) )
-	) {
-		ui.showInfo( __( 'OpenAI isn’t connected. Use /openai-key to enter an API key.' ) );
+	} else if ( currentProvider === 'openai-api-key' ) {
+		const openAiKey = await readOpenAiKeyForTurn().catch( ( error: unknown ) => {
+			// A keychain Studio can't reach: say so, not that no key is saved.
+			ui.showInfo( error instanceof Error ? error.message : String( error ) );
+			return undefined;
+		} );
+		if ( openAiKey === null ) {
+			ui.showInfo( __( 'OpenAI isn’t connected. Use /openai-key to enter an API key.' ) );
+		}
 	}
 
 	async function askUserAndPersistAnswers(

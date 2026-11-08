@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { isRetryableAssistantError } from '@earendil-works/pi-ai/utils/retry';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { createAgent } from '@studio/agent/node/agent';
 import {
 	OPENAI_MODEL_CAPABILITIES,
@@ -708,6 +708,11 @@ describe( 'OpenAI turns', () => {
 		it( 'runs Bash without any provider key, whatever the parent process holds', async () => {
 			process.env.OPENAI_API_KEY = AMBIENT_KEY;
 			process.env.ANTHROPIC_API_KEY = 'sk-ant-TESTONLY';
+			// Windows reads names in any case: this one is OPENAI_API_KEY there.
+			process.env.OpenAI_Api_Key = 'sk-proj-TESTONLY_mixed_case_key';
+			onTestFinished( () => {
+				delete process.env.OpenAI_Api_Key;
+			} );
 			const { options } = await runTurn( {
 				prompt: 'hi',
 				model: 'gpt-6.1-sol',
@@ -727,7 +732,12 @@ describe( 'OpenAI turns', () => {
 				.map( ( part ) => ( part.type === 'text' ? part.text : '' ) )
 				.join();
 			expect( output ).toMatch( /\bPATH=/ );
-			for ( const leaked of [ KEY, AMBIENT_KEY, 'sk-ant-TESTONLY' ] ) {
+			for ( const leaked of [
+				KEY,
+				AMBIENT_KEY,
+				'sk-ant-TESTONLY',
+				'sk-proj-TESTONLY_mixed_case_key',
+			] ) {
 				expect( output ).not.toContain( leaked );
 			}
 			expect( output ).not.toMatch( /\b(OPENAI_API_KEY|STUDIO_OPENAI_API_KEY|ANTHROPIC_API_KEY)=/ );

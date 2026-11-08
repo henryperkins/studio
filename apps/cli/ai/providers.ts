@@ -116,6 +116,44 @@ async function resolveAnthropicApiKey( options?: {
 }
 
 /**
+ * The OpenAI key a turn uses, or null when none is saved. A keychain Studio
+ * can't reach, or can't read, is reported as such rather than as a missing
+ * key: the key may well be saved there.
+ */
+export async function readOpenAiKeyForTurn(): Promise<
+	Awaited< ReturnType< typeof readOpenAiApiKey > >
+> {
+	let source: Awaited< ReturnType< typeof readOpenAiApiKey > >;
+	try {
+		source = await readOpenAiApiKey();
+	} catch ( error ) {
+		if (
+			error instanceof OpenAiSessionKeyUnavailableError ||
+			error instanceof SecureStorageError
+		) {
+			throw new LoggerError( error.message );
+		}
+		throw error;
+	}
+	if ( source ) {
+		return source;
+	}
+	const keychain = await getSecureStorageStatus();
+	if ( ! keychain.available && ! keychain.absent ) {
+		throw new LoggerError(
+			sprintf(
+				/* translators: %s: why the system keychain can't be used. */
+				__(
+					'Studio couldn’t reach the system keychain to read the OpenAI API key (%s). Unlock it and try again, or use /openai-key to enter a key for this session.'
+				),
+				keychain.reason
+			)
+		);
+	}
+	return null;
+}
+
+/**
  * The saved OpenAI key, or a prompt for one. The key goes to the system
  * keychain; without one, the user may keep it for this session only. A key
  * OpenAI rejects is never saved.
@@ -287,12 +325,7 @@ const AI_PROVIDER_DEFINITIONS: Record< AiProviderId, AiProviderDefinition > = {
 			await resolveOpenAiApiKey( options );
 		},
 		resolveEnv: async () => {
-			const source = await readOpenAiApiKey().catch( ( error: unknown ) => {
-				if ( error instanceof OpenAiSessionKeyUnavailableError ) {
-					throw new LoggerError( error.message );
-				}
-				return null;
-			} );
+			const source = await readOpenAiKeyForTurn();
 			if ( ! source ) {
 				throw new LoggerError(
 					__(
