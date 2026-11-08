@@ -1055,6 +1055,60 @@ describe( 'ChatGPT credential broker', () => {
 				'test-access-token-3'
 			);
 		} );
+
+		it( 'leaves what a sign-in saved when it began after the sign-out did', async () => {
+			const broker = startBroker();
+			const { registrationId } = await broker.saveSignIn( signIn() );
+			// The sign-out has begun, and waits for the refresh lock before clearing.
+			const refreshLock = pauseNextLock( `${ registrationId }.lock` );
+			const signingOut = startBroker().signOut( registrationId );
+			await refreshLock.reached;
+
+			await expect(
+				broker.saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) )
+			).resolves.toMatchObject( { state: 'signed-in', logoutGeneration: 1 } );
+			refreshLock.release();
+
+			// It cleared nothing it could find from before; the tokens it ended were replaced.
+			await expect( signingOut ).resolves.toEqual( {
+				localCleared: true,
+				remoteRevocationConfirmed: false,
+			} );
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				state: 'signed-in',
+				logoutGeneration: 1,
+			} );
+			await expect( startBroker().getAccessToken( registrationId ) ).resolves.toBe(
+				'test-access-token-2'
+			);
+			expect( service.revocations ).toEqual( [] );
+		} );
+
+		it( 'leaves a session-only sign-in that began after the sign-out did', async () => {
+			const app = startBroker( { timing: { turnSettleTimeoutMs: 10_000 } } );
+			const { registrationId } = await app.saveSignIn( signIn( { storage: 'session' } ) );
+			// A turn that settles only when the test says keeps the sign-out waiting.
+			const turn = await app.beginTurn( registrationId );
+			const signingOut = app.signOut( registrationId );
+			await vi.waitFor( async () =>
+				expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+					state: 'signed-out',
+				} )
+			);
+
+			await app.saveSignIn( signIn( { registrationId, storage: 'session', tokens: tokens( 2 ) } ) );
+			turn.end();
+
+			await expect( signingOut ).resolves.toEqual( {
+				localCleared: true,
+				remoteRevocationConfirmed: false,
+			} );
+			await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-2' );
+			expect( app.getSessionForkEnvironment() ).toEqual( {
+				STUDIO_CHATGPT_SESSIONS_OFFERED: registrationId,
+			} );
+			expect( service.revocations ).toEqual( [] );
+		} );
 	} );
 
 	describe( 'sign-out', () => {

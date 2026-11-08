@@ -160,7 +160,10 @@ export interface ChatGptSignIn extends ChatGptAccountSignIn {
 }
 
 export interface ChatGptSignOutResult {
-	/** No token of the registration is left stored where Studio would use it. */
+	/**
+	 * No token from before the sign-out is left stored where Studio would use
+	 * it. A sign-in that began after the sign-out keeps its own.
+	 */
 	localCleared: boolean;
 	/**
 	 * OpenAI confirmed the refresh token is revoked. False when it couldn't be
@@ -1048,16 +1051,23 @@ export function createChatGptCredentialBroker(
 	/**
 	 * Raises the logout generation, ends this process's turns on the account,
 	 * revokes the refresh token and clears every token. The registration, its
-	 * issued client and the host id stay, for the next sign-in.
+	 * issued client and the host id stay, for the next sign-in. A sign-in that
+	 * began after the sign-out did keeps what it saved.
 	 */
 	async function signOut( connectionId: string ): Promise< ChatGptSignOutResult > {
 		if ( ! isChatGptRegistrationId( connectionId ) ) {
 			throw new ChatGptConnectionError( 'not-found' );
 		}
 		const account = await startChatGptSignOut( connectionId );
+		// Only a sign-in begun since then can mark the account signed in again.
+		const signedInSince = async () =>
+			( await readChatGptAccount( connectionId ).catch( () => null ) )?.state === 'signed-in';
 		await endTurns( connectionId );
 		parent?.tokens.delete( connectionId );
 		const session = await serializeSession( connectionId, async () => {
+			if ( await signedInSince() ) {
+				return undefined;
+			}
 			const held = sessions.get( connectionId );
 			dropSession( connectionId );
 			return held;
@@ -1067,6 +1077,14 @@ export function createChatGptCredentialBroker(
 		// process that died doesn't keep the user from signing out.
 		const unlock = await lockRefresh( connectionId ).catch( () => null );
 		try {
+			if ( await signedInSince() ) {
+				return {
+					localCleared: true,
+					remoteRevocationConfirmed: session
+						? await revoke( account.clientId, session.record.refreshToken )
+						: false,
+				};
+			}
 			const read = await readRecord( key, account ).catch( () => null );
 			const record = session?.record ?? ( read?.status === 'ok' ? read.record : null );
 			const remoteRevocationConfirmed = record
