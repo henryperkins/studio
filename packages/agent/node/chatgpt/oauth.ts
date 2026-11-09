@@ -438,7 +438,10 @@ export function createChatGptSignInFlow(
 	 * saved session: another account's, or a new registration's whose client
 	 * no registration uses. One for the registration's own account, or one
 	 * whose account isn't known, shares the saved session's client and maybe
-	 * its grant, so it stays.
+	 * its grant, so it stays. Registrations can share an issued client, so a
+	 * verified identity is checked against every saved registration with
+	 * this client, not only the one signed in to: another registration for
+	 * the same account under the same client may share the grant.
 	 */
 	async function isUnsharedGrant(
 		pending: PendingAttempt,
@@ -446,13 +449,21 @@ export function createChatGptSignInFlow(
 		identity: VerifiedIdentity | null
 	): Promise< boolean > {
 		if ( pending.registration ) {
-			return (
-				identity !== null &&
-				! isSameChatGptIdentity( pending.registration, {
-					issuer: pending.authServer.issuer,
-					subject: identity.subject,
-				} )
-			);
+			if ( ! identity ) {
+				return false;
+			}
+			const verified = { issuer: pending.authServer.issuer, subject: identity.subject };
+			if ( isSameChatGptIdentity( pending.registration, verified ) ) {
+				return false;
+			}
+			try {
+				const accounts = await readChatGptAccounts();
+				return ! accounts.some(
+					( account ) => account.clientId === clientId && isSameChatGptIdentity( account, verified )
+				);
+			} catch {
+				return false;
+			}
 		}
 		try {
 			const accounts = await readChatGptAccounts();

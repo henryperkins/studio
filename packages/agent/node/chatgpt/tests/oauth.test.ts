@@ -971,6 +971,25 @@ describe( 'Signing in to ChatGPT', () => {
 			await expectUntouched( existing );
 		} );
 
+		it( 'are left when the other account is saved under the same client on another registration', async () => {
+			// Two registrations can share an issued client: the second account
+			// is saved under the first's client too.
+			const existing = await signInExisting();
+			fake.script.issueClient = () => 'test-issued-client-1';
+			fake.account = { subject: 'test-subject-2', email: 'other@example.com' };
+			const second = await signIn();
+			expect( second.outcome.ok ).toBe( true );
+			const before = await snapshot();
+
+			// Signing that account in to the first registration fails as
+			// another account, but its grant may be the second registration's.
+			const { outcome } = await signIn( existing.registrationId );
+
+			expect( outcome ).toEqual( failed( 'identity-mismatch' ) );
+			expect( fake.revokeRequests ).toEqual( [] );
+			expect( await snapshot() ).toEqual( before );
+		} );
+
 		it( 'are left when the registration’s own account signs in, or one that can’t be verified, so its session goes on', async () => {
 			const existing = await signInExisting();
 			fake.script.grantedScope = withoutPlan;
