@@ -447,9 +447,14 @@ function watchEventStream( response: Response, exchange: ChatGptExchange ): Resp
 		}
 		const failure = classifyChatGptStreamEvent( typed );
 		if ( failure && ! exchange.streamFailure ) {
-			exchange.streamFailure = failure.detail
-				? { ...failure, detail: exchange.redact( failure.detail ) }
-				: failure;
+			// The code and param are shown to the user too, so the turn's token
+			// comes out of them as it does out of the detail.
+			exchange.streamFailure = {
+				...failure,
+				...( failure.code ? { code: exchange.redact( failure.code ) } : {} ),
+				...( failure.param ? { param: exchange.redact( failure.param ) } : {} ),
+				...( failure.detail ? { detail: exchange.redact( failure.detail ) } : {} ),
+			};
 		}
 	};
 	const read = ( text: string ) => {

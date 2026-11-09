@@ -1309,6 +1309,48 @@ describe( 'the ChatGPT transport', () => {
 			expect( reply.errorMessage ).toContain( 'Bad token [redacted].' );
 		} );
 
+		it( 'removes the token from an error’s code and param, in a response and in a stream', async () => {
+			const turn = await registerChatGpt( snapshotFor( 'medium' ) );
+			captureFetch( [
+				() =>
+					jsonError( 400, {
+						error: {
+							code: `invalid_${ TOKEN }`,
+							param: `field_${ TOKEN }`,
+							message: 'Refused.',
+						},
+					} ),
+				() =>
+					sse( [
+						...PARTIAL,
+						{
+							type: 'error',
+							code: 'subscription_sharing_unsupported_capability',
+							message: 'Not supported.',
+							param: `input_${ TOKEN }`,
+							sequence_number: 4,
+						},
+					] ),
+			] );
+
+			const fromResponse = await streamTurn(
+				turn,
+				conversation( [ userMessage( 'hi' ) ] ),
+				'medium'
+			).result();
+			const fromStream = await streamTurn(
+				turn,
+				conversation( [ userMessage( 'hi' ) ] ),
+				'medium'
+			).result();
+
+			expectUnretried( fromResponse );
+			expect( fromResponse.errorMessage ).toContain( 'invalid_[redacted]' );
+			expect( fromResponse.errorMessage ).toContain( 'param field_[redacted]' );
+			expectUnretried( fromStream );
+			expect( fromStream.errorMessage ).toContain( '(input_[redacted])' );
+		} );
+
 		it( 'explains a network failure, without trying again', async () => {
 			const turn = await registerChatGpt( snapshotFor( 'medium' ) );
 			const spy = vi.spyOn( globalThis, 'fetch' ).mockRejectedValue(

@@ -127,6 +127,8 @@ function toDetail( text: string | undefined, secrets: readonly string[] ): strin
 }
 
 // A summary from an `error` object's fields, wherever the route put them.
+// The code and param are the route's text too: they are shown to the user, so
+// anything token-shaped comes out of them as it does out of the detail.
 function summarizeErrorFields(
 	fields: Record< string, unknown >,
 	fallback: ChatGptErrorKind,
@@ -139,8 +141,8 @@ function summarizeErrorFields(
 	const detail = kind === 'authorization' ? undefined : toDetail( text, secrets );
 	return {
 		kind,
-		...( code ? { code } : {} ),
-		...( param ? { param } : {} ),
+		...( code ? { code: redactChatGptSecrets( code, secrets ) } : {} ),
+		...( param ? { param: redactChatGptSecrets( param, secrets ) } : {} ),
 		...( detail ? { detail } : {} ),
 	};
 }
@@ -191,7 +193,10 @@ export function classifyChatGptStreamEvent( event: unknown ): ChatGptErrorSummar
 		case 'response.incomplete': {
 			const details = isRecord( response.incomplete_details ) ? response.incomplete_details : {};
 			const reason = readString( details.reason );
-			return { kind: 'incomplete', ...( reason ? { code: reason } : {} ) };
+			return {
+				kind: 'incomplete',
+				...( reason ? { code: redactChatGptSecrets( reason ) } : {} ),
+			};
 		}
 		case 'response.failed':
 			return isRecord( response.error ) ? fromFields( response.error ) : { kind: 'failed' };
