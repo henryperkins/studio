@@ -25,12 +25,23 @@ import {
 	SettingsManager,
 	type AgentSession,
 	type AgentSessionEvent,
+	type SessionEntry,
 	type SessionManager,
 	type ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import { getAiTracksIdentity } from '@studio/common/lib/tracks-identity';
 import { type TSchema } from 'typebox';
 import { withDesignSystemPreview } from '@studio/agent/node/chat-artifacts';
+import {
+	beginChatGptTurn,
+	listChatGptConnections,
+	type ChatGptTurnHandle,
+} from '@studio/agent/node/chatgpt/credential-broker';
+import {
+	describeChatGptReasoningProblem,
+	getChatGptModelCapabilities,
+	resolveChatGptReasoning,
+} from '@studio/agent/node/chatgpt/models';
 import { readGlobalInstructions } from '@studio/agent/node/global-instructions';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
 import { OPENAI_API_BASE_URL } from '@studio/agent/node/openai-model-list';
@@ -41,6 +52,12 @@ import { createAskUserQuestionTool } from '@studio/agent/node/tools/ask-user-que
 import { bindTool } from '@studio/agent/node/tools/define-tool';
 import { createPresentDesignOptionsTool } from '@studio/agent/node/tools/present-design-options';
 import { createSkillTool } from '@studio/agent/node/tools/skill';
+import {
+	describeConnectionSelectionError,
+	resolveConnectionSelection,
+	type ConnectionRegistryEntry,
+	type ConnectionSelection,
+} from '@studio/agent/protocol/connections';
 import {
 	aiModelSupportsImages,
 	DEFAULT_MODEL,
@@ -57,10 +74,21 @@ import {
 	OPENAI_DEFAULT_MAX_OUTPUT_TOKENS,
 	OPENAI_DEFAULT_REASONING_MODE,
 	resolveOpenAiTurnSettings,
+	type OpenAiReasoningEffort,
 	type OpenAiTurnSettings,
 } from '@studio/agent/protocol/openai-models';
-import { ANTHROPIC_PI_PROVIDER } from '@studio/agent/protocol/providers';
+import {
+	ANTHROPIC_PI_PROVIDER,
+	CHATGPT_PI_PROVIDER,
+	getAiModelFamilyProvider,
+	getEffectiveSessionProvider,
+} from '@studio/agent/protocol/providers';
 import { findLastAssistant, isEmptyStop } from '@studio/agent/protocol/session-events';
+import {
+	buildChatGptModel,
+	createChatGptProviderConfig,
+	type ChatGptTurnSnapshot,
+} from './chatgpt-transport';
 import { getFileToolPrompt } from './file-tool-prompts';
 import { withLeakedToolCallMarkupRemoved } from './leaked-tool-call-markup';
 import {
@@ -107,6 +135,24 @@ const STUDIO_COMPACTION_SETTINGS = {
 	keepRecentTokens: 20_000,
 };
 
+/**
+ * What one ChatGPT turn sends, fixed when the turn starts: the reasoning
+ * effort every request uses, and the model's display label. No output cap
+ * and no reasoning mode: the ChatGPT route takes neither, so neither exists
+ * here to leak into a request.
+ */
+export interface ChatGptTurnSettings {
+	/**
+	 * Checked against the model's ChatGPT capabilities when the turn starts;
+	 * an effort the model doesn't list fails the turn rather than sending a
+	 * nearby one. Defaults to medium when the model lists it, else its
+	 * lowest listed effort.
+	 */
+	reasoningEffort?: OpenAiReasoningEffort;
+	/** The model's display name, as its connection's model list gave it. */
+	label?: string;
+}
+
 export interface StudioAgentTurnConfig {
 	prompt: string;
 	images?: StudioChatImage[];
@@ -123,6 +169,17 @@ export interface StudioAgentTurnConfig {
 	 * included — uses these. Defaults to the model's initial settings.
 	 */
 	openAi?: OpenAiTurnSettings;
+	/**
+	 * The validated connection this turn runs on, from
+	 * `resolveConnectionSelection`. A ChatGPT selection routes the turn
+	 * through that connection alone: no API key can stand in for it, and the
+	 * session must already run on that same connection and revision. A
+	 * legacy selection must name the provider and model `model` already
+	 * does. Without one, routing is inferred from `model` as before.
+	 */
+	connection?: ConnectionSelection;
+	/** The ChatGPT turn's effort and label; only with a ChatGPT `connection`. */
+	chatGpt?: ChatGptTurnSettings;
 	activeSite?: SiteInfo | null;
 	onAskUser?: AskUserHandler;
 	onEvent: ( event: AgentSessionEvent ) => void;
@@ -303,38 +360,220 @@ function resolveTurnOpenAiSettings(
 		: { ok: false, reason: describeOpenAiSettingsProblem( result.problem ) };
 }
 
+/** How one turn reaches its model: a legacy provider's credentials, or one ChatGPT connection's turn. */
+type TurnRouting =
+	| {
+			kind: 'legacy';
+			family: AiModelFamily;
+			creds: ResolvedCredentials;
+			openAiSettings?: OpenAiTurnSettings;
+	  }
+	| {
+			kind: 'chatgpt';
+			turn: ChatGptTurnHandle;
+			model: Model< 'openai-responses' >;
+			reasoningEffort: OpenAiReasoningEffort;
+	  };
+
+function defaultChatGptReasoningEffort( modelId: string ): OpenAiReasoningEffort {
+	const capabilities = getChatGptModelCapabilities( modelId );
+	if ( ! capabilities ) {
+		return 'medium';
+	}
+	return capabilities.reasoningEfforts.includes( 'medium' )
+		? 'medium'
+		: capabilities.reasoningEfforts[ 0 ];
+}
+
+// The selection against the broker's live registry: the same checks
+// `resolveConnectionSelection` makes of a recorded one, of the caller's.
+function validateChatGptSelectionLive(
+	selection: ConnectionSelection,
+	connections: readonly ConnectionRegistryEntry[]
+): string | undefined {
+	const providerId = 'chatgpt-oauth';
+	const connection = connections.find( ( entry ) => entry.connectionId === selection.connectionId );
+	if ( ! connection ) {
+		return describeConnectionSelectionError( { code: 'disconnected', providerId } );
+	}
+	if ( connection.providerId !== providerId || connection.backend !== 'pi' ) {
+		return describeConnectionSelectionError( { code: 'unsupported', providerId } );
+	}
+	if ( connection.revision !== selection.revision ) {
+		return describeConnectionSelectionError( { code: 'changed', providerId } );
+	}
+	if ( connection.authStatus !== 'connected' || ! connection.identity?.subject ) {
+		return describeConnectionSelectionError( { code: 'disconnected', providerId } );
+	}
+	return undefined;
+}
+
+// The session against the selection: a conversation that ran on ChatGPT
+// continues only on the connection, model and revision it recorded, and one
+// that ran elsewhere never continues on ChatGPT. A session with no history
+// yet may start on the selected connection.
+function validateChatGptSessionBinding(
+	entries: SessionEntry[],
+	selection: ConnectionSelection,
+	connections: readonly ConnectionRegistryEntry[]
+): string | undefined {
+	if ( getEffectiveSessionProvider( entries, null ) === 'chatgpt-oauth' ) {
+		const resolved = resolveConnectionSelection( entries, { connections, settings: null } );
+		if ( ! resolved.ok ) {
+			return describeConnectionSelectionError( resolved.error );
+		}
+		const recorded = resolved.selection;
+		if (
+			recorded.connectionId !== selection.connectionId ||
+			recorded.model.providerId !== selection.model.providerId ||
+			recorded.model.modelId !== selection.model.modelId ||
+			recorded.revision !== selection.revision
+		) {
+			return 'This chat ran on a different ChatGPT connection or model than the selected one, so it can’t continue on it. Start a new chat.';
+		}
+		return undefined;
+	}
+	const hasHistory = entries.some(
+		( entry ) =>
+			entry.type === 'message' ||
+			entry.type === 'model_change' ||
+			( entry.type === 'custom' && entry.customType === 'studio.session_context' )
+	);
+	return hasHistory
+		? 'This chat ran on another provider, so it can’t continue on ChatGPT. Start a new chat with ChatGPT.'
+		: undefined;
+}
+
+/**
+ * A ChatGPT turn's routing, or why it can't run: the model and effort
+ * checked, the selection live and bound to the session, then the
+ * connection's turn begun. No API key is read: a disconnected connection
+ * fails here however usable a saved key is.
+ */
+async function resolveChatGptRouting(
+	config: ResolvedStudioAgentTurnConfig,
+	selection: ConnectionSelection
+): Promise< { ok: true; routing: TurnRouting } | { ok: false; reason: string } > {
+	if ( config.openAi ) {
+		return {
+			ok: false,
+			reason: 'A ChatGPT turn doesn’t use OpenAI API settings, so none may be set for it.',
+		};
+	}
+	const reasoning = resolveChatGptReasoning(
+		selection.model.modelId,
+		config.chatGpt?.reasoningEffort ?? defaultChatGptReasoningEffort( selection.model.modelId )
+	);
+	if ( ! reasoning.ok ) {
+		return { ok: false, reason: describeChatGptReasoningProblem( reasoning.problem ) };
+	}
+	let model: Model< 'openai-responses' >;
+	try {
+		model = buildChatGptModel( selection.model, config.chatGpt?.label );
+	} catch ( error ) {
+		return { ok: false, reason: error instanceof Error ? error.message : String( error ) };
+	}
+	let connections: ConnectionRegistryEntry[];
+	try {
+		connections = await listChatGptConnections();
+	} catch ( error ) {
+		return { ok: false, reason: error instanceof Error ? error.message : String( error ) };
+	}
+	const liveProblem = validateChatGptSelectionLive( selection, connections );
+	if ( liveProblem ) {
+		return { ok: false, reason: liveProblem };
+	}
+	const bindingProblem = validateChatGptSessionBinding(
+		config.session.getEntries(),
+		selection,
+		connections
+	);
+	if ( bindingProblem ) {
+		return { ok: false, reason: bindingProblem };
+	}
+	let turn: ChatGptTurnHandle;
+	try {
+		turn = await beginChatGptTurn( selection.connectionId );
+	} catch ( error ) {
+		return { ok: false, reason: error instanceof Error ? error.message : String( error ) };
+	}
+	if ( turn.connectionId !== selection.connectionId ) {
+		turn.end();
+		return {
+			ok: false,
+			reason: 'The ChatGPT turn began on a different connection than the selected one.',
+		};
+	}
+	return {
+		ok: true,
+		routing: { kind: 'chatgpt', turn, model, reasoningEffort: reasoning.effort },
+	};
+}
+
 async function runAgentSessionTurn(
 	config: ResolvedStudioAgentTurnConfig,
 	controller: AbortController,
 	setActiveSession: ( session: AgentSession | undefined ) => void
 ): Promise< void > {
-	const family = getAiModelFamily( config.model );
-	const resolved = resolveCredentials( family, config.env );
-	if ( ! resolved.ok ) {
-		config.onEvent( syntheticErrorAgentEnd( 'error', resolved.reason ) );
+	const selection = config.connection;
+	const isChatGptTurn = selection?.model.providerId === 'chatgpt-oauth';
+	if ( config.chatGpt && ! isChatGptTurn ) {
+		config.onEvent(
+			syntheticErrorAgentEnd(
+				'error',
+				'ChatGPT turn settings need a ChatGPT connection selection.'
+			)
+		);
 		return;
 	}
-	let openAiSettings: OpenAiTurnSettings | undefined;
-	if ( family === 'openai' ) {
-		const settings = resolveTurnOpenAiSettings( config );
-		if ( ! settings.ok ) {
-			config.onEvent( syntheticErrorAgentEnd( 'error', settings.reason ) );
+	if ( selection && ! isChatGptTurn ) {
+		const family = getAiModelFamily( config.model );
+		if (
+			selection.model.providerId !== getAiModelFamilyProvider( family ) ||
+			selection.model.modelId !== config.model
+		) {
+			config.onEvent(
+				syntheticErrorAgentEnd(
+					'error',
+					'The selected connection doesn’t match the model this turn runs on.'
+				)
+			);
 			return;
 		}
-		openAiSettings = settings.settings;
+	}
+
+	let routing: TurnRouting;
+	if ( isChatGptTurn ) {
+		const resolved = await resolveChatGptRouting( config, selection );
+		if ( ! resolved.ok ) {
+			config.onEvent( syntheticErrorAgentEnd( 'error', resolved.reason ) );
+			return;
+		}
+		routing = resolved.routing;
+	} else {
+		const family = getAiModelFamily( config.model );
+		const resolved = resolveCredentials( family, config.env );
+		if ( ! resolved.ok ) {
+			config.onEvent( syntheticErrorAgentEnd( 'error', resolved.reason ) );
+			return;
+		}
+		let openAiSettings: OpenAiTurnSettings | undefined;
+		if ( family === 'openai' ) {
+			const settings = resolveTurnOpenAiSettings( config );
+			if ( ! settings.ok ) {
+				config.onEvent( syntheticErrorAgentEnd( 'error', settings.reason ) );
+				return;
+			}
+			openAiSettings = settings.settings;
+		}
+		routing = { kind: 'legacy', family, creds: resolved.creds, openAiSettings };
 	}
 
 	let session: AgentSession | undefined;
 	let unsubscribe: ( () => void ) | undefined;
 	const payloadGuardState: StudioToolPayloadGuardState = {};
 	try {
-		session = await createStudioAgentSession(
-			config,
-			family,
-			resolved.creds,
-			payloadGuardState,
-			openAiSettings
-		);
+		session = await createStudioAgentSession( config, payloadGuardState, routing );
 		setActiveSession( session );
 		let emptyStopContinues = 0;
 		let continueAfterEmptyStop = false;
@@ -403,20 +642,27 @@ async function runAgentSessionTurn(
 		unsubscribe?.();
 		session?.dispose();
 		setActiveSession( undefined );
+		if ( routing.kind === 'chatgpt' ) {
+			routing.turn.end();
+		}
 	}
 }
 
 async function createStudioAgentSession(
 	config: ResolvedStudioAgentTurnConfig,
-	family: AiModelFamily,
-	creds: ResolvedCredentials,
 	payloadGuardState: StudioToolPayloadGuardState,
-	openAiSettings?: OpenAiTurnSettings
+	routing: TurnRouting
 ): Promise< AgentSession > {
-	const model = openAiSettings
-		? buildOpenAiModel( openAiSettings, getAiModelLabel( openAiSettings.model ) )
-		: buildModel( config.model, family, creds );
-	const visionEnabled = aiModelSupportsImages( config.model );
+	const model =
+		routing.kind === 'chatgpt'
+			? routing.model
+			: routing.openAiSettings
+			? buildOpenAiModel( routing.openAiSettings, getAiModelLabel( routing.openAiSettings.model ) )
+			: buildModel( config.model, routing.family, routing.creds );
+	const visionEnabled =
+		routing.kind === 'chatgpt'
+			? routing.model.input.includes( 'image' )
+			: aiModelSupportsImages( config.model );
 	const [ userInstructions, imageGenerationEnabled ] = await Promise.all( [
 		readGlobalInstructions(),
 		isImageGenerationAvailable(),
@@ -435,9 +681,16 @@ async function createStudioAgentSession(
 	const resultNotes =
 		site && ! site.remote ? ( text: string ) => notes( site.path, text ) : undefined;
 	const toolDefinitions = tools.map( ( tool ) =>
-		toToolDefinition( config.host, tool, payloadGuardState, pendingWork, resultNotes )
+		toToolDefinition(
+			config.host,
+			tool,
+			payloadGuardState,
+			pendingWork,
+			resultNotes,
+			routing.kind === 'chatgpt' ? routing.turn : undefined
+		)
 	);
-	const modelRuntime = await createModelRuntime( model, family, creds, openAiSettings );
+	const modelRuntime = await createModelRuntime( model, routing );
 	const settingsManager = createSettingsManager( config.env );
 	const { sitesRoot } = config.host;
 	const resourceLoader = new DefaultResourceLoader( {
@@ -459,8 +712,13 @@ async function createStudioAgentSession(
 		agentDir: sitesRoot,
 		modelRuntime,
 		model,
-		// OpenAI turns use the chosen effort; the other providers keep medium.
-		thinkingLevel: openAiSettings ? toPiThinkingLevel( openAiSettings.reasoningEffort ) : 'medium',
+		// OpenAI and ChatGPT turns use the chosen effort; the others keep medium.
+		thinkingLevel:
+			routing.kind === 'chatgpt'
+				? toPiThinkingLevel( routing.reasoningEffort )
+				: routing.openAiSettings
+				? toPiThinkingLevel( routing.openAiSettings.reasoningEffort )
+				: 'medium',
 		sessionManager: config.session,
 		settingsManager,
 		resourceLoader,
@@ -603,36 +861,53 @@ class InMemoryCredentialStore implements CredentialStore {
 
 async function createModelRuntime(
 	model: StudioModel,
-	family: AiModelFamily,
-	creds: ResolvedCredentials,
-	openAiSettings?: OpenAiTurnSettings
+	routing: TurnRouting
 ): Promise< ModelRuntime > {
 	const modelRuntime = await ModelRuntime.create( {
 		credentials: new InMemoryCredentialStore(),
 		modelsPath: null,
 	} );
 
-	if ( openAiSettings ) {
+	if ( routing.kind === 'chatgpt' ) {
+		// No token is registered: each request takes the turn's current one.
+		const snapshot: ChatGptTurnSnapshot = {
+			connectionId: routing.turn.connectionId,
+			getAccessToken: () => routing.turn.getAccessToken(),
+			signal: routing.turn.signal,
+			reasoningEffort: routing.reasoningEffort,
+		};
 		modelRuntime.registerProvider(
-			STUDIO_OPENAI_PROVIDER,
-			createOpenAiProviderConfig(
+			CHATGPT_PI_PROVIDER,
+			createChatGptProviderConfig(
 				model as Model< 'openai-responses' >,
-				creds.apiKey,
-				openAiSettings
+				routing.turn.connectionId,
+				snapshot
 			)
 		);
 		return modelRuntime;
 	}
 
-	if ( family === 'studio' ) {
+	if ( routing.openAiSettings ) {
 		modelRuntime.registerProvider(
-			model.provider,
-			createWpcomProviderConfig( model as StudioWpcomModel, creds )
+			STUDIO_OPENAI_PROVIDER,
+			createOpenAiProviderConfig(
+				model as Model< 'openai-responses' >,
+				routing.creds.apiKey,
+				routing.openAiSettings
+			)
 		);
 		return modelRuntime;
 	}
 
-	await modelRuntime.setRuntimeApiKey( family, creds.apiKey );
+	if ( routing.family === 'studio' ) {
+		modelRuntime.registerProvider(
+			model.provider,
+			createWpcomProviderConfig( model as StudioWpcomModel, routing.creds )
+		);
+		return modelRuntime;
+	}
+
+	await modelRuntime.setRuntimeApiKey( routing.family, routing.creds.apiKey );
 	return modelRuntime;
 }
 
@@ -730,7 +1005,8 @@ function toToolDefinition(
 	tool: AgentToolAny,
 	payloadGuardState: StudioToolPayloadGuardState,
 	pendingWork: PendingWork,
-	resultNotes?: ( text: string ) => Promise< string >
+	resultNotes?: ( text: string ) => Promise< string >,
+	chatGptTurn?: ChatGptTurnHandle
 ): ToolDefinition {
 	return {
 		name: tool.name,
@@ -741,6 +1017,11 @@ function toToolDefinition(
 		executionMode: tool.executionMode,
 		promptSnippet: ( tool as ToolPromptFields ).promptSnippet,
 		execute: async ( toolCallId, params, signal, onUpdate ) => {
+			// A ChatGPT sign-out since the model asked for this call stops it
+			// here: the tool never runs on a connection that is gone.
+			if ( chatGptTurn ) {
+				await chatGptTurn.assertActive();
+			}
 			const incompleteToolCallReason = getIncompleteToolCallReason( payloadGuardState, toolCallId );
 			if ( incompleteToolCallReason ) {
 				throw new Error( incompleteToolCallReason );
