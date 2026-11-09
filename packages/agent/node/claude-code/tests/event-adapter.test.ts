@@ -96,3 +96,156 @@ it( 'does not report success for a zero-turn blocked prompt', () => {
 	} );
 	expect( events ).toMatchObject( [ { type: 'turn.terminal', outcome: { status: 'error' } } ] );
 } );
+
+it( 'keeps stopped streamed block identities when a complete multi-block frame arrives and is replayed', () => {
+	const events: BackendTurnEvent[] = [];
+	const adapter = createClaudeEventAdapter( 'run', 'turn', ( event ) => events.push( event ) );
+	adapter.accept( {
+		type: 'stream_event',
+		event: { type: 'message_start', message: { id: 'message' } },
+	} );
+	for ( const [ index, text ] of [
+		[ 0, 'First' ],
+		[ 1, 'Second' ],
+	] as const ) {
+		adapter.accept( {
+			type: 'stream_event',
+			event: { type: 'content_block_start', index, content_block: { type: 'text', text: '' } },
+		} );
+		adapter.accept( {
+			type: 'stream_event',
+			event: { type: 'content_block_delta', index, delta: { type: 'text_delta', text } },
+		} );
+		adapter.accept( { type: 'stream_event', event: { type: 'content_block_stop', index } } );
+	}
+	const payload = {
+		id: 'message',
+		content: [
+			{ type: 'text', text: 'First' },
+			{ type: 'text', text: 'Second' },
+		],
+	};
+	adapter.accept( { type: 'assistant', uuid: 'frame', message: payload } );
+	adapter.accept( { type: 'assistant', uuid: 'replayed-frame', message: payload } );
+	expect( events.filter( ( event ) => event.type === 'content.confirmed' ) ).toMatchObject( [
+		{ messageId: 'message', blockId: '0', text: 'First' },
+		{ messageId: 'message', blockId: '1', text: 'Second' },
+	] );
+} );
+
+it( 'reconciles a stopped single block with a late complete frame', () => {
+	const events: BackendTurnEvent[] = [];
+	const adapter = createClaudeEventAdapter( 'run', 'turn', ( event ) => events.push( event ) );
+	adapter.accept( {
+		type: 'stream_event',
+		event: { type: 'message_start', message: { id: 'message' } },
+	} );
+	adapter.accept( {
+		type: 'stream_event',
+		event: { type: 'content_block_start', index: 2, content_block: { type: 'text', text: '' } },
+	} );
+	adapter.accept( {
+		type: 'stream_event',
+		event: { type: 'content_block_delta', index: 2, delta: { type: 'text_delta', text: 'Hello' } },
+	} );
+	adapter.accept( { type: 'stream_event', event: { type: 'content_block_stop', index: 2 } } );
+	adapter.accept( {
+		type: 'assistant',
+		uuid: 'late',
+		message: { id: 'message', content: [ { type: 'text', text: 'Hello' } ] },
+	} );
+	expect( events ).toMatchObject( [
+		{ type: 'content.provisional', blockId: '2' },
+		{ type: 'content.confirmed', blockId: '2' },
+	] );
+} );
+
+it( 'does not associate a completed text block with an earlier non-text stream block', () => {
+	const events: BackendTurnEvent[] = [];
+	const adapter = createClaudeEventAdapter( 'run', 'turn', ( event ) => events.push( event ) );
+	adapter.accept( {
+		type: 'stream_event',
+		event: { type: 'message_start', message: { id: 'm' } },
+	} );
+	adapter.accept( {
+		type: 'stream_event',
+		event: {
+			type: 'content_block_start',
+			index: 0,
+			content_block: { type: 'tool_use', id: 'call', name: 'Read', input: {} },
+		},
+	} );
+	adapter.accept( { type: 'stream_event', event: { type: 'content_block_stop', index: 0 } } );
+	adapter.accept( {
+		type: 'stream_event',
+		event: { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } },
+	} );
+	adapter.accept( {
+		type: 'stream_event',
+		event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Hi' } },
+	} );
+	adapter.accept( { type: 'stream_event', event: { type: 'content_block_stop', index: 1 } } );
+	adapter.accept( {
+		type: 'assistant',
+		uuid: 'f',
+		message: { id: 'm', content: [ { type: 'text', text: 'Hi' } ] },
+	} );
+	expect( events ).toMatchObject( [
+		{ type: 'content.provisional', blockId: '1' },
+		{ type: 'content.confirmed', blockId: '1' },
+	] );
+} );
+
+it( 'retains text and reasoning from one complete assistant message', () => {
+	const events: BackendTurnEvent[] = [];
+	const adapter = createClaudeEventAdapter( 'run', 'turn', ( event ) => events.push( event ) );
+	adapter.accept( {
+		type: 'assistant',
+		uuid: 'frame',
+		message: {
+			id: 'm',
+			content: [
+				{ type: 'thinking', thinking: 'Consider' },
+				{ type: 'text', text: 'Answer' },
+			],
+		},
+	} );
+	expect( events ).toMatchObject( [
+		{ type: 'content.confirmed', blockType: 'reasoning', blockId: '0', text: 'Consider' },
+		{ type: 'content.confirmed', blockType: 'text', blockId: '1', text: 'Answer' },
+	] );
+} );
+
+it( 'uses provisional text evidence to distinguish stopped text blocks', () => {
+	const events: BackendTurnEvent[] = [];
+	const adapter = createClaudeEventAdapter( 'run', 'turn', ( event ) => events.push( event ) );
+	adapter.accept( {
+		type: 'stream_event',
+		event: { type: 'message_start', message: { id: 'm' } },
+	} );
+	for ( const index of [ 0, 1 ] ) {
+		adapter.accept( {
+			type: 'stream_event',
+			event: { type: 'content_block_start', index, content_block: { type: 'text', text: '' } },
+		} );
+		if ( index === 1 )
+			adapter.accept( {
+				type: 'stream_event',
+				event: {
+					type: 'content_block_delta',
+					index,
+					delta: { type: 'text_delta', text: 'Second' },
+				},
+			} );
+		adapter.accept( { type: 'stream_event', event: { type: 'content_block_stop', index } } );
+	}
+	adapter.accept( {
+		type: 'assistant',
+		uuid: 'frame',
+		message: { id: 'm', content: [ { type: 'text', text: 'Second' } ] },
+	} );
+	expect( events ).toMatchObject( [
+		{ type: 'content.provisional', blockId: '1' },
+		{ type: 'content.confirmed', blockId: '1' },
+	] );
+} );

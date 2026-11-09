@@ -1,9 +1,18 @@
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { createReadStream } from 'fs';
-import { appendFile, mkdir, readFile, readdir, realpath, stat, writeFile } from 'fs/promises';
+import {
+	appendFile,
+	mkdir,
+	readFile,
+	readdir,
+	realpath,
+	stat,
+	unlink,
+	writeFile,
+} from 'fs/promises';
 import path from 'path';
 import { createInterface } from 'readline';
-import { lockFileAsync, unlockFileAsync } from '@studio/common/lib/lockfile';
+import { writeFile as atomicWriteFile } from 'atomically';
 import { resolveClaudeResume } from '../backends/resume';
 import type { ClaudeTranscriptCandidate } from '../backends/resume';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
@@ -53,35 +62,80 @@ function validate( value: unknown ): ClaudeBackendSessionRef {
 export function createNativeSessionStore( root: string ) {
 	const filename = ( conversationId: string ) =>
 		path.join( root, `${ key( conversationId ) }.json` );
+	const orderPath = ( conversationId: string ) =>
+		path.join( root, `${ key( conversationId ) }.journal-order.json` );
+	const journalPrefix = ( conversationId: string ) => `${ key( conversationId ) }-`;
+	async function journalNames( conversationId: string ): Promise< string[] > {
+		try {
+			const prefix = journalPrefix( conversationId );
+			return ( await readdir( root ) ).filter(
+				( name ) =>
+					name.startsWith( prefix ) &&
+					/^[a-f0-9]{64}\.journal\.jsonl$/.test( name.slice( prefix.length ) )
+			);
+		} catch ( error ) {
+			if ( ( error as NodeJS.ErrnoException ).code === 'ENOENT' ) return [];
+			throw error;
+		}
+	}
+	async function readOrder( conversationId: string ): Promise< string[] > {
+		let data: unknown;
+		try {
+			data = JSON.parse( await readFile( orderPath( conversationId ), 'utf8' ) );
+		} catch ( error ) {
+			if ( ( error as NodeJS.ErrnoException ).code === 'ENOENT' ) return [];
+			throw error;
+		}
+		const record = data as { version?: unknown; entries?: unknown } | null;
+		const prefix = journalPrefix( conversationId );
+		if (
+			record?.version !== 1 ||
+			! Array.isArray( record.entries ) ||
+			record.entries.some(
+				( name: unknown ) =>
+					typeof name !== 'string' ||
+					! name.startsWith( prefix ) ||
+					! /^[a-f0-9]{64}\.journal\.jsonl$/.test( name.slice( prefix.length ) )
+			) ||
+			new Set( record.entries ).size !== record.entries.length
+		)
+			throw new Error( 'Invalid journal order' );
+		return record.entries as string[];
+	}
+	async function orderedNames( conversationId: string ): Promise< string[] > {
+		const [ names, order ] = await Promise.all( [
+			journalNames( conversationId ),
+			readOrder( conversationId ),
+		] );
+		const orderedSet = new Set( order );
+		const legacy = await Promise.all(
+			names
+				.filter( ( name ) => ! orderedSet.has( name ) )
+				.map( async ( name ) => ( {
+					name,
+					time: ( await stat( path.join( root, name ) ) ).birthtimeMs,
+				} ) )
+		);
+		legacy.sort( ( a, b ) => a.time - b.time || a.name.localeCompare( b.name ) );
+		return [ ...legacy.map( ( entry ) => entry.name ), ...order ];
+	}
 	return {
 		async readJournals( conversationId: string ): Promise< BackendTurnEvent[][] > {
-			let names: string[];
-			try {
-				names = await readdir( root );
-			} catch ( error ) {
-				if ( ( error as NodeJS.ErrnoException ).code === 'ENOENT' ) return [];
-				throw error;
-			}
-			const prefix = `${ key( conversationId ) }-`;
+			const names = await orderedNames( conversationId );
 			const entries = await Promise.all(
-				names
-					.filter( ( name ) => name.startsWith( prefix ) && name.endsWith( '.journal.jsonl' ) )
-					.map( async ( name ) => {
-						const file = path.join( root, name );
-						return {
-							name,
-							time: ( await stat( file ) ).birthtimeMs,
-							events: ( await readFile( file, 'utf8' ) )
-								.split( '\n' )
-								.filter( Boolean )
-								.map( ( line ) => JSON.parse( line ) as BackendTurnEvent ),
-						};
-					} )
+				names.map( async ( name ) => {
+					try {
+						return ( await readFile( path.join( root, name ), 'utf8' ) )
+							.split( '\n' )
+							.filter( Boolean )
+							.map( ( line ) => JSON.parse( line ) as BackendTurnEvent );
+					} catch ( error ) {
+						if ( ( error as NodeJS.ErrnoException ).code === 'ENOENT' ) return undefined;
+						throw error;
+					}
+				} )
 			);
-			entries.sort(
-				( left, right ) => left.time - right.time || left.name.localeCompare( right.name )
-			);
-			return entries.map( ( entry ) => entry.events );
+			return entries.filter( ( entry ): entry is BackendTurnEvent[] => entry !== undefined );
 		},
 		journal( conversationId: string, turnId: string ) {
 			const journalPath = path.join(
@@ -94,6 +148,14 @@ export function createNativeSessionStore( root: string ) {
 					if ( event.turnId !== turnId ) throw new Error( 'Turn mismatch' );
 					pending = pending.then( async () => {
 						await mkdir( root, { recursive: true } );
+						const name = path.basename( journalPath );
+						const order = await orderedNames( conversationId );
+						if ( ! order.includes( name ) ) order.push( name );
+						await atomicWriteFile(
+							orderPath( conversationId ),
+							JSON.stringify( { version: 1, entries: order } ),
+							{ mode: 0o600 }
+						);
 						await appendFile( journalPath, JSON.stringify( event ) + '\n', { mode: 0o600 } );
 					} );
 					return pending;
@@ -167,8 +229,13 @@ export function createNativeSessionStore( root: string ) {
 		async lockTurn( conversationId: string ) {
 			await mkdir( root, { recursive: true } );
 			const lock = filename( conversationId ) + '.lock';
-			await lockFileAsync( lock, { stale: 60 * 60 * 1000, retries: 0 } );
-			return () => unlockFileAsync( lock );
+			const token = randomUUID();
+			await writeFile( lock, token, { flag: 'wx', mode: 0o600 } );
+			return async () => {
+				if ( ( await readFile( lock, 'utf8' ) ) !== token )
+					throw new Error( 'Run lock ownership changed' );
+				await unlink( lock );
+			};
 		},
 		async create( input: ClaudeBackendSessionRef ) {
 			const record = validate( input );

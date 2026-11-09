@@ -16,7 +16,14 @@ export function createClaudeEventAdapter(
 	let messageId: string | undefined;
 	let openIndex: number | undefined;
 	const frames = new Set< string >();
-	const blocks = new Map< number, { text: string; sequence: number; confirmed: boolean } >();
+	type StreamBlock = {
+		text: string;
+		sequence: number;
+		confirmed: boolean;
+		type?: string;
+		finalText?: string;
+	};
+	const messages = new Map< string, Map< number, StreamBlock > >();
 	return {
 		accept( message: ObjectValue ) {
 			if ( terminal ) return;
@@ -42,31 +49,48 @@ export function createClaudeEventAdapter(
 				if ( event?.type === 'message_start' ) {
 					const start = object( event.message );
 					messageId = typeof start?.id === 'string' ? start.id : undefined;
-					blocks.clear();
+					openIndex = undefined;
+					if ( messageId && ! messages.has( messageId ) ) messages.set( messageId, new Map() );
 				} else if ( event?.type === 'content_block_start' && typeof event.index === 'number' ) {
 					openIndex = event.index;
-					blocks.set( event.index, { text: '', sequence: 0, confirmed: false } );
+					const blocks = messageId ? messages.get( messageId ) : undefined;
+					if ( blocks && ! blocks.has( event.index ) ) {
+						const content = object( event.content_block );
+						blocks.set( event.index, {
+							text: '',
+							sequence: 0,
+							confirmed: false,
+							type: typeof content?.type === 'string' ? content.type : undefined,
+						} );
+					}
 				} else if (
 					event?.type === 'content_block_delta' &&
 					typeof event.index === 'number' &&
 					messageId
 				) {
 					const delta = object( event.delta );
-					const block = blocks.get( event.index );
+					const block = messages.get( messageId )?.get( event.index );
+					const text =
+						delta?.type === 'text_delta'
+							? delta.text
+							: delta?.type === 'thinking_delta'
+							? delta.thinking
+							: undefined;
 					if (
 						block &&
 						! block.confirmed &&
-						delta?.type === 'text_delta' &&
-						typeof delta.text === 'string'
+						( ( block.type === 'text' && delta?.type === 'text_delta' ) ||
+							( block.type === 'thinking' && delta?.type === 'thinking_delta' ) ) &&
+						typeof text === 'string'
 					) {
-						block.text += delta.text;
+						block.text += text;
 						onEvent( {
 							type: 'content.provisional',
 							runId,
 							turnId,
 							messageId,
 							blockId: String( event.index ),
-							blockType: 'text',
+							blockType: block.type === 'thinking' ? 'reasoning' : 'text',
 							text: block.text,
 							sequence: ++block.sequence,
 						} );
@@ -83,23 +107,67 @@ export function createClaudeEventAdapter(
 				frames.add( message.uuid );
 				const payload = object( message.message );
 				const content = Array.isArray( payload?.content ) ? payload.content : [];
-				const block = object( content[ 0 ] );
-				if (
-					typeof payload?.id === 'string' &&
-					block?.type === 'text' &&
-					typeof block.text === 'string'
-				) {
-					const index = payload.id === messageId ? openIndex : undefined;
-					const state = index === undefined ? undefined : blocks.get( index );
-					if ( state ) state.confirmed = true;
+				if ( typeof payload?.id !== 'string' ) return;
+				const id = payload.id;
+				let blocks = messages.get( id );
+				for ( const [ position, rawBlock ] of content.entries() ) {
+					const block = object( rawBlock );
+					const text =
+						block?.type === 'text'
+							? block.text
+							: block?.type === 'thinking'
+							? block.thinking
+							: undefined;
+					if ( typeof text !== 'string' ) continue;
+					const blockType = block?.type === 'thinking' ? 'reasoning' : 'text';
+					let index: number | undefined;
+					if ( content.length > 1 ) index = position;
+					else if ( blocks ) {
+						const candidates = [ ...blocks.entries() ].filter(
+							( [ , state ] ) =>
+								state.type === block?.type && ! state.confirmed && text.startsWith( state.text )
+						);
+						const evidenced = candidates.filter( ( [ , state ] ) => state.text.length > 0 );
+						index =
+							evidenced.find(
+								( [ candidate ] ) => id === messageId && candidate === openIndex
+							)?.[ 0 ] ??
+							( evidenced.length === 1 ? evidenced[ 0 ][ 0 ] : undefined ) ??
+							candidates.find(
+								( [ candidate ] ) => id === messageId && candidate === openIndex
+							)?.[ 0 ] ??
+							( candidates.length === 1 ? candidates[ 0 ][ 0 ] : undefined );
+						if (
+							index === undefined &&
+							[ ...blocks.values() ].some(
+								( state ) =>
+									state.type === block?.type && state.confirmed && state.finalText === text
+							)
+						)
+							continue;
+					}
+					let state = index === undefined ? undefined : blocks?.get( index );
+					if ( content.length > 1 && index !== undefined && ! state ) {
+						if ( ! blocks ) {
+							blocks = new Map();
+							messages.set( id, blocks );
+						}
+						state = { text: '', sequence: 0, confirmed: false, type: block?.type as string };
+						blocks.set( index, state );
+					}
+					if ( state?.confirmed ) continue;
+					if ( state ) {
+						state.confirmed = true;
+						state.finalText = text;
+					}
 					onEvent( {
 						type: 'content.confirmed',
 						runId,
 						turnId,
-						messageId: payload.id,
+						messageId: id,
 						blockId: index === undefined ? message.uuid : String( index ),
-						blockType: 'text',
-						text: block.text,
+						blockType,
+						text,
 					} );
 				}
 				return;
