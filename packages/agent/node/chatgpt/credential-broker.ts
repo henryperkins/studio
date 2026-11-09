@@ -598,6 +598,22 @@ export function createChatGptCredentialBroker(
 		return opened;
 	}
 
+	// A record the held key can't open may be sealed under a key that replaced
+	// it in the keychain since this process last read it: the cached key goes,
+	// the keychain is read again, and the record is tried once more.
+	async function readRecordRetryingStaleKey(
+		account: ChatGptAccount,
+		heldKey: Buffer | null
+	): Promise< { key: Buffer | null; read: RecordRead } > {
+		const read = await readRecord( heldKey, account );
+		if ( read.status !== 'unusable' ) {
+			return { key: heldKey, read };
+		}
+		wrappingKey = null;
+		const key = await getWrappingKey();
+		return { key, read: await readRecord( key, account ) };
+	}
+
 	const writeSealedRecord = ( registrationId: string, sealed: string ) =>
 		writeChatGptFileAtomically( credentialsDirectory(), recordFile( registrationId ), sealed );
 
@@ -713,15 +729,7 @@ export function createChatGptCredentialBroker(
 			if ( current.storage !== 'vault' ) {
 				throw new ChatGptConnectionError( 'session-unavailable' );
 			}
-			let key = heldKey;
-			let read = await readRecord( key, current );
-			if ( read.status === 'unusable' ) {
-				// Another process may have saved the record under a key that
-				// replaced the one this process holds.
-				wrappingKey = null;
-				key = await getWrappingKey();
-				read = await readRecord( key, current );
-			}
+			const { key, read } = await readRecordRetryingStaleKey( current, heldKey );
 			if ( read.status === 'newer' ) {
 				throw new ChatGptConnectionError( 'newer-format' );
 			}
@@ -892,8 +900,16 @@ export function createChatGptCredentialBroker(
 			return sessions.get( connectionId )?.record.idToken ?? null;
 		}
 		const key = await getWrappingKey().catch( () => null );
-		const read = await readRecord( key, account );
-		return read.status === 'ok' ? read.record.idToken : null;
+		try {
+			const { read } = await readRecordRetryingStaleKey( account, key );
+			return read.status === 'ok' ? read.record.idToken : null;
+		} catch ( error ) {
+			// No hint is better than failing the sign-in the hint only helps.
+			if ( error instanceof ChatGptConnectionError && error.code === 'vault-unavailable' ) {
+				return null;
+			}
+			throw error;
+		}
 	}
 
 	async function saveSignIn( signIn: ChatGptSignIn ): Promise< ChatGptAccount > {
@@ -1093,8 +1109,8 @@ export function createChatGptCredentialBroker(
 						: false,
 				};
 			}
-			const read = await readRecord( key, account ).catch( () => null );
-			const record = session?.record ?? ( read?.status === 'ok' ? read.record : null );
+			const vault = await readRecordRetryingStaleKey( account, key ).catch( () => null );
+			const record = session?.record ?? ( vault?.read.status === 'ok' ? vault.read.record : null );
 			const remoteRevocationConfirmed = record
 				? await revoke( account.clientId, record.refreshToken )
 				: false;

@@ -676,6 +676,30 @@ describe( 'ChatGPT credential broker', () => {
 			expect( await readChatGptAccount( registrationId ) ).toMatchObject( { state: 'signed-in' } );
 		} );
 
+		it( 'reads the keychain again before giving up on the ID token it keeps for a sign-in again', async () => {
+			const app = startBroker();
+			const { registrationId } = await app.saveSignIn( signIn() );
+			keychain.items.clear();
+			await startBroker().saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) );
+
+			await expect( app.readIdTokenHint( registrationId ) ).resolves.toBe( 'test-id-token-2' );
+		} );
+
+		it( 'reads the keychain again before giving up on the record a sign-out revokes', async () => {
+			const app = startBroker();
+			const { registrationId } = await app.saveSignIn( signIn() );
+			keychain.items.clear();
+			await startBroker().saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) );
+
+			await expect( app.signOut( registrationId ) ).resolves.toEqual( {
+				localCleared: true,
+				remoteRevocationConfirmed: true,
+			} );
+			expect( service.revocations ).toEqual( [
+				{ clientId: 'test-issued-client-1', refreshToken: 'test-refresh-token-2' },
+			] );
+		} );
+
 		it.each( [ 'clientId', 'subject' ] as const )(
 			'refuses a record whose %s differs from its registration’s',
 			async ( field ) => {
