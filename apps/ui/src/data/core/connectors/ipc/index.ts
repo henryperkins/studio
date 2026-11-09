@@ -565,6 +565,13 @@ export function createIpcConnector(): Connector {
 		async createSession( siteId ): Promise< AiSessionSummary > {
 			return ( await ipcApi.createAiSession( siteId ) ) as AiSessionSummary;
 		},
+		getClaudeRuntimeState: () => ipcApi.getClaudeRuntimeState(),
+		configureClaudeRuntime: ( action ) => unwrapIpcError( ipcApi.configureClaudeRuntime( action ) ),
+		getClaudeModelCatalog: ( connectionId, siteId ) =>
+			ipcApi.getClaudeModelCatalog( connectionId, siteId ),
+		createClaudeSession: ( request ) => unwrapIpcError( ipcApi.createClaudeSession( request ) ),
+		setClaudeSessionSelection: ( sessionId, selection ) =>
+			unwrapIpcError( ipcApi.setClaudeSessionSelection( sessionId, selection ) ),
 
 		async continueSession( sessionId, prompt, options ): Promise< { runId: string } > {
 			return ( await ipcApi.continueAiSession( sessionId, prompt, options ) ) as {

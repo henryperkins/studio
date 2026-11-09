@@ -321,6 +321,12 @@
 	gap: var( --space-1 );
 }
 
+.claudeRuntimeForm {
+	display: grid;
+	justify-items: start;
+	gap: var( --space-2 );
+}
+
 .settingsControl:has( > .colorControl, > .sliderControl ) {
 	min-width: 192px;
 	max-width: 100%;

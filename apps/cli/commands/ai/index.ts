@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { stripVTControlCharacters } from 'node:util';
 import {
 	closeSharedBrowser,
 	createAgent,
@@ -7,10 +8,10 @@ import {
 	type StudioAgentHost,
 	AskUserQuestion,
 } from '@studio/agent/node';
-import { runClaudeTurn } from '@studio/agent/node/claude-code/runtime';
 import {
 	getClaudeSessionStoreRoot,
 	validateClaudeSendSelection,
+	verifyClaudeTurnSession,
 } from '@studio/agent/node/claude-code/studio-surface';
 import {
 	readAiSettings,
@@ -62,6 +63,7 @@ import {
 	resolveUnavailableAiProvider,
 	saveSelectedAiProvider,
 } from 'cli/ai/auth';
+import { getTerminalClaudeApprover } from 'cli/ai/claude-approval';
 import { cliAgentHost } from 'cli/ai/host';
 import { emitEvent } from 'cli/ai/json-events';
 import { type AiOutputAdapter, JsonAdapter } from 'cli/ai/output-adapter';
@@ -89,6 +91,7 @@ import {
 import { Logger, LoggerError } from 'cli/logger';
 import { StudioArgv } from 'cli/types';
 import type { SessionManager } from '@earendil-works/pi-coding-agent';
+import type { ClaudeToolPolicy } from '@studio/agent/node/claude-code/tool-bridge';
 import type {
 	StudioCustomEntryDataMap,
 	StudioCustomEntryType,
@@ -254,6 +257,7 @@ async function resolveOpenAiTurn(
 
 export async function runCommand( options: {
 	adapter: AiOutputAdapter;
+	approveClaude?: ClaudeToolPolicy[ 'approve' ];
 	startupSignal?: AbortSignal;
 	initialMessage?: string;
 	initialTurnId?: string;
@@ -336,6 +340,17 @@ export async function runCommand( options: {
 	}
 	const entries = options.resumeSession?.entries ?? resumedById?.getEntries();
 	const claude = entries && resolveClaudeSession( entries );
+	const savedHeader = resumedById?.getHeader?.();
+	if (
+		! claude &&
+		( options.claudeSelection !== undefined ||
+			options.resumeSession?.summary.backend === 'claude-code' ||
+			( savedHeader &&
+				'studioBackend' in savedHeader &&
+				savedHeader.studioBackend === 'claude-code' ) )
+	) {
+		throw new Error( 'The Claude Code workspace binding is missing.' );
+	}
 	if ( claude ) {
 		const selection = options.claudeSelection ?? claude.selection;
 		if (
@@ -354,10 +369,12 @@ export async function runCommand( options: {
 		await validateClaudeSendSelection( getSessionsDirectory(), conversationId, selection );
 		const pending = new Map< string, ( answer: 'allow' | 'deny' ) => void >();
 		const approve = async (
-			request: { operationId: string },
+			request: Parameters< ClaudeToolPolicy[ 'approve' ] >[ 0 ],
 			signal: AbortSignal
 		): Promise< 'allow' | 'deny' > => {
-			if ( typeof process.send !== 'function' || signal.aborted ) return 'deny';
+			if ( signal.aborted ) return 'deny';
+			if ( typeof process.send !== 'function' )
+				return options.approveClaude?.( request, signal ) ?? 'deny';
 			return new Promise( ( resolve ) => {
 				const done = ( answer: 'allow' | 'deny' ) => {
 					pending.delete( request.operationId );
@@ -370,12 +387,14 @@ export async function runCommand( options: {
 				if ( signal.aborted ) abort();
 			} );
 		};
+		const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
 		const claudeAgent = createAgent( {
 			host,
 			claudeCode: ( snapshot, input ) =>
 				runClaudeTurn( snapshot, host, input, {
 					storeRoot: getClaudeSessionStoreRoot( getSessionsDirectory() ),
 					approve,
+					verifySession: ( turn ) => verifyClaudeTurnSession( getSessionsDirectory(), turn ),
 				} ),
 		} );
 		const turn = claudeAgent.runBackendTurn(
@@ -400,9 +419,9 @@ export async function runCommand( options: {
 					if ( isJsonMode )
 						emitEvent( { type: 'backend.event', timestamp: new Date().toISOString(), event } );
 					else if ( event.type === 'content.confirmed' && event.blockType === 'text' )
-						ui.showInfo( event.text );
+						process.stdout.write( stripVTControlCharacters( event.text ) + '\n' );
 					else if ( event.type === 'turn.terminal' && event.outcome.status !== 'success' )
-						ui.showError( event.outcome.message ?? event.outcome.status );
+						process.stderr.write( ( event.outcome.message ?? event.outcome.status ) + '\n' );
 				},
 			}
 		);
@@ -1238,6 +1257,7 @@ export const registerCommand = ( yargs: StudioArgv ) => {
 				}
 				await runCommand( {
 					adapter,
+					approveClaude: typedArgv.json ? undefined : getTerminalClaudeApprover(),
 					initialMessage,
 					resumeSessionId: typedArgv.resumeSession,
 					showLegacyCommandNotice: argv._[ 0 ] === 'ai',

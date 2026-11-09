@@ -12,6 +12,7 @@ import { useAuthUser, useLogin } from '@/data/queries/use-auth-user';
 import { LearnMoreLink } from '@/features/onboarding';
 import { useOffline } from '@/lib/hooks';
 import { Button, Input } from '@/lib/ui';
+import { ClaudeRuntimeSettings } from './claude-runtime';
 import { OpenAiProviderRow, OpenAiSettingsGroup } from './openai-settings';
 import { connectedBadge, SettingsGroup, SettingsRow, SettingsSelect } from './rows';
 import styles from './style.module.css';
@@ -216,6 +217,7 @@ export function AiPanel( { onManageCredits }: { onManageCredits: () => void } ) 
 			</SettingsGroup>
 			<ProvidersSection onManageCredits={ onManageCredits } />
 			<OpenAiSettingsGroup />
+			<ClaudeRuntimeSettings />
 		</div>
 	);
 }

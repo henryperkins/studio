@@ -3,6 +3,7 @@ import {
 	createClaudeSession,
 	getClaudeModelCatalog,
 	getClaudeRuntimeState,
+	setClaudeSessionSelection,
 } from '@studio/agent/node/claude-code/studio-surface';
 import { parseClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
 import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
@@ -24,6 +25,7 @@ export const registerCommand = ( yargs: StudioArgv ) =>
 						'disconnect',
 						'models',
 						'new',
+						'select',
 					] as const,
 					demandOption: true,
 				} )
@@ -31,6 +33,7 @@ export const registerCommand = ( yargs: StudioArgv ) =>
 				.option( 'config-directory', { type: 'string' } )
 				.option( 'connection', { type: 'string' } )
 				.option( 'site', { type: 'string' } )
+				.option( 'session', { type: 'string' } )
 				.option( 'model', { type: 'string' } )
 				.option( 'effort', { type: 'string' } ),
 		handler: async ( argv ) => {
@@ -73,6 +76,14 @@ export const registerCommand = ( yargs: StudioArgv ) =>
 						siteId: requireValue( argv.site, 'site' ),
 						selection: parseClaudeSessionSelection( { model: argv.model, effort: argv.effort } ),
 					} );
+					break;
+				case 'select':
+					await setClaudeSessionSelection(
+						getSessionsDirectory(),
+						requireValue( argv.session, 'session' ),
+						parseClaudeSessionSelection( { model: argv.model, effort: argv.effort } )
+					);
+					result = { ok: true };
 					break;
 			}
 			process.stdout.write( JSON.stringify( result, null, 2 ) + '\n' );

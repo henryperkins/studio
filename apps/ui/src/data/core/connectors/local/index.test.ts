@@ -100,6 +100,17 @@ describe( 'createLocalConnector Connect contracts', () => {
 		} );
 	} );
 
+	it( 'carries the captured Claude selection and browser owner with a turn', async () => {
+		fetchMock.mockResolvedValue( new Response( JSON.stringify( { runId: 'run-a' } ) ) );
+		const connector = createLocalConnector( { apiBaseUrl: 'http://localhost:8081' } );
+		const claudeSelection = { model: 'claude-model', effort: 'medium' } as const;
+		await connector.continueSession( 'session-a', 'hello', { claudeSelection } );
+		expect( JSON.parse( String( fetchMock.mock.calls[ 0 ][ 1 ]?.body ) ) ).toMatchObject( {
+			claudeSelection,
+			clientId: expect.stringMatching( /^[a-f0-9-]{36}$/ ),
+		} );
+	} );
+
 	it( 'requests the signup-aware login URL', async () => {
 		fetchMock.mockResolvedValue(
 			new Response( JSON.stringify( { url: 'https://wordpress.com/start' } ) )

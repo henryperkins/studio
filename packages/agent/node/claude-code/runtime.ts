@@ -4,6 +4,7 @@ import { realpath } from 'fs/promises';
 import path from 'path';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
+import { isClaudeEffort, isClaudeModelId } from '@studio/agent/protocol/claude-code';
 import { compareClaudeExecutionAuth } from './auth-status';
 import { getClaudeConnections, prepareClaudeInvocation } from './connection';
 import { QUALIFIED_CLAUDE_CODE_VERSION } from './discovery';
@@ -19,6 +20,7 @@ import type {
 	ClaudeBackendTurnSnapshot,
 } from '@studio/agent/protocol/backend-events';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
+import type { ClaudeModelOption } from '@studio/agent/protocol/claude-code';
 
 interface StartupControl {
 	initializationResult(): Promise< {
@@ -85,9 +87,10 @@ export async function qualifyClaudeStartup(
 			inventory[ 0 ].tools[ 0 ].name !== 'wp_cli'
 		)
 			return { ok: false as const };
-		const catalog = new Map< string, { id: string; displayName: string; efforts: string[] } >();
+		const catalog = new Map< string, ClaudeModelOption >();
 		for ( const item of models ) {
 			const id = item.resolvedModel ?? item.value;
+			if ( ! isClaudeModelId( id ) ) continue;
 			const current = catalog.get( id );
 			if ( current )
 				current.efforts = current.efforts.filter(
@@ -97,7 +100,7 @@ export async function qualifyClaudeStartup(
 				catalog.set( id, {
 					id,
 					displayName: item.displayName,
-					efforts: [ ...( item.supportedEffortLevels ?? [] ) ],
+					efforts: ( item.supportedEffortLevels ?? [] ).filter( isClaudeEffort ),
 				} );
 		}
 		const available = [ ...catalog.values() ].filter( ( item ) => item.efforts.length );
@@ -105,7 +108,7 @@ export async function qualifyClaudeStartup(
 		const row = models.find(
 			( candidate ) => candidate.value === model || candidate.resolvedModel === model
 		);
-		if ( ! row || ! effort ) return { ok: false as const };
+		if ( ! row || ! isClaudeEffort( effort ) ) return { ok: false as const };
 		const canonical = row.resolvedModel ?? row.value;
 		if ( ! catalog.get( canonical )?.efforts.includes( effort ) ) return { ok: false as const };
 		return {
@@ -226,7 +229,7 @@ type Prepared =
 			env: NodeJS.ProcessEnv;
 			identity: ClaudeAuthIdentity;
 	  }
-	| { ok: false };
+	| { ok: false; blockers?: string[] };
 interface RuntimeDependencies {
 	query?: typeof sdkQuery;
 	connection?: (
@@ -238,6 +241,7 @@ interface RuntimeDependencies {
 interface RuntimeOptions extends RuntimeDependencies {
 	storeRoot: string;
 	approve: ClaudeToolPolicy[ 'approve' ];
+	verifySession?: ( snapshot: ClaudeBackendTurnSnapshot ) => Promise< boolean >;
 }
 
 type TerminalEvent = Extract< BackendTurnEvent, { type: 'turn.terminal' } >;
@@ -331,7 +335,7 @@ export async function discoverClaudeModels(
 	workingDirectory: string,
 	dependencies: RuntimeDependencies = {}
 ) {
-	const failed = { ok: false as const };
+	const failed = { ok: false as const, blockers: [ 'native-runtime-unqualified' ] };
 	const controller = new AbortController();
 	let child: ReturnType< typeof spawn > | undefined;
 	let sdk: ReturnType< typeof sdkQuery > | undefined;
@@ -347,18 +351,19 @@ export async function discoverClaudeModels(
 	} );
 	let result:
 		| typeof failed
-		| { ok: true; models: Array< { id: string; displayName: string; efforts: string[] } > } =
+		| { ok: true; models: ClaudeModelOption[]; workingDirectory: string; configDirectory: string } =
 		failed;
 	try {
 		const findConnection = dependencies.connection ?? findSavedConnection;
 		const connection = await findConnection( connectionId );
-		if ( ! connection ) return failed;
+		if ( ! connection ) return { ok: false as const, blockers: [ 'connection-not-found' ] };
 		const prepared = await ( dependencies.prepare ?? prepareClaudeInvocation )(
 			connection.executablePath,
 			workingDirectory,
 			connection.configDirectory
 		);
-		if ( ! prepared.ok ) return failed;
+		if ( ! prepared.ok )
+			return { ok: false as const, blockers: prepared.blockers ?? failed.blockers };
 		server = createStudioClaudeMcpServer( async () => ( { content: [], isError: true } ) );
 		sdk = ( dependencies.query ?? sdkQuery )( {
 			prompt: { [ Symbol.asyncIterator ]: () => ( { next: () => done } ) },
@@ -380,7 +385,12 @@ export async function discoverClaudeModels(
 		} );
 		const qualification = await qualifyWithinDeadline( sdk, prepared.identity, controller.signal );
 		if ( qualification.ok && ( await findConnection( connectionId ) ) ) {
-			result = { ok: true, models: qualification.models };
+			result = {
+				ok: true,
+				models: qualification.models,
+				workingDirectory: prepared.cwd,
+				configDirectory: prepared.configDirectory,
+			};
 		}
 	} catch {
 		result = failed;
@@ -417,6 +427,18 @@ export async function runClaudeTurn(
 			message: 'Claude Code could not start or safely complete this turn.',
 		},
 	} );
+	const rebind = (
+		message = 'The original Claude workspace or native history could not be verified. Start a new Claude chat to continue.'
+	): TerminalEvent => ( {
+		type: 'turn.terminal',
+		runId,
+		turnId,
+		outcome: {
+			status: 'error',
+			code: 'rebind_required',
+			message,
+		},
+	} );
 	const controller = new AbortController();
 	const cancel = () => controller.abort();
 	input.signal.addEventListener( 'abort', cancel, { once: true } );
@@ -430,6 +452,8 @@ export async function runClaudeTurn(
 		openGate = resolve;
 	} );
 	let terminal: TerminalEvent | undefined;
+	let detached = false;
+	let connectionWatch: ReturnType< typeof setTimeout > | undefined;
 	const failIfSuccessful = () => {
 		if ( ! terminal || terminal.outcome.status === 'success' ) terminal = fail();
 	};
@@ -439,21 +463,57 @@ export async function runClaudeTurn(
 	let journalFailed = false;
 	try {
 		if ( input.signal.aborted ) throw new Error();
+		const store = createNativeSessionStore( options.storeRoot );
+		try {
+			release = await store.lockTurn( workspace.conversationId );
+		} catch ( error ) {
+			if ( ( error as NodeJS.ErrnoException ).code !== 'EEXIST' ) throw error;
+			terminal = rebind(
+				'This chat still has a Claude run lock. Confirm the earlier native process has exited before starting another chat.'
+			);
+			return;
+		}
+		if (
+			( await store.isPendingDeletion( workspace.conversationId ) ) ||
+			( options.verifySession && ! ( await options.verifySession( snapshot ) ) )
+		) {
+			throw new Error( 'The Studio chat was deleted or changed before the turn started' );
+		}
+		journal = store.journal( workspace.conversationId, turnId );
 		const images = validateStudioChatImages( input.images );
 		const findConnection = options.connection ?? findSavedConnection;
 		const connection = await findConnection( selection.connectionId );
-		if ( ! connection ) throw new Error();
+		if ( ! connection ) {
+			terminal = rebind(
+				'This Claude Code connection was detached. Select a connection and start a new Claude chat.'
+			);
+			return;
+		}
+		const site = ( await host.sites.all() ).find(
+			( candidate ) => candidate.id === workspace.siteId
+		);
+		if (
+			! site ||
+			( await realpath( site.path ).catch( () => undefined ) ) !== workspace.workingDirectory ||
+			( await realpath( workspace.configDirectory ).catch( () => undefined ) ) !==
+				workspace.configDirectory
+		) {
+			terminal = rebind();
+			return;
+		}
 		const prepared = await ( options.prepare ?? prepareClaudeInvocation )(
 			connection.executablePath,
 			workspace.workingDirectory,
 			connection.configDirectory
 		);
+		if ( ! prepared.ok ) throw new Error();
 		if (
-			! prepared.ok ||
 			prepared.cwd !== workspace.workingDirectory ||
 			prepared.configDirectory !== workspace.configDirectory
-		)
-			throw new Error();
+		) {
+			terminal = rebind();
+			return;
+		}
 		const stillConnected = async () => {
 			const current = await findConnection( selection.connectionId );
 			return (
@@ -462,9 +522,34 @@ export async function runClaudeTurn(
 				current.configDirectory === connection.configDirectory
 			);
 		};
-		const store = createNativeSessionStore( options.storeRoot );
-		release = await store.lockTurn( workspace.conversationId );
-		const existing = await store.load( workspace.conversationId );
+		const watchConnection = async () => {
+			const connected = await stillConnected().catch( () => false );
+			if ( controller.signal.aborted ) return;
+			if ( ! connected ) {
+				detached = true;
+				controller.abort();
+				return;
+			}
+			connectionWatch = setTimeout( () => void watchConnection(), 1000 ).unref();
+		};
+		let existing;
+		try {
+			existing = await store.load( workspace.conversationId );
+			if (
+				! existing &&
+				( await store.readJournals( workspace.conversationId ) ).some( ( events ) =>
+					events.some(
+						( event ) => event.type !== 'turn.terminal' || event.outcome.status === 'success'
+					)
+				)
+			) {
+				terminal = rebind();
+				return;
+			}
+		} catch {
+			terminal = rebind();
+			return;
+		}
 		const binding = {
 			connectionId: selection.connectionId,
 			conversationId: workspace.conversationId,
@@ -475,18 +560,15 @@ export async function runClaudeTurn(
 		if (
 			existing &&
 			( await store.resolve( existing, binding, prepared.projectsDirectory ) ).status !== 'ready'
-		)
-			throw new Error();
+		) {
+			terminal = rebind();
+			return;
+		}
 		const session = existing ?? {
 			backend: 'claude-code' as const,
 			...binding,
 			nativeSessionId: randomUUID(),
 		};
-		const site = ( await host.sites.all() ).find(
-			( candidate ) => candidate.id === workspace.siteId
-		);
-		if ( ! site || ( await realpath( site.path ) ) !== prepared.cwd ) throw new Error();
-		journal = store.journal( workspace.conversationId, turnId );
 		const emit = ( event: BackendTurnEvent ) => {
 			if ( event.type === 'turn.terminal' ) {
 				terminal ??= event;
@@ -540,8 +622,7 @@ export async function runClaudeTurn(
 				};
 		};
 		const effort = snapshot.effort;
-		if ( ! effort || ! [ 'low', 'medium', 'high', 'xhigh', 'max' ].includes( effort ) )
-			throw new Error();
+		if ( ! isClaudeEffort( effort ) ) throw new Error();
 		native = ( options.query ?? sdkQuery )( {
 			prompt: nativeInput(),
 			options: {
@@ -552,7 +633,7 @@ export async function runClaudeTurn(
 					? { resume: session.nativeSessionId }
 					: { sessionId: session.nativeSessionId } ),
 				model: selection.model.modelId,
-				effort: effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max',
+				effort,
 				includePartialMessages: true,
 				mcpServers: { studio: bridge.server },
 				canUseTool: async ( name, toolInput ) =>
@@ -615,6 +696,11 @@ export async function runClaudeTurn(
 			throw new Error();
 		if ( ! existing ) await store.create( session );
 		if ( controller.signal.aborted || ! ( await stillConnected() ) ) throw new Error();
+		const submitted = { type: 'turn.prompt' as const, runId, turnId, text: input.prompt };
+		await journal.append( submitted );
+		if ( controller.signal.aborted || ! ( await stillConnected() ) ) throw new Error();
+		input.onEvent( submitted );
+		connectionWatch = setTimeout( () => void watchConnection(), 1000 ).unref();
 		openGate( true );
 		const adapter = createClaudeEventAdapter( runId, turnId, emit );
 		for await ( const message of native ) {
@@ -654,12 +740,14 @@ export async function runClaudeTurn(
 			if ( terminal ) break;
 		}
 	} catch {
-		terminal ??= input.signal.aborted
-			? { type: 'turn.terminal', runId, turnId, outcome: { status: 'interrupted' } }
-			: fail();
+		terminal ??=
+			input.signal.aborted || detached
+				? { type: 'turn.terminal', runId, turnId, outcome: { status: 'interrupted' } }
+				: fail();
 	} finally {
 		openGate( false );
 		controller.abort();
+		clearTimeout( connectionWatch );
 		try {
 			native?.close();
 		} catch {
@@ -680,8 +768,13 @@ export async function runClaudeTurn(
 			type: 'turn.terminal',
 			runId,
 			turnId,
-			outcome: { status: input.signal.aborted ? 'interrupted' : 'unknown_process_exit' },
+			outcome: {
+				status: input.signal.aborted || detached ? 'interrupted' : 'unknown_process_exit',
+			},
 		};
+		if ( detached && terminal.outcome.status === 'interrupted' ) {
+			terminal.outcome.message = 'Claude Code was detached during this turn.';
+		}
 		if ( ! stopped ) failIfSuccessful();
 		try {
 			await journalWork;

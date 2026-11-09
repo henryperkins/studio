@@ -51,6 +51,7 @@ export interface BackendTurnOutcome {
 		| 'unknown_process_exit';
 	/** Display-safe information supplied by the backend. */
 	message?: string;
+	code?: 'rebind_required';
 }
 
 interface ContentBlock {
@@ -67,13 +68,20 @@ interface ToolCall {
 /** Events sent by a backend using Studio's display protocol. */
 export type BackendTurnEvent = BackendTurnIds &
 	// Cumulative text, ordered by sequence within the block.
-	( | ( { type: 'content.provisional'; sequence: number } & ContentBlock )
+	( | { type: 'turn.prompt'; text: string }
+		| ( { type: 'content.provisional'; sequence: number } & ContentBlock )
 		// Authoritative replacement for any provisional text for this block.
 		| ( { type: 'content.confirmed' } & ContentBlock )
 		| ( { type: 'tool.started'; name: string; messageId?: string; blockId?: string } & ToolCall )
 		| ( { type: 'tool.progress'; message: string; update?: boolean } & ToolCall )
 		| ( { type: 'tool.result'; message?: string; isError: boolean } & ToolCall )
-		| ( { type: 'approval.requested'; requestId: string; description: string } & ToolCall )
+		| ( {
+				type: 'approval.requested';
+				requestId: string;
+				description: string;
+				draft?: { siteName: string; title: string; content?: string };
+		  } & ToolCall )
+		| ( { type: 'approval.resolved'; requestId: string } & ToolCall )
 		| {
 				type: 'question.asked';
 				requestId: string;

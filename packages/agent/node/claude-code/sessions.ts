@@ -2,10 +2,12 @@ import { createHash, randomUUID } from 'crypto';
 import { createReadStream } from 'fs';
 import {
 	appendFile,
+	lstat,
 	mkdir,
 	readFile,
 	readdir,
 	realpath,
+	rm,
 	stat,
 	unlink,
 	writeFile,
@@ -24,6 +26,13 @@ import type {
 function key( conversationId: string ) {
 	if ( ! conversationId ) throw new Error( 'Missing conversation ID' );
 	return createHash( 'sha256' ).update( conversationId ).digest( 'hex' );
+}
+
+async function readJournalFile( file: string ): Promise< BackendTurnEvent[] > {
+	const lines = ( await readFile( file, 'utf8' ) ).split( '\n' );
+	// Every committed entry ends with a newline. A killed writer can leave a partial tail.
+	lines.pop();
+	return lines.filter( Boolean ).map( ( line ) => JSON.parse( line ) as BackendTurnEvent );
 }
 function validate( value: unknown ): ClaudeBackendSessionRef {
 	if ( ! value || typeof value !== 'object' ) throw new Error( 'Invalid native session' );
@@ -59,11 +68,17 @@ function validate( value: unknown ): ClaudeBackendSessionRef {
 		...( record.transcriptPath ? { transcriptPath: record.transcriptPath as string } : {} ),
 	};
 }
+export function getClaudeSessionStoreRoot( sessionsRoot: string ): string {
+	return `${ sessionsRoot }.claude-code`;
+}
+
 export function createNativeSessionStore( root: string ) {
 	const filename = ( conversationId: string ) =>
 		path.join( root, `${ key( conversationId ) }.json` );
 	const orderPath = ( conversationId: string ) =>
 		path.join( root, `${ key( conversationId ) }.journal-order.json` );
+	const lockPath = ( conversationId: string ) => filename( conversationId ) + '.lock';
+	const deletionPath = ( conversationId: string ) => filename( conversationId ) + '.deleting';
 	const journalPrefix = ( conversationId: string ) => `${ key( conversationId ) }-`;
 	async function journalNames( conversationId: string ): Promise< string[] > {
 		try {
@@ -120,15 +135,45 @@ export function createNativeSessionStore( root: string ) {
 		return [ ...legacy.map( ( entry ) => entry.name ), ...order ];
 	}
 	return {
+		async isTurnLocked( conversationId: string ): Promise< boolean > {
+			try {
+				await lstat( lockPath( conversationId ) );
+				return true;
+			} catch ( error ) {
+				return ( error as NodeJS.ErrnoException ).code !== 'ENOENT';
+			}
+		},
+		async isPendingDeletion( conversationId: string ): Promise< boolean > {
+			try {
+				await lstat( deletionPath( conversationId ) );
+				return true;
+			} catch ( error ) {
+				return ( error as NodeJS.ErrnoException ).code !== 'ENOENT';
+			}
+		},
+		async clearConversation(
+			conversationId: string,
+			removeSession: () => Promise< void >
+		): Promise< void > {
+			const marker = deletionPath( conversationId );
+			await writeFile( marker, '', { flag: 'a', mode: 0o600 } );
+			const names = await journalNames( conversationId );
+			await Promise.all(
+				[
+					filename( conversationId ),
+					orderPath( conversationId ),
+					...names.map( ( name ) => path.join( root, name ) ),
+				].map( ( file ) => rm( file, { force: true } ) )
+			);
+			await removeSession();
+			await rm( marker, { force: true } );
+		},
 		async readJournals( conversationId: string ): Promise< BackendTurnEvent[][] > {
 			const names = await orderedNames( conversationId );
 			const entries = await Promise.all(
 				names.map( async ( name ) => {
 					try {
-						return ( await readFile( path.join( root, name ), 'utf8' ) )
-							.split( '\n' )
-							.filter( Boolean )
-							.map( ( line ) => JSON.parse( line ) as BackendTurnEvent );
+						return await readJournalFile( path.join( root, name ) );
 					} catch ( error ) {
 						if ( ( error as NodeJS.ErrnoException ).code === 'ENOENT' ) return undefined;
 						throw error;
@@ -143,19 +188,23 @@ export function createNativeSessionStore( root: string ) {
 				`${ key( conversationId ) }-${ key( turnId ) }.journal.jsonl`
 			);
 			let pending = Promise.resolve();
+			let indexed = false;
 			return {
 				append( event: BackendTurnEvent ) {
 					if ( event.turnId !== turnId ) throw new Error( 'Turn mismatch' );
 					pending = pending.then( async () => {
-						await mkdir( root, { recursive: true } );
-						const name = path.basename( journalPath );
-						const order = await orderedNames( conversationId );
-						if ( ! order.includes( name ) ) order.push( name );
-						await atomicWriteFile(
-							orderPath( conversationId ),
-							JSON.stringify( { version: 1, entries: order } ),
-							{ mode: 0o600 }
-						);
+						if ( ! indexed ) {
+							await mkdir( root, { recursive: true } );
+							const name = path.basename( journalPath );
+							const order = await orderedNames( conversationId );
+							if ( ! order.includes( name ) ) order.push( name );
+							await atomicWriteFile(
+								orderPath( conversationId ),
+								JSON.stringify( { version: 1, entries: order } ),
+								{ mode: 0o600 }
+							);
+							indexed = true;
+						}
 						await appendFile( journalPath, JSON.stringify( event ) + '\n', { mode: 0o600 } );
 					} );
 					return pending;
@@ -163,10 +212,7 @@ export function createNativeSessionStore( root: string ) {
 				async read(): Promise< BackendTurnEvent[] > {
 					await pending;
 					try {
-						return ( await readFile( journalPath, 'utf8' ) )
-							.split( '\n' )
-							.filter( Boolean )
-							.map( ( line ) => JSON.parse( line ) as BackendTurnEvent );
+						return await readJournalFile( journalPath );
 					} catch ( error ) {
 						if ( ( error as NodeJS.ErrnoException ).code === 'ENOENT' ) return [];
 						throw error;
@@ -228,7 +274,7 @@ export function createNativeSessionStore( root: string ) {
 		},
 		async lockTurn( conversationId: string ) {
 			await mkdir( root, { recursive: true } );
-			const lock = filename( conversationId ) + '.lock';
+			const lock = lockPath( conversationId );
 			const token = randomUUID();
 			await writeFile( lock, token, { flag: 'wx', mode: 0o600 } );
 			return async () => {

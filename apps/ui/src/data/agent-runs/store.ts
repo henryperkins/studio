@@ -3,6 +3,7 @@ import type {
 	StudioChatImage,
 	StudioVisualAnnotationSummary,
 } from '@/data/core';
+import type { ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
 
 export interface PendingQuestion {
 	question: string;
@@ -10,6 +11,7 @@ export interface PendingQuestion {
 }
 
 export interface SendMessageOptions {
+	claudeSelection?: ClaudeSessionSelection;
 	displayMessage?: string;
 	images?: StudioChatImage[];
 	files?: StudioChatFileAttachment[];

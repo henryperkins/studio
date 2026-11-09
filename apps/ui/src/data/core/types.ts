@@ -1,6 +1,13 @@
 import type { ActiveAgentRun, AgentRunEvent } from '@studio/agent/protocol/agent-events';
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
+import type {
+	ClaudeModelCatalog,
+	ClaudeRuntimeAction,
+	ClaudeRuntimeState,
+	ClaudeSessionSelection,
+	CreateClaudeSessionRequest,
+} from '@studio/agent/protocol/claude-code';
 import type { AiModelId } from '@studio/agent/protocol/models';
 import type {
 	AiProviderId,
@@ -406,6 +413,14 @@ export interface Connector {
 	// Create an empty session file so it appears immediately. When `siteId`
 	// is omitted, the session is a user chat with no owner site.
 	createSession( siteId?: string ): Promise< AiSessionSummary >;
+	getClaudeRuntimeState(): Promise< ClaudeRuntimeState >;
+	configureClaudeRuntime( action: ClaudeRuntimeAction ): Promise< void >;
+	getClaudeModelCatalog( connectionId: string, siteId: string ): Promise< ClaudeModelCatalog >;
+	createClaudeSession( request: CreateClaudeSessionRequest ): Promise< AiSessionSummary >;
+	setClaudeSessionSelection(
+		sessionId: string,
+		selection: ClaudeSessionSelection
+	): Promise< void >;
 
 	// Continue an existing session by sending a new prompt. Returns a `runId`
 	// that identifies the in-flight agent run; live events for that run stream
@@ -415,6 +430,7 @@ export interface Connector {
 		prompt: string,
 		options?: {
 			turnId?: string;
+			claudeSelection?: ClaudeSessionSelection;
 			displayMessage?: string;
 			images?: StudioChatImage[];
 			files?: StudioChatFileAttachment[];

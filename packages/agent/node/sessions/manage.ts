@@ -27,6 +27,8 @@ import {
 	pickLiveSite,
 } from '@studio/agent/protocol/sessions/effective-site';
 import { findAiSessionOwnerSite } from '@studio/agent/protocol/sessions/owner-site';
+import { createNativeSessionStore, getClaudeSessionStoreRoot } from '../claude-code/sessions';
+import type { CreateAiSessionOptions } from '@studio/agent/node/sessions/store';
 import type {
 	AiSessionMetadata,
 	AiSessionSummary,
@@ -102,10 +104,23 @@ export async function loadHydratedAiSession(
 		readSharedSession( session.summary.id ),
 		readAiSessionPlacement( session.summary.id ),
 	] );
-	return {
+	const hydrated: LoadedAiSession = {
 		...session,
 		summary: hydrateAiSessionSummary( session.summary, metadata, placement ),
 	};
+	if ( session.summary.backend === 'claude-code' ) {
+		const store = createNativeSessionStore( getClaudeSessionStoreRoot( rootDirectory ) );
+		try {
+			hydrated.claudeJournal = await store.readJournals( session.summary.id );
+			if ( await store.isPendingDeletion( session.summary.id ) )
+				hydrated.claudeRecovery = 'deletion-pending';
+			else if ( await store.isTurnLocked( session.summary.id ) )
+				hydrated.claudeRecovery = 'run-locked';
+		} catch {
+			hydrated.claudeRecovery = 'journal-unreadable';
+		}
+	}
+	return hydrated;
 }
 
 // Match by id OR path: placements may hold either a stale path (site moved) or
@@ -147,7 +162,7 @@ export async function deleteAiSessionsForSite(
  */
 export async function createHydratedAiSession(
 	rootDirectory: string,
-	options: { site?: SessionSite } = {}
+	options: { site?: SessionSite; claude?: CreateAiSessionOptions[ 'claude' ] } = {}
 ): Promise< AiSessionSummary > {
 	const { site } = options;
 	if ( ! site ) {
@@ -156,6 +171,7 @@ export async function createHydratedAiSession(
 
 	const created = await createAiSession( rootDirectory, {
 		site: { id: site.id, name: site.name, path: site.path },
+		claude: options.claude,
 	} );
 	const placement = await setAiSessionSitePlacement( created.id, {
 		siteId: site.id,
@@ -208,6 +224,8 @@ export async function setSessionEnvironment(
 	environment: 'local' | 'live'
 ): Promise< void > {
 	const { summary } = await loadHydratedAiSession( root, sessionId );
+	if ( summary.backend === 'claude-code' )
+		throw new Error( 'Claude Code chats are bound to their original local workspace.' );
 	const ownerSite = findAiSessionOwnerSite( await readSites(), summary );
 	if ( ! ownerSite ) {
 		throw new Error( 'This chat is not attached to a site.' );

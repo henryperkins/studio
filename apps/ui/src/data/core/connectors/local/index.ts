@@ -94,6 +94,7 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 	// The server namespaces its API under /api so the SPA's real-path routes
 	// (also /sessions/:id, /sites/:id) can share the same origin.
 	const base = `${ apiBaseUrl.replace( /\/$/, '' ) }/api`;
+	const clientId = crypto.randomUUID();
 
 	const agentListeners = new Set< ( event: AgentRunEvent ) => void >();
 	const placementListeners = new Set< ( event: AiSessionPlacementUpdatedEvent ) => void >();
@@ -183,7 +184,7 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 		async init() {
 			// The browser's EventSource reconnects automatically.
 			eventSource?.close();
-			eventSource = new EventSource( `${ base }/events` );
+			eventSource = new EventSource( `${ base }/events?clientId=${ clientId }` );
 			let hasConnected = false;
 			eventSource.onopen = () => {
 				if ( hasConnected ) {
@@ -727,6 +728,28 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 				body: JSON.stringify( { siteId } ),
 			} );
 		},
+		getClaudeRuntimeState: () => api( '/claude-code' ),
+		configureClaudeRuntime: ( action ) =>
+			api( '/claude-code/connection', {
+				method: 'POST',
+				body: JSON.stringify( action ),
+			} ),
+		getClaudeModelCatalog: ( connectionId, siteId ) =>
+			api(
+				`/claude-code/${ encodeURIComponent( connectionId ) }/models/${ encodeURIComponent(
+					siteId
+				) }`
+			),
+		createClaudeSession: ( request ) =>
+			api( '/claude-code/sessions', {
+				method: 'POST',
+				body: JSON.stringify( request ),
+			} ),
+		setClaudeSessionSelection: ( sessionId, selection ) =>
+			api( `/sessions/${ encodeURIComponent( sessionId ) }/claude-selection`, {
+				method: 'POST',
+				body: JSON.stringify( selection ),
+			} ),
 		async continueSession( sessionId, prompt, options ): Promise< { runId: string } > {
 			return api< { runId: string } >( `/sessions/${ encodeURIComponent( sessionId ) }/messages`, {
 				method: 'POST',
@@ -737,11 +760,12 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 					images: options?.images,
 					files: options?.files,
 					visualAnnotations: options?.visualAnnotations,
+					...( options?.claudeSelection && { claudeSelection: options.claudeSelection, clientId } ),
 				} ),
 			} );
 		},
 		async getActiveAgentRuns(): Promise< ActiveAgentRun[] > {
-			return api< ActiveAgentRun[] >( '/runs/active' );
+			return api< ActiveAgentRun[] >( `/runs/active?clientId=${ clientId }` );
 		},
 		async setSessionModel( sessionId, model ) {
 			await api( `/sessions/${ encodeURIComponent( sessionId ) }/model`, {
@@ -773,7 +797,7 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 		async answerAgentQuestion( runId, answers ) {
 			await api( `/runs/${ encodeURIComponent( runId ) }/answer`, {
 				method: 'POST',
-				body: JSON.stringify( { answers } ),
+				body: JSON.stringify( { answers, clientId } ),
 			} );
 		},
 		onAgentEvent( listener ) {

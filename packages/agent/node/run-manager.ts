@@ -237,7 +237,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 				...( getTracksOrigin ? { STUDIO_TRACKS_ORIGIN: getTracksOrigin() } : {} ),
 				// Tells the turn it may ask for an OpenAI key kept for this app
 				// session; the key itself only goes over the IPC channel.
-				...getOpenAiSessionKeyForkEnvironment(),
+				...( claudeSelection ? {} : getOpenAiSessionKeyForkEnvironment() ),
 			},
 		} );
 
@@ -267,6 +267,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 
 		child.on( 'message', ( message ) => {
 			if (
+				! run.claude &&
 				answerOpenAiSessionKeyRequest( message, ( reply ) => {
 					if ( child.connected ) {
 						child.send( reply );
@@ -280,6 +281,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			// messages that look like the CLI JSON transport envelope.
 			if ( message && typeof message === 'object' && 'type' in message ) {
 				const event = message as JsonEvent;
+				if ( run.claude && event.type !== 'backend.event' ) return;
 				if ( event.type === 'backend.event' ) {
 					if (
 						! run.claude ||

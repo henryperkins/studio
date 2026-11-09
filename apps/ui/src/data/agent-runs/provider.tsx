@@ -287,6 +287,27 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					endRun( payload.sessionId );
 					return;
 				}
+				case 'backend.event': {
+					queryClient.setQueryData< LoadedAiSession >(
+						[ ...SESSIONS_QUERY_KEY, payload.sessionId ],
+						( previous ) => {
+							if ( ! previous ) return previous;
+							const journal = previous.claudeJournal ?? [];
+							const index = journal.findIndex(
+								( turn ) => turn[ 0 ]?.turnId === event.event.turnId
+							);
+							if ( index < 0 )
+								return { ...previous, claudeJournal: [ ...journal, [ event.event ] ] };
+							return {
+								...previous,
+								claudeJournal: journal.map( ( turn, i ) =>
+									i === index ? [ ...turn, event.event ] : turn
+								),
+							};
+						}
+					);
+					return;
+				}
 				case 'message': {
 					const inner = event.message;
 					// A failed turn only surfaces through its final `agent_end` —
@@ -475,6 +496,7 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					images,
 					files,
 					visualAnnotations,
+					...( options.claudeSelection ? { claudeSelection: options.claudeSelection } : {} ),
 				} );
 				if ( interruptPendingStartSessionIdsRef.current.has( sessionId ) ) {
 					interruptPendingStartSessionIdsRef.current.delete( sessionId );

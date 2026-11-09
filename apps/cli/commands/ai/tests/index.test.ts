@@ -1056,3 +1056,16 @@ it( 'routes a Claude session resumed by ID and rejects a stale selection', async
 		output.mockRestore();
 	}
 } );
+
+it( 'does not use Pi when a Claude transport payload loses its workspace binding', async () => {
+	vi.mocked( resolveInitialAiProvider ).mockClear();
+	await expect(
+		runCommand( {
+			adapter: new JsonAdapter(),
+			initialMessage: 'Do not send',
+			claudeSelection: { model: 'model', effort: 'high' },
+			resumeSession: { summary: { id: 'session' }, entries: [] } as never,
+		} )
+	).rejects.toThrow( 'workspace binding is missing' );
+	expect( resolveInitialAiProvider ).not.toHaveBeenCalled();
+} );

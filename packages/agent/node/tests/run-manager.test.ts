@@ -148,6 +148,24 @@ describe( 'createAgentRunManager OpenAI session keys', () => {
 		child.emit( 'message', REQUEST );
 		expect( child.send ).toHaveBeenCalledWith( { type: 'studio.openai-session-key', key: null } );
 	} );
+
+	it( 'does not offer or send the OpenAI session key to a Claude run', async () => {
+		await storeOpenAiKey( KEY, 'session' );
+		const child = Object.assign( createChild(), { connected: true } );
+		mockFork.mockImplementation( () => child as never );
+		const emit = vi.fn();
+		const manager = createAgentRunManager( { cliBinary: '/cli.mjs', surface: 'desktop', emit } );
+		manager.startAgentRun( {
+			sessionId: 'claude-session',
+			prompt: 'hello',
+			claudeSelection: { model: 'sonnet', effort: 'medium' },
+		} );
+		child.emit( 'message', REQUEST );
+		expect( getForkEnv() ).not.toHaveProperty( 'STUDIO_OPENAI_SESSION_KEY_OFFERED' );
+		expect( child.send ).not.toHaveBeenCalled();
+		expect( emit ).not.toHaveBeenCalled();
+		child.emit( 'exit', 1 );
+	} );
 } );
 
 describe( 'createAgentRunManager active runs', () => {

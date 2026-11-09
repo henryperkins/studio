@@ -69,6 +69,8 @@ import { PreviewParticles, StoppedSitePreview } from '@/features/sites';
 import { ArrowDownIcon } from '@/lib/icons';
 import { getMotionDuration } from '@/lib/theme';
 import { Button, IconButton, VisuallyHidden } from '@/lib/ui';
+import { ClaudeNewChat } from './claude-new-chat';
+import { ClaudeSessionView } from './claude-session-view';
 import { Conversation } from './conversation';
 import { QueuedPrompts } from './queued-prompts';
 import { SessionFrame } from './session-frame';
@@ -88,6 +90,8 @@ interface SessionViewProps {
 }
 
 export function SessionView( props: SessionViewProps ) {
+	const { data } = useSession( props.sessionId );
+	if ( data?.summary.backend === 'claude-code' ) return <ClaudeSessionView data={ data } />;
 	return (
 		<SessionUIProvider>
 			<SessionViewContent { ...props } />
@@ -496,6 +500,7 @@ function SessionViewContent( {
 						! showEmpty && fadeAfterQuotaCheck && styles.fadeInQuick
 					) }
 				>
+					{ ! sessionId && siteId ? <ClaudeNewChat siteId={ siteId } /> : null }
 					<QueuedPrompts
 						prompts={ queuedPrompts }
 						onRemove={ removeQueuedPrompt }

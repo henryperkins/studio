@@ -23,6 +23,7 @@ import type {
 	SiteEmail,
 	UserPreferences,
 } from '@/data/core';
+import type { ClaudeModelOption, ClaudeRuntimeState } from '@studio/agent/protocol/claude-code';
 import type { AiSettings } from '@studio/agent/protocol/providers';
 
 type Methods = {
@@ -47,6 +48,8 @@ export interface FakeConnectorState {
 	sites: SiteDetails[];
 	sessions: LoadedAiSession[];
 	user: AuthUser | null;
+	claudeRuntime: ClaudeRuntimeState;
+	claudeModels: ClaudeModelOption[];
 	preferences: UserPreferences;
 	// Each site's email, newest first.
 	emails: Record< string, SiteEmail[] >;
@@ -128,6 +131,8 @@ export function createInMemoryConnector(
 		sites: [],
 		sessions: [],
 		user: TEST_USER,
+		claudeRuntime: { enabled: false, connections: [] },
+		claudeModels: [],
 		emails: {},
 		...initial,
 		preferences: { ...defaultPreferences(), ...initial.preferences },
@@ -296,6 +301,91 @@ export function createInMemoryConnector(
 			} );
 			state.sessions = [ ...state.sessions, { summary, entries: [] } ];
 			return summary;
+		},
+		getClaudeRuntimeState: async () => state.claudeRuntime,
+		configureClaudeRuntime: async ( action ) => {
+			const { connections } = state.claudeRuntime;
+			if ( action.type === 'save' ) {
+				state.claudeRuntime = {
+					...state.claudeRuntime,
+					connections: [
+						...connections,
+						{
+							id: `claude-${ nextId++ }`,
+							executablePath: action.executablePath,
+							configDirectory: action.configDirectory,
+							blockers: [ 'native-auth-unqualified' ],
+							findings: [],
+						},
+					],
+				};
+			} else if ( action.type === 'disconnect' ) {
+				state.claudeRuntime = {
+					...state.claudeRuntime,
+					connections: connections.filter( ( item ) => item.id !== action.connectionId ),
+				};
+			}
+		},
+		getClaudeModelCatalog: async () =>
+			state.claudeRuntime.enabled
+				? { ok: true, models: state.claudeModels }
+				: { ok: false, blockers: [ 'experimental-feature-disabled' ] },
+		createClaudeSession: async ( { siteId, connectionId, selection } ) => {
+			const site = state.sites.find( ( entry ) => entry.id === siteId );
+			if ( ! site ) throw new Error( 'Site unavailable.' );
+			const summary = makeSession( {
+				id: `session-${ nextId++ }`,
+				backend: 'claude-code',
+				ownerSiteId: site.id,
+				ownerSitePath: site.path,
+				ownerSiteName: site.name,
+			} );
+			const timestamp = new Date().toISOString();
+			state.sessions = [
+				...state.sessions,
+				{
+					summary,
+					claudeJournal: [],
+					entries: [
+						{
+							type: 'custom',
+							id: `entry-${ nextId++ }`,
+							parentId: null,
+							timestamp,
+							customType: 'studio.claude_binding',
+							data: {
+								connectionId,
+								siteId,
+								workingDirectory: site.path,
+								configDirectory: '/.claude',
+							},
+						},
+						{
+							type: 'custom',
+							id: `entry-${ nextId++ }`,
+							parentId: null,
+							timestamp,
+							customType: 'studio.claude_selection',
+							data: selection,
+						},
+					],
+				},
+			];
+			return summary;
+		},
+		setClaudeSessionSelection: async ( id, selection ) => {
+			const session = findSession( id );
+			session.entries = [
+				...session.entries,
+				{
+					type: 'custom',
+					id: `entry-${ nextId++ }`,
+					parentId: null,
+					timestamp: new Date().toISOString(),
+					customType: 'studio.claude_selection',
+					data: selection,
+				},
+			];
 		},
 		continueSession: async () => ( { runId: `run-${ nextId++ }` } ),
 		getActiveAgentRuns: async () => [],

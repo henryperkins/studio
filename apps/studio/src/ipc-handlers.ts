@@ -17,6 +17,14 @@ import nodePath from 'path';
 import * as Sentry from '@sentry/electron/main';
 import { recordAnnotationSubmitted } from '@studio/agent/node/annotation-tracks';
 import {
+	configureClaudeRuntime as configureClaudeRuntimeOnHost,
+	createClaudeSession as createClaudeSessionOnHost,
+	getClaudeModelCatalog as getClaudeModelCatalogOnHost,
+	getClaudeRuntimeState as getClaudeRuntimeStateOnHost,
+	setClaudeSessionSelection as setClaudeSessionSelectionOnHost,
+	validateClaudeSendSelection,
+} from '@studio/agent/node/claude-code/studio-surface';
+import {
 	getGlobalInstructionsEnabled as readGlobalInstructionsEnabled,
 	setGlobalInstructionsEnabled as writeGlobalInstructionsEnabled,
 } from '@studio/agent/node/global-instructions';
@@ -25,7 +33,6 @@ import {
 	createHydratedAiSession,
 	listHydratedAiSessions,
 	loadHydratedAiSession,
-	reconcileSessionEnvironment,
 	setSessionEnvironment,
 	updateHydratedAiSessionMetadata,
 } from '@studio/agent/node/sessions/manage';
@@ -197,6 +204,11 @@ import type { ActiveAgentRun } from '@studio/agent/protocol/agent-events';
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type {
+	ClaudeRuntimeAction,
+	ClaudeSessionSelection,
+	CreateClaudeSessionRequest,
+} from '@studio/agent/protocol/claude-code';
+import type {
 	AiSessionMetadata,
 	AiSessionSummary,
 	LoadedAiSession,
@@ -288,6 +300,40 @@ export async function loadAiSession(
 	return loadHydratedAiSession( getSessionsDirectory(), sessionIdOrPrefix );
 }
 
+export async function getClaudeRuntimeState( _event: IpcMainInvokeEvent ) {
+	return getClaudeRuntimeStateOnHost();
+}
+
+export async function configureClaudeRuntime(
+	_event: IpcMainInvokeEvent,
+	action: ClaudeRuntimeAction
+) {
+	await configureClaudeRuntimeOnHost( action );
+}
+
+export async function getClaudeModelCatalog(
+	_event: IpcMainInvokeEvent,
+	connectionId: string,
+	siteId: string
+) {
+	return getClaudeModelCatalogOnHost( connectionId, siteId );
+}
+
+export async function createClaudeSession(
+	_event: IpcMainInvokeEvent,
+	request: CreateClaudeSessionRequest
+) {
+	return createClaudeSessionOnHost( getSessionsDirectory(), request );
+}
+
+export async function setClaudeSessionSelection(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	selection: ClaudeSessionSelection
+) {
+	await setClaudeSessionSelectionOnHost( getSessionsDirectory(), sessionId, selection );
+}
+
 export async function createAiSession(
 	_event: IpcMainInvokeEvent,
 	siteId?: string
@@ -326,19 +372,25 @@ export async function continueAiSession(
 	prompt: string,
 	options: {
 		turnId?: string;
+		claudeSelection?: ClaudeSessionSelection;
 		displayMessage?: string;
 		images?: StudioChatImage[];
 		files?: StudioChatFileAttachment[];
 		visualAnnotations?: unknown;
 	} = {}
 ): Promise< { runId: string } > {
-	await reconcileSessionEnvironment( getSessionsDirectory(), sessionId );
+	const claudeSelection = await validateClaudeSendSelection(
+		getSessionsDirectory(),
+		sessionId,
+		options.claudeSelection
+	);
 	const images = validateStudioChatImages( options.images );
 	const files = validateStudioChatFiles( options.files );
 	const visualAnnotations = validateStudioVisualAnnotations( options.visualAnnotations, images );
 	const result = startAgentRun( {
 		sessionId,
-		prompt: expandSkillCommandPrompt( prompt ),
+		prompt: claudeSelection ? prompt : expandSkillCommandPrompt( prompt ),
+		claudeSelection,
 		turnId: options.turnId,
 		displayMessage: options.displayMessage,
 		images,
@@ -356,9 +408,9 @@ export async function continueAiSession(
 }
 
 export async function listActiveAiAgentRuns(
-	_event: IpcMainInvokeEvent
+	event: IpcMainInvokeEvent
 ): Promise< ActiveAgentRun[] > {
-	return listActiveAgentRuns();
+	return listActiveAgentRuns( event.sender );
 }
 
 export async function setAiSessionModel(
@@ -414,11 +466,11 @@ export async function interruptAiAgentRun(
 }
 
 export async function answerAiAgentQuestion(
-	_event: IpcMainInvokeEvent,
+	event: IpcMainInvokeEvent,
 	runId: string,
 	answers: Record< string, string >
 ): Promise< void > {
-	answerAgentRun( runId, answers );
+	answerAgentRun( runId, answers, event.sender );
 }
 
 export async function getWordPressSkillsStatusAllSites(

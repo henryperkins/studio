@@ -5,6 +5,7 @@ import path from 'path';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk/core';
 import { Value } from 'typebox/value';
 import { z } from 'zod';
+import { escapeClaudeApprovalText } from '@studio/agent/protocol/claude-code';
 import { bindTool } from '../tools/define-tool';
 import { runWpCliTool } from '../tools/wp-cli';
 import type { StudioAgentHost } from '../host';
@@ -140,11 +141,16 @@ export function createStudioClaudeMcpServer(
 
 export function createStudioClaudeToolBridge(
 	host: StudioAgentHost,
-	policy: ClaudeToolPolicy,
+	inputPolicy: ClaudeToolPolicy,
 	onEvent: ( event: BackendTurnEvent ) => void
 ) {
-	let disposed = false;
-	async function invoke( name: string, args: unknown ) {
+	const controller = new AbortController();
+	const policy = {
+		...inputPolicy,
+		signal: AbortSignal.any( [ inputPolicy.signal, controller.signal ] ),
+	};
+	const active = new Set< Promise< unknown > >();
+	async function execute( name: string, args: unknown ) {
 		const toolCallId = randomUUID();
 		onEvent( {
 			type: 'tool.started',
@@ -167,7 +173,6 @@ export function createStudioClaudeToolBridge(
 			};
 		};
 		if (
-			disposed ||
 			policy.signal.aborted ||
 			name !== runWpCliTool.name ||
 			! Value.Check( runWpCliTool.parameters, args )
@@ -184,8 +189,7 @@ export function createStudioClaudeToolBridge(
 							! kind ||
 							site.id !== policy.siteId ||
 							( await realpath( site.path ) ) !== policy.workingDirectory ||
-							policy.signal.aborted ||
-							disposed
+							policy.signal.aborted
 						)
 							throw new Error( 'Denied' );
 						if ( kind === 'draft' ) {
@@ -198,6 +202,12 @@ export function createStudioClaudeToolBridge(
 								description: 'Create a draft post on the current local site',
 								args: [ ...wpArgs ],
 							};
+							const title = wpArgs
+								.find( ( arg ) => arg.startsWith( '--post_title=' ) )!
+								.slice( '--post_title='.length );
+							const content = wpArgs
+								.find( ( arg ) => arg.startsWith( '--post_content=' ) )
+								?.slice( '--post_content='.length );
 							onEvent( {
 								type: 'approval.requested',
 								runId: policy.runId,
@@ -205,26 +215,40 @@ export function createStudioClaudeToolBridge(
 								toolCallId,
 								requestId: request.operationId,
 								description: request.description,
+								draft: {
+									siteName: escapeClaudeApprovalText( site.name ),
+									title: escapeClaudeApprovalText( title ),
+									content: content === undefined ? undefined : escapeClaudeApprovalText( content ),
+								},
 							} );
-							if ( ! ( await approval( policy, request ) ) ) throw new Error( 'Denied' );
+							const allowed = await approval( policy, request );
+							onEvent( {
+								type: 'approval.resolved',
+								runId: policy.runId,
+								turnId: policy.turnId,
+								toolCallId,
+								requestId: request.operationId,
+							} );
+							if ( ! allowed ) throw new Error( 'Denied' );
 						}
 						const current = await host.sites.resolve( site.path );
-						if (
-							disposed ||
-							policy.signal.aborted ||
-							! ( await policy.stillConnected() ) ||
-							current.id !== policy.siteId ||
-							( await realpath( current.path ) ) !== policy.workingDirectory ||
-							( await hasWpCliOverrides( policy.workingDirectory ) )
-						)
-							throw new Error( 'Denied' );
-						if ( disposed || policy.signal.aborted ) throw new Error( 'Denied' );
-						return host.sites.wpCli( current, [
-							...wpArgs,
-							'--skip-packages',
-							'--skip-plugins',
-							'--skip-themes',
-						] );
+						const beforeSpawn = async () => {
+							policy.signal.throwIfAborted();
+							if (
+								! ( await policy.stillConnected() ) ||
+								current.id !== policy.siteId ||
+								( await realpath( current.path ) ) !== policy.workingDirectory ||
+								( await hasWpCliOverrides( policy.workingDirectory ) )
+							)
+								throw new Error( 'Denied' );
+							policy.signal.throwIfAborted();
+						};
+						await beforeSpawn();
+						return host.sites.wpCli(
+							current,
+							[ ...wpArgs, '--skip-packages', '--skip-plugins', '--skip-themes' ],
+							{ signal: policy.signal, beforeSpawn }
+						);
 					},
 				},
 			};
@@ -258,13 +282,26 @@ export function createStudioClaudeToolBridge(
 			return fail();
 		}
 	}
+	async function invoke( name: string, args: unknown ) {
+		const operation = execute( name, args );
+		active.add( operation );
+		try {
+			return await operation;
+		} finally {
+			active.delete( operation );
+		}
+	}
 	const server = createStudioClaudeMcpServer( ( args ) => invoke( runWpCliTool.name, args ) );
 	return {
 		server,
 		invoke,
 		async dispose() {
-			disposed = true;
-			await server.instance.close();
+			controller.abort();
+			try {
+				await server.instance.close();
+			} finally {
+				await Promise.allSettled( active );
+			}
 		},
 	};
 }

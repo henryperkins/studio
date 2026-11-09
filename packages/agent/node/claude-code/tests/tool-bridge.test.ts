@@ -159,6 +159,37 @@ it( 'denies a host operation when cancellation arrives during the final connecti
 	expect( host.sites.wpCli ).not.toHaveBeenCalled();
 } );
 
+it( 'aborts a running host operation and waits for it to settle before disposing', async () => {
+	const { bridge, host } = await setup();
+	let toolStarted = false;
+	let settleHost!: () => void;
+	const onHostAbort = vi.fn();
+	host.sites.wpCli = async ( _site, _args, options ) => {
+		await options?.beforeSpawn?.();
+		options?.signal?.addEventListener( 'abort', onHostAbort, { once: true } );
+		await new Promise< void >( ( resolve ) => {
+			settleHost = resolve;
+			toolStarted = true;
+		} );
+		throw new Error( 'The child stopped' );
+	};
+	const running = bridge.invoke( 'wp_cli', { nameOrPath: 'site', command: 'post list' } );
+	await vi.waitFor( () => expect( toolStarted ).toBe( true ) );
+	let disposed = false;
+	const disposing = bridge.dispose().then( () => {
+		disposed = true;
+	} );
+	try {
+		expect( onHostAbort ).toHaveBeenCalledOnce();
+		await Promise.resolve();
+		expect( disposed ).toBe( false );
+	} finally {
+		settleHost();
+		await disposing;
+	}
+	expect( ( await running ).isError ).toBe( true );
+} );
+
 it( 'reports the lifecycle of a Studio tool invocation without exposing exception text', async () => {
 	const { host, controller } = await setup();
 	const events: import('@studio/agent/protocol/backend-events').BackendTurnEvent[] = [];
