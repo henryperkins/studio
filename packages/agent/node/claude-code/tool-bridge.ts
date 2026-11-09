@@ -1,11 +1,14 @@
 import { randomUUID } from 'crypto';
-import { realpath } from 'fs/promises';
+import { lstat, realpath } from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk/core';
 import { Value } from 'typebox/value';
 import { z } from 'zod';
 import { bindTool } from '../tools/define-tool';
 import { runWpCliTool } from '../tools/wp-cli';
 import type { StudioAgentHost } from '../host';
+import type { ToolResult } from '../tools/define-tool';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 
 export interface ClaudeApprovalRequest {
@@ -63,6 +66,32 @@ function classify( args: string[] ): 'read' | 'draft' | undefined {
 	return 'draft';
 }
 
+async function hasWpCliOverrides( workspace: string ): Promise< boolean > {
+	if (
+		Object.entries( process.env ).some( ( [ name, value ] ) => /^WP_CLI_/i.test( name ) && value )
+	)
+		return true;
+
+	const candidates = new Set( [ path.join( os.homedir(), '.wp-cli', 'config.yml' ) ] );
+	if ( process.env.HOME && path.isAbsolute( process.env.HOME ) ) {
+		candidates.add( path.join( process.env.HOME, '.wp-cli', 'config.yml' ) );
+	}
+	for ( let directory = workspace; ; directory = path.dirname( directory ) ) {
+		candidates.add( path.join( directory, 'wp-cli.local.yml' ) );
+		candidates.add( path.join( directory, 'wp-cli.yml' ) );
+		if ( path.dirname( directory ) === directory ) break;
+	}
+	for ( const candidate of candidates ) {
+		try {
+			await lstat( candidate );
+			return true;
+		} catch ( error ) {
+			if ( ( error as NodeJS.ErrnoException ).code !== 'ENOENT' ) return true;
+		}
+	}
+	return false;
+}
+
 async function approval(
 	policy: ClaudeToolPolicy,
 	request: ClaudeApprovalRequest
@@ -87,6 +116,26 @@ async function approval(
 		policy.signal.removeEventListener( 'abort', cancel );
 		controller.abort();
 	}
+}
+
+export function createStudioClaudeMcpServer(
+	invoke: ( args: unknown ) => Promise< { content: ToolResult[ 'content' ]; isError: boolean } >
+) {
+	const schema = z.fromJSONSchema(
+		runWpCliTool.parameters as unknown as Parameters< typeof z.fromJSONSchema >[ 0 ]
+	);
+	if ( ! ( schema instanceof z.ZodObject ) ) throw new Error( 'Unsupported tool schema' );
+	return createSdkMcpServer( {
+		name: 'studio',
+		tools: [
+			tool(
+				runWpCliTool.name,
+				'Read the current local WordPress site or request approval to create a draft post.',
+				schema.shape,
+				invoke
+			),
+		],
+	} );
 }
 
 export function createStudioClaudeToolBridge(
@@ -165,11 +214,17 @@ export function createStudioClaudeToolBridge(
 							policy.signal.aborted ||
 							! ( await policy.stillConnected() ) ||
 							current.id !== policy.siteId ||
-							( await realpath( current.path ) ) !== policy.workingDirectory
+							( await realpath( current.path ) ) !== policy.workingDirectory ||
+							( await hasWpCliOverrides( policy.workingDirectory ) )
 						)
 							throw new Error( 'Denied' );
 						if ( disposed || policy.signal.aborted ) throw new Error( 'Denied' );
-						return host.sites.wpCli( current, wpArgs );
+						return host.sites.wpCli( current, [
+							...wpArgs,
+							'--skip-packages',
+							'--skip-plugins',
+							'--skip-themes',
+						] );
 					},
 				},
 			};
@@ -203,21 +258,7 @@ export function createStudioClaudeToolBridge(
 			return fail();
 		}
 	}
-	const schema = z.fromJSONSchema(
-		runWpCliTool.parameters as unknown as Parameters< typeof z.fromJSONSchema >[ 0 ]
-	);
-	if ( ! ( schema instanceof z.ZodObject ) ) throw new Error( 'Unsupported tool schema' );
-	const server = createSdkMcpServer( {
-		name: 'studio',
-		tools: [
-			tool(
-				runWpCliTool.name,
-				'Read the current local WordPress site or request approval to create a draft post.',
-				schema.shape,
-				( args ) => invoke( runWpCliTool.name, args )
-			),
-		],
-	} );
+	const server = createStudioClaudeMcpServer( ( args ) => invoke( runWpCliTool.name, args ) );
 	return {
 		server,
 		invoke,

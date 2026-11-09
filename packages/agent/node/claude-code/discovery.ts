@@ -5,6 +5,7 @@ import { promisify } from 'util';
 import { buildClaudeEnvironment } from './auth-status';
 
 const execFileAsync = promisify( execFile );
+export const QUALIFIED_CLAUDE_CODE_VERSION = '2.1.319';
 export function trustedPowerShellPath(): string {
 	if ( ! process.env.SystemRoot || ! path.isAbsolute( process.env.SystemRoot ) )
 		throw new Error( 'Windows system root unavailable' );
@@ -70,7 +71,8 @@ export async function inspectClaudeExecutable(
 			maxBuffer: 4096,
 		} );
 		const version = /^(\d+\.\d+\.\d+)\s/.exec( stdout.trim() )?.[ 1 ];
-		if ( version !== '2.1.319' ) return { ok: false, reason: 'version-unqualified' };
+		if ( version !== QUALIFIED_CLAUDE_CODE_VERSION )
+			return { ok: false, reason: 'version-unqualified' };
 		return {
 			ok: true,
 			executablePath,

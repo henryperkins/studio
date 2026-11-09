@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm } from 'fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +8,7 @@ import type { ClaudeToolPolicy } from '../tool-bridge';
 
 const dirs: string[] = [];
 afterEach( async () => {
+	vi.unstubAllEnvs();
 	await Promise.all(
 		dirs.splice( 0 ).map( ( dir ) => rm( dir, { recursive: true, force: true } ) )
 	);
@@ -16,8 +17,10 @@ async function setup(
 	approve: ClaudeToolPolicy[ 'approve' ] = vi.fn( async () => 'allow' as const ),
 	stillConnected = vi.fn( async () => true )
 ) {
-	const dir = await realpath( await mkdtemp( path.join( os.tmpdir(), 'studio-claude-' ) ) );
-	dirs.push( dir );
+	const parent = await realpath( await mkdtemp( path.join( os.tmpdir(), 'studio-claude-' ) ) );
+	dirs.push( parent );
+	const dir = path.join( parent, 'site' );
+	await mkdir( dir );
 	const host = createFakeHost();
 	host.sites.resolve = vi.fn( async () => ( { ...fakeSite, path: dir } ) );
 	const controller = new AbortController();
@@ -35,7 +38,7 @@ async function setup(
 		},
 		() => {}
 	);
-	return { host, bridge, approve, controller };
+	return { host, bridge, approve, controller, parent };
 }
 describe( 'Claude Studio tool boundary (mock host)', () => {
 	it( 'runs canonical local read and denies other routes and invalid schema', async () => {
@@ -76,6 +79,24 @@ describe( 'Claude Studio tool boundary (mock host)', () => {
 		expect( ( await allowed.bridge.invoke( 'wp_cli', args ) ).isError ).toBe( true );
 		expect( allowed.host.sites.wpCli ).toHaveBeenCalledOnce();
 	} );
+} );
+
+it( 'blocks a local operation when an ancestor WP-CLI config can redirect it', async () => {
+	const { host, bridge, parent } = await setup();
+	await writeFile( path.join( parent, 'wp-cli.local.yml' ), 'ssh: remote.example.invalid\n' );
+	expect(
+		( await bridge.invoke( 'wp_cli', { nameOrPath: 'site', command: 'post list' } ) ).isError
+	).toBe( true );
+	expect( host.sites.wpCli ).not.toHaveBeenCalled();
+} );
+
+it( 'blocks WP-CLI environment overrides before reaching the host', async () => {
+	vi.stubEnv( 'WP_CLI_CONFIG_PATH', 'override.yml' );
+	const { host, bridge } = await setup();
+	expect(
+		( await bridge.invoke( 'wp_cli', { nameOrPath: 'site', command: 'post list' } ) ).isError
+	).toBe( true );
+	expect( host.sites.wpCli ).not.toHaveBeenCalled();
 } );
 
 it( 'expires a pending draft approval, rejects a late allow, and exposes the exact proposed arguments', async () => {

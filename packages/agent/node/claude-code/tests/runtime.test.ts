@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { qualifyClaudeStartup } from '../runtime';
+import { discoverClaudeModels, qualifyClaudeStartup } from '../runtime';
 
 describe( 'Claude SDK startup (mock control responses)', () => {
 	const identity = { email: 'user@example.com', subscriptionType: 'max' };
@@ -54,6 +54,50 @@ describe( 'Claude SDK startup (mock control responses)', () => {
 			false
 		);
 	} );
+
+	it( 'discovers available models without starting a turn or sending user input', async () => {
+		let launch: Record< string, unknown > | undefined;
+		let input: Promise< IteratorResult< unknown > > | undefined;
+		let closed = false;
+		let inventoryRequests = 0;
+		const query = ( request: {
+			prompt: AsyncIterable< unknown >;
+			options: Record< string, unknown >;
+		} ) => {
+			launch = request.options;
+			input = request.prompt[ Symbol.asyncIterator ]().next();
+			return {
+				...good(),
+				mcpServerStatus: () =>
+					inventoryRequests++ === 0 ? Promise.resolve( [] ) : good().mcpServerStatus(),
+				close: () => {
+					closed = true;
+				},
+			};
+		};
+		await expect(
+			discoverClaudeModels( 'connection', '.', {
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				connection: async () => ( { id: 'connection', executablePath: 'fake' } ),
+				prepare: async () => ( {
+					ok: true as const,
+					executablePath: 'fake',
+					cwd: '.',
+					configDirectory: '.',
+					projectsDirectory: '.',
+					env: {},
+					identity,
+				} ),
+			} )
+		).resolves.toEqual( {
+			ok: true,
+			models: [ { id: 'claude-xyz', displayName: 'Sonnet', efforts: [ 'medium' ] } ],
+		} );
+		expect( launch ).toMatchObject( { persistSession: false, strictMcpConfig: true } );
+		expect( launch?.model ).toBeUndefined();
+		expect( closed ).toBe( true );
+		await expect( input ).resolves.toMatchObject( { done: true } );
+	} );
 } );
 
 it( 'rejects an unexpected SDK tool inventory', async () => {
@@ -88,7 +132,7 @@ it( 'rejects an unexpected SDK tool inventory', async () => {
 	).toBe( false );
 } );
 
-it( 'releases no prompt when startup qualification fails and closes the mock SDK query', async () => {
+it( 'releases no prompt and reports startup failure even if closing the SDK throws', async () => {
 	const { runClaudeTurn } = await import( '../runtime' );
 	const { createFakeHost } = await import( '../../tests/fake-host' );
 	const fs = await import( 'fs/promises' );
@@ -112,6 +156,7 @@ it( 'releases no prompt when startup qualification fails and closes the mock SDK
 		],
 		close: () => {
 			closed = true;
+			throw new Error( 'Private details from the SDK close' );
 		},
 		async *[ Symbol.asyncIterator ]() {
 			for await ( const message of input.prompt ) {
@@ -205,6 +250,7 @@ it( 'sends only after verified startup, freezes options and records an explicit 
 			},
 		};
 		let emittedPrompt = false;
+		let seenInput: unknown;
 		let seenOptions: Record< string, unknown > = {};
 		const fakeQuery = ( input: {
 			prompt: AsyncIterable< unknown >;
@@ -229,8 +275,9 @@ it( 'sends only after verified startup, freezes options and records an explicit 
 				],
 				close: () => {},
 				async *[ Symbol.asyncIterator ]() {
-					for await ( const _message of input.prompt ) {
+					for await ( const message of input.prompt ) {
 						emittedPrompt = true;
+						seenInput = message;
 						yield {
 							type: 'system',
 							subtype: 'init',
@@ -267,6 +314,15 @@ it( 'sends only after verified startup, freezes options and records an explicit 
 			host,
 			{
 				prompt: 'hello',
+				images: [
+					{
+						id: 'image',
+						name: 'sample.png',
+						mimeType: 'image/png',
+						dataBase64: 'iVBORw0KGgo=',
+						size: 8,
+					},
+				],
 				signal: new AbortController().signal,
 				onEvent: ( event ) => events.push( event ),
 			},
@@ -287,6 +343,17 @@ it( 'sends only after verified startup, freezes options and records an explicit 
 			}
 		);
 		expect( emittedPrompt ).toBe( true );
+		expect( seenInput ).toMatchObject( {
+			message: {
+				content: [
+					{ type: 'text', text: 'hello' },
+					{
+						type: 'image',
+						source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
+					},
+				],
+			},
+		} );
 		expect( seenOptions ).toMatchObject( {
 			pathToClaudeCodeExecutable: 'fake',
 			cwd: root,
