@@ -1,0 +1,574 @@
+import { describe, expect, it } from 'vitest';
+import { qualifyClaudeStartup } from '../runtime';
+
+describe( 'Claude SDK startup (mock control responses)', () => {
+	const identity = { email: 'user@example.com', subscriptionType: 'max' };
+	const good = () => ( {
+		initializationResult: async () => ( { hooks_applied: true, hook_on_failure_supported: true } ),
+		accountInfo: async () => ( {
+			email: 'user@example.com',
+			subscriptionType: 'Max',
+			apiProvider: 'firstParty',
+		} ),
+		mcpServerStatus: async () => [
+			{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+		],
+		supportedModels: async () => [
+			{
+				value: 'sonnet',
+				resolvedModel: 'claude-xyz',
+				displayName: 'Sonnet',
+				supportedEffortLevels: [ 'medium' ],
+			},
+		],
+	} );
+	it( 'requires matching effective authentication, hooks, inventory and exact model effort', async () => {
+		expect( ( await qualifyClaudeStartup( good(), identity, 'claude-xyz', 'medium' ) ).ok ).toBe(
+			true
+		);
+		for ( const bad of [
+			{
+				...good(),
+				accountInfo: async () => ( {
+					email: 'other@example.com',
+					subscriptionType: 'Max',
+					apiProvider: 'firstParty',
+				} ),
+			},
+			{
+				...good(),
+				initializationResult: async () => ( {
+					hooks_applied: true,
+					hook_on_failure_supported: false,
+				} ),
+			},
+			{
+				...good(),
+				mcpServerStatus: async () => [ { name: 'studio', source: 'project', status: 'connected' } ],
+			},
+		] )
+			expect( ( await qualifyClaudeStartup( bad, identity, 'claude-xyz', 'medium' ) ).ok ).toBe(
+				false
+			);
+		expect( ( await qualifyClaudeStartup( good(), identity, 'claude-xyz', 'high' ) ).ok ).toBe(
+			false
+		);
+	} );
+} );
+
+it( 'rejects an unexpected SDK tool inventory', async () => {
+	const query = {
+		initializationResult: async () => ( { hooks_applied: true, hook_on_failure_supported: true } ),
+		accountInfo: async () => ( {
+			email: 'user@example.com',
+			subscriptionType: 'Max',
+			apiProvider: 'firstParty',
+		} ),
+		mcpServerStatus: async () => [
+			{
+				name: 'studio',
+				source: 'sdk',
+				status: 'connected',
+				tools: [ { name: 'wp_cli' }, { name: 'escape' } ],
+			},
+		],
+		supportedModels: async () => [
+			{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+		],
+	};
+	expect(
+		(
+			await qualifyClaudeStartup(
+				query,
+				{ email: 'user@example.com', subscriptionType: 'max' },
+				'sonnet',
+				'medium'
+			)
+		).ok
+	).toBe( false );
+} );
+
+it( 'releases no prompt when startup qualification fails and closes the mock SDK query', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createFakeHost } = await import( '../../tests/fake-host' );
+	const fs = await import( 'fs/promises' );
+	const os = await import( 'os' );
+	const path = await import( 'path' );
+	const storeRoot = await fs.mkdtemp( path.join( os.tmpdir(), 'claude-test-' ) );
+	let promptRead = false;
+	let closed = false;
+	const fakeQuery = ( input: { prompt: AsyncIterable< unknown > } ) => ( {
+		initializationResult: async () => ( { hooks_applied: false, hook_on_failure_supported: true } ),
+		accountInfo: async () => ( {
+			email: 'user@example.com',
+			subscriptionType: 'Max',
+			apiProvider: 'firstParty',
+		} ),
+		mcpServerStatus: async () => [
+			{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+		],
+		supportedModels: async () => [
+			{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+		],
+		close: () => {
+			closed = true;
+		},
+		async *[ Symbol.asyncIterator ]() {
+			for await ( const message of input.prompt ) {
+				promptRead = true;
+				yield message;
+			}
+		},
+	} );
+	const snapshot = {
+		backend: 'claude-code' as const,
+		runId: 'run',
+		turnId: 'turn',
+		selection: {
+			connectionId: 'native',
+			model: { providerId: 'claude-code' as const, modelId: 'sonnet' },
+			revision: 1,
+		},
+		effort: 'medium',
+		permissionPolicyRevision: 1,
+		workspace: {
+			conversationId: 'chat',
+			siteId: 'site',
+			workingDirectory: process.cwd(),
+			configDirectory: process.cwd(),
+		},
+	};
+	const events: unknown[] = [];
+	const host = createFakeHost();
+	host.sites.all = async () => [
+		{ id: 'site', path: process.cwd(), name: 'site', url: 'http://localhost', phpVersion: '8.4' },
+	];
+	await runClaudeTurn(
+		snapshot,
+		host,
+		{
+			prompt: 'do not send',
+			signal: new AbortController().signal,
+			onEvent: ( event ) => events.push( event ),
+		},
+		{
+			query: fakeQuery as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+			connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+			prepare: async () => ( {
+				ok: true as const,
+				executablePath: 'fake',
+				cwd: process.cwd(),
+				configDirectory: process.cwd(),
+				projectsDirectory: process.cwd(),
+				env: {},
+				identity: { email: 'user@example.com', subscriptionType: 'max' },
+			} ),
+			storeRoot,
+			approve: async () => 'deny',
+		}
+	);
+	expect( promptRead ).toBe( false );
+	expect( closed ).toBe( true );
+	await fs.rm( storeRoot, { recursive: true, force: true } );
+	expect( events ).toMatchObject( [ { type: 'turn.terminal', outcome: { status: 'error' } } ] );
+} );
+
+it( 'sends only after verified startup, freezes options and records an explicit session (mock SDK)', async () => {
+	const fs = await import( 'fs/promises' );
+	const os = await import( 'os' );
+	const path = await import( 'path' );
+	const root = await fs.realpath( await fs.mkdtemp( path.join( os.tmpdir(), 'claude-runtime-' ) ) );
+	try {
+		const { runClaudeTurn } = await import( '../runtime' );
+		const { createFakeHost } = await import( '../../tests/fake-host' );
+		const { createNativeSessionStore } = await import( '../sessions' );
+		const host = createFakeHost();
+		host.sites.all = async () => [
+			{ id: 'site', path: root, name: 'site', url: 'http://localhost', phpVersion: '8.4' },
+		];
+		const snapshot = {
+			backend: 'claude-code' as const,
+			runId: 'run',
+			turnId: 'turn',
+			selection: {
+				connectionId: 'native',
+				model: { providerId: 'claude-code' as const, modelId: 'sonnet' },
+				revision: 1,
+			},
+			effort: 'medium',
+			permissionPolicyRevision: 1,
+			workspace: {
+				conversationId: 'chat',
+				siteId: 'site',
+				workingDirectory: root,
+				configDirectory: root,
+			},
+		};
+		let emittedPrompt = false;
+		let seenOptions: Record< string, unknown > = {};
+		const fakeQuery = ( input: {
+			prompt: AsyncIterable< unknown >;
+			options: Record< string, unknown >;
+		} ) => {
+			seenOptions = input.options;
+			return {
+				initializationResult: async () => ( {
+					hooks_applied: true,
+					hook_on_failure_supported: true,
+				} ),
+				accountInfo: async () => ( {
+					email: 'user@example.com',
+					subscriptionType: 'Max',
+					apiProvider: 'firstParty',
+				} ),
+				mcpServerStatus: async () => [
+					{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+				],
+				supportedModels: async () => [
+					{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+				],
+				close: () => {},
+				async *[ Symbol.asyncIterator ]() {
+					for await ( const _message of input.prompt ) {
+						emittedPrompt = true;
+						yield {
+							type: 'system',
+							subtype: 'init',
+							session_id: input.options.sessionId,
+							permissionMode: 'default',
+							plugins: [],
+							tools: [ 'Read', 'mcp__studio__wp_cli' ],
+							cwd: root,
+							apiKeySource: 'none',
+							claude_code_version: '2.1.319',
+							model: 'sonnet',
+							mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
+						};
+						yield {
+							type: 'assistant',
+							session_id: input.options.sessionId,
+							uuid: 'unexpected',
+							message: { id: 'msg', model: 'other', content: [ { type: 'text', text: 'unsafe' } ] },
+						};
+						yield {
+							type: 'result',
+							subtype: 'success',
+							is_error: false,
+							num_turns: 1,
+							session_id: input.options.sessionId,
+						};
+					}
+				},
+			};
+		};
+		const events: unknown[] = [];
+		await runClaudeTurn(
+			snapshot,
+			host,
+			{
+				prompt: 'hello',
+				signal: new AbortController().signal,
+				onEvent: ( event ) => events.push( event ),
+			},
+			{
+				query: fakeQuery as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+				prepare: async () => ( {
+					ok: true as const,
+					executablePath: 'fake',
+					cwd: root,
+					configDirectory: root,
+					projectsDirectory: path.join( root, 'projects' ),
+					env: {},
+					identity: { email: 'user@example.com', subscriptionType: 'max' },
+				} ),
+				storeRoot: path.join( root, 'store' ),
+				approve: async () => 'deny',
+			}
+		);
+		expect( emittedPrompt ).toBe( true );
+		expect( seenOptions ).toMatchObject( {
+			pathToClaudeCodeExecutable: 'fake',
+			cwd: root,
+			model: 'sonnet',
+			effort: 'medium',
+			tools: [ 'Read' ],
+			permissionMode: 'default',
+			settingSources: [],
+		} );
+		const saved = await createNativeSessionStore( path.join( root, 'store' ) ).load( 'chat' );
+		expect( saved?.nativeSessionId ).toBe( seenOptions.sessionId );
+		expect(
+			await createNativeSessionStore( path.join( root, 'store' ) ).journal( 'chat', 'turn' ).read()
+		).toMatchObject( [ { type: 'turn.terminal', outcome: { status: 'error' } } ] );
+		expect( events ).toMatchObject( [ { type: 'turn.terminal', outcome: { status: 'error' } } ] );
+	} finally {
+		await fs.rm( root, { recursive: true, force: true } );
+	}
+} );
+
+it( 'denies native tools until system init has been verified (mock SDK)', async () => {
+	const fs = await import( 'fs/promises' );
+	const os = await import( 'os' );
+	const path = await import( 'path' );
+	const root = await fs.realpath( await fs.mkdtemp( path.join( os.tmpdir(), 'claude-init-' ) ) );
+	try {
+		const { runClaudeTurn } = await import( '../runtime' );
+		const { createFakeHost } = await import( '../../tests/fake-host' );
+		const host = createFakeHost();
+		host.sites.all = async () => [
+			{ id: 'site', path: root, name: 'site', url: 'http://localhost', phpVersion: '8.4' },
+		];
+		const snapshot = {
+			backend: 'claude-code' as const,
+			runId: 'run',
+			turnId: 'turn',
+			selection: {
+				connectionId: 'native',
+				model: { providerId: 'claude-code' as const, modelId: 'sonnet' },
+				revision: 1,
+			},
+			effort: 'medium',
+			permissionPolicyRevision: 1,
+			workspace: {
+				conversationId: 'chat',
+				siteId: 'site',
+				workingDirectory: root,
+				configDirectory: root,
+			},
+		};
+		let before: unknown;
+		const fakeQuery = ( input: {
+			prompt: AsyncIterable< unknown >;
+			options: {
+				hooks: {
+					PreToolUse: Array< { hooks: Array< ( input: unknown ) => Promise< unknown > > } >;
+				};
+				sessionId: string;
+			};
+		} ) => ( {
+			initializationResult: async () => ( {
+				hooks_applied: true,
+				hook_on_failure_supported: true,
+			} ),
+			accountInfo: async () => ( {
+				email: 'user@example.com',
+				subscriptionType: 'Max',
+				apiProvider: 'firstParty',
+			} ),
+			mcpServerStatus: async () => [
+				{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+			],
+			supportedModels: async () => [
+				{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+			],
+			close: () => {},
+			async *[ Symbol.asyncIterator ]() {
+				for await ( const _message of input.prompt ) {
+					before = await input.options.hooks.PreToolUse[ 0 ].hooks[ 0 ]( {
+						hook_event_name: 'PreToolUse',
+						tool_name: 'mcp__studio__wp_cli',
+						mcp_server: { name: 'studio', source: 'sdk' },
+					} );
+					yield {
+						type: 'result',
+						subtype: 'success',
+						is_error: false,
+						session_id: input.options.sessionId,
+					};
+				}
+			},
+		} );
+		await runClaudeTurn(
+			snapshot,
+			host,
+			{ prompt: 'hello', signal: new AbortController().signal, onEvent: () => {} },
+			{
+				query: fakeQuery as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+				prepare: async () => ( {
+					ok: true as const,
+					executablePath: 'fake',
+					cwd: root,
+					configDirectory: root,
+					projectsDirectory: path.join( root, 'projects' ),
+					env: {},
+					identity: { email: 'user@example.com', subscriptionType: 'max' },
+				} ),
+				storeRoot: path.join( root, 'store' ),
+				approve: async () => 'deny',
+			}
+		);
+		expect( before ).toMatchObject( { hookSpecificOutput: { permissionDecision: 'deny' } } );
+	} finally {
+		await fs.rm( root, { recursive: true, force: true } );
+	}
+} );
+
+it( 'qualifies only the known built-in privacy plugin and rejects unqualified plugins', async () => {
+	const { isQualifiedClaudePlugins } = await import( '../runtime' );
+	expect( isQualifiedClaudePlugins( [ { name: 'cc-plugin-privacy', path: 'builtin' } ] ) ).toBe(
+		true
+	);
+	expect(
+		isQualifiedClaudePlugins( [ { name: 'cc-plugin-privacy', path: 'C:\\untrusted' } ] )
+	).toBe( false );
+	expect(
+		isQualifiedClaudePlugins( [
+			{ name: 'cc-plugin-privacy', path: 'builtin' },
+			{ name: 'unknown', path: 'builtin' },
+		] )
+	).toBe( false );
+} );
+
+it( 'blocks native reads of credential-bearing files and the native config tree', async () => {
+	const fs = await import( 'fs/promises' );
+	const os = await import( 'os' );
+	const path = await import( 'path' );
+	const root = await fs.realpath( await fs.mkdtemp( path.join( os.tmpdir(), 'claude-read-' ) ) );
+	try {
+		const config = path.join( root, 'config' );
+		await fs.mkdir( config );
+		for ( const file of [
+			'safe.txt',
+			'.env',
+			'wp-config.php',
+			'.credentials.json',
+			'config/state.json',
+		] )
+			await fs.writeFile( path.join( root, file ), 'fixture' );
+		const { isAllowedNativeRead } = await import( '../runtime' );
+		expect( await isAllowedNativeRead( path.join( root, 'safe.txt' ), root, config ) ).toBe( true );
+		for ( const file of [ '.env', 'wp-config.php', '.credentials.json', 'config/state.json' ] )
+			expect( await isAllowedNativeRead( path.join( root, file ), root, config ) ).toBe( false );
+	} finally {
+		await fs.rm( root, { recursive: true, force: true } );
+	}
+} );
+
+it( 'waits for the exact SDK server to finish connecting before qualification', async () => {
+	let calls = 0;
+	const query = {
+		initializationResult: async () => ( { hooks_applied: true, hook_on_failure_supported: true } ),
+		accountInfo: async () => ( {
+			email: 'user@example.com',
+			subscriptionType: 'Max',
+			apiProvider: 'firstParty',
+		} ),
+		mcpServerStatus: async () =>
+			++calls === 1
+				? [ { name: 'studio', source: 'sdk', status: 'pending' } ]
+				: [ { name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] } ],
+		supportedModels: async () => [
+			{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+		],
+	};
+	expect(
+		(
+			await qualifyClaudeStartup(
+				query,
+				{ email: 'user@example.com', subscriptionType: 'max' },
+				'sonnet',
+				'medium'
+			)
+		).ok
+	).toBe( true );
+	expect( calls ).toBe( 2 );
+} );
+
+it( 'rejects any SDK spawn command, cwd or environment that changes the qualified invocation', async () => {
+	const { isQualifiedClaudeSpawn } = await import( '../runtime' );
+	const expected = {
+		command: 'C:\\Claude\\claude.exe',
+		cwd: 'C:\\Site',
+		env: { PATH: 'path', CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1' },
+	};
+	const valid = {
+		...expected,
+		args: [],
+		env: {
+			...expected.env,
+			CLAUDE_AGENT_SDK_VERSION: 'test',
+			CLAUDE_CODE_ENTRYPOINT: 'sdk',
+			CLAUDE_CODE_SDK_READS_SESSION_STATE: '1',
+		},
+	};
+	expect( isQualifiedClaudeSpawn( valid, expected ) ).toBe( true );
+	expect( isQualifiedClaudeSpawn( { ...valid, command: 'C:\\other.exe' }, expected ) ).toBe(
+		false
+	);
+	expect( isQualifiedClaudeSpawn( { ...valid, cwd: 'C:\\other' }, expected ) ).toBe( false );
+	expect(
+		isQualifiedClaudeSpawn(
+			{ ...valid, env: { ...valid.env, ANTHROPIC_API_KEY: 'secret' } },
+			expected
+		)
+	).toBe( false );
+	expect(
+		isQualifiedClaudeSpawn( { ...valid, env: { ...valid.env, PATH: 'other' } }, expected )
+	).toBe( false );
+} );
+
+it( 'waits for an owned child to exit and kills a stalled child before releasing its lock', async () => {
+	const { settleNativeProcess } = await import( '../runtime' );
+	let killed = false;
+	let exited = false;
+	let listener: () => void = () => {};
+	const child = {
+		get exitCode() {
+			return exited ? 0 : null;
+		},
+		get signalCode() {
+			return null;
+		},
+		once: ( _event: string, fn: () => void ) => {
+			listener = fn;
+		},
+		off: () => {},
+		kill: () => {
+			killed = true;
+			exited = true;
+			listener();
+			return true;
+		},
+	};
+	expect( await settleNativeProcess( child, 10 ) ).toBe( true );
+	expect( killed ).toBe( true );
+} );
+
+it( 'deduplicates discovered model aliases by canonical ID without inventing effort levels', async () => {
+	const q = {
+		initializationResult: async () => ( { hooks_applied: true, hook_on_failure_supported: true } ),
+		accountInfo: async () => ( {
+			email: 'user@example.com',
+			subscriptionType: 'Max',
+			apiProvider: 'firstParty',
+		} ),
+		mcpServerStatus: async () => [
+			{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+		],
+		supportedModels: async () => [
+			{
+				value: 'sonnet',
+				resolvedModel: 'canonical',
+				displayName: 'Sonnet',
+				supportedEffortLevels: [ 'medium', 'high' ],
+			},
+			{
+				value: 'alias',
+				resolvedModel: 'canonical',
+				displayName: 'Sonnet',
+				supportedEffortLevels: [ 'medium' ],
+			},
+		],
+	};
+	const result = await qualifyClaudeStartup(
+		q,
+		{ email: 'user@example.com', subscriptionType: 'max' },
+		'canonical',
+		'medium'
+	);
+	expect( result.ok && result.models ).toEqual( [
+		{ id: 'canonical', displayName: 'Sonnet', efforts: [ 'medium' ] },
+	] );
+} );
