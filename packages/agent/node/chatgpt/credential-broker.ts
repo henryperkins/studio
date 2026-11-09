@@ -515,34 +515,7 @@ export function createChatGptCredentialBroker(
 		}
 	}
 
-	/** The vault's key; created on first use when `create` is set, else null until then. */
-	async function getWrappingKey( create: boolean ): Promise< Buffer | null > {
-		if ( wrappingKey ) {
-			return wrappingKey;
-		}
-		let text = await readWrappingKeyText();
-		if ( ! text && create ) {
-			text = await withLock(
-				path.join( credentialsDirectory(), 'vault-key.lock' ),
-				{ wait: WRAPPING_KEY_LOCK_MS, stale: WRAPPING_KEY_LOCK_MS },
-				async () => {
-					const existing = await readWrappingKeyText();
-					if ( existing ) {
-						return existing;
-					}
-					const created = randomBytes( WRAPPING_KEY_BYTES ).toString( 'base64url' );
-					try {
-						await credentialStore.set( WRAPPING_KEY_ACCOUNT, created );
-					} catch ( error ) {
-						throw vaultUnavailable( error, created );
-					}
-					return created;
-				}
-			);
-		}
-		if ( ! text ) {
-			return null;
-		}
+	function cacheWrappingKey( text: string ): Buffer {
 		if ( ! WRAPPING_KEY_TEXT.test( text ) ) {
 			throw new ChatGptConnectionError(
 				'vault-unavailable',
@@ -551,6 +524,41 @@ export function createChatGptCredentialBroker(
 		}
 		wrappingKey = Buffer.from( text, 'base64url' );
 		return wrappingKey;
+	}
+
+	/** The vault's key, as this process last read it; null while there is none. */
+	async function getWrappingKey(): Promise< Buffer | null > {
+		if ( wrappingKey ) {
+			return wrappingKey;
+		}
+		const text = await readWrappingKeyText();
+		return text ? cacheWrappingKey( text ) : null;
+	}
+
+	/**
+	 * The key a record is sealed with: the one the keychain holds now, which
+	 * another process may have put there since this one last read it. Created
+	 * there, under the key's lock, only when there is none.
+	 */
+	async function getSealingKey(): Promise< Buffer > {
+		const text = await withLock(
+			path.join( credentialsDirectory(), 'vault-key.lock' ),
+			{ wait: WRAPPING_KEY_LOCK_MS, stale: WRAPPING_KEY_LOCK_MS },
+			async () => {
+				const existing = await readWrappingKeyText();
+				if ( existing ) {
+					return existing;
+				}
+				const created = randomBytes( WRAPPING_KEY_BYTES ).toString( 'base64url' );
+				try {
+					await credentialStore.set( WRAPPING_KEY_ACCOUNT, created );
+				} catch ( error ) {
+					throw vaultUnavailable( error, created );
+				}
+				return created;
+			}
+		);
+		return cacheWrappingKey( text );
 	}
 
 	async function lockRefresh( registrationId: string ): Promise< () => Promise< void > > {
@@ -711,7 +719,7 @@ export function createChatGptCredentialBroker(
 				// Another process may have saved the record under a key that
 				// replaced the one this process holds.
 				wrappingKey = null;
-				key = await getWrappingKey( false );
+				key = await getWrappingKey();
 				read = await readRecord( key, current );
 			}
 			if ( read.status === 'newer' ) {
@@ -745,7 +753,7 @@ export function createChatGptCredentialBroker(
 	}
 
 	async function getVaultAccessToken( account: ChatGptAccount ): Promise< string > {
-		const key = await getWrappingKey( false );
+		const key = await getWrappingKey();
 		const read = await readRecord( key, account );
 		if ( read.status === 'newer' ) {
 			throw new ChatGptConnectionError( 'newer-format' );
@@ -883,7 +891,7 @@ export function createChatGptCredentialBroker(
 		if ( account.storage === 'session' ) {
 			return sessions.get( connectionId )?.record.idToken ?? null;
 		}
-		const key = await getWrappingKey( false ).catch( () => null );
+		const key = await getWrappingKey().catch( () => null );
 		const read = await readRecord( key, account );
 		return read.status === 'ok' ? read.record.idToken : null;
 	}
@@ -918,7 +926,7 @@ export function createChatGptCredentialBroker(
 			scopes: tokens.scopes,
 			savedAt: now,
 		};
-		const key = signIn.storage === 'vault' ? await getWrappingKey( true ) : null;
+		const key = signIn.storage === 'vault' ? await getSealingKey() : null;
 		const accountSignIn: ChatGptAccountSignIn = {
 			issuer: signIn.issuer,
 			subject: signIn.subject,
@@ -1072,7 +1080,7 @@ export function createChatGptCredentialBroker(
 			dropSession( connectionId );
 			return held;
 		} );
-		const key = await getWrappingKey( false ).catch( () => null );
+		const key = await getWrappingKey().catch( () => null );
 		// A refresh holds the lock for one request at most; a lock left by a
 		// process that died doesn't keep the user from signing out.
 		const unlock = await lockRefresh( connectionId ).catch( () => null );

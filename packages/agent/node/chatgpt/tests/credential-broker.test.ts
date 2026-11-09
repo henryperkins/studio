@@ -623,6 +623,48 @@ describe( 'ChatGPT credential broker', () => {
 			expect( await readChatGptAccounts() ).toEqual( [ account ] );
 		} );
 
+		it( 'seals a sign-in under the key the keychain holds now, even one another process made since', async () => {
+			const app = startBroker();
+			const { registrationId } = await app.saveSignIn( signIn() );
+			// The keychain item went, and another process made a new key.
+			keychain.items.clear();
+			const other = startBroker();
+			await other.saveSignIn(
+				signIn( {
+					subject: 'test-subject-2',
+					clientId: 'test-issued-client-2',
+					tokens: tokens( 2 ),
+				} )
+			);
+			const replacement = keychain.items.get( 'chatgpt-vault-key' );
+
+			await app.saveSignIn( signIn( { registrationId, tokens: tokens( 3 ) } ) );
+
+			expect( keychain.items.get( 'chatgpt-vault-key' ) ).toBe( replacement );
+			for ( const reader of [ other, startBroker(), app ] ) {
+				await expect( reader.getAccessToken( registrationId ) ).resolves.toBe(
+					'test-access-token-3'
+				);
+			}
+		} );
+
+		it( 'refuses to save a sign-in while the keychain is locked, even with a key from before, and makes no new one', async () => {
+			const app = startBroker();
+			const { registrationId } = await app.saveSignIn( signIn() );
+			const key = keychain.items.get( 'chatgpt-vault-key' );
+			keychain.state.available = false;
+
+			await expect(
+				app.saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) )
+			).rejects.toMatchObject( { code: 'vault-unavailable' } );
+
+			keychain.state.available = true;
+			expect( [ ...keychain.items.entries() ] ).toEqual( [ [ 'chatgpt-vault-key', key ] ] );
+			await expect( startBroker().getAccessToken( registrationId ) ).resolves.toBe(
+				'test-access-token-1'
+			);
+		} );
+
 		it( 'reads the keychain again before giving up on a record its key can’t open', async () => {
 			const app = startBroker();
 			const { registrationId } = await app.saveSignIn( signIn() );
