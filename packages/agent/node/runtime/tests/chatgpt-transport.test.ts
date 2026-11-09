@@ -613,13 +613,8 @@ describe( 'the ChatGPT transport', () => {
 			const snapshot = snapshotFor( 'medium', {
 				getAccessToken: async () => `test-rotating-token-${ ++issued }`,
 			} );
-			const config = createChatGptProviderConfig(
-				buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: 'gpt-6.1-sol' } ),
-				CONNECTION,
-				snapshot
-			);
-			expect( issued ).toBe( 0 );
 			const turn = await registerChatGpt( snapshot );
+			expect( issued ).toBe( 0 );
 			const http = captureFetch( [ () => sse( textReply( 'a' ) ), () => sse( textReply( 'b' ) ) ] );
 
 			await streamTurn( turn, conversation( [ userMessage( 'one' ) ] ), 'medium' ).result();
@@ -631,9 +626,10 @@ describe( 'the ChatGPT transport', () => {
 			expect( http.request( 1 ).headers.get( 'authorization' ) ).toBe(
 				'Bearer test-rotating-token-2'
 			);
-			expect( JSON.stringify( { ...config, streamSimple: undefined } ) ).not.toMatch(
-				/test-rotating-token/
-			);
+			// The registration pi keeps holds neither token, after both requests.
+			const registered = turn.runtime.getRegisteredProviderConfig( CHATGPT_PI_PROVIDER );
+			expect( registered?.apiKey ).toBeDefined();
+			expect( JSON.stringify( registered ) ).not.toMatch( /test-rotating-token/ );
 		} );
 
 		it( 'sends system text as instructions and never a system message', async () => {

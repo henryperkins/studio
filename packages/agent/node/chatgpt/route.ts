@@ -26,13 +26,11 @@ export const CHATGPT_UNAVAILABLE_RETRY_DELAYS_MS: readonly number[] = [ 1_000, 3
 /** A current access token for the connection, for one request. */
 export type ChatGptTokenSource = () => Promise< string >;
 
+/** A `POST` of a JSON body to the Responses endpoint, or a `GET` of the model list. */
 export type ChatGptRouteRequest = {
 	getAccessToken: ChatGptTokenSource;
 	signal?: AbortSignal;
-} & (
-	| { endpoint: 'responses'; /** The JSON body to `POST`. */ body: string }
-	| { endpoint: 'models' }
-);
+} & ( { endpoint: 'responses'; body: string } | { endpoint: 'models' } );
 
 export interface ChatGptRouteResponse {
 	/** The response, whatever its status; an error response's body is still unread. */
