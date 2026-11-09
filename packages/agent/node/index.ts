@@ -4,6 +4,18 @@
 // apps never load the runtime.
 export { createAgent, type StudioAgent } from './agent';
 export type {
+	BackendTurnHandle,
+	ClaudeBackendTurnHandlers,
+	ClaudeCodeBackend,
+	RunBackendTurn,
+} from './backends/dispatch';
+export type { PiBackendTurnHandlers } from './backends/pi';
+export {
+	resolveClaudeResume,
+	type ClaudeResumeResolution,
+	type ClaudeTranscriptCandidate,
+} from './backends/resume';
+export type {
 	HostSite,
 	ProgressCallback,
 	StudioAgentHost,
