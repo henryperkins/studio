@@ -94,7 +94,8 @@ export interface FakeAuthorizationServer {
 	readonly revokeRequests: URLSearchParams[];
 	/** What each successful token response carried, in order. */
 	readonly issued: IssuedTokens[];
-	readonly counts: { discovery: number; jwks: number };
+	/** Requests answered; `tokenResponses` counts token responses sent, late ones too. */
+	readonly counts: { discovery: number; jwks: number; tokenResponses: number };
 	/** Every code, token, verifier, nonce and ID token hint it issued or was shown. */
 	secrets(): string[];
 	close(): Promise< void >;
@@ -219,7 +220,10 @@ export async function startFakeAuthorizationServer(
 		fake.tokenRequests.push( form );
 		keep( form.get( 'code' ), form.get( 'code_verifier' ), form.get( 'refresh_token' ) );
 		const answer = await answerToken( form );
-		setTimeout( () => reply( answer.status, answer.body ), fake.script.tokenDelayMs ?? 0 );
+		setTimeout( () => {
+			reply( answer.status, answer.body );
+			fake.counts.tokenResponses++;
+		}, fake.script.tokenDelayMs ?? 0 );
 	}
 
 	async function answerToken( form: URLSearchParams ): Promise< Answer > {
@@ -300,7 +304,7 @@ export async function startFakeAuthorizationServer(
 		tokenRequests: [],
 		revokeRequests: [],
 		issued: [],
-		counts: { discovery: 0, jwks: 0 },
+		counts: { discovery: 0, jwks: 0, tokenResponses: 0 },
 		secrets: () => [ ...secrets ],
 		close: () =>
 			new Promise< void >( ( resolve ) => {

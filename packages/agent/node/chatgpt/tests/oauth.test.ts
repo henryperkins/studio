@@ -59,6 +59,7 @@ const RANDOM = /^[\w-]{43,128}$/;
 const CALLBACK = /^http:\/\/127\.0\.0\.1:(\d+)\/auth\/callback$/;
 
 const sleep = ( ms: number ) => new Promise( ( resolve ) => setTimeout( resolve, ms ) );
+const nextTurn = () => new Promise( ( resolve ) => setImmediate( resolve ) );
 
 async function until( condition: () => boolean, timeoutMs = 5_000 ): Promise< void > {
 	const deadline = Date.now() + timeoutMs;
@@ -341,7 +342,7 @@ describe( 'Signing in to ChatGPT', () => {
 			expectNoSecrets( outcome, delivery.page );
 			// The listener closed with the attempt.
 			expect( await deliver( callbackUrl ) ).toEqual( { status: 0, page: '' } );
-			expect( fake.counts ).toEqual( { discovery: 1, jwks: 1 } );
+			expect( fake.counts ).toEqual( { discovery: 1, jwks: 1, tokenResponses: 1 } );
 		} );
 
 		it( 'keeps a sign-in in this app’s memory only, when asked to', async () => {
@@ -862,7 +863,9 @@ describe( 'Signing in to ChatGPT', () => {
 			const delivery = await delivered;
 			expect( delivery.status ).toBe( 200 );
 			expectNoSecrets( delivery.page );
-			await sleep( 400 );
+			// The late tokens arrive, with a turn for anything they could set off.
+			await until( () => fake.counts.tokenResponses === 2 );
+			await nextTurn();
 			await expectUntouched( existing );
 		} );
 
@@ -901,7 +904,8 @@ describe( 'Signing in to ChatGPT', () => {
 			const exchanging = await begin( undefined, undefined, quick );
 			void deliver( await authorize( exchanging.url ) );
 			expect( await quick.wait( exchanging.attemptId ) ).toEqual( failed( 'timed-out' ) );
-			await sleep( 600 );
+			await until( () => fake.counts.tokenResponses === 2 );
+			await nextTurn();
 			await expectUntouched( existing );
 		} );
 
