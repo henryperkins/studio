@@ -268,10 +268,11 @@ export function createChatGptTokenClient(
 				return { ok: true, value: undefined };
 			}
 			const code = readErrorCode( response.body );
+			// A server error or a rate limit may pass, so the broker tries again.
 			return {
 				ok: false,
 				error: {
-					kind: response.status >= 500 ? 'transient' : 'terminal',
+					kind: response.status >= 500 || response.status === 429 ? 'transient' : 'terminal',
 					...( code !== undefined ? { code } : {} ),
 					status: response.status,
 				},

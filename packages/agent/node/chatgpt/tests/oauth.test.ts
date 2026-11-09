@@ -1274,7 +1274,7 @@ describe( 'Signing in to ChatGPT', () => {
 			}
 		} );
 
-		it( 'revokes at discovery’s revocation endpoint, confirmed by a 200, retried only after a server error', async () => {
+		it( 'revokes at discovery’s revocation endpoint, confirmed by a 200, retried only after a server error or a rate limit', async () => {
 			const client = createChatGptTokenClient( { discoveryUrl: fake.discoveryUrl } );
 
 			const confirmed = await client.revoke( request() );
@@ -1282,6 +1282,8 @@ describe( 'Signing in to ChatGPT', () => {
 			const unavailable = await client.revoke( request() );
 			fake.script.revoke = () => ( { status: 400, body: { error: 'invalid_client' } } );
 			const refused = await client.revoke( request() );
+			fake.script.revoke = () => ( { status: 429, body: { error: 'rate_limit_exceeded' } } );
+			const limited = await client.revoke( request() );
 
 			expect( confirmed ).toEqual( { ok: true, value: undefined } );
 			expect( Object.fromEntries( fake.revokeRequests[ 0 ] ) ).toEqual( {
@@ -1293,6 +1295,10 @@ describe( 'Signing in to ChatGPT', () => {
 			expect( refused ).toEqual( {
 				ok: false,
 				error: { kind: 'terminal', code: 'invalid_client', status: 400 },
+			} );
+			expect( limited ).toEqual( {
+				ok: false,
+				error: { kind: 'transient', code: 'rate_limit_exceeded', status: 429 },
 			} );
 		} );
 
@@ -1318,6 +1324,21 @@ describe( 'Signing in to ChatGPT', () => {
 				token_type_hint: 'refresh_token',
 				client_id: 'test-issued-client-1',
 			} );
+		} );
+
+		it( 'has the credential broker try a rate-limited revocation again, until it is confirmed', async () => {
+			const registrationId = registrationOf( ( await signIn() ).outcome );
+			let answered = 0;
+			fake.script.revoke = () =>
+				answered++ === 0
+					? { status: 429, body: { error: 'rate_limit_exceeded' } }
+					: { status: 200 };
+
+			expect( await broker.signOut( registrationId ) ).toEqual( {
+				localCleared: true,
+				remoteRevocationConfirmed: true,
+			} );
+			expect( fake.revokeRequests ).toHaveLength( 2 );
 		} );
 	} );
 } );
