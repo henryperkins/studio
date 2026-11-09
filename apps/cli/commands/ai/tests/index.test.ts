@@ -1,3 +1,8 @@
+vi.mock( '@studio/agent/node/claude-code/studio-surface', () => ( {
+	getClaudeSessionStoreRoot: () => 'root',
+	validateClaudeSendSelection: vi.fn(),
+} ) );
+vi.mock( '@studio/agent/node/claude-code/runtime', () => ( { runClaudeTurn: vi.fn() } ) );
 import { runStudioAgentTurn } from '@studio/agent/node/runtime';
 import { resolveResumeSessionContext } from '@studio/agent/node/sessions/context';
 import {
@@ -937,4 +942,117 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 			)
 		).toBe( false );
 	} );
+} );
+
+it( 'routes marked Claude sessions before Pi provider selection', async () => {
+	const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
+	vi.mocked( runClaudeTurn ).mockImplementationOnce( async ( snapshot, _host, input ) => {
+		input.onEvent( {
+			type: 'turn.terminal',
+			runId: snapshot.runId,
+			turnId: snapshot.turnId,
+			outcome: { status: 'success' },
+		} );
+	} );
+	vi.mocked( resolveInitialAiProvider ).mockClear();
+	const adapter = new JsonAdapter();
+	const output = vi.spyOn( process.stdout, 'write' ).mockImplementation( () => true );
+	try {
+		await runCommand( {
+			adapter,
+			initialMessage: 'hello',
+			initialRunId: 'run',
+			initialTurnId: 'turn',
+			claudeSelection: { model: 'model', effort: 'high' },
+			resumeSession: {
+				summary: { id: 'session' },
+				entries: [
+					{
+						type: 'custom',
+						customType: 'studio.claude_binding',
+						data: {
+							connectionId: 'connection',
+							siteId: 'site',
+							workingDirectory: 'workspace',
+							configDirectory: 'config',
+						},
+					},
+					{
+						type: 'custom',
+						customType: 'studio.claude_selection',
+						data: { model: 'model', effort: 'high' },
+					},
+				],
+			} as never,
+		} );
+		expect( resolveInitialAiProvider ).not.toHaveBeenCalled();
+		expect( runClaudeTurn ).toHaveBeenCalledWith(
+			expect.objectContaining( { backend: 'claude-code', runId: 'run', turnId: 'turn' } ),
+			expect.anything(),
+			expect.anything(),
+			expect.anything()
+		);
+	} finally {
+		output.mockRestore();
+	}
+} );
+
+it( 'routes a Claude session resumed by ID and rejects a stale selection', async () => {
+	const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
+	const entries = [
+		{
+			type: 'custom',
+			customType: 'studio.claude_binding',
+			data: {
+				connectionId: 'connection',
+				siteId: 'site',
+				workingDirectory: 'workspace',
+				configDirectory: 'config',
+			},
+		},
+		{
+			type: 'custom',
+			customType: 'studio.claude_selection',
+			data: { model: 'model', effort: 'high' },
+		},
+	];
+	vi.mocked( listStudioSessionFiles ).mockResolvedValueOnce( [ 'session-file' ] );
+	vi.mocked( openStudioSession ).mockResolvedValueOnce( {
+		getSessionId: () => 'session',
+		getEntries: () => entries,
+	} as never );
+	vi.mocked( runClaudeTurn ).mockImplementationOnce( async ( snapshot, _host, input ) =>
+		input.onEvent( {
+			type: 'turn.terminal',
+			runId: snapshot.runId,
+			turnId: snapshot.turnId,
+			outcome: { status: 'success' },
+		} )
+	);
+	const output = vi.spyOn( process.stdout, 'write' ).mockImplementation( () => true );
+	try {
+		await runCommand( {
+			adapter: new JsonAdapter(),
+			initialMessage: 'hello',
+			resumeSessionId: 'session',
+		} );
+		expect( runClaudeTurn ).toHaveBeenCalledWith(
+			expect.objectContaining( {
+				workspace: expect.objectContaining( { conversationId: 'session' } ),
+			} ),
+			expect.anything(),
+			expect.anything(),
+			expect.anything()
+		);
+		await expect(
+			runCommand( {
+				adapter: new JsonAdapter(),
+				initialMessage: 'hello',
+				claudeSelection: { model: 'other', effort: 'high' },
+				resumeSession: { summary: { id: 'session' }, entries } as never,
+			} )
+		).rejects.toThrow( 'settings changed' );
+	} finally {
+		output.mockRestore();
+	}
 } );

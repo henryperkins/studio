@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import {
 	closeSharedBrowser,
 	createAgent,
@@ -6,6 +7,11 @@ import {
 	type StudioAgentHost,
 	AskUserQuestion,
 } from '@studio/agent/node';
+import { runClaudeTurn } from '@studio/agent/node/claude-code/runtime';
+import {
+	getClaudeSessionStoreRoot,
+	validateClaudeSendSelection,
+} from '@studio/agent/node/claude-code/studio-surface';
 import {
 	readAiSettings,
 	readAnthropicApiKey,
@@ -17,6 +23,10 @@ import {
 	type StudioChatFileAttachment,
 } from '@studio/agent/protocol/chat-files';
 import { type StudioChatImage } from '@studio/agent/protocol/chat-images';
+import {
+	resolveClaudeSession,
+	type ClaudeSessionSelection,
+} from '@studio/agent/protocol/claude-code';
 import { getAgentEndFailure } from '@studio/agent/protocol/json-events';
 import { getAiModelFamily, type AiModelId } from '@studio/agent/protocol/models';
 import {
@@ -244,8 +254,11 @@ async function resolveOpenAiTurn(
 
 export async function runCommand( options: {
 	adapter: AiOutputAdapter;
+	startupSignal?: AbortSignal;
 	initialMessage?: string;
 	initialTurnId?: string;
+	initialRunId?: string;
+	claudeSelection?: ClaudeSessionSelection;
 	initialDisplayMessage?: string;
 	initialImages?: StudioChatImage[];
 	initialFiles?: StudioChatFileAttachment[];
@@ -320,6 +333,107 @@ export async function runCommand( options: {
 			ui.emitTurnCompleted( 'error', '' );
 			return;
 		}
+	}
+	const entries = options.resumeSession?.entries ?? resumedById?.getEntries();
+	const claude = entries && resolveClaudeSession( entries );
+	if ( claude ) {
+		const selection = options.claudeSelection ?? claude.selection;
+		if (
+			selection.model !== claude.selection.model ||
+			selection.effort !== claude.selection.effort
+		) {
+			throw new Error( 'Claude session settings changed before the turn started.' );
+		}
+		if ( ! options.initialMessage?.trim() )
+			throw new Error( 'A message is required for a Claude turn.' );
+		if ( options.initialFiles?.length || options.initialVisualAnnotations?.length )
+			throw new Error( 'File attachments are not supported for Claude turns.' );
+		const runId = options.initialRunId ?? randomUUID();
+		const turnId = options.initialTurnId ?? randomUUID();
+		const conversationId = options.resumeSession?.summary.id ?? resumedById!.getSessionId();
+		await validateClaudeSendSelection( getSessionsDirectory(), conversationId, selection );
+		const pending = new Map< string, ( answer: 'allow' | 'deny' ) => void >();
+		const approve = async (
+			request: { operationId: string },
+			signal: AbortSignal
+		): Promise< 'allow' | 'deny' > => {
+			if ( typeof process.send !== 'function' || signal.aborted ) return 'deny';
+			return new Promise( ( resolve ) => {
+				const done = ( answer: 'allow' | 'deny' ) => {
+					pending.delete( request.operationId );
+					signal.removeEventListener( 'abort', abort );
+					resolve( answer );
+				};
+				const abort = () => done( 'deny' );
+				pending.set( request.operationId, done );
+				signal.addEventListener( 'abort', abort, { once: true } );
+				if ( signal.aborted ) abort();
+			} );
+		};
+		const claudeAgent = createAgent( {
+			host,
+			claudeCode: ( snapshot, input ) =>
+				runClaudeTurn( snapshot, host, input, {
+					storeRoot: getClaudeSessionStoreRoot( getSessionsDirectory() ),
+					approve,
+				} ),
+		} );
+		const turn = claudeAgent.runBackendTurn(
+			{
+				backend: 'claude-code',
+				runId,
+				turnId,
+				effort: selection.effort,
+				permissionPolicyRevision: 0,
+				selection: {
+					connectionId: claude.binding.connectionId,
+					revision: 0,
+					model: { providerId: 'claude-code', modelId: selection.model },
+				},
+				workspace: { ...claude.binding, conversationId },
+			},
+			{
+				backend: 'claude-code',
+				prompt: options.initialMessage,
+				images: options.initialImages,
+				onEvent: ( event ) => {
+					if ( isJsonMode )
+						emitEvent( { type: 'backend.event', timestamp: new Date().toISOString(), event } );
+					else if ( event.type === 'content.confirmed' && event.blockType === 'text' )
+						ui.showInfo( event.text );
+					else if ( event.type === 'turn.terminal' && event.outcome.status !== 'success' )
+						ui.showError( event.outcome.message ?? event.outcome.status );
+				},
+			}
+		);
+		const onMessage = ( value: unknown ) => {
+			if ( ! value || typeof value !== 'object' ) return;
+			const message = value as { type?: string; answers?: Record< string, string > };
+			if ( message.type === 'interrupt' ) void turn.interrupt();
+			if ( message.type === 'answer' && message.answers )
+				for ( const [ id, answer ] of Object.entries( message.answers ) ) {
+					if ( answer === 'allow' || answer === 'deny' ) pending.get( id )?.( answer );
+				}
+		};
+		const interrupt = () => {
+			void turn.interrupt();
+		};
+		process.on( 'message', onMessage );
+		process.on( 'disconnect', interrupt );
+		process.on( 'SIGINT', interrupt );
+		options.startupSignal?.addEventListener( 'abort', interrupt, { once: true } );
+		if ( options.startupSignal?.aborted ) interrupt();
+		try {
+			const result = await turn.result;
+			if ( result.status !== 'success' ) process.exitCode = 1;
+		} finally {
+			process.off( 'message', onMessage );
+			process.off( 'disconnect', interrupt );
+			process.off( 'SIGINT', interrupt );
+			options.startupSignal?.removeEventListener( 'abort', interrupt );
+			for ( const resolve of pending.values() ) resolve( 'deny' );
+		}
+		return;
 	}
 	const resumeContext = resolveResumeSessionContext(
 		options.resumeSession ??
