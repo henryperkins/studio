@@ -107,6 +107,7 @@ async function readNativeStatus(
 	env: NodeJS.ProcessEnv
 ): Promise< Record< string, unknown > > {
 	let stdout: string;
+	let signedOutExit = false;
 	try {
 		( { stdout } = await execFileAsync( executablePath, [ 'auth', 'status', '--json' ], {
 			cwd,
@@ -119,11 +120,14 @@ async function readNativeStatus(
 		const failure = error as { code?: unknown; stdout?: unknown; killed?: boolean };
 		if ( failure.code !== 1 || failure.killed || typeof failure.stdout !== 'string' ) throw error;
 		stdout = failure.stdout;
+		signedOutExit = true;
 	}
 	const status: unknown = JSON.parse( stdout );
 	if ( ! status || typeof status !== 'object' || Array.isArray( status ) )
 		throw new Error( 'Invalid auth status' );
-	return status as Record< string, unknown >;
+	const record = status as Record< string, unknown >;
+	if ( signedOutExit && record.loggedIn !== false ) throw new Error( 'Invalid signed-out status' );
+	return record;
 }
 
 // Internal only: callers must finish the SDK account and inventory checks before sending a prompt.
@@ -192,6 +196,8 @@ export async function prepareClaudeInvocation(
 		const identity = {
 			email: typeof status.email === 'string' ? status.email : undefined,
 			organization: typeof status.orgName === 'string' ? status.orgName : undefined,
+			subscriptionType:
+				typeof status.subscriptionType === 'string' ? status.subscriptionType : undefined,
 		};
 		return {
 			ok: true as const,
@@ -296,7 +302,7 @@ export async function openClaudeNativeSignIn( connectionId: string ): Promise< v
 		throw new Error( 'Claude configuration is not qualified for sign-in' );
 	if ( config.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = config.directory;
 	const encodedPath = Buffer.from( executable.executablePath, 'utf8' ).toString( 'base64' );
-	const script = `Start-Process -FilePath ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ encodedPath }'))) -ArgumentList @('auth','login')`;
+	const script = `Start-Process -FilePath ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ encodedPath }'))) -ArgumentList @('auth','login') -WindowStyle Normal -ErrorAction Stop`;
 	await execFileAsync(
 		trustedPowerShellPath(),
 		[

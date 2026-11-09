@@ -79,9 +79,14 @@ export function compareClaudeExecutionAuth(
 ): boolean {
 	if ( ! preflight.email || ! current.email ) return false;
 	if ( current.apiProvider !== 'firstParty' ) return false;
+	const nativePlan = /^(pro|max)$/i.exec( preflight.subscriptionType ?? '' )?.[ 1 ];
+	const sdkPlan = /^(?:claude )?(pro|max)(?: plan)?$/i.exec(
+		current.subscriptionType ?? ''
+	)?.[ 1 ];
+	if ( ! nativePlan || nativePlan.toLowerCase() !== sdkPlan?.toLowerCase() ) return false;
 	if (
 		current.tokenSource !== undefined ||
-		( current.apiKeySource && current.apiKeySource !== 'none' )
+		( current.apiKeySource !== undefined && current.apiKeySource !== 'none' )
 	)
 		return false;
 	for ( const key of [ 'email', 'organization' ] as const ) {
