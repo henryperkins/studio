@@ -76,6 +76,12 @@ interface AccountIndex {
 	version: typeof ACCOUNTS_VERSION;
 	/** This host's `ext_agent_host_id`: generated once, never changed. */
 	hostId: string | null;
+	/**
+	 * The client a first sign-in was issued before its exchange failed: kept
+	 * so the next first sign-in registers through it instead of registering
+	 * another client. Null when no sign-in is unfinished that way.
+	 */
+	retainedClientId: string | null;
 	accounts: ChatGptAccount[];
 }
 
@@ -210,6 +216,11 @@ function isAccountIndex( value: unknown ): value is AccountIndex {
 			value.hostId === null ||
 			( typeof value.hostId === 'string' && HOST_ID.test( value.hostId ) )
 		) ||
+		! (
+			value.retainedClientId === undefined ||
+			value.retainedClientId === null ||
+			isIssuedChatGptClientId( value.retainedClientId )
+		) ||
 		! Array.isArray( value.accounts ) ||
 		! value.accounts.every( isAccount )
 	) {
@@ -245,7 +256,7 @@ async function readIndex(): Promise< AccountIndex > {
 		text = await readFile( getAccountsPath(), { encoding: 'utf8' } );
 	} catch ( error ) {
 		if ( isErrnoException( error ) && error.code === 'ENOENT' ) {
-			return { version: ACCOUNTS_VERSION, hostId: null, accounts: [] };
+			return { version: ACCOUNTS_VERSION, hostId: null, retainedClientId: null, accounts: [] };
 		}
 		throw error;
 	}
@@ -258,7 +269,8 @@ async function readIndex(): Promise< AccountIndex > {
 	if ( ! isAccountIndex( parsed ) ) {
 		throw new ChatGptConnectionError( 'accounts-unreadable' );
 	}
-	return parsed;
+	// Indexes written before the retained client was kept don't carry it.
+	return { ...parsed, retainedClientId: parsed.retainedClientId ?? null };
 }
 
 async function removeLeftoverTempFiles( directory: string, fileName: string ): Promise< void > {
@@ -443,6 +455,22 @@ export async function readChatGptAccounts(): Promise< ChatGptAccount[] > {
 	return ( await readIndex() ).accounts.map( toAccount );
 }
 
+/** The client an unfinished first sign-in was issued and kept, or null when none was. */
+export async function readRetainedChatGptClientId(): Promise< string | null > {
+	return ( await readIndex() ).retainedClientId;
+}
+
+/**
+ * Keeps the client a first sign-in was issued, before its one-time code is
+ * exchanged, so an exchange that fails doesn't make the next first sign-in
+ * register another client.
+ */
+export function retainChatGptClientId( clientId: string ): Promise< void > {
+	return updateIndex( ( index ) => {
+		index.retainedClientId = clientId;
+	} );
+}
+
 /** The registration, or null when there is none by that id. */
 export async function readChatGptAccount(
 	registrationId: string
@@ -481,6 +509,10 @@ export function createChatGptAccount(
 			updatedAt: now,
 		};
 		index.accounts.push( account );
+		// The registration now holds this client, so it is no longer unfinished.
+		if ( index.retainedClientId === account.clientId ) {
+			index.retainedClientId = null;
+		}
 		return toAccount( account );
 	} );
 }

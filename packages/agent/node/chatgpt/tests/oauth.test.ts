@@ -10,6 +10,7 @@ import {
 	getChatGptHostId,
 	readChatGptAccount,
 	readChatGptAccounts,
+	readRetainedChatGptClientId,
 } from '@studio/agent/node/chatgpt/account-store';
 import {
 	CHATGPT_TERMINAL_REFRESH_ERRORS,
@@ -366,6 +367,49 @@ describe( 'Signing in to ChatGPT', () => {
 				'test-issued-client-1',
 				'test-issued-client-2',
 			] );
+		} );
+
+		it( 'keeps the client a failed first sign-in was issued, so the next one registers through it', async () => {
+			fake.script.token = () => ( { status: 400, body: { error: 'invalid_grant' } } );
+			const first = await signIn();
+			expect( first.outcome ).toEqual( failed( 'code-rejected' ) );
+			expect( await readChatGptAccounts() ).toEqual( [] );
+			expect( await readRetainedChatGptClientId() ).toBe( 'test-issued-client-1' );
+
+			fake.script.token = undefined;
+			const second = await signIn();
+			expect( query( 1 ) ).toMatchObject( { client_id: 'test-issued-client-1' } );
+			expect( query( 1 ) ).not.toHaveProperty( 'agent_name_hint' );
+			expect( tokenForm( 1 ).client_id ).toBe( 'test-issued-client-1' );
+			const registrationId = registrationOf( second.outcome );
+			expect( ( await readChatGptAccount( registrationId ) )?.clientId ).toBe(
+				'test-issued-client-1'
+			);
+
+			// Claimed by the registration: a later first sign-in registers anew.
+			expect( await readRetainedChatGptClientId() ).toBeNull();
+			const third = await signIn();
+			expect( query( 2 ).client_id ).toBe( 'dynamic_agent_client' );
+			expect( ( await readChatGptAccount( registrationOf( third.outcome ) ) )?.clientId ).toBe(
+				'test-issued-client-2'
+			);
+		} );
+
+		it( 'refuses a callback naming another client than the one a first sign-in kept', async () => {
+			fake.script.token = () => ( { status: 400, body: { error: 'invalid_grant' } } );
+			await signIn();
+			fake.script.token = undefined;
+			fake.script.callback = ( params ) => ( {
+				...params,
+				client_id: 'test-issued-client-99',
+			} );
+
+			const { outcome } = await signIn();
+
+			expect( outcome ).toEqual( failed( 'client-mismatch' ) );
+			expect( fake.tokenRequests ).toHaveLength( 1 );
+			expect( await readChatGptAccounts() ).toEqual( [] );
+			expect( await readRetainedChatGptClientId() ).toBe( 'test-issued-client-1' );
 		} );
 	} );
 

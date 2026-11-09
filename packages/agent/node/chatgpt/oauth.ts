@@ -10,6 +10,8 @@ import {
 	isSameChatGptIdentity,
 	readChatGptAccount,
 	readChatGptAccounts,
+	readRetainedChatGptClientId,
+	retainChatGptClientId,
 	type ChatGptAccount,
 	type ChatGptCredentialStorage,
 } from '@studio/agent/node/chatgpt/account-store';
@@ -33,7 +35,9 @@ import type { AddressInfo } from 'node:net';
  * public client registered on first sign-in, PKCE, a loopback callback on
  * 127.0.0.1 and a verified ID token, against the endpoints OpenAI's discovery
  * document names. Nothing an attempt receives is saved until every check has
- * passed, so no failure changes or clears a registration.
+ * passed, so no failure changes or clears a registration — except the client
+ * a first sign-in is issued, which is kept before its one-time code is
+ * exchanged so a failed exchange doesn't register another client next time.
  *
  * The backend opens the authorization page in the system browser itself: its
  * URL can carry the account's ID token, so no caller, renderer or log ever
@@ -224,6 +228,8 @@ interface PendingAttempt {
 	attemptId: string;
 	/** The registration signed in to again, with its verified identity and issued client; null for a new one. */
 	registration: Pick< ChatGptAccount, 'registrationId' | 'issuer' | 'subject' | 'clientId' > | null;
+	/** A new registration's client, kept from an earlier first sign-in whose exchange never saved it; null when none was kept. */
+	retainedClientId: string | null;
 	storage: ChatGptCredentialStorage;
 	authServer: ChatGptAuthServer;
 	redirectUri: string;
@@ -494,7 +500,8 @@ export function createChatGptSignInFlow(
 		forget.unref?.();
 	}
 
-	// The callback's checks, in order; nothing is saved until every one has passed.
+	// The callback's checks, in order; nothing but a new registration's issued
+	// client is saved until every one has passed.
 	async function complete(
 		attempt: Attempt,
 		pending: PendingAttempt,
@@ -506,13 +513,16 @@ export function createChatGptSignInFlow(
 			);
 		}
 		const returnedClients = params.getAll( 'client_id' );
+		// The client this attempt registered through, if it already has one:
+		// its registration's, or one kept from an unfinished first sign-in.
+		const expectedClient = pending.registration?.clientId ?? pending.retainedClientId;
 		let clientId: string;
-		if ( pending.registration ) {
-			// Signing in again, the callback may leave the client out, but may not name another.
-			if ( returnedClients.some( ( returned ) => returned !== pending.registration?.clientId ) ) {
+		if ( expectedClient ) {
+			// The callback may leave the client out, but may not name another.
+			if ( returnedClients.some( ( returned ) => returned !== expectedClient ) ) {
 				return failure( 'client-mismatch' );
 			}
-			clientId = pending.registration.clientId;
+			clientId = expectedClient;
 		} else {
 			const [ issued ] = returnedClients;
 			if ( returnedClients.length !== 1 || ! isIssuedChatGptClientId( issued ) ) {
@@ -523,6 +533,13 @@ export function createChatGptSignInFlow(
 		const codes = params.getAll( 'code' );
 		if ( codes.length !== 1 || ! codes[ 0 ] ) {
 			return failure( 'authorization-failed' );
+		}
+		if ( ! pending.registration && pending.retainedClientId !== clientId ) {
+			// OpenAI has registered this client already. Keep it before the
+			// one-time code is spent, so an exchange that fails — an expired
+			// code above all — doesn't register another client next time.
+			// Failing to keep it only costs that, so it never fails the sign-in.
+			await retainChatGptClientId( clientId ).catch( () => undefined );
 		}
 
 		const exchange = await exchangeChatGptAuthorizationCode(
@@ -671,6 +688,14 @@ export function createChatGptSignInFlow(
 		} catch {
 			throw new ChatGptSignInError( 'accounts-unreadable' );
 		}
+		let retainedClientId: string | null = null;
+		if ( ! account ) {
+			try {
+				retainedClientId = await readRetainedChatGptClientId();
+			} catch {
+				throw new ChatGptSignInError( 'accounts-unreadable' );
+			}
+		}
 		let authServer: ChatGptAuthServer;
 		try {
 			authServer = await discoverChatGptAuthServer( options.discoveryUrl );
@@ -696,6 +721,7 @@ export function createChatGptSignInFlow(
 						clientId: account.clientId,
 				  }
 				: null,
+			retainedClientId,
 			storage: isCredentialStorage( signInOptions.storage )
 				? signInOptions.storage
 				: account?.storage ?? 'vault',
@@ -707,7 +733,7 @@ export function createChatGptSignInFlow(
 		};
 
 		const params: Record< string, string > = {
-			client_id: account?.clientId ?? REGISTRATION_CLIENT_ID,
+			client_id: account?.clientId ?? retainedClientId ?? REGISTRATION_CLIENT_ID,
 			ext_agent_host_id: hostId,
 			response_type: 'code',
 			redirect_uri: pending.redirectUri,
@@ -718,11 +744,11 @@ export function createChatGptSignInFlow(
 			code_challenge_method: 'S256',
 			code_challenge: createHash( 'sha256' ).update( pending.codeVerifier ).digest( 'base64url' ),
 		};
-		if ( ! account ) {
+		if ( ! account && ! retainedClientId ) {
 			params.agent_name_hint = AGENT_NAME;
 		} else if ( idTokenHint ) {
 			params.id_token_hint = idTokenHint;
-		} else if ( account.email ) {
+		} else if ( account?.email ) {
 			params.login_hint = account.email;
 		}
 		if ( signInOptions.reconsent ) {
