@@ -102,7 +102,10 @@ export type ChatGptSignInOutcome =
 export interface ChatGptSignInOptions {
 	/** Shows ChatGPT's consent screen again, to grant a permission declined before. */
 	reconsent?: boolean;
-	/** Where the tokens are kept: the vault (the default), or this app's memory only. */
+	/**
+	 * Where the tokens are kept: the vault, or this app's memory only. A new
+	 * registration goes to the vault, and one signed in again stays where it is.
+	 */
 	storage?: ChatGptCredentialStorage;
 }
 
@@ -241,6 +244,10 @@ interface Attempt {
 }
 
 const randomValue = () => randomBytes( 32 ).toString( 'base64url' );
+
+// Whatever an untyped caller passes, only these two count as a choice.
+const isCredentialStorage = ( value: unknown ): value is ChatGptCredentialStorage =>
+	value === 'vault' || value === 'session';
 
 function isSameText( value: string, expected: string ): boolean {
 	const actual = Buffer.from( value );
@@ -618,7 +625,9 @@ export function createChatGptSignInFlow(
 						clientId: account.clientId,
 				  }
 				: null,
-			storage: signInOptions.storage === 'session' ? 'session' : 'vault',
+			storage: isCredentialStorage( signInOptions.storage )
+				? signInOptions.storage
+				: account?.storage ?? 'vault',
 			authServer,
 			redirectUri: `http://${ CALLBACK_HOST }:${ port }${ CALLBACK_PATH }`,
 			state: randomValue(),

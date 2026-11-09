@@ -420,6 +420,51 @@ describe( 'Signing in to ChatGPT', () => {
 			expect( ( await readChatGptAccount( existing.registrationId ) )?.state ).toBe( 'signed-in' );
 		} );
 
+		it( 'keeps a registration kept in memory there when it signs in again without being told otherwise', async () => {
+			const registrationId = registrationOf(
+				( await signIn( undefined, { storage: 'session' } ) ).outcome
+			);
+			// Most likely why it was kept out of the vault.
+			keychain.state.available = false;
+
+			const again = await signIn( registrationId );
+			const reconsented = await signIn( registrationId, { reconsent: true } );
+			const unreadable = await signIn( registrationId, {
+				storage: 'test-no-such-storage',
+			} as unknown as ChatGptSignInOptions );
+
+			for ( const { outcome } of [ again, reconsented, unreadable ] ) {
+				expect( outcome ).toMatchObject( { ok: true, registrationId } );
+			}
+			expect( ( await readChatGptAccount( registrationId ) )?.storage ).toBe( 'session' );
+			expect( vaultFiles() ).toEqual( [] );
+			await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
+				fake.issued[ 3 ].accessToken
+			);
+		} );
+
+		it( 'moves a registration between the vault and memory only when a sign-in says so', async () => {
+			const registrationId = registrationOf( ( await signIn() ).outcome );
+
+			await signIn( registrationId );
+			const keptInVault = await readChatGptAccount( registrationId );
+			const vaultedFiles = vaultFiles();
+			await signIn( registrationId, { storage: 'session' } );
+			const keptInMemory = await readChatGptAccount( registrationId );
+			const memoryFiles = vaultFiles();
+			await signIn( registrationId, { storage: 'vault' } );
+
+			expect( keptInVault?.storage ).toBe( 'vault' );
+			expect( vaultedFiles ).toEqual( [ `${ registrationId }.vault` ] );
+			expect( keptInMemory?.storage ).toBe( 'session' );
+			expect( memoryFiles ).toEqual( [] );
+			expect( ( await readChatGptAccount( registrationId ) )?.storage ).toBe( 'vault' );
+			expect( vaultFiles() ).toEqual( [ `${ registrationId }.vault` ] );
+			await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
+				fake.issued[ 3 ].accessToken
+			);
+		} );
+
 		it( 'won’t begin for a registration Studio doesn’t have', async () => {
 			const error = await flow.begin( '00000000-0000-4000-8000-000000000000' ).catch( ( e ) => e );
 
