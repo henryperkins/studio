@@ -10,6 +10,7 @@ import {
 	type AiSettings,
 } from '@studio/agent/protocol/providers';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import type { ChatGptErrorSummary } from '@studio/agent/protocol/chatgpt-errors';
 import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
 
 /**
@@ -109,6 +110,8 @@ export interface ChatGptModelAvailability {
 	checkedAt: string | null;
 	/** The listed models Studio supports, in the list's order, or null while unknown. */
 	models: Array< { id: string; label: string } > | null;
+	/** Why the latest read failed, or null. A failed read keeps the list read at the same revision. */
+	lastError: ChatGptErrorSummary | null;
 }
 
 const LEGACY_CONNECTION_REVISION = 0;
