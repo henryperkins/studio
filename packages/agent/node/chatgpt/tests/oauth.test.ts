@@ -1190,6 +1190,27 @@ describe( 'Signing in to ChatGPT', () => {
 			}
 		);
 
+		it.each( CHATGPT_TERMINAL_REFRESH_ERRORS )(
+			'reads a server error as a failure that may pass, even one that carries %s',
+			async ( code ) => {
+				const client = createChatGptTokenClient( { discoveryUrl: fake.discoveryUrl } );
+
+				fake.script.token = () => ( { status: 503, body: { error: code } } );
+				const oauthShape = await client.refresh( request() );
+				fake.script.token = () => ( { status: 500, body: { error: { code } } } );
+				const objectShape = await client.refresh( request() );
+
+				expect( oauthShape ).toEqual( {
+					ok: false,
+					error: { kind: 'transient', code, status: 503 },
+				} );
+				expect( objectShape ).toEqual( {
+					ok: false,
+					error: { kind: 'transient', code, status: 500 },
+				} );
+			}
+		);
+
 		it( 'reads anything else as a failure that may pass, keeping the credentials', async () => {
 			const client = createChatGptTokenClient( { discoveryUrl: fake.discoveryUrl } );
 			const answers = [

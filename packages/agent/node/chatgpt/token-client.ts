@@ -170,13 +170,13 @@ async function requestTokens(
 			: { ok: false, error: { kind: 'transient', code: 'invalid_response', status: 200 } };
 	}
 	const code = readErrorCode( response.body );
+	// A server error may pass, whatever code it carries.
+	const terminal =
+		response.status < 500 && code !== undefined && CHATGPT_TERMINAL_REFRESH_ERRORS.includes( code );
 	return {
 		ok: false,
 		error: {
-			kind:
-				code !== undefined && CHATGPT_TERMINAL_REFRESH_ERRORS.includes( code )
-					? 'terminal'
-					: 'transient',
+			kind: terminal ? 'terminal' : 'transient',
 			...( code !== undefined ? { code } : {} ),
 			status: response.status,
 		},
