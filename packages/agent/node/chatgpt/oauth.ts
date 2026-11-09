@@ -7,7 +7,9 @@ import {
 	ChatGptConnectionError,
 	getChatGptHostId,
 	isIssuedChatGptClientId,
+	isSameChatGptIdentity,
 	readChatGptAccount,
+	readChatGptAccounts,
 	type ChatGptAccount,
 	type ChatGptCredentialStorage,
 } from '@studio/agent/node/chatgpt/account-store';
@@ -19,6 +21,7 @@ import {
 } from '@studio/agent/node/chatgpt/credential-broker';
 import {
 	CHATGPT_RESOURCE,
+	createChatGptTokenClient,
 	discoverChatGptAuthServer,
 	exchangeChatGptAuthorizationCode,
 	type ChatGptAuthServer,
@@ -68,6 +71,8 @@ const ID_TOKEN_CLOCK_TOLERANCE_S = 5 * 60;
 // An ID token is issued during its attempt, so it is never older than one.
 const ID_TOKEN_MAX_AGE_S = CHATGPT_SIGN_IN_TIMEOUT_MS / 1000;
 const KEY_SET_TIMEOUT_MS = 30_000;
+// Revoking a failed attempt's tokens holds up its outcome this long at most.
+const REVOKE_TIMEOUT_MS = 10_000;
 // How long `waitForChatGptSignIn` can still read a finished attempt's outcome.
 const OUTCOME_RETENTION_MS = 10 * 60_000;
 // Port 0 can't collide; should listening still fail that way, the system picks again.
@@ -227,6 +232,12 @@ interface PendingAttempt {
 	codeVerifier: string;
 }
 
+/** The account a verified ID token names. */
+interface VerifiedIdentity {
+	subject: string;
+	email: string | null;
+}
+
 interface Attempt {
 	attemptId: string;
 	/** Gone, with its secrets, once the attempt is over. */
@@ -364,6 +375,7 @@ export function createChatGptSignInFlow(
 	};
 	const attempts = new Map< string, Attempt >();
 	const keySets = new Map< string, ReturnType< typeof createRemoteJWKSet > >();
+	const tokenClient = createChatGptTokenClient( { discoveryUrl: options.discoveryUrl } );
 
 	// Cached; fetched again, once per verification, when a token names a key it doesn't hold.
 	function keySetFor( jwksUri: string ) {
@@ -395,7 +407,7 @@ export function createChatGptSignInFlow(
 		idToken: string,
 		pending: PendingAttempt,
 		clientId: string
-	): Promise< { subject: string; email: string | null } | null > {
+	): Promise< VerifiedIdentity | null > {
 		try {
 			const { payload } = await jwtVerify( idToken, keySetFor( pending.authServer.jwksUri ), {
 				issuer: pending.authServer.issuer,
@@ -419,6 +431,42 @@ export function createChatGptSignInFlow(
 		} catch {
 			return null;
 		}
+	}
+
+	/**
+	 * Whether the grant a failed attempt was issued can go without ending a
+	 * saved session: another account's, or a new registration's whose client
+	 * no registration uses. One for the registration's own account, or one
+	 * whose account isn't known, shares the saved session's client and maybe
+	 * its grant, so it stays.
+	 */
+	async function isUnsharedGrant(
+		pending: PendingAttempt,
+		clientId: string,
+		identity: VerifiedIdentity | null
+	): Promise< boolean > {
+		if ( pending.registration ) {
+			return (
+				identity !== null &&
+				! isSameChatGptIdentity( pending.registration, {
+					issuer: pending.authServer.issuer,
+					subject: identity.subject,
+				} )
+			);
+		}
+		try {
+			const accounts = await readChatGptAccounts();
+			return ! accounts.some( ( account ) => account.clientId === clientId );
+		} catch {
+			return false;
+		}
+	}
+
+	// Bounded and silent: whatever comes of it, the outcome stays as it is.
+	async function revokeQuietly( clientId: string, refreshToken: string ): Promise< void > {
+		await tokenClient
+			.revoke( { clientId, refreshToken, signal: AbortSignal.timeout( REVOKE_TIMEOUT_MS ) } )
+			.catch( () => undefined );
 	}
 
 	function finish( attempt: Attempt, outcome: ChatGptSignInOutcome ): void {
@@ -483,26 +531,38 @@ export function createChatGptSignInFlow(
 			);
 		}
 		const { refreshToken, idToken, ...tokens } = exchange.value;
+		// From here a failure leaves a live grant behind: it goes where no saved session can share it.
+		const discard = async (
+			code: ChatGptSignInFailureCode,
+			identity: VerifiedIdentity | null = null
+		): Promise< ChatGptSignInOutcome > => {
+			if ( refreshToken && ( await isUnsharedGrant( pending, clientId, identity ) ) ) {
+				await revokeQuietly( clientId, refreshToken );
+			}
+			return failure( code );
+		};
 		if ( ! refreshToken || ! idToken ) {
-			return failure( 'token-exchange-failed' );
+			return discard( 'token-exchange-failed' );
 		}
 		const identity = await verifyIdToken( idToken, pending, clientId );
 		if ( ! identity ) {
-			return failure( 'id-token-invalid' );
+			return discard( 'id-token-invalid' );
 		}
 		if (
 			pending.registration &&
-			( identity.subject !== pending.registration.subject ||
-				pending.authServer.issuer !== pending.registration.issuer )
+			! isSameChatGptIdentity( pending.registration, {
+				issuer: pending.authServer.issuer,
+				subject: identity.subject,
+			} )
 		) {
-			return failure( 'identity-mismatch' );
+			return discard( 'identity-mismatch', identity );
 		}
 		// A verified identity alone doesn't let Studio use the plan.
 		if ( ! ( tokens.scope ?? '' ).split( /\s+/ ).includes( CHATGPT_DIRECT_USE_SCOPE ) ) {
-			return failure( 'permission-missing' );
+			return discard( 'permission-missing', identity );
 		}
 		if ( attempt.status !== 'completing' ) {
-			return failure( 'cancelled' );
+			return discard( 'cancelled', identity );
 		}
 
 		attempt.status = 'committing';
@@ -523,7 +583,7 @@ export function createChatGptSignInFlow(
 				email: account.email,
 			};
 		} catch ( error ) {
-			return failure( commitFailureCode( error ) );
+			return discard( commitFailureCode( error ), identity );
 		}
 	}
 

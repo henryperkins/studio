@@ -62,6 +62,8 @@ interface Answer {
 export interface FakeAuthorizationServerScript {
 	/** Answers discovery instead of the server's own document, which it is given. */
 	discovery?: ( document: Record< string, string > ) => Answer;
+	/** The client a first sign-in is issued: a new one each time by default. */
+	issueClient?: () => string;
 	/** Rewrites the parameters the browser is sent back to the callback with. */
 	callback?: ( params: Record< string, string > ) => Record< string, string >;
 	/** Rewrites an ID token's claims before it is signed. */
@@ -194,7 +196,7 @@ export async function startFakeAuthorizationServer(
 		const params: Record< string, string > = { state: query.get( 'state' ) ?? '' };
 		// A first sign-in registers a client; signing in again keeps the account's.
 		if ( clientId === REGISTRATION_CLIENT_ID ) {
-			clientId = `test-issued-client-${ ++clients }`;
+			clientId = fake.script.issueClient?.() ?? `test-issued-client-${ ++clients }`;
 			params.client_id = clientId;
 		}
 		const code = `test-auth-code-${ ++serial }`;

@@ -38,6 +38,7 @@ import {
 	signIdToken,
 	startFakeAuthorizationServer,
 	type FakeAuthorizationServer,
+	type FakeAuthorizationServerScript,
 	type SigningKey,
 } from './fixtures/fake-authorization-server';
 import type { AddressInfo } from 'node:net';
@@ -687,6 +688,14 @@ describe( 'Signing in to ChatGPT', () => {
 			expect( query( 1 ) ).toMatchObject( { login_hint: 'someone@example.com' } );
 			expect( outcome ).toEqual( failed( 'vault-unavailable' ) );
 			expect( added.outcome ).toEqual( failed( 'vault-unavailable' ) );
+			// The new registration's grant goes; the account's own one is left to its saved session.
+			expect( fake.revokeRequests.map( ( form ) => Object.fromEntries( form ) ) ).toEqual( [
+				{
+					token: fake.issued[ 2 ].refreshToken,
+					token_type_hint: 'refresh_token',
+					client_id: 'test-issued-client-2',
+				},
+			] );
 			keychain.state.available = true;
 			await expectUntouched( existing );
 		} );
@@ -912,6 +921,110 @@ describe( 'Signing in to ChatGPT', () => {
 		it( 'reports an attempt it doesn’t know', async () => {
 			expect( await flow.wait( 'test-unknown-attempt' ) ).toEqual( failed( 'unknown-attempt' ) );
 			expect( flow.cancel( 'test-unknown-attempt' ) ).toBe( false );
+		} );
+	} );
+
+	describe( 'the tokens a failed sign-in was issued', () => {
+		const withoutPlan = 'openid profile email offline_access resource.invoke';
+		const revoked = () => fake.revokeRequests.map( ( form ) => Object.fromEntries( form ) );
+		const revocationOf = ( issued: number, clientId: string ) => ( {
+			token: fake.issued[ issued ].refreshToken,
+			token_type_hint: 'refresh_token',
+			client_id: clientId,
+		} );
+
+		it.each< [ string, ( script: FakeAuthorizationServerScript ) => void ] >( [
+			[
+				'lacks the permission to use the plan',
+				( script ) => {
+					script.grantedScope = withoutPlan;
+				},
+			],
+			[
+				'brings an ID token that doesn’t verify',
+				( script ) => {
+					script.idTokenClaims = ( claims ) => ( { ...claims, nonce: 'test-other-nonce' } );
+				},
+			],
+		] )(
+			'are revoked, with its issued client, when a new registration %s',
+			async ( _name, misbehave ) => {
+				const existing = await signInExisting();
+				misbehave( fake.script );
+
+				const { outcome } = await signIn();
+
+				expect( outcome.ok ).toBe( false );
+				expect( revoked() ).toEqual( [ revocationOf( 1, 'test-issued-client-2' ) ] );
+				await expectUntouched( existing );
+			}
+		);
+
+		it( 'are revoked when another account signs in to a registration', async () => {
+			const existing = await signInExisting();
+			fake.account = { subject: 'test-subject-2', email: 'other@example.com' };
+
+			const { outcome } = await signIn( existing.registrationId );
+
+			expect( outcome ).toEqual( failed( 'identity-mismatch' ) );
+			expect( revoked() ).toEqual( [ revocationOf( 1, 'test-issued-client-1' ) ] );
+			await expectUntouched( existing );
+		} );
+
+		it( 'are left when the registration’s own account signs in, or one that can’t be verified, so its session goes on', async () => {
+			const existing = await signInExisting();
+			fake.script.grantedScope = withoutPlan;
+			const unpermitted = await signIn( existing.registrationId );
+			fake.script.grantedScope = undefined;
+			fake.script.idTokenClaims = ( claims ) => ( { ...claims, nonce: 'test-other-nonce' } );
+			const unverified = await signIn( existing.registrationId );
+
+			expect( unpermitted.outcome ).toEqual( failed( 'permission-missing' ) );
+			expect( unverified.outcome ).toEqual( failed( 'id-token-invalid' ) );
+			expect( fake.revokeRequests ).toEqual( [] );
+			await expectUntouched( existing );
+		} );
+
+		it( 'are left when a registration Studio has already uses the client they were issued to', async () => {
+			const existing = await signInExisting();
+			fake.script.issueClient = () => 'test-issued-client-1';
+			fake.script.grantedScope = withoutPlan;
+
+			const { outcome } = await signIn();
+
+			expect( outcome ).toEqual( failed( 'permission-missing' ) );
+			expect( fake.revokeRequests ).toEqual( [] );
+			await expectUntouched( existing );
+		} );
+
+		it( 'are revoked when a new registration is cancelled while its ID token is verified', async () => {
+			const existing = await signInExisting();
+			const rotated = await createSigningKey( 'test-key-2' );
+			fake.keys = [ signingKey, rotated ];
+			fake.signingKey = rotated;
+			fake.script.jwksDelayMs = 300;
+			const start = await begin();
+			const delivered = deliver( await authorize( start.url ) );
+			await until( () => fake.counts.jwks === 2 );
+
+			expect( flow.cancel( start.attemptId ) ).toBe( true );
+			await delivered;
+
+			expect( await flow.wait( start.attemptId ) ).toEqual( failed( 'cancelled' ) );
+			expect( revoked() ).toEqual( [ revocationOf( 1, 'test-issued-client-2' ) ] );
+			await expectUntouched( existing );
+		} );
+
+		it( 'leave the outcome as it is when revoking them fails', async () => {
+			const existing = await signInExisting();
+			fake.script.grantedScope = withoutPlan;
+			fake.script.revoke = () => ( { status: 503 } );
+
+			const { outcome } = await signIn();
+
+			expect( outcome ).toEqual( failed( 'permission-missing' ) );
+			expect( revoked() ).toEqual( [ revocationOf( 1, 'test-issued-client-2' ) ] );
+			await expectUntouched( existing );
 		} );
 	} );
 
