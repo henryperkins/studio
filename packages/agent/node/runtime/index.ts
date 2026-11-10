@@ -870,7 +870,7 @@ async function createModelRuntime(
 			connectionId: routing.turn.connectionId,
 			getAccessToken: () => routing.turn.getAccessToken(),
 			signal: routing.turn.signal,
-			invalidateAccessToken: () => routing.turn.invalidateAccessToken(),
+			invalidateAccessToken: ( token ) => routing.turn.invalidateAccessToken( token ),
 			reasoningEffort: routing.reasoningEffort,
 		};
 		modelRuntime.registerProvider(

@@ -183,8 +183,8 @@ export interface ChatGptTurnHandle {
 	getAccessToken(): Promise< string >;
 	/** Before each tool call: the same check. */
 	assertActive(): Promise< void >;
-	/** The route rejected the current access token: the next token is refreshed. */
-	invalidateAccessToken(): Promise< void >;
+	/** Invalidates the rejected token only if it has not already been replaced. */
+	invalidateAccessToken( rejectedAccessToken: string ): Promise< void >;
 	/** Once the turn has settled, however it ended. */
 	end(): void;
 }
@@ -199,8 +199,8 @@ export interface ChatGptCredentialBrokerOptions {
 export interface ChatGptCredentialBroker {
 	saveSignIn( signIn: ChatGptSignIn ): Promise< ChatGptAccount >;
 	getAccessToken( connectionId: string ): Promise< string >;
-	/** Drops the current access token so the next `getAccessToken` refreshes once. */
-	invalidateAccessToken( connectionId: string ): Promise< void >;
+	/** Drops only the rejected access token, preserving any newer token. */
+	invalidateAccessToken( connectionId: string, rejectedAccessToken: string ): Promise< void >;
 	/** The ID token to send as `id_token_hint` when signing in again, or null. */
 	readIdTokenHint( connectionId: string ): Promise< string | null >;
 	beginTurn( connectionId: string ): Promise< ChatGptTurnHandle >;
@@ -242,6 +242,22 @@ type Renewal =
 interface AccessToken {
 	accessToken: string;
 	expiresAt: number;
+	tokenGeneration: string;
+	logoutGeneration: number;
+}
+
+interface SessionCredentials {
+	record: CredentialRecord;
+	logoutGeneration: number;
+	tokenGeneration: string;
+}
+
+type RevocationCredentials = Pick< CredentialRecord, 'clientId' | 'refreshToken' >;
+
+interface SessionSignOut {
+	/** Known once this sign-out has advanced the account's generation. */
+	logoutGeneration?: number;
+	credentials: Map< number, RevocationCredentials >;
 }
 
 interface ActiveTurn {
@@ -435,7 +451,8 @@ async function callTokenService< T >(
 
 function requestParentToken(
 	channel: ParentChannel,
-	connectionId: string
+	connectionId: string,
+	logoutGeneration: number
 ): Promise< AccessToken | null > {
 	return new Promise( ( resolve ) => {
 		const requestId = randomUUID();
@@ -446,10 +463,15 @@ function requestParentToken(
 		};
 		const onMessage = ( message: unknown ) => {
 			if ( isMessageOfType( message, SESSION_TOKEN_REPLY ) && message.requestId === requestId ) {
-				const { accessToken, expiresAt } = message;
+				const { accessToken, expiresAt, tokenGeneration } = message;
 				finish(
-					isNonEmptyString( accessToken ) && typeof expiresAt === 'number'
-						? { accessToken, expiresAt }
+					message.connectionId === connectionId &&
+						message.logoutGeneration === logoutGeneration &&
+						isNonEmptyString( accessToken ) &&
+						typeof expiresAt === 'number' &&
+						Number.isFinite( expiresAt ) &&
+						isChatGptRegistrationId( tokenGeneration )
+						? { accessToken, expiresAt, tokenGeneration, logoutGeneration }
 						: null
 				);
 			}
@@ -458,11 +480,14 @@ function requestParentToken(
 		const timer = setTimeout( () => finish( null ), SESSION_TOKEN_REPLY_TIMEOUT_MS );
 		channel.on( 'message', onMessage );
 		try {
-			channel.send?.( { type: SESSION_TOKEN_REQUEST, requestId, connectionId }, ( error ) => {
-				if ( error ) {
-					finish( null );
+			channel.send?.(
+				{ type: SESSION_TOKEN_REQUEST, requestId, connectionId, logoutGeneration },
+				( error ) => {
+					if ( error ) {
+						finish( null );
+					}
 				}
-			} );
+			);
 		} catch {
 			finish( null );
 		}
@@ -491,14 +516,16 @@ export function createChatGptCredentialBroker(
 	const timing: ChatGptBrokerTiming = { ...DEFAULT_TIMING, ...options.timing };
 	let wrappingKey: Buffer | null = null;
 	// Session-only tokens this app holds, with the logout generation they belong to.
-	const sessions = new Map< string, { record: CredentialRecord; logoutGeneration: number } >();
+	const sessions = new Map< string, SessionCredentials >();
 	const sessionQueues = new Map< string, Promise< unknown > >();
+	// Pruning can remove active credentials while sign-out waits for a fork or refresh.
+	const sessionSignOuts = new Map< string, Set< SessionSignOut > >();
 	let stopWatchingSessions: ( () => void ) | null = null;
 	// In a turn forked by an app holding session-only tokens: how to ask it for them.
 	let parent: {
 		channel: ParentChannel;
 		offered: Set< string >;
-		tokens: Map< string, AccessToken & { logoutGeneration: number } >;
+		tokens: Map< string, AccessToken >;
 	} | null = null;
 	const turns = new Set< ActiveTurn >();
 
@@ -796,14 +823,45 @@ export function createChatGptCredentialBroker(
 		return next;
 	}
 
+	function retainSessionRevocation(
+		registrationId: string,
+		logoutGeneration: number,
+		record: CredentialRecord
+	): boolean {
+		let owned = false;
+		for ( const pending of sessionSignOuts.get( registrationId ) ?? [] ) {
+			if (
+				pending.logoutGeneration === undefined ||
+				pending.logoutGeneration === logoutGeneration
+			) {
+				pending.credentials.set( logoutGeneration, {
+					clientId: record.clientId,
+					refreshToken: record.refreshToken,
+				} );
+				owned ||= pending.logoutGeneration === logoutGeneration;
+			}
+		}
+		return owned;
+	}
+
+	const sessionAccessToken = ( session: SessionCredentials ): AccessToken => ( {
+		accessToken: session.record.accessToken,
+		expiresAt: session.record.expiresAt,
+		tokenGeneration: session.tokenGeneration,
+		logoutGeneration: session.logoutGeneration,
+	} );
+
 	// While this app holds a session-only sign-in, it watches for a sign-out
 	// anywhere, so it stops holding and offering tokens nothing should use.
 	function holdSession(
 		registrationId: string,
 		session: { record: CredentialRecord; logoutGeneration: number }
-	): void {
-		sessions.set( registrationId, session );
+	): SessionCredentials {
+		const held = { ...session, tokenGeneration: randomUUID() };
+		sessions.set( registrationId, held );
+		retainSessionRevocation( registrationId, held.logoutGeneration, held.record );
 		stopWatchingSessions ??= watchChatGptAccounts( pruneSessions, timing.accountsPollMs );
+		return held;
 	}
 
 	function dropSession( registrationId: string ): void {
@@ -849,7 +907,7 @@ export function createChatGptCredentialBroker(
 				throw new ChatGptConnectionError( 'session-unavailable' );
 			}
 			if ( isFresh( held.record.expiresAt ) ) {
-				return { accessToken: held.record.accessToken, expiresAt: held.record.expiresAt };
+				return sessionAccessToken( held );
 			}
 			const renewal = await renew( current, held.record );
 			if ( renewal.status === 'failed' ) {
@@ -861,11 +919,14 @@ export function createChatGptCredentialBroker(
 				throw new ChatGptConnectionError( 'needs-sign-in' );
 			}
 			if ( ! isUnchanged( await readChatGptAccount( registrationId ), logoutGeneration ) ) {
-				revokeQuietly( current.clientId, renewal.record.refreshToken );
+				if ( ! retainSessionRevocation( registrationId, logoutGeneration, renewal.record ) ) {
+					revokeQuietly( current.clientId, renewal.record.refreshToken );
+				}
 				throw new ChatGptConnectionError( 'signed-out' );
 			}
-			holdSession( registrationId, { record: renewal.record, logoutGeneration } );
-			return { accessToken: renewal.record.accessToken, expiresAt: renewal.record.expiresAt };
+			return sessionAccessToken(
+				holdSession( registrationId, { record: renewal.record, logoutGeneration } )
+			);
 		} );
 	}
 
@@ -881,12 +942,12 @@ export function createChatGptCredentialBroker(
 		if ( cached && cached.logoutGeneration === logoutGeneration && isFresh( cached.expiresAt ) ) {
 			return cached;
 		}
-		const token = await requestParentToken( parent.channel, registrationId );
+		const token = await requestParentToken( parent.channel, registrationId, logoutGeneration );
 		if ( ! token ) {
 			parent.tokens.delete( registrationId );
 			throw new ChatGptConnectionError( 'session-unavailable' );
 		}
-		parent.tokens.set( registrationId, { ...token, logoutGeneration } );
+		parent.tokens.set( registrationId, token );
 		return token;
 	}
 
@@ -897,34 +958,55 @@ export function createChatGptCredentialBroker(
 			: getVaultAccessToken( account );
 	}
 
-	async function invalidateAccessToken( connectionId: string ): Promise< void > {
+	function invalidateSessionToken(
+		connectionId: string,
+		matches: ( held: SessionCredentials ) => boolean
+	): Promise< void > {
+		return serializeSession( connectionId, async () => {
+			const held = sessions.get( connectionId );
+			if ( held && matches( held ) ) {
+				sessions.set( connectionId, {
+					...held,
+					record: { ...held.record, expiresAt: 0 },
+				} );
+			}
+		} );
+	}
+
+	async function invalidateAccessToken(
+		connectionId: string,
+		rejectedAccessToken: string
+	): Promise< void > {
+		const cached = parent?.tokens.get( connectionId );
 		const account = await readChatGptAccount( connectionId );
 		if ( ! account || account.state !== 'signed-in' ) {
 			return;
 		}
 		if ( account.storage === 'session' ) {
-			parent?.tokens.delete( connectionId );
-			// A token this process was handed came from the app that forked it:
-			// tell it, so it stops handing back the token the route rejected.
-			if ( parent?.offered.has( connectionId ) ) {
+			if ( parent && cached?.accessToken === rejectedAccessToken ) {
+				if ( parent.tokens.get( connectionId ) === cached ) {
+					parent.tokens.delete( connectionId );
+				}
 				try {
 					parent.channel.send?.(
-						{ type: SESSION_TOKEN_INVALIDATE, connectionId },
+						{
+							type: SESSION_TOKEN_INVALIDATE,
+							connectionId,
+							tokenGeneration: cached.tokenGeneration,
+							logoutGeneration: cached.logoutGeneration,
+						},
 						() => undefined
 					);
 				} catch {
 					// The app has gone; the next request fails closed anyway.
 				}
 			}
-			await serializeSession( connectionId, async () => {
-				const held = sessions.get( connectionId );
-				if ( held ) {
-					sessions.set( connectionId, {
-						...held,
-						record: { ...held.record, expiresAt: 0 },
-					} );
-				}
-			} );
+			await invalidateSessionToken(
+				connectionId,
+				( held ) =>
+					held.logoutGeneration === account.logoutGeneration &&
+					held.record.accessToken === rejectedAccessToken
+			);
 			return;
 		}
 		const unlock = await lockRefresh( connectionId ).catch( () => null );
@@ -933,12 +1015,17 @@ export function createChatGptCredentialBroker(
 		}
 		try {
 			const current = await readChatGptAccount( connectionId );
-			if ( ! current || current.state !== 'signed-in' || current.storage !== 'vault' ) {
+			if (
+				! current ||
+				current.state !== 'signed-in' ||
+				current.storage !== 'vault' ||
+				current.logoutGeneration !== account.logoutGeneration
+			) {
 				return;
 			}
 			const heldKey = await getWrappingKey().catch( () => null );
 			const { key, read } = await readRecordRetryingStaleKey( current, heldKey );
-			if ( read.status === 'ok' && key ) {
+			if ( read.status === 'ok' && key && read.record.accessToken === rejectedAccessToken ) {
 				await writeSealedRecord(
 					connectionId,
 					sealRecord( key, { ...read.record, expiresAt: 0 } )
@@ -1105,8 +1192,9 @@ export function createChatGptCredentialBroker(
 				}
 				return token;
 			},
-			async invalidateAccessToken() {
-				await invalidateAccessToken( connectionId );
+			async invalidateAccessToken( rejectedAccessToken ) {
+				await assertActive();
+				await invalidateAccessToken( connectionId, rejectedAccessToken );
 			},
 			end() {
 				stopWatching();
@@ -1146,42 +1234,61 @@ export function createChatGptCredentialBroker(
 		if ( ! isChatGptRegistrationId( connectionId ) ) {
 			throw new ChatGptConnectionError( 'not-found' );
 		}
-		const account = await startChatGptSignOut( connectionId );
-		// Only a sign-in begun since then can mark the account signed in again.
-		const signedInSince = async () =>
-			( await readChatGptAccount( connectionId ).catch( () => null ) )?.state === 'signed-in';
-		await endTurns( connectionId );
-		parent?.tokens.delete( connectionId );
-		const session = await serializeSession( connectionId, async () => {
-			if ( await signedInSince() ) {
-				return undefined;
-			}
-			const held = sessions.get( connectionId );
-			dropSession( connectionId );
-			return held;
-		} );
-		const key = await getWrappingKey().catch( () => null );
-		// A refresh holds the lock for one request at most; a lock left by a
-		// process that died doesn't keep the user from signing out.
-		const unlock = await lockRefresh( connectionId ).catch( () => null );
+		const pending: SessionSignOut = { credentials: new Map() };
+		const held = sessions.get( connectionId );
+		if ( held ) {
+			pending.credentials.set( held.logoutGeneration, {
+				clientId: held.record.clientId,
+				refreshToken: held.record.refreshToken,
+			} );
+		}
+		const signingOut = sessionSignOuts.get( connectionId ) ?? new Set< SessionSignOut >();
+		signingOut.add( pending );
+		sessionSignOuts.set( connectionId, signingOut );
 		try {
-			if ( await signedInSince() ) {
-				return {
-					localCleared: true,
-					remoteRevocationConfirmed: session
-						? await revoke( account.clientId, session.record.refreshToken )
-						: false,
-				};
+			const account = await startChatGptSignOut( connectionId );
+			const logoutGeneration = account.logoutGeneration - 1;
+			pending.logoutGeneration = logoutGeneration;
+			for ( const generation of pending.credentials.keys() ) {
+				if ( generation !== logoutGeneration ) {
+					pending.credentials.delete( generation );
+				}
 			}
-			const vault = await readRecordRetryingStaleKey( account, key ).catch( () => null );
-			const record = session?.record ?? ( vault?.read.status === 'ok' ? vault.read.record : null );
-			const remoteRevocationConfirmed = record
-				? await revoke( account.clientId, record.refreshToken )
-				: false;
-			const localCleared = await removeRecord( connectionId );
-			return { localCleared, remoteRevocationConfirmed };
+			await endTurns( connectionId );
+			parent?.tokens.delete( connectionId );
+			const key = await getWrappingKey().catch( () => null );
+			const unlock = await lockRefresh( connectionId ).catch( () => null );
+			try {
+				// Wait for an in-flight session refresh to retain its rotated credential.
+				await serializeSession( connectionId, async () => {
+					const current = sessions.get( connectionId );
+					if ( current && current.logoutGeneration <= logoutGeneration ) {
+						dropSession( connectionId );
+					}
+				} );
+				// A newer sign-in may share the old grant; revoking it could end that sign-in too.
+				if ( ( await readChatGptAccount( connectionId ) )?.state === 'signed-in' ) {
+					return { localCleared: true, remoteRevocationConfirmed: false };
+				}
+				const session = pending.credentials.get( logoutGeneration );
+				const vault = session
+					? null
+					: await readRecordRetryingStaleKey( account, key ).catch( () => null );
+				const record = session ?? ( vault?.read.status === 'ok' ? vault.read.record : null );
+				const remoteRevocationConfirmed = record
+					? await revoke( record.clientId, record.refreshToken )
+					: false;
+				const localCleared = await removeRecord( connectionId );
+				return { localCleared, remoteRevocationConfirmed };
+			} finally {
+				await unlock?.();
+			}
 		} finally {
-			await unlock?.();
+			pending.credentials.clear();
+			signingOut.delete( pending );
+			if ( ! signingOut.size ) {
+				sessionSignOuts.delete( connectionId );
+			}
 		}
 	}
 
@@ -1221,16 +1328,22 @@ export function createChatGptCredentialBroker(
 		if ( ! isMessageOfType( message, SESSION_TOKEN_REQUEST ) ) {
 			return false;
 		}
-		const { requestId, connectionId } = message;
+		const { requestId, connectionId, logoutGeneration } = message;
 		void ( async () => {
 			let token: AccessToken | null = null;
 			// Only a session-only sign-in this app holds is handed over; a turn
 			// reads a stored one itself.
-			if ( typeof connectionId === 'string' && sessions.has( connectionId ) ) {
+			if (
+				typeof connectionId === 'string' &&
+				typeof logoutGeneration === 'number' &&
+				Number.isSafeInteger( logoutGeneration ) &&
+				logoutGeneration >= 0 &&
+				sessions.has( connectionId )
+			) {
 				try {
 					await pruneSession( connectionId );
 					if ( sessions.has( connectionId ) ) {
-						token = await renewSession( await requireSignedIn( connectionId ) );
+						token = await renewSession( await requireUnchanged( connectionId, logoutGeneration ) );
 					}
 				} catch {
 					token = null;
@@ -1243,6 +1356,8 @@ export function createChatGptCredentialBroker(
 					connectionId,
 					accessToken: token?.accessToken ?? null,
 					expiresAt: token?.expiresAt ?? null,
+					tokenGeneration: token?.tokenGeneration ?? null,
+					logoutGeneration: token?.logoutGeneration ?? null,
 				} );
 			} catch {
 				// The turn has gone.
@@ -1255,18 +1370,20 @@ export function createChatGptCredentialBroker(
 		if ( ! isMessageOfType( message, SESSION_TOKEN_INVALIDATE ) ) {
 			return false;
 		}
-		const { connectionId } = message;
-		if ( typeof connectionId === 'string' ) {
-			// Zero a held token synchronously, so a request that arrives right
-			// after this message can't be handed the rejected token again.
-			const held = sessions.get( connectionId );
-			if ( held ) {
-				sessions.set( connectionId, {
-					...held,
-					record: { ...held.record, expiresAt: 0 },
-				} );
-			}
-			void invalidateAccessToken( connectionId ).catch( () => undefined );
+		const { connectionId, tokenGeneration, logoutGeneration } = message;
+		if (
+			isChatGptRegistrationId( connectionId ) &&
+			isChatGptRegistrationId( tokenGeneration ) &&
+			typeof logoutGeneration === 'number' &&
+			Number.isSafeInteger( logoutGeneration ) &&
+			logoutGeneration >= 0
+		) {
+			// Enqueue before the next IPC request, comparing again after any refresh finishes.
+			void invalidateSessionToken(
+				connectionId,
+				( held ) =>
+					held.tokenGeneration === tokenGeneration && held.logoutGeneration === logoutGeneration
+			).catch( () => undefined );
 		}
 		return true;
 	}
@@ -1333,9 +1450,12 @@ export function getChatGptAccessToken( connectionId: string ): Promise< string >
 	return getAppBroker().getAccessToken( connectionId );
 }
 
-/** Drops the connection's current access token, so the next one is refreshed. */
-export function invalidateChatGptAccessToken( connectionId: string ): Promise< void > {
-	return getAppBroker().invalidateAccessToken( connectionId );
+/** Drops only the access token that the route rejected. */
+export function invalidateChatGptAccessToken(
+	connectionId: string,
+	rejectedAccessToken: string
+): Promise< void > {
+	return getAppBroker().invalidateAccessToken( connectionId, rejectedAccessToken );
 }
 
 /** The verified ID token kept for the connection, to send as `id_token_hint` when signing in again. */

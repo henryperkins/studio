@@ -90,7 +90,7 @@ export async function fetchChatGptModels(
 	signal?: AbortSignal,
 	options: {
 		getAccessToken?: ChatGptTokenSource;
-		invalidateAccessToken?: () => Promise< void >;
+		invalidateAccessToken?: ( rejectedAccessToken: string ) => Promise< void >;
 	} = {}
 ): Promise< ChatGptModelListResult > {
 	const timeout = AbortSignal.timeout( MODEL_LIST_TIMEOUT_MS );
@@ -100,7 +100,8 @@ export async function fetchChatGptModels(
 			endpoint: 'models',
 			getAccessToken: options.getAccessToken ?? ( () => getChatGptAccessToken( connectionId ) ),
 			invalidateAccessToken:
-				options.invalidateAccessToken ?? ( () => invalidateChatGptAccessToken( connectionId ) ),
+				options.invalidateAccessToken ??
+				( ( token ) => invalidateChatGptAccessToken( connectionId, token ) ),
 			signal: signal ? AbortSignal.any( [ signal, timeout ] ) : timeout,
 		} );
 	} catch ( error ) {

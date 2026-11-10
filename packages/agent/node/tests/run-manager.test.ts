@@ -52,13 +52,19 @@ vi.mock( '@studio/agent/node/chatgpt/credential-broker', () => ( {
 		) {
 			return false;
 		}
-		const { requestId, connectionId } = message as { requestId?: unknown; connectionId?: unknown };
+		const { requestId, connectionId, logoutGeneration } = message as {
+			requestId?: unknown;
+			connectionId?: unknown;
+			logoutGeneration?: unknown;
+		};
 		reply( {
 			type: 'studio.chatgpt-session-token',
 			requestId,
 			connectionId,
 			accessToken: 'test-access-token-run-manager',
 			expiresAt: Date.now() + 3_600_000,
+			tokenGeneration: 'c1841277-61a7-47d4-b65b-06b593717972',
+			logoutGeneration,
 		} );
 		return true;
 	},
@@ -231,6 +237,7 @@ describe( 'createAgentRunManager ChatGPT session tokens', () => {
 			type: 'studio.chatgpt-session-token.request',
 			requestId: 'request-1',
 			connectionId: CONNECTION_ID,
+			logoutGeneration: 0,
 		} );
 
 		expect( child.send ).toHaveBeenCalledWith(
@@ -238,6 +245,8 @@ describe( 'createAgentRunManager ChatGPT session tokens', () => {
 				type: 'studio.chatgpt-session-token',
 				requestId: 'request-1',
 				connectionId: CONNECTION_ID,
+				tokenGeneration: 'c1841277-61a7-47d4-b65b-06b593717972',
+				logoutGeneration: 0,
 			} )
 		);
 		expect( JSON.stringify( emit.mock.calls ) ).not.toContain( 'chatgpt-session-token' );
@@ -248,6 +257,8 @@ describe( 'createAgentRunManager ChatGPT session tokens', () => {
 		const message = {
 			type: 'studio.chatgpt-session-token.invalidate',
 			connectionId: CONNECTION_ID,
+			tokenGeneration: 'c1841277-61a7-47d4-b65b-06b593717972',
+			logoutGeneration: 0,
 		};
 
 		child.emit( 'message', message );

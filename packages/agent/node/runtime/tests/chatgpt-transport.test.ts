@@ -1157,11 +1157,11 @@ describe( 'the ChatGPT transport', () => {
 
 		it( 'invalidates a rejected token, and a 401 on the fresh token is an authorization failure', async () => {
 			let currentToken = TOKEN;
-			let invalidations = 0;
+			const invalidations: string[] = [];
 			const snapshot = snapshotFor( 'medium', {
 				getAccessToken: async () => currentToken,
-				invalidateAccessToken: async () => {
-					invalidations++;
+				invalidateAccessToken: async ( rejectedAccessToken ) => {
+					invalidations.push( rejectedAccessToken );
 					currentToken = 'fresh-test-chatgpt-token';
 				},
 			} );
@@ -1176,7 +1176,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 			expectFailure( first );
-			expect( invalidations ).toBe( 1 );
+			expect( invalidations ).toEqual( [ TOKEN ] );
 			expect( http.spy ).toHaveBeenCalledTimes( 1 );
 
 			const second = await streamTurn(
@@ -1190,7 +1190,7 @@ describe( 'the ChatGPT transport', () => {
 				'Bearer fresh-test-chatgpt-token'
 			);
 			expect( http.spy ).toHaveBeenCalledTimes( 2 );
-			expect( invalidations ).toBe( 2 );
+			expect( invalidations ).toEqual( [ TOKEN, 'fresh-test-chatgpt-token' ] );
 		} );
 
 		it.each( [
