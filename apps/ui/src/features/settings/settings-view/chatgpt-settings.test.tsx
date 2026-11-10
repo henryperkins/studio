@@ -157,6 +157,25 @@ describe( 'ChatGPT account settings', () => {
 		);
 	} );
 
+	it( 'refreshes local sign-out and explains unconfirmed remote revocation', async () => {
+		const { connector, settings } = await openSettings( { accounts: [ account() ] } );
+		connector.signOutChatGpt.mockImplementationOnce( async () => {
+			settings.accounts = [ { ...account(), state: 'signed-out', authStatus: 'disconnected' } ];
+			return { localCleared: true, remoteRevocationConfirmed: false };
+		} );
+		fireEvent.click( await screen.findByRole( 'button', { name: 'Sign out' } ) );
+
+		expect(
+			await screen.findByRole( 'status', { name: 'ChatGPT sign-in status' } )
+		).toHaveTextContent(
+			'Signed out locally. Remote revocation wasn’t confirmed; you can remove Studio in your ChatGPT account settings.'
+		);
+		expect( await screen.findByText( 'Signed out' ) ).toBeVisible();
+		expect( screen.getByRole( 'button', { name: 'Refresh models' } ) ).toBeDisabled();
+		expect( screen.queryByText( 'Connected' ) ).not.toBeInTheDocument();
+		expect( connector.signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( ACCOUNT_A );
+	} );
+
 	it( 'explains callback-host restrictions and keeps sign-in unavailable', async () => {
 		const { connector } = await openSettings( { signInSupported: false } );
 		expect( await screen.findByText( /Open Studio on localhost/ ) ).toBeVisible();

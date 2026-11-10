@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ChatGptSettingsError } from '@studio/agent/node/chatgpt/settings';
 import {
 	InvalidAnthropicApiKeyError,
 	readAiSettings,
@@ -37,6 +38,7 @@ describe( 'ai settings store', () => {
 
 	afterEach( () => {
 		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
 		if ( previousDevConfigDir === undefined ) {
 			delete process.env.DEV_CONFIG_DIR;
 		} else {
@@ -119,6 +121,29 @@ describe( 'ai settings store', () => {
 		await expect( setAiProvider( 'anthropic-api-key' ) ).rejects.toBeInstanceOf(
 			InvalidAnthropicApiKeyError
 		);
+	} );
+
+	it.each( [ '', '1' ] )(
+		'rejects a global ChatGPT default with the gate set to %j',
+		async ( gate ) => {
+			vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', gate );
+			const config = JSON.stringify( { version: 1, aiProvider: 'openai-api-key', locale: 'es' } );
+			fs.writeFileSync( sharedConfigPath(), config );
+
+			await expect( setAiProvider( 'chatgpt-oauth' ) ).rejects.toBeInstanceOf(
+				ChatGptSettingsError
+			);
+
+			expect( fs.readFileSync( sharedConfigPath(), 'utf8' ) ).toBe( config );
+			expect( fetch ).not.toHaveBeenCalled();
+		}
+	);
+
+	it( 'does not create global settings when ChatGPT is requested as the default', async () => {
+		await expect( setAiProvider( 'chatgpt-oauth' ) ).rejects.toThrow(
+			'Choose a ChatGPT account in a new chat instead of setting a default provider.'
+		);
+		expect( fs.existsSync( sharedConfigPath() ) ).toBe( false );
 	} );
 
 	it( 'clears the key, falls back to WordPress.com, and preserves unrelated fields', async () => {

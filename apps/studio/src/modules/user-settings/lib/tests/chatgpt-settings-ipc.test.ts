@@ -1,19 +1,29 @@
 // @vitest-environment node
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import {
 	beginChatGptSignIn as start,
 	cancelChatGptSignIn as cancel,
 	ChatGptSignInError,
 	waitForChatGptSignIn as finish,
 } from '@studio/agent/node/chatgpt/oauth';
+import { createFakeCredentialStore } from '@studio/agent/node/tests/fake-credential-store';
+import { writeFile } from 'atomically';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	beginChatGptSignIn,
 	cancelChatGptSignIn,
 	getChatGptSettings,
+	setAiProvider,
 	waitForChatGptSignIn,
 } from 'src/modules/user-settings/lib/ipc-handlers';
 import type { IpcMainInvokeEvent } from 'electron';
 
+vi.mock( '@studio/common/lib/os-credential-store', async ( original ) => ( {
+	...( await original< typeof import('@studio/common/lib/os-credential-store') >() ),
+	createOsCredentialStore: () => createFakeCredentialStore().store,
+} ) );
 vi.mock( '@studio/agent/node/chatgpt/oauth', async ( original ) => ( {
 	...( await original< object >() ),
 	beginChatGptSignIn: vi.fn(),
@@ -26,13 +36,26 @@ const ATTEMPT = 'b69a1ddf-d1a2-4ff6-b293-75c358ff42df';
 const PRIVATE_HINT = 'TEST_ONLY_RETURNING_ID_TOKEN';
 const PRIVATE_URL = `https://auth.example.test/authorize?id_token_hint=${ PRIVATE_HINT }`;
 const event = {} as IpcMainInvokeEvent;
-beforeEach( () => vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' ) );
-afterEach( () => {
+let configDir: string;
+beforeEach( async () => {
+	configDir = await mkdtemp( path.join( os.tmpdir(), 'studio-chatgpt-ipc-' ) );
+	vi.stubEnv( 'DEV_CONFIG_DIR', configDir );
+	vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' );
+} );
+afterEach( async () => {
 	vi.unstubAllEnvs();
 	vi.restoreAllMocks();
+	await rm( configDir, { recursive: true, force: true } );
 } );
 
 describe( 'ChatGPT desktop IPC boundary', () => {
+	it( 'rejects ChatGPT as a global default before writing settings', async () => {
+		await expect( setAiProvider( event, 'chatgpt-oauth' ) ).rejects.toThrow(
+			'Choose a ChatGPT account in a new chat instead of setting a default provider.'
+		);
+		expect( writeFile ).not.toHaveBeenCalled();
+	} );
+
 	it( 'projects returning sign-in results before they reach the renderer', async () => {
 		vi.mocked( start ).mockResolvedValueOnce( {
 			attemptId: ATTEMPT,

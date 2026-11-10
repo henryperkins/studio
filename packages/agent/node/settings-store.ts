@@ -7,6 +7,7 @@ import {
 	updateSharedConfigFrom,
 } from '@studio/common/lib/shared-config';
 import { __ } from '@wordpress/i18n';
+import { ChatGptSettingsError } from '@studio/agent/node/chatgpt/settings';
 import {
 	getSecureStorageStatus,
 	readOpenAiKeySource,
@@ -407,6 +408,13 @@ export async function saveAnthropicApiKey( key: string | null ): Promise< AiSett
  * Existing sessions keep the provider recorded in their session context.
  */
 export function setAiProvider( provider: AiProviderId ): Promise< AiSettings > {
+	if ( provider === 'chatgpt-oauth' ) {
+		return Promise.reject(
+			new ChatGptSettingsError(
+				__( 'Choose a ChatGPT account in a new chat instead of setting a default provider.' )
+			)
+		);
+	}
 	// In order with OpenAI key changes: a removal can't land between OpenAI's
 	// check and the write, and an earlier choice can't overwrite a later one.
 	return serializeOpenAiChange( async () => {

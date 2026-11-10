@@ -10,6 +10,16 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-08-subscription-connections-design.md`
 
+## Observed completion — November 10, 2026
+
+Tasks 1–3 and Task 4's implementation and offline qualification are complete on draft [PR #2](https://github.com/henryperkins/studio/pull/2). Task 4 at `1feb4ba11` passed Desktop and `studio ui` light/dark checks, Windows x64 packaging and nine Desktop end-to-end tests. These are observed results; the original acceptance checkboxes below remain requirements.
+
+The offline follow-up to `1feb4ba11` rejects `chatgpt-oauth` as a global default before writing settings, with settings-store, HTTP (400) and Desktop IPC regressions. Settings also covers local sign-out when remote revocation is unconfirmed. Verification: modified-file ESLint, repository typecheck, CLI build, and 127 tests across the settings-store, OpenAI settings, ChatGPT HTTP/IPC/Settings/CLI, and CLI auth suites.
+
+Still required with quota and explicit authorization: successful inference, disposable-site read/draft/readback, effort changes across turns, restart/resume, and session-only sign-out/revocation-race acceptance. Earlier live sign-in, model discovery, refresh and vault sign-out passed; the attempted turn stopped at the account's usage limit. Keep `STUDIO_EXPERIMENTAL_CHATGPT` default-off until acceptance passes.
+
+See [ChatGPT provider behavior](../../design-docs/chatgpt-provider.md). PR #3 receives these fixes by merge; merge PR #2 into `trunk` before retargeting PR #3.
+
 ## Global constraints
 
 Use a feature branch in Henry's fork, not Automattic. Recheck the base and repository instructions. No real credentials in tests/logs/commits. No automatic billing fallback. No implementation outcome is assumed. Keep new features disabled until their acceptance checks pass.

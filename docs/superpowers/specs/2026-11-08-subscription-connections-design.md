@@ -1,6 +1,6 @@
-# Studio subscription connections: proposed design
+# Studio subscription connections: design
 
-**Status:** Design and implementation handoff. No application patch, branch, tests, authenticated requests, or deployment was performed in preparing these documents.
+**Status (November 10, 2026):** Implemented as default-off proofs of concept in draft PR #2 (ChatGPT plan) and stacked PR #3 (Claude runtime). The implementation plans record observed completion separately from their original acceptance checklists. Authenticated acceptance remains deferred pending quota and authorization; the Claude public-distribution gate remains open.
 
 **Repository:** `henryperkins/studio`. Source inspected at `8672a64e7daf368051db0b35989dc9dd89523ff9`, the merge of PR #1. Refresh the branch and record the actual base before implementing. Preserve unrelated work and never force-push or modify the upstream Automattic repository.
 
