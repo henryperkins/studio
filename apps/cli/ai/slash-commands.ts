@@ -1,3 +1,4 @@
+import { isChatGptEnabled } from '@studio/agent/node/chatgpt/settings';
 import { readAiSettings, removeOpenAiApiKey } from '@studio/agent/node/settings-store';
 import {
 	aiModelRequiresPaidCredits,
@@ -17,6 +18,7 @@ import {
 	type OpenAiReasoningEffort,
 	type OpenAiReasoningMode,
 } from '@studio/agent/protocol/openai-models';
+import { isSubscriptionProvider } from '@studio/agent/protocol/providers';
 import { getAiSkillCommands } from '@studio/agent/protocol/slash-commands';
 import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { isAutomatticianFromToken, readAuthToken } from '@studio/common/lib/shared-config';
@@ -34,6 +36,7 @@ import {
 } from '@studio/common/lib/studio-assistant-top-up-pricing';
 import { __, sprintf } from '@wordpress/i18n';
 import { getAvailableAiProviders, isAiProviderReady } from 'cli/ai/auth';
+import { runChatGptCommand } from 'cli/ai/chatgpt';
 import { AI_PROVIDERS, getAiProviderDefinition, type AiProviderId } from 'cli/ai/providers';
 import { runCommand as runLoginCommand } from 'cli/commands/auth/login';
 import { runCommand as runLogoutCommand } from 'cli/commands/auth/logout';
@@ -46,6 +49,7 @@ import { getSnapshotLink, getSnapshotsFromConfig, isSnapshotExpired } from 'cli/
 import { fetchSyncableSites } from 'cli/lib/sync-api';
 import { Logger, LoggerError } from 'cli/logger';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import type { ChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import type { AiChatUI } from 'cli/ai/ui';
 
 export interface SlashCommandContext {
@@ -60,7 +64,8 @@ export interface SlashCommandContext {
 	): Promise< void >;
 	maybeAutoSwitchProvider(): Promise< void >;
 	persistSessionContext(): Promise< void >;
-	clearSession(): Promise< void >;
+	clearSession( options?: { preserveConnection?: boolean } ): Promise< void >;
+	selectChatGpt( selection: ChatGptSessionSelection ): Promise< void >;
 	getSessionEntries(): Promise< SessionEntry[] >;
 	persistOpenAiReasoning(
 		model: OpenAiModelId,
@@ -83,7 +88,9 @@ export interface SlashCommandDef {
 export function getActiveSlashCommands(): SlashCommandDef[] {
 	// Alphabetical order is what the autocomplete shows for a bare `/`; once
 	// the user types a query, fuzzy-match scoring takes over the ordering.
-	return [ ...AI_CHAT_SLASH_COMMANDS ].sort( ( a, b ) => a.name.localeCompare( b.name ) );
+	return AI_CHAT_SLASH_COMMANDS.filter(
+		( command ) => command.name !== 'chatgpt' || isChatGptEnabled()
+	).sort( ( a, b ) => a.name.localeCompare( b.name ) );
 }
 
 function isPromptAbortError( error: unknown ): boolean {
@@ -141,6 +148,11 @@ function showCreditBalance( ctx: SlashCommandContext, quota: StudioAssistantQuot
 }
 
 export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
+	{
+		name: 'chatgpt',
+		description: __( 'Manage ChatGPT plan accounts and select a connection' ),
+		handler: async ( _prompt, ctx ) => runChatGptCommand( ctx ),
+	},
 	{
 		name: 'browser',
 		description: __( 'Open the active site in the browser' ),
@@ -334,6 +346,7 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 		name: 'reasoning',
 		description: __( 'Choose the reasoning effort and mode for OpenAI models' ),
 		handler: async ( _prompt, ctx ) => {
+			if ( ctx.currentProvider === 'chatgpt-oauth' ) return runChatGptCommand( ctx, 'reasoning' );
 			if ( ctx.currentProvider !== 'openai-api-key' ) {
 				ctx.ui.showInfo(
 					__( 'Reasoning settings apply to OpenAI models. Use /provider to switch.' )
@@ -464,6 +477,7 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 		name: 'model',
 		description: __( 'Switch the AI model' ),
 		handler: async ( _prompt, ctx ) => {
+			if ( ctx.currentProvider === 'chatgpt-oauth' ) return runChatGptCommand( ctx, 'model' );
 			const { availableModels } = getAiProviderDefinition( ctx.currentProvider );
 			// The paid tiers are only offered once the account has bought credits;
 			// Automatticians are exempt. The current model always stays listed,
@@ -565,18 +579,34 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 			);
 			if ( newProvider && newProvider !== ctx.currentProvider ) {
 				const previousFamily = getAiModelFamily( ctx.currentModel );
+				const previousProvider = ctx.currentProvider;
 				try {
 					await ctx.prepareProviderSelection( newProvider );
-					await ctx.switchProvider( newProvider );
-					// Providers don't share a model family, so a switch is the
-					// same runtime handoff as a cross-family /model switch.
-					if ( getAiModelFamily( ctx.currentModel ) !== previousFamily ) {
-						await ctx.clearSession();
+					if (
+						isSubscriptionProvider( previousProvider ) ||
+						isSubscriptionProvider( newProvider )
+					) {
+						// Clear first so the new provider pin lands in the fresh
+						// conversation, not in the one being left.
+						await ctx.clearSession( { preserveConnection: false } );
+						await ctx.switchProvider( newProvider );
 						ctx.ui.showInfo(
 							__(
-								"Switching across model families starts a fresh conversation — the prior turns aren't carried over."
+								"Changing the connection started a fresh conversation — the prior turns aren't carried over."
 							)
 						);
+					} else {
+						await ctx.switchProvider( newProvider );
+						if ( getAiModelFamily( ctx.currentModel ) !== previousFamily ) {
+							// Providers don't share a model family, so a switch is the
+							// same runtime handoff as a cross-family /model switch.
+							await ctx.clearSession();
+							ctx.ui.showInfo(
+								__(
+									"Switching across model families starts a fresh conversation — the prior turns aren't carried over."
+								)
+							);
+						}
 					}
 				} catch ( error ) {
 					if ( isPromptAbortError( error ) ) {

@@ -25,15 +25,21 @@ import type {
 	OpenAiReasoningEffort,
 	OpenAiReasoningMode,
 } from '@studio/agent/protocol/openai-models';
+import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
 
 // The literal entries of AI_MODELS, so `id` stays the `AiModelId` union
 // instead of widening to `string` for callers that key off it.
 type AiProviderModel = ( typeof AI_MODELS )[ number ];
 
-// Persisted in shared.json (`aiProvider`), so treat the list as append-only:
-// readers narrow with `isAiProviderId` and fall back to the default on values
-// they don't know.
-export const AI_PROVIDER_IDS = [ 'wpcom', 'anthropic-api-key', 'openai-api-key' ] as const;
+// Persisted in shared.json (`aiProvider`) and in session records, so treat the
+// list as append-only: readers narrow with `isAiProviderId` and fall back to
+// the default on values they don't know.
+export const AI_PROVIDER_IDS = [
+	'wpcom',
+	'anthropic-api-key',
+	'openai-api-key',
+	'chatgpt-oauth',
+] as const;
 
 export type AiProviderId = ( typeof AI_PROVIDER_IDS )[ number ];
 
@@ -44,18 +50,33 @@ export const AI_PROVIDER_LABELS: Record< AiProviderId, string > = {
 	wpcom: 'WordPress.com',
 	'anthropic-api-key': 'Anthropic API',
 	'openai-api-key': 'OpenAI API',
+	'chatgpt-oauth': 'ChatGPT',
 };
+
+/**
+ * Whether a provider is a subscription connection, which a conversation never
+ * moves to, from or between without starting a new one.
+ */
+export function isSubscriptionProvider( provider: AiProviderId ): boolean {
+	return provider === 'chatgpt-oauth';
+}
 
 // Which model families each provider can service. `wpcom` serves only the
 // studio capability tiers (resolved to upstream models by the proxy);
-// direct-API providers are restricted to their own family.
+// direct-API providers are restricted to their own family. ChatGPT serves
+// none of AI_MODELS: each of its connections lists its own models.
 const PROVIDER_MODEL_FAMILIES: Record< AiProviderId, readonly AiModelFamily[] > = {
 	wpcom: [ 'studio' ],
 	'anthropic-api-key': [ 'anthropic' ],
 	'openai-api-key': [ 'openai' ],
+	'chatgpt-oauth': [],
 };
 
-/** The provider that serves a model family; each family has exactly one. */
+/**
+ * The provider that serves a model family's catalog models; each family has
+ * exactly one. A ChatGPT connection is never inferred from a family, even for
+ * a model whose slug an OpenAI catalog model shares.
+ */
 export function getAiModelFamilyProvider( family: AiModelFamily ): AiProviderId {
 	switch ( family ) {
 		case 'studio':
@@ -129,28 +150,41 @@ export function resolveSessionModelForProvider(
 }
 
 /**
- * The provider a session is pinned to: the latest `studio.session_context`
- * entry naming a provider wins. Only explicit switches record one (per-turn
- * records carry just the model), so pins survive fallback runs. Undefined
- * when never pinned — callers fall back to the saved global selection.
+ * The record a session is pinned by: the latest `studio.session_context`
+ * entry naming a provider Studio knows. Only explicit switches record one
+ * (per-turn records carry just the model), so pins survive fallback runs;
+ * OpenAI's and ChatGPT's per-turn records may carry theirs, since those never
+ * fall back. Undefined when never pinned.
  */
-export function resolveSessionProvider( entries: SessionEntry[] ): AiProviderId | undefined {
+export function readSessionPin(
+	entries: SessionEntry[]
+): ( StudioSessionContextData & { provider: AiProviderId } ) | undefined {
 	for ( let index = entries.length - 1; index >= 0; index -= 1 ) {
 		const entry = entries[ index ];
 		if ( isStudioCustomEntryOfType( entry, 'studio.session_context' ) ) {
-			const provider = entry.data?.provider;
-			if ( provider && isAiProviderId( provider ) ) {
-				return provider;
+			const data = entry.data;
+			if ( data?.provider && isAiProviderId( data.provider ) ) {
+				return { ...data, provider: data.provider };
 			}
 		}
 	}
 	return undefined;
 }
 
-// The pi provider ids of Studio's OpenAI and Anthropic models. The runtime
-// takes them from here, so the replies it records always match this reader.
+/**
+ * The provider a session is pinned to (see `readSessionPin`). Undefined when
+ * never pinned — callers fall back to the saved global selection.
+ */
+export function resolveSessionProvider( entries: SessionEntry[] ): AiProviderId | undefined {
+	return readSessionPin( entries )?.provider;
+}
+
+// The pi provider ids of Studio's OpenAI, Anthropic and ChatGPT models. The
+// runtime takes them from here, so the replies it records always match this
+// reader. ChatGPT's is Studio's own transport, not pi's built-in `openai-codex`.
 export const OPENAI_PI_PROVIDER = 'studio-openai';
 export const ANTHROPIC_PI_PROVIDER = 'anthropic';
+export const CHATGPT_PI_PROVIDER = 'studio-chatgpt';
 
 /**
  * The provider a conversation's latest reply came from, read from the pi
@@ -170,6 +204,9 @@ export function readLastReplyProvider( entries: SessionEntry[] ): AiProviderId |
 		}
 		if ( provider === OPENAI_PI_PROVIDER ) {
 			return 'openai-api-key';
+		}
+		if ( provider === CHATGPT_PI_PROVIDER ) {
+			return 'chatgpt-oauth';
 		}
 		return provider === ANTHROPIC_PI_PROVIDER ? 'anthropic-api-key' : DEFAULT_AI_PROVIDER;
 	}
@@ -191,18 +228,28 @@ export interface ConversationProviderInput {
 /**
  * The provider a conversation runs on.
  *
- * OpenAI never falls back: a conversation on OpenAI stays there when its key
- * is missing (and shows as disconnected), and the OpenAI default applies only
- * to conversations that haven't run on another provider yet.
+ * OpenAI and ChatGPT never fall back: a conversation pinned to either, or
+ * unpinned and last run there, stays there when its key or connection is
+ * missing (and shows as disconnected). The OpenAI default applies only to
+ * conversations that haven't run on another provider yet. Nothing else puts
+ * a conversation on ChatGPT: not the saved default, and not a model's family.
  *
  * Otherwise the pre-existing rules hold: the pin, then the saved global
  * selection, with WordPress.com whenever no Anthropic key is saved.
  */
 export function resolveConversationProvider( input: ConversationProviderInput ): AiProviderId {
-	const { pinnedProvider, recordedModel, globalProvider, hasAnthropicApiKey } = input;
-	if ( pinnedProvider === 'openai-api-key' ) {
+	const { pinnedProvider, recordedModel, lastReplyProvider, hasAnthropicApiKey } = input;
+	if ( pinnedProvider === 'openai-api-key' || pinnedProvider === 'chatgpt-oauth' ) {
 		return pinnedProvider;
 	}
+	// One that ran on ChatGPT stays there even when no record names its
+	// connection: its turns then fail, rather than move.
+	if ( ! pinnedProvider && lastReplyProvider === 'chatgpt-oauth' ) {
+		return lastReplyProvider;
+	}
+	// As the saved default, ChatGPT reads as unset.
+	const globalProvider =
+		input.globalProvider === 'chatgpt-oauth' ? undefined : input.globalProvider;
 	const recordedProvider = recordedModel
 		? getAiModelFamilyProvider( getAiModelFamily( recordedModel ) )
 		: undefined;
@@ -210,14 +257,14 @@ export function resolveConversationProvider( input: ConversationProviderInput ):
 	// its turns then fail with a fix to apply, rather than move.
 	if (
 		! pinnedProvider &&
-		( recordedProvider === 'openai-api-key' || input.lastReplyProvider === 'openai-api-key' )
+		( recordedProvider === 'openai-api-key' || lastReplyProvider === 'openai-api-key' )
 	) {
 		return 'openai-api-key';
 	}
 	if ( ! pinnedProvider && globalProvider === 'openai-api-key' ) {
 		// One that ran elsewhere keeps its provider: it never moves to OpenAI on
 		// its own. One without a reply yet starts on the default.
-		const ranOn = recordedProvider ?? input.lastReplyProvider;
+		const ranOn = recordedProvider ?? lastReplyProvider;
 		if ( ! ranOn ) {
 			return globalProvider;
 		}
@@ -232,7 +279,8 @@ export function resolveConversationProvider( input: ConversationProviderInput ):
 /**
  * The provider a conversation effectively runs on (see
  * `resolveConversationProvider`). Missing or unloaded settings read as
- * WordPress.com, except for a conversation already on OpenAI.
+ * WordPress.com, except for a conversation already on OpenAI or ChatGPT.
+ * `resolveConnectionSelection` also names the connection and checks it.
  */
 export function getEffectiveSessionProvider(
 	entries: SessionEntry[],
@@ -262,6 +310,10 @@ export function isAiProviderConnected(
 			return options.settings?.hasAnthropicApiKey ?? false;
 		case 'openai-api-key':
 			return options.settings?.hasOpenAiApiKey ?? false;
+		// Each ChatGPT conversation's own connection is checked instead (see
+		// `resolveConnectionSelection`), so the provider is never offered whole.
+		case 'chatgpt-oauth':
+			return false;
 	}
 }
 

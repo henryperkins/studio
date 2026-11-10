@@ -21,6 +21,7 @@ import {
 	saveSelectedAiProvider,
 } from 'cli/ai/auth';
 import { JsonAdapter } from 'cli/ai/output-adapter';
+import { readConnectionRegistry } from 'cli/ai/providers';
 import { findSiteByFolder } from 'cli/lib/cli-config/sites';
 import { disconnectFromDaemon } from 'cli/lib/daemon-client';
 import { isSiteRunning } from 'cli/lib/site-utils';
@@ -56,6 +57,7 @@ vi.mock( 'cli/ai/providers', () => ( {
 		defaultModel: 'claude-sonnet-5',
 	} ),
 	getStudioUserAgent: () => 'WordPressStudio',
+	readConnectionRegistry: vi.fn( async () => ( { connections: [], settings: null } ) ),
 	readOpenAiKeyForTurn: vi.fn( async () => null ),
 } ) );
 vi.mock( '@studio/agent/node/settings-store', () => ( {
@@ -875,6 +877,60 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 		expect( showError ).toHaveBeenCalledWith( expect.stringMatching( message ) );
 	} );
 
+	it( 'runs a ChatGPT turn on its recorded connection and slug, recording the turn', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' );
+		onTestFinished( () => {
+			vi.unstubAllEnvs();
+		} );
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: 'chatgpt-oauth',
+			model: undefined,
+		} );
+		( readConnectionRegistry as Mock ).mockResolvedValue( {
+			connections: [
+				{
+					connectionId: 'conn-1',
+					providerId: 'chatgpt-oauth',
+					backend: 'pi',
+					revision: 1,
+					identity: { subject: 'test-subject-1' },
+					authStatus: 'connected',
+				},
+			],
+			settings: null,
+		} );
+		( resolveAiEnvironment as Mock ).mockResolvedValue( {} );
+		entries.push(
+			contextEntry( {
+				provider: 'chatgpt-oauth',
+				connectionId: 'conn-1',
+				revision: 1,
+				model: 'gpt-6-luna',
+				reasoningEffort: 'high',
+			} )
+		);
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'hello', resumeSession } );
+
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'chatgpt-oauth', expect.anything() );
+		expect( turnConfig() ).toMatchObject( {
+			connection: {
+				connectionId: 'conn-1',
+				model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' },
+				revision: 1,
+			},
+			chatGpt: { reasoningEffort: 'high' },
+		} );
+		expect( turnConfig()?.openAi ).toBeUndefined();
+		expect( appendCustomEntry ).toHaveBeenCalledWith( 'studio.session_context', {
+			provider: 'chatgpt-oauth',
+			connectionId: 'conn-1',
+			revision: 1,
+			model: 'gpt-6-luna',
+			reasoningEffort: 'high',
+		} );
+	} );
+
 	it( 'keeps a conversation that ran on WordPress.com there when OpenAI is the default', async () => {
 		( readSelectedAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
 		( resolveResumeSessionContext as Mock ).mockReturnValue( {
@@ -936,5 +992,194 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 					type === 'studio.session_context' && data.provider === 'openai-api-key'
 			)
 		).toBe( false );
+	} );
+} );
+
+describe( 'AI runCommand — ChatGPT conversations', () => {
+	beforeEach( () => vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' ) );
+	afterEach( () => vi.unstubAllEnvs() );
+	let stdoutSpy: ReturnType< typeof vi.spyOn >;
+	let entries: unknown[];
+	let appendCustomEntry: Mock;
+
+	const CONNECTION_ID = 'chatgpt-connection-1';
+	const chatGptRecord = () => ( {
+		type: 'custom',
+		id: Math.random().toString( 36 ).slice( 2 ),
+		parentId: null,
+		timestamp: new Date( 0 ).toISOString(),
+		customType: 'studio.session_context',
+		data: {
+			provider: 'chatgpt-oauth',
+			connectionId: CONNECTION_ID,
+			revision: 1,
+			model: 'gpt-6.1-sol',
+		},
+	} );
+	const resumeSession = () =>
+		( {
+			summary: { id: 'chatgpt-session', filePath: '/sessions/chatgpt.jsonl' },
+			entries,
+		} ) as never;
+	// The conversation's own entries choose its provider, as in a real run.
+	const readOwnContext = async () => {
+		const { resolveResumeSessionContext: readContext } = await vi.importActual<
+			typeof import('@studio/agent/node/sessions/context')
+		>( '@studio/agent/node/sessions/context' );
+		( resolveResumeSessionContext as Mock ).mockImplementationOnce( readContext );
+	};
+
+	beforeEach( () => {
+		vi.clearAllMocks();
+		entries = [ chatGptRecord() ];
+		appendCustomEntry = vi.fn( ( customType: string, data: unknown ) => {
+			entries.push( { type: 'custom', customType, data } );
+			return 'entry-id';
+		} );
+		( openStudioSession as Mock ).mockResolvedValue( {
+			appendCustomEntry,
+			getSessionId: () => 'chatgpt-session',
+			getEntries: () => entries,
+		} );
+		( readAuthToken as Mock ).mockResolvedValue( null );
+		( readSelectedAiProvider as Mock ).mockResolvedValue( 'wpcom' );
+		( resolveInitialAiProvider as Mock ).mockResolvedValue( 'wpcom' );
+		( isAiProviderReady as Mock ).mockResolvedValue( false );
+		( resolveAiEnvironment as Mock ).mockResolvedValue( {} );
+		stdoutSpy = vi.spyOn( process.stdout, 'write' ).mockImplementation( () => true );
+	} );
+
+	afterEach( () => {
+		stdoutSpy.mockRestore();
+		process.exitCode = undefined;
+	} );
+
+	it( 'stays on ChatGPT when its connection is gone, failing the turn as disconnected', async () => {
+		await readOwnContext();
+		const adapter = new JsonAdapter();
+		const showError = vi.spyOn( adapter, 'showError' );
+
+		await runCommand( { adapter, initialMessage: 'hello', resumeSession: resumeSession() } );
+
+		expect( showError ).toHaveBeenCalledWith(
+			'ChatGPT isn’t connected, so this chat can’t continue. Start a new chat with another provider.'
+		);
+		// Neither WordPress.com, where an unusable pin falls back, nor the API
+		// key its model's family names.
+		expect( resolveAiEnvironment ).not.toHaveBeenCalled();
+		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
+		expect( appendCustomEntry ).not.toHaveBeenCalled();
+		expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
+	} );
+
+	it( 'blocks a resumed ChatGPT turn while the experimental feature is disabled', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+		await readOwnContext();
+		const adapter = new JsonAdapter();
+		const showError = vi.spyOn( adapter, 'showError' );
+		await runCommand( { adapter, initialMessage: 'hello', resumeSession: resumeSession() } );
+		expect( showError ).toHaveBeenCalledWith(
+			'ChatGPT plan connections are not enabled in this app.'
+		);
+		expect( readConnectionRegistry ).not.toHaveBeenCalled();
+		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
+	} );
+
+	it( 'never sends an OpenAI model recorded under ChatGPT to the OpenAI API key', async () => {
+		( readSelectedAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
+		( isAiProviderReady as Mock ).mockResolvedValue( true );
+		( resolveResumeSessionContext as Mock ).mockReturnValueOnce( {
+			provider: 'chatgpt-oauth',
+			model: 'gpt-6.1-sol',
+			lastReplyProvider: 'chatgpt-oauth',
+		} );
+		const adapter = new JsonAdapter();
+		const showError = vi.spyOn( adapter, 'showError' );
+
+		await runCommand( { adapter, initialMessage: 'hello', resumeSession: resumeSession() } );
+
+		expect( resolveAiEnvironment ).not.toHaveBeenCalled();
+		expect( showError ).toHaveBeenCalledWith(
+			expect.stringContaining( 'ChatGPT isn’t connected' )
+		);
+	} );
+
+	it( 'fails the turn when the connection changed since the chat ran on it', async () => {
+		await readOwnContext();
+		vi.mocked( readConnectionRegistry ).mockResolvedValueOnce( {
+			connections: [
+				{
+					connectionId: CONNECTION_ID,
+					providerId: 'chatgpt-oauth',
+					backend: 'pi',
+					revision: 2,
+					identity: { subject: 'test-subject-1' },
+					authStatus: 'connected',
+				},
+			],
+			settings: null,
+		} );
+		const adapter = new JsonAdapter();
+		const showError = vi.spyOn( adapter, 'showError' );
+
+		await runCommand( { adapter, initialMessage: 'hello', resumeSession: resumeSession() } );
+
+		expect( showError ).toHaveBeenCalledWith(
+			'The ChatGPT connection this chat ran on has changed since, so the chat can’t continue. Start a new chat.'
+		);
+		expect( resolveAiEnvironment ).not.toHaveBeenCalled();
+		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
+	} );
+
+	// Undefined: no provider was ever saved, a first run, which would otherwise
+	// pin the chat to WordPress.com.
+	it.each( [ 'wpcom', 'openai-api-key', undefined ] )(
+		'fails a chat that ran on ChatGPT with no record, rather than run it elsewhere (saved: %s)',
+		async ( saved ) => {
+			entries = [
+				{ type: 'message', message: { role: 'user', content: 'Hello', timestamp: 0 } },
+				{
+					type: 'message',
+					message: { role: 'assistant', content: [], provider: 'studio-chatgpt', timestamp: 0 },
+				},
+			];
+			( readSelectedAiProvider as Mock ).mockResolvedValue( saved );
+			( resolveInitialAiProvider as Mock ).mockResolvedValue( saved ?? 'wpcom' );
+			( isAiProviderReady as Mock ).mockResolvedValue( true );
+			await readOwnContext();
+			const adapter = new JsonAdapter();
+			const showError = vi.spyOn( adapter, 'showError' );
+
+			await runCommand( { adapter, initialMessage: 'hello', resumeSession: resumeSession() } );
+
+			expect( showError ).toHaveBeenCalledWith(
+				'This chat doesn’t name a ChatGPT connection Studio can use, so it can’t continue. Start a new chat.'
+			);
+			expect( resolveAiEnvironment ).not.toHaveBeenCalled();
+			expect( runStudioAgentTurn ).not.toHaveBeenCalled();
+			expect( appendCustomEntry ).not.toHaveBeenCalled();
+			expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
+		}
+	);
+
+	it( 'doesn’t ask how to connect when a terminal first resumes a ChatGPT conversation', async () => {
+		// No provider was ever saved: a terminal's first run.
+		( readSelectedAiProvider as Mock ).mockResolvedValue( undefined );
+		await readOwnContext();
+		const json = new JsonAdapter();
+		const askUser = vi
+			.spyOn( json, 'askUser' )
+			.mockResolvedValue( { connect: 'WordPress.com (recommended)' } );
+		// An interactive adapter: anything but the JSON one.
+		const terminal = new Proxy( json, { getPrototypeOf: () => Object.prototype } );
+
+		// The turn fails; only then would the chat loop need the real terminal UI.
+		await expect(
+			runCommand( { adapter: terminal, initialMessage: 'hello', resumeSession: resumeSession() } )
+		).rejects.toThrow( 'Interactive mode requires AiChatUI adapter' );
+
+		expect( askUser ).not.toHaveBeenCalled();
+		expect( appendCustomEntry ).not.toHaveBeenCalled();
+		expect( resolveAiEnvironment ).not.toHaveBeenCalled();
 	} );
 } );

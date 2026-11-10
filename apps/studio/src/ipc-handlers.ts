@@ -21,6 +21,7 @@ import {
 	setGlobalInstructionsEnabled as writeGlobalInstructionsEnabled,
 } from '@studio/agent/node/global-instructions';
 import { resolveLocalMediaFile } from '@studio/agent/node/local-media';
+import { setSessionChatGptSelection } from '@studio/agent/node/sessions/chatgpt-selection';
 import {
 	createHydratedAiSession,
 	listHydratedAiSessions,
@@ -30,11 +31,9 @@ import {
 	updateHydratedAiSessionMetadata,
 } from '@studio/agent/node/sessions/manage';
 import { setSessionOpenAiSelection } from '@studio/agent/node/sessions/openai-selection';
-import { appendModelChangeEntry, appendStudioEntry } from '@studio/agent/node/sessions/store';
+import { setSessionModel, setSessionProvider } from '@studio/agent/node/sessions/selection';
 import { validateStudioChatFiles } from '@studio/agent/protocol/chat-files';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
-import { isAiModelId } from '@studio/agent/protocol/models';
-import { isAiProviderId, providerServesModel } from '@studio/agent/protocol/providers';
 import { expandSkillCommandPrompt } from '@studio/agent/protocol/slash-commands';
 import { validateStudioVisualAnnotations } from '@studio/agent/protocol/visual-annotations';
 import { DEBUG_LOG_RELATIVE_PATH } from '@studio/common/constants';
@@ -234,9 +233,13 @@ export {
 } from 'src/modules/preview-site/lib/ipc-handlers';
 
 export {
+	beginChatGptSignIn,
+	cancelChatGptSignIn,
 	connectAgentApp,
 	getAgentApps,
 	getAiSettings,
+	getChatGptModels,
+	getChatGptSettings,
 	getGlobalAgentInstructions,
 	getInstalledAppsAndTerminals,
 	getOnboardingHints,
@@ -252,6 +255,8 @@ export {
 	setAiProvider,
 	setOpenAiDefaults,
 	setUserPreferences,
+	signOutChatGpt,
+	waitForChatGptSignIn,
 } from 'src/modules/user-settings/lib/ipc-handlers';
 
 export { importSite, exportSite } from 'src/modules/import-export/lib/ipc-handlers';
@@ -366,10 +371,7 @@ export async function setAiSessionModel(
 	sessionId: string,
 	model: string
 ): Promise< void > {
-	if ( ! isAiModelId( model ) ) {
-		throw new Error( `Unknown AI model: ${ model }` );
-	}
-	await appendModelChangeEntry( getSessionsDirectory(), sessionId, '', model );
+	await setSessionModel( getSessionsDirectory(), sessionId, model );
 }
 
 export async function setAiSessionProvider(
@@ -378,16 +380,7 @@ export async function setAiSessionProvider(
 	provider: string,
 	model: string
 ): Promise< void > {
-	if ( ! isAiProviderId( provider ) ) {
-		throw new Error( `Unknown AI provider: ${ provider }` );
-	}
-	if ( ! isAiModelId( model ) || ! providerServesModel( provider, model ) ) {
-		throw new Error( `Model ${ model } is not served by provider ${ provider }` );
-	}
-	await appendStudioEntry( getSessionsDirectory(), sessionId, 'studio.session_context', {
-		provider,
-		model,
-	} );
+	await setSessionProvider( getSessionsDirectory(), sessionId, provider, model );
 }
 
 export async function setAiSessionOpenAiSelection(
@@ -396,6 +389,14 @@ export async function setAiSessionOpenAiSelection(
 	selection: { model: unknown; reasoningEffort: unknown; reasoningMode: unknown }
 ): Promise< void > {
 	await setSessionOpenAiSelection( getSessionsDirectory(), sessionId, selection );
+}
+
+export async function setAiSessionChatGptSelection(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	selection: unknown
+): Promise< void > {
+	await setSessionChatGptSelection( getSessionsDirectory(), sessionId, selection );
 }
 
 export async function setAiSessionEnvironment(

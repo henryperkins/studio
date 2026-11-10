@@ -34,6 +34,13 @@ import type {
 	UserPreferences,
 } from '../../types';
 import type { AgentRunEvent } from '@studio/agent/protocol/agent-events';
+import type {
+	ChatGptSettings,
+	ChatGptSignInStart,
+	ChatGptSignInOutcome,
+	ChatGptSignOutResult,
+} from '@studio/agent/protocol/chatgpt';
+import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
 import type { AiSettings } from '@studio/agent/protocol/providers';
 import type { AuthAnalytics, OnboardingAnalytics } from '@studio/common/lib/auth-tracks';
 import type { SiteEvent, SiteListItem, SnapshotEvent } from '@studio/common/lib/cli-events';
@@ -94,6 +101,10 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 	// The server namespaces its API under /api so the SPA's real-path routes
 	// (also /sessions/:id, /sites/:id) can share the same origin.
 	const base = `${ apiBaseUrl.replace( /\/$/, '' ) }/api`;
+	const callbackHosts = new Set( [ 'localhost', '127.0.0.1', '[::1]', 'studio.local' ] );
+	const chatGptSignInSupported =
+		callbackHosts.has( window.location.hostname ) &&
+		callbackHosts.has( new URL( apiBaseUrl, window.location.href ).hostname );
 
 	const agentListeners = new Set< ( event: AgentRunEvent ) => void >();
 	const placementListeners = new Set< ( event: AiSessionPlacementUpdatedEvent ) => void >();
@@ -761,6 +772,12 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 				body: JSON.stringify( selection ),
 			} );
 		},
+		async setSessionChatGptSelection( sessionId, selection ) {
+			await api( `/sessions/${ encodeURIComponent( sessionId ) }/chatgpt-selection`, {
+				method: 'POST',
+				body: JSON.stringify( selection ),
+			} );
+		},
 		async setSessionEnvironment( sessionId, environment ) {
 			await api( `/sessions/${ encodeURIComponent( sessionId ) }/environment`, {
 				method: 'POST',
@@ -853,6 +870,39 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 
 		async getAiSettings(): Promise< AiSettings > {
 			return api< AiSettings >( '/ai-settings' );
+		},
+		async getChatGptSettings() {
+			const settings = await api< ChatGptSettings >( '/chatgpt' );
+			return { ...settings, signInSupported: settings.signInSupported && chatGptSignInSupported };
+		},
+		async beginChatGptSignIn( registrationId, options ) {
+			if ( ! chatGptSignInSupported ) {
+				throw new Error( __( 'Open Studio on localhost to sign in to ChatGPT on this computer.' ) );
+			}
+			return api< ChatGptSignInStart >( '/chatgpt/sign-in', {
+				method: 'POST',
+				body: JSON.stringify( { registrationId, options } ),
+			} );
+		},
+		async waitForChatGptSignIn( attemptId ) {
+			return api< ChatGptSignInOutcome >( `/chatgpt/sign-in/${ encodeURIComponent( attemptId ) }` );
+		},
+		async cancelChatGptSignIn( attemptId ) {
+			return api< boolean >( `/chatgpt/sign-in/${ encodeURIComponent( attemptId ) }`, {
+				method: 'DELETE',
+			} );
+		},
+		async signOutChatGpt( connectionId ) {
+			return api< ChatGptSignOutResult >( '/chatgpt/sign-out', {
+				method: 'POST',
+				body: JSON.stringify( { connectionId } ),
+			} );
+		},
+		async getChatGptModels( connectionId, revision ) {
+			return api< ChatGptModelAvailability >( '/chatgpt/models', {
+				method: 'POST',
+				body: JSON.stringify( { connectionId, revision } ),
+			} );
 		},
 		async saveAnthropicApiKey( key: string | null ): Promise< AiSettings > {
 			return api< AiSettings >( '/ai-settings', {

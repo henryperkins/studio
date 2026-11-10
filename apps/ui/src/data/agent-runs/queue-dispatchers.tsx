@@ -1,6 +1,10 @@
+import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
+import { resolveChatGptReasoning } from '@studio/agent/protocol/chatgpt-models';
+import { resolveConnectionSelection } from '@studio/agent/protocol/connections';
 import { getEffectiveSessionProvider } from '@studio/agent/protocol/providers';
 import { useEffect, useSyncExternalStore } from 'react';
 import { useAiSettings } from '@/data/queries/use-ai-settings';
+import { useChatGptModels, useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
 import { useIsOutOfAiCredits } from '@/data/queries/use-is-out-of-ai-credits';
 import { useSession } from '@/data/queries/use-sessions';
 import { useEntriesWithSettingChanges } from '@/data/session-setting-changes';
@@ -34,13 +38,32 @@ function QueueDispatcher( { sessionId }: { sessionId: string } ) {
 	const entries = useEntriesWithSettingChanges( sessionId, session?.entries );
 	const { data: aiSettings, isPending: isAiSettingsPending } = useAiSettings();
 	const isOutOfCredits = useIsOutOfAiCredits();
+	const provider = getEffectiveSessionProvider( entries ?? [], aiSettings );
+	const chatGptSettings = useChatGptSettings();
+	const chatGpt = readChatGptSessionSelection( entries ?? [] );
+	const account = chatGptSettings.data?.accounts.find(
+		( item ) => item.connectionId === chatGpt?.connectionId && item.revision === chatGpt.revision
+	);
+	const models = useChatGptModels(
+		account,
+		provider === 'chatgpt-oauth' && !! chatGptSettings.data?.enabled
+	);
+	const heldChatGpt =
+		provider === 'chatgpt-oauth' &&
+		( ! chatGptSettings.data?.enabled ||
+			chatGptSettings.isError ||
+			! chatGpt ||
+			! resolveConnectionSelection( entries ?? [], {
+				connections: chatGptSettings.data.accounts,
+				settings: aiSettings ?? null,
+			} ).ok ||
+			! resolveChatGptReasoning( chatGpt.model, chatGpt.reasoningEffort ).ok ||
+			! models.data?.models?.some( ( model ) => model.id === chatGpt.model ) );
 	// Holding rather than clearing: a balance spent mid-run leaves the queued
 	// prompt visible and it dispatches on its own once a top-up refreshes the
 	// quota, instead of being silently dropped or sent to a certain rejection.
 	const held =
-		! session ||
-		isAiSettingsPending ||
-		( isOutOfCredits && getEffectiveSessionProvider( entries ?? [], aiSettings ) === 'wpcom' );
+		! session || isAiSettingsPending || heldChatGpt || ( isOutOfCredits && provider === 'wpcom' );
 	const next = state.phase === 'idle' && ! held ? state.queuedPrompts[ 0 ] : undefined;
 
 	useEffect( () => {

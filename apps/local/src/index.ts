@@ -5,6 +5,15 @@ import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { recordAnnotationSubmitted } from '@studio/agent/node/annotation-tracks';
 import {
+	ChatGptSettingsError,
+	disconnectChatGpt,
+	finishChatGptSignIn,
+	readChatGptModels,
+	readChatGptSettings,
+	startChatGptSignIn,
+	stopChatGptSignIn,
+} from '@studio/agent/node/chatgpt/settings';
+import {
 	getGlobalInstructionsEnabled,
 	readGlobalInstructionsFile,
 	setGlobalInstructionsEnabled,
@@ -12,6 +21,7 @@ import {
 } from '@studio/agent/node/global-instructions';
 import { resolveLocalMediaFile } from '@studio/agent/node/local-media';
 import { createAgentRunManager } from '@studio/agent/node/run-manager';
+import { setSessionChatGptSelection } from '@studio/agent/node/sessions/chatgpt-selection';
 import {
 	createHydratedAiSession,
 	listHydratedAiSessions,
@@ -22,11 +32,8 @@ import {
 } from '@studio/agent/node/sessions/manage';
 import { setSessionOpenAiSelection } from '@studio/agent/node/sessions/openai-selection';
 import { deleteAiSessionPlacement } from '@studio/agent/node/sessions/placement';
-import {
-	appendModelChangeEntry,
-	appendStudioEntry,
-	deleteAiSession,
-} from '@studio/agent/node/sessions/store';
+import { setSessionModel, setSessionProvider } from '@studio/agent/node/sessions/selection';
+import { deleteAiSession } from '@studio/agent/node/sessions/store';
 import {
 	InvalidAnthropicApiKeyError,
 	InvalidOpenAiApiKeyError,
@@ -539,6 +546,7 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 	const allowedOrigins = new Set( [
 		`http://localhost:${ port }`,
 		`http://127.0.0.1:${ port }`,
+		`http://[::1]:${ port }`,
 		// Vite dev server for `npm run dev:local --workspace=apps/ui`, which proxies
 		// the API but keeps the page's Origin on POSTs.
 		'http://localhost:5400',
@@ -589,6 +597,49 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 	api.get( '/health', ( _req: Request, res: Response ) => {
 		res.json( { status: 'ok' } );
 	} );
+
+	api.get(
+		'/chatgpt',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json( await readChatGptSettings( LOCAL_HOSTNAMES.has( req.hostname ) ) );
+		} )
+	);
+	api.post(
+		'/chatgpt/sign-in',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json(
+				await startChatGptSignIn(
+					req.body?.registrationId,
+					req.body?.options,
+					LOCAL_HOSTNAMES.has( req.hostname )
+				)
+			);
+		} )
+	);
+	api.get(
+		'/chatgpt/sign-in/:id',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json( await finishChatGptSignIn( req.params.id ) );
+		} )
+	);
+	api.delete(
+		'/chatgpt/sign-in/:id',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json( await stopChatGptSignIn( req.params.id ) );
+		} )
+	);
+	api.post(
+		'/chatgpt/sign-out',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json( await disconnectChatGpt( req.body?.connectionId ) );
+		} )
+	);
+	api.post(
+		'/chatgpt/models',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json( await readChatGptModels( req.body?.connectionId, req.body?.revision ) );
+		} )
+	);
 
 	// --- Analytics — the browser UI's equivalent of the desktop's IPC handler --
 	// Unknown names are dropped, not forwarded, as in `recordAnalyticsEvent`.
@@ -2276,7 +2327,7 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 				res.status( 400 ).json( { error: `Unknown AI model: ${ model }` } );
 				return;
 			}
-			await appendModelChangeEntry( sessionsRoot, req.params.id, '', model );
+			await setSessionModel( sessionsRoot, req.params.id, model );
 			res.sendStatus( 204 );
 		} )
 	);
@@ -2293,10 +2344,7 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 				res.status( 400 ).json( { error: `Model ${ model } is not served by ${ provider }` } );
 				return;
 			}
-			await appendStudioEntry( sessionsRoot, req.params.id, 'studio.session_context', {
-				provider,
-				model,
-			} );
+			await setSessionProvider( sessionsRoot, req.params.id, provider, model );
 			res.sendStatus( 204 );
 		} )
 	);
@@ -2305,6 +2353,14 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 		'/sessions/:id/openai-selection',
 		asyncHandler( async ( req: Request, res: Response ) => {
 			await setSessionOpenAiSelection( sessionsRoot, req.params.id, req.body ?? {} );
+			res.sendStatus( 204 );
+		} )
+	);
+
+	api.post(
+		'/sessions/:id/chatgpt-selection',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			await setSessionChatGptSelection( sessionsRoot, req.params.id, req.body );
 			res.sendStatus( 204 );
 		} )
 	);
@@ -2528,6 +2584,7 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 		if (
 			err instanceof InvalidAnthropicApiKeyError ||
 			err instanceof InvalidOpenAiApiKeyError ||
+			err instanceof ChatGptSettingsError ||
 			err instanceof OpenAiSettingsError
 		) {
 			res.status( 400 ).json( { error: err.message } );

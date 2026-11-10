@@ -1,6 +1,7 @@
 import { __ } from '@wordpress/i18n';
 import { isStudioCustomEntryOfType } from '@studio/agent/protocol/sessions/entry-types';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import type { AiProviderId } from '@studio/agent/protocol/providers';
 
 export type AiModelFamily = 'anthropic' | 'studio' | 'openai';
 
@@ -110,13 +111,18 @@ export function aiModelSupportsImages( id: AiModelId ): boolean {
 	return MODEL_BY_ID.get( id )?.supportsImages ?? true;
 }
 
+// A ChatGPT record's model is one its connection listed, never one of
+// AI_MODELS, even when it shares an OpenAI catalog model's slug.
+const CHATGPT_PROVIDER = 'chatgpt-oauth' satisfies AiProviderId;
+
 /**
  * Read the raw model id recorded on a single session entry, if any.
  *
  * Looks at the `model_change` entry the UI writes when the user picks a model
- * and the `studio.session_context` payload the CLI records per turn. Returns
- * the stored string verbatim (no validation) so callers can distinguish "no
- * model recorded" from "a model we no longer offer".
+ * and the `studio.session_context` payload the CLI records per turn, other
+ * than ChatGPT's. Returns the stored string verbatim (no validation) so
+ * callers can distinguish "no model recorded" from "a model we no longer
+ * offer".
  */
 function readEntryModelId( entry: SessionEntry ): string | undefined {
 	if ( entry.type === 'model_change' ) {
@@ -124,6 +130,9 @@ function readEntryModelId( entry: SessionEntry ): string | undefined {
 		return typeof modelId === 'string' ? modelId : undefined;
 	}
 	if ( isStudioCustomEntryOfType( entry, 'studio.session_context' ) ) {
+		if ( entry.data?.provider === CHATGPT_PROVIDER ) {
+			return undefined;
+		}
 		const model = entry.data?.model;
 		return typeof model === 'string' ? model : undefined;
 	}
