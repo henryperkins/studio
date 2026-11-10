@@ -877,6 +877,56 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 		expect( showError ).toHaveBeenCalledWith( expect.stringMatching( message ) );
 	} );
 
+	it( 'runs a ChatGPT turn on its recorded connection and slug, recording the turn', async () => {
+		( resolveResumeSessionContext as Mock ).mockReturnValue( {
+			provider: 'chatgpt-oauth',
+			model: undefined,
+		} );
+		( readConnectionRegistry as Mock ).mockResolvedValue( {
+			connections: [
+				{
+					connectionId: 'conn-1',
+					providerId: 'chatgpt-oauth',
+					backend: 'pi',
+					revision: 1,
+					identity: { subject: 'test-subject-1' },
+					authStatus: 'connected',
+				},
+			],
+			settings: null,
+		} );
+		( resolveAiEnvironment as Mock ).mockResolvedValue( {} );
+		entries.push(
+			contextEntry( {
+				provider: 'chatgpt-oauth',
+				connectionId: 'conn-1',
+				revision: 1,
+				model: 'gpt-chat-test',
+				reasoningEffort: 'high',
+			} )
+		);
+
+		await runCommand( { adapter: new JsonAdapter(), initialMessage: 'hello', resumeSession } );
+
+		expect( resolveAiEnvironment ).toHaveBeenCalledWith( 'chatgpt-oauth', expect.anything() );
+		expect( turnConfig() ).toMatchObject( {
+			connection: {
+				connectionId: 'conn-1',
+				model: { providerId: 'chatgpt-oauth', modelId: 'gpt-chat-test' },
+				revision: 1,
+			},
+			chatGpt: { reasoningEffort: 'high' },
+		} );
+		expect( turnConfig()?.openAi ).toBeUndefined();
+		expect( appendCustomEntry ).toHaveBeenCalledWith( 'studio.session_context', {
+			provider: 'chatgpt-oauth',
+			connectionId: 'conn-1',
+			revision: 1,
+			model: 'gpt-chat-test',
+			reasoningEffort: 'high',
+		} );
+	} );
+
 	it( 'keeps a conversation that ran on WordPress.com there when OpenAI is the default', async () => {
 		( readSelectedAiProvider as Mock ).mockResolvedValue( 'openai-api-key' );
 		( resolveResumeSessionContext as Mock ).mockReturnValue( {

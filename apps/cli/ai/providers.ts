@@ -360,11 +360,9 @@ const AI_PROVIDER_DEFINITIONS: Record< AiProviderId, AiProviderDefinition > = {
 				describeConnectionSelectionError( { code: 'disconnected', providerId: 'chatgpt-oauth' } )
 			);
 		},
-		resolveEnv: async () => {
-			throw new LoggerError(
-				describeConnectionSelectionError( { code: 'disconnected', providerId: 'chatgpt-oauth' } )
-			);
-		},
+		// No token and nothing secret: the runtime takes each request's token
+		// from the connection's turn handle, never from the environment.
+		resolveEnv: async () => createBaseEnvironment(),
 	} ),
 };
 

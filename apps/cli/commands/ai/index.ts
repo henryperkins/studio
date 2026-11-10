@@ -17,17 +17,20 @@ import {
 	type StudioChatFileAttachment,
 } from '@studio/agent/protocol/chat-files';
 import { type StudioChatImage } from '@studio/agent/protocol/chat-images';
+import { getDefaultChatGptReasoningEffort } from '@studio/agent/protocol/chatgpt-models';
 import {
 	describeConnectionSelectionError,
 	resolveConnectionSelection,
 	type ConnectionSelection,
 } from '@studio/agent/protocol/connections';
 import { getAgentEndFailure } from '@studio/agent/protocol/json-events';
-import { getAiModelFamily, type AiModelId } from '@studio/agent/protocol/models';
+import { getAiModelFamily, isAiModelId, type AiModelId } from '@studio/agent/protocol/models';
 import {
 	describeOpenAiSettingsProblem,
+	isOpenAiReasoningEffort,
 	resolveOpenAiSessionSelection,
 	resolveOpenAiTurnSettings,
+	type OpenAiReasoningEffort,
 	type OpenAiTurnSettings,
 } from '@studio/agent/protocol/openai-models';
 import {
@@ -269,6 +272,28 @@ async function resolveChatGptConnection( sm: SessionManager ): Promise< Connecti
 	return result.selection;
 }
 
+/** The effort the latest ChatGPT record for this connection ran with, if any. */
+function readChatGptReasoningEffort(
+	entries: ReturnType< SessionManager[ 'getEntries' ] >,
+	selection: ConnectionSelection
+): OpenAiReasoningEffort | undefined {
+	for ( let index = entries.length - 1; index >= 0; index -= 1 ) {
+		const entry = entries[ index ];
+		if ( entry.type !== 'custom' || entry.customType !== 'studio.session_context' ) {
+			continue;
+		}
+		const data = ( entry as { data?: Record< string, unknown > } ).data;
+		if ( data?.provider !== 'chatgpt-oauth' || data.connectionId !== selection.connectionId ) {
+			continue;
+		}
+		return typeof data.reasoningEffort === 'string' &&
+			isOpenAiReasoningEffort( data.reasoningEffort )
+			? data.reasoningEffort
+			: undefined;
+	}
+	return undefined;
+}
+
 export async function runCommand( options: {
 	adapter: AiOutputAdapter;
 	initialMessage?: string;
@@ -454,6 +479,22 @@ export async function runCommand( options: {
 			appendStudioEntry( sm, 'studio.session_context', {
 				provider: currentProvider,
 				model: currentModel,
+			} )
+		);
+	}
+
+	// ChatGPT never falls back either: each turn records its connection.
+	async function persistChatGptSessionContext(
+		selection: ConnectionSelection,
+		reasoningEffort: OpenAiReasoningEffort
+	): Promise< void > {
+		await append( ( sm ) =>
+			appendStudioEntry( sm, 'studio.session_context', {
+				provider: 'chatgpt-oauth',
+				connectionId: selection.connectionId,
+				revision: selection.revision,
+				model: selection.model.modelId,
+				reasoningEffort,
 			} )
 		);
 	}
@@ -760,8 +801,21 @@ export async function runCommand( options: {
 			currentModel = openAiTurn.settings.model;
 			ui.currentModel = currentModel;
 		}
+		let chatGptTurn:
+			| { selection: ConnectionSelection; reasoningEffort: OpenAiReasoningEffort }
+			| undefined;
 		if ( currentProvider === 'chatgpt-oauth' ) {
-			await resolveChatGptConnection( sm );
+			const selection = await resolveChatGptConnection( sm );
+			chatGptTurn = {
+				selection,
+				reasoningEffort:
+					readChatGptReasoningEffort( sm.getEntries(), selection ) ??
+					getDefaultChatGptReasoningEffort( selection.model.modelId ),
+			};
+			if ( isAiModelId( selection.model.modelId ) ) {
+				currentModel = selection.model.modelId;
+				ui.currentModel = currentModel;
+			}
 		}
 		const env = await resolveAiEnvironment( currentProvider, {
 			sessionId,
@@ -804,7 +858,9 @@ export async function runCommand( options: {
 			enrichedPrompt = `${ enrichedPrompt }${ buildAttachedFilesPromptBlock( files ) }`;
 		}
 
-		if ( openAiTurn?.needsPin ) {
+		if ( chatGptTurn ) {
+			await persistChatGptSessionContext( chatGptTurn.selection, chatGptTurn.reasoningEffort );
+		} else if ( openAiTurn?.needsPin ) {
 			await persistOpenAiPin( openAiTurn.settings );
 		} else {
 			await persistSessionContext();
@@ -817,8 +873,8 @@ export async function runCommand( options: {
 			...getTracksOrigin(),
 			...getAiTracksIdentity( sessionId ),
 			provider: currentProvider,
-			model: currentModel,
-			model_family: getAiModelFamily( currentModel ),
+			model: chatGptTurn ? chatGptTurn.selection.model.modelId : currentModel,
+			model_family: chatGptTurn ? 'openai' : getAiModelFamily( currentModel ),
 		};
 		const turnStartedAt = Date.now();
 		await recordChatTracksEvent( TRACKS_EVENTS.CODE_MESSAGE_SENT, () => ( {
@@ -853,6 +909,8 @@ export async function runCommand( options: {
 			env,
 			model: currentModel,
 			openAi: openAiTurn?.settings,
+			connection: chatGptTurn?.selection,
+			chatGpt: chatGptTurn ? { reasoningEffort: chatGptTurn.reasoningEffort } : undefined,
 			session: sm,
 			activeSite: site,
 			onAskUser: ( questions ) => askUserAndPersistAnswers( questions ),

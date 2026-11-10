@@ -434,15 +434,20 @@ describe( 'AI auth helpers', () => {
 			await expect( resolveInitialAiProvider() ).resolves.toBe( 'wpcom' );
 		} );
 
-		it( 'fails a turn as disconnected rather than run it', async () => {
+		it( 'resolves a secret-free environment for a turn, with no token in it', async () => {
 			makeReady( { wpcom: true, anthropic: true } );
 
-			const resolving = resolveAiEnvironment( 'chatgpt-oauth' );
+			const env = await resolveAiEnvironment( 'chatgpt-oauth' );
 
-			await expect( resolving ).rejects.toBeInstanceOf( LoggerError );
-			await expect( resolving ).rejects.toThrow(
-				'ChatGPT isn’t connected, so this chat can’t continue. Start a new chat with another provider.'
-			);
+			expect( env ).not.toHaveProperty( 'STUDIO_OPENAI_API_KEY' );
+			expect( env ).not.toHaveProperty( 'OPENAI_API_KEY' );
+			expect( env ).not.toHaveProperty( 'ANTHROPIC_API_KEY' );
+			expect( env ).not.toHaveProperty( 'STUDIO_WPCOM_API_KEY' );
+			expect( JSON.stringify( env ) ).not.toContain( 'test-access-token' );
+			const chatGpt = getAiProviderDefinition( 'chatgpt-oauth' );
+			await expect( chatGpt.isVisible() ).resolves.toBe( false );
+			expect( chatGpt.autoSelectable ).toBe( false );
+			expect( chatGpt.autoFallbackWhenUnavailable ).toBe( false );
 		} );
 	} );
 
