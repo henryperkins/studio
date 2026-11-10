@@ -1504,10 +1504,13 @@ describe( 'ChatGPT credential broker', () => {
 			const sent: unknown[] = [];
 			const send = vi.fn( ( message: unknown, callback: ( error: Error | null ) => void ) => {
 				sent.push( message );
-				const answered = app.answerSessionTokenRequest( message, ( reply ) => {
+				let answered = app.answerSessionTokenRequest( message, ( reply ) => {
 					sent.push( reply );
 					setImmediate( () => events.emit( 'message', reply ) );
 				} );
+				if ( ! answered ) {
+					answered = app.answerSessionTokenInvalidation( message );
+				}
 				callback( answered ? null : new Error( 'Unexpected message' ) );
 			} );
 			return Object.assign( events, { send, sent } );
@@ -1605,6 +1608,35 @@ describe( 'ChatGPT credential broker', () => {
 				] );
 			}
 		);
+
+		it( 'refreshes the parent-held token after a forked turn invalidates the one it was handed', async () => {
+			const app = startBroker();
+			const account = await app.saveSignIn( signIn( { storage: 'session' } ) );
+			const channel = channelTo( app );
+			const turn = startBroker();
+			turn.acceptSessionTokensFromParent( channel, {
+				STUDIO_CHATGPT_SESSIONS_OFFERED: account.registrationId,
+			} );
+
+			await expect( turn.getAccessToken( account.registrationId ) ).resolves.toBe(
+				'test-access-token-1'
+			);
+			await turn.invalidateAccessToken( account.registrationId );
+
+			expect( channel.sent ).toContainEqual( {
+				type: 'studio.chatgpt-session-token.invalidate',
+				connectionId: account.registrationId,
+			} );
+			expect( app.answerSessionTokenInvalidation( { type: 'interrupt' } ) ).toBe( false );
+
+			// The parent no longer hands back the rejected token: it refreshes.
+			await expect( turn.getAccessToken( account.registrationId ) ).resolves.toBe(
+				'test-access-token-renewed-1'
+			);
+			expect( service.refreshes ).toEqual( [
+				{ clientId: 'test-issued-client-1', refreshToken: 'test-refresh-token-1' },
+			] );
+		} );
 
 		it( 'fails a forked turn whose app no longer holds its session, rather than read a stored record', async () => {
 			const owner = startBroker();

@@ -87,6 +87,7 @@ const WRAPPING_KEY_LOCK_MS = 60_000;
 const SESSION_OFFER_ENV = 'STUDIO_CHATGPT_SESSIONS_OFFERED';
 const SESSION_TOKEN_REQUEST = 'studio.chatgpt-session-token.request';
 const SESSION_TOKEN_REPLY = 'studio.chatgpt-session-token';
+const SESSION_TOKEN_INVALIDATE = 'studio.chatgpt-session-token.invalidate';
 
 export interface ChatGptBrokerTiming {
 	/** How long a sign-out waits for this process's turns on the account to settle. */
@@ -207,6 +208,7 @@ export interface ChatGptCredentialBroker {
 	listConnections(): Promise< ConnectionRegistryEntry[] >;
 	getSessionForkEnvironment(): Record< string, string >;
 	answerSessionTokenRequest( message: unknown, reply: ( message: unknown ) => void ): boolean;
+	answerSessionTokenInvalidation( message: unknown ): boolean;
 	acceptSessionTokensFromParent( channel?: ParentChannel, env?: NodeJS.ProcessEnv ): void;
 }
 
@@ -902,6 +904,18 @@ export function createChatGptCredentialBroker(
 		}
 		if ( account.storage === 'session' ) {
 			parent?.tokens.delete( connectionId );
+			// A token this process was handed came from the app that forked it:
+			// tell it, so it stops handing back the token the route rejected.
+			if ( parent?.offered.has( connectionId ) ) {
+				try {
+					parent.channel.send?.(
+						{ type: SESSION_TOKEN_INVALIDATE, connectionId },
+						() => undefined
+					);
+				} catch {
+					// The app has gone; the next request fails closed anyway.
+				}
+			}
 			await serializeSession( connectionId, async () => {
 				const held = sessions.get( connectionId );
 				if ( held ) {
@@ -1237,6 +1251,26 @@ export function createChatGptCredentialBroker(
 		return true;
 	}
 
+	function answerSessionTokenInvalidation( message: unknown ): boolean {
+		if ( ! isMessageOfType( message, SESSION_TOKEN_INVALIDATE ) ) {
+			return false;
+		}
+		const { connectionId } = message;
+		if ( typeof connectionId === 'string' ) {
+			// Zero a held token synchronously, so a request that arrives right
+			// after this message can't be handed the rejected token again.
+			const held = sessions.get( connectionId );
+			if ( held ) {
+				sessions.set( connectionId, {
+					...held,
+					record: { ...held.record, expiresAt: 0 },
+				} );
+			}
+			void invalidateAccessToken( connectionId ).catch( () => undefined );
+		}
+		return true;
+	}
+
 	function acceptSessionTokensFromParent(
 		channel: ParentChannel = process as unknown as ParentChannel,
 		env: NodeJS.ProcessEnv = process.env
@@ -1260,6 +1294,7 @@ export function createChatGptCredentialBroker(
 		listConnections,
 		getSessionForkEnvironment,
 		answerSessionTokenRequest,
+		answerSessionTokenInvalidation,
 		acceptSessionTokensFromParent,
 	};
 }
@@ -1339,6 +1374,15 @@ export function answerChatGptSessionTokenRequest(
 	reply: ( message: unknown ) => void
 ): boolean {
 	return getAppBroker().answerSessionTokenRequest( message, reply );
+}
+
+/**
+ * Takes in a forked turn's word that the session-only access token it was
+ * handed was rejected: this app stops handing it out, so the turn's next
+ * request refreshes. False for any other message.
+ */
+export function answerChatGptSessionTokenInvalidation( message: unknown ): boolean {
+	return getAppBroker().answerSessionTokenInvalidation( message );
 }
 
 /**
