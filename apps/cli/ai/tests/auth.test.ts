@@ -1,4 +1,8 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { password } from '@inquirer/prompts';
+import { saveChatGptSignIn } from '@studio/agent/node/chatgpt/credential-broker';
 import {
 	getSecureStorageStatus,
 	OpenAiSessionKeyUnavailableError,
@@ -10,16 +14,21 @@ import {
 	readSelectedAiProvider,
 	saveOpenAiApiKey,
 } from '@studio/agent/node/settings-store';
-import { SecureStorageError } from '@studio/common/lib/os-credential-store';
+import {
+	createOsCredentialStore,
+	SecureStorageError,
+} from '@studio/common/lib/os-credential-store';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { vi } from 'vitest';
 import {
+	getAvailableAiProviders,
 	isAiProviderReady,
 	prepareAiProvider,
 	resolveAiEnvironment,
 	resolveInitialAiProvider,
 	resolveUnavailableAiProvider,
 } from 'cli/ai/auth';
+import { getAiProviderDefinition, readConnectionRegistry } from 'cli/ai/providers';
 import { LoggerError } from 'cli/logger';
 
 vi.mock( '@inquirer/prompts', () => ( {
@@ -28,6 +37,20 @@ vi.mock( '@inquirer/prompts', () => ( {
 
 vi.mock( '@studio/common/lib/shared-config', () => ( {
 	readAuthToken: vi.fn(),
+} ) );
+
+// Never the real system keychain from a unit test.
+vi.mock( '@studio/common/lib/os-credential-store', async ( importOriginal ) => ( {
+	...( await importOriginal< typeof import('@studio/common/lib/os-credential-store') >() ),
+	createOsCredentialStore: vi.fn( () => {
+		const items = new Map< string, string >();
+		return {
+			check: async () => ( { available: true } ),
+			get: async ( account: string ) => items.get( account ) ?? null,
+			set: async ( account: string, secret: string ) => void items.set( account, secret ),
+			delete: async ( account: string ) => void items.delete( account ),
+		};
+	} ),
 } ) );
 
 vi.mock( '@studio/agent/node/openai-credentials', async ( importOriginal ) => ( {
@@ -296,6 +319,135 @@ describe( 'AI auth helpers', () => {
 			await expect( resolveUnavailableAiProvider( 'wpcom' ) ).resolves.toBeUndefined();
 			// …and a first run doesn't start on it.
 			await expect( resolveInitialAiProvider() ).resolves.toBe( 'wpcom' );
+		} );
+	} );
+
+	describe( 'ChatGPT', () => {
+		const wpcomToken = () => ( {
+			accessToken: 'wpcom-token',
+			displayName: 'User',
+			email: 'user@example.com',
+			expiresIn: 3600,
+			expirationTime: Date.now() + 3600_000,
+			id: 1,
+		} );
+		const makeReady = ( { wpcom = false, anthropic = false } ) => {
+			vi.mocked( readAuthToken ).mockResolvedValue( wpcom ? wpcomToken() : null );
+			vi.mocked( readAnthropicApiKey ).mockResolvedValue( anthropic ? 'saved-key' : undefined );
+			vi.mocked( readOpenAiApiKey ).mockResolvedValue( null );
+		};
+
+		it.each( [ 'wpcom', 'anthropic-api-key' ] as const )(
+			'never falls back from a disconnected chat while %s is ready',
+			async ( ready ) => {
+				makeReady( { wpcom: ready === 'wpcom', anthropic: ready === 'anthropic-api-key' } );
+				await expect( isAiProviderReady( ready ) ).resolves.toBe( true );
+
+				await expect( isAiProviderReady( 'chatgpt-oauth' ) ).resolves.toBe( false );
+				await expect( resolveUnavailableAiProvider( 'chatgpt-oauth' ) ).resolves.toBeUndefined();
+			}
+		);
+
+		it.each( [
+			[ 'WordPress.com when it is ready', 'wpcom', { wpcom: true } ],
+			[ 'Anthropic when only its key is', 'anthropic-api-key', { anthropic: true } ],
+			[ 'WordPress.com when nothing is ready', 'wpcom', {} ],
+		] as const )(
+			'starts a chat on %s, never on a saved ChatGPT default',
+			async ( _label, expected, ready ) => {
+				makeReady( ready );
+				vi.mocked( readSelectedAiProvider ).mockResolvedValue( 'chatgpt-oauth' );
+
+				await expect( resolveInitialAiProvider() ).resolves.toBe( expected );
+			}
+		);
+
+		it( 'is never offered as a provider to choose', async () => {
+			await expect( getAvailableAiProviders() ).resolves.not.toContain( 'chatgpt-oauth' );
+		} );
+
+		it( 'is never picked for a conversation automatically, even once shown and ready', async () => {
+			const chatGpt = getAiProviderDefinition( 'chatgpt-oauth' );
+			const isVisible = vi.spyOn( chatGpt, 'isVisible' ).mockResolvedValue( true );
+			const isReady = vi.spyOn( chatGpt, 'isReady' ).mockResolvedValue( true );
+			onTestFinished( () => {
+				isVisible.mockRestore();
+				isReady.mockRestore();
+			} );
+			makeReady( {} );
+			vi.mocked( readSelectedAiProvider ).mockResolvedValue( undefined );
+
+			// A logged-out WordPress.com conversation doesn't move to ChatGPT…
+			await expect( resolveUnavailableAiProvider( 'wpcom' ) ).resolves.toBeUndefined();
+			// …and a first run doesn't start on it.
+			await expect( resolveInitialAiProvider() ).resolves.toBe( 'wpcom' );
+		} );
+
+		it( 'checks turns against the ChatGPT accounts signed in here, and still never offers ChatGPT', async () => {
+			const configDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-cli-chatgpt-' ) );
+			const previousConfigDir = process.env.DEV_CONFIG_DIR;
+			process.env.DEV_CONFIG_DIR = configDir;
+			onTestFinished( () => {
+				if ( previousConfigDir === undefined ) {
+					delete process.env.DEV_CONFIG_DIR;
+				} else {
+					process.env.DEV_CONFIG_DIR = previousConfigDir;
+				}
+				fs.rmSync( configDir, { recursive: true, force: true } );
+			} );
+			// The app's broker can only reach a stand-in for the system keychain.
+			expect( vi.isMockFunction( createOsCredentialStore ) ).toBe( true );
+			const account = await saveChatGptSignIn( {
+				issuer: 'https://auth.openai.com',
+				subject: 'test-subject-1',
+				email: 'someone@example.com',
+				clientId: 'test-issued-client-1',
+				storage: 'session',
+				tokens: {
+					accessToken: 'test-access-token-1',
+					refreshToken: 'test-refresh-token-1',
+					idToken: 'test-id-token-1',
+					tokenType: 'Bearer',
+					expiresIn: 3600,
+					scope: 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct',
+				},
+			} );
+
+			await expect( readConnectionRegistry() ).resolves.toEqual( {
+				connections: [
+					{
+						connectionId: account.registrationId,
+						providerId: 'chatgpt-oauth',
+						backend: 'pi',
+						revision: 1,
+						identity: { subject: 'test-subject-1', email: 'someone@example.com' },
+						authStatus: 'connected',
+					},
+				],
+				settings: null,
+			} );
+			makeReady( {} );
+			vi.mocked( readSelectedAiProvider ).mockResolvedValue( undefined );
+			await expect( isAiProviderReady( 'chatgpt-oauth' ) ).resolves.toBe( false );
+			await expect( getAvailableAiProviders() ).resolves.not.toContain( 'chatgpt-oauth' );
+			await expect( resolveUnavailableAiProvider( 'wpcom' ) ).resolves.toBeUndefined();
+			await expect( resolveInitialAiProvider() ).resolves.toBe( 'wpcom' );
+		} );
+
+		it( 'resolves a secret-free environment for a turn, with no token in it', async () => {
+			makeReady( { wpcom: true, anthropic: true } );
+
+			const env = await resolveAiEnvironment( 'chatgpt-oauth' );
+
+			expect( env ).not.toHaveProperty( 'STUDIO_OPENAI_API_KEY' );
+			expect( env ).not.toHaveProperty( 'OPENAI_API_KEY' );
+			expect( env ).not.toHaveProperty( 'ANTHROPIC_API_KEY' );
+			expect( env ).not.toHaveProperty( 'STUDIO_WPCOM_API_KEY' );
+			expect( JSON.stringify( env ) ).not.toContain( 'test-access-token' );
+			const chatGpt = getAiProviderDefinition( 'chatgpt-oauth' );
+			await expect( chatGpt.isVisible() ).resolves.toBe( false );
+			expect( chatGpt.autoSelectable ).toBe( false );
+			expect( chatGpt.autoFallbackWhenUnavailable ).toBe( false );
 		} );
 	} );
 

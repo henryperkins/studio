@@ -22,6 +22,7 @@ const PROVIDER_BRANDS: Record< AiProviderId, { name: string; icon: ComponentType
 	wpcom: { name: 'WordPress', icon: WordPressIcon },
 	'anthropic-api-key': { name: 'Claude', icon: ClaudeIcon },
 	'openai-api-key': { name: 'OpenAI', icon: SparklesIcon },
+	'chatgpt-oauth': { name: 'ChatGPT', icon: SparklesIcon },
 };
 
 interface ModelPickerProps {

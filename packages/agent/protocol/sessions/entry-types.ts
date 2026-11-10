@@ -58,10 +58,17 @@ export interface StudioTurnClosedData {
 // `provider` marks an explicit user pin; the CLI's per-turn records carry
 // only the model so a fallback run never rewrites the pin. OpenAI never falls
 // back, so its per-turn records also carry the provider and the reasoning the
-// turn ran with. Reasoning fields are plain strings for the same reason as
-// `provider`: readers validate them against the model's capabilities.
+// turn ran with. ChatGPT never falls back either: its pins and per-turn
+// records carry the provider, the connection and the connection's revision,
+// and their model is one that connection listed. Reasoning fields are plain
+// strings for the same reason as `provider`: readers validate them against the
+// model's capabilities, as they do the connection fields.
 export interface StudioSessionContextData {
 	provider?: string;
+	/** The connection a ChatGPT record ran on: an opaque id, never parsed. */
+	connectionId?: string;
+	/** The connection's configuration revision when a ChatGPT record was written. */
+	revision?: number;
 	model: string;
 	reasoningEffort?: string;
 	reasoningMode?: string;

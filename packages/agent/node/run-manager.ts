@@ -6,7 +6,16 @@ import path from 'node:path';
 import { isDevRun } from '@studio/common/lib/dev-run';
 import { captureException } from '@studio/common/lib/error-reporting';
 import { updateSharedSession } from '@studio/common/lib/shared-config';
+import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { recordAgentRun, recordAgentSend, type AgentSurface } from '@studio/agent/node/agent-stats';
+import {
+	answerChatGptSessionTokenInvalidation,
+	answerChatGptSessionTokenRequest,
+	beginChatGptTurn,
+	getChatGptSessionForkEnvironment,
+	listChatGptConnections,
+	type ChatGptTurnHandle,
+} from '@studio/agent/node/chatgpt/credential-broker';
 import {
 	answerOpenAiSessionKeyRequest,
 	getOpenAiSessionKeyForkEnvironment,
@@ -16,6 +25,8 @@ import {
 	setAiSessionSitePlacement,
 	type AiSessionPlacementUpdatedEvent,
 } from '@studio/agent/node/sessions/placement';
+import { loadAiSession } from '@studio/agent/node/sessions/store';
+import { resolveConnectionSelection } from '@studio/agent/protocol/connections';
 import type { ActiveAgentRun, AgentRunEvent } from '@studio/agent/protocol/agent-events';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
@@ -52,6 +63,7 @@ interface AgentRun {
 	pendingClaudeApprovals: Extract< BackendTurnEvent, { type: 'approval.requested' } >[];
 	seenClaudeApprovals: Set< string >;
 	pendingQuestions: NonNullable< ActiveAgentRun[ 'pendingQuestions' ] >;
+	chatGptTurn: Pick< ChatGptTurnHandle, 'signal' | 'end' > | null;
 }
 
 // Everything a run produces for the UI. The host maps each kind to its transport
@@ -74,6 +86,15 @@ export interface AgentRunManagerConfig {
 	// `STUDIO_TRACKS_ORIGIN` for the forked CLI, which emits the chat events; without it they fall
 	// back to `channel: studio-cli`. Called per fork, as the renderer can change. Unset by `studio ui`.
 	getTracksOrigin?: () => string;
+	// The ChatGPT connection a session's run is pinned to, or null when it runs
+	// on another provider. Injected by tests; by default the session's recorded
+	// selection is resolved the way the CLI resolves it.
+	resolveChatGptConnectionId?: ( sessionId: string ) => Promise< string | null >;
+	// Begins a ChatGPT turn in this process, so a sign-out here or anywhere
+	// aborts its signal. Injected by tests; the app broker's by default.
+	beginChatGptTurn?: (
+		connectionId: string
+	) => Promise< Pick< ChatGptTurnHandle, 'signal' | 'end' > >;
 }
 
 export interface StartAgentRunOptions {
@@ -113,6 +134,25 @@ function writeInputPayloadFile( payload: StudioAiSessionInputPayload ): {
 	return { dir, path: filePath };
 }
 
+// The ChatGPT connection a session runs on, from its recorded selection
+// checked against the connections this process can run — the CLI's own
+// resolution, minus its error reporting: anything else, or an unreadable
+// session, simply means no turn to watch here.
+async function resolveRecordedChatGptConnectionId( sessionId: string ): Promise< string | null > {
+	try {
+		const { entries } = await loadAiSession( getSessionsDirectory(), sessionId );
+		const result = resolveConnectionSelection( entries, {
+			connections: await listChatGptConnections(),
+			settings: null,
+		} );
+		return result.ok && result.selection.model.providerId === 'chatgpt-oauth'
+			? result.selection.connectionId
+			: null;
+	} catch {
+		return null;
+	}
+}
+
 export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRunManager {
 	const { cliBinary, nodeBinary, surface, getTracksOrigin } = config;
 
@@ -120,6 +160,41 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 	// recorder, so we reject the second one here.
 	const runsBySessionId = new Map< string, AgentRun >();
 	const runsById = new Map< string, AgentRun >();
+
+	// A ChatGPT run is watched in this process for its whole life: when its
+	// connection is signed out, the turn handle's signal aborts and the run is
+	// interrupted, so no forked turn keeps streaming on a signed-out account.
+	// A run on another provider, or one whose turn can't begin here, is left
+	// alone — the forked turn itself fails closed for a disconnected ChatGPT
+	// connection.
+	async function watchChatGptTurn( run: AgentRun ): Promise< void > {
+		if ( run.claude ) {
+			return;
+		}
+		try {
+			const resolveConnectionId =
+				config.resolveChatGptConnectionId ?? resolveRecordedChatGptConnectionId;
+			const connectionId = await resolveConnectionId( run.sessionId );
+			if ( ! connectionId || runsById.get( run.runId ) !== run ) {
+				return;
+			}
+			const beginTurn = config.beginChatGptTurn ?? beginChatGptTurn;
+			const handle = await beginTurn( connectionId );
+			if ( runsById.get( run.runId ) !== run ) {
+				handle.end();
+				return;
+			}
+			run.chatGptTurn = handle;
+			handle.signal.addEventListener( 'abort', () => interruptAgentRun( run.runId ), {
+				once: true,
+			} );
+			if ( handle.signal.aborted ) {
+				interruptAgentRun( run.runId );
+			}
+		} catch {
+			// The forked turn reports a ChatGPT connection it can't use.
+		}
+	}
 
 	function sendEvent( run: AgentRun, event: AgentRunEvent[ 'event' ] ): void {
 		config.emit( {
@@ -238,6 +313,9 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 				// Tells the turn it may ask for an OpenAI key kept for this app
 				// session; the key itself only goes over the IPC channel.
 				...( claudeSelection ? {} : getOpenAiSessionKeyForkEnvironment() ),
+				// The registrations whose session-only ChatGPT tokens this app
+				// holds and may hand over on request; ids only, never a token.
+				...( claudeSelection ? {} : getChatGptSessionForkEnvironment() ),
 			},
 		} );
 
@@ -254,10 +332,13 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			seenClaudeApprovals: new Set(),
 			claude: !! claudeSelection,
 			turnId,
+			chatGptTurn: null,
 		};
 
 		runsBySessionId.set( sessionId, run );
 		runsById.set( runId, run );
+
+		void watchChatGptTurn( run );
 
 		recordAgentSend( surface );
 
@@ -274,6 +355,19 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 					}
 				} )
 			) {
+				return;
+			}
+			if (
+				! run.claude &&
+				answerChatGptSessionTokenRequest( message, ( reply ) => {
+					if ( child.connected ) {
+						child.send( reply as { type: string } );
+					}
+				} )
+			) {
+				return;
+			}
+			if ( ! run.claude && answerChatGptSessionTokenInvalidation( message ) ) {
 				return;
 			}
 			// The CLI's `Logger` also writes to this IPC channel with a different
@@ -319,6 +413,8 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			cleanedUp = true;
 			runsBySessionId.delete( sessionId );
 			runsById.delete( runId );
+			run.chatGptTurn?.end();
+			run.chatGptTurn = null;
 
 			recordAgentRun( surface, { interrupted: run.interrupted, code } );
 

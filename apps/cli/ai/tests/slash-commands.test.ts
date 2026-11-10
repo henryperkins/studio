@@ -4,6 +4,7 @@ import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { isAutomatticianFromToken, readAuthToken } from '@studio/common/lib/shared-config';
 import { fetchStudioAssistantQuota } from '@studio/common/lib/studio-assistant-quota';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { getAvailableAiProviders } from 'cli/ai/auth';
 import { AI_CHAT_SLASH_COMMANDS, type SlashCommandContext } from 'cli/ai/slash-commands';
 
 vi.mock( 'cli/ai/auth', () => ( {
@@ -204,7 +205,7 @@ describe( '/credits slash command', () => {
 	function makeCtx( ui: ReturnType< typeof makeUi > ): SlashCommandContext {
 		return {
 			ui: ui as unknown as SlashCommandContext[ 'ui' ],
-			currentModel: 'claude-sonnet-4-5' as SlashCommandContext[ 'currentModel' ],
+			currentModel: 'claude-sonnet-5' as SlashCommandContext[ 'currentModel' ],
 			currentProvider: 'wpcom' as SlashCommandContext[ 'currentProvider' ],
 			showCapabilitiesOnConnect: false,
 			switchProvider: vi.fn().mockResolvedValue( undefined ),
@@ -416,6 +417,164 @@ describe( '/openai-key slash command', () => {
 		expect( ctx.prepareProviderSelection ).not.toHaveBeenCalled();
 		expect( removeOpenAiApiKey ).not.toHaveBeenCalled();
 		expect( ctx.ui.showInfo ).toHaveBeenCalledWith( 'API key update canceled.' );
+	} );
+} );
+
+describe( '/provider slash command', () => {
+	const handler = AI_CHAT_SLASH_COMMANDS.find( ( c ) => c.name === 'provider' )?.handler;
+
+	function buildProviderCtx( {
+		currentProvider,
+		currentModel,
+		targetLabel,
+		modelAfterSwitch,
+	}: {
+		currentProvider: SlashCommandContext[ 'currentProvider' ];
+		currentModel: SlashCommandContext[ 'currentModel' ];
+		targetLabel: string;
+		modelAfterSwitch?: SlashCommandContext[ 'currentModel' ];
+	} ) {
+		const { ctx } = buildModelCtx( { askUserResponse: targetLabel, currentModel } );
+		ctx.currentProvider = currentProvider;
+		vi.mocked( ctx.switchProvider ).mockImplementation( async () => {
+			if ( modelAfterSwitch ) {
+				ctx.currentModel = modelAfterSwitch;
+			}
+		} );
+		return ctx;
+	}
+
+	beforeEach( () => {
+		vi.mocked( getAvailableAiProviders ).mockResolvedValue( [
+			'wpcom',
+			'anthropic-api-key',
+			'openai-api-key',
+			'chatgpt-oauth',
+		] );
+	} );
+
+	it( 'starts a fresh conversation when leaving ChatGPT, though the model family is the same', async () => {
+		const ctx = buildProviderCtx( {
+			currentProvider: 'chatgpt-oauth',
+			currentModel: 'fast',
+			targetLabel: 'WordPress.com',
+		} );
+
+		await handler?.( '', ctx );
+
+		expect( ctx.switchProvider ).toHaveBeenCalledWith( 'wpcom' );
+		expect( ctx.clearSession ).toHaveBeenCalledTimes( 1 );
+		expect( ctx.ui.showInfo ).toHaveBeenCalledWith( expect.stringMatching( /fresh conversation/ ) );
+	} );
+
+	it( 'starts a fresh conversation when moving to ChatGPT, though the model family is the same', async () => {
+		const ctx = buildProviderCtx( {
+			currentProvider: 'wpcom',
+			currentModel: 'fast',
+			targetLabel: 'ChatGPT',
+		} );
+
+		await handler?.( '', ctx );
+
+		expect( ctx.switchProvider ).toHaveBeenCalledWith( 'chatgpt-oauth' );
+		expect( ctx.clearSession ).toHaveBeenCalledTimes( 1 );
+		expect( ctx.ui.showInfo ).toHaveBeenCalledWith( expect.stringMatching( /fresh conversation/ ) );
+	} );
+
+	it( 'keeps the conversation on a switch that stays in the same model family', async () => {
+		const ctx = buildProviderCtx( {
+			currentProvider: 'wpcom',
+			currentModel: 'fast',
+			targetLabel: 'Anthropic · API key',
+		} );
+
+		await handler?.( '', ctx );
+
+		expect( ctx.switchProvider ).toHaveBeenCalledWith( 'anthropic-api-key' );
+		expect( ctx.clearSession ).not.toHaveBeenCalled();
+	} );
+
+	it( 'starts a fresh conversation when a switch changes the model family', async () => {
+		const ctx = buildProviderCtx( {
+			currentProvider: 'wpcom',
+			currentModel: 'fast',
+			targetLabel: 'Anthropic · API key',
+			modelAfterSwitch: 'claude-sonnet-5',
+		} );
+
+		await handler?.( '', ctx );
+
+		expect( ctx.clearSession ).toHaveBeenCalledTimes( 1 );
+		expect( ctx.ui.showInfo ).toHaveBeenCalledWith( expect.stringMatching( /model families/ ) );
+	} );
+
+	describe( 'when a subscription connection is involved', () => {
+		function logCalls( ctx: SlashCommandContext ) {
+			const calls: string[] = [];
+			vi.mocked( ctx.prepareProviderSelection ).mockImplementation( async () => {
+				calls.push( 'prepare' );
+			} );
+			vi.mocked( ctx.clearSession ).mockImplementation( async () => {
+				calls.push( 'clear' );
+			} );
+			vi.mocked( ctx.switchProvider ).mockImplementation( async () => {
+				calls.push( 'switch' );
+			} );
+			return calls;
+		}
+
+		it.each( [
+			[ 'chatgpt-oauth', 'WordPress.com' ],
+			[ 'wpcom', 'ChatGPT' ],
+		] as const )(
+			'clears the session before the new pin is written when moving from %s to %s',
+			async ( currentProvider, targetLabel ) => {
+				const ctx = buildProviderCtx( { currentProvider, currentModel: 'fast', targetLabel } );
+				const calls = logCalls( ctx );
+
+				await handler?.( '', ctx );
+
+				expect( calls ).toEqual( [ 'prepare', 'clear', 'switch' ] );
+			}
+		);
+
+		it( 'clears nothing when the provider setup is canceled', async () => {
+			const ctx = buildProviderCtx( {
+				currentProvider: 'chatgpt-oauth',
+				currentModel: 'fast',
+				targetLabel: 'WordPress.com',
+			} );
+			vi.mocked( ctx.prepareProviderSelection ).mockRejectedValue(
+				Object.assign( new Error( 'canceled' ), { name: 'ExitPromptError' } )
+			);
+
+			await expect( handler?.( '', ctx ) ).resolves.toBe( 'continue' );
+
+			expect( ctx.clearSession ).not.toHaveBeenCalled();
+			expect( ctx.switchProvider ).not.toHaveBeenCalled();
+		} );
+	} );
+
+	it( 'keeps the switch-then-clear order on a legacy family change', async () => {
+		const ctx = buildProviderCtx( {
+			currentProvider: 'wpcom',
+			currentModel: 'fast',
+			targetLabel: 'Anthropic · API key',
+			modelAfterSwitch: 'claude-sonnet-5',
+		} );
+		const calls: string[] = [];
+		const switchImpl = vi.mocked( ctx.switchProvider ).getMockImplementation()!;
+		vi.mocked( ctx.switchProvider ).mockImplementation( async ( ...args ) => {
+			calls.push( 'switch' );
+			await switchImpl( ...args );
+		} );
+		vi.mocked( ctx.clearSession ).mockImplementation( async () => {
+			calls.push( 'clear' );
+		} );
+
+		await handler?.( '', ctx );
+
+		expect( calls ).toEqual( [ 'switch', 'clear' ] );
 	} );
 } );
 

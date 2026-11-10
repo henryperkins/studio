@@ -24,16 +24,24 @@ import {
 	type StudioChatFileAttachment,
 } from '@studio/agent/protocol/chat-files';
 import { type StudioChatImage } from '@studio/agent/protocol/chat-images';
+import { getDefaultChatGptReasoningEffort } from '@studio/agent/protocol/chatgpt-models';
 import {
 	resolveClaudeSession,
 	type ClaudeSessionSelection,
 } from '@studio/agent/protocol/claude-code';
+import {
+	describeConnectionSelectionError,
+	resolveConnectionSelection,
+	type ConnectionSelection,
+} from '@studio/agent/protocol/connections';
 import { getAgentEndFailure } from '@studio/agent/protocol/json-events';
-import { getAiModelFamily, type AiModelId } from '@studio/agent/protocol/models';
+import { getAiModelFamily, isAiModelId, type AiModelId } from '@studio/agent/protocol/models';
 import {
 	describeOpenAiSettingsProblem,
+	isOpenAiReasoningEffort,
 	resolveOpenAiSessionSelection,
 	resolveOpenAiTurnSettings,
+	type OpenAiReasoningEffort,
 	type OpenAiTurnSettings,
 } from '@studio/agent/protocol/openai-models';
 import {
@@ -71,6 +79,7 @@ import {
 	AI_PROVIDERS,
 	DEFAULT_AI_PROVIDER,
 	getAiProviderDefinition,
+	readConnectionRegistry,
 	readOpenAiKeyForTurn,
 	type AiProviderId,
 } from 'cli/ai/providers';
@@ -165,15 +174,21 @@ async function resolveWpcomDefaultModel(): Promise< AiModelId > {
 
 /**
  * The provider this run uses for a resumed (or new) conversation. An OpenAI
- * conversation stays on OpenAI even without a key — its turn then fails as
- * disconnected — and a conversation that ran elsewhere keeps its provider when
- * OpenAI becomes the default. The WordPress.com and Anthropic rules are
- * unchanged.
+ * or ChatGPT conversation, pinned there or unpinned and last run there, stays
+ * put without its key or connection — its turn then fails — and a
+ * conversation that ran elsewhere keeps its provider when OpenAI becomes the
+ * default. The WordPress.com and Anthropic rules are unchanged.
  */
 async function resolveRunProvider(
 	resumeContext: ReturnType< typeof resolveResumeSessionContext >
 ): Promise< AiProviderId > {
 	const pinned = resumeContext.provider;
+	if (
+		pinned === 'chatgpt-oauth' ||
+		( ! pinned && resumeContext.lastReplyProvider === 'chatgpt-oauth' )
+	) {
+		return 'chatgpt-oauth';
+	}
 	const recordedProvider = resumeContext.model
 		? getAiModelFamilyProvider( getAiModelFamily( resumeContext.model ) )
 		: undefined;
@@ -253,6 +268,43 @@ async function resolveOpenAiTurn(
 		settings: result.settings,
 		needsPin: ! recorded.model || ! recorded.reasoningEffort || ! recorded.reasoningMode,
 	};
+}
+
+/** The ChatGPT connection a conversation's turn runs on, or why it can't run. */
+async function resolveChatGptConnection( sm: SessionManager ): Promise< ConnectionSelection > {
+	const result = resolveConnectionSelection( sm.getEntries(), await readConnectionRegistry() );
+	if ( ! result.ok ) {
+		throw new LoggerError( describeConnectionSelectionError( result.error ) );
+	}
+	// On ChatGPT without a ChatGPT record (cleared, say): nothing names its connection.
+	if ( result.selection.model.providerId !== 'chatgpt-oauth' ) {
+		throw new LoggerError(
+			describeConnectionSelectionError( { code: 'unsupported', providerId: 'chatgpt-oauth' } )
+		);
+	}
+	return result.selection;
+}
+
+/** The effort the latest ChatGPT record for this connection ran with, if any. */
+function readChatGptReasoningEffort(
+	entries: ReturnType< SessionManager[ 'getEntries' ] >,
+	selection: ConnectionSelection
+): OpenAiReasoningEffort | undefined {
+	for ( let index = entries.length - 1; index >= 0; index -= 1 ) {
+		const entry = entries[ index ];
+		if ( entry.type !== 'custom' || entry.customType !== 'studio.session_context' ) {
+			continue;
+		}
+		const data = ( entry as { data?: Record< string, unknown > } ).data;
+		if ( data?.provider !== 'chatgpt-oauth' || data.connectionId !== selection.connectionId ) {
+			continue;
+		}
+		return typeof data.reasoningEffort === 'string' &&
+			isOpenAiReasoningEffort( data.reasoningEffort )
+			? data.reasoningEffort
+			: undefined;
+	}
+	return undefined;
 }
 
 export async function runCommand( options: {
@@ -564,6 +616,22 @@ export async function runCommand( options: {
 		);
 	}
 
+	// ChatGPT never falls back either: each turn records its connection.
+	async function persistChatGptSessionContext(
+		selection: ConnectionSelection,
+		reasoningEffort: OpenAiReasoningEffort
+	): Promise< void > {
+		await append( ( sm ) =>
+			appendStudioEntry( sm, 'studio.session_context', {
+				provider: 'chatgpt-oauth',
+				connectionId: selection.connectionId,
+				revision: selection.revision,
+				model: selection.model.modelId,
+				reasoningEffort,
+			} )
+		);
+	}
+
 	// OpenAI never falls back, so its record can carry the provider safely.
 	async function persistOpenAiPin( settings: OpenAiTurnSettings ): Promise< void > {
 		await append( ( sm ) =>
@@ -696,16 +764,25 @@ export async function runCommand( options: {
 	let showCapabilitiesOnConnect = ( await readSelectedAiProvider() ) === undefined;
 
 	// Studio Code Desktop defaults to WordPress.com provider — unless the
-	// session is pinned, which must survive the run untouched, or ran on OpenAI.
+	// session is pinned, which must survive the run untouched, or ran on OpenAI
+	// or ChatGPT.
 	if ( isJsonMode && showCapabilitiesOnConnect ) {
-		if ( ! resumeContext.provider && currentProvider !== 'openai-api-key' ) {
+		if (
+			! resumeContext.provider &&
+			currentProvider !== 'openai-api-key' &&
+			currentProvider !== 'chatgpt-oauth'
+		) {
 			await switchProvider( 'wpcom', false );
 		}
 		showCapabilitiesOnConnect = false;
 	}
 
-	// Choosing how to connect would re-pin the conversation; one on OpenAI stays there.
-	if ( showCapabilitiesOnConnect && currentProvider === 'openai-api-key' ) {
+	// Choosing how to connect would re-pin the conversation; one on OpenAI or
+	// ChatGPT stays there.
+	if (
+		showCapabilitiesOnConnect &&
+		( currentProvider === 'openai-api-key' || currentProvider === 'chatgpt-oauth' )
+	) {
 		showCapabilitiesOnConnect = false;
 	}
 
@@ -857,6 +934,22 @@ export async function runCommand( options: {
 			currentModel = openAiTurn.settings.model;
 			ui.currentModel = currentModel;
 		}
+		let chatGptTurn:
+			| { selection: ConnectionSelection; reasoningEffort: OpenAiReasoningEffort }
+			| undefined;
+		if ( currentProvider === 'chatgpt-oauth' ) {
+			const selection = await resolveChatGptConnection( sm );
+			chatGptTurn = {
+				selection,
+				reasoningEffort:
+					readChatGptReasoningEffort( sm.getEntries(), selection ) ??
+					getDefaultChatGptReasoningEffort( selection.model.modelId ),
+			};
+			if ( isAiModelId( selection.model.modelId ) ) {
+				currentModel = selection.model.modelId;
+				ui.currentModel = currentModel;
+			}
+		}
 		const env = await resolveAiEnvironment( currentProvider, {
 			sessionId,
 		} );
@@ -898,7 +991,9 @@ export async function runCommand( options: {
 			enrichedPrompt = `${ enrichedPrompt }${ buildAttachedFilesPromptBlock( files ) }`;
 		}
 
-		if ( openAiTurn?.needsPin ) {
+		if ( chatGptTurn ) {
+			await persistChatGptSessionContext( chatGptTurn.selection, chatGptTurn.reasoningEffort );
+		} else if ( openAiTurn?.needsPin ) {
 			await persistOpenAiPin( openAiTurn.settings );
 		} else {
 			await persistSessionContext();
@@ -911,8 +1006,8 @@ export async function runCommand( options: {
 			...getTracksOrigin(),
 			...getAiTracksIdentity( sessionId ),
 			provider: currentProvider,
-			model: currentModel,
-			model_family: getAiModelFamily( currentModel ),
+			model: chatGptTurn ? chatGptTurn.selection.model.modelId : currentModel,
+			model_family: chatGptTurn ? 'openai' : getAiModelFamily( currentModel ),
 		};
 		const turnStartedAt = Date.now();
 		await recordChatTracksEvent( TRACKS_EVENTS.CODE_MESSAGE_SENT, () => ( {
@@ -947,6 +1042,8 @@ export async function runCommand( options: {
 			env,
 			model: currentModel,
 			openAi: openAiTurn?.settings,
+			connection: chatGptTurn?.selection,
+			chatGpt: chatGptTurn ? { reasoningEffort: chatGptTurn.reasoningEffort } : undefined,
 			session: sm,
 			activeSite: site,
 			onAskUser: ( questions ) => askUserAndPersistAnswers( questions ),

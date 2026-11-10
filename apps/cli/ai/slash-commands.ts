@@ -17,6 +17,7 @@ import {
 	type OpenAiReasoningEffort,
 	type OpenAiReasoningMode,
 } from '@studio/agent/protocol/openai-models';
+import { isSubscriptionProvider } from '@studio/agent/protocol/providers';
 import { getAiSkillCommands } from '@studio/agent/protocol/slash-commands';
 import { SecureStorageError } from '@studio/common/lib/os-credential-store';
 import { isAutomatticianFromToken, readAuthToken } from '@studio/common/lib/shared-config';
@@ -565,18 +566,34 @@ export const AI_CHAT_SLASH_COMMANDS: SlashCommandDef[] = [
 			);
 			if ( newProvider && newProvider !== ctx.currentProvider ) {
 				const previousFamily = getAiModelFamily( ctx.currentModel );
+				const previousProvider = ctx.currentProvider;
 				try {
 					await ctx.prepareProviderSelection( newProvider );
-					await ctx.switchProvider( newProvider );
-					// Providers don't share a model family, so a switch is the
-					// same runtime handoff as a cross-family /model switch.
-					if ( getAiModelFamily( ctx.currentModel ) !== previousFamily ) {
+					if (
+						isSubscriptionProvider( previousProvider ) ||
+						isSubscriptionProvider( newProvider )
+					) {
+						// Clear first so the new provider pin lands in the fresh
+						// conversation, not in the one being left.
 						await ctx.clearSession();
+						await ctx.switchProvider( newProvider );
 						ctx.ui.showInfo(
 							__(
-								"Switching across model families starts a fresh conversation — the prior turns aren't carried over."
+								"Changing the connection started a fresh conversation — the prior turns aren't carried over."
 							)
 						);
+					} else {
+						await ctx.switchProvider( newProvider );
+						if ( getAiModelFamily( ctx.currentModel ) !== previousFamily ) {
+							// Providers don't share a model family, so a switch is the
+							// same runtime handoff as a cross-family /model switch.
+							await ctx.clearSession();
+							ctx.ui.showInfo(
+								__(
+									"Switching across model families starts a fresh conversation — the prior turns aren't carried over."
+								)
+							);
+						}
 					}
 				} catch ( error ) {
 					if ( isPromptAbortError( error ) ) {
