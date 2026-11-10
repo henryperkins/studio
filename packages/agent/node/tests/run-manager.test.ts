@@ -35,6 +35,47 @@ vi.mock( '@studio/common/lib/os-credential-store', async ( importOriginal ) => {
 vi.mock( '@studio/common/lib/shared-config', () => ( {
 	updateSharedSession: vi.fn().mockResolvedValue( undefined ),
 } ) );
+const chatGptBroker = vi.hoisted( () => ( {
+	forkEnvironment: {} as Record< string, string >,
+	invalidations: [] as unknown[],
+} ) );
+vi.mock( '@studio/agent/node/chatgpt/credential-broker', () => ( {
+	getChatGptSessionForkEnvironment: () => chatGptBroker.forkEnvironment,
+	answerChatGptSessionTokenRequest: (
+		message: unknown,
+		reply: ( message: unknown ) => void
+	): boolean => {
+		if (
+			typeof message !== 'object' ||
+			message === null ||
+			( message as { type?: unknown } ).type !== 'studio.chatgpt-session-token.request'
+		) {
+			return false;
+		}
+		const { requestId, connectionId } = message as { requestId?: unknown; connectionId?: unknown };
+		reply( {
+			type: 'studio.chatgpt-session-token',
+			requestId,
+			connectionId,
+			accessToken: 'test-access-token-run-manager',
+			expiresAt: Date.now() + 3_600_000,
+		} );
+		return true;
+	},
+	answerChatGptSessionTokenInvalidation: ( message: unknown ): boolean => {
+		if (
+			typeof message !== 'object' ||
+			message === null ||
+			( message as { type?: unknown } ).type !== 'studio.chatgpt-session-token.invalidate'
+		) {
+			return false;
+		}
+		chatGptBroker.invalidations.push( message );
+		return true;
+	},
+	beginChatGptTurn: vi.fn(),
+	listChatGptConnections: async () => [],
+} ) );
 
 const mockFork = vi.mocked( fork );
 
@@ -147,6 +188,148 @@ describe( 'createAgentRunManager OpenAI session keys', () => {
 		expect( getForkEnv() ).not.toHaveProperty( 'STUDIO_OPENAI_SESSION_KEY_OFFERED' );
 		child.emit( 'message', REQUEST );
 		expect( child.send ).toHaveBeenCalledWith( { type: 'studio.openai-session-key', key: null } );
+	} );
+} );
+
+describe( 'createAgentRunManager ChatGPT session tokens', () => {
+	const CONNECTION_ID = '11111111-2222-4333-8444-555555555555';
+
+	function startRun() {
+		const child = Object.assign( createChild(), { connected: true } );
+		mockFork.mockImplementation( () => child as never );
+		const emit = vi.fn();
+		const manager = createAgentRunManager( { cliBinary: '/cli.mjs', surface: 'desktop', emit } );
+		manager.startAgentRun( { sessionId: 'session-1', prompt: 'hello' } );
+		return { child, emit };
+	}
+
+	beforeEach( () => {
+		vi.clearAllMocks();
+		mockFork.mockReset();
+		chatGptBroker.forkEnvironment = {};
+		chatGptBroker.invalidations = [];
+	} );
+
+	it( 'offers session registrations in the fork environment, never a token', () => {
+		chatGptBroker.forkEnvironment = { STUDIO_CHATGPT_SESSIONS_OFFERED: CONNECTION_ID };
+		startRun();
+
+		expect( getForkEnv().STUDIO_CHATGPT_SESSIONS_OFFERED ).toBe( CONNECTION_ID );
+		expect( JSON.stringify( getForkEnv() ) ).not.toContain( 'test-access-token' );
+	} );
+
+	it( 'offers nothing when no session registration is held', () => {
+		startRun();
+
+		expect( getForkEnv() ).not.toHaveProperty( 'STUDIO_CHATGPT_SESSIONS_OFFERED' );
+	} );
+
+	it( 'answers a child token request over IPC and does not forward it as an event', () => {
+		const { child, emit } = startRun();
+
+		child.emit( 'message', {
+			type: 'studio.chatgpt-session-token.request',
+			requestId: 'request-1',
+			connectionId: CONNECTION_ID,
+		} );
+
+		expect( child.send ).toHaveBeenCalledWith(
+			expect.objectContaining( {
+				type: 'studio.chatgpt-session-token',
+				requestId: 'request-1',
+				connectionId: CONNECTION_ID,
+			} )
+		);
+		expect( JSON.stringify( emit.mock.calls ) ).not.toContain( 'chatgpt-session-token' );
+	} );
+
+	it( 'takes a child token invalidation without forwarding it as an event', () => {
+		const { child, emit } = startRun();
+		const message = {
+			type: 'studio.chatgpt-session-token.invalidate',
+			connectionId: CONNECTION_ID,
+		};
+
+		child.emit( 'message', message );
+
+		expect( chatGptBroker.invalidations ).toEqual( [ message ] );
+		expect( JSON.stringify( emit.mock.calls ) ).not.toContain( 'chatgpt-session-token' );
+	} );
+} );
+
+describe( 'createAgentRunManager ChatGPT turn watching', () => {
+	function startWatchedRun(
+		resolveChatGptConnectionId: ( sessionId: string ) => Promise< string | null >,
+		beginChatGptTurn: ( connectionId: string ) => Promise< {
+			signal: AbortSignal;
+			end: () => void;
+		} >
+	) {
+		const child = Object.assign( createChild(), { connected: true } );
+		mockFork.mockImplementation( () => child as never );
+		const emit = vi.fn();
+		const manager = createAgentRunManager( {
+			cliBinary: '/cli.mjs',
+			surface: 'desktop',
+			emit,
+			resolveChatGptConnectionId,
+			beginChatGptTurn,
+		} );
+		const { runId } = manager.startAgentRun( { sessionId: 'session-1', prompt: 'hello' } );
+		return { child, emit, manager, runId };
+	}
+
+	beforeEach( () => {
+		vi.clearAllMocks();
+		mockFork.mockReset();
+		chatGptBroker.forkEnvironment = {};
+		chatGptBroker.invalidations = [];
+	} );
+
+	it( 'interrupts the run when its ChatGPT connection is signed out', async () => {
+		const controller = new AbortController();
+		const end = vi.fn();
+		const beginChatGptTurn = vi.fn( async () => ( { signal: controller.signal, end } ) );
+		const { child, emit } = startWatchedRun( async () => 'connection-1', beginChatGptTurn );
+
+		await vi.waitFor( () => expect( beginChatGptTurn ).toHaveBeenCalledWith( 'connection-1' ) );
+		controller.abort( new Error( 'signed out' ) );
+
+		expect( child.send ).toHaveBeenCalledWith( { type: 'interrupt' } );
+		expect( JSON.stringify( emit.mock.calls ) ).toContain( 'run.interrupting' );
+	} );
+
+	it( 'does not begin a ChatGPT turn for a non-ChatGPT run', async () => {
+		const beginChatGptTurn = vi.fn();
+		startWatchedRun( async () => null, beginChatGptTurn );
+
+		await new Promise( ( resolve ) => setImmediate( resolve ) );
+		expect( beginChatGptTurn ).not.toHaveBeenCalled();
+	} );
+
+	it( 'ends the turn handle when the run exits', async () => {
+		const end = vi.fn();
+		const beginChatGptTurn = vi.fn( async () => ( {
+			signal: new AbortController().signal,
+			end,
+		} ) );
+		const { child } = startWatchedRun( async () => 'connection-1', beginChatGptTurn );
+		await vi.waitFor( () => expect( beginChatGptTurn ).toHaveBeenCalled() );
+
+		child.emit( 'exit', 0 );
+
+		expect( end ).toHaveBeenCalledTimes( 1 );
+	} );
+
+	it( 'still starts the run when beginning the ChatGPT turn fails', async () => {
+		const beginChatGptTurn = vi.fn( async () => {
+			throw new Error( 'disconnected' );
+		} );
+		const { child, runId } = startWatchedRun( async () => 'connection-1', beginChatGptTurn );
+
+		expect( runId ).toBeTruthy();
+		await vi.waitFor( () => expect( beginChatGptTurn ).toHaveBeenCalled() );
+		child.emit( 'exit', 0 );
 	} );
 } );
 
