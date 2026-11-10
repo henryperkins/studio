@@ -24,6 +24,7 @@ const broker = vi.hoisted( () => ( {
 } ) );
 
 vi.mock( '@studio/agent/node/chatgpt/credential-broker', () => ( {
+	invalidateChatGptAccessToken: async () => undefined,
 	getChatGptAccessToken: async ( connectionId: string ) => {
 		if ( broker.failure ) {
 			throw broker.failure;
@@ -451,7 +452,7 @@ describe( 'CHATGPT_MODEL_CAPABILITIES', () => {
 			const api = OPENAI_MODEL_CAPABILITIES[ slug as keyof typeof OPENAI_MODEL_CAPABILITIES ];
 			expect( CHATGPT_MODEL_CAPABILITIES[ slug ] ).toEqual( {
 				reasoningEfforts: api.reasoningEfforts,
-				reasoningModes: api.reasoningModes,
+				reasoningModes: [ 'standard' ],
 				imageInput: api.imageInput,
 			} );
 		}

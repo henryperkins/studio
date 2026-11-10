@@ -62,6 +62,22 @@ export interface ChatGptErrorSummary {
 const CHATGPT_USAGE_URL = 'https://chatgpt.com/settings/usage';
 
 const MAX_DETAIL_LENGTH = 500;
+const MAX_REFERENCE_LENGTH = 64;
+
+// Server-supplied reference fields enter messages, records and logs, so they
+// are kept only as a short, safe token: anything else becomes an underscore.
+function toSafeReference(
+	text: string | undefined,
+	secrets: readonly string[]
+): string | undefined {
+	if ( ! text ) {
+		return undefined;
+	}
+	const safe = redactChatGptSecrets( text, secrets )
+		.replace( /[^A-Za-z0-9._-]/g, '_' )
+		.slice( 0, MAX_REFERENCE_LENGTH );
+	return safe || undefined;
+}
 // A JSON Web Token: the shape OpenAI's sample access-token payload suggests.
 const JWT_SHAPED = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*/g;
 
@@ -139,10 +155,12 @@ function summarizeErrorFields(
 	const param = readString( fields.param );
 	const kind = kindForCode( code ) ?? fallback;
 	const detail = kind === 'authorization' ? undefined : toDetail( text, secrets );
+	const safeCode = toSafeReference( code, secrets );
+	const safeParam = toSafeReference( param, secrets );
 	return {
 		kind,
-		...( code ? { code: redactChatGptSecrets( code, secrets ) } : {} ),
-		...( param ? { param: redactChatGptSecrets( param, secrets ) } : {} ),
+		...( safeCode ? { code: safeCode } : {} ),
+		...( safeParam ? { param: safeParam } : {} ),
 		...( detail ? { detail } : {} ),
 	};
 }
@@ -193,9 +211,10 @@ export function classifyChatGptStreamEvent( event: unknown ): ChatGptErrorSummar
 		case 'response.incomplete': {
 			const details = isRecord( response.incomplete_details ) ? response.incomplete_details : {};
 			const reason = readString( details.reason );
+			const safeReason = toSafeReference( reason, [] );
 			return {
 				kind: 'incomplete',
-				...( reason ? { code: redactChatGptSecrets( reason ) } : {} ),
+				...( safeReason ? { code: safeReason } : {} ),
 			};
 		}
 		case 'response.failed':
