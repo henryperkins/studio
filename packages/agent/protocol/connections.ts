@@ -17,8 +17,10 @@ import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/e
  * A model as the provider that serves it names it: the same slug under the
  * OpenAI API and under ChatGPT is two models, billed two ways.
  */
-export interface ProviderModelRef {
-	providerId: AiProviderId;
+export interface ProviderModelRef<
+	ProviderId extends AiProviderId | 'claude-code' = AiProviderId,
+> {
+	providerId: ProviderId;
 	modelId: string;
 }
 
@@ -26,9 +28,11 @@ export interface ProviderModelRef {
  * What a conversation runs on: a connection, a model of the connection's
  * provider, and the connection's configuration revision it ran under.
  */
-export interface ConnectionSelection {
+export interface ConnectionSelection<
+	ProviderId extends AiProviderId | 'claude-code' = AiProviderId,
+> {
 	connectionId: string;
-	model: ProviderModelRef;
+	model: ProviderModelRef< ProviderId >;
 	revision: number;
 }
 

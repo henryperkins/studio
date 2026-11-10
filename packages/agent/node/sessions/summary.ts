@@ -7,6 +7,7 @@ interface PiSessionHeader {
 	type: 'session';
 	id: string;
 	timestamp: string;
+	studioBackend?: unknown;
 }
 
 interface PiAssistantContentBlock {
@@ -82,10 +83,16 @@ export async function readAiSessionSummaryFromEntries(
 	let lastSelectedWpcomSiteId: number | undefined;
 	let endReason: 'error' | 'stopped' | undefined;
 	let entryCount = 0;
+	let isClaude = header?.studioBackend === 'claude-code';
 
 	for ( const entry of fileEntries ) {
 		if ( isPiHeader( entry ) ) continue;
 		entryCount += 1;
+		if (
+			isStudioCustomEntryOfType( entry, 'studio.claude_binding' ) ||
+			isStudioCustomEntryOfType( entry, 'studio.claude_selection' )
+		)
+			isClaude = true;
 		const ts = entry.timestamp;
 		if ( typeof ts === 'string' ) updatedAt = ts;
 
@@ -125,6 +132,7 @@ export async function readAiSessionSummaryFromEntries(
 
 	return {
 		id: sessionId,
+		...( isClaude ? { backend: 'claude-code' as const } : {} ),
 		filePath,
 		createdAt: createdAt ?? fallbackTimestamp,
 		updatedAt: updatedAt ?? createdAt ?? fallbackTimestamp,
@@ -134,8 +142,8 @@ export async function readAiSessionSummaryFromEntries(
 		ownerSitePath: undefined,
 		ownerSiteName: undefined,
 		selectedSiteName,
-		activeEnvironment,
-		lastSelectedWpcomSiteId,
+		activeEnvironment: isClaude ? 'local' : activeEnvironment,
+		lastSelectedWpcomSiteId: isClaude ? undefined : lastSelectedWpcomSiteId,
 		endReason,
 		eventCount: entryCount,
 	};

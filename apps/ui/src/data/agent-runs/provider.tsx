@@ -167,6 +167,7 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					startedAt: run.startedAt,
 					interrupting: run.phase === 'interrupting',
 					pendingQuestions: run.pendingQuestions,
+					pendingClaudeApprovals: run.pendingClaudeApprovals ?? [],
 				} );
 			}
 		};
@@ -285,6 +286,36 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 						] );
 					}
 					endRun( payload.sessionId );
+					return;
+				}
+				case 'backend.event': {
+					if ( event.event.runId !== payload.runId ) return;
+					if (
+						stateStore.getState()[ payload.sessionId ]?.runId === payload.runId &&
+						( event.event.type === 'approval.requested' ||
+							event.event.type === 'approval.resolved' ||
+							event.event.type === 'turn.terminal' )
+					) {
+						dispatchSession( payload.sessionId, { type: 'claude_event', event: event.event } );
+					}
+					queryClient.setQueryData< LoadedAiSession >(
+						[ ...SESSIONS_QUERY_KEY, payload.sessionId ],
+						( previous ) => {
+							if ( ! previous ) return previous;
+							const journal = previous.claudeJournal ?? [];
+							const index = journal.findIndex(
+								( turn ) => turn[ 0 ]?.turnId === event.event.turnId
+							);
+							if ( index < 0 )
+								return { ...previous, claudeJournal: [ ...journal, [ event.event ] ] };
+							return {
+								...previous,
+								claudeJournal: journal.map( ( turn, i ) =>
+									i === index ? [ ...turn, event.event ] : turn
+								),
+							};
+						}
+					);
 					return;
 				}
 				case 'message': {
@@ -475,6 +506,7 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					images,
 					files,
 					visualAnnotations,
+					...( options.claudeSelection ? { claudeSelection: options.claudeSelection } : {} ),
 				} );
 				if ( interruptPendingStartSessionIdsRef.current.has( sessionId ) ) {
 					interruptPendingStartSessionIdsRef.current.delete( sessionId );

@@ -170,4 +170,24 @@ describe( 'ChatGPT session selection', () => {
 			)
 		).toBe( true );
 	} );
+
+	it( 'refuses to repin a Claude Code runtime session to ChatGPT or an API provider', async () => {
+		const { id } = await createAiSession( root, {
+			site: { id: 'site-1', name: 'Example', path: root },
+			claude: {
+				binding: {
+					connectionId: 'claude-conn-1',
+					siteId: 'site-1',
+					workingDirectory: root,
+					configDirectory: path.join( root, '.claude' ),
+				},
+				selection: { model: 'claude-sonnet-4-6', effort: 'medium' },
+			},
+		} );
+		await expect( setSessionChatGptSelection( root, id, selection ) ).rejects.toThrow( /new chat/ );
+		await expect( setSessionProvider( root, id, 'openai-api-key', 'gpt-6-luna' ) ).rejects.toThrow(
+			/new chat/
+		);
+		await expect( setSessionModel( root, id, 'gpt-6-luna' ) ).rejects.toThrow( /new chat/ );
+	} );
 } );

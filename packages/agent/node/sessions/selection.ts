@@ -26,6 +26,11 @@ export async function withSessionSelection< T >(
 	write: ( entries: SessionEntry[] ) => Promise< T >
 ): Promise< T > {
 	const { summary } = await loadAiSession( sessionsRoot, sessionId );
+	if ( summary.backend === 'claude-code' ) {
+		throw new ChatGptSettingsError(
+			__( 'Start a new chat to change the runtime or billing connection.' )
+		);
+	}
 	const lockPath = `${ summary.filePath }.settings.lock`;
 	await lockFileAsync( lockPath, { stale: LOCKFILE_STALE_TIME, wait: LOCKFILE_WAIT_TIME } );
 	try {

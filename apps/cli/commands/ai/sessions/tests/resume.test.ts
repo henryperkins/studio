@@ -91,3 +91,19 @@ describe( 'sessions resume — active site hydration (JSON mode)', () => {
 		);
 	} );
 } );
+
+it( 'preserves an interrupt received while the session is loading', async () => {
+	let finish!: ( value: { entries: never[] } ) => void;
+	vi.mocked( loadAiSession ).mockReturnValueOnce(
+		new Promise( ( resolve ) => {
+			finish = resolve;
+		} ) as never
+	);
+	const task = runCommand( 'session-1', { json: true, message: 'hello' } );
+	process.emit( 'message', { type: 'interrupt' }, undefined as never );
+	finish( { entries: [] } );
+	await task;
+	expect( vi.mocked( runAiCommand ).mock.calls.at( -1 )?.[ 0 ].startupSignal?.aborted ).toBe(
+		true
+	);
+} );

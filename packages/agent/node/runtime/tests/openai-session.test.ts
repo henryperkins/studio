@@ -198,28 +198,51 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 	async function runTurn(
 		sessionFile: string | undefined,
 		prompt: string,
-		effort: OpenAiReasoningEffort
+		effort: OpenAiReasoningEffort,
+		dispatch = false
 	) {
 		const session = sessionFile
 			? SessionManager.open( sessionFile, sessionDir, sitesRoot )
 			: SessionManager.create( sitesRoot, sessionDir );
 		const events: AgentSessionEvent[] = [];
 		const agent = createAgent( { host: createFakeHost( sitesRoot ) } );
-		const handle = agent.runTurn( {
+		const config = {
 			prompt,
 			session,
-			model: 'gpt-6.1-sol',
-			openAi: settingsFor( effort ),
 			env: { STUDIO_OPENAI_API_KEY: KEY },
-			onEvent: ( event ) => events.push( event ),
-		} );
-		await handle.result;
+			onEvent: ( event: AgentSessionEvent ) => events.push( event ),
+		};
+		const outcome = dispatch
+			? await agent.runBackendTurn(
+					{
+						backend: 'pi',
+						runId: 'openai-run',
+						turnId: 'openai-turn',
+						selection: {
+							connectionId: 'openai-api-key',
+							model: { providerId: 'openai-api-key', modelId: 'gpt-6.1-sol' },
+							revision: 0,
+						},
+						effort,
+						permissionPolicyRevision: 0,
+						workspace: {
+							siteId: null,
+							conversationId: session.getSessionId(),
+							workingDirectory: sitesRoot,
+						},
+					},
+					{ backend: 'pi', config, openAi: settingsFor( effort ) }
+			  ).result
+			: await agent.runTurn( { ...config, model: 'gpt-6.1-sol', openAi: settingsFor( effort ) } )
+					.result;
 		const end = [ ...events ].reverse().find( ( event ) => event.type === 'agent_end' );
 		const last = end?.type === 'agent_end' ? end.messages.at( -1 ) : undefined;
 		return {
 			sessionFile: session.getSessionFile()!,
 			error: last?.role === 'assistant' ? last.errorMessage : undefined,
 			entries: session.getEntries(),
+			events,
+			outcome,
 		};
 	}
 
@@ -229,9 +252,13 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 	it( 'keeps reasoning, tool calls and settings straight across tool use, reopened sessions and compaction', async () => {
 		// Turn 1, Medium: the model reasons, reads a file, then answers.
 		replies.push( toolCallReply, () => textReply( 'DB_NAME is studio.' ) );
-		const first = await runTurn( undefined, 'What is the database name?', 'medium' );
+		const first = await runTurn( undefined, 'What is the database name?', 'medium', true );
 
 		expect( first.error ).toBeUndefined();
+		expect( first.outcome ).toEqual( { status: 'success' } );
+		expect( first.events.map( ( event ) => event.type ) ).toEqual(
+			expect.arrayContaining( [ 'tool_execution_start', 'tool_execution_end' ] )
+		);
 		// The provider pi records on the replies is the one Studio reads them by.
 		expect( readLastReplyProvider( first.entries ) ).toBe( 'openai-api-key' );
 		expect( requests ).toHaveLength( 2 );

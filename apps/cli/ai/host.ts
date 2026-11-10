@@ -137,9 +137,12 @@ export const cliAgentHost: StudioAgentHost = {
 				false,
 				new Logger( { onProgress } )
 			),
-		wpCli: ( site, args ) =>
+		wpCli: ( site, args, options ) =>
 			withDaemon( async () => {
-				await using command = await runWpCliCommand( await getSiteByFolder( site.path ), args );
+				const localSite = await getSiteByFolder( site.path );
+				await using command = options
+					? await runWpCliCommand( localSite, args, options )
+					: await runWpCliCommand( localSite, args );
 				return {
 					exitCode: await command.response.exitCode,
 					stdout: await command.response.stdoutText,

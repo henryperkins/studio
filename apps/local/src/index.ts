@@ -14,6 +14,14 @@ import {
 	stopChatGptSignIn,
 } from '@studio/agent/node/chatgpt/settings';
 import {
+	configureClaudeRuntime,
+	createClaudeSession,
+	getClaudeModelCatalog,
+	getClaudeRuntimeState,
+	setClaudeSessionSelection,
+	validateClaudeSendSelection,
+} from '@studio/agent/node/claude-code/studio-surface';
+import {
 	getGlobalInstructionsEnabled,
 	readGlobalInstructionsFile,
 	setGlobalInstructionsEnabled,
@@ -26,7 +34,6 @@ import {
 	createHydratedAiSession,
 	listHydratedAiSessions,
 	loadHydratedAiSession,
-	reconcileSessionEnvironment,
 	setSessionEnvironment,
 	updateHydratedAiSessionMetadata,
 } from '@studio/agent/node/sessions/manage';
@@ -408,6 +415,8 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 
 	// --- Server-Sent Events: one stream carries live UI updates ----------------
 	const sseClients = new Set< Response >();
+	const claudeClients = new Map< string, Response >();
+	const claudeRunClients = new Map< string, string >();
 	function sseSend( message: { channel: string; payload: unknown } ): void {
 		if ( sseClients.size === 0 ) {
 			return;
@@ -490,7 +499,18 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 		nodeBinary,
 		surface: 'cliui',
 		// Agent-run events on `agent`, session-placement updates on `placement`.
-		emit: ( output ) => sseSend( { channel: output.kind, payload: output.event } ),
+		emit: ( output ) => {
+			const clientId = claudeRunClients.get( output.runId );
+			const message = { channel: output.kind, payload: output.event };
+			if ( ! clientId ) {
+				sseSend( message );
+				return;
+			}
+			claudeClients.get( clientId )?.write( `data: ${ JSON.stringify( message ) }\n\n` );
+			if ( output.kind === 'agent' && output.event.event.type === 'run.exited' ) {
+				claudeRunClients.delete( output.runId );
+			}
+		},
 	} );
 
 	// Changes made anywhere — the agent, a terminal, the Desktop app — reach the
@@ -583,14 +603,27 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 	app.use( express.json( { limit: STUDIO_CHAT_MAX_TOTAL_IMAGE_BYTES * 2 } ) );
 
 	api.get( '/events', ( req: Request, res: Response ) => {
+		const clientId = req.query.clientId;
+		const claudeClientId =
+			typeof clientId === 'string' && /^[a-f0-9-]{36}$/.test( clientId ) ? clientId : undefined;
+		if ( claudeClientId && claudeClients.has( claudeClientId ) ) {
+			res.sendStatus( 409 );
+			return;
+		}
 		res.setHeader( 'Content-Type', 'text/event-stream' );
 		res.setHeader( 'Cache-Control', 'no-cache' );
 		res.setHeader( 'Connection', 'keep-alive' );
 		res.flushHeaders?.();
 		res.write( ': connected\n\n' );
 		sseClients.add( res );
+		if ( claudeClientId ) claudeClients.set( claudeClientId, res );
 		req.on( 'close', () => {
 			sseClients.delete( res );
+			if ( ! claudeClientId ) return;
+			claudeClients.delete( claudeClientId );
+			for ( const [ runId, owner ] of claudeRunClients ) {
+				if ( owner === claudeClientId ) runManager.interruptAgentRun( runId );
+			}
 		} );
 	} );
 
@@ -2259,6 +2292,38 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 
 	// --- AI sessions ----------------------------------------------------------
 	api.get(
+		'/claude-code',
+		asyncHandler( async ( _req: Request, res: Response ) => {
+			res.json( await getClaudeRuntimeState() );
+		} )
+	);
+	api.post(
+		'/claude-code/connection',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			await configureClaudeRuntime( req.body );
+			res.sendStatus( 204 );
+		} )
+	);
+	api.get(
+		'/claude-code/:connectionId/models/:siteId',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json( await getClaudeModelCatalog( req.params.connectionId, req.params.siteId ) );
+		} )
+	);
+	api.post(
+		'/claude-code/sessions',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json( await createClaudeSession( sessionsRoot, req.body ) );
+		} )
+	);
+	api.post(
+		'/sessions/:id/claude-selection',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			await setClaudeSessionSelection( sessionsRoot, req.params.id, req.body );
+			res.sendStatus( 204 );
+		} )
+	);
+	api.get(
 		'/sessions',
 		asyncHandler( async ( _req: Request, res: Response ) => {
 			res.json( await listHydratedAiSessions( sessionsRoot ) );
@@ -2401,16 +2466,32 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 				res.status( 400 ).json( { error: ( error as Error ).message } );
 				return;
 			}
-			await reconcileSessionEnvironment( sessionsRoot, req.params.id );
+			const claudeSelection = await validateClaudeSendSelection(
+				sessionsRoot,
+				req.params.id,
+				req.body.claudeSelection
+			);
+			const clientId = req.body.clientId;
+			if (
+				claudeSelection &&
+				( typeof clientId !== 'string' || ! claudeClients.has( clientId ) )
+			) {
+				res
+					.status( 409 )
+					.json( { error: 'Reconnect to Studio before sending a Claude Code message.' } );
+				return;
+			}
 			const { runId } = runManager.startAgentRun( {
 				sessionId: req.params.id,
-				prompt: expandSkillCommandPrompt( prompt ),
+				prompt: claudeSelection ? prompt : expandSkillCommandPrompt( prompt ),
+				claudeSelection,
 				turnId: typeof req.body.turnId === 'string' ? req.body.turnId : undefined,
 				displayMessage,
 				images,
 				files,
 				visualAnnotations: validatedVisualAnnotations,
 			} );
+			if ( claudeSelection ) claudeRunClients.set( runId, clientId );
 			void recordAnnotationSubmitted( {
 				annotationCount: validatedVisualAnnotations?.length ?? 0,
 				sessionsRoot,
@@ -2540,8 +2621,13 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 	);
 
 	// --- Runs -----------------------------------------------------------------
-	api.get( '/runs/active', ( _req: Request, res: Response ) => {
-		res.json( runManager.listActiveAgentRuns() );
+	api.get( '/runs/active', ( req: Request, res: Response ) => {
+		res.json(
+			runManager.listActiveAgentRuns().filter( ( run ) => {
+				const owner = claudeRunClients.get( run.runId );
+				return ! owner || owner === req.query.clientId;
+			} )
+		);
 	} );
 
 	api.post( '/runs/:runId/interrupt', ( req: Request, res: Response ) => {
@@ -2550,6 +2636,11 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 	} );
 
 	api.post( '/runs/:runId/answer', ( req: Request, res: Response ) => {
+		const owner = claudeRunClients.get( req.params.runId );
+		if ( owner && ( owner !== req.body?.clientId || ! claudeClients.has( owner ) ) ) {
+			res.sendStatus( 403 );
+			return;
+		}
 		const { answers } = req.body as { answers?: Record< string, string > };
 		runManager.answerAgentRun( req.params.runId, answers ?? {} );
 		res.sendStatus( 204 );
@@ -2617,6 +2708,7 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 				watch.cancelled = true;
 			}
 			publishWatches.clear();
+			for ( const runId of claudeRunClients.keys() ) runManager.interruptAgentRun( runId );
 			for ( const client of sseClients ) {
 				client.end();
 			}

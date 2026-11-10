@@ -3,6 +3,8 @@ import type {
 	StudioChatImage,
 	StudioVisualAnnotationSummary,
 } from '@/data/core';
+import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
+import type { ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
 
 export interface PendingQuestion {
 	question: string;
@@ -10,6 +12,7 @@ export interface PendingQuestion {
 }
 
 export interface SendMessageOptions {
+	claudeSelection?: ClaudeSessionSelection;
 	displayMessage?: string;
 	images?: StudioChatImage[];
 	files?: StudioChatFileAttachment[];
@@ -34,6 +37,7 @@ export interface AgentRunState {
 	isInterrupting: boolean;
 	pendingQuestions: PendingQuestion[];
 	pendingAnswers: Record< string, string >;
+	pendingClaudeApprovals: Extract< BackendTurnEvent, { type: 'approval.requested' } >[];
 	queuedPrompts: QueuedPrompt[];
 }
 
@@ -44,6 +48,7 @@ export const initialAgentRunState: AgentRunState = {
 	isInterrupting: false,
 	pendingQuestions: [],
 	pendingAnswers: {},
+	pendingClaudeApprovals: [],
 	queuedPrompts: [],
 };
 
@@ -54,6 +59,7 @@ export type AgentRunAction =
 			startedAt: number;
 			interrupting: boolean;
 			pendingQuestions?: PendingQuestion[];
+			pendingClaudeApprovals?: AgentRunState[ 'pendingClaudeApprovals' ];
 	  }
 	| { type: 'send_pending'; startedAt: number }
 	| { type: 'send_start'; runId: string; startedAt: number }
@@ -64,6 +70,7 @@ export type AgentRunAction =
 	| { type: 'question_answered'; question: string; answer: string }
 	| { type: 'question_answer_cleared'; question: string }
 	| { type: 'batch_dispatched' }
+	| { type: 'claude_event'; event: BackendTurnEvent }
 	| { type: 'queue_append'; prompt: QueuedPrompt }
 	| { type: 'queue_remove'; id: string }
 	| { type: 'queue_shift' }
@@ -91,6 +98,13 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 				pendingQuestions: action.pendingQuestions?.length
 					? action.pendingQuestions
 					: state.pendingQuestions,
+				pendingClaudeApprovals:
+					action.interrupting || ( state.runId === action.runId && state.phase === 'winding_down' )
+						? []
+						: (
+								action.pendingClaudeApprovals ??
+								( state.runId === action.runId ? state.pendingClaudeApprovals : [] )
+						  ).filter( ( approval ) => approval.runId === action.runId ),
 			};
 		case 'send_pending':
 			return {
@@ -99,6 +113,7 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 				runId: null,
 				startedAt: action.startedAt,
 				isInterrupting: false,
+				pendingClaudeApprovals: [],
 			};
 		case 'send_start':
 			return {
@@ -114,6 +129,7 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 				phase: state.phase === 'idle' ? 'idle' : 'winding_down',
 				pendingQuestions: [],
 				pendingAnswers: {},
+				pendingClaudeApprovals: [],
 			};
 		case 'run_ended':
 			// Preserve the queue across run boundaries so staged follow-ups
@@ -129,6 +145,7 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 				isInterrupting: true,
 				pendingQuestions: [],
 				pendingAnswers: {},
+				pendingClaudeApprovals: [],
 			};
 		case 'questions_added':
 			return {
@@ -146,6 +163,31 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 		}
 		case 'batch_dispatched':
 			return { ...state, pendingQuestions: [], pendingAnswers: {} };
+		case 'claude_event': {
+			const { event } = action;
+			if ( state.runId !== event.runId || state.phase !== 'running' ) return state;
+			if ( event.type === 'approval.requested' ) {
+				return {
+					...state,
+					pendingClaudeApprovals: [
+						...state.pendingClaudeApprovals.filter(
+							( item ) => item.requestId !== event.requestId
+						),
+						event,
+					],
+				};
+			}
+			if ( event.type === 'approval.resolved' ) {
+				return {
+					...state,
+					pendingClaudeApprovals: state.pendingClaudeApprovals.filter(
+						( item ) => item.requestId !== event.requestId
+					),
+				};
+			}
+			if ( event.type === 'turn.terminal' ) return { ...state, pendingClaudeApprovals: [] };
+			return state;
+		}
 		case 'queue_append':
 			return { ...state, queuedPrompts: [ ...state.queuedPrompts, action.prompt ] };
 		case 'queue_remove':

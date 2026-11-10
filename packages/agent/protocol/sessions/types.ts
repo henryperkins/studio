@@ -1,4 +1,5 @@
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 
 // Also sent as `outcome` on `studio_code_turn_completed`.
 export type TurnStatus = 'success' | 'error' | 'max_turns' | 'interrupted';
@@ -11,6 +12,7 @@ export interface AiSessionMetadata {
 
 export interface AiSessionSummary extends AiSessionMetadata {
 	id: string;
+	backend?: 'claude-code';
 	filePath: string;
 	createdAt: string;
 	updatedAt: string;
@@ -37,4 +39,6 @@ export interface AiSessionSummary extends AiSessionMetadata {
 export interface LoadedAiSession {
 	summary: AiSessionSummary;
 	entries: SessionEntry[];
+	claudeJournal?: BackendTurnEvent[][];
+	claudeRecovery?: 'run-locked' | 'journal-unreadable' | 'deletion-pending';
 }

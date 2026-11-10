@@ -174,6 +174,13 @@ const api: IpcApi = {
 	listAiSessions: () => ipcRendererInvoke( 'listAiSessions' ),
 	loadAiSession: ( sessionIdOrPrefix ) => ipcRendererInvoke( 'loadAiSession', sessionIdOrPrefix ),
 	createAiSession: ( siteId ) => ipcRendererInvoke( 'createAiSession', siteId ),
+	getClaudeRuntimeState: () => ipcRendererInvoke( 'getClaudeRuntimeState' ),
+	configureClaudeRuntime: ( action ) => ipcRendererInvoke( 'configureClaudeRuntime', action ),
+	getClaudeModelCatalog: ( connectionId, siteId ) =>
+		ipcRendererInvoke( 'getClaudeModelCatalog', connectionId, siteId ),
+	createClaudeSession: ( request ) => ipcRendererInvoke( 'createClaudeSession', request ),
+	setClaudeSessionSelection: ( sessionId, selection ) =>
+		ipcRendererInvoke( 'setClaudeSessionSelection', sessionId, selection ),
 	updateAiSessionMetadata: ( sessionIdOrPrefix, patch ) =>
 		ipcRendererInvoke( 'updateAiSessionMetadata', sessionIdOrPrefix, patch ),
 	continueAiSession: ( sessionId, prompt, options ) =>

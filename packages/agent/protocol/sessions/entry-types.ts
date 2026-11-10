@@ -5,6 +5,10 @@
 import type { CustomEntry, SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { StudioChatArtifactData } from '@studio/agent/protocol/chat-artifacts';
 import type { StudioChatImageAttachment } from '@studio/agent/protocol/chat-images';
+import type {
+	ClaudeSessionSelection,
+	ClaudeWorkspaceBinding,
+} from '@studio/agent/protocol/claude-code';
 import type { StudioVisualAnnotationSummary } from '@studio/agent/protocol/visual-annotations';
 
 export type StudioCustomEntryType =
@@ -14,6 +18,8 @@ export type StudioCustomEntryType =
 	| 'studio.agent_question'
 	| 'studio.turn_closed'
 	| 'studio.session_context'
+	| 'studio.claude_binding'
+	| 'studio.claude_selection'
 	| 'studio.user_prompt'
 	| 'studio.message_edited';
 
@@ -110,6 +116,8 @@ export interface StudioCustomEntryDataMap {
 	'studio.agent_question': StudioAgentQuestionData;
 	'studio.turn_closed': StudioTurnClosedData;
 	'studio.session_context': StudioSessionContextData;
+	'studio.claude_binding': ClaudeWorkspaceBinding;
+	'studio.claude_selection': ClaudeSessionSelection;
 	'studio.user_prompt': StudioUserPromptData;
 	'studio.message_edited': StudioMessageEditedData;
 }

@@ -146,6 +146,8 @@ function drainToMemory( source: Readable ): Readable {
 
 export type RunWpCliCommandOptions = {
 	phpVersion?: SupportedPHPVersion;
+	signal?: AbortSignal;
+	beforeSpawn?: () => Promise< void >;
 	requireSqliteCliCommand?: boolean;
 	siteUrl?: string;
 	stdio?: 'inherit' | 'pipe';
@@ -211,6 +213,7 @@ export async function runWpCliCommand(
 	args: string[],
 	options: RunWpCliCommandOptions = {}
 ): Promise< DisposableWpCliResponse | DisposableExitCode > {
+	options.signal?.throwIfAborted();
 	const phpVersion = resolveSupportedPhpVersion( options.phpVersion ?? DEFAULT_PHP_VERSION );
 	await ensurePhpBinaryAvailable( phpVersion );
 	await writeStudioMuPlugins( site.path, site.isWpAutoUpdating, site.id );
@@ -226,6 +229,8 @@ export async function runWpCliCommand(
 		emailDirectory: getSiteEmailDirectory( site.id ),
 	} );
 	const wpCliArgs = applyWpCliCommandOptions( args, options );
+	await options.beforeSpawn?.();
+	options.signal?.throwIfAborted();
 	const child = spawn(
 		getPhpBinaryPath( phpVersion ),
 		[
@@ -250,9 +255,13 @@ export async function runWpCliCommand(
 		child.once( 'error', ( error: Error ) => reject( error ) );
 		child.once( 'exit', ( code ) => resolve( code ?? 1 ) );
 	} );
+	const stopOnAbort = () => killPhpProcessTree( child, 'SIGKILL' );
+	options.signal?.addEventListener( 'abort', stopOnAbort, { once: true } );
+	if ( options.signal?.aborted ) stopOnAbort();
 
 	const dispose = () => {
 		removeReaper();
+		options.signal?.removeEventListener( 'abort', stopOnAbort );
 		// Tree-kill so any subprocess WP-CLI spawned dies with it, not just the php.exe itself.
 		if ( child.exitCode === null && child.signalCode === null && ! child.killed ) {
 			killPhpProcessTree( child, 'SIGKILL' );

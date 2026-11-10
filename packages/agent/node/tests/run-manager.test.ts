@@ -195,6 +195,24 @@ describe( 'createAgentRunManager OpenAI session keys', () => {
 		child.emit( 'message', REQUEST );
 		expect( child.send ).toHaveBeenCalledWith( { type: 'studio.openai-session-key', key: null } );
 	} );
+
+	it( 'does not offer or send the OpenAI session key to a Claude run', async () => {
+		await storeOpenAiKey( KEY, 'session' );
+		const child = Object.assign( createChild(), { connected: true } );
+		mockFork.mockImplementation( () => child as never );
+		const emit = vi.fn();
+		const manager = createAgentRunManager( { cliBinary: '/cli.mjs', surface: 'desktop', emit } );
+		manager.startAgentRun( {
+			sessionId: 'claude-session',
+			prompt: 'hello',
+			claudeSelection: { model: 'sonnet', effort: 'medium' },
+		} );
+		child.emit( 'message', REQUEST );
+		expect( getForkEnv() ).not.toHaveProperty( 'STUDIO_OPENAI_SESSION_KEY_OFFERED' );
+		expect( child.send ).not.toHaveBeenCalled();
+		expect( emit ).not.toHaveBeenCalled();
+		child.emit( 'exit', 1 );
+	} );
 } );
 
 describe( 'createAgentRunManager ChatGPT session tokens', () => {
@@ -405,4 +423,53 @@ it( 'passes the exact dispatched turn ID through the existing input payload', ()
 		turnId,
 	} );
 	child.emit( 'exit', 0 );
+} );
+
+it( 'scopes Claude approvals and treats an exit without a terminal event as unknown', async () => {
+	const child = Object.assign( createChild(), { connected: true } );
+	mockFork.mockReturnValueOnce( child as never );
+	const emit = vi.fn();
+	const manager = createAgentRunManager( { cliBinary: '/cli.mjs', surface: 'desktop', emit } );
+	const { runId } = manager.startAgentRun( {
+		sessionId: 'claude',
+		prompt: 'hello',
+		turnId: 'turn',
+		claudeSelection: { model: 'model', effort: 'high' },
+	} );
+	const approval = {
+		type: 'approval.requested',
+		runId,
+		turnId: 'turn',
+		requestId: 'req',
+		toolCallId: 'tool',
+		description: 'Approve',
+	};
+	child.emit( 'message', {
+		type: 'backend.event',
+		timestamp: '',
+		event: { ...approval, runId: 'wrong' },
+	} );
+	child.emit( 'message', { type: 'backend.event', timestamp: '', event: approval } );
+	await vi.waitFor( () =>
+		expect( manager.listActiveAgentRuns()[ 0 ].pendingClaudeApprovals ).toEqual( [ approval ] )
+	);
+	manager.answerAgentRun( runId, { req: 'allow' } );
+	manager.answerAgentRun( runId, { req: 'allow' } );
+	expect( child.send ).toHaveBeenCalledTimes( 1 );
+	child.emit( 'exit', 0 );
+	await vi.waitFor( () =>
+		expect( emit ).toHaveBeenCalledWith(
+			expect.objectContaining( {
+				event: expect.objectContaining( {
+					event: expect.objectContaining( {
+						type: 'backend.event',
+						event: expect.objectContaining( {
+							type: 'turn.terminal',
+							outcome: { status: 'unknown_process_exit' },
+						} ),
+					} ),
+				} ),
+			} )
+		)
+	);
 } );

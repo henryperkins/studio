@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { stripVTControlCharacters } from 'node:util';
 import {
 	closeSharedBrowser,
 	createAgent,
@@ -11,6 +13,11 @@ import {
 	chatGptSettingsAction,
 	validateChatGptSelection,
 } from '@studio/agent/node/chatgpt/settings';
+import {
+	getClaudeSessionStoreRoot,
+	validateClaudeSendSelection,
+	verifyClaudeTurnSession,
+} from '@studio/agent/node/claude-code/studio-surface';
 import { assertSessionSelection } from '@studio/agent/node/sessions/selection';
 import {
 	readAiSettings,
@@ -29,6 +36,10 @@ import {
 	getDefaultChatGptReasoningEffort,
 	resolveChatGptReasoning,
 } from '@studio/agent/protocol/chatgpt-models';
+import {
+	resolveClaudeSession,
+	type ClaudeSessionSelection,
+} from '@studio/agent/protocol/claude-code';
 import {
 	describeConnectionSelectionError,
 	resolveConnectionSelection,
@@ -70,6 +81,7 @@ import {
 	resolveUnavailableAiProvider,
 	saveSelectedAiProvider,
 } from 'cli/ai/auth';
+import { getTerminalClaudeApprover } from 'cli/ai/claude-approval';
 import { cliAgentHost } from 'cli/ai/host';
 import { emitEvent } from 'cli/ai/json-events';
 import { type AiOutputAdapter, JsonAdapter } from 'cli/ai/output-adapter';
@@ -98,6 +110,7 @@ import {
 import { Logger, LoggerError } from 'cli/logger';
 import { StudioArgv } from 'cli/types';
 import type { SessionManager } from '@earendil-works/pi-coding-agent';
+import type { ClaudeToolPolicy } from '@studio/agent/node/claude-code/tool-bridge';
 import type {
 	StudioCustomEntryDataMap,
 	StudioCustomEntryType,
@@ -285,8 +298,12 @@ async function resolveChatGptConnection( sm: SessionManager ): Promise< Connecti
 
 export async function runCommand( options: {
 	adapter: AiOutputAdapter;
+	approveClaude?: ClaudeToolPolicy[ 'approve' ];
+	startupSignal?: AbortSignal;
 	initialMessage?: string;
 	initialTurnId?: string;
+	initialRunId?: string;
+	claudeSelection?: ClaudeSessionSelection;
 	initialDisplayMessage?: string;
 	initialImages?: StudioChatImage[];
 	initialFiles?: StudioChatFileAttachment[];
@@ -361,6 +378,122 @@ export async function runCommand( options: {
 			ui.emitTurnCompleted( 'error', '' );
 			return;
 		}
+	}
+	const entries = options.resumeSession?.entries ?? resumedById?.getEntries();
+	const claude = entries && resolveClaudeSession( entries );
+	const savedHeader = resumedById?.getHeader?.();
+	if (
+		! claude &&
+		( options.claudeSelection !== undefined ||
+			options.resumeSession?.summary.backend === 'claude-code' ||
+			( savedHeader &&
+				'studioBackend' in savedHeader &&
+				savedHeader.studioBackend === 'claude-code' ) )
+	) {
+		throw new Error( 'The Claude Code workspace binding is missing.' );
+	}
+	if ( claude ) {
+		const selection = options.claudeSelection ?? claude.selection;
+		if (
+			selection.model !== claude.selection.model ||
+			selection.effort !== claude.selection.effort
+		) {
+			throw new Error( 'Claude session settings changed before the turn started.' );
+		}
+		if ( ! options.initialMessage?.trim() )
+			throw new Error( 'A message is required for a Claude turn.' );
+		if ( options.initialFiles?.length || options.initialVisualAnnotations?.length )
+			throw new Error( 'File attachments are not supported for Claude turns.' );
+		const runId = options.initialRunId ?? randomUUID();
+		const turnId = options.initialTurnId ?? randomUUID();
+		const conversationId = options.resumeSession?.summary.id ?? resumedById!.getSessionId();
+		await validateClaudeSendSelection( getSessionsDirectory(), conversationId, selection );
+		const pending = new Map< string, ( answer: 'allow' | 'deny' ) => void >();
+		const approve = async (
+			request: Parameters< ClaudeToolPolicy[ 'approve' ] >[ 0 ],
+			signal: AbortSignal
+		): Promise< 'allow' | 'deny' > => {
+			if ( signal.aborted ) return 'deny';
+			if ( typeof process.send !== 'function' )
+				return options.approveClaude?.( request, signal ) ?? 'deny';
+			return new Promise( ( resolve ) => {
+				const done = ( answer: 'allow' | 'deny' ) => {
+					pending.delete( request.operationId );
+					signal.removeEventListener( 'abort', abort );
+					resolve( answer );
+				};
+				const abort = () => done( 'deny' );
+				pending.set( request.operationId, done );
+				signal.addEventListener( 'abort', abort, { once: true } );
+				if ( signal.aborted ) abort();
+			} );
+		};
+		const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
+		const claudeAgent = createAgent( {
+			host,
+			claudeCode: ( snapshot, input ) =>
+				runClaudeTurn( snapshot, host, input, {
+					storeRoot: getClaudeSessionStoreRoot( getSessionsDirectory() ),
+					approve,
+					verifySession: ( turn ) => verifyClaudeTurnSession( getSessionsDirectory(), turn ),
+				} ),
+		} );
+		const turn = claudeAgent.runBackendTurn(
+			{
+				backend: 'claude-code',
+				runId,
+				turnId,
+				effort: selection.effort,
+				permissionPolicyRevision: 0,
+				selection: {
+					connectionId: claude.binding.connectionId,
+					revision: 0,
+					model: { providerId: 'claude-code', modelId: selection.model },
+				},
+				workspace: { ...claude.binding, conversationId },
+			},
+			{
+				backend: 'claude-code',
+				prompt: options.initialMessage,
+				images: options.initialImages,
+				onEvent: ( event ) => {
+					if ( isJsonMode )
+						emitEvent( { type: 'backend.event', timestamp: new Date().toISOString(), event } );
+					else if ( event.type === 'content.confirmed' && event.blockType === 'text' )
+						process.stdout.write( stripVTControlCharacters( event.text ) + '\n' );
+					else if ( event.type === 'turn.terminal' && event.outcome.status !== 'success' )
+						process.stderr.write( ( event.outcome.message ?? event.outcome.status ) + '\n' );
+				},
+			}
+		);
+		const onMessage = ( value: unknown ) => {
+			if ( ! value || typeof value !== 'object' ) return;
+			const message = value as { type?: string; answers?: Record< string, string > };
+			if ( message.type === 'interrupt' ) void turn.interrupt();
+			if ( message.type === 'answer' && message.answers )
+				for ( const [ id, answer ] of Object.entries( message.answers ) ) {
+					if ( answer === 'allow' || answer === 'deny' ) pending.get( id )?.( answer );
+				}
+		};
+		const interrupt = () => {
+			void turn.interrupt();
+		};
+		process.on( 'message', onMessage );
+		process.on( 'disconnect', interrupt );
+		process.on( 'SIGINT', interrupt );
+		options.startupSignal?.addEventListener( 'abort', interrupt, { once: true } );
+		if ( options.startupSignal?.aborted ) interrupt();
+		try {
+			const result = await turn.result;
+			if ( result.status !== 'success' ) process.exitCode = 1;
+		} finally {
+			process.off( 'message', onMessage );
+			process.off( 'disconnect', interrupt );
+			process.off( 'SIGINT', interrupt );
+			options.startupSignal?.removeEventListener( 'abort', interrupt );
+			for ( const resolve of pending.values() ) resolve( 'deny' );
+		}
+		return;
 	}
 	const resumeContext = resolveResumeSessionContext(
 		options.resumeSession ??
@@ -1289,6 +1422,7 @@ export const registerCommand = ( yargs: StudioArgv ) => {
 				}
 				await runCommand( {
 					adapter,
+					approveClaude: typedArgv.json ? undefined : getTerminalClaudeApprover(),
 					initialMessage,
 					resumeSessionId: typedArgv.resumeSession,
 					showLegacyCommandNotice: argv._[ 0 ] === 'ai',

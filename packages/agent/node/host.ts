@@ -59,7 +59,11 @@ export interface StudioAgentHost {
 			mode: 'full' | 'db',
 			onProgress: ProgressCallback
 		): Promise< void >;
-		wpCli( site: HostSite, args: string[] ): Promise< WpCliOutput >;
+		wpCli(
+			site: HostSite,
+			args: string[],
+			options?: { signal?: AbortSignal; beforeSpawn?: () => Promise< void > }
+		): Promise< WpCliOutput >;
 	};
 	previews: {
 		list( site: HostSite ): Promise< Snapshot[] >;

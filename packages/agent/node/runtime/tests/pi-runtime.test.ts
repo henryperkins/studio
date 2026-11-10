@@ -242,6 +242,82 @@ describe( 'pi runtime', () => {
 		} );
 	} );
 
+	it.each( [
+		{
+			providerId: 'wpcom',
+			modelId: 'fast',
+			piProvider: 'studio-wpcom',
+			api: 'openai-completions',
+			env: WPCOM_ENV,
+		},
+		{
+			providerId: 'anthropic-api-key',
+			modelId: 'claude-sonnet-5',
+			piProvider: 'anthropic',
+			api: 'anthropic-messages',
+			env: { ANTHROPIC_API_KEY: 'test-key' },
+		},
+	] as const )(
+		'forwards $providerId replies and tool progress through either entry point',
+		async ( fixture ) => {
+			const { modelId, providerId, piProvider, api, env } = fixture;
+			const message = {
+				...assistantMessage( [ { type: 'text', text: 'Found the site.' } ] ).message,
+				role: 'assistant' as const,
+				provider: piProvider,
+				model: modelId,
+				api,
+			} as Extract< AgentSessionEvent, { type: 'agent_end' } >[ 'messages' ][ number ];
+			const events: AgentSessionEvent[] = [
+				{
+					type: 'tool_execution_update',
+					toolCallId: 'site-list',
+					toolName: 'list_sites',
+					args: {},
+					partialResult: { content: [], details: { studioProgress: { message: 'Listing sites' } } },
+				},
+				{ type: 'message_end', message },
+				{ type: 'agent_end', willRetry: false, messages: [ message ] },
+			];
+			mocks.nextEvents = structuredClone( events );
+			const legacyEvents = await runRuntime( {
+				prompt: 'Find a site',
+				model: modelId,
+				env,
+				session: newSession(),
+			} );
+			const dispatchedEvents: AgentSessionEvent[] = [];
+			mocks.nextEvents = structuredClone( events );
+			const { result } = agent.runBackendTurn(
+				{
+					backend: 'pi',
+					runId: 'run',
+					turnId: 'turn',
+					selection: { connectionId: providerId, model: { providerId, modelId }, revision: 0 },
+					effort: null,
+					permissionPolicyRevision: 0,
+					workspace: { conversationId: 'chat', siteId: null, workingDirectory: mocks.studioRoot },
+				},
+				{
+					backend: 'pi',
+					config: {
+						prompt: 'Find a site',
+						env,
+						session: newSession(),
+						onEvent: ( event ) => dispatchedEvents.push( event ),
+					},
+				}
+			);
+			await expect( result ).resolves.toEqual( { status: 'success' } );
+			expect( legacyEvents ).toEqual( events );
+			expect( dispatchedEvents ).toEqual( legacyEvents );
+			expect( mocks.createdSessions.map( ( session ) => session.state.model ) ).toEqual( [
+				{ id: modelId, provider: piProvider },
+				{ id: modelId, provider: piProvider },
+			] );
+		}
+	);
+
 	it( 'emits agent_end carrying the credential error when STUDIO_WPCOM_API_KEY is absent', async () => {
 		const events = await runRuntime( {
 			prompt: 'hello',
