@@ -192,6 +192,16 @@ const api: IpcApi = {
 		ipcRendererInvoke( 'setAiSessionProvider', sessionId, provider, model ),
 	setAiSessionOpenAiSelection: ( sessionId, selection ) =>
 		ipcRendererInvoke( 'setAiSessionOpenAiSelection', sessionId, selection ),
+	setAiSessionChatGptSelection: ( sessionId, selection ) =>
+		ipcRendererInvoke( 'setAiSessionChatGptSelection', sessionId, selection ),
+	getChatGptSettings: () => ipcRendererInvoke( 'getChatGptSettings' ),
+	beginChatGptSignIn: ( registrationId, options ) =>
+		ipcRendererInvoke( 'beginChatGptSignIn', registrationId, options ),
+	waitForChatGptSignIn: ( attemptId ) => ipcRendererInvoke( 'waitForChatGptSignIn', attemptId ),
+	cancelChatGptSignIn: ( attemptId ) => ipcRendererInvoke( 'cancelChatGptSignIn', attemptId ),
+	signOutChatGpt: ( connectionId ) => ipcRendererInvoke( 'signOutChatGpt', connectionId ),
+	getChatGptModels: ( connectionId, revision ) =>
+		ipcRendererInvoke( 'getChatGptModels', connectionId, revision ),
 	setAiSessionEnvironment: ( sessionId, environment ) =>
 		ipcRendererInvoke( 'setAiSessionEnvironment', sessionId, environment ),
 	interruptAiAgentRun: ( runId ) => ipcRendererInvoke( 'interruptAiAgentRun', runId ),

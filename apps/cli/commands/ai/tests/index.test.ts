@@ -883,6 +883,10 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 	} );
 
 	it( 'runs a ChatGPT turn on its recorded connection and slug, recording the turn', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' );
+		onTestFinished( () => {
+			vi.unstubAllEnvs();
+		} );
 		( resolveResumeSessionContext as Mock ).mockReturnValue( {
 			provider: 'chatgpt-oauth',
 			model: undefined,
@@ -906,7 +910,7 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 				provider: 'chatgpt-oauth',
 				connectionId: 'conn-1',
 				revision: 1,
-				model: 'gpt-chat-test',
+				model: 'gpt-6-luna',
 				reasoningEffort: 'high',
 			} )
 		);
@@ -917,7 +921,7 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 		expect( turnConfig() ).toMatchObject( {
 			connection: {
 				connectionId: 'conn-1',
-				model: { providerId: 'chatgpt-oauth', modelId: 'gpt-chat-test' },
+				model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' },
 				revision: 1,
 			},
 			chatGpt: { reasoningEffort: 'high' },
@@ -927,7 +931,7 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 			provider: 'chatgpt-oauth',
 			connectionId: 'conn-1',
 			revision: 1,
-			model: 'gpt-chat-test',
+			model: 'gpt-6-luna',
 			reasoningEffort: 'high',
 		} );
 	} );
@@ -1123,6 +1127,8 @@ it( 'does not use Pi when a Claude transport payload loses its workspace binding
 } );
 
 describe( 'AI runCommand — ChatGPT conversations', () => {
+	beforeEach( () => vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' ) );
+	afterEach( () => vi.unstubAllEnvs() );
 	let stdoutSpy: ReturnType< typeof vi.spyOn >;
 	let entries: unknown[];
 	let appendCustomEntry: Mock;
@@ -1195,6 +1201,19 @@ describe( 'AI runCommand — ChatGPT conversations', () => {
 		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
 		expect( appendCustomEntry ).not.toHaveBeenCalled();
 		expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
+	} );
+
+	it( 'blocks a resumed ChatGPT turn while the experimental feature is disabled', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+		await readOwnContext();
+		const adapter = new JsonAdapter();
+		const showError = vi.spyOn( adapter, 'showError' );
+		await runCommand( { adapter, initialMessage: 'hello', resumeSession: resumeSession() } );
+		expect( showError ).toHaveBeenCalledWith(
+			'ChatGPT plan connections are not enabled in this app.'
+		);
+		expect( readConnectionRegistry ).not.toHaveBeenCalled();
+		expect( runStudioAgentTurn ).not.toHaveBeenCalled();
 	} );
 
 	it( 'never sends an OpenAI model recorded under ChatGPT to the OpenAI API key', async () => {

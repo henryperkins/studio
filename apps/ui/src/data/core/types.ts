@@ -2,12 +2,21 @@ import type { ActiveAgentRun, AgentRunEvent } from '@studio/agent/protocol/agent
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type {
+	ChatGptSessionSelection,
+	ChatGptSettings,
+	ChatGptSignInOptions,
+	ChatGptSignInOutcome,
+	ChatGptSignInStart,
+	ChatGptSignOutResult,
+} from '@studio/agent/protocol/chatgpt';
+import type {
 	ClaudeModelCatalog,
 	ClaudeRuntimeAction,
 	ClaudeRuntimeState,
 	ClaudeSessionSelection,
 	CreateClaudeSessionRequest,
 } from '@studio/agent/protocol/claude-code';
+import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
 import type { AiModelId } from '@studio/agent/protocol/models';
 import type {
 	AiProviderId,
@@ -457,6 +466,10 @@ export interface Connector {
 		sessionId: string,
 		selection: OpenAiSessionSelection
 	): Promise< void >;
+	setSessionChatGptSelection(
+		sessionId: string,
+		selection: ChatGptSessionSelection
+	): Promise< void >;
 	// Point the session's next turn at its local site or its connected live site.
 	setSessionEnvironment( sessionId: string, environment: 'local' | 'live' ): Promise< void >;
 	interruptAgentRun( runId: string ): Promise< void >;
@@ -521,6 +534,16 @@ export interface Connector {
 	// Reads the project's model list again; a failure keeps the previous list.
 	refreshOpenAiModels(): Promise< AiSettings >;
 	setOpenAiDefaults( update: OpenAiDefaultsUpdate ): Promise< AiSettings >;
+
+	getChatGptSettings(): Promise< ChatGptSettings >;
+	beginChatGptSignIn(
+		registrationId?: string,
+		options?: ChatGptSignInOptions
+	): Promise< ChatGptSignInStart >;
+	waitForChatGptSignIn( attemptId: string ): Promise< ChatGptSignInOutcome >;
+	cancelChatGptSignIn( attemptId: string ): Promise< boolean >;
+	signOutChatGpt( connectionId: string ): Promise< ChatGptSignOutResult >;
+	getChatGptModels( connectionId: string, revision: number ): Promise< ChatGptModelAvailability >;
 
 	// Apps detected on disk (editors + terminals). Options in the preferences
 	// form are filtered against this so users can't pick something that isn't

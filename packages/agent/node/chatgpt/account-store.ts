@@ -8,6 +8,9 @@ import { lockFileAsync, unlockFileAsync } from '@studio/common/lib/lockfile';
 import { getConfigDirectory } from '@studio/common/lib/well-known-paths';
 import { __, sprintf } from '@wordpress/i18n';
 import { readFile, writeFile } from 'atomically';
+import type { ChatGptAccountState, ChatGptCredentialStorage } from '@studio/agent/protocol/chatgpt';
+
+export type { ChatGptAccountState, ChatGptCredentialStorage } from '@studio/agent/protocol/chatgpt';
 
 /**
  * The ChatGPT accounts Studio signed in to on this host, without any secret:
@@ -32,15 +35,6 @@ const RENAME_RETRY_MS = 1_000;
 // the lock is coming free, so taking it is tried again.
 const LOCK_RACE_ERRORS = new Set( [ 'EPERM', 'EACCES', 'EBUSY' ] );
 const LOCK_RACE_RETRY_MS = 25;
-
-/** Where a registration's tokens live: the vault, or the memory of the app that signed in. */
-export type ChatGptCredentialStorage = 'vault' | 'session';
-
-/**
- * Signed in; signed out by the user; or its tokens were rejected, lost or
- * found unusable, so it needs a sign-in again.
- */
-export type ChatGptAccountState = 'signed-in' | 'signed-out' | 'needs-sign-in';
 
 export interface ChatGptAccount {
 	registrationId: string;

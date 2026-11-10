@@ -62,6 +62,7 @@ import {
 	ComposerSkeleton,
 	pendingPromptSlot,
 	useComposerNotice,
+	useChatGptConversation,
 	useOpenAiConversation,
 	type ComposerHandle,
 } from '@/features/composer';
@@ -178,8 +179,12 @@ function SessionViewContent( {
 	} );
 	// An OpenAI chat shows the model it recorded, even one it can't use yet.
 	const openAiModel = openAi?.selection.model;
-	const currentModel = openAiModel && isOpenAiModelId( openAiModel ) ? openAiModel : draftModel;
-	const notice = useComposerNotice( sessionProvider, ownerSite?.id ) ?? openAi?.notice;
+	const chatGpt = useChatGptConversation( { provider: sessionProvider, sessionId, entries } );
+	const recordedModel = chatGpt?.selection?.model ?? openAiModel;
+	const currentModel =
+		recordedModel && isOpenAiModelId( recordedModel ) ? recordedModel : draftModel;
+	const notice =
+		useComposerNotice( sessionProvider, ownerSite?.id ) ?? openAi?.notice ?? chatGpt?.notice;
 	const openAiSelection = openAi?.settings;
 	const sendMessage = useCallback(
 		( prompt: string, options?: Parameters< typeof sendSessionMessage >[ 1 ] ) =>
@@ -565,6 +570,7 @@ function SessionViewContent( {
 						annotationSiteId={ annotationSiteId }
 						notice={ notice }
 						openAi={ openAi }
+						chatGpt={ chatGpt }
 					/>
 				</div>
 			}
