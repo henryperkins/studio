@@ -3,6 +3,7 @@ import { useAgentRunStore } from './context';
 import {
 	hasUnansweredQuestion,
 	initialAgentRunState,
+	type AgentRunState,
 	type PendingQuestion,
 	type QueuedPrompt,
 	type SendMessageOptions,
@@ -11,6 +12,8 @@ import {
 export type { QueuedPrompt } from './store';
 
 interface LiveAgentEvents {
+	runId: string | null;
+	pendingClaudeApprovals: AgentRunState[ 'pendingClaudeApprovals' ];
 	// Agent loop is working - drives the thinking indicator. Clears at
 	// `turn.completed`, before the subprocess has finished winding down.
 	isRunning: boolean;
@@ -125,6 +128,8 @@ export function useAgentRun( sessionId: string | undefined ): LiveAgentEvents {
 	);
 
 	return {
+		runId: state.runId,
+		pendingClaudeApprovals: state.pendingClaudeApprovals,
 		isRunning: phase === 'starting' || phase === 'running',
 		hasActiveRun: phase !== 'idle',
 		isInterrupting,

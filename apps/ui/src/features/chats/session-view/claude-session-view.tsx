@@ -49,11 +49,20 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 			connector.getClaudeModelCatalog( session!.binding.connectionId, session!.binding.siteId ),
 		enabled: !! session,
 	} );
-	const active = useQuery( {
-		queryKey: [ 'claude-active', sessionId ],
-		queryFn: () => connector.getActiveAgentRuns(),
-		enabled: !! sessionId,
+	const state = useQuery( {
+		queryKey: [ 'claude-runtime' ],
+		queryFn: () => connector.getClaudeRuntimeState(),
 	} );
+	const connection = state.data?.enabled
+		? state.data.connections.find( ( item ) => item.id === session?.binding.connectionId )
+		: undefined;
+	const available =
+		state.isSuccess &&
+		! state.isFetching &&
+		connection?.blockers.length === 0 &&
+		catalog.isSuccess &&
+		! catalog.isFetching &&
+		catalog.data.ok;
 	const events = ( data.claudeJournal ?? [] ).flat();
 	const content = new Map< string, { index: number; sequence: number } >();
 	const visible = new Set< number >();
@@ -71,26 +80,18 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 		content.set( key, { index, sequence } );
 	}
 	const visibleEvents = events.filter( ( _event, index ) => visible.has( index ) );
-	const latestTurn = data.claudeJournal?.[ ( data.claudeJournal?.length ?? 1 ) - 1 ] ?? [];
-	const approvals = latestTurn.filter(
-		( event ): event is Extract< BackendTurnEvent, { type: 'approval.requested' } > =>
-			event.type === 'approval.requested'
-	);
-	const restored =
-		active.data?.find( ( item ) => item.sessionId === sessionId )?.pendingClaudeApprovals ?? [];
-	const pending = [ ...approvals, ...restored ].filter(
-		( event, index, all ) =>
-			all.findIndex(
-				( item ) => item.requestId === event.requestId && item.runId === event.runId
-			) === index &&
+	const pending = run.pendingClaudeApprovals.filter(
+		( event ) =>
+			event.runId === run.runId &&
 			! answered.includes( `${ event.runId }:${ event.requestId }` ) &&
-			! latestTurn.some(
+			! events.some(
 				( item ) =>
 					item.runId === event.runId &&
 					( item.type === 'turn.terminal' ||
 						( item.type === 'approval.resolved' && item.requestId === event.requestId ) )
 			) &&
-			run.hasActiveRun
+			run.hasActiveRun &&
+			! run.isInterrupting
 	);
 	const models = catalog.data?.ok ? catalog.data.models : [];
 	const selection = session?.selection;
@@ -141,7 +142,12 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 							<Select
 								items={ models.map( ( item ) => ( { value: item.id, label: item.displayName } ) ) }
 								value={ pendingModel ?? selection?.model ?? null }
-								onValueChange={ ( model ) => {
+								onValueChange={ ( model, details ) => {
+									// Option-list changes can restore an initial value without user input.
+									if ( details.reason === 'none' ) {
+										details.cancel();
+										return;
+									}
 									const option = models.find( ( item ) => item.id === model );
 									if ( ! option || ! selection ) return;
 									if ( option.efforts.includes( selection.effort ) ) {
@@ -168,7 +174,11 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 									label: value,
 								} ) ) }
 								value={ pendingModel ? null : selection?.effort ?? null }
-								onValueChange={ ( effort ) => {
+								onValueChange={ ( effort, details ) => {
+									if ( details.reason === 'none' ) {
+										details.cancel();
+										return;
+									}
 									if ( effort && selectedModel )
 										save( { model: selectedModel.id, effort: effort as ClaudeEffort } );
 								} }
@@ -192,6 +202,12 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 							{ catalog.isError && (
 								<p role="alert">{ __( 'Claude Code model capabilities could not be checked.' ) }</p>
 							) }
+							{ state.isError ||
+							( state.isSuccess && ( ! connection || connection.blockers.length > 0 ) ) ? (
+								<p role="alert">
+									{ __( 'Claude Code is unavailable. Recheck its status in Settings.' ) }
+								</p>
+							) : null }
 							{ pendingModel && <p>{ __( 'Choose an effort for the selected model.' ) }</p> }
 							<Textarea
 								aria-label={ __( 'Message Claude' ) }
@@ -200,6 +216,7 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 							/>
 							<Button
 								disabled={
+									! available ||
 									run.hasActiveRun ||
 									rebindRequired ||
 									!! pendingModel ||

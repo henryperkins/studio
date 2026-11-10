@@ -167,6 +167,7 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					startedAt: run.startedAt,
 					interrupting: run.phase === 'interrupting',
 					pendingQuestions: run.pendingQuestions,
+					pendingClaudeApprovals: run.pendingClaudeApprovals ?? [],
 				} );
 			}
 		};
@@ -288,6 +289,15 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					return;
 				}
 				case 'backend.event': {
+					if ( event.event.runId !== payload.runId ) return;
+					if (
+						stateStore.getState()[ payload.sessionId ]?.runId === payload.runId &&
+						( event.event.type === 'approval.requested' ||
+							event.event.type === 'approval.resolved' ||
+							event.event.type === 'turn.terminal' )
+					) {
+						dispatchSession( payload.sessionId, { type: 'claude_event', event: event.event } );
+					}
 					queryClient.setQueryData< LoadedAiSession >(
 						[ ...SESSIONS_QUERY_KEY, payload.sessionId ],
 						( previous ) => {

@@ -22,7 +22,11 @@ function Choice( {
 		<Select
 			value={ value || null }
 			items={ options }
-			onValueChange={ ( next ) => {
+			onValueChange={ ( next, details ) => {
+				if ( details.reason === 'none' ) {
+					details.cancel();
+					return;
+				}
 				if ( next ) onChange( next );
 			} }
 		>
@@ -71,6 +75,14 @@ export function ClaudeNewChat( { siteId }: { siteId: string } ) {
 		},
 	} );
 	if ( ! state.data?.enabled ) return null;
+	const connection = state.data.connections.find( ( item ) => item.id === connectionId );
+	const available =
+		state.isSuccess &&
+		! state.isFetching &&
+		connection?.blockers.length === 0 &&
+		catalog.isSuccess &&
+		! catalog.isFetching &&
+		catalog.data.ok;
 	const models = catalog.data?.ok ? catalog.data.models : [];
 	const selected = models.find( ( item ) => item.id === model );
 	return (
@@ -103,6 +115,14 @@ export function ClaudeNewChat( { siteId }: { siteId: string } ) {
 								</p>
 						  ) )
 						: null }
+					{ catalog.isError && (
+						<p role="alert">{ __( 'Claude Code model capabilities could not be checked.' ) }</p>
+					) }
+					{ connectionId && ( state.isError || ! connection || connection.blockers.length > 0 ) ? (
+						<p role="alert">
+							{ __( 'Claude Code is unavailable. Recheck its status in Settings.' ) }
+						</p>
+					) : null }
 					<Choice
 						label={ __( 'Claude model' ) }
 						value={ model }
@@ -121,7 +141,7 @@ export function ClaudeNewChat( { siteId }: { siteId: string } ) {
 					{ create.error ? <p role="alert">{ create.error.message }</p> : null }
 					<Button
 						disabled={
-							! connectionId ||
+							! available ||
 							! selected ||
 							! effort ||
 							! selected.efforts.includes( effort ) ||

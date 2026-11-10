@@ -439,167 +439,182 @@ it( 'releases no prompt and reports startup failure even if closing the SDK thro
 	expect( events ).toMatchObject( [ { type: 'turn.terminal', outcome: { status: 'error' } } ] );
 } );
 
-it( 'sends only after verified startup, freezes options and records an explicit session (mock SDK)', async () => {
-	const fs = await import( 'fs/promises' );
-	const os = await import( 'os' );
-	const path = await import( 'path' );
-	const root = await fs.realpath( await fs.mkdtemp( path.join( os.tmpdir(), 'claude-runtime-' ) ) );
-	try {
-		const { runClaudeTurn } = await import( '../runtime' );
-		const { createFakeHost } = await import( '../../tests/fake-host' );
-		const { createNativeSessionStore } = await import( '../sessions' );
-		const host = createFakeHost();
-		host.sites.all = async () => [
-			{ id: 'site', path: root, name: 'site', url: 'http://localhost', phpVersion: '8.4' },
-		];
-		const snapshot = {
-			backend: 'claude-code' as const,
-			runId: 'run',
-			turnId: 'turn',
-			selection: {
-				connectionId: 'native',
-				model: { providerId: 'claude-code' as const, modelId: 'sonnet' },
-				revision: 1,
-			},
-			effort: 'medium',
-			permissionPolicyRevision: 1,
-			workspace: {
-				conversationId: 'chat',
-				siteId: 'site',
-				workingDirectory: root,
-				configDirectory: root,
-			},
-		};
-		let emittedPrompt = false;
-		let seenInput: unknown;
-		let seenOptions: Record< string, unknown > = {};
-		const fakeQuery = ( input: {
-			prompt: AsyncIterable< unknown >;
-			options: Record< string, unknown >;
-		} ) => {
-			seenOptions = input.options;
-			return {
-				initializationResult: async () => ( {
-					hooks_applied: true,
-					hook_on_failure_supported: true,
-				} ),
-				accountInfo: async () => ( {
-					email: 'user@example.com',
-					subscriptionType: 'Max',
-					apiProvider: 'firstParty',
-				} ),
-				mcpServerStatus: async () => [
-					{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-				],
-				supportedModels: async () => [
-					{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
-				],
-				close: () => {},
-				async *[ Symbol.asyncIterator ]() {
-					for await ( const message of input.prompt ) {
-						emittedPrompt = true;
-						seenInput = message;
-						yield {
-							type: 'system',
-							subtype: 'init',
-							session_id: input.options.sessionId,
-							permissionMode: 'default',
-							plugins: [],
-							tools: [ 'Read', 'mcp__studio__wp_cli' ],
-							cwd: root,
-							apiKeySource: 'none',
-							claude_code_version: '2.1.319',
-							model: 'sonnet',
-							mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
-						};
-						yield {
-							type: 'assistant',
-							session_id: input.options.sessionId,
-							uuid: 'unexpected',
-							message: { id: 'msg', model: 'other', content: [ { type: 'text', text: 'unsafe' } ] },
-						};
-						yield {
-							type: 'result',
-							subtype: 'success',
-							is_error: false,
-							num_turns: 1,
-							session_id: input.options.sessionId,
-						};
-					}
+it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
+	'fails closed after verified startup on %s (mock SDK)',
+	async ( failure ) => {
+		const fs = await import( 'fs/promises' );
+		const os = await import( 'os' );
+		const path = await import( 'path' );
+		const root = await fs.realpath(
+			await fs.mkdtemp( path.join( os.tmpdir(), 'claude-runtime-' ) )
+		);
+		try {
+			const { runClaudeTurn } = await import( '../runtime' );
+			const { createFakeHost } = await import( '../../tests/fake-host' );
+			const { createNativeSessionStore } = await import( '../sessions' );
+			const host = createFakeHost();
+			host.sites.all = async () => [
+				{ id: 'site', path: root, name: 'site', url: 'http://localhost', phpVersion: '8.4' },
+			];
+			const snapshot = {
+				backend: 'claude-code' as const,
+				runId: 'run',
+				turnId: 'turn',
+				selection: {
+					connectionId: 'native',
+					model: { providerId: 'claude-code' as const, modelId: 'sonnet' },
+					revision: 1,
+				},
+				effort: 'medium',
+				permissionPolicyRevision: 1,
+				workspace: {
+					conversationId: 'chat',
+					siteId: 'site',
+					workingDirectory: root,
+					configDirectory: root,
 				},
 			};
-		};
-		const events: unknown[] = [];
-		await runClaudeTurn(
-			snapshot,
-			host,
-			{
-				prompt: 'hello',
-				images: [
-					{
-						id: 'image',
-						name: 'sample.png',
-						mimeType: 'image/png',
-						dataBase64: 'iVBORw0KGgo=',
-						size: 8,
+			let emittedPrompt = false;
+			let seenInput: unknown;
+			let seenOptions: Record< string, unknown > = {};
+			const fakeQuery = ( input: {
+				prompt: AsyncIterable< unknown >;
+				options: Record< string, unknown >;
+			} ) => {
+				seenOptions = input.options;
+				return {
+					initializationResult: async () => ( {
+						hooks_applied: true,
+						hook_on_failure_supported: true,
+					} ),
+					accountInfo: async () => ( {
+						email: 'user@example.com',
+						subscriptionType: 'Max',
+						apiProvider: 'firstParty',
+					} ),
+					mcpServerStatus: async () => [
+						{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+					],
+					supportedModels: async () => [
+						{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+					],
+					close: () => {},
+					async *[ Symbol.asyncIterator ]() {
+						for await ( const message of input.prompt ) {
+							emittedPrompt = true;
+							seenInput = message;
+							yield {
+								type: 'system',
+								subtype: 'init',
+								session_id: input.options.sessionId,
+								permissionMode: 'default',
+								plugins: [],
+								tools: [ 'Read', 'mcp__studio__wp_cli' ],
+								cwd: root,
+								apiKeySource: 'none',
+								claude_code_version: '2.1.319',
+								model: 'sonnet',
+								mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
+							};
+							if ( failure === 'eof' ) return;
+							if ( failure === 'process-failure' )
+								throw new Error( 'Private native process failure' );
+							yield {
+								type: 'assistant',
+								session_id: input.options.sessionId,
+								uuid: 'unexpected',
+								message: {
+									id: 'msg',
+									model: 'other',
+									content: [ { type: 'text', text: 'unsafe' } ],
+								},
+							};
+							yield {
+								type: 'result',
+								subtype: 'success',
+								is_error: false,
+								num_turns: 1,
+								session_id: input.options.sessionId,
+							};
+						}
 					},
-				],
-				signal: new AbortController().signal,
-				onEvent: ( event ) => events.push( event ),
-			},
-			{
-				query: fakeQuery as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-				connection: async () => ( { id: 'native', executablePath: 'fake' } ),
-				prepare: async () => ( {
-					ok: true as const,
-					executablePath: 'fake',
-					cwd: root,
-					configDirectory: root,
-					projectsDirectory: path.join( root, 'projects' ),
-					env: {},
-					identity: { email: 'user@example.com', subscriptionType: 'max' },
-				} ),
-				storeRoot: path.join( root, 'store' ),
-				approve: async () => 'deny',
-			}
-		);
-		expect( emittedPrompt ).toBe( true );
-		expect( seenInput ).toMatchObject( {
-			message: {
-				content: [
-					{ type: 'text', text: 'hello' },
-					{
-						type: 'image',
-						source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
-					},
-				],
-			},
-		} );
-		expect( seenOptions ).toMatchObject( {
-			pathToClaudeCodeExecutable: 'fake',
-			cwd: root,
-			model: 'sonnet',
-			effort: 'medium',
-			tools: [ 'Read' ],
-			permissionMode: 'default',
-			settingSources: [],
-		} );
-		const saved = await createNativeSessionStore( path.join( root, 'store' ) ).load( 'chat' );
-		expect( saved?.nativeSessionId ).toBe( seenOptions.sessionId );
-		expect(
-			await createNativeSessionStore( path.join( root, 'store' ) ).journal( 'chat', 'turn' ).read()
-		).toMatchObject( [
-			{ type: 'turn.prompt', text: 'hello' },
-			{ type: 'turn.terminal', outcome: { status: 'error' } },
-		] );
-		expect( events ).toMatchObject( [
-			{ type: 'turn.prompt', text: 'hello' },
-			{ type: 'turn.terminal', outcome: { status: 'error' } },
-		] );
-	} finally {
-		await fs.rm( root, { recursive: true, force: true } );
+				};
+			};
+			const events: unknown[] = [];
+			await runClaudeTurn(
+				snapshot,
+				host,
+				{
+					prompt: 'hello',
+					images: [
+						{
+							id: 'image',
+							name: 'sample.png',
+							mimeType: 'image/png',
+							dataBase64: 'iVBORw0KGgo=',
+							size: 8,
+						},
+					],
+					signal: new AbortController().signal,
+					onEvent: ( event ) => events.push( event ),
+				},
+				{
+					query: fakeQuery as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+					prepare: async () => ( {
+						ok: true as const,
+						executablePath: 'fake',
+						cwd: root,
+						configDirectory: root,
+						projectsDirectory: path.join( root, 'projects' ),
+						env: {},
+						identity: { email: 'user@example.com', subscriptionType: 'max' },
+					} ),
+					storeRoot: path.join( root, 'store' ),
+					approve: async () => 'deny',
+				}
+			);
+			expect( emittedPrompt ).toBe( true );
+			expect( seenInput ).toMatchObject( {
+				message: {
+					content: [
+						{ type: 'text', text: 'hello' },
+						{
+							type: 'image',
+							source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' },
+						},
+					],
+				},
+			} );
+			expect( seenOptions ).toMatchObject( {
+				pathToClaudeCodeExecutable: 'fake',
+				cwd: root,
+				model: 'sonnet',
+				effort: 'medium',
+				tools: [ 'Read' ],
+				permissionMode: 'default',
+				settingSources: [],
+			} );
+			const saved = await createNativeSessionStore( path.join( root, 'store' ) ).load( 'chat' );
+			expect( saved?.nativeSessionId ).toBe( seenOptions.sessionId );
+			const status = failure === 'eof' ? 'unknown_process_exit' : 'error';
+			expect(
+				await createNativeSessionStore( path.join( root, 'store' ) )
+					.journal( 'chat', 'turn' )
+					.read()
+			).toMatchObject( [
+				{ type: 'turn.prompt', text: 'hello' },
+				{ type: 'turn.terminal', outcome: { status } },
+			] );
+			expect( events ).toMatchObject( [
+				{ type: 'turn.prompt', text: 'hello' },
+				{ type: 'turn.terminal', outcome: { status } },
+			] );
+		} finally {
+			await fs.rm( root, { recursive: true, force: true } );
+		}
 	}
-} );
+);
 
 it( 'denies native tools until system init has been verified (mock SDK)', async () => {
 	const fs = await import( 'fs/promises' );
