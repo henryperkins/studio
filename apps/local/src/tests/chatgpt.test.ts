@@ -11,10 +11,15 @@ import {
 	waitForChatGptSignIn,
 } from '@studio/agent/node/chatgpt/oauth';
 import { createAiSession, loadAiSession } from '@studio/agent/node/sessions/store';
+import { createFakeCredentialStore } from '@studio/agent/node/tests/fake-credential-store';
 import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { startLocalServer, type LocalServer } from '../index';
 
+vi.mock( '@studio/common/lib/os-credential-store', async ( original ) => ( {
+	...( await original< typeof import('@studio/common/lib/os-credential-store') >() ),
+	createOsCredentialStore: () => createFakeCredentialStore().store,
+} ) );
 vi.mock( '@studio/agent/node/chatgpt/oauth', async ( original ) => ( {
 	...( await original< object >() ),
 	beginChatGptSignIn: vi.fn(),
@@ -70,6 +75,21 @@ afterEach( async () => {
 } );
 
 describe( 'ChatGPT HTTP boundary', () => {
+	it( 'rejects a global ChatGPT default with a settings error and preserves the saved provider', async () => {
+		const configPath = path.join( root, 'shared.json' );
+		const config = JSON.stringify( { version: 1, aiProvider: 'wpcom', locale: 'es' } );
+		await fs.writeFile( configPath, config );
+
+		const response = await request( '/ai-settings/provider', { provider: 'chatgpt-oauth' }, 'PUT' );
+
+		expect( response.status ).toBe( 400 );
+		expect( await response.json() ).toEqual( {
+			error: 'Choose a ChatGPT account in a new chat instead of setting a default provider.',
+		} );
+		expect( await fs.readFile( configPath, 'utf8' ) ).toBe( config );
+		expect( listChatGptConnections ).not.toHaveBeenCalled();
+	} );
+
 	it( 'returns only the attempt id for a returning sign-in and non-secret completion', async () => {
 		vi.mocked( beginChatGptSignIn ).mockResolvedValueOnce( {
 			attemptId: ATTEMPT,

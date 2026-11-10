@@ -10,6 +10,12 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-08-subscription-connections-design.md`. Reuse the provider-qualified connection types introduced in the ChatGPT plan; do not reimplement them.
 
+## Observed completion — November 10, 2026
+
+Draft [PR #3](https://github.com/henryperkins/studio/pull/3), stacked on PR #2, implements Tasks 1–2 and Task 3's scoped proof of concept. At `95853473e`, Task 4's application surfaces and no-prompt native startup are implemented; renderer coverage, completed Windows x64 packaging, combined light/dark checks and abrupt-process cleanup qualification are being completed on that branch.
+
+The bridge supports allowlisted `wp_cli` text reads and approved draft creation. Image results, artifacts and preview/annotations remain outside this proof of concept. Authenticated disposable-site acceptance and the public-distribution/branding gate remain open. Keep `STUDIO_EXPERIMENTAL_CLAUDE_CODE` default-off. The original checkboxes below remain acceptance requirements.
+
 ## Global constraints
 
 No Claude OAuth implementation or token-file parsing in Studio. Do not modify vendor binaries or remove their authentication methods. No Studio-owned API credentials passed into subscription runtime sessions. No blanket permission bypass. No cloud execution, WSL fallback, production-site edits or automatic publishing. Keep existing Pi behavior and files readable.
