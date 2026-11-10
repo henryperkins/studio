@@ -587,6 +587,9 @@ export function createIpcConnector(): Connector {
 		async setSessionOpenAiSelection( sessionId, selection ) {
 			await unwrapIpcError( ipcApi.setAiSessionOpenAiSelection( sessionId, selection ) );
 		},
+		async setSessionChatGptSelection( sessionId, selection ) {
+			await unwrapIpcError( ipcApi.setAiSessionChatGptSelection( sessionId, selection ) );
+		},
 
 		async setSessionEnvironment( sessionId, environment ) {
 			await ipcApi.setAiSessionEnvironment( sessionId, environment );
@@ -705,6 +708,24 @@ export function createIpcConnector(): Connector {
 		},
 		async setOpenAiDefaults( update ): Promise< AiSettings > {
 			return unwrapIpcError( ipcApi.setOpenAiDefaults( update ) );
+		},
+		async getChatGptSettings() {
+			return unwrapIpcError( ipcApi.getChatGptSettings() );
+		},
+		async beginChatGptSignIn( registrationId, options ) {
+			return unwrapIpcError( ipcApi.beginChatGptSignIn( registrationId, options ) );
+		},
+		async waitForChatGptSignIn( attemptId ) {
+			return unwrapIpcError( ipcApi.waitForChatGptSignIn( attemptId ) );
+		},
+		async cancelChatGptSignIn( attemptId ) {
+			return unwrapIpcError( ipcApi.cancelChatGptSignIn( attemptId ) );
+		},
+		async signOutChatGpt( connectionId ) {
+			return unwrapIpcError( ipcApi.signOutChatGpt( connectionId ) );
+		},
+		async getChatGptModels( connectionId, revision ) {
+			return unwrapIpcError( ipcApi.getChatGptModels( connectionId, revision ) );
 		},
 
 		async getInstalledApps(): Promise< InstalledApps > {

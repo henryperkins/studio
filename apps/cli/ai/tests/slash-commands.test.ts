@@ -57,6 +57,7 @@ function buildModelCtx(
 		clearSession: vi.fn().mockResolvedValue( undefined ),
 		getSessionEntries: vi.fn().mockResolvedValue( [] ),
 		persistOpenAiReasoning: vi.fn().mockResolvedValue( undefined ),
+		selectChatGpt: vi.fn().mockResolvedValue( undefined ),
 	};
 	return { ctx, persistMock };
 }
@@ -215,6 +216,7 @@ describe( '/credits slash command', () => {
 			clearSession: vi.fn().mockResolvedValue( undefined ),
 			getSessionEntries: vi.fn().mockResolvedValue( [] ),
 			persistOpenAiReasoning: vi.fn().mockResolvedValue( undefined ),
+			selectChatGpt: vi.fn().mockResolvedValue( undefined ),
 		};
 	}
 

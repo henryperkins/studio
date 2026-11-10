@@ -7,6 +7,12 @@ import {
 	AskUserQuestion,
 } from '@studio/agent/node';
 import {
+	assertChatGptEnabled,
+	chatGptSettingsAction,
+	validateChatGptSelection,
+} from '@studio/agent/node/chatgpt/settings';
+import { assertSessionSelection } from '@studio/agent/node/sessions/selection';
+import {
 	readAiSettings,
 	readAnthropicApiKey,
 	readSelectedAiProvider,
@@ -17,7 +23,12 @@ import {
 	type StudioChatFileAttachment,
 } from '@studio/agent/protocol/chat-files';
 import { type StudioChatImage } from '@studio/agent/protocol/chat-images';
-import { getDefaultChatGptReasoningEffort } from '@studio/agent/protocol/chatgpt-models';
+import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
+import {
+	describeChatGptReasoningProblem,
+	getDefaultChatGptReasoningEffort,
+	resolveChatGptReasoning,
+} from '@studio/agent/protocol/chatgpt-models';
 import {
 	describeConnectionSelectionError,
 	resolveConnectionSelection,
@@ -27,7 +38,6 @@ import { getAgentEndFailure } from '@studio/agent/protocol/json-events';
 import { getAiModelFamily, isAiModelId, type AiModelId } from '@studio/agent/protocol/models';
 import {
 	describeOpenAiSettingsProblem,
-	isOpenAiReasoningEffort,
 	resolveOpenAiSessionSelection,
 	resolveOpenAiTurnSettings,
 	type OpenAiReasoningEffort,
@@ -259,6 +269,7 @@ async function resolveOpenAiTurn(
 
 /** The ChatGPT connection a conversation's turn runs on, or why it can't run. */
 async function resolveChatGptConnection( sm: SessionManager ): Promise< ConnectionSelection > {
+	assertChatGptEnabled();
 	const result = resolveConnectionSelection( sm.getEntries(), await readConnectionRegistry() );
 	if ( ! result.ok ) {
 		throw new LoggerError( describeConnectionSelectionError( result.error ) );
@@ -270,28 +281,6 @@ async function resolveChatGptConnection( sm: SessionManager ): Promise< Connecti
 		);
 	}
 	return result.selection;
-}
-
-/** The effort the latest ChatGPT record for this connection ran with, if any. */
-function readChatGptReasoningEffort(
-	entries: ReturnType< SessionManager[ 'getEntries' ] >,
-	selection: ConnectionSelection
-): OpenAiReasoningEffort | undefined {
-	for ( let index = entries.length - 1; index >= 0; index -= 1 ) {
-		const entry = entries[ index ];
-		if ( entry.type !== 'custom' || entry.customType !== 'studio.session_context' ) {
-			continue;
-		}
-		const data = ( entry as { data?: Record< string, unknown > } ).data;
-		if ( data?.provider !== 'chatgpt-oauth' || data.connectionId !== selection.connectionId ) {
-			continue;
-		}
-		return typeof data.reasoningEffort === 'string' &&
-			isOpenAiReasoningEffort( data.reasoningEffort )
-			? data.reasoningEffort
-			: undefined;
-	}
-	return undefined;
 }
 
 export async function runCommand( options: {
@@ -511,6 +500,37 @@ export async function runCommand( options: {
 		);
 	}
 
+	async function clearConversation( {
+		preserveConnection = true,
+	}: { preserveConnection?: boolean } = {} ): Promise< void > {
+		const chatGpt =
+			preserveConnection && currentProvider === 'chatgpt-oauth'
+				? readChatGptSessionSelection( ( await ensureSession() ).getEntries() )
+				: undefined;
+		session = await agent.sessions.create();
+		if ( chatGpt ) {
+			appendStudioEntry( session, 'studio.session_context', {
+				provider: 'chatgpt-oauth',
+				...chatGpt,
+			} );
+		} else if ( preserveConnection ) {
+			await persistSessionContext();
+		}
+		const site = ui.activeSite;
+		if ( site )
+			appendStudioEntry( session, 'studio.site_selected', {
+				siteName: site.name,
+				sitePath: site.path,
+				siteId: site.id,
+				remote: site.remote,
+				url: site.url,
+				wpcomSiteId: site.wpcomSiteId,
+			} );
+		if ( ui instanceof AiChatUI ) ui.clearTranscript();
+		ui.showWelcome();
+		ui.showInfo( __( 'Conversation cleared' ) );
+	}
+
 	ui.onSiteSelected = ( site ) => {
 		void append( ( sm ) =>
 			appendStudioEntry( sm, 'studio.site_selected', {
@@ -551,6 +571,15 @@ export async function runCommand( options: {
 	}
 
 	async function switchProvider( provider: AiProviderId, announce = true ): Promise< void > {
+		if ( provider === 'chatgpt-oauth' ) {
+			throw new LoggerError( __( 'Use /chatgpt to choose a saved account and model.' ) );
+		}
+		if (
+			currentProvider === 'chatgpt-oauth' &&
+			readChatGptSessionSelection( ( await ensureSession() ).getEntries() )
+		) {
+			await clearConversation( { preserveConnection: false } );
+		}
 		// The pin written below carries the model, so the quota-based default
 		// must be final first — otherwise an early switch durably records the
 		// static fallback for a paid account.
@@ -744,6 +773,17 @@ export async function runCommand( options: {
 		if ( openAiKey === null ) {
 			ui.showInfo( __( 'OpenAI isn’t connected. Use /openai-key to enter an API key.' ) );
 		}
+	} else if ( currentProvider === 'chatgpt-oauth' ) {
+		const selected = readChatGptSessionSelection( ( await ensureSession() ).getEntries() );
+		if ( selected && isAiModelId( selected.model ) ) {
+			currentModel = selected.model;
+			ui.currentModel = currentModel;
+		}
+		ui.setStatusMessage(
+			`${ __( 'ChatGPT plan' ) } · ${
+				selected?.connectionId.slice( 0, 8 ) ?? __( 'Account unavailable' )
+			}`
+		);
 	}
 
 	async function askUserAndPersistAnswers(
@@ -806,11 +846,17 @@ export async function runCommand( options: {
 			| undefined;
 		if ( currentProvider === 'chatgpt-oauth' ) {
 			const selection = await resolveChatGptConnection( sm );
+			const reasoning = resolveChatGptReasoning(
+				selection.model.modelId,
+				readChatGptSessionSelection( sm.getEntries() )?.reasoningEffort ??
+					getDefaultChatGptReasoningEffort( selection.model.modelId )
+			);
+			if ( ! reasoning.ok ) {
+				throw new LoggerError( describeChatGptReasoningProblem( reasoning.problem ) );
+			}
 			chatGptTurn = {
 				selection,
-				reasoningEffort:
-					readChatGptReasoningEffort( sm.getEntries(), selection ) ??
-					getDefaultChatGptReasoningEffort( selection.model.modelId ),
+				reasoningEffort: reasoning.effort,
 			};
 			if ( isAiModelId( selection.model.modelId ) ) {
 				currentModel = selection.model.modelId;
@@ -1083,25 +1129,47 @@ export async function runCommand( options: {
 				} )
 			);
 		},
-		async clearSession() {
-			session = await agent.sessions.create();
-			ui.clearTranscript();
-			ui.showWelcome();
-			ui.showInfo( __( 'Conversation cleared' ) );
-			await persistSessionContext();
-			const site = ui.activeSite;
-			if ( site ) {
-				await append( ( sm ) =>
-					appendStudioEntry( sm, 'studio.site_selected', {
+		clearSession: clearConversation,
+		async selectChatGpt( input ) {
+			await chatGptSettingsAction( async () => {
+				const selected = await validateChatGptSelection( input );
+				const previous = await ensureSession();
+				const current = readChatGptSessionSelection( previous.getEntries() );
+				const sameConnection =
+					currentProvider === 'chatgpt-oauth' &&
+					current?.connectionId === selected.connectionId &&
+					current.revision === selected.revision;
+				const next = sameConnection ? previous : await agent.sessions.create();
+				const context = { provider: 'chatgpt-oauth' as const, ...selected };
+				assertSessionSelection( next.getEntries(), context );
+				appendStudioEntry( next, 'studio.session_context', context );
+				if ( ! sameConnection && ui.activeSite ) {
+					const site = ui.activeSite;
+					appendStudioEntry( next, 'studio.site_selected', {
 						siteName: site.name,
 						sitePath: site.path,
 						siteId: site.id,
 						remote: site.remote,
 						url: site.url,
 						wpcomSiteId: site.wpcomSiteId,
-					} )
+					} );
+				}
+				session = next;
+				currentProvider = 'chatgpt-oauth';
+				ui.currentProvider = currentProvider;
+				quotaDefaultApplicable = false;
+				if ( isAiModelId( selected.model ) ) currentModel = selected.model;
+				ui.currentModel = currentModel;
+				if ( ! sameConnection ) {
+					ui.clearTranscript();
+					ui.showWelcome();
+				}
+				ui.setStatusMessage(
+					`${ __( 'ChatGPT plan' ) } · ${ selected.connectionId.slice( 0, 8 ) } · ${
+						selected.model
+					}`
 				);
-			}
+			} );
 		},
 	};
 

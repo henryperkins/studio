@@ -23,6 +23,7 @@ import type {
 	SiteEmail,
 	UserPreferences,
 } from '@/data/core';
+import type { ChatGptSettings } from '@studio/agent/protocol/chatgpt';
 import type { AiSettings } from '@studio/agent/protocol/providers';
 
 type Methods = {
@@ -50,6 +51,7 @@ export interface FakeConnectorState {
 	preferences: UserPreferences;
 	// Each site's email, newest first.
 	emails: Record< string, SiteEmail[] >;
+	chatGpt: ChatGptSettings;
 }
 
 export type FakeConnectorInitialState = Partial< Omit< FakeConnectorState, 'preferences' > > & {
@@ -129,6 +131,7 @@ export function createInMemoryConnector(
 		sessions: [],
 		user: TEST_USER,
 		emails: {},
+		chatGpt: { enabled: false, signInSupported: false, secureStorage: 'available', accounts: [] },
 		...initial,
 		preferences: { ...defaultPreferences(), ...initial.preferences },
 	};
@@ -302,6 +305,20 @@ export function createInMemoryConnector(
 		setSessionModel: async () => {},
 		setSessionProvider: async () => {},
 		setSessionOpenAiSelection: async () => {},
+		setSessionChatGptSelection: async ( id, selection ) => {
+			const session = findSession( id );
+			session.entries = [
+				...session.entries,
+				{
+					type: 'custom',
+					customType: 'studio.session_context',
+					id: `selection-${ nextId++ }`,
+					parentId: null,
+					timestamp: new Date().toISOString(),
+					data: { provider: 'chatgpt-oauth', ...selection },
+				},
+			];
+		},
 		setSessionEnvironment: async ( id, environment ) => {
 			const session = findSession( id );
 			session.summary = { ...session.summary, activeEnvironment: environment };
@@ -331,6 +348,29 @@ export function createInMemoryConnector(
 			hasAnthropicApiKey: false,
 			anthropicApiKeyPreview: null,
 			...openAi,
+		} ),
+		getChatGptSettings: async () => structuredClone( state.chatGpt ),
+		beginChatGptSignIn: async () => ( { attemptId: 'test-sign-in-attempt' } ),
+		waitForChatGptSignIn: async () => ( {
+			ok: false,
+			code: 'cancelled',
+			message: 'Signing in was cancelled.',
+		} ),
+		cancelChatGptSignIn: async () => true,
+		signOutChatGpt: async ( connectionId ) => {
+			state.chatGpt.accounts = state.chatGpt.accounts.map( ( account ) =>
+				account.connectionId === connectionId
+					? { ...account, state: 'signed-out', authStatus: 'disconnected' }
+					: account
+			);
+			return { localCleared: true, remoteRevocationConfirmed: true };
+		},
+		getChatGptModels: async ( connectionId, revision ) => ( {
+			connectionId,
+			revision,
+			checkedAt: new Date().toISOString(),
+			models: [ { id: 'gpt-6-luna', label: 'GPT-6 Luna' } ],
+			lastError: null,
 		} ),
 		saveAnthropicApiKey: async ( key ) => ( {
 			provider: 'wpcom',

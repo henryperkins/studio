@@ -28,7 +28,20 @@ import {
 	exchangeChatGptAuthorizationCode,
 	type ChatGptAuthServer,
 } from '@studio/agent/node/chatgpt/token-client';
+import type {
+	ChatGptSignInFailureCode,
+	ChatGptSignInOptions,
+	ChatGptSignInOutcome,
+	ChatGptSignInStart,
+} from '@studio/agent/protocol/chatgpt';
 import type { AddressInfo } from 'node:net';
+
+export type {
+	ChatGptSignInFailureCode,
+	ChatGptSignInOptions,
+	ChatGptSignInOutcome,
+	ChatGptSignInStart,
+} from '@studio/agent/protocol/chatgpt';
 
 /**
  * Signing in with ChatGPT, as OpenAI documents it for open-source apps: a
@@ -81,47 +94,6 @@ const REVOKE_TIMEOUT_MS = 10_000;
 const OUTCOME_RETENTION_MS = 10 * 60_000;
 // Port 0 can't collide; should listening still fail that way, the system picks again.
 const LISTEN_ATTEMPTS = 3;
-
-export type ChatGptSignInFailureCode =
-	| 'unknown-attempt'
-	| 'not-found'
-	| 'accounts-unreadable'
-	| 'discovery-failed'
-	| 'callback-unavailable'
-	| 'browser-unavailable'
-	| 'cancelled'
-	| 'timed-out'
-	| 'denied'
-	| 'authorization-failed'
-	| 'registration-incomplete'
-	| 'client-mismatch'
-	| 'code-rejected'
-	| 'token-exchange-failed'
-	| 'id-token-invalid'
-	| 'identity-mismatch'
-	| 'permission-missing'
-	| 'vault-unavailable'
-	| 'save-failed';
-
-/** How a sign-in ended: the registration it saved, or why it saved nothing. Never a secret. */
-export type ChatGptSignInOutcome =
-	| { ok: true; registrationId: string; label: string; email: string | null }
-	| { ok: false; code: ChatGptSignInFailureCode; message: string };
-
-export interface ChatGptSignInOptions {
-	/** Shows ChatGPT's consent screen again, to grant a permission declined before. */
-	reconsent?: boolean;
-	/**
-	 * Where the tokens are kept: the vault, or this app's memory only. A new
-	 * registration goes to the vault, and one signed in again stays where it is.
-	 */
-	storage?: ChatGptCredentialStorage;
-}
-
-/** A sign-in under way, whose page is open in the system browser. */
-export interface ChatGptSignInStart {
-	attemptId: string;
-}
 
 /** Opens a URL in the system browser; rejects when it can't. */
 export type ChatGptBrowserOpener = ( url: string ) => Promise< void >;

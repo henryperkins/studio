@@ -1,4 +1,4 @@
-import { appendStudioEntry } from '@studio/agent/node/sessions/store';
+import { appendSessionSelection } from '@studio/agent/node/sessions/selection';
 import { OpenAiSettingsError } from '@studio/agent/node/settings-store';
 import {
 	describeOpenAiSettingsProblem,
@@ -40,7 +40,7 @@ export async function setSessionOpenAiSelection(
 		reasoningEffort: result.settings.reasoningEffort,
 		reasoningMode: result.settings.reasoningMode,
 	};
-	await appendStudioEntry( sessionsRoot, sessionId, 'studio.session_context', {
+	await appendSessionSelection( sessionsRoot, sessionId, {
 		provider: 'openai-api-key',
 		...pinned,
 	} );

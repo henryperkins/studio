@@ -1,4 +1,6 @@
-import { aiModelSupportsImages } from '@studio/agent/protocol/models';
+import { getDefaultChatGptReasoningEffort } from '@studio/agent/protocol/chatgpt-models';
+import { aiModelSupportsImages, getAiModelLabel, isAiModelId } from '@studio/agent/protocol/models';
+import { isOpenAiReasoningEffort } from '@studio/agent/protocol/openai-models';
 import { resolveSkillFromPrompt } from '@studio/agent/protocol/slash-commands';
 import { __, sprintf } from '@wordpress/i18n';
 import { clsx } from 'clsx';
@@ -14,6 +16,8 @@ import {
 	type MouseEvent,
 } from 'react';
 import { createPortal } from 'react-dom';
+import { toast } from '@/data/app-messages';
+import { useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
 import { useIsOutOfAiCredits } from '@/data/queries/use-is-out-of-ai-credits';
 import { useSaveUserPreferences, useUserPreferences } from '@/data/queries/use-user-preferences';
 import { useOpenSettings } from '@/data/use-open-settings';
@@ -26,6 +30,7 @@ import {
 import { AttachmentChips } from '@/features/composer/attachment-chips';
 import { applyCommandToDraft, getComposerCommands } from '@/features/composer/composer-commands';
 import { composerSubmission } from '@/features/composer/composer-submission';
+import { ConnectionSwitchDialog } from '@/features/composer/connection-switch-dialog';
 import { getComposerDraft, saveComposerDraft } from '@/features/composer/draft-store';
 import { FamilySwitchConfirmDialog } from '@/features/composer/family-switch-confirm-dialog';
 import { ModeChip } from '@/features/composer/mode-chip';
@@ -36,6 +41,7 @@ import { SendButton, StartButton, StopButton } from '@/features/composer/submit-
 import { useAddCredits } from '@/features/composer/use-add-credits';
 import { useCommandSheet } from '@/features/composer/use-command-sheet';
 import { useComposerHandle, type ComposerHandle } from '@/features/composer/use-composer-handle';
+import { useConnectionSwitch } from '@/features/composer/use-connection-switch';
 import { useDraftAttachments } from '@/features/composer/use-draft-attachments';
 import { useModelAccess } from '@/features/composer/use-model-access';
 import { useModelSwitch } from '@/features/composer/use-model-switch';
@@ -55,7 +61,9 @@ import {
 import styles from './style.module.css';
 import type { AiModelId, SessionEntry, StudioVisualAnnotationSummary } from '@/data/core';
 import type { ComposerAttachment, ComposerSendAttachments } from '@/data/use-composer-attachments';
+import type { ChatGptConversation } from '@/features/composer/use-chatgpt-conversation';
 import type { OpenAiConversation } from '@/features/composer/use-openai-conversation';
+import type { ChatGptAccountView } from '@studio/agent/protocol/chatgpt';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
 
 /**
@@ -122,6 +130,7 @@ interface ComposerProps {
 	notice?: ComposerNotice;
 	// The reasoning of a chat on OpenAI.
 	openAi?: OpenAiConversation;
+	chatGpt?: ChatGptConversation;
 }
 
 function shouldShellFocusTextarea( target: EventTarget ) {
@@ -164,6 +173,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		onModelChange,
 		notice: blockingNotice,
 		openAi,
+		chatGpt,
 	},
 	ref
 ) {
@@ -205,6 +215,24 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		entries,
 		provider,
 	} );
+	const { data: chatGptSettings } = useChatGptSettings();
+	const chatGptAccounts =
+		chatGptSettings?.enabled && onSwitchSession && ! isField ? chatGptSettings.accounts : [];
+	const canChooseModel = providers.length > 0 || chatGptAccounts.length > 0 || !! chatGpt;
+	const connectionSwitch = useConnectionSwitch( ownerSiteId, onSwitchSession );
+	const chatGptModel = chatGpt?.selection?.model;
+	const chatGptModelLabel = chatGpt
+		? chatGptModel && isAiModelId( chatGptModel )
+			? getAiModelLabel( chatGptModel )
+			: chatGptModel || __( 'ChatGPT model unavailable' )
+		: undefined;
+	const chatGptLabel = chatGpt
+		? chatGpt.account
+			? `${ chatGpt.account.label } · ${
+					chatGpt.account.email ?? chatGpt.account.connectionId.slice( 0, 8 )
+			  } · ${ chatGpt.account.connectionId.slice( 0, 8 ) }`
+			: chatGpt.selection?.connectionId.slice( 0, 8 ) || __( 'Account unavailable' )
+		: undefined;
 	const isWpcom = sessionProvider === 'wpcom';
 	const isOutOfCredits = useIsOutOfAiCredits() && isWpcom;
 	const { openAddCredits, purchase, closePurchase } = useAddCredits();
@@ -230,7 +258,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 			panelCommand,
 			siteCommand,
 			autoStartOn,
-			canChooseModel: ! busy && providers.length > 0,
+			canChooseModel: ( ! busy || !! chatGpt ) && canChooseModel,
 			environment,
 			canChangeEnvironment: !! onEnvironmentChange,
 		} ),
@@ -323,7 +351,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 	}, [ attachments, draftKey, value ] );
 
 	const {
-		changeModel,
+		changeModel: changeLegacyModel,
 		pendingModel,
 		familySwitchInFlight,
 		cancelFamilyChange,
@@ -340,6 +368,42 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		text: value,
 		attachments,
 	} );
+	const changeModel = ( nextProvider: AiProviderId, nextModel: AiModelId ) => {
+		if ( chatGpt && nextProvider !== 'chatgpt-oauth' ) {
+			connectionSwitch.request( { provider: nextProvider, model: nextModel } );
+		} else {
+			changeLegacyModel( nextProvider, nextModel );
+		}
+	};
+	const changeChatGptModel = ( account: ChatGptAccountView, nextModel: string ) => {
+		const current = chatGpt?.selection;
+		const sameConnection =
+			current?.connectionId === account.connectionId && current.revision === account.revision;
+		const effort = sameConnection
+			? current.reasoningEffort
+			: getDefaultChatGptReasoningEffort( nextModel );
+		if ( ! isOpenAiReasoningEffort( effort ) ) {
+			toast.error(
+				__( 'Choose a supported reasoning effort before changing this ChatGPT model.' )
+			);
+			return;
+		}
+		const selection = {
+			connectionId: account.connectionId,
+			revision: account.revision,
+			model: nextModel,
+			reasoningEffort: effort,
+		};
+		if ( sameConnection && chatGpt ) {
+			chatGpt.changeSelection( selection );
+		} else {
+			connectionSwitch.request( {
+				provider: 'chatgpt-oauth',
+				selection,
+				label: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
+			} );
+		}
+	};
 
 	useEffect( () => {
 		if ( autoFocus ) {
@@ -382,7 +446,10 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 			} );
 			return;
 		}
-		if ( submission.options.images?.length && ! aiModelSupportsImages( model ) ) {
+		if (
+			submission.options.images?.length &&
+			! ( chatGpt ? chatGpt.capabilities?.imageInput : aiModelSupportsImages( model ) )
+		) {
 			setValidationError( {
 				message: __( 'Choose a model that supports images before sending these attachments' ),
 				value,
@@ -435,6 +502,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		annotationSiteId,
 		model,
 		stagedNotes,
+		chatGpt,
 	] );
 
 	useComposerHandle( ref, {
@@ -601,7 +669,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 							/>
 						</div>
 						<div className={ styles.rightActions }>
-							{ providers.length ? (
+							{ canChooseModel ? (
 								<ModelPicker
 									open={ modelOpen }
 									onOpenChange={ setModelOpen }
@@ -609,10 +677,16 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 									providers={ providers }
 									sessionProvider={ sessionProvider }
 									getModelLockReason={ getModelLockReason }
-									disabled={ busy }
+									disabled={ busy && ! chatGpt }
 									anchor={ rootNode }
 									onChange={ changeModel }
 									onAddCredits={ openAddCredits }
+									chatGptAccounts={ chatGptAccounts }
+									chatGptLabel={ chatGptLabel }
+									chatGptModel={ chatGptModelLabel }
+									chatGptModelId={ chatGptModel }
+									chatGptConnectionId={ chatGpt?.selection?.connectionId }
+									onChatGptChange={ changeChatGptModel }
 								/>
 							) : null }
 							{ openAi ? (
@@ -623,6 +697,17 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 									mode={ openAi.selection.reasoningMode }
 									disabled={ false }
 									onChange={ openAi.changeReasoning }
+								/>
+							) : null }
+							{ chatGpt?.selection ? (
+								<ReasoningPicker
+									capabilities={ chatGpt.capabilities }
+									effort={ chatGpt.selection.reasoningEffort }
+									mode="standard"
+									disabled={ ! chatGpt.connected }
+									onChange={ ( reasoningEffort ) =>
+										chatGpt.changeSelection( { ...chatGpt.selection!, reasoningEffort } )
+									}
 								/>
 							) : null }
 							{ isField ? null : showStop ? (
@@ -643,6 +728,11 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 							) }
 						</div>
 					</div>
+					{ chatGpt ? (
+						<div className={ styles.connectionLabel }>
+							{ __( 'ChatGPT plan' ) } · { chatGptLabel }
+						</div>
+					) : null }
 				</InputGroup>
 			</div>
 			<CommandSheet
@@ -664,6 +754,15 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 				onCancel={ cancelFamilyChange }
 				onConfirm={ () => void confirmFamilyChange() }
 			/>
+			{ connectionSwitch.target ? (
+				<ConnectionSwitchDialog
+					target={ connectionSwitch.target }
+					inFlight={ connectionSwitch.inFlight }
+					error={ connectionSwitch.error }
+					onCancel={ connectionSwitch.cancel }
+					onConfirm={ ( summary ) => void connectionSwitch.confirm( summary ) }
+				/>
+			) : null }
 			{ purchase ? (
 				<AiCreditsPurchaseDialog
 					open

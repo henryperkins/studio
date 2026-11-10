@@ -14,7 +14,7 @@ import { Button, Menu } from '@/lib/ui';
 import styles from './style.module.css';
 
 interface ReasoningPickerProps {
-	capabilities?: OpenAiModelCapabilities;
+	capabilities?: Pick< OpenAiModelCapabilities, 'reasoningEfforts' | 'reasoningModes' >;
 	// Plain strings: a stored value the model doesn't support still shows.
 	effort: string;
 	mode: string;
