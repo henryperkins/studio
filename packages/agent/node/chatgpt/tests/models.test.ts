@@ -21,10 +21,11 @@ import type { ChatGptModelAvailability } from '@studio/agent/protocol/connection
 const broker = vi.hoisted( () => ( {
 	tokens: new Map< string, string >(),
 	failure: null as Error | null,
+	invalidate: vi.fn< ( connectionId: string, rejectedAccessToken: string ) => Promise< void > >(),
 } ) );
 
 vi.mock( '@studio/agent/node/chatgpt/credential-broker', () => ( {
-	invalidateChatGptAccessToken: async () => undefined,
+	invalidateChatGptAccessToken: broker.invalidate,
 	getChatGptAccessToken: async ( connectionId: string ) => {
 		if ( broker.failure ) {
 			throw broker.failure;
@@ -109,6 +110,20 @@ beforeEach( () => {
 		[ ACCOUNT_B, TOKEN_B ],
 	] );
 	broker.failure = null;
+	broker.invalidate.mockReset().mockResolvedValue( undefined );
+} );
+
+it( 'invalidates the model request’s rejected token when a newer token is already available', async () => {
+	const http = captureFetch( () => {
+		broker.tokens.set( ACCOUNT_A, 'test-access-token-renewed' );
+		return json( { error: 'invalid_token' }, { status: 401 } );
+	} );
+
+	const result = await fetchChatGptModels( ACCOUNT_A );
+
+	expect( failureOf( result ).kind ).toBe( 'authorization' );
+	expect( broker.invalidate ).toHaveBeenCalledExactlyOnceWith( ACCOUNT_A, TOKEN_A );
+	expect( http.spy ).toHaveBeenCalledTimes( 1 );
 } );
 
 afterEach( () => {

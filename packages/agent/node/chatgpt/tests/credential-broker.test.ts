@@ -848,7 +848,7 @@ describe( 'ChatGPT credential broker', () => {
 			await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
 				'test-access-token-1'
 			);
-			await broker.invalidateAccessToken( registrationId );
+			await broker.invalidateAccessToken( registrationId, 'test-access-token-1' );
 			await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
 				'test-access-token-2'
 			);
@@ -873,13 +873,57 @@ describe( 'ChatGPT credential broker', () => {
 			const handle = await broker.beginTurn( registrationId );
 			try {
 				await expect( handle.getAccessToken() ).resolves.toBe( 'test-access-token-1' );
-				await handle.invalidateAccessToken();
+				await handle.invalidateAccessToken( 'test-access-token-1' );
 				await expect( handle.getAccessToken() ).resolves.toBe( 'test-access-token-2' );
 				expect( service.refreshes ).toHaveLength( 1 );
 			} finally {
 				handle.end();
 			}
 		} );
+
+		it.each( [ 'vault', 'session' ] as const )(
+			'keeps a refreshed %s token when an older request is rejected later',
+			async ( storage ) => {
+				const broker = startBroker();
+				const { registrationId } = await broker.saveSignIn( signIn( { storage } ) );
+				const rejected = await broker.getAccessToken( registrationId );
+				const other = storage === 'vault' ? startBroker() : broker;
+				await other.invalidateAccessToken( registrationId, rejected );
+				const renewed = await other.getAccessToken( registrationId );
+				service.answerRefresh( async () => ( {
+					ok: false,
+					error: { kind: 'transient', status: 429 },
+				} ) );
+
+				await broker.invalidateAccessToken( registrationId, rejected );
+
+				await expect( broker.getAccessToken( registrationId ) ).resolves.toBe( renewed );
+				expect( service.refreshes ).toHaveLength( 1 );
+			}
+		);
+
+		it.each( [ 'vault', 'session' ] as const )(
+			'does not invalidate a %s refresh that finishes while invalidation waits',
+			async ( storage ) => {
+				const broker = startBroker();
+				const { registrationId } = await broker.saveSignIn( signIn( { storage } ) );
+				const rejected = await broker.getAccessToken( registrationId );
+				await broker.invalidateAccessToken( registrationId, rejected );
+				const refresh = deferred< ChatGptTokenServiceResult< ChatGptTokenSet > >();
+				service.answerRefresh( () => refresh.promise );
+				const renewing = broker.getAccessToken( registrationId );
+				await vi.waitFor( () => expect( service.refreshes ).toHaveLength( 1 ) );
+				const invalidating = broker.invalidateAccessToken( registrationId, rejected );
+				refresh.resolve( { ok: true, value: tokens( 2 ) } );
+
+				await expect( renewing ).resolves.toBe( 'test-access-token-2' );
+				await invalidating;
+				await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
+					'test-access-token-2'
+				);
+				expect( service.refreshes ).toHaveLength( 1 );
+			}
+		);
 
 		it( 'renews a token within five minutes of expiry with the issued client, replacing token, expiry and refresh token together', async () => {
 			const broker = startBroker();
@@ -1221,6 +1265,198 @@ describe( 'ChatGPT credential broker', () => {
 	} );
 
 	describe( 'sign-out', () => {
+		it.each( [ false, true ] )(
+			'revokes a session-only token after pruning it while the turn exits (polling only: %s)',
+			async ( pollingOnly ) => {
+				fileWatching.refused = pollingOnly;
+				const broker = startBroker( {
+					timing: { accountsPollMs: 20, turnSettleTimeoutMs: 10_000 },
+				} );
+				const { registrationId } = await broker.saveSignIn( signIn( { storage: 'session' } ) );
+				const handle = await broker.beginTurn( registrationId );
+				let completed = false;
+				const signingOut = broker.signOut( registrationId ).then( ( result ) => {
+					completed = true;
+					return result;
+				} );
+				try {
+					await vi.waitFor( () => expect( handle.signal.aborted ).toBe( true ) );
+					await vi.waitFor( () => expect( broker.getSessionForkEnvironment() ).toEqual( {} ) );
+					expect( completed ).toBe( false );
+					await expect( broker.getAccessToken( registrationId ) ).rejects.toMatchObject( {
+						code: 'signed-out',
+					} );
+				} finally {
+					handle.end();
+				}
+
+				await expect( signingOut ).resolves.toEqual( {
+					localCleared: true,
+					remoteRevocationConfirmed: true,
+				} );
+				expect( service.revocations ).toEqual( [
+					{ clientId: 'test-issued-client-1', refreshToken: 'test-refresh-token-1' },
+				] );
+				expectNoSecret( readAllFiles() );
+			}
+		);
+
+		it( 'revokes the session-only rotation that arrives after sign-out starts', async () => {
+			const broker = startBroker();
+			const { registrationId } = await broker.saveSignIn(
+				signIn( { storage: 'session', tokens: expiring() } )
+			);
+			const refresh = deferred< ChatGptTokenServiceResult< ChatGptTokenSet > >();
+			service.answerRefresh( () => refresh.promise );
+			const renewing = settled( broker.getAccessToken( registrationId ) );
+			await vi.waitFor( () => expect( service.refreshes ).toHaveLength( 1 ) );
+			const signingOut = broker.signOut( registrationId );
+			await vi.waitFor( async () =>
+				expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+					state: 'signed-out',
+				} )
+			);
+			refresh.resolve( { ok: true, value: tokens( 2 ) } );
+
+			expect( await renewing ).toEqual( {
+				error: expect.objectContaining( { code: 'signed-out' } ),
+			} );
+			await expect( signingOut ).resolves.toEqual( {
+				localCleared: true,
+				remoteRevocationConfirmed: true,
+			} );
+			expect( service.revocations ).toEqual( [
+				{ clientId: 'test-issued-client-1', refreshToken: 'test-refresh-token-2' },
+			] );
+			expect( broker.getSessionForkEnvironment() ).toEqual( {} );
+		} );
+
+		it( 'retains a session-only rotation completed while sign-out waits to mark the account', async () => {
+			const broker = startBroker();
+			const { registrationId } = await broker.saveSignIn(
+				signIn( { storage: 'session', tokens: expiring() } )
+			);
+			const accountList = pauseNextLock( 'chatgpt-accounts.json.lock' );
+			const signingOut = broker.signOut( registrationId );
+			await accountList.reached;
+			try {
+				await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
+					'test-access-token-renewed-1'
+				);
+			} finally {
+				accountList.release();
+			}
+
+			await expect( signingOut ).resolves.toEqual( {
+				localCleared: true,
+				remoteRevocationConfirmed: true,
+			} );
+			expect( service.revocations ).toEqual( [
+				{ clientId: 'test-issued-client-1', refreshToken: 'test-refresh-token-renewed-1' },
+			] );
+		} );
+
+		it( 'preserves a newer sign-in when a retired session refresh finishes', async () => {
+			const broker = startBroker( { timing: { turnSettleTimeoutMs: 10_000 } } );
+			const { registrationId } = await broker.saveSignIn(
+				signIn( { storage: 'session', tokens: expiring() } )
+			);
+			const turn = await broker.beginTurn( registrationId );
+			const refresh = deferred< ChatGptTokenServiceResult< ChatGptTokenSet > >();
+			service.answerRefresh( () => refresh.promise );
+			const renewing = settled( broker.getAccessToken( registrationId ) );
+			await vi.waitFor( () => expect( service.refreshes ).toHaveLength( 1 ) );
+			const signingOut = broker.signOut( registrationId );
+			try {
+				await vi.waitFor( () => expect( turn.signal.aborted ).toBe( true ) );
+				const signingIn = broker.saveSignIn(
+					signIn( { registrationId, storage: 'session', tokens: tokens( 3 ) } )
+				);
+				await vi.waitFor( async () =>
+					expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+						state: 'signed-in',
+						logoutGeneration: 1,
+					} )
+				);
+				refresh.resolve( { ok: true, value: tokens( 2 ) } );
+				await signingIn;
+			} finally {
+				refresh.resolve( { ok: true, value: tokens( 2 ) } );
+				turn.end();
+			}
+
+			expect( await renewing ).toEqual( {
+				error: expect.objectContaining( { code: 'signed-out' } ),
+			} );
+			await expect( signingOut ).resolves.toEqual( {
+				localCleared: true,
+				remoteRevocationConfirmed: false,
+			} );
+			await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
+				'test-access-token-3'
+			);
+			expect( service.revocations ).toEqual( [] );
+		} );
+
+		it( 'keeps each overlapping session sign-out’s revocation tied to its own generation', async () => {
+			const broker = startBroker();
+			const { registrationId } = await broker.saveSignIn( signIn( { storage: 'session' } ) );
+			const refreshLock = pauseNextLock( `${ registrationId }.lock` );
+			const first = broker.signOut( registrationId );
+			await refreshLock.reached;
+			try {
+				await broker.saveSignIn(
+					signIn( { registrationId, storage: 'session', tokens: tokens( 2 ) } )
+				);
+				await expect( broker.signOut( registrationId ) ).resolves.toEqual( {
+					localCleared: true,
+					remoteRevocationConfirmed: true,
+				} );
+			} finally {
+				refreshLock.release();
+			}
+
+			await expect( first ).resolves.toEqual( {
+				localCleared: true,
+				remoteRevocationConfirmed: true,
+			} );
+			expect( service.revocations ).toEqual( [
+				{ clientId: 'test-issued-client-1', refreshToken: 'test-refresh-token-2' },
+				{ clientId: 'test-issued-client-1', refreshToken: 'test-refresh-token-1' },
+			] );
+			expect( broker.getSessionForkEnvironment() ).toEqual( {} );
+			await expect( broker.getAccessToken( registrationId ) ).rejects.toMatchObject( {
+				code: 'signed-out',
+			} );
+		} );
+
+		it.each( [ true, false ] )(
+			'releases retained session credentials after revocation completes (confirmed: %s)',
+			async ( confirmed ) => {
+				const broker = startBroker();
+				const { registrationId } = await broker.saveSignIn( signIn( { storage: 'session' } ) );
+				service.answerRevoke( async () =>
+					confirmed
+						? { ok: true, value: undefined }
+						: { ok: false, error: { kind: 'transient', status: 503 } }
+				);
+
+				await expect( broker.signOut( registrationId ) ).resolves.toEqual( {
+					localCleared: true,
+					remoteRevocationConfirmed: confirmed,
+				} );
+				const attempts = service.revocations.length;
+				expect( attempts ).toBe( confirmed ? 1 : 3 );
+				await expect( broker.signOut( registrationId ) ).resolves.toEqual( {
+					localCleared: true,
+					remoteRevocationConfirmed: false,
+				} );
+				expect( service.revocations ).toHaveLength( attempts );
+				expect( broker.getSessionForkEnvironment() ).toEqual( {} );
+				expectNoSecret( readAllFiles() );
+			}
+		);
+
 		it( 'revokes the refresh token, then clears every token, keeping the registration, its issued client and the host id', async () => {
 			const broker = startBroker();
 			const account = await broker.saveSignIn( signIn() );
@@ -1595,6 +1831,7 @@ describe( 'ChatGPT credential broker', () => {
 						type: 'studio.chatgpt-session-token.request',
 						requestId: 'request-1',
 						connectionId: registrationId,
+						logoutGeneration: 0,
 					},
 					reply
 				);
@@ -1621,11 +1858,13 @@ describe( 'ChatGPT credential broker', () => {
 			await expect( turn.getAccessToken( account.registrationId ) ).resolves.toBe(
 				'test-access-token-1'
 			);
-			await turn.invalidateAccessToken( account.registrationId );
+			await turn.invalidateAccessToken( account.registrationId, 'test-access-token-1' );
 
 			expect( channel.sent ).toContainEqual( {
 				type: 'studio.chatgpt-session-token.invalidate',
 				connectionId: account.registrationId,
+				tokenGeneration: expect.stringMatching( new RegExp( `^${ UUID_V4 }$` ) ),
+				logoutGeneration: 0,
 			} );
 			expect( app.answerSessionTokenInvalidation( { type: 'interrupt' } ) ).toBe( false );
 
@@ -1637,6 +1876,146 @@ describe( 'ChatGPT credential broker', () => {
 				{ clientId: 'test-issued-client-1', refreshToken: 'test-refresh-token-1' },
 			] );
 		} );
+
+		it( 'ignores a fork’s late rejection after another request refreshed the parent token', async () => {
+			const app = startBroker();
+			const { registrationId } = await app.saveSignIn( signIn( { storage: 'session' } ) );
+			const child = startBroker();
+			child.acceptSessionTokensFromParent( channelTo( app ), app.getSessionForkEnvironment() );
+			const rejected = await child.getAccessToken( registrationId );
+			await app.invalidateAccessToken( registrationId, rejected );
+			const renewed = await app.getAccessToken( registrationId );
+			service.answerRefresh( async () => ( {
+				ok: false,
+				error: { kind: 'transient', status: 429 },
+			} ) );
+
+			await child.invalidateAccessToken( registrationId, rejected );
+
+			const nextChild = startBroker();
+			nextChild.acceptSessionTokensFromParent( channelTo( app ), app.getSessionForkEnvironment() );
+			await expect( nextChild.getAccessToken( registrationId ) ).resolves.toBe( renewed );
+			expect( service.refreshes ).toHaveLength( 1 );
+		} );
+
+		it( 'ignores a replayed invalidation after handing the fork a refreshed token', async () => {
+			const app = startBroker();
+			const { registrationId } = await app.saveSignIn( signIn( { storage: 'session' } ) );
+			const channel = channelTo( app );
+			const child = startBroker();
+			child.acceptSessionTokensFromParent( channel, app.getSessionForkEnvironment() );
+			const rejected = await child.getAccessToken( registrationId );
+			await child.invalidateAccessToken( registrationId, rejected );
+			const renewed = await child.getAccessToken( registrationId );
+			const invalidation = channel.sent.find(
+				( message ) =>
+					( message as { type: string } ).type === 'studio.chatgpt-session-token.invalidate'
+			);
+
+			expect( app.answerSessionTokenInvalidation( invalidation ) ).toBe( true );
+
+			await expect( app.getAccessToken( registrationId ) ).resolves.toBe( renewed );
+			expect( service.refreshes ).toHaveLength( 1 );
+			expectNoSecret( invalidation );
+		} );
+
+		it( 'keeps a newer cached token when a request using the old token is rejected', async () => {
+			const app = startBroker();
+			const { registrationId } = await app.saveSignIn( signIn( { storage: 'session' } ) );
+			const channel = channelTo( app );
+			const child = startBroker();
+			child.acceptSessionTokensFromParent( channel, app.getSessionForkEnvironment() );
+			const rejected = await child.getAccessToken( registrationId );
+			await child.invalidateAccessToken( registrationId, rejected );
+			const renewed = await child.getAccessToken( registrationId );
+			const messages = channel.sent.length;
+
+			await child.invalidateAccessToken( registrationId, rejected );
+
+			await expect( child.getAccessToken( registrationId ) ).resolves.toBe( renewed );
+			expect( channel.sent ).toHaveLength( messages );
+			expect( service.refreshes ).toHaveLength( 1 );
+		} );
+
+		it.each( [ false, true ] )(
+			'ignores old IPC generations after reauthentication, even with the same token (sign-out: %s)',
+			async ( signOutFirst ) => {
+				const app = startBroker();
+				const { registrationId } = await app.saveSignIn( signIn( { storage: 'session' } ) );
+				const channel = channelTo( app );
+				const child = startBroker();
+				child.acceptSessionTokensFromParent( channel, app.getSessionForkEnvironment() );
+				await child.getAccessToken( registrationId );
+				const issued = channel.sent.find(
+					( message ) => ( message as { type: string } ).type === 'studio.chatgpt-session-token'
+				) as { tokenGeneration: string; logoutGeneration: number };
+				if ( signOutFirst ) {
+					await app.signOut( registrationId );
+				}
+				await app.saveSignIn( signIn( { registrationId, storage: 'session' } ) );
+
+				app.answerSessionTokenInvalidation( {
+					type: 'studio.chatgpt-session-token.invalidate',
+					connectionId: registrationId,
+					tokenGeneration: issued.tokenGeneration,
+					logoutGeneration: issued.logoutGeneration,
+				} );
+
+				await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-1' );
+				expect( service.refreshes ).toHaveLength( 0 );
+			}
+		);
+
+		it( 'does not hand a newer sign-in’s token to an old-generation IPC request', async () => {
+			const app = startBroker();
+			const { registrationId } = await app.saveSignIn( signIn( { storage: 'session' } ) );
+			await app.signOut( registrationId );
+			await app.saveSignIn( signIn( { registrationId, storage: 'session', tokens: tokens( 2 ) } ) );
+			const reply = vi.fn();
+
+			app.answerSessionTokenRequest(
+				{
+					type: 'studio.chatgpt-session-token.request',
+					requestId: 'old-request',
+					connectionId: registrationId,
+					logoutGeneration: 0,
+				},
+				reply
+			);
+
+			await vi.waitFor( () =>
+				expect( reply ).toHaveBeenCalledWith(
+					expect.objectContaining( {
+						requestId: 'old-request',
+						accessToken: null,
+					} )
+				)
+			);
+			await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-2' );
+		} );
+
+		it.each( [ 'vault', 'session' ] as const )(
+			'ignores unscoped and malformed IPC invalidations of a %s token',
+			async ( storage ) => {
+				const app = startBroker();
+				const { registrationId } = await app.saveSignIn( signIn( { storage } ) );
+				for ( const fields of [
+					{},
+					{ tokenGeneration: crypto.randomUUID() },
+					{ tokenGeneration: crypto.randomUUID(), logoutGeneration: -1 },
+					{ tokenGeneration: crypto.randomUUID(), logoutGeneration: 0 },
+				] ) {
+					app.answerSessionTokenInvalidation( {
+						type: 'studio.chatgpt-session-token.invalidate',
+						connectionId: registrationId,
+						...fields,
+					} );
+				}
+
+				await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-1' );
+				expect( service.refreshes ).toHaveLength( 0 );
+			}
+		);
 
 		it( 'fails a forked turn whose app no longer holds its session, rather than read a stored record', async () => {
 			const owner = startBroker();

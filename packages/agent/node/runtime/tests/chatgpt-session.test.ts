@@ -55,7 +55,7 @@ class FakeChatGptTurnHandle implements ChatGptTurnHandle {
 	private readonly controller = new AbortController();
 	ended = false;
 	tokenRequests = 0;
-	invalidations = 0;
+	invalidations: string[] = [];
 
 	constructor( connectionId: string ) {
 		this.connectionId = connectionId;
@@ -78,11 +78,11 @@ class FakeChatGptTurnHandle implements ChatGptTurnHandle {
 	async getAccessToken(): Promise< string > {
 		await this.assertActive();
 		this.tokenRequests++;
-		return TOKEN;
+		return fakeBroker.token;
 	}
 
-	async invalidateAccessToken(): Promise< void > {
-		this.invalidations++;
+	async invalidateAccessToken( rejectedAccessToken: string ): Promise< void > {
+		this.invalidations.push( rejectedAccessToken );
 	}
 
 	end(): void {
@@ -93,6 +93,7 @@ class FakeChatGptTurnHandle implements ChatGptTurnHandle {
 const fakeBroker = vi.hoisted( () => ( {
 	connections: [] as ConnectionRegistryEntry[],
 	handles: [] as FakeChatGptTurnHandle[],
+	token: '',
 } ) );
 
 vi.mock( '@studio/agent/node/chatgpt/credential-broker', async ( importOriginal ) => {
@@ -369,6 +370,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		replyCount = 0;
 		fakeBroker.connections = [ connectionEntry() ];
 		fakeBroker.handles = [];
+		fakeBroker.token = TOKEN;
 		fetchSpy = vi.spyOn( globalThis, 'fetch' ).mockImplementation( async ( input, init ) => {
 			const url = input instanceof Request ? input.url : String( input );
 			if ( url !== RESPONSES_URL ) {
@@ -573,6 +575,45 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( JSON.stringify( requests[ 0 ].body.input ) ).not.toContain(
 			REASONING.encrypted_content
 		);
+	} );
+
+	it( 'invalidates only the rejected request’s token and lets the next turn use a newer one', async () => {
+		const selection = selectionFor();
+		const renewed = 'test-chatgpt-renewed-token';
+		replies.push( () => {
+			fakeBroker.token = renewed;
+			return new Response( JSON.stringify( { detail: `Rejected ${ TOKEN }` } ), {
+				status: 401,
+				headers: { 'content-type': 'application/json' },
+			} );
+		} );
+
+		const first = await runChatGptTurn( newChatGptSession( selection ), 'hi', selection, 'medium' );
+
+		expect( first.stopReason ).toBe( 'error' );
+		expect( first.error ).toMatch( /^ChatGPT didn’t accept the sign-in/ );
+		expect( requests ).toHaveLength( 1 );
+		expect( requests[ 0 ].headers.get( 'authorization' ) ).toBe( `Bearer ${ TOKEN }` );
+		expect( fakeBroker.handles[ 0 ].invalidations ).toEqual( [ TOKEN ] );
+		expect( fakeBroker.handles[ 0 ].ended ).toBe( true );
+		expect( first.events.some( ( event ) => event.type === 'auto_retry_start' ) ).toBe( false );
+
+		replies.push( () => textReply( 'Hello again.' ) );
+		const second = await runChatGptTurn(
+			reopen( first.sessionFile ),
+			'hi again',
+			selection,
+			'medium'
+		);
+
+		expect( second.error ).toBeUndefined();
+		expect( second.text ).toBe( 'Hello again.' );
+		expect( requests ).toHaveLength( 2 );
+		expect( requests[ 1 ].headers.get( 'authorization' ) ).toBe( `Bearer ${ renewed }` );
+		expect( fakeBroker.handles[ 1 ].invalidations ).toEqual( [] );
+		const recorded = JSON.stringify( [ first.events, second.events, second.entries ] );
+		expect( recorded ).not.toContain( TOKEN );
+		expect( recorded ).not.toContain( renewed );
 	} );
 
 	it( 'fails a stream that ends without response.completed, keeping what streamed', async () => {

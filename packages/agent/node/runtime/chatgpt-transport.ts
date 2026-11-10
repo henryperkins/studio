@@ -69,8 +69,8 @@ export interface ChatGptTurnSnapshot {
 	getAccessToken: ChatGptTokenSource;
 	/** Aborted once the connection is signed out, or changes, under the turn: the turn handle's. */
 	signal: AbortSignal;
-	/** Drops the current token after a 401, so the next request refreshes it. */
-	invalidateAccessToken?: () => Promise< void >;
+	/** Invalidates the rejected token without discarding a newer one. */
+	invalidateAccessToken?: ( rejectedAccessToken: string ) => Promise< void >;
 	/** The effort every request of the turn sends. */
 	reasoningEffort: OpenAiReasoningEffort;
 }
@@ -498,7 +498,7 @@ function watchEventStream( response: Response, exchange: ChatGptExchange ): Resp
 function createChatGptExchange(
 	target: { model: string; reasoningEffort: OpenAiReasoningEffort },
 	getAccessToken: ChatGptTokenSource,
-	invalidateAccessToken?: () => Promise< void >
+	invalidateAccessToken?: ( rejectedAccessToken: string ) => Promise< void >
 ): ChatGptExchange {
 	const exchange: ChatGptExchange = {
 		sent: false,
