@@ -29,6 +29,8 @@ export type ChatGptTokenSource = () => Promise< string >;
 /** A `POST` of a JSON body to the Responses endpoint, or a `GET` of the model list. */
 export type ChatGptRouteRequest = {
 	getAccessToken: ChatGptTokenSource;
+	/** Called when the route rejects a token with 401, so it is never reused. */
+	invalidateAccessToken?: () => Promise< void >;
 	signal?: AbortSignal;
 } & ( { endpoint: 'responses'; body: string } | { endpoint: 'models' } );
 
@@ -170,6 +172,15 @@ export async function sendChatGptRequest(
 		}
 		if ( response.ok ) {
 			return { response, requestId, redact };
+		}
+		if ( response.status === 401 ) {
+			// The rejected token must not serve the next request; a fresh one
+			// that is also rejected surfaces below as an authorization failure.
+			try {
+				await request.invalidateAccessToken?.();
+			} catch {
+				// The 401 classification below is the failure to report.
+			}
 		}
 		// Read once to classify, then handed on with the same body.
 		const text = await response.text().catch( () => '' );

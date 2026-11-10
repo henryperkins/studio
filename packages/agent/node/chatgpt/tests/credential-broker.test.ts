@@ -838,6 +838,49 @@ describe( 'ChatGPT credential broker', () => {
 			expect( service.refreshes ).toEqual( [] );
 		} );
 
+		it( 'refreshes once after the current access token is invalidated, then keeps the fresh one', async () => {
+			const broker = startBroker();
+			const { registrationId } = await broker.saveSignIn(
+				signIn( { tokens: tokens( 1, { expiresIn: 3600 } ) } )
+			);
+			service.answerRefresh( async () => ( { ok: true, value: tokens( 2 ) } ) );
+
+			await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
+				'test-access-token-1'
+			);
+			await broker.invalidateAccessToken( registrationId );
+			await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
+				'test-access-token-2'
+			);
+			expect( service.refreshes ).toHaveLength( 1 );
+			await expect( broker.getAccessToken( registrationId ) ).resolves.toBe(
+				'test-access-token-2'
+			);
+			expect( service.refreshes ).toHaveLength( 1 );
+			// Another process sees the fresh token, not the invalidated one.
+			await expect( startBroker().getAccessToken( registrationId ) ).resolves.toBe(
+				'test-access-token-2'
+			);
+			expect( service.refreshes ).toHaveLength( 1 );
+		} );
+
+		it( 'invalidates through a turn handle, so its next token is refreshed', async () => {
+			const broker = startBroker();
+			const { registrationId } = await broker.saveSignIn(
+				signIn( { tokens: tokens( 1, { expiresIn: 3600 } ) } )
+			);
+			service.answerRefresh( async () => ( { ok: true, value: tokens( 2 ) } ) );
+			const handle = await broker.beginTurn( registrationId );
+			try {
+				await expect( handle.getAccessToken() ).resolves.toBe( 'test-access-token-1' );
+				await handle.invalidateAccessToken();
+				await expect( handle.getAccessToken() ).resolves.toBe( 'test-access-token-2' );
+				expect( service.refreshes ).toHaveLength( 1 );
+			} finally {
+				handle.end();
+			}
+		} );
+
 		it( 'renews a token within five minutes of expiry with the issued client, replacing token, expiry and refresh token together', async () => {
 			const broker = startBroker();
 			const { registrationId } = await broker.saveSignIn(

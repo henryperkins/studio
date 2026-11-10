@@ -182,6 +182,8 @@ export interface ChatGptTurnHandle {
 	getAccessToken(): Promise< string >;
 	/** Before each tool call: the same check. */
 	assertActive(): Promise< void >;
+	/** The route rejected the current access token: the next token is refreshed. */
+	invalidateAccessToken(): Promise< void >;
 	/** Once the turn has settled, however it ended. */
 	end(): void;
 }
@@ -196,6 +198,8 @@ export interface ChatGptCredentialBrokerOptions {
 export interface ChatGptCredentialBroker {
 	saveSignIn( signIn: ChatGptSignIn ): Promise< ChatGptAccount >;
 	getAccessToken( connectionId: string ): Promise< string >;
+	/** Drops the current access token so the next `getAccessToken` refreshes once. */
+	invalidateAccessToken( connectionId: string ): Promise< void >;
 	/** The ID token to send as `id_token_hint` when signing in again, or null. */
 	readIdTokenHint( connectionId: string ): Promise< string | null >;
 	beginTurn( connectionId: string ): Promise< ChatGptTurnHandle >;
@@ -891,6 +895,46 @@ export function createChatGptCredentialBroker(
 			: getVaultAccessToken( account );
 	}
 
+	async function invalidateAccessToken( connectionId: string ): Promise< void > {
+		const account = await readChatGptAccount( connectionId );
+		if ( ! account || account.state !== 'signed-in' ) {
+			return;
+		}
+		if ( account.storage === 'session' ) {
+			parent?.tokens.delete( connectionId );
+			await serializeSession( connectionId, async () => {
+				const held = sessions.get( connectionId );
+				if ( held ) {
+					sessions.set( connectionId, {
+						...held,
+						record: { ...held.record, expiresAt: 0 },
+					} );
+				}
+			} );
+			return;
+		}
+		const unlock = await lockRefresh( connectionId ).catch( () => null );
+		if ( ! unlock ) {
+			return;
+		}
+		try {
+			const current = await readChatGptAccount( connectionId );
+			if ( ! current || current.state !== 'signed-in' || current.storage !== 'vault' ) {
+				return;
+			}
+			const heldKey = await getWrappingKey().catch( () => null );
+			const { key, read } = await readRecordRetryingStaleKey( current, heldKey );
+			if ( read.status === 'ok' && key ) {
+				await writeSealedRecord(
+					connectionId,
+					sealRecord( key, { ...read.record, expiresAt: 0 } )
+				);
+			}
+		} finally {
+			await unlock();
+		}
+	}
+
 	async function readIdTokenHint( connectionId: string ): Promise< string | null > {
 		const account = await readChatGptAccount( connectionId );
 		if ( account?.state !== 'signed-in' ) {
@@ -1027,6 +1071,9 @@ export function createChatGptCredentialBroker(
 				throw controller.signal.reason;
 			}
 			await check();
+			if ( controller.signal.aborted ) {
+				throw controller.signal.reason;
+			}
 		};
 		// A sign-out in another process aborts the turn too, between requests
 		// or in the middle of one, within the watch's poll bound.
@@ -1043,6 +1090,9 @@ export function createChatGptCredentialBroker(
 					throw controller.signal.reason;
 				}
 				return token;
+			},
+			async invalidateAccessToken() {
+				await invalidateAccessToken( connectionId );
 			},
 			end() {
 				stopWatching();
@@ -1203,6 +1253,7 @@ export function createChatGptCredentialBroker(
 	return {
 		saveSignIn,
 		getAccessToken,
+		invalidateAccessToken,
 		readIdTokenHint,
 		beginTurn,
 		signOut,
@@ -1245,6 +1296,11 @@ export function saveChatGptSignIn( signIn: ChatGptSignIn ): Promise< ChatGptAcco
 /** A current access token for the connection, renewed first when it is about to expire. */
 export function getChatGptAccessToken( connectionId: string ): Promise< string > {
 	return getAppBroker().getAccessToken( connectionId );
+}
+
+/** Drops the connection's current access token, so the next one is refreshed. */
+export function invalidateChatGptAccessToken( connectionId: string ): Promise< void > {
+	return getAppBroker().invalidateAccessToken( connectionId );
 }
 
 /** The verified ID token kept for the connection, to send as `id_token_hint` when signing in again. */
