@@ -1,10 +1,9 @@
 // @vitest-environment node
-import { isRetryableAssistantError } from '@earendil-works/pi-ai/utils/retry';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChatGptConnectionError } from '@studio/agent/node/chatgpt/account-store';
-import { CHATGPT_MODEL_CAPABILITIES } from '@studio/agent/node/chatgpt/models';
 import { CHATGPT_UNAVAILABLE_RETRY_DELAYS_MS } from '@studio/agent/node/chatgpt/route';
+import { CHATGPT_MODEL_CAPABILITIES } from '@studio/agent/protocol/chatgpt-models';
 import { OPENAI_MODEL_CAPABILITIES } from '@studio/agent/protocol/openai-models';
 import { CHATGPT_PI_PROVIDER, OPENAI_PI_PROVIDER } from '@studio/agent/protocol/providers';
 import {
@@ -399,12 +398,10 @@ const asFunctionTools = ( tools: typeof TOOLS ) =>
 		strict: false,
 	} ) );
 
-function expectUnretried( reply: AssistantMessage ) {
+function expectFailure( reply: AssistantMessage ) {
 	expect( reply.stopReason ).toBe( 'error' );
-	// pi re-runs a failed request on its own when the text reads as transient;
-	// nothing on this route may be re-run that way.
-	expect( isRetryableAssistantError( reply ) ).toBe( false );
 	expect( reply.errorMessage ).not.toContain( TOKEN );
+	expect( reply.errorMessage ).not.toContain( '(ChatGPT plan billing' );
 }
 
 describe( 'the ChatGPT transport', () => {
@@ -506,7 +503,7 @@ describe( 'the ChatGPT transport', () => {
 				reasoning: 'low',
 			} ).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch(
 				/would have used low reasoning instead of the selected high/
 			);
@@ -744,7 +741,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( http.spy ).toHaveBeenCalledTimes( 1 );
 			expect( http.request().url ).toBe( RESPONSES_URL );
 			expect( http.request().headers.get( 'authorization' ) ).toBe( `Bearer ${ TOKEN }` );
@@ -933,15 +930,23 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.content ).toEqual( [
 				expect.objectContaining( { type: 'text', text: 'Here is the first half of' } ),
 			] );
 			expect( reply.errorMessage ).toMatch( /^You’ve reached a ChatGPT usage limit/ );
 			expect( reply.errorMessage ).toContain( 'https://chatgpt.com/settings/usage' );
 			expect( reply.errorMessage ).toContain( 'The partial reply is kept but incomplete.' );
-			expect( reply.errorMessage ).toContain( 'subscription_sharing_usage_limit_exceeded' );
-			expect( reply.errorMessage ).toContain( 'req_stream_1' );
+			expect( reply.errorMessage ).not.toContain( 'subscription_sharing_usage_limit_exceeded' );
+			expect( reply.diagnostics ).toEqual( [
+				expect.objectContaining( {
+					type: 'studio.chatgpt-error',
+					details: expect.objectContaining( {
+						code: 'subscription_sharing_usage_limit_exceeded',
+						requestId: 'req_stream_1',
+					} ),
+				} ),
+			] );
 			expect( http.spy ).toHaveBeenCalledTimes( 1 );
 		} );
 
@@ -970,12 +975,17 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.content ).toEqual( [
 				expect.objectContaining( { text: 'Here is the first half of' } ),
 			] );
 			expect( reply.errorMessage ).toMatch( /^ChatGPT stopped before finishing its reply/ );
-			expect( reply.errorMessage ).toContain( 'max_output_tokens' );
+			expect( reply.errorMessage ).not.toContain( 'max_output_tokens' );
+			expect( reply.diagnostics ).toEqual( [
+				expect.objectContaining( {
+					details: expect.objectContaining( { code: 'max_output_tokens' } ),
+				} ),
+			] );
 			expect( reply.errorMessage ).toContain( 'The partial reply is kept but incomplete.' );
 		} );
 
@@ -1001,11 +1011,19 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch(
-				/^ChatGPT plan usage doesn’t support part of this request \(input\[2\]\.content\)/
+				/^ChatGPT plan usage doesn’t support part of this request/
 			);
-			expect( reply.errorMessage ).toContain( 'subscription_sharing_unsupported_capability' );
+			expect( reply.errorMessage ).not.toContain( 'subscription_sharing_unsupported_capability' );
+			expect( reply.diagnostics ).toEqual( [
+				expect.objectContaining( {
+					details: expect.objectContaining( {
+						code: 'subscription_sharing_unsupported_capability',
+						param: 'input_2_.content',
+					} ),
+				} ),
+			] );
 		} );
 
 		it( 'reads an `error` event whose data nests its error, as the OpenAI SDK does', async () => {
@@ -1030,7 +1048,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^You’ve reached a ChatGPT usage limit/ );
 			expect( reply.errorMessage ).toContain( 'The partial reply is kept but incomplete.' );
 		} );
@@ -1045,7 +1063,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^ChatGPT’s reply ended before ChatGPT confirmed/ );
 			expect( reply.content ).toEqual( [
 				expect.objectContaining( { text: 'Here is the first half of' } ),
@@ -1062,7 +1080,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^The connection to ChatGPT dropped/ );
 			expect( reply.errorMessage ).toContain( 'The partial reply is kept but incomplete.' );
 			expect( http.spy ).toHaveBeenCalledTimes( 1 );
@@ -1078,7 +1096,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.stopReason ).not.toBe( 'toolUse' );
 		} );
 
@@ -1092,7 +1110,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^ChatGPT sent a response Studio couldn’t read/ );
 		} );
 	} );
@@ -1110,7 +1128,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^ChatGPT refused this request/ );
 			expect( reply.errorMessage ).toContain( 'HTTP 403' );
 			expect( reply.errorMessage ).toContain( 'req_403' );
@@ -1130,11 +1148,49 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^ChatGPT didn’t accept the sign-in for this account/ );
 			expect( reply.errorMessage ).toContain( 'HTTP 401' );
 			expect( reply.errorMessage ).not.toContain( 'Signature rejected' );
 			expect( http.spy ).toHaveBeenCalledTimes( 1 );
+		} );
+
+		it( 'invalidates a rejected token, and a 401 on the fresh token is an authorization failure', async () => {
+			let currentToken = TOKEN;
+			let invalidations = 0;
+			const snapshot = snapshotFor( 'medium', {
+				getAccessToken: async () => currentToken,
+				invalidateAccessToken: async () => {
+					invalidations++;
+					currentToken = 'fresh-test-chatgpt-token';
+				},
+			} );
+			const turn = await registerChatGpt( snapshot );
+			const http = captureFetch( () =>
+				jsonError( 401, { error: { code: 'subscription_sharing_invalid_user', message: 'No.' } } )
+			);
+
+			const first = await streamTurn(
+				turn,
+				conversation( [ userMessage( 'hi' ) ] ),
+				'medium'
+			).result();
+			expectFailure( first );
+			expect( invalidations ).toBe( 1 );
+			expect( http.spy ).toHaveBeenCalledTimes( 1 );
+
+			const second = await streamTurn(
+				turn,
+				conversation( [ userMessage( 'hi again' ) ] ),
+				'medium'
+			).result();
+			expectFailure( second );
+			expect( second.errorMessage ).toMatch( /^ChatGPT didn’t accept the sign-in/ );
+			expect( http.request( 1 ).headers.get( 'authorization' ) ).toBe(
+				'Bearer fresh-test-chatgpt-token'
+			);
+			expect( http.spy ).toHaveBeenCalledTimes( 2 );
+			expect( invalidations ).toBe( 2 );
 		} );
 
 		it.each( [
@@ -1159,7 +1215,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( message );
 			expect( reply.errorMessage ).toContain( code );
 			expect( http.spy ).toHaveBeenCalledTimes( 1 );
@@ -1182,7 +1238,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^You’ve reached a ChatGPT usage limit/ );
 			expect( reply.errorMessage ).toContain( 'https://chatgpt.com/settings/usage' );
 			expect( reply.errorMessage ).not.toMatch( /reset|hours?\b|minutes?\b/i );
@@ -1208,7 +1264,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch(
 				/^ChatGPT plan usage doesn’t support part of this request \(reasoning\.effort\)/
 			);
@@ -1235,7 +1291,7 @@ describe( 'the ChatGPT transport', () => {
 			);
 			const reply = await pending;
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^ChatGPT plan usage is unavailable right now/ );
 			expect( reply.errorMessage ).toContain( 'HTTP 503' );
 			const attempts = CHATGPT_UNAVAILABLE_RETRY_DELAYS_MS.length + 1;
@@ -1287,7 +1343,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^ChatGPT plan usage is unavailable right now/ );
 			expect( http.spy ).toHaveBeenCalledTimes( 1 );
 		} );
@@ -1304,7 +1360,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^ChatGPT rejected the request/ );
 			expect( reply.errorMessage ).toContain( 'Bad token [redacted].' );
 		} );
@@ -1344,11 +1400,22 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( fromResponse );
-			expect( fromResponse.errorMessage ).toContain( 'invalid_[redacted]' );
-			expect( fromResponse.errorMessage ).toContain( 'param field_[redacted]' );
-			expectUnretried( fromStream );
-			expect( fromStream.errorMessage ).toContain( '(input_[redacted])' );
+			expectFailure( fromResponse );
+			expect( fromResponse.errorMessage ).toContain( 'invalid__redacted_' );
+			expect( fromResponse.errorMessage ).toContain( 'param field__redacted_' );
+			expectFailure( fromStream );
+			// After streaming began, the reference rides in the structured
+			// diagnostic, not in the text pi scans for overflow or retry.
+			expect( fromStream.errorMessage ).not.toContain( 'input_' );
+			expect( fromStream.diagnostics ).toEqual( [
+				expect.objectContaining( {
+					type: 'studio.chatgpt-error',
+					details: expect.objectContaining( {
+						code: 'subscription_sharing_unsupported_capability',
+						param: 'input__redacted_',
+					} ),
+				} ),
+			] );
 		} );
 
 		it( 'explains a network failure, without trying again', async () => {
@@ -1365,7 +1432,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^Couldn’t reach ChatGPT/ );
 			expect( reply.errorMessage ).toContain( 'ENOTFOUND' );
 			expect( spy ).toHaveBeenCalledTimes( 1 );
@@ -1409,11 +1476,13 @@ describe( 'the ChatGPT transport', () => {
 			}
 			const reply = await events.result();
 
-			expectUnretried( reply );
-			expect( reply.errorMessage ).toMatch(
-				/^You signed out of this ChatGPT account\. Sign in again to continue\./
+			expect( reply.stopReason ).toBe( 'aborted' );
+			expect( reply.errorMessage ).toBe(
+				'You signed out of this ChatGPT account. Sign in again to continue.'
 			);
-			expect( reply.errorMessage ).toContain( 'The partial reply is kept but incomplete.' );
+			expect( reply.content ).toEqual( [
+				expect.objectContaining( { text: 'Here is the first half of' } ),
+			] );
 		} );
 
 		it( 'stops before contacting OpenAI when the token source refuses', async () => {
@@ -1432,7 +1501,7 @@ describe( 'the ChatGPT transport', () => {
 				'medium'
 			).result();
 
-			expectUnretried( reply );
+			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch( /^Your ChatGPT sign-in expired or was revoked/ );
 			expect( http.spy ).not.toHaveBeenCalled();
 		} );

@@ -37,11 +37,6 @@ import {
 	listChatGptConnections,
 	type ChatGptTurnHandle,
 } from '@studio/agent/node/chatgpt/credential-broker';
-import {
-	describeChatGptReasoningProblem,
-	getChatGptModelCapabilities,
-	resolveChatGptReasoning,
-} from '@studio/agent/node/chatgpt/models';
 import { readGlobalInstructions } from '@studio/agent/node/global-instructions';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
 import { OPENAI_API_BASE_URL } from '@studio/agent/node/openai-model-list';
@@ -52,6 +47,11 @@ import { createAskUserQuestionTool } from '@studio/agent/node/tools/ask-user-que
 import { bindTool } from '@studio/agent/node/tools/define-tool';
 import { createPresentDesignOptionsTool } from '@studio/agent/node/tools/present-design-options';
 import { createSkillTool } from '@studio/agent/node/tools/skill';
+import {
+	describeChatGptReasoningProblem,
+	getDefaultChatGptReasoningEffort,
+	resolveChatGptReasoning,
+} from '@studio/agent/protocol/chatgpt-models';
 import {
 	describeConnectionSelectionError,
 	resolveConnectionSelection,
@@ -305,7 +305,8 @@ function resolveCredentials(
 // the last assistant message — same path as a real run that errored.
 function syntheticErrorAgentEnd(
 	stopReason: 'error' | 'aborted',
-	errorMessage: string
+	errorMessage: string,
+	provider: string = ANTHROPIC_PI_PROVIDER
 ): AgentSessionEvent {
 	return {
 		type: 'agent_end',
@@ -314,8 +315,8 @@ function syntheticErrorAgentEnd(
 			{
 				role: 'assistant',
 				content: errorMessage ? [ { type: 'text', text: errorMessage } ] : [],
-				api: 'anthropic-messages',
-				provider: ANTHROPIC_PI_PROVIDER,
+				api: provider === CHATGPT_PI_PROVIDER ? 'openai-responses' : 'anthropic-messages',
+				provider,
 				model: '',
 				usage: {
 					input: 0,
@@ -374,16 +375,6 @@ type TurnRouting =
 			model: Model< 'openai-responses' >;
 			reasoningEffort: OpenAiReasoningEffort;
 	  };
-
-function defaultChatGptReasoningEffort( modelId: string ): OpenAiReasoningEffort {
-	const capabilities = getChatGptModelCapabilities( modelId );
-	if ( ! capabilities ) {
-		return 'medium';
-	}
-	return capabilities.reasoningEfforts.includes( 'medium' )
-		? 'medium'
-		: capabilities.reasoningEfforts[ 0 ];
-}
 
 // The selection against the broker's live registry: the same checks
 // `resolveConnectionSelection` makes of a recorded one, of the caller's.
@@ -462,7 +453,7 @@ async function resolveChatGptRouting(
 	}
 	const reasoning = resolveChatGptReasoning(
 		selection.model.modelId,
-		config.chatGpt?.reasoningEffort ?? defaultChatGptReasoningEffort( selection.model.modelId )
+		config.chatGpt?.reasoningEffort ?? getDefaultChatGptReasoningEffort( selection.model.modelId )
 	);
 	if ( ! reasoning.ok ) {
 		return { ok: false, reason: describeChatGptReasoningProblem( reasoning.problem ) };
@@ -517,11 +508,14 @@ async function runAgentSessionTurn(
 ): Promise< void > {
 	const selection = config.connection;
 	const isChatGptTurn = selection?.model.providerId === 'chatgpt-oauth';
+	const syntheticProvider =
+		isChatGptTurn || config.chatGpt ? CHATGPT_PI_PROVIDER : ANTHROPIC_PI_PROVIDER;
 	if ( config.chatGpt && ! isChatGptTurn ) {
 		config.onEvent(
 			syntheticErrorAgentEnd(
 				'error',
-				'ChatGPT turn settings need a ChatGPT connection selection.'
+				'ChatGPT turn settings need a ChatGPT connection selection.',
+				CHATGPT_PI_PROVIDER
 			)
 		);
 		return;
@@ -546,7 +540,7 @@ async function runAgentSessionTurn(
 	if ( isChatGptTurn ) {
 		const resolved = await resolveChatGptRouting( config, selection );
 		if ( ! resolved.ok ) {
-			config.onEvent( syntheticErrorAgentEnd( 'error', resolved.reason ) );
+			config.onEvent( syntheticErrorAgentEnd( 'error', resolved.reason, syntheticProvider ) );
 			return;
 		}
 		routing = resolved.routing;
@@ -602,7 +596,7 @@ async function runAgentSessionTurn(
 
 		if ( controller.signal.aborted ) {
 			await session.abort();
-			config.onEvent( syntheticErrorAgentEnd( 'aborted', '' ) );
+			config.onEvent( syntheticErrorAgentEnd( 'aborted', '', syntheticProvider ) );
 			return;
 		}
 
@@ -618,7 +612,7 @@ async function runAgentSessionTurn(
 		while ( continueAfterEmptyStop ) {
 			continueAfterEmptyStop = false;
 			if ( controller.signal.aborted ) {
-				config.onEvent( syntheticErrorAgentEnd( 'aborted', '' ) );
+				config.onEvent( syntheticErrorAgentEnd( 'aborted', '', syntheticProvider ) );
 				break;
 			}
 			emptyStopContinues++;
@@ -637,7 +631,9 @@ async function runAgentSessionTurn(
 	} catch ( error ) {
 		const aborted = controller.signal.aborted;
 		const message = aborted ? '' : error instanceof Error ? error.message : String( error );
-		config.onEvent( syntheticErrorAgentEnd( aborted ? 'aborted' : 'error', message ) );
+		config.onEvent(
+			syntheticErrorAgentEnd( aborted ? 'aborted' : 'error', message, syntheticProvider )
+		);
 	} finally {
 		unsubscribe?.();
 		session?.dispose();
@@ -691,7 +687,7 @@ async function createStudioAgentSession(
 		)
 	);
 	const modelRuntime = await createModelRuntime( model, routing );
-	const settingsManager = createSettingsManager( config.env );
+	const settingsManager = createSettingsManager( config.env, routing.kind === 'chatgpt' );
 	const { sitesRoot } = config.host;
 	const resourceLoader = new DefaultResourceLoader( {
 		cwd: sitesRoot,
@@ -874,6 +870,7 @@ async function createModelRuntime(
 			connectionId: routing.turn.connectionId,
 			getAccessToken: () => routing.turn.getAccessToken(),
 			signal: routing.turn.signal,
+			invalidateAccessToken: () => routing.turn.invalidateAccessToken(),
 			reasoningEffort: routing.reasoningEffort,
 		};
 		modelRuntime.registerProvider(
@@ -982,11 +979,16 @@ function createWpcomProviderConfig(
 	};
 }
 
-function createSettingsManager( _env: Record< string, string > ): SettingsManager {
+function createSettingsManager(
+	_env: Record< string, string >,
+	disableRetry = false
+): SettingsManager {
 	return SettingsManager.inMemory(
 		{
 			defaultThinkingLevel: 'high',
 			compaction: STUDIO_COMPACTION_SETTINGS,
+			// A ChatGPT turn is never re-run by pi: no automatic retry, ever.
+			...( disableRetry ? { retry: { enabled: false } } : {} ),
 		},
 		{ projectTrusted: false }
 	);
@@ -1021,6 +1023,9 @@ function toToolDefinition(
 			// here: the tool never runs on a connection that is gone.
 			if ( chatGptTurn ) {
 				await chatGptTurn.assertActive();
+				if ( chatGptTurn.signal.aborted ) {
+					throw chatGptTurn.signal.reason;
+				}
 			}
 			const incompleteToolCallReason = getIncompleteToolCallReason( payloadGuardState, toolCallId );
 			if ( incompleteToolCallReason ) {

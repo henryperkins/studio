@@ -10,11 +10,6 @@ import {
 import { streamSimple as streamOpenAiResponses } from '@earendil-works/pi-ai/api/openai-responses';
 import { __, sprintf } from '@wordpress/i18n';
 import {
-	describeChatGptReasoningProblem,
-	getChatGptModelCapabilities,
-	resolveChatGptReasoning,
-} from '@studio/agent/node/chatgpt/models';
-import {
 	CHATGPT_RESPONSES_URL,
 	ChatGptRouteError,
 	sendChatGptRequest,
@@ -30,6 +25,11 @@ import {
 	redactChatGptSecrets,
 	type ChatGptErrorSummary,
 } from '@studio/agent/protocol/chatgpt-errors';
+import {
+	describeChatGptReasoningProblem,
+	getChatGptModelCapabilities,
+	resolveChatGptReasoning,
+} from '@studio/agent/protocol/chatgpt-models';
 import {
 	OPENAI_REASONING_EFFORTS,
 	type OpenAiReasoningEffort,
@@ -60,11 +60,6 @@ const LOCAL_MAX_OUTPUT_TOKENS = 32_000;
 // the bearer. The fetch below builds every request's headers itself, with the
 // turn's token, so this placeholder is neither a credential nor ever sent.
 const TOKEN_FROM_TURN = 'studio-chatgpt-token-from-turn';
-// pi re-runs a failed request by itself when its error text reads as transient
-// (`isRetryableAssistantError`), dropping what streamed: this route must not be
-// re-run that way. Every ChatGPT turn error ends with this untranslated note;
-// "billing" is a word pi never retries on, and the note says what Studio does.
-const NO_FALLBACK_NOTE = '(ChatGPT plan billing, no fallback)';
 
 /** What one ChatGPT turn fixes when it starts. Never a token: only where to get one. */
 export interface ChatGptTurnSnapshot {
@@ -74,6 +69,8 @@ export interface ChatGptTurnSnapshot {
 	getAccessToken: ChatGptTokenSource;
 	/** Aborted once the connection is signed out, or changes, under the turn: the turn handle's. */
 	signal: AbortSignal;
+	/** Drops the current token after a 401, so the next request refreshes it. */
+	invalidateAccessToken?: () => Promise< void >;
 	/** The effort every request of the turn sends. */
 	reasoningEffort: OpenAiReasoningEffort;
 }
@@ -448,11 +445,17 @@ function watchEventStream( response: Response, exchange: ChatGptExchange ): Resp
 		const failure = classifyChatGptStreamEvent( typed );
 		if ( failure && ! exchange.streamFailure ) {
 			// The code and param are shown to the user too, so the turn's token
-			// comes out of them as it does out of the detail.
+			// comes out of them as it does out of the detail, in the same safe
+			// form classification gave them.
+			const safeReference = ( text: string ) =>
+				exchange
+					.redact( text )
+					.replace( /[^A-Za-z0-9._-]/g, '_' )
+					.slice( 0, 64 );
 			exchange.streamFailure = {
 				...failure,
-				...( failure.code ? { code: exchange.redact( failure.code ) } : {} ),
-				...( failure.param ? { param: exchange.redact( failure.param ) } : {} ),
+				...( failure.code ? { code: safeReference( failure.code ) } : {} ),
+				...( failure.param ? { param: safeReference( failure.param ) } : {} ),
 				...( failure.detail ? { detail: exchange.redact( failure.detail ) } : {} ),
 			};
 		}
@@ -494,7 +497,8 @@ function watchEventStream( response: Response, exchange: ChatGptExchange ): Resp
 
 function createChatGptExchange(
 	target: { model: string; reasoningEffort: OpenAiReasoningEffort },
-	getAccessToken: ChatGptTokenSource
+	getAccessToken: ChatGptTokenSource,
+	invalidateAccessToken?: () => Promise< void >
 ): ChatGptExchange {
 	const exchange: ChatGptExchange = {
 		sent: false,
@@ -534,6 +538,7 @@ function createChatGptExchange(
 					endpoint: 'responses',
 					body,
 					getAccessToken,
+					invalidateAccessToken,
 					signal: init?.signal ?? undefined,
 				} );
 			} catch ( error ) {
@@ -586,15 +591,40 @@ const hasPartialOutput = ( message: AssistantMessage ) =>
 
 function toFailure(
 	message: AssistantMessage,
-	summary: ChatGptErrorSummary
+	summary: ChatGptErrorSummary,
+	exchange?: ChatGptExchange
 ): AssistantMessageEvent {
 	const partial = hasPartialOutput( message ) ? { partial: true } : {};
+	const fullSummary = { ...summary, ...partial };
+	// After streaming began, the server's raw reference and diagnostic text
+	// stay out of `errorMessage`: pi reads that text for overflow recovery
+	// and would compact and re-send. They ride in a structured diagnostic.
+	const postStream = Boolean( exchange?.opened || exchange?.streamFailure );
+	if ( postStream ) {
+		message.diagnostics = [
+			...( message.diagnostics ?? [] ),
+			{
+				type: 'studio.chatgpt-error',
+				timestamp: Date.now(),
+				details: { ...fullSummary },
+			},
+		];
+	}
+	const described = postStream ? { kind: summary.kind, ...partial } : fullSummary;
 	message.stopReason = 'error';
-	message.errorMessage = `${ describeChatGptError( {
-		...summary,
-		...partial,
-	} ) } ${ NO_FALLBACK_NOTE }`;
+	message.errorMessage = describeChatGptError( described );
 	return { type: 'error', reason: 'error', error: message };
+}
+
+function toInterrupted(
+	message: AssistantMessage,
+	summary: ChatGptErrorSummary
+): AssistantMessageEvent {
+	message.stopReason = 'aborted';
+	// The broker's own words for why the connection ended, with no reference
+	// appended: the clear sign-out message the user reads.
+	message.errorMessage = summary.detail ?? describeChatGptError( summary );
+	return { type: 'error', reason: 'aborted', error: message };
 }
 
 /**
@@ -612,26 +642,72 @@ function withChatGptOutcome(
 	const outcome = createAssistantMessageEventStream();
 	const connectionEnded = () => connectionSignal.aborted && ! userSignal?.aborted;
 	void ( async () => {
-		for await ( const event of source ) {
-			if ( event.type === 'done' ) {
-				const succeeded =
-					exchange.completed && ( event.reason === 'stop' || event.reason === 'toolUse' );
-				outcome.push(
-					succeeded ? event : toFailure( event.message, classifyOutcome( exchange, '' ) )
-				);
-			} else if ( event.type === 'error' && connectionEnded() ) {
-				outcome.push(
-					toFailure( event.error, summarizeChatGptTokenFailure( connectionSignal.reason ) )
-				);
-			} else if ( event.type === 'error' && event.reason === 'error' ) {
-				outcome.push(
-					toFailure( event.error, classifyOutcome( exchange, event.error.errorMessage ?? '' ) )
-				);
-			} else {
-				outcome.push( event );
+		let lastMessage: AssistantMessage | undefined;
+		let pushedTerminal = false;
+		try {
+			for await ( const event of source ) {
+				if ( event.type === 'done' ) {
+					lastMessage = event.message;
+					const succeeded =
+						exchange.completed && ( event.reason === 'stop' || event.reason === 'toolUse' );
+					pushedTerminal = true;
+					outcome.push(
+						succeeded
+							? event
+							: toFailure( event.message, classifyOutcome( exchange, '' ), exchange )
+					);
+				} else if ( event.type === 'error' && connectionEnded() ) {
+					lastMessage = event.error;
+					pushedTerminal = true;
+					outcome.push(
+						toInterrupted( event.error, summarizeChatGptTokenFailure( connectionSignal.reason ) )
+					);
+				} else if ( event.type === 'error' && event.reason === 'error' ) {
+					lastMessage = event.error;
+					pushedTerminal = true;
+					outcome.push(
+						toFailure(
+							event.error,
+							classifyOutcome( exchange, event.error.errorMessage ?? '' ),
+							exchange
+						)
+					);
+				} else if ( event.type === 'error' ) {
+					lastMessage = event.error;
+					pushedTerminal = true;
+					outcome.push( event );
+				} else {
+					if ( 'partial' in event && event.partial ) {
+						lastMessage = event.partial as AssistantMessage;
+					}
+					outcome.push( event );
+				}
 			}
+		} catch ( error ) {
+			if ( ! pushedTerminal && lastMessage ) {
+				try {
+					outcome.push(
+						connectionEnded()
+							? toInterrupted(
+									lastMessage,
+									summarizeChatGptTokenFailure( connectionSignal.reason )
+							  )
+							: toFailure(
+									lastMessage,
+									classifyOutcome(
+										exchange,
+										error instanceof Error ? error.message : String( error )
+									),
+									exchange
+							  )
+					);
+				} catch {
+					// Ending the stream below is what keeps the turn from hanging.
+				}
+			}
+		} finally {
+			outcome.end();
 		}
-		outcome.end();
 	} )();
 	return outcome;
 }
@@ -661,7 +737,11 @@ export function createChatGptProviderConfig(
 		apiKey: TOKEN_FROM_TURN,
 		api: 'openai-responses',
 		streamSimple: ( m, context, options?: SimpleStreamOptions ) => {
-			const exchange = createChatGptExchange( target, turnSnapshot.getAccessToken );
+			const exchange = createChatGptExchange(
+				target,
+				turnSnapshot.getAccessToken,
+				turnSnapshot.invalidateAccessToken
+			);
 			const userSignal = options?.signal;
 			return withChatGptOutcome(
 				streamOpenAiResponses( m as Model< 'openai-responses' >, context, {

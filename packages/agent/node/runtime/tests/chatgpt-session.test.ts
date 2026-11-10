@@ -55,6 +55,7 @@ class FakeChatGptTurnHandle implements ChatGptTurnHandle {
 	private readonly controller = new AbortController();
 	ended = false;
 	tokenRequests = 0;
+	invalidations = 0;
 
 	constructor( connectionId: string ) {
 		this.connectionId = connectionId;
@@ -78,6 +79,10 @@ class FakeChatGptTurnHandle implements ChatGptTurnHandle {
 		await this.assertActive();
 		this.tokenRequests++;
 		return TOKEN;
+	}
+
+	async invalidateAccessToken(): Promise< void > {
+		this.invalidations++;
 	}
 
 	end(): void {
@@ -221,6 +226,46 @@ const toolCallReply = () =>
 		},
 	] );
 
+const IMAGE_READ_CALL = {
+	...READ_CALL,
+	id: 'fc_image',
+	call_id: 'call_read_image',
+	arguments: '{"path":"screenshot.png"}',
+};
+
+// Asks to read an image file, whose tool result carries the image itself.
+const imageToolCallReply = () =>
+	sse( [
+		{ type: 'response.created', response: { id: 'resp_img', status: 'in_progress', output: [] } },
+		{
+			type: 'response.output_item.added',
+			output_index: 0,
+			item: { ...IMAGE_READ_CALL, arguments: '', status: 'in_progress' },
+		},
+		{
+			type: 'response.function_call_arguments.delta',
+			output_index: 0,
+			item_id: IMAGE_READ_CALL.id,
+			delta: IMAGE_READ_CALL.arguments,
+		},
+		{
+			type: 'response.function_call_arguments.done',
+			output_index: 0,
+			item_id: IMAGE_READ_CALL.id,
+			arguments: IMAGE_READ_CALL.arguments,
+		},
+		{ type: 'response.output_item.done', output_index: 0, item: IMAGE_READ_CALL },
+		{
+			type: 'response.completed',
+			response: {
+				id: 'resp_img',
+				status: 'completed',
+				output: [ IMAGE_READ_CALL ],
+				usage: usage(),
+			},
+		},
+	] );
+
 let replyCount = 0;
 const textReply = ( text: string, inputTokens?: number ) => {
 	const id = `msg_${ ++replyCount }`;
@@ -312,6 +357,13 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			path.join( sitesRoot, 'wp-config.php' ),
 			"<?php define( 'DB_NAME', 'studio' );\n"
 		);
+		fs.writeFileSync(
+			path.join( sitesRoot, 'screenshot.png' ),
+			Buffer.from(
+				'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAAZ0lEQVR4nO3QAQEAAACCoP6ftiHKBIbckCsAuQKQKwC5ApArALkCkCsAuQKQKwC5ApArALkCkCsAuQKQKwC5ApArALkCkCsAuQKQKwC5ApArALkCkCsAuQKQKwC5ApArALkCkCsAuQNG0MOymiW+jAAAAABJRU5ErkJggg==',
+				'base64'
+			)
+		);
 		replies = [];
 		requests = [];
 		replyCount = 0;
@@ -384,6 +436,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		return {
 			sessionFile: session.getSessionFile()!,
 			error: last?.role === 'assistant' ? last.errorMessage : undefined,
+			stopReason: last?.role === 'assistant' ? last.stopReason : undefined,
 			text,
 			entries: session.getEntries(),
 			events,
@@ -452,6 +505,11 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( String( output.output ) ).toContain( "define( 'DB_NAME', 'studio' )" );
 		expect( fakeBroker.handles ).toHaveLength( 1 );
 		expect( fakeBroker.handles[ 0 ].ended ).toBe( true );
+		// One token taken per request in the turn.
+		expect( fakeBroker.handles[ 0 ].tokenRequests ).toBe( 2 );
+		// No credential in the session entries or the events the turn emitted.
+		expect( JSON.stringify( first.entries ) ).not.toContain( TOKEN );
+		expect( JSON.stringify( first.events ) ).not.toContain( TOKEN );
 
 		// Turn 2, in a fresh agent on the reopened file, with High passed in.
 		// Its reply reports a context close to the budget, so the session
@@ -478,6 +536,14 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( itemsOfType( turnRequest, 'function_call_output' ) ).toEqual( [
 			expect.objectContaining( { call_id: READ_CALL.call_id } ),
 		] );
+		// The earlier assistant text is replayed as an assistant message.
+		expect(
+			turnRequest.body.input.some(
+				( item ) =>
+					item.role === 'assistant' &&
+					JSON.stringify( item.content ).includes( 'DB_NAME is studio.' )
+			)
+		).toBe( true );
 		// Compaction's summary request runs on the same connection, model and effort.
 		for ( const request of compactionRequests ) {
 			expect( request.headers.get( 'authorization' ) ).toBe( `Bearer ${ TOKEN }` );
@@ -520,6 +586,90 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( fetchSpy ).toHaveBeenCalledTimes( 1 );
 	} );
 
+	it( 'does not retry a mid-stream failure in the whole loop', async () => {
+		const selection = selectionFor();
+		replies.push( () =>
+			sse( [
+				...PARTIAL_EVENTS,
+				{
+					type: 'response.failed',
+					response: {
+						id: 'resp_partial',
+						status: 'failed',
+						output: [],
+						error: { code: 'server_error', message: 'Upstream exploded.' },
+					},
+				},
+			] )
+		);
+
+		const turn = await runChatGptTurn( newChatGptSession( selection ), 'hi', selection, 'medium' );
+
+		expect( turn.stopReason ).toBe( 'error' );
+		expect( turn.error ).toMatch( /^ChatGPT had a server error/ );
+		expect( turn.text ).toContain( 'Here is the first half of' );
+		// Exactly one request, and pi never scheduled a retry of it.
+		expect( requests ).toHaveLength( 1 );
+		expect( turn.events.some( ( event ) => event.type === 'auto_retry_start' ) ).toBe( false );
+		expect( JSON.stringify( turn.entries ) ).not.toContain( TOKEN );
+	} );
+
+	it( 'does not re-send a mid-stream context_length_exceeded failure after compaction', async () => {
+		const selection = selectionFor();
+		replies.push( () =>
+			sse( [
+				...PARTIAL_EVENTS,
+				{
+					type: 'error',
+					code: 'context_length_exceeded',
+					message: 'context_length_exceeded: too many tokens in this request',
+					sequence_number: 3,
+				},
+			] )
+		);
+
+		const turn = await runChatGptTurn( newChatGptSession( selection ), 'hi', selection, 'medium' );
+
+		expect( turn.stopReason ).toBe( 'error' );
+		// The raw overflow text stays out of the message pi scans, and rides
+		// in the structured diagnostic instead.
+		expect( turn.error ).not.toContain( 'context_length_exceeded' );
+		expect( turn.error ).not.toContain( 'too many tokens' );
+		const lastMessage = [ ...turn.events ]
+			.reverse()
+			.find( ( event ) => event.type === 'agent_end' );
+		const messages =
+			lastMessage?.type === 'agent_end'
+				? ( lastMessage.messages as Array< { diagnostics?: unknown } > )
+				: [];
+		expect( JSON.stringify( messages.at( -1 )?.diagnostics ?? [] ) ).toContain(
+			'context_length_exceeded'
+		);
+		expect( requests ).toHaveLength( 1 );
+		expect( turn.events.some( ( event ) => event.type === 'auto_retry_start' ) ).toBe( false );
+		expect( turn.entries.some( ( entry ) => entry.type === 'compaction' ) ).toBe( false );
+	} );
+
+	it( 'sends an image tool result back as image input', async () => {
+		const selection = selectionFor();
+		replies.push( imageToolCallReply, () => textReply( 'It is a tiny image.' ) );
+
+		const turn = await runChatGptTurn(
+			newChatGptSession( selection ),
+			'Describe screenshot.png',
+			selection,
+			'medium'
+		);
+
+		expect( turn.error ).toBeUndefined();
+		expect( requests ).toHaveLength( 2 );
+		const [ output ] = itemsOfType( requests[ 1 ], 'function_call_output' );
+		expect( output.call_id ).toBe( IMAGE_READ_CALL.call_id );
+		expect( JSON.stringify( output.output ) ).toContain( 'input_image' );
+		expect( JSON.stringify( output.output ) ).toContain( 'data:image/png;base64,' );
+		expect( fakeBroker.handles[ 0 ].tokenRequests ).toBe( 2 );
+	} );
+
 	it( 'ends the turn when the connection is signed out mid-stream', async () => {
 		const selection = selectionFor();
 		replies.push( () => stalledSse( PARTIAL_EVENTS ) );
@@ -541,6 +691,8 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		);
 
 		expect( turn.error ).toMatch( /^You signed out of this ChatGPT account/ );
+		// Closed as interrupted, not as an error.
+		expect( turn.stopReason ).toBe( 'aborted' );
 		expect( turn.text ).toContain( 'Here is the first half of' );
 		expect( fakeBroker.handles[ 0 ].ended ).toBe( true );
 	} );
@@ -563,6 +715,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		);
 
 		expect( turn.error ).toMatch( /^You signed out of this ChatGPT account/ );
+		expect( turn.stopReason ).toBe( 'aborted' );
 		// The tool never ran, so no continuation carrying its output was sent
 		// and no result in the session holds the file it would have read.
 		expect( requests ).toHaveLength( 1 );
@@ -603,6 +756,10 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			);
 
 			expect( chatGpt.error ).toBeUndefined();
+			expect( JSON.stringify( chatGpt.entries ) ).not.toContain( TOKEN );
+			expect( JSON.stringify( chatGpt.entries ) ).not.toContain( API_KEY );
+			expect( JSON.stringify( chatGpt.events ) ).not.toContain( TOKEN );
+			expect( JSON.stringify( chatGpt.events ) ).not.toContain( API_KEY );
 			expect( readLastReplyProvider( chatGpt.entries ) ).toBe( 'chatgpt-oauth' );
 			expect( requests ).toHaveLength( 2 );
 			for ( const request of requests ) {
@@ -646,6 +803,9 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( turn.error ).toBe(
 				'ChatGPT isn’t connected, so this chat can’t continue. Start a new chat with another provider.'
 			);
+			// The synthetic failure is stamped as a ChatGPT reply, not Anthropic's.
+			expect( JSON.stringify( turn.events ) ).toContain( '"provider":"studio-chatgpt"' );
+			expect( JSON.stringify( turn.entries ) ).not.toContain( API_KEY );
 			expect( fetchSpy ).not.toHaveBeenCalled();
 			expect( fakeBroker.handles ).toHaveLength( 0 );
 		} );
