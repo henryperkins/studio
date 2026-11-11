@@ -3,11 +3,12 @@ import readline from 'node:readline';
 
 /**
  * One Studio process for the cross-process tests, run from the sources by bare
- * Node: `node broker-process.ts <command> <keychain file> <token service URL> [registration id]`.
- * The workspace links resolve `@studio/*` to the TypeScript sources, whose
- * types Node strips. It reports one JSON line on stdout.
+ * Node: `node broker-process.ts <command> <keychain file> <token service URL> [registration id]
+ * [stored registration id]`. The workspace links resolve `@studio/*` to the
+ * TypeScript sources, whose types Node strips. It reports one JSON line on stdout.
  */
-const [ command, keychainFile, serviceUrl, registrationId ] = process.argv.slice( 2 );
+const [ command, keychainFile, serviceUrl, registrationId, storedRegistrationId ] =
+	process.argv.slice( 2 );
 // How long to wait for a line from the test, so a lost one fails the test rather than hanging it.
 const LINE_TIMEOUT_MS = Number( process.env.STUDIO_TEST_LINE_TIMEOUT_MS ) || 20_000;
 
@@ -93,6 +94,45 @@ async function main(): Promise< void > {
 		// Killed once the token service has rotated the refresh token, before the
 		// record that holds the rotation replaces the one that doesn't.
 		await report( () => broker.getAccessToken( registrationId ) );
+	} else if ( command === 'fork-turns-outlive-app' ) {
+		// Forked by the test as an app forks a turn: one turn on the app's
+		// session-only sign-in, one on a stored sign-in.
+		broker.acceptSessionTokensFromParent();
+		const turns = {
+			session: await broker.beginTurn( registrationId ),
+			stored: await broker.beginTurn( storedRegistrationId ),
+		};
+		for ( const turn of Object.values( turns ) ) {
+			await turn.getAccessToken();
+		}
+		const appGone = new Promise( ( resolve ) => process.once( 'disconnect', resolve ) );
+		console.log( 'ready' );
+		await appGone;
+		const outcome = ( promise: Promise< unknown > ) =>
+			promise.then(
+				( value ) => value,
+				( error: { code?: unknown } ) => error?.code ?? null
+			);
+		await report( async () => {
+			const statuses = new Map(
+				( await broker.listConnections() ).map( ( entry ) => [
+					entry.connectionId,
+					entry.authStatus,
+				] )
+			);
+			const result: Record< string, unknown > = {};
+			for ( const [ name, turn ] of Object.entries( turns ) ) {
+				result[ name ] = {
+					token: await outcome( broker.getAccessToken( turn.connectionId ) ),
+					// A tool approved once the app had gone: the turn checks before running it.
+					tool: await outcome( turn.assertActive().then( () => 'ran' ) ),
+					aborted: turn.signal.aborted,
+					authStatus: statuses.get( turn.connectionId ),
+				};
+				turn.end();
+			}
+			return result;
+		} );
 	} else if ( command === 'hold-turn' ) {
 		const handle = await broker.beginTurn( registrationId );
 		await handle.getAccessToken();

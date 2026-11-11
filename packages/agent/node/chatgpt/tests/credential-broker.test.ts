@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
@@ -2168,8 +2168,9 @@ describe( 'ChatGPT credential broker', () => {
 			} );
 		} );
 
-		it( 'fails a forked turn closed once the app holding its session has exited, never falling back to a stored record', async () => {
-			const app = startBroker();
+		// A session-only sign-in that a vault record from before the switch to it
+		// was put back for, where a fallback would find it.
+		async function signInForThisSessionOverStoredRecord( app: ChatGptCredentialBroker ) {
 			const account = await app.saveSignIn( signIn() );
 			const storedRecord = fs.readFileSync( vaultPath( account.registrationId ) );
 			await app.saveSignIn(
@@ -2179,12 +2180,19 @@ describe( 'ChatGPT credential broker', () => {
 					tokens: tokens( 2 ),
 				} )
 			);
-			// The record from before the switch, put back where a fallback would find it.
 			fs.writeFileSync( vaultPath( account.registrationId ), storedRecord );
+			return { registrationId: account.registrationId, storedRecord };
+		}
+
+		it( 'ends a forked turn’s session-only sign-in once sending to the app that held it fails, never falling back to a stored record', async () => {
+			const app = startBroker();
+			const { registrationId, storedRecord } = await signInForThisSessionOverStoredRecord( app );
 			const offer = app.getSessionForkEnvironment();
 			let appExited = false;
+			const sent: unknown[] = [];
 			const channel = Object.assign( new EventEmitter(), {
 				send: ( message: unknown, callback: ( error: Error | null ) => void ) => {
+					sent.push( message );
 					if ( appExited ) {
 						// What Node reports to a child sending after its parent's end has closed.
 						const closed = Object.assign( new Error( 'Channel closed' ), {
@@ -2202,33 +2210,119 @@ describe( 'ChatGPT credential broker', () => {
 			} );
 			const fork = startBroker();
 			fork.acceptSessionTokensFromParent( channel, { ...offer } );
-			const handed = await fork.getAccessToken( account.registrationId );
+			const turn = await fork.beginTurn( registrationId );
+			const handed = await turn.getAccessToken();
 			expect( handed ).toBe( 'test-access-token-2' );
 
 			appExited = true;
-			// The route then rejects the token the turn holds, and there is nowhere to get another.
-			await fork.invalidateAccessToken( account.registrationId, handed );
+			// The route rejects the token the turn holds; telling the app so fails.
+			await turn.invalidateAccessToken( handed );
 
-			await expect( fork.getAccessToken( account.registrationId ) ).rejects.toMatchObject( {
+			await expect( turn.getAccessToken() ).rejects.toMatchObject( {
 				code: 'session-unavailable',
 			} );
-			// A channel that throws once its app has gone fails the same way.
+			expect( turn.signal.aborted ).toBe( true );
+			await expect( fork.getAccessToken( registrationId ) ).rejects.toMatchObject( {
+				code: 'session-unavailable',
+			} );
+			// The request and the failed invalidation: nothing is sent after the failure.
+			expect( sent ).toHaveLength( 2 );
+			turn.end();
+
+			// A channel that throws once its app has gone is asked only once.
+			const send = vi.fn( () => {
+				throw new Error( 'Channel closed' );
+			} );
 			const orphan = startBroker();
-			orphan.acceptSessionTokensFromParent(
-				Object.assign( new EventEmitter(), {
-					send: () => {
-						throw new Error( 'Channel closed' );
-					},
-				} ),
-				{ ...offer }
-			);
-			await expect( orphan.getAccessToken( account.registrationId ) ).rejects.toMatchObject( {
-				code: 'session-unavailable',
+			orphan.acceptSessionTokensFromParent( Object.assign( new EventEmitter(), { send } ), {
+				...offer,
 			} );
+			for ( let request = 0; request < 2; request++ ) {
+				await expect( orphan.getAccessToken( registrationId ) ).rejects.toMatchObject( {
+					code: 'session-unavailable',
+				} );
+			}
+			expect( send ).toHaveBeenCalledTimes( 1 );
 			expect( service.refreshes ).toEqual( [] );
 			expect( service.revocations ).toEqual( [] );
-			expect( fs.readFileSync( vaultPath( account.registrationId ) ) ).toEqual( storedRecord );
+			expect( fs.readFileSync( vaultPath( registrationId ) ) ).toEqual( storedRecord );
 		} );
+
+		it( 'ends a forked turn’s session-only sign-in with the app that held it, so its pending tool never runs, leaving stored sign-ins running', async () => {
+			const tokenService = await startMockTokenService( { refreshToken: 'test-refresh-token-0' } );
+			onTestFinished( () => tokenService.close() );
+			const keychainFile = path.join( configDir, 'test-keychain.json' );
+			const app = startBroker( {
+				credentialStore: createFileCredentialStore( keychainFile ),
+				tokenClient: createHttpTokenClient( tokenService.url ),
+			} );
+			const { registrationId } = await signInForThisSessionOverStoredRecord( app );
+			const stored = await app.saveSignIn(
+				signIn( {
+					subject: 'test-subject-2',
+					clientId: 'test-issued-client-2',
+					tokens: tokens( 3 ),
+				} )
+			);
+			const savedState = () => ( {
+				accounts: fs.readFileSync( accountsPath(), 'utf8' ),
+				vault: vaultFiles().map( ( name ) => [
+					name,
+					fs.readFileSync( path.join( credentialsDir(), name ), 'utf8' ),
+				] ),
+				keychain: fs.readFileSync( keychainFile, 'utf8' ),
+			} );
+			const before = savedState();
+			const fork = startBrokerProcess(
+				[
+					'fork-turns-outlive-app',
+					keychainFile,
+					tokenService.url,
+					registrationId,
+					stored.registrationId,
+				],
+				app.getSessionForkEnvironment(),
+				{ ipc: true }
+			);
+			fork.child.on( 'message', ( message ) => {
+				const answered = app.answerSessionTokenRequest( message, ( reply ) => {
+					if ( fork.child.connected ) {
+						fork.child.send( reply as object );
+					}
+				} );
+				if ( ! answered ) {
+					app.answerSessionTokenInvalidation( message );
+				}
+			} );
+			expect( await fork.nextLine() ).toBe( 'ready' );
+
+			// The app's end of the channel closes, as it does when the app exits.
+			fork.child.disconnect();
+			const report = JSON.parse( await fork.nextLine() );
+
+			expect( report ).toEqual( {
+				ok: true,
+				value: {
+					session: {
+						token: 'session-unavailable',
+						tool: 'session-unavailable',
+						aborted: true,
+						authStatus: 'disconnected',
+					},
+					stored: {
+						token: 'test-access-token-3',
+						tool: 'ran',
+						aborted: false,
+						authStatus: 'connected',
+					},
+				},
+			} );
+			expect( tokenService.refreshes ).toEqual( [] );
+			expect( tokenService.revocations ).toEqual( [] );
+			// It signed no one out and changed nothing saved; the app still holds its session.
+			expect( savedState() ).toEqual( before );
+			await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-2' );
+		}, 60_000 );
 	} );
 
 	describe( 'the connection registry', () => {
@@ -2388,16 +2482,20 @@ describe( 'ChatGPT credential broker', () => {
 		}, 30_000 );
 	} );
 
-	// One Studio process running the broker from the sources.
-	function startBrokerProcess( args: string[], env: Record< string, string > = {} ) {
+	// One Studio process running the broker from the sources; with `ipc`, forked by this one.
+	function startBrokerProcess(
+		args: string[],
+		env: Record< string, string > = {},
+		{ ipc = false } = {}
+	) {
 		const child = spawn(
 			process.execPath,
 			[ path.join( import.meta.dirname, 'fixtures', 'broker-process.ts' ), ...args ],
 			{
 				env: { ...process.env, DEV_CONFIG_DIR: configDir, ...env },
-				stdio: [ 'pipe', 'pipe', 'pipe' ],
+				stdio: [ 'pipe', 'pipe', 'pipe', ...( ipc ? [ 'ipc' as const ] : [] ) ],
 			}
-		);
+		) as ChildProcessWithoutNullStreams;
 		let stdout = '';
 		let stderr = '';
 		child.stdout.setEncoding( 'utf8' ).on( 'data', ( chunk: string ) => ( stdout += chunk ) );
