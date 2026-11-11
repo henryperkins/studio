@@ -8,6 +8,7 @@ import {
 	saveClaudeConnection,
 } from '../connection';
 import { inspectClaudeExecutable } from '../discovery';
+import { peBinary } from './fixtures/native-binaries';
 import type { ExecFileOptions } from 'child_process';
 
 const { invoke } = vi.hoisted( () => ( {
@@ -25,12 +26,7 @@ vi.mock( 'child_process', async ( importOriginal ) => {
 } );
 
 function peHeader( machine: number ): Buffer {
-	const buffer = Buffer.alloc( 96 );
-	buffer.write( 'MZ' );
-	buffer.writeUInt32LE( 64, 60 );
-	buffer.writeUInt32LE( 0x4550, 64 );
-	buffer.writeUInt16LE( machine, 68 );
-	return buffer;
+	return peBinary( { machine } );
 }
 
 describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
@@ -99,6 +95,13 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 				ok: true,
 				cwd: workspace,
 				executablePath: executable,
+				executable: {
+					target: 'windows-x64',
+					format: 'pe',
+					provenance: { verification: 'authenticode', signer: 'Anthropic, PBC' },
+					qualification: { state: 'qualified' },
+				},
+				executableIdentity: { path: executable },
 			} );
 			const [ , , options ] = invoke.mock.calls.find( ( [ , args ] ) => args[ 0 ] === 'auth' )!;
 			expect( options ).toMatchObject( { cwd: workspace, timeout: 10000 } );
@@ -115,7 +118,7 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 				inspectClaudeExecutable( path.join( root, 'claude.bat' ) )
 			).resolves.toMatchObject( { ok: false } );
 			await writeFile( executable, peHeader( 0xaa64 ) );
-			await expect( inspectClaudeExecutable( executable ) ).resolves.toEqual( {
+			await expect( inspectClaudeExecutable( executable ) ).resolves.toMatchObject( {
 				ok: false,
 				reason: 'architecture-unqualified',
 			} );

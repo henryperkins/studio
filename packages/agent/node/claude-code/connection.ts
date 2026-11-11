@@ -245,6 +245,8 @@ export async function prepareClaudeInvocation(
 			env: child.env,
 			identity,
 			version: executable.version,
+			executable,
+			executableIdentity: executable.identity,
 			findings: configuration.findings,
 		};
 	} catch {
@@ -257,13 +259,7 @@ export async function inspectClaudeConnection( executablePath: string, configDir
 	if ( ! result.ok ) return { ...result, qualified: false as const };
 	return {
 		qualified: false as const,
-		executable: {
-			ok: true as const,
-			executablePath: result.executablePath,
-			version: result.version,
-			platform: process.platform,
-			architecture: process.arch,
-		},
+		executable: result.executable,
 		config: { mode: result.configMode, directory: result.configDirectory },
 		auth: { qualified: true, method: 'claude.ai' },
 		findings: result.findings,

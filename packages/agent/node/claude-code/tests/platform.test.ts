@@ -1,4 +1,5 @@
-import { readFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'fs/promises';
+import os from 'os';
 import path from 'path';
 import { describe, expect, it } from 'vitest';
 import { inspectClaudeExecutable } from '../discovery';
@@ -6,9 +7,36 @@ import {
 	CLAUDE_AGENT_SDK_VERSION,
 	CLAUDE_QUALIFICATION_MATRIX,
 	claudePlatformTarget,
+	defaultClaudePlatformSeams,
+	isClaudeExecutableUnchanged,
 	isClaudeRuntimeSurfaceEnabled,
 	qualifyClaudeRuntime,
+	verifyClaudeExecutableIdentity,
 } from '../platform';
+import { linuxAdapter, readElfHeader } from '../platforms/linux';
+import { readMachOHeader } from '../platforms/macos';
+import { readPeHeader } from '../platforms/windows';
+import {
+	CPU_TYPE_ARM64,
+	CPU_TYPE_POWERPC64,
+	CPU_TYPE_X86_64,
+	EM_AARCH64,
+	EM_RISCV,
+	EM_X86_64,
+	GLIBC_ARM64,
+	GLIBC_X64,
+	MUSL_X64,
+	elfBinary,
+	exitWith,
+	machOBinary,
+	peBinary,
+	recordingRunner,
+	sha256,
+	simulatedHost,
+	spawnFailure,
+	universalBinary,
+} from './fixtures/native-binaries';
+import type { ClaudeQualificationRecord } from '../platform';
 
 const TARGETS = [
 	'windows-x64',
@@ -185,3 +213,601 @@ describe( 'Claude platform gates', () => {
 		).resolves.toMatchObject( { ok: false, reason: 'platform-unsupported' } );
 	} );
 } );
+
+const reader = ( bytes: Buffer ) => async ( position: number, length: number ) =>
+	Buffer.from( bytes.subarray( position, position + length ) );
+
+describe( 'Claude executable headers', () => {
+	it( 'reads a PE32+ executable image and its architecture, and nothing else', async () => {
+		expect( await readPeHeader( reader( peBinary( { machine: 0x8664 } ) ) ) ).toEqual( {
+			format: 'pe',
+			architectures: [ 'x64' ],
+		} );
+		expect( await readPeHeader( reader( peBinary( { machine: 0xaa64 } ) ) ) ).toEqual( {
+			format: 'pe',
+			architectures: [ 'arm64' ],
+		} );
+		expect( await readPeHeader( reader( peBinary( { machine: 0x14c } ) ) ) ).toEqual( {
+			format: 'pe',
+			architectures: [],
+		} );
+		for ( const bytes of [
+			peBinary( { optionalMagic: 0x10b } ),
+			peBinary( { characteristics: 0x2022 } ),
+			peBinary( { characteristics: 0x0020 } ),
+			peBinary( { signature: 0x4551 } ),
+			peBinary().subarray( 0, 70 ),
+			Buffer.from( '@echo off\r\nclaude.exe %*\r\n' ),
+			elfBinary( EM_X86_64, { interpreter: GLIBC_X64 } ),
+			machOBinary( CPU_TYPE_X86_64 ),
+		] )
+			expect( await readPeHeader( reader( bytes ) ) ).toBeUndefined();
+	} );
+
+	it( 'reads thin and universal 64-bit Mach-O architectures, and refuses other layouts', async () => {
+		expect( await readMachOHeader( reader( machOBinary( CPU_TYPE_X86_64 ) ) ) ).toEqual( {
+			format: 'mach-o',
+			architectures: [ 'x64' ],
+		} );
+		expect( await readMachOHeader( reader( machOBinary( CPU_TYPE_ARM64 ) ) ) ).toEqual( {
+			format: 'mach-o',
+			architectures: [ 'arm64' ],
+		} );
+		expect(
+			await readMachOHeader( reader( universalBinary( [ CPU_TYPE_X86_64, CPU_TYPE_ARM64 ] ) ) )
+		).toEqual( { format: 'mach-o-universal', architectures: [ 'x64', 'arm64' ] } );
+		expect(
+			await readMachOHeader(
+				reader( universalBinary( [ CPU_TYPE_ARM64, CPU_TYPE_X86_64 ], { wide: true } ) )
+			)
+		).toEqual( { format: 'mach-o-universal', architectures: [ 'arm64', 'x64' ] } );
+		expect( await readMachOHeader( reader( machOBinary( CPU_TYPE_POWERPC64 ) ) ) ).toEqual( {
+			format: 'mach-o',
+			architectures: [],
+		} );
+		for ( const bytes of [
+			machOBinary( CPU_TYPE_X86_64, { magic: 0xfeedface } ),
+			machOBinary( CPU_TYPE_X86_64, { bigEndian: true } ),
+			universalBinary( [ CPU_TYPE_X86_64 ], { count: 52 } ),
+			universalBinary( [ CPU_TYPE_X86_64, CPU_TYPE_ARM64 ], { count: 3 } ),
+			universalBinary( [] ),
+			machOBinary( CPU_TYPE_X86_64 ).subarray( 0, 6 ),
+			Buffer.from( '#!/bin/sh\nexec claude "$@"\n' ),
+			peBinary(),
+			elfBinary( EM_AARCH64, { interpreter: GLIBC_ARM64 } ),
+		] )
+			expect( await readMachOHeader( reader( bytes ) ) ).toBeUndefined();
+	} );
+
+	it( 'reads a 64-bit little-endian ELF executable, its architecture and the C library its loader names', async () => {
+		expect(
+			await readElfHeader( reader( elfBinary( EM_X86_64, { interpreter: GLIBC_X64 } ) ) )
+		).toEqual( { format: 'elf', architectures: [ 'x64' ], libc: 'glibc' } );
+		expect(
+			await readElfHeader( reader( elfBinary( EM_AARCH64, { interpreter: GLIBC_ARM64 } ) ) )
+		).toEqual( { format: 'elf', architectures: [ 'arm64' ], libc: 'glibc' } );
+		expect(
+			await readElfHeader( reader( elfBinary( EM_X86_64, { interpreter: MUSL_X64 } ) ) )
+		).toEqual( { format: 'elf', architectures: [ 'x64' ], libc: 'musl' } );
+		expect( await readElfHeader( reader( elfBinary( EM_X86_64, { type: 2 } ) ) ) ).toEqual( {
+			format: 'elf',
+			architectures: [ 'x64' ],
+			libc: 'static',
+		} );
+		expect( await readElfHeader( reader( elfBinary( EM_RISCV ) ) ) ).toEqual( {
+			format: 'elf',
+			architectures: [],
+			libc: 'static',
+		} );
+		for ( const bytes of [
+			elfBinary( EM_X86_64, { elfClass: 1 } ),
+			elfBinary( EM_X86_64, { data: 2 } ),
+			elfBinary( EM_X86_64, { type: 1 } ),
+			elfBinary( EM_X86_64, { interpreter: GLIBC_X64 } ).subarray( 0, 40 ),
+			Buffer.from( '#!/usr/bin/env node\n' ),
+			peBinary(),
+			machOBinary( CPU_TYPE_ARM64 ),
+		] )
+			expect( await readElfHeader( reader( bytes ) ) ).toBeUndefined();
+	} );
+} );
+
+const authenticodeOk = '';
+const versionOutput = ( version: string ) => `${ version } (Claude Code)\n`;
+const decodedScript = ( args: string[] ) =>
+	Buffer.from( args[ args.indexOf( '-EncodedCommand' ) + 1 ], 'base64' ).toString( 'utf16le' );
+
+describe( 'Claude executable inspection on Windows', () => {
+	const env = { SystemRoot: 'C:\\Windows', Path: 'C:\\Windows\\System32' };
+	const powershell = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+	const selected = 'C:\\Users\\Ünïcode User\\Claude Tools\\claude.exe';
+
+	function windows(
+		arch: 'x64' | 'arm64',
+		answers: { signature?: string | Error; version?: string | Error } = {}
+	) {
+		const runner = recordingRunner( ( command ) => {
+			if ( command.file === powershell ) return answers.signature ?? authenticodeOk;
+			if ( command.args[ 0 ] === '--version' ) return answers.version ?? versionOutput( '2.1.319' );
+			return new Error( 'unexpected' );
+		} );
+		const { fs, seams } = simulatedHost( { platform: 'win32', arch }, path.win32, {
+			env,
+			run: runner.run,
+		} );
+		return { fs, seams, calls: runner.calls };
+	}
+
+	it( 'qualifies the vendor-signed x64 runtime at a path with spaces and Unicode, returning safe metadata', async () => {
+		const { fs, seams, calls } = windows( 'x64' );
+		const bytes = peBinary();
+		fs.write( selected, bytes );
+		const result = await inspectClaudeExecutable( selected, seams );
+		expect( result ).toEqual( {
+			ok: true,
+			executablePath: selected,
+			version: '2.1.319',
+			platform: 'win32',
+			architecture: 'x64',
+			target: 'windows-x64',
+			format: 'pe',
+			architectures: [ 'x64' ],
+			provenance: {
+				verification: 'authenticode',
+				signer: 'Anthropic, PBC',
+				vendorPlatform: 'win32-x64',
+			},
+			identity: expect.objectContaining( {
+				path: selected,
+				size: bytes.length,
+				sha256: sha256( bytes ),
+			} ),
+			qualification: {
+				state: 'qualified',
+				record: expect.objectContaining( { target: 'windows-x64', runtimeVersion: '2.1.319' } ),
+			},
+		} );
+		expect( calls.map( ( { file, args } ) => [ file, args[ 0 ] ] ) ).toEqual( [
+			[ powershell, '-NoProfile' ],
+			[ selected, '--version' ],
+		] );
+		const script = decodedScript( calls[ 0 ].args );
+		expect( script ).toContain( 'Get-AuthenticodeSignature -LiteralPath $p' );
+		expect( script ).toContain( 'Anthropic, PBC' );
+		expect( script ).toContain( Buffer.from( selected, 'utf8' ).toString( 'base64' ) );
+		expect( script ).not.toContain( 'Ünïcode' );
+		expect( JSON.stringify( result ) ).not.toMatch( /token|secret|credential/i );
+	} );
+
+	it( 'inspects and runs the file a symlink resolves to', async () => {
+		const { fs, seams, calls } = windows( 'x64' );
+		const real = 'C:\\Users\\tester\\.local\\share\\claude\\versions\\2.1.319.exe';
+		fs.write( real, peBinary() );
+		fs.link( 'C:\\Users\\tester\\.local\\bin\\claude.exe', real );
+		await expect(
+			inspectClaudeExecutable( 'C:\\Users\\tester\\.local\\bin\\claude.exe', seams )
+		).resolves.toMatchObject( {
+			ok: true,
+			executablePath: real,
+			identity: { path: real },
+		} );
+		expect( calls.at( -1 ) ).toMatchObject( { file: real, args: [ '--version' ] } );
+	} );
+
+	it( 'refuses names, scripts, other formats and other architectures before running anything', async () => {
+		const { fs, seams, calls } = windows( 'x64' );
+		fs.write( 'C:\\tools\\claude.cmd', Buffer.from( '@echo off\r\n' ) );
+		fs.write( 'C:\\tools\\script.exe', Buffer.from( '@echo off\r\n' ) );
+		fs.write( 'C:\\tools\\linux.exe', elfBinary( EM_X86_64, { interpreter: GLIBC_X64 } ) );
+		fs.write( 'C:\\tools\\arm.exe', peBinary( { machine: 0xaa64 } ) );
+		fs.write( 'C:\\tools\\x86.exe', peBinary( { machine: 0x14c } ) );
+		fs.directory( 'C:\\tools\\folder.exe' );
+		for ( const [ candidate, reason ] of [
+			[ 'claude', 'absolute-native-executable-required' ],
+			[ 'claude.exe', 'absolute-native-executable-required' ],
+			[ 'C:\\tools\\claude.cmd', 'absolute-native-executable-required' ],
+			[ 'C:\\tools\\absent.exe', 'executable-unavailable' ],
+			[ 'C:\\tools\\folder.exe', 'executable-unavailable' ],
+			[ 'C:\\tools\\script.exe', 'invalid-executable-format' ],
+			[ 'C:\\tools\\linux.exe', 'invalid-executable-format' ],
+			[ 'C:\\tools\\arm.exe', 'architecture-unqualified' ],
+			[ 'C:\\tools\\x86.exe', 'architecture-unqualified' ],
+		] )
+			await expect( inspectClaudeExecutable( candidate, seams ), candidate ).resolves.toMatchObject(
+				{ ok: false, reason }
+			);
+		expect( calls ).toEqual( [] );
+	} );
+
+	it( 'never runs a binary whose Authenticode signature is not the vendor’s or cannot be checked', async () => {
+		for ( const [ signature, reason ] of [
+			[ exitWith( 3 ), 'signature-invalid' ],
+			[ exitWith( 1 ), 'signature-unverifiable' ],
+			[ spawnFailure(), 'signature-unverifiable' ],
+			[
+				Object.assign( new Error( 'timeout' ), { killed: true, code: null } ),
+				'signature-unverifiable',
+			],
+		] as const ) {
+			const { fs, seams, calls } = windows( 'x64', { signature } );
+			fs.write( selected, peBinary() );
+			await expect( inspectClaudeExecutable( selected, seams ) ).resolves.toMatchObject( {
+				ok: false,
+				reason,
+			} );
+			expect( calls.some( ( { args } ) => args[ 0 ] === '--version' ) ).toBe( false );
+		}
+		const { fs, seams, calls } = windows( 'x64' );
+		fs.write( selected, peBinary() );
+		await expect(
+			inspectClaudeExecutable( selected, { ...seams, env: { Path: 'C:\\Windows' } } )
+		).resolves.toMatchObject( { ok: false, reason: 'signature-unverifiable' } );
+		expect( calls ).toEqual( [] );
+	} );
+
+	it( 'keeps an auto-updated or unreadable version visible and unqualified', async () => {
+		const updated = windows( 'x64', { version: versionOutput( '2.1.320' ) } );
+		updated.fs.write( selected, peBinary() );
+		await expect( inspectClaudeExecutable( selected, updated.seams ) ).resolves.toEqual( {
+			ok: false,
+			reason: 'version-unqualified',
+			executable: expect.objectContaining( {
+				executablePath: selected,
+				version: '2.1.320',
+				architectures: [ 'x64' ],
+				provenance: expect.objectContaining( { verification: 'authenticode' } ),
+			} ),
+			qualification: {
+				state: 'unqualified',
+				reason: 'version-unqualified',
+				supportedRuntimeVersions: [ '2.1.319' ],
+			},
+		} );
+		for ( const version of [ 'Claude Code', exitWith( 3 ), '' ] ) {
+			const unreadable = windows( 'x64', { version } );
+			unreadable.fs.write( selected, peBinary() );
+			await expect( inspectClaudeExecutable( selected, unreadable.seams ) ).resolves.toMatchObject(
+				{ ok: false, reason: 'version-unreadable' }
+			);
+		}
+	} );
+
+	it( 'refuses a binary that changes while it is inspected', async () => {
+		const host = simulatedHost( { platform: 'win32', arch: 'x64' }, path.win32, { env } );
+		const runner = recordingRunner( ( command ) => {
+			if ( command.args[ 0 ] !== '--version' ) return authenticodeOk;
+			host.fs.write( selected, peBinary( { body: 'replaced' } ) );
+			return versionOutput( '2.1.319' );
+		} );
+		host.fs.write( selected, peBinary() );
+		await expect(
+			inspectClaudeExecutable( selected, { ...host.seams, run: runner.run } )
+		).resolves.toMatchObject( {
+			ok: false,
+			reason: 'executable-changed',
+		} );
+	} );
+
+	it( 'reports an ARM64 host as unqualified while still showing what it found', async () => {
+		const { fs, seams } = windows( 'arm64' );
+		fs.write( selected, peBinary( { machine: 0xaa64 } ) );
+		await expect( inspectClaudeExecutable( selected, seams ) ).resolves.toMatchObject( {
+			ok: false,
+			reason: 'platform-unqualified',
+			executable: {
+				version: '2.1.319',
+				architectures: [ 'arm64' ],
+				provenance: { verification: 'authenticode', vendorPlatform: 'win32-arm64' },
+			},
+			qualification: {
+				state: 'unqualified',
+				reason: 'platform-unqualified',
+				record: { target: 'windows-arm64', reason: 'no-native-qualification-run' },
+			},
+		} );
+	} );
+} );
+
+describe( 'Claude executable inspection on macOS', () => {
+	const codesign = '/usr/bin/codesign';
+	const launcher = '/Users/tester/.local/bin/claude';
+	const installed = '/Users/tester/.local/share/claude/versions/2.1.319';
+
+	function macos(
+		arch: 'x64' | 'arm64',
+		answers: { signature?: string | Error; version?: string | Error } = {}
+	) {
+		const runner = recordingRunner( ( command ) => {
+			if ( command.file === codesign ) return answers.signature ?? '';
+			if ( command.args[ 0 ] === '--version' ) return answers.version ?? versionOutput( '2.1.319' );
+			return new Error( 'unexpected' );
+		} );
+		const { fs, seams } = simulatedHost( { platform: 'darwin', arch }, path.posix, {
+			env: { HOME: '/Users/tester', PATH: '/usr/bin:/bin' },
+			run: runner.run,
+		} );
+		return { fs, seams, calls: runner.calls };
+	}
+
+	it.each( [
+		[ 'x64', machOBinary( CPU_TYPE_X86_64 ) ],
+		[ 'arm64', machOBinary( CPU_TYPE_ARM64 ) ],
+		[ 'x64', universalBinary( [ CPU_TYPE_X86_64, CPU_TYPE_ARM64 ] ) ],
+		[ 'arm64', universalBinary( [ CPU_TYPE_X86_64, CPU_TYPE_ARM64 ], { wide: true } ) ],
+	] as const )(
+		'verifies the Apple code signature of the installed %s binary and reports the platform unqualified',
+		async ( arch, bytes ) => {
+			const { fs, seams, calls } = macos( arch );
+			fs.write( installed, bytes );
+			fs.link( launcher, installed );
+			await expect( inspectClaudeExecutable( launcher, seams ) ).resolves.toMatchObject( {
+				ok: false,
+				reason: 'platform-unqualified',
+				executable: {
+					selectedPath: launcher,
+					executablePath: installed,
+					version: '2.1.319',
+					provenance: {
+						verification: 'apple-code-signature',
+						signer: 'Anthropic PBC',
+						vendorPlatform: arch === 'x64' ? 'darwin-x64' : 'darwin-arm64',
+					},
+					identity: { path: installed, sha256: sha256( bytes ) },
+				},
+				qualification: { reason: 'platform-unqualified' },
+			} );
+			expect( calls[ 0 ] ).toEqual( {
+				file: codesign,
+				args: [
+					'--verify',
+					'--strict',
+					'-R',
+					'=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.O] = "Anthropic PBC"',
+					installed,
+				],
+				env: expect.any( Object ),
+			} );
+			expect( calls[ 1 ] ).toMatchObject( { file: installed, args: [ '--version' ] } );
+		}
+	);
+
+	it( 'never runs a binary that is unsigned, signed by someone else, or whose signature cannot be checked', async () => {
+		for ( const [ signature, check ] of [
+			[ exitWith( 1 ), 'signature-invalid' ],
+			[ exitWith( 3 ), 'signature-invalid' ],
+			[ spawnFailure(), 'signature-unverifiable' ],
+		] as const ) {
+			const { fs, seams, calls } = macos( 'arm64', { signature } );
+			fs.write( installed, machOBinary( CPU_TYPE_ARM64 ) );
+			await expect( inspectClaudeExecutable( installed, seams ) ).resolves.toMatchObject( {
+				ok: false,
+				reason: 'platform-unqualified',
+				check,
+			} );
+			expect( calls.some( ( { args } ) => args[ 0 ] === '--version' ) ).toBe( false );
+		}
+	} );
+
+	it( 'refuses other formats, missing slices and non-executable files before running anything', async () => {
+		const { fs, seams, calls } = macos( 'arm64' );
+		fs.write( '/opt/claude/x64-only', machOBinary( CPU_TYPE_X86_64 ) );
+		fs.write( '/opt/claude/universal-x64', universalBinary( [ CPU_TYPE_X86_64 ] ) );
+		fs.write( '/opt/claude/linux', elfBinary( EM_AARCH64, { interpreter: GLIBC_ARM64 } ) );
+		fs.write( '/opt/claude/script', Buffer.from( '#!/bin/sh\n' ) );
+		fs.write( '/opt/claude/not-executable', machOBinary( CPU_TYPE_ARM64 ), { mode: 0o644 } );
+		for ( const [ candidate, check ] of [
+			[ 'claude', 'absolute-native-executable-required' ],
+			[ '/opt/claude/absent', 'executable-unavailable' ],
+			[ '/opt/claude/not-executable', 'executable-unavailable' ],
+			[ '/opt/claude/script', 'invalid-executable-format' ],
+			[ '/opt/claude/linux', 'invalid-executable-format' ],
+			[ '/opt/claude/x64-only', 'architecture-unqualified' ],
+			[ '/opt/claude/universal-x64', 'architecture-unqualified' ],
+		] )
+			await expect( inspectClaudeExecutable( candidate, seams ), candidate ).resolves.toMatchObject(
+				{ ok: false, reason: 'platform-unqualified', check }
+			);
+		expect( calls ).toEqual( [] );
+	} );
+} );
+
+describe( 'Claude executable inspection on Linux', () => {
+	const installed = '/home/tester/.local/share/claude/versions/2.1.319';
+
+	it( 'never runs a binary without a signed-manifest checksum recorded for its platform', async () => {
+		for ( const arch of [ 'x64', 'arm64' ] as const ) {
+			const runner = recordingRunner( () => new Error( 'unexpected' ) );
+			const { fs, seams } = simulatedHost( { platform: 'linux', arch }, path.posix, {
+				run: runner.run,
+			} );
+			fs.write(
+				installed,
+				elfBinary( arch === 'x64' ? EM_X86_64 : EM_AARCH64, {
+					interpreter: arch === 'x64' ? GLIBC_X64 : GLIBC_ARM64,
+				} )
+			);
+			await expect( inspectClaudeExecutable( installed, seams ) ).resolves.toMatchObject( {
+				ok: false,
+				reason: 'platform-unqualified',
+				check: 'signature-unverifiable',
+				executable: { format: 'elf', architectures: [ arch ], libc: 'glibc' },
+			} );
+			expect( runner.calls ).toEqual( [] );
+		}
+	} );
+
+	it( 'refuses musl binaries and hosts, other formats and other architectures', async () => {
+		const { fs, seams } = simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix );
+		fs.write( '/opt/musl', elfBinary( EM_X86_64, { interpreter: MUSL_X64 } ) );
+		fs.write( '/opt/static', elfBinary( EM_X86_64 ) );
+		fs.write( '/opt/glibc', elfBinary( EM_X86_64, { interpreter: GLIBC_X64 } ) );
+		fs.write( '/opt/arm', elfBinary( EM_AARCH64, { interpreter: GLIBC_ARM64 } ) );
+		fs.write( '/opt/mac', machOBinary( CPU_TYPE_X86_64 ) );
+		for ( const [ candidate, check, host ] of [
+			[ '/opt/musl', 'libc-unsupported', 'glibc' ],
+			[ '/opt/static', 'libc-unsupported', 'glibc' ],
+			[ '/opt/glibc', 'libc-unsupported', 'musl' ],
+			[ '/opt/glibc', 'libc-unsupported', 'unknown' ],
+			[ '/opt/arm', 'architecture-unqualified', 'glibc' ],
+			[ '/opt/mac', 'invalid-executable-format', 'glibc' ],
+		] as const )
+			await expect(
+				inspectClaudeExecutable( candidate, { ...seams, hostLibc: () => host } ),
+				`${ candidate } on ${ host }`
+			).resolves.toMatchObject( { ok: false, reason: 'platform-unqualified', check } );
+	} );
+
+	it( 'accepts only the checksum a qualification copied from the signed manifest', async () => {
+		const bytes = elfBinary( EM_X86_64, { interpreter: GLIBC_X64 } );
+		const record = CLAUDE_QUALIFICATION_MATRIX.find( ( item ) => item.target === 'linux-x64' )!;
+		const pinned: ClaudeQualificationRecord = { ...record, manifestSha256: sha256( bytes ) };
+		const header = {
+			format: 'elf' as const,
+			architectures: [ 'x64' as const ],
+			libc: 'glibc' as const,
+		};
+		const { seams } = simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix );
+		const verify = ( records: ClaudeQualificationRecord[], digest: string ) =>
+			linuxAdapter.verifyBinary(
+				{ executablePath: installed, sha256: digest, header, records, env: {} },
+				defaultClaudePlatformSeams( seams )
+			);
+		await expect( verify( [ pinned ], sha256( bytes ) ) ).resolves.toEqual( {
+			ok: true,
+			provenance: {
+				verification: 'signed-manifest-checksum',
+				vendorPlatform: 'linux-x64',
+				libc: 'glibc',
+				manifestRuntimeVersion: '2.1.319',
+			},
+		} );
+		await expect( verify( [ pinned ], sha256( Buffer.from( 'changed' ) ) ) ).resolves.toEqual( {
+			ok: false,
+			reason: 'signature-invalid',
+		} );
+		await expect( verify( [ record ], sha256( bytes ) ) ).resolves.toEqual( {
+			ok: false,
+			reason: 'signature-unverifiable',
+		} );
+	} );
+} );
+
+describe( 'Claude executable identity', () => {
+	const selected = '/home/tester/.local/bin/claude';
+	const first = '/home/tester/.local/share/claude/versions/2.1.319';
+	const second = '/home/tester/.local/share/claude/versions/2.1.320';
+
+	async function identityFor( bytes: Buffer ) {
+		const { fs } = simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix );
+		fs.write( first, bytes );
+		fs.write( second, Buffer.from( 'next version' ) );
+		fs.link( selected, first );
+		const stat = await fs.files.stat( first );
+		return {
+			fs,
+			identity: {
+				path: first,
+				size: stat.size,
+				device: stat.device,
+				inode: stat.inode,
+				modified: stat.modified,
+				changed: stat.changed,
+				sha256: sha256( bytes ),
+			},
+		};
+	}
+
+	it( 'stays verified only while the selected path resolves to the same, unchanged file', async () => {
+		const bytes = elfBinary( EM_X86_64, { interpreter: GLIBC_X64 } );
+		const { fs, identity } = await identityFor( bytes );
+		const verify = () =>
+			verifyClaudeExecutableIdentity( identity, {
+				selectedPath: selected,
+				files: fs.files,
+			} );
+		await expect( verify() ).resolves.toBe( true );
+		expect( isClaudeExecutableUnchanged( identity, fs.files ) ).toBe( true );
+
+		fs.link( selected, second );
+		await expect( verify() ).resolves.toBe( false );
+		fs.link( selected, first );
+		await expect( verify() ).resolves.toBe( true );
+
+		fs.write( first, Buffer.from( bytes ), { inPlace: true } );
+		await expect( verify() ).resolves.toBe( false );
+		expect( isClaudeExecutableUnchanged( identity, fs.files ) ).toBe( false );
+	} );
+
+	it( 'detects a same-size replacement by content even when metadata is restored', async () => {
+		const bytes = elfBinary( EM_X86_64, { interpreter: GLIBC_X64, body: 'aaaa' } );
+		const { fs, identity } = await identityFor( bytes );
+		const tampered = elfBinary( EM_X86_64, { interpreter: GLIBC_X64, body: 'bbbb' } );
+		const files = {
+			...fs.files,
+			stat: async () => ( {
+				kind: 'file' as const,
+				size: identity.size,
+				device: identity.device,
+				inode: identity.inode,
+				modified: identity.modified,
+				changed: identity.changed,
+				executable: true,
+			} ),
+			sha256: async () => sha256( tampered ),
+		};
+		await expect( verifyClaudeExecutableIdentity( identity, { files } ) ).resolves.toBe( false );
+		await expect(
+			verifyClaudeExecutableIdentity( identity, { files, content: false } )
+		).resolves.toBe( true );
+	} );
+
+	it( 'treats a missing file as changed rather than throwing', async () => {
+		const { fs, identity } = await identityFor( Buffer.from( 'x' ) );
+		fs.remove( first );
+		await expect(
+			verifyClaudeExecutableIdentity( identity, { selectedPath: selected, files: fs.files } )
+		).resolves.toBe( false );
+		expect( isClaudeExecutableUnchanged( identity, fs.files ) ).toBe( false );
+	} );
+} );
+
+describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
+	'Claude executable inspection on this Windows x64 machine’s filesystem',
+	() => {
+		it( 'follows a junction to a folder with spaces, Unicode and shell characters, and notices the file changing', async () => {
+			const root = await realpath(
+				await mkdtemp( path.join( os.tmpdir(), 'Studio Claude Platform Évidence ' ) )
+			);
+			try {
+				const folder = path.join( root, 'Claude Édition $HOME `x` [1]' );
+				const junction = path.join( root, 'linked folder' );
+				await mkdir( folder );
+				const executable = path.join( folder, 'claude.exe' );
+				await writeFile( executable, peBinary() );
+				await symlink( folder, junction, 'junction' );
+				const runner = recordingRunner( ( command ) =>
+					command.args[ 0 ] === '--version' ? versionOutput( '2.1.319' ) : authenticodeOk
+				);
+				const selectedPath = path.join( junction, 'claude.exe' );
+				const result = await inspectClaudeExecutable( selectedPath, { run: runner.run } );
+				expect( result ).toMatchObject( { ok: true, executablePath: executable } );
+				expect( runner.calls.at( -1 ) ).toMatchObject( {
+					file: executable,
+					args: [ '--version' ],
+				} );
+				if ( ! result.ok ) return;
+				await expect(
+					verifyClaudeExecutableIdentity( result.identity, { selectedPath } )
+				).resolves.toBe( true );
+				expect( isClaudeExecutableUnchanged( result.identity ) ).toBe( true );
+				await writeFile( executable, peBinary( { body: 'auto-updated' } ) );
+				await expect(
+					verifyClaudeExecutableIdentity( result.identity, { selectedPath } )
+				).resolves.toBe( false );
+				expect( isClaudeExecutableUnchanged( result.identity ) ).toBe( false );
+			} finally {
+				await rm( root, { recursive: true, force: true, maxRetries: 4 } );
+			}
+		} );
+	}
+);
