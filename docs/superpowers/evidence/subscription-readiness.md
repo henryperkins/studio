@@ -134,7 +134,8 @@ Read at `4ae1e38da` in the primary checkout. The registry is identical at `ce4ee
 - `resolveStudioTools(host, options)` removes or substitutes some of them (D.2).
 - The Pi runtime (`buildAgentTools` in `packages/agent/node/runtime/index.ts`) adds three tools conditionally and seven file/shell tools: **up to 39** tools in total (29 + 3 + 7). The count of 29 in the plans equals the Studio-tool list only; it excludes the ten runtime-bound tools.
 - The MCP server (`apps/cli/ai/runtimes/mcp/index.ts`) also calls `agent.tools(...)` and adds `present_design_options` and `studio_instructions`, which are outside this count and are not listed in D.3.
-- The registry does not branch on the session environment. The only environment notion found is the session's `activeEnvironment: 'local' | 'live'` (`packages/agent/protocol/sessions/types.ts`), which `resolveStudioTools` and `buildAgentTools` do not read. "Global" is a conversation placement (a chat not tied to a site), tested by `node/sessions/tests/placement.test.ts`. Whether individual handlers behave differently for a live (remote) site was not examined by M1.
+- The registry does not branch on the session target. The session records `activeEnvironment: 'local' | 'live'` and `lastSelectedWpcomSiteId` (`packages/agent/protocol/sessions/types.ts`), and a `studio.site_selected` entry carries `siteId`, `remote`, `url`, `wpcomSiteId` (`protocol/sessions/entry-types.ts`). `resolveStudioTools` and `buildAgentTools` do not read them, and `ToolContext` holds only the host and a progress callback (`tools/define-tool.ts`). The active site reaches the Pi runtime only as `config.activeSite` (`SiteInfo`, `node/types.ts`), which the runtime uses in two places: the system prompt's "Active site" section (`buildActiveSiteSection`, which appends the remote-site runbook when `site.remote`), and result notes, enabled only for a non-remote site (`runtime/index.ts`, near line 675). No tool handler receives the target. Each tool takes its target as an argument. How each tool behaves in a global, local-site and live-site conversation is in D.4.
+- "Global" is a conversation placement (a chat not tied to a site), tested by `node/sessions/tests/placement.test.ts`; M1 did not run it.
 - The host contexts that do change the set: Studio UI attached (`host.ui`), the caller can ask the user (`onAskUser` / `canAskUser`), image generation configured, WordPress.com requests allowed, vision-capable model.
 
 ### D.2 Gates in `resolveStudioTools` and `buildAgentTools`
@@ -200,6 +201,36 @@ Annotation class: RO read-only, RR remote read, LC local change, LO local overwr
 Counted from code: 29 Studio definitions, 3 runtime-bound conditional, 7 Pi file tools, 39 total possible. For the Claude runtime today: 1 native tool (`Read`) and 1 bridged tool (`wp_cli`, restricted); 37 of 39 are not yet covered. The plan requires every entry mapped to a tested native equivalent or a shared bridge operation with no unexplained exclusions; none of these 37 has that yet, and each has an owning task above.
 
 Acceptance condition for each Claude row, per C2: a contract test and an outcome test that exercise the real tool, with required work settled before successful completion. These do not exist yet (`none yet`).
+
+### D.4 Behavior by conversation target (global, local site, live site)
+
+Established by reading each tool's definition and handler in `packages/agent/node/tools/` at `4ae1e38da`, `apps/cli/ai/host.ts` and `apps/cli/lib/cli-config/sites.ts` (what `host.sites.resolve` does), `node/site-selection.ts`, `node/system-prompt.ts` and `node/runtime/index.ts`. A "live site" is a WordPress.com site selected as the target (`SiteInfo.remote === true`). Codes:
+
+- **Arg-local**: the handler resolves a local Studio site from a `nameOrPath` argument via `host.sites.resolve`, which looks in the CLI site registry by name, by folder name, then by path, and otherwise throws "The specified directory is not added to Studio" (`apps/cli/ai/host.ts`, `cli-config/sites.ts`). Works in any conversation that names a registered local site. It does not use the selected target. With a live site selected, the model must name a local site; a remote name or URL fails to resolve. Result for a live-site target: not applicable (the tool is not a live-site channel); what the model does instead is steered by the prompt only.
+- **Arg-global**: needs no selected site. The target is in the arguments or none is needed.
+- **Live channel**: the tool addresses a WordPress.com site by an argument (`siteId`, `remoteSite`).
+
+| Tool | Global (no site selected) | Local site selected | Live site selected | Read in |
+| --- | --- | --- | --- | --- |
+| `site_create` | works; creates a new site under `sitesRoot`; the host's `selectSite` callback may then make it the conversation site | works (creates another site; target not read) | works the same; target not read | `create-site.ts` |
+| `site_list` | works; it lists WordPress.com sites using the stored auth token, or reports not signed in | same | same | `list-sites.ts` |
+| `site_info`, `site_start`, `site_stop`, `site_delete`, `preview_create`, `preview_list`, `preview_update`, `wp_cli`, `scaffold_theme`, `validate_blocks`, `install_taxonomy_scripts`, `need_for_speed`, `rank_me_up`, `site_import`, `site_export` | Arg-local: works when the model names a registered local site | Arg-local: works; no check that the named site equals the selected site | Arg-local: a remote target cannot be named; no local effect unless the model names a different local site; nothing in code stops it | each tool's file, `nameOrPath` and `host.sites.resolve` |
+| `site_connected_remote_sites`, `site_push`, `site_pull` | Arg-local for the local site plus a WordPress.com token and, for push/pull, a `remoteSite` argument (Live channel for the remote side) | same | same; the selected live site is not passed to the tool | `list-connected-remote-sites.ts`, `push-site.ts`, `pull-site.ts` |
+| `preview_delete` | Arg-global: takes a preview hostname | same | same | `delete-preview.ts` |
+| `wpcom_request` | Live channel: works without a selected site because `siteId` is an argument; needs a stored token | same | the intended live-site channel (the prompt comment in `system-prompt.ts` says a WordPress.com site "changes only through wpcom_request"); `siteId` is still the model's argument, not taken from the selection | `wpcom-request.ts`, `system-prompt.ts` |
+| `take_screenshot`, `inspect_design`, `open_annotation_browser` | Arg-global: take a URL; `themeScreenshot` is confined under `sitesRoot` | same | same; a live URL is only reached if the model passes it. Not tested here | `take-screenshot.ts`, `inspect-design.ts`, `open-annotation-browser.ts` |
+| `generate_images` | Arg-global for the service; the handler finds the local site that contains the given file paths and throws if none (`findSiteContaining`) | same | same; images land in a local site, not a live one | `generate-images.ts` |
+| `pick_design`, `AskUserQuestion`, `present_design_options`, `Skill`, `send_feedback` | Arg-global; no site involved | same | same | `pick-design.ts`, `ask-user-question.ts`, `present-design-options.ts`, `skill.ts`, `send-feedback.ts` |
+| `refresh_browser` | needs `host.ui`; reloads the preview the app shows; no site argument | same | same; what the app's preview shows for a live site is not decided in this package | `refresh-browser.ts` |
+| `Read`, `Write`, `Edit`, `Bash`, `Grep`, `Glob`, `Ls` | rooted at `host.sitesRoot` (all local sites), not at a selected site | same | same; a live site has no local files here | `runtime/index.ts` (`buildAgentTools`, `sitesRoot`) |
+
+What this means, and what is not established:
+
+1. The Pi tool set is the same in all three targets. Differences come from the prompt (the "Active site" section and, for a live site, the remote runbook) and from the model's arguments. The code does not enforce that a tool's target equals the selected target. For Claude that enforcement is the C1 contract.
+2. Not established from reading: runtime behavior of each Arg-local tool when the selected target is a live site and the model passes a local site anyway; how the Desktop and `studio ui` apps resolve a live-site selection into `activeSite`. These need runtime outcomes, not code reading.
+3. Claude at `ce4eea5dc`: the bridge is bound to a single local site per run (`siteId`, `workingDirectory` in `ClaudeToolPolicy`, checked against the resolved site's real path in `tool-bridge.ts`), and `createClaudeSession` takes one local site (`studio-surface.ts`). Global conversations and live-site targets are not supported there yet. Owner for the target contract: C1.
+
+Open gates for the environment dimension are listed in section H (E1 to E3).
 
 ## E. Vendor decisions
 
@@ -276,3 +307,6 @@ Not done by M1, and not claimed: the user-visible service/account indication. Ow
 | Session-only ChatGPT failure cause | open (code only `assertion-failed` retained) | G1 |
 | All capability rows with `none yet` evidence | open | Owners in sections A, B, D |
 | PR test/build CI workflow absent | open | M2 |
+| E1: Claude target contract for global, local-site and live-site conversations (today one local site per run; no global or live target) | open | C1. Acceptance: tests for global chat and site creation, explicit local/live target change, changed target after send; a tool call whose target differs from the selected target is refused before execution. |
+| E2: Per-tool outcome evidence for each target on each provider, covering the Arg-local tools with a live site selected, `wpcom_request` as the live channel with a disposable staging site, and global-chat tools | open: not established from code (D.4 item 2) | ChatGPT: G4. Claude: C5. Acceptance: a recorded run per provider, bound to the candidate SHA, using designated disposable local and staging targets only, with the observed target for each tool call. |
+| E3: How Desktop and `studio ui` resolve a live-site selection into `activeSite` and the "Active site" prompt text | open: not read by M1 | G4 for ChatGPT surfaces, C3 for Claude surfaces. Acceptance: a Desktop and a `studio ui` run with a live site selected shows the expected prompt section and remote-site tool use. |
