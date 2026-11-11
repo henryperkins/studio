@@ -10,8 +10,8 @@ import {
 	type ChatGptModelListResult,
 } from '@studio/agent/node/chatgpt/models';
 import { CHATGPT_UNAVAILABLE_RETRY_DELAYS_MS } from '@studio/agent/node/chatgpt/route';
-import { OPENAI_MODEL_CAPABILITIES, isOpenAiModelId } from '@studio/agent/protocol/openai-models';
 import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
+import type { OpenAiModelCapabilities, OpenAiModelId } from '@studio/agent/protocol/openai-models';
 
 /*
  * The ChatGPT route's model list, read through a mocked `fetch`: nothing here
@@ -147,12 +147,12 @@ describe( 'fetchChatGptModels', () => {
 		expect( headers.get( 'authorization' ) ).toBe( `Bearer ${ TOKEN_A }` );
 	} );
 
-	it( 'lists the account’s displayed models in the server’s order, provider-qualified', async () => {
+	it( 'lists the account’s displayed models Studio qualifies, provider-qualified, by the route’s name', async () => {
 		captureFetch( () =>
 			json( {
 				models: [
-					listed( 'gpt-6-luna', 'GPT-6 Luna', { context_window: 1 } ),
 					listed( 'gpt-6.1-sol', 'GPT-6.1 Sol' ),
+					listed( 'gpt-6-luna', 'GPT-6 Luna', { context_window: 1 } ),
 					listed( 'gpt-6-astra', 'GPT-6 Astra' ),
 				],
 			} )
@@ -169,45 +169,31 @@ describe( 'fetchChatGptModels', () => {
 					label: 'GPT-6 Luna',
 					capabilities: CHATGPT_MODEL_CAPABILITIES[ 'gpt-6-luna' ],
 				},
-				{
-					providerId: 'chatgpt-oauth',
-					modelId: 'gpt-6.1-sol',
-					label: 'GPT-6.1 Sol',
-					capabilities: CHATGPT_MODEL_CAPABILITIES[ 'gpt-6.1-sol' ],
-				},
-				{
-					providerId: 'chatgpt-oauth',
-					modelId: 'gpt-6-astra',
-					label: 'GPT-6 Astra',
-					capabilities: CHATGPT_MODEL_CAPABILITIES[ 'gpt-6-astra' ],
-				},
 			],
 		} );
 	} );
 
-	it( 'leaves out models the server doesn’t mean to display', async () => {
-		captureFetch( () =>
-			json( {
-				models: [
-					listed( 'gpt-6-luna', 'GPT-6 Luna', { visibility: 'hide' } ),
-					listed( 'gpt-6.1-terra', 'GPT-6.1 Terra', { visibility: undefined } ),
-					listed( 'gpt-6.1-sol', 'GPT-6.1 Sol' ),
-				],
-			} )
-		);
+	it.each( [ 'hide', undefined ] )(
+		'leaves out a model whose visibility is %s',
+		async ( visibility ) => {
+			captureFetch( () =>
+				json( { models: [ listed( 'gpt-6-luna', 'GPT-6 Luna', { visibility } ) ] } )
+			);
 
-		const result = await fetchChatGptModels( ACCOUNT_A );
-
-		expect( result.ok && result.models.map( ( model ) => model.modelId ) ).toEqual( [
-			'gpt-6.1-sol',
-		] );
-	} );
+			await expect( fetchChatGptModels( ACCOUNT_A ) ).resolves.toEqual( {
+				ok: true,
+				models: [],
+			} );
+		}
+	);
 
 	it( 'hides a model whose capabilities Studio doesn’t know, never guessing them', async () => {
 		captureFetch( () =>
 			json( {
 				models: [
 					listed( 'gpt-7-nova', 'GPT-7 Nova', { reasoning_efforts: [ 'low' ] } ),
+					// In the OpenAI API catalog, but not qualified on this route.
+					listed( 'gpt-6.1-sol', 'GPT-6.1 Sol' ),
 					listed( 'gpt-6-luna', 'GPT-6 Luna' ),
 					{ display_name: 'No slug', visibility: 'list' },
 					'not a model',
@@ -370,8 +356,8 @@ describe( 'fetchChatGptModels', () => {
 		it( 'reads each connection’s list with that connection’s own token', async () => {
 			const http = captureFetch( ( _url, init ) =>
 				new Headers( init?.headers ).get( 'authorization' ) === `Bearer ${ TOKEN_A }`
-					? json( { models: [ listed( 'gpt-6.1-sol', 'GPT-6.1 Sol' ) ] } )
-					: json( { models: [ listed( 'gpt-6-luna', 'GPT-6 Luna' ) ] } )
+					? json( { models: [ listed( 'gpt-6-luna', 'Luna for A' ) ] } )
+					: json( { models: [ listed( 'gpt-6-luna', 'Luna for B' ) ] } )
 			);
 
 			const a = await fetchChatGptModels( ACCOUNT_A );
@@ -379,8 +365,8 @@ describe( 'fetchChatGptModels', () => {
 
 			expect( http.request( 0 ).headers.get( 'authorization' ) ).toBe( `Bearer ${ TOKEN_A }` );
 			expect( http.request( 1 ).headers.get( 'authorization' ) ).toBe( `Bearer ${ TOKEN_B }` );
-			expect( a.ok && a.models.map( ( model ) => model.modelId ) ).toEqual( [ 'gpt-6.1-sol' ] );
-			expect( b.ok && b.models.map( ( model ) => model.modelId ) ).toEqual( [ 'gpt-6-luna' ] );
+			expect( a.ok && a.models.map( ( model ) => model.label ) ).toEqual( [ 'Luna for A' ] );
+			expect( b.ok && b.models.map( ( model ) => model.label ) ).toEqual( [ 'Luna for B' ] );
 		} );
 
 		const goodList: ChatGptModelListResult = {
@@ -388,9 +374,9 @@ describe( 'fetchChatGptModels', () => {
 			models: [
 				{
 					providerId: 'chatgpt-oauth',
-					modelId: 'gpt-6.1-sol',
-					label: 'GPT-6.1 Sol',
-					capabilities: CHATGPT_MODEL_CAPABILITIES[ 'gpt-6.1-sol' ],
+					modelId: 'gpt-6-luna',
+					label: 'GPT-6 Luna',
+					capabilities: CHATGPT_MODEL_CAPABILITIES[ 'gpt-6-luna' ],
 				},
 			],
 		};
@@ -411,7 +397,7 @@ describe( 'fetchChatGptModels', () => {
 				connectionId: ACCOUNT_A,
 				revision: 1,
 				checkedAt: '2026-11-08T10:00:00.000Z',
-				models: [ { id: 'gpt-6.1-sol', label: 'GPT-6.1 Sol' } ],
+				models: [ { id: 'gpt-6-luna', label: 'GPT-6 Luna' } ],
 				lastError: null,
 			} );
 		} );
@@ -458,56 +444,179 @@ describe( 'fetchChatGptModels', () => {
 	} );
 } );
 
+// What the route is qualified for (ledger section A, "G2 record"): gpt-6-luna
+// at the efforts a captured run completed, with image input per the route's
+// documentation. Every other model and effort is unknown, so unavailable.
+const QUALIFIED_ROUTE_CAPABILITIES = {
+	'gpt-6-luna': {
+		reasoningEfforts: [ 'low', 'medium' ],
+		reasoningModes: [ 'standard' ],
+		imageInput: true,
+	},
+};
+
 describe( 'CHATGPT_MODEL_CAPABILITIES', () => {
-	it( 'is seeded from the OpenAI API catalog for the same slugs, without API-only fields', () => {
-		const slugs = Object.keys( CHATGPT_MODEL_CAPABILITIES );
-		expect( slugs.length ).toBeGreaterThan( 0 );
-		for ( const slug of slugs ) {
-			expect( isOpenAiModelId( slug ) ).toBe( true );
-			const api = OPENAI_MODEL_CAPABILITIES[ slug as keyof typeof OPENAI_MODEL_CAPABILITIES ];
-			expect( CHATGPT_MODEL_CAPABILITIES[ slug ] ).toEqual( {
-				reasoningEfforts: api.reasoningEfforts,
-				reasoningModes: [ 'standard' ],
-				imageInput: api.imageInput,
-			} );
+	it( 'offers only what the route is qualified for', () => {
+		expect( CHATGPT_MODEL_CAPABILITIES ).toEqual( QUALIFIED_ROUTE_CAPABILITIES );
+	} );
+
+	it( 'is frozen, so nothing can widen it at run time', () => {
+		expect( Object.isFrozen( CHATGPT_MODEL_CAPABILITIES ) ).toBe( true );
+		for ( const capabilities of Object.values( CHATGPT_MODEL_CAPABILITIES ) ) {
+			expect( Object.isFrozen( capabilities ) ).toBe( true );
+			expect( Object.isFrozen( capabilities.reasoningEfforts ) ).toBe( true );
 		}
 	} );
 } );
 
-describe( 'resolveChatGptReasoning', () => {
-	it( 'accepts an effort the model lists', () => {
-		expect( resolveChatGptReasoning( 'gpt-6.1-terra', 'none' ) ).toEqual( {
-			ok: true,
-			effort: 'none',
+describe( 'the ChatGPT route’s controls, whatever the OpenAI API catalog says', () => {
+	type ApiCatalog = Readonly< Record< OpenAiModelId, OpenAiModelCapabilities > >;
+
+	// Every API model with every effort, no image input, a longer context, and
+	// a model the API catalog alone knows.
+	const widenApiCatalog = ( catalog: ApiCatalog ): ApiCatalog => {
+		const edited = Object.fromEntries(
+			Object.entries( catalog ).map( ( [ id, capabilities ] ) => [
+				id,
+				{
+					...capabilities,
+					reasoningEfforts: [ 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max' ],
+					reasoningModes: [ 'standard', 'pro' ],
+					imageInput: false,
+					contextWindow: 2_000_000,
+					maxInputTokens: 1_900_000,
+				},
+			] )
+		);
+		return {
+			...edited,
+			'gpt-7-nova': { ...edited[ 'gpt-6-luna' ], apiModelId: 'gpt-7-nova' },
+		} as unknown as ApiCatalog;
+	};
+
+	afterEach( () => {
+		vi.doUnmock( '@studio/agent/protocol/openai-models' );
+		vi.resetModules();
+	} );
+
+	// The route's controls as a fresh import sees them, with the API catalog
+	// edited or left alone.
+	async function routeControls( editApiCatalog?: ( catalog: ApiCatalog ) => ApiCatalog ) {
+		vi.resetModules();
+		if ( editApiCatalog ) {
+			vi.doMock( '@studio/agent/protocol/openai-models', async ( importOriginal ) => {
+				const actual =
+					await importOriginal< typeof import('@studio/agent/protocol/openai-models') >();
+				return {
+					...actual,
+					OPENAI_MODEL_CAPABILITIES: editApiCatalog( actual.OPENAI_MODEL_CAPABILITIES ),
+				};
+			} );
+		}
+		const protocol = await import( '@studio/agent/protocol/chatgpt-models' );
+		const models = await import( '@studio/agent/node/chatgpt/models' );
+		const transport = await import( '@studio/agent/node/runtime/chatgpt-transport' );
+		const apiSlugs = [ 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6.1-terra', 'gpt-6-luna', 'gpt-7-nova' ];
+		vi.spyOn( globalThis, 'fetch' ).mockImplementation( async () =>
+			json( { models: apiSlugs.map( ( slug ) => listed( slug, slug ) ) } )
+		);
+		const catalog = await models.fetchChatGptModels( ACCOUNT_A, undefined, {
+			getAccessToken: async () => 'test-injected-token',
+		} );
+		return {
+			table: protocol.CHATGPT_MODEL_CAPABILITIES,
+			listed: catalog.ok ? catalog.models.map( ( model ) => model.modelId ) : catalog.error,
+			efforts: Object.fromEntries(
+				apiSlugs.map( ( slug ) => [
+					slug,
+					[ 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max' ].filter(
+						( effort ) => protocol.resolveChatGptReasoning( slug, effort ).ok
+					),
+				] )
+			),
+			defaultEffort: protocol.getDefaultChatGptReasoningEffort( 'gpt-6-luna' ),
+			piModel: ( () => {
+				const model = transport.buildChatGptModel( {
+					providerId: 'chatgpt-oauth',
+					modelId: 'gpt-6-luna',
+				} );
+				return {
+					input: model.input,
+					contextWindow: model.contextWindow,
+					thinkingLevelMap: model.thinkingLevelMap,
+				};
+			} )(),
+		};
+	}
+
+	it( 'stay the route-qualified ones when the API catalog changes', async () => {
+		const unchanged = await routeControls();
+		const edited = await routeControls( widenApiCatalog );
+
+		expect( edited ).toEqual( unchanged );
+		expect( unchanged.table ).toEqual( QUALIFIED_ROUTE_CAPABILITIES );
+		expect( unchanged.listed ).toEqual( [ 'gpt-6-luna' ] );
+		expect( unchanged.efforts ).toEqual( {
+			'gpt-6.1-sol': [],
+			'gpt-6-astra': [],
+			'gpt-6.1-terra': [],
+			'gpt-6-luna': [ 'low', 'medium' ],
+			'gpt-7-nova': [],
+		} );
+		expect( unchanged.piModel ).toEqual( {
+			input: [ 'text', 'image' ],
+			contextWindow: 200_000,
+			thinkingLevelMap: {
+				off: null,
+				minimal: null,
+				low: 'low',
+				medium: 'medium',
+				high: null,
+				xhigh: null,
+				max: null,
+			},
 		} );
 	} );
 
-	it( 'refuses an effort the model doesn’t list, never offering a nearby one instead', () => {
-		const result = resolveChatGptReasoning( 'gpt-6-astra', 'none' );
+	it( 'ignore an API catalog that drops every model', async () => {
+		const unchanged = await routeControls();
+		const emptied = await routeControls( () => ( {} ) as ApiCatalog );
+
+		expect( emptied ).toEqual( unchanged );
+	} );
+} );
+
+describe( 'resolveChatGptReasoning', () => {
+	it.each( [ 'low', 'medium' ] )( 'accepts %s, an effort the model lists', ( effort ) => {
+		expect( resolveChatGptReasoning( 'gpt-6-luna', effort ) ).toEqual( { ok: true, effort } );
+	} );
+
+	it( 'refuses an effort the model doesn’t list, saying it isn’t qualified, never offering a nearby one instead', () => {
+		const result = resolveChatGptReasoning( 'gpt-6-luna', 'high' );
 
 		expect( result ).toEqual( {
 			ok: false,
 			problem: {
 				code: 'unsupported-effort',
-				model: 'gpt-6-astra',
-				effort: 'none',
-				supported: CHATGPT_MODEL_CAPABILITIES[ 'gpt-6-astra' ].reasoningEfforts,
+				model: 'gpt-6-luna',
+				effort: 'high',
+				supported: [ 'low', 'medium' ],
 			},
 		} );
 		expect( ! result.ok && describeChatGptReasoningProblem( result.problem ) ).toBe(
-			'gpt-6-astra doesn’t support “None” reasoning with ChatGPT. Choose one of: Low, Medium, High, Extra high, Max.'
+			'Studio doesn’t support “High” reasoning for gpt-6-luna with ChatGPT yet: it isn’t qualified for use with a ChatGPT plan. Choose one of: Low, Medium.'
 		);
 	} );
 
-	it( 'refuses a model Studio has no capabilities for', () => {
-		const result = resolveChatGptReasoning( 'gpt-7-nova', 'medium' );
+	it.each( [ 'gpt-7-nova', 'gpt-6.1-sol' ] )(
+		'refuses %s, a model Studio has no route-qualified capabilities for, saying so',
+		( model ) => {
+			const result = resolveChatGptReasoning( model, 'medium' );
 
-		expect( result ).toEqual( {
-			ok: false,
-			problem: { code: 'unknown-model', model: 'gpt-7-nova' },
-		} );
-		expect( ! result.ok && describeChatGptReasoningProblem( result.problem ) ).toBe(
-			'Studio doesn’t support the ChatGPT model “gpt-7-nova”. Choose another model to continue.'
-		);
-	} );
+			expect( result ).toEqual( { ok: false, problem: { code: 'unknown-model', model } } );
+			expect( ! result.ok && describeChatGptReasoningProblem( result.problem ) ).toBe(
+				`Studio doesn’t support the ChatGPT model “${ model }” yet: it isn’t qualified for use with a ChatGPT plan. Choose another model to continue.`
+			);
+		}
+	);
 } );

@@ -124,14 +124,14 @@ const connectionEntry = (
 
 const selectionFor = ( overrides: Partial< ConnectionSelection > = {} ): ConnectionSelection => ( {
 	connectionId: CONNECTION_ID,
-	model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6.1-sol' },
+	model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' },
 	revision: 1,
 	...overrides,
 } );
 
 const openAiSettingsFor = ( reasoningEffort: OpenAiReasoningEffort ): OpenAiTurnSettings => ( {
-	model: 'gpt-6.1-sol',
-	apiModelId: OPENAI_MODEL_CAPABILITIES[ 'gpt-6.1-sol' ].apiModelId,
+	model: 'gpt-6-luna',
+	apiModelId: OPENAI_MODEL_CAPABILITIES[ 'gpt-6-luna' ].apiModelId,
 	reasoningEffort,
 	reasoningMode: 'standard',
 	maxOutputTokens: 32_000,
@@ -458,7 +458,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			prompt,
 			{
 				connection: selection,
-				chatGpt: { reasoningEffort: effort, label: 'GPT-6.1 Sol' },
+				chatGpt: { reasoningEffort: effort, label: 'GPT-6 Luna' },
 				env,
 			},
 			onEvent
@@ -486,7 +486,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( requests ).toHaveLength( 2 );
 		for ( const request of requests ) {
 			expect( request.headers.get( 'authorization' ) ).toBe( `Bearer ${ TOKEN }` );
-			expect( request.body.model ).toBe( 'gpt-6.1-sol' );
+			expect( request.body.model ).toBe( 'gpt-6-luna' );
 			expect( request.body.reasoning ).toEqual( { effort: 'medium' } );
 			// Nothing of the OpenAI API turn settings exists to leak.
 			expect( request.body ).not.toHaveProperty( 'max_output_tokens' );
@@ -513,7 +513,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( JSON.stringify( first.entries ) ).not.toContain( TOKEN );
 		expect( JSON.stringify( first.events ) ).not.toContain( TOKEN );
 
-		// Turn 2, in a fresh agent on the reopened file, with High passed in.
+		// Turn 2, in a fresh agent on the reopened file, with Low passed in.
 		// Its reply reports a context close to the budget, so the session
 		// compacts afterwards.
 		requests.length = 0;
@@ -528,13 +528,13 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			reopen( first.sessionFile ),
 			longPrompt,
 			selection,
-			'high'
+			'low'
 		);
 
 		expect( second.error ).toBeUndefined();
 		expect( requests.length ).toBeGreaterThanOrEqual( 2 );
 		const [ turnRequest, ...compactionRequests ] = requests;
-		expect( turnRequest.body.reasoning ).toEqual( { effort: 'high' } );
+		expect( turnRequest.body.reasoning ).toEqual( { effort: 'low' } );
 		expect( itemsOfType( turnRequest, 'function_call_output' ) ).toEqual( [
 			expect.objectContaining( { call_id: READ_CALL.call_id } ),
 		] );
@@ -549,8 +549,8 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		// Compaction's summary request runs on the same connection, model and effort.
 		for ( const request of compactionRequests ) {
 			expect( request.headers.get( 'authorization' ) ).toBe( `Bearer ${ TOKEN }` );
-			expect( request.body.model ).toBe( 'gpt-6.1-sol' );
-			expect( request.body.reasoning ).toEqual( { effort: 'high' } );
+			expect( request.body.model ).toBe( 'gpt-6-luna' );
+			expect( request.body.reasoning ).toEqual( { effort: 'low' } );
 			expect( request.body ).not.toHaveProperty( 'max_output_tokens' );
 		}
 		expect( second.entries.some( ( entry ) => entry.type === 'compaction' ) ).toBe( true );
@@ -558,16 +558,11 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		// Turn 3, in another fresh agent: the summary stands in for the early turns.
 		requests.length = 0;
 		replies.push( () => textReply( 'Anything else?' ) );
-		const third = await runChatGptTurn(
-			reopen( second.sessionFile ),
-			'Thanks.',
-			selection,
-			'high'
-		);
+		const third = await runChatGptTurn( reopen( second.sessionFile ), 'Thanks.', selection, 'low' );
 
 		expect( third.error ).toBeUndefined();
 		expect( requests ).toHaveLength( 1 );
-		expect( requests[ 0 ].body.reasoning ).toEqual( { effort: 'high' } );
+		expect( requests[ 0 ].body.reasoning ).toEqual( { effort: 'low' } );
 		expect( JSON.stringify( requests[ 0 ].body.input ) ).toContain(
 			'the user asked for the database name'
 		);
@@ -785,7 +780,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 
 		it( 'lets the selected connection alone decide credentials and settings when both expose the same slug', async () => {
 			const selection = selectionFor();
-			// Both connections can serve 'gpt-6.1-sol', and a usable API key is
+			// Both connections can serve 'gpt-6-luna', and a usable API key is
 			// saved: the ChatGPT turn still runs on the plan, through a tool.
 			replies.push( toolCallReply, () => textReply( 'DB_NAME is studio.' ) );
 			const chatGpt = await runChatGptTurn(
@@ -815,7 +810,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			requests.length = 0;
 			replies.push( toolCallReply, () => textReply( 'DB_NAME is studio.' ) );
 			const openAi = await runTurn( SessionManager.create( sitesRoot, sessionDir ), 'hi', {
-				model: 'gpt-6.1-sol',
+				model: 'gpt-6-luna',
 				openAi: openAiSettingsFor( 'medium' ),
 				env: { STUDIO_OPENAI_API_KEY: API_KEY },
 			} );
@@ -888,7 +883,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		it( 'refuses to continue a conversation that ran on another provider', async () => {
 			replies.push( () => textReply( 'From the API.' ) );
 			const openAi = await runTurn( SessionManager.create( sitesRoot, sessionDir ), 'hi', {
-				model: 'gpt-6.1-sol',
+				model: 'gpt-6-luna',
 				openAi: openAiSettingsFor( 'medium' ),
 				env: { STUDIO_OPENAI_API_KEY: API_KEY },
 			} );
@@ -908,30 +903,34 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( fakeBroker.handles ).toHaveLength( 0 );
 		} );
 
-		it( 'refuses a ChatGPT model Studio doesn’t support', async () => {
-			const selection = selectionFor( {
-				model: { providerId: 'chatgpt-oauth', modelId: 'gpt-7-nova' },
-			} );
+		it.each( [ 'gpt-7-nova', 'gpt-6.1-sol' ] )(
+			'refuses %s, a ChatGPT model Studio doesn’t support, saying it isn’t qualified',
+			async ( modelId ) => {
+				const selection = selectionFor( { model: { providerId: 'chatgpt-oauth', modelId } } );
 
-			const turn = await runChatGptTurn(
-				newChatGptSession( selection ),
-				'hi',
-				selection,
-				'medium'
-			);
+				const turn = await runChatGptTurn(
+					newChatGptSession( selection ),
+					'hi',
+					selection,
+					'medium'
+				);
 
-			expect( turn.error ).toContain( 'gpt-7-nova' );
-			expect( fetchSpy ).not.toHaveBeenCalled();
-		} );
+				expect( turn.error ).toBe(
+					`Studio doesn’t support the ChatGPT model “${ modelId }” yet: it isn’t qualified for use with a ChatGPT plan. Choose another model to continue.`
+				);
+				expect( fetchSpy ).not.toHaveBeenCalled();
+				expect( fakeBroker.handles ).toHaveLength( 0 );
+			}
+		);
 
 		it( 'refuses an effort the model doesn’t list, rather than sending a nearby one', async () => {
-			const selection = selectionFor( {
-				model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-astra' },
-			} );
+			const selection = selectionFor();
 
-			const turn = await runChatGptTurn( newChatGptSession( selection ), 'hi', selection, 'none' );
+			const turn = await runChatGptTurn( newChatGptSession( selection ), 'hi', selection, 'high' );
 
-			expect( turn.error ).toMatch( /doesn’t support “None” reasoning/ );
+			expect( turn.error ).toMatch(
+				/^Studio doesn’t support “High” reasoning for gpt-6-luna with ChatGPT yet/
+			);
 			expect( fetchSpy ).not.toHaveBeenCalled();
 		} );
 

@@ -134,8 +134,8 @@ function snapshotFor(
 	return snapshot;
 }
 
-async function registerChatGpt( snapshot: ChatGptTurnSnapshot, slug = 'gpt-6.1-sol' ) {
-	const model = buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: slug }, 'GPT-6.1 Sol' );
+async function registerChatGpt( snapshot: ChatGptTurnSnapshot, slug = 'gpt-6-luna' ) {
+	const model = buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: slug }, 'GPT-6 Luna' );
 	const runtime = await ModelRuntime.create( {
 		credentials: new MemoryCredentialStore(),
 		modelsPath: null,
@@ -449,7 +449,7 @@ describe( 'the ChatGPT transport', () => {
 				'stream',
 			] );
 			expect( body ).toMatchObject( {
-				model: 'gpt-6.1-sol',
+				model: 'gpt-6-luna',
 				instructions: SYSTEM_PROMPT,
 				stream: true,
 				store: false,
@@ -461,19 +461,27 @@ describe( 'the ChatGPT transport', () => {
 			] );
 		} );
 
-		// `include` is undocumented for this route: it is sent only because pi asks
-		// for encrypted reasoning to replay it statelessly, as on the public API.
+		// `include` is undocumented for this route: it is sent because pi asks for
+		// encrypted reasoning to replay it statelessly, as on the public API. The
+		// captured run's requests carried it at both qualified efforts. Without a
+		// reasoning effort pi asks for none, and none is sent.
 		it( 'asks for encrypted reasoning exactly when pi does, for stateless replay (undocumented for this route)', async () => {
-			const withReasoning = await registerChatGpt( snapshotFor( 'low' ), 'gpt-6.1-terra' );
-			const without = await registerChatGpt( snapshotFor( 'none' ), 'gpt-6.1-terra' );
+			const turn = await registerChatGpt( snapshotFor( 'low' ) );
 			const http = captureFetch( [ () => sse( textReply( 'a' ) ), () => sse( textReply( 'b' ) ) ] );
 
-			await streamTurn( withReasoning, conversation( [ userMessage( 'hi' ) ] ), 'low' ).result();
-			await streamTurn( without, conversation( [ userMessage( 'hi' ) ] ), 'none' ).result();
+			await streamTurn( turn, conversation( [ userMessage( 'hi' ) ] ), 'low' ).result();
 
 			expect( http.request( 0 ).body.include ).toEqual( [ 'reasoning.encrypted_content' ] );
-			expect( http.request( 1 ).body ).not.toHaveProperty( 'include' );
-			expect( http.request( 1 ).body.reasoning ).toEqual( { effort: 'none' } );
+			expect(
+				serializeChatGptRequest(
+					{
+						model: 'gpt-6-luna',
+						input: [ { role: 'user', content: 'hi' } ],
+						reasoning: { effort: 'low' },
+					},
+					{ model: 'gpt-6-luna', reasoningEffort: 'low' }
+				)
+			).not.toHaveProperty( 'include' );
 		} );
 
 		it.each(
@@ -496,16 +504,16 @@ describe( 'the ChatGPT transport', () => {
 		} );
 
 		it( 'refuses to send an effort other than the selected one', async () => {
-			const turn = await registerChatGpt( snapshotFor( 'high' ) );
+			const turn = await registerChatGpt( snapshotFor( 'medium' ) );
 			const http = captureFetch( [ () => sse( textReply( 'no' ) ) ] );
 
-			const reply = await streamTurn( turn, conversation( [ userMessage( 'hi' ) ] ), 'high', {
+			const reply = await streamTurn( turn, conversation( [ userMessage( 'hi' ) ] ), 'medium', {
 				reasoning: 'low',
 			} ).result();
 
 			expectFailure( reply );
 			expect( reply.errorMessage ).toMatch(
-				/would have used low reasoning instead of the selected high/
+				/would have used low reasoning instead of the selected medium/
 			);
 			expect( http.spy ).not.toHaveBeenCalled();
 		} );
@@ -551,7 +559,7 @@ describe( 'the ChatGPT transport', () => {
 		} );
 
 		it( 'replays the conversation statelessly, keeping item ids and their order', async () => {
-			const turn = await registerChatGpt( snapshotFor( 'xhigh' ) );
+			const turn = await registerChatGpt( snapshotFor( 'low' ) );
 			const http = captureFetch( [
 				() => sse( TOOL_CALL_REPLY ),
 				() => sse( textReply( 'Read it.' ) ),
@@ -560,7 +568,7 @@ describe( 'the ChatGPT transport', () => {
 			const first = await streamTurn(
 				turn,
 				conversation( [ userMessage( 'read the config' ) ] ),
-				'xhigh'
+				'low'
 			).result();
 			expect( first.stopReason ).toBe( 'toolUse' );
 			expect( first.content.find( ( block ) => block.type === 'toolCall' ) ).toMatchObject( {
@@ -583,14 +591,14 @@ describe( 'the ChatGPT transport', () => {
 						timestamp: 0,
 					},
 				] ),
-				'xhigh'
+				'low'
 			).result();
 
 			expect( second.stopReason ).toBe( 'stop' );
 			const { body } = http.request( 1 );
 			expect( body ).not.toHaveProperty( 'previous_response_id' );
 			expect( body.store ).toBe( false );
-			expect( body.reasoning ).toEqual( { effort: 'xhigh' } );
+			expect( body.reasoning ).toEqual( { effort: 'low' } );
 			expect( body.input.slice( 1 ) ).toEqual( [
 				{ role: 'user', content: [ { type: 'input_text', text: 'read the config' } ] },
 				REASONING_ITEM,
@@ -696,13 +704,13 @@ describe( 'the ChatGPT transport', () => {
 		it( 'sends no output cap, while an OpenAI API request keeps its configured one', async () => {
 			const chatGpt = await registerChatGpt( snapshotFor( 'medium' ) );
 			const settings = {
-				model: 'gpt-6.1-sol' as const,
-				apiModelId: OPENAI_MODEL_CAPABILITIES[ 'gpt-6.1-sol' ].apiModelId,
+				model: 'gpt-6-luna' as const,
+				apiModelId: OPENAI_MODEL_CAPABILITIES[ 'gpt-6-luna' ].apiModelId,
 				reasoningEffort: 'medium' as const,
 				reasoningMode: 'standard' as const,
 				maxOutputTokens: 64_000,
 			};
-			const openAiModel = buildOpenAiModel( settings, 'GPT-6.1 Sol' );
+			const openAiModel = buildOpenAiModel( settings, 'GPT-6 Luna' );
 			const openAiRuntime = await ModelRuntime.create( {
 				credentials: new MemoryCredentialStore(),
 				modelsPath: null,
@@ -752,27 +760,32 @@ describe( 'the ChatGPT transport', () => {
 		it( 'refuses a turn snapshot made for another connection', () => {
 			expect( () =>
 				createChatGptProviderConfig(
-					buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: 'gpt-6.1-sol' } ),
+					buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' } ),
 					'registration-other',
 					snapshotFor( 'medium' )
 				)
 			).toThrow( /another ChatGPT connection/ );
 		} );
 
-		it( 'refuses an effort the model doesn’t list, rather than sending a nearby one', () => {
-			expect( () =>
-				createChatGptProviderConfig(
-					buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: 'gpt-6-astra' } ),
-					CONNECTION,
-					snapshotFor( 'none' )
-				)
-			).toThrow( 'gpt-6-astra doesn’t support “None” reasoning with ChatGPT.' );
-		} );
+		it.each( [ 'none', 'high', 'xhigh', 'max' ] as const )(
+			'refuses %s, an effort the model isn’t qualified for, rather than sending a nearby one',
+			( effort ) => {
+				expect( () =>
+					createChatGptProviderConfig(
+						buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' } ),
+						CONNECTION,
+						snapshotFor( effort )
+					)
+				).toThrow( /^Studio doesn’t support “.+” reasoning for gpt-6-luna with ChatGPT yet/ );
+			}
+		);
 
 		it( 'builds models only for ChatGPT slugs it has capabilities for', () => {
-			expect( () =>
-				buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: 'gpt-7-nova' } )
-			).toThrow( /gpt-7-nova/ );
+			for ( const modelId of [ 'gpt-7-nova', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6.1-terra' ] ) {
+				expect( () => buildChatGptModel( { providerId: 'chatgpt-oauth', modelId } ) ).toThrow(
+					`Studio doesn’t support the ChatGPT model “${ modelId }” yet`
+				);
+			}
 			expect( () =>
 				buildChatGptModel( { providerId: 'openai-api-key', modelId: 'gpt-6.1-sol' } )
 			).toThrow( /isn’t a ChatGPT model/ );
@@ -786,14 +799,17 @@ describe( 'the ChatGPT transport', () => {
 				baseUrl: 'https://api.openai.com/v1',
 				reasoning: true,
 				input: [ 'text', 'image' ],
+				contextWindow: 200_000,
+				// Only the qualified efforts map to a request effort: pi has no
+				// other level to send.
 				thinkingLevelMap: {
-					off: 'none',
+					off: null,
 					minimal: null,
 					low: 'low',
 					medium: 'medium',
-					high: 'high',
-					xhigh: 'xhigh',
-					max: 'max',
+					high: null,
+					xhigh: null,
+					max: null,
 				},
 			} );
 		} );

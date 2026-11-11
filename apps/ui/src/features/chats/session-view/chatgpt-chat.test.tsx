@@ -3,7 +3,10 @@ import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/provide
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { getVisibleToasts } from '@/data/app-messages';
-import { CHATGPT_SETTINGS_QUERY_KEY } from '@/data/queries/use-chatgpt-settings';
+import {
+	CHATGPT_MODELS_QUERY_KEY,
+	CHATGPT_SETTINGS_QUERY_KEY,
+} from '@/data/queries/use-chatgpt-settings';
 import { createFakeConnector, makeSession, makeSite } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { SessionEntry } from '@/data/core';
@@ -86,10 +89,7 @@ async function setup( entries = [ pin( INITIAL ) ], withApi = false ) {
 		revision,
 		checkedAt: new Date().toISOString(),
 		lastError: null,
-		models: [
-			{ id: 'gpt-6-luna', label: 'GPT-6 Luna' },
-			{ id: 'gpt-6-astra', label: 'GPT-6 Astra' },
-		],
+		models: [ { id: 'gpt-6-luna', label: 'GPT-6 Luna' } ],
 	} ) );
 	connector.setSessionProvider.mockImplementation( async ( id, provider, model ) => {
 		connector.state.sessions
@@ -145,12 +145,12 @@ describe( 'ChatGPT chats', () => {
 		fireEvent.click(
 			within( await screen.findByRole( 'group', { name: 'Reasoning effort' } ) ).getByRole(
 				'menuitemradio',
-				{ name: 'High' }
+				{ name: 'Low' }
 			)
 		);
 		send();
 		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
-		expect( runs[ 0 ].selection ).toEqual( { ...INITIAL, reasoningEffort: 'high' } );
+		expect( runs[ 0 ].selection ).toEqual( { ...INITIAL, reasoningEffort: 'low' } );
 		expect( connector.setSessionOpenAiSelection ).not.toHaveBeenCalled();
 		expect( connector.setAiProvider ).not.toHaveBeenCalled();
 	} );
@@ -163,15 +163,15 @@ describe( 'ChatGPT chats', () => {
 			await save.promise;
 			await persist( id, selection );
 		} );
-		await chooseEffort( 'High' );
-		send();
 		await chooseEffort( 'Low' );
+		send();
+		await chooseEffort( 'Medium' );
 		expect( runs ).toHaveLength( 0 );
 		await act( async () => save.resolve() );
 		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
-		expect( runs[ 0 ].selection?.reasoningEffort ).toBe( 'high' );
+		expect( runs[ 0 ].selection?.reasoningEffort ).toBe( 'low' );
 		expect( connector.setSessionChatGptSelection ).toHaveBeenCalledTimes( 1 );
-		expect( reasoning() ).toHaveTextContent( 'Low' );
+		expect( reasoning() ).toHaveTextContent( 'Medium' );
 		act( () =>
 			connector.emit( 'onAgentEvent', {
 				sessionId: 'chat',
@@ -189,14 +189,14 @@ describe( 'ChatGPT chats', () => {
 		);
 		send( 'Following request' );
 		await waitFor( () => expect( runs ).toHaveLength( 2 ) );
-		expect( runs[ 1 ].selection?.reasoningEffort ).toBe( 'low' );
+		expect( runs[ 1 ].selection?.reasoningEffort ).toBe( 'medium' );
 	} );
 
 	it( 'takes back a failed save and keeps the waiting message unsent', async () => {
 		const { connector, runs } = await setup();
 		const save = deferred< void >();
 		connector.setSessionChatGptSelection.mockReturnValueOnce( save.promise );
-		await chooseEffort( 'High' );
+		await chooseEffort( 'Low' );
 		send();
 		await act( async () => save.reject( new Error( 'Disk full.' ) ) );
 		await waitFor( () => expect( reasoning() ).toHaveTextContent( 'Medium' ) );
@@ -208,35 +208,37 @@ describe( 'ChatGPT chats', () => {
 
 	it( 'preserves a newer successful choice across an older failure and a late stale refetch', async () => {
 		const { connector, queryClient, runs } = await setup();
-		const high = deferred< void >();
 		const low = deferred< void >();
+		const medium = deferred< void >();
 		const read = deferred< void >();
 		const persist = connector.setSessionChatGptSelection.getMockImplementation()!;
 		connector.setSessionChatGptSelection
-			.mockImplementationOnce( () => high.promise )
+			.mockImplementationOnce( () => low.promise )
 			.mockImplementationOnce( async ( id, selection ) => {
-				await low.promise;
+				await medium.promise;
 				await persist( id, selection );
 			} );
-		await chooseEffort( 'High' );
 		await chooseEffort( 'Low' );
+		await chooseEffort( 'Medium' );
+		// A read from before the newest choice was saved, which saw the older one.
 		connector.getSession.mockImplementationOnce( async () => {
 			const stale = structuredClone( connector.state.sessions[ 0 ] );
+			stale.entries.push( pin( { ...INITIAL, reasoningEffort: 'low' } ) );
 			await read.promise;
 			return stale;
 		} );
 		void queryClient.invalidateQueries( { queryKey: [ 'sessions', 'chat' ] } );
-		await act( async () => high.reject( new Error( 'Old save failed.' ) ) );
+		await act( async () => low.reject( new Error( 'Old save failed.' ) ) );
 		await waitFor( () =>
 			expect( connector.setSessionChatGptSelection ).toHaveBeenCalledTimes( 2 )
 		);
-		await act( async () => low.resolve() );
-		expect( reasoning() ).toHaveTextContent( 'Low' );
+		await act( async () => medium.resolve() );
+		expect( reasoning() ).toHaveTextContent( 'Medium' );
 		await act( async () => read.resolve() );
 		await waitFor( () => expect( queryClient.isFetching() ).toBe( 0 ) );
-		expect( reasoning() ).toHaveTextContent( 'Low' );
+		expect( reasoning() ).toHaveTextContent( 'Medium' );
 		send();
-		await waitFor( () => expect( runs[ 0 ]?.selection?.reasoningEffort ).toBe( 'low' ) );
+		await waitFor( () => expect( runs[ 0 ]?.selection?.reasoningEffort ).toBe( 'medium' ) );
 	} );
 
 	it.each( [ 'to-chatgpt', 'from-chatgpt', 'between-accounts' ] as const )(
@@ -336,6 +338,76 @@ describe( 'ChatGPT chats', () => {
 			readChatGptSessionSelection( connector.state.sessions[ 0 ].entries )?.connectionId
 		).toBe( A );
 	} );
+
+	it( 'holds queued messages once a refreshed catalog drops the chat’s model, never switching to another', async () => {
+		const { connector, queryClient, runs } = await setup();
+		send( 'First request' );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		send( 'Queued private request' );
+		await screen.findByText( 'Queued private request' );
+		connector.getChatGptModels.mockImplementation( async ( connectionId, revision ) => ( {
+			connectionId,
+			revision,
+			checkedAt: new Date().toISOString(),
+			lastError: null,
+			models: [],
+		} ) );
+		await act( async () => {
+			await queryClient.invalidateQueries( { queryKey: CHATGPT_MODELS_QUERY_KEY } );
+		} );
+		act( () =>
+			connector.emit( 'onAgentEvent', {
+				sessionId: 'chat',
+				runId: 'run-1',
+				event: {
+					type: 'run.exited',
+					timestamp: new Date().toISOString(),
+					status: 'success',
+					code: 0,
+				},
+			} )
+		);
+		await waitFor( () =>
+			expect(
+				screen.getByText(
+					'This model isn’t listed for the selected ChatGPT account. Choose another model.'
+				)
+			).toBeVisible()
+		);
+		expect( screen.getByText( 'Queued private request' ) ).toBeVisible();
+		expect( runs ).toHaveLength( 1 );
+		expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+		expect( readChatGptSessionSelection( connector.state.sessions[ 0 ].entries ) ).toEqual(
+			INITIAL
+		);
+	} );
+
+	it.each( [
+		[
+			'a model',
+			{ model: 'gpt-6.1-sol' },
+			'Studio doesn’t support the ChatGPT model “gpt-6.1-sol” yet: it isn’t qualified for use with a ChatGPT plan. Choose another model to continue.',
+		],
+		[
+			'an effort',
+			{ reasoningEffort: 'high' },
+			'Studio doesn’t support “High” reasoning for gpt-6-luna with ChatGPT yet: it isn’t qualified for use with a ChatGPT plan. Choose one of: Low, Medium.',
+		],
+	] )(
+		'explains and holds a recorded choice of %s the route isn’t qualified for, never replacing it',
+		async ( _name, recorded, explanation ) => {
+			const { connector, runs } = await setup( [ pin( { ...INITIAL, ...recorded } ) ] );
+			expect( await screen.findByText( explanation ) ).toBeVisible();
+			send( 'Held request' );
+			await act( async () => {} );
+			expect( runs ).toHaveLength( 0 );
+			expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+			expect( readChatGptSessionSelection( connector.state.sessions[ 0 ].entries ) ).toEqual( {
+				...INITIAL,
+				...recorded,
+			} );
+		}
+	);
 
 	it( 'holds queued messages after the selected account disconnects, even with another account and an API key', async () => {
 		const { connector, queryClient, runs } = await setup( [ pin( INITIAL ) ], true );

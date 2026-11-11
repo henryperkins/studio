@@ -2,8 +2,6 @@ import { __, sprintf } from '@wordpress/i18n';
 import {
 	getOpenAiReasoningEffortLabel,
 	isOpenAiReasoningEffort,
-	OPENAI_MODEL_CAPABILITIES,
-	type OpenAiModelId,
 	type OpenAiReasoningEffort,
 	type OpenAiReasoningMode,
 } from '@studio/agent/protocol/openai-models';
@@ -17,30 +15,40 @@ export interface ChatGptModelCapabilities {
 	 * sent, and the route's mode support is undocumented, so this is standard.
 	 */
 	reasoningModes: readonly OpenAiReasoningMode[];
-	/** Accepts image input, so screenshot tools may be offered. */
+	/**
+	 * Accepts images: those the user attaches, and those tool results carry
+	 * (screenshots, image files read), so screenshot tools may be offered.
+	 */
 	imageInput: boolean;
 }
 
-// The API catalog's values for the model of the same name, without what only
-// the API takes: its model name and output cap (this route takes no
-// `max_output_tokens`), and its context limits.
-function seedFromApiCatalog( model: OpenAiModelId ): ChatGptModelCapabilities {
-	const { reasoningEfforts, imageInput } = OPENAI_MODEL_CAPABILITIES[ model ];
-	return { reasoningEfforts, reasoningModes: [ 'standard' ], imageInput };
-}
+/**
+ * The budget compaction keeps a ChatGPT conversation under. The route
+ * documents no context window, so this is Studio's own, as on its other
+ * providers.
+ */
+export const CHATGPT_LOCAL_CONTEXT_BUDGET = 200_000;
 
 /**
  * The ChatGPT-route models Studio supports, by the slug the route lists them
- * under. The route's model list carries no capabilities (SIWC "Models and
- * inference"), so a listed model is offered only when it is here: Studio
- * never guesses what a model accepts.
+ * under, with what each is qualified for on this route: by the route's own
+ * documentation or a request it was seen to complete. The route's model list
+ * carries no capabilities (SIWC "Models and inference"), and the OpenAI API
+ * catalog describes another route, so nothing here comes from either: a
+ * listed model is offered only when it is here, and only with what is here.
+ * Sources for each value are in the readiness ledger's G2 record.
  */
-export const CHATGPT_MODEL_CAPABILITIES: Readonly< Record< string, ChatGptModelCapabilities > > = {
-	'gpt-6.1-sol': seedFromApiCatalog( 'gpt-6.1-sol' ),
-	'gpt-6-astra': seedFromApiCatalog( 'gpt-6-astra' ),
-	'gpt-6.1-terra': seedFromApiCatalog( 'gpt-6.1-terra' ),
-	'gpt-6-luna': seedFromApiCatalog( 'gpt-6-luna' ),
-};
+export const CHATGPT_MODEL_CAPABILITIES: Readonly< Record< string, ChatGptModelCapabilities > > =
+	Object.freeze( {
+		// Low and medium completed in a captured run; the other efforts were never
+		// sent. Image input: the route takes images when the model accepts them
+		// (SIWC "Preview limitations"), which this model's page states.
+		'gpt-6-luna': Object.freeze( {
+			reasoningEfforts: Object.freeze( [ 'low', 'medium' ] as const ),
+			reasoningModes: Object.freeze( [ 'standard' ] as const ),
+			imageInput: true,
+		} ),
+	} );
 
 export function getChatGptModelCapabilities( slug: string ): ChatGptModelCapabilities | undefined {
 	return Object.prototype.hasOwnProperty.call( CHATGPT_MODEL_CAPABILITIES, slug )
@@ -100,13 +108,17 @@ export function describeChatGptReasoningProblem( problem: ChatGptReasoningProble
 		case 'unknown-model':
 			return sprintf(
 				/* translators: %s: a ChatGPT model id Studio does not support. */
-				__( 'Studio doesn’t support the ChatGPT model “%s”. Choose another model to continue.' ),
+				__(
+					'Studio doesn’t support the ChatGPT model “%s” yet: it isn’t qualified for use with a ChatGPT plan. Choose another model to continue.'
+				),
 				problem.model
 			);
 		case 'unsupported-effort':
 			return sprintf(
 				/* translators: 1: ChatGPT model id, 2: the requested reasoning effort, 3: comma-separated list of supported efforts. */
-				__( '%1$s doesn’t support “%2$s” reasoning with ChatGPT. Choose one of: %3$s.' ),
+				__(
+					'Studio doesn’t support “%2$s” reasoning for %1$s with ChatGPT yet: it isn’t qualified for use with a ChatGPT plan. Choose one of: %3$s.'
+				),
 				problem.model,
 				isOpenAiReasoningEffort( problem.effort )
 					? getOpenAiReasoningEffortLabel( problem.effort )

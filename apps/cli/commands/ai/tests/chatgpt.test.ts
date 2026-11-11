@@ -248,7 +248,7 @@ describe( 'ChatGPT interactive CLI', () => {
 					'Select saved account',
 					`Work · ${ B }`,
 					'GPT-6 Luna · gpt-6-luna',
-					'High',
+					'Low',
 					'Start new chat',
 				]
 			);
@@ -259,7 +259,7 @@ describe( 'ChatGPT interactive CLI', () => {
 			expect( readChatGptSessionSelection( runs[ 0 ].entries ) ).toEqual( {
 				...INITIAL,
 				connectionId: B,
-				reasoningEffort: 'high',
+				reasoningEffort: 'low',
 			} );
 			expect( JSON.stringify( runs[ 0 ].entries ) ).not.toContain(
 				'Previous private conversation'
@@ -289,7 +289,7 @@ describe( 'ChatGPT interactive CLI', () => {
 		const old = await previousChat();
 		const ui = terminal(
 			[ '/model', 'First request', '/reasoning', 'Second request' ],
-			[ 'GPT-6 Astra · gpt-6-astra', 'High', 'Low' ]
+			[ 'GPT-6 Luna · gpt-6-luna', 'Low', 'Medium' ]
 		);
 		await runCommand( { adapter: ui, resumeSession: resume( old ) } );
 		expect( ui.showError ).not.toHaveBeenCalled();
@@ -299,17 +299,29 @@ describe( 'ChatGPT interactive CLI', () => {
 			old.getSessionId(),
 		] );
 		expect( runs.map( ( run ) => run.config.chatGpt?.reasoningEffort ) ).toEqual( [
-			'high',
 			'low',
+			'medium',
 		] );
-		expect( runs[ 1 ].config.connection?.model.modelId ).toBe( 'gpt-6-astra' );
+		expect( runs[ 1 ].config.connection?.model.modelId ).toBe( 'gpt-6-luna' );
 		const reopened = await openStudioSession( root, old.getSessionFile()! );
 		expect( readChatGptSessionSelection( reopened.getEntries() ) ).toEqual( {
 			...INITIAL,
-			model: 'gpt-6-astra',
-			reasoningEffort: 'low',
+			reasoningEffort: 'medium',
 		} );
 		expect( ui.clearTranscript ).not.toHaveBeenCalled();
+	} );
+
+	it( 'offers only the listed models and efforts the route is qualified for', async () => {
+		const old = await previousChat();
+		const ui = terminal( [ '/model', '/exit' ], [ 'GPT-6 Luna · gpt-6-luna', 'Low' ] );
+		await runCommand( { adapter: ui, resumeSession: resume( old ) } );
+		const offered = vi
+			.mocked( ui.askUser )
+			.mock.calls.map( ( [ questions ] ) =>
+				questions[ 0 ].options.map( ( option: { label: string } ) => option.label )
+			);
+		// The account also lists GPT-6 Astra, which isn't qualified on this route.
+		expect( offered ).toEqual( [ [ 'GPT-6 Luna · gpt-6-luna' ], [ 'Low', 'Medium' ] ] );
 	} );
 
 	it( 'preserves the account on /clear while dropping the previous conversation', async () => {
@@ -328,7 +340,7 @@ describe( 'ChatGPT interactive CLI', () => {
 		const old = await previousChat();
 		const ui = terminal(
 			[ '/chatgpt', 'Still here' ],
-			[ 'Select saved account', `Work · ${ B }`, 'GPT-6 Luna · gpt-6-luna', 'High', 'Cancel' ]
+			[ 'Select saved account', `Work · ${ B }`, 'GPT-6 Luna · gpt-6-luna', 'Low', 'Cancel' ]
 		);
 		await runCommand( { adapter: ui, resumeSession: resume( old ) } );
 		expect( runs[ 0 ].sessionId ).toBe( old.getSessionId() );
