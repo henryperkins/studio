@@ -910,33 +910,6 @@ it( 'rejects any SDK spawn command, cwd or environment that changes the qualifie
 	).toBe( false );
 } );
 
-it( 'waits for an owned child to exit and kills a stalled child before releasing its lock', async () => {
-	const { settleNativeProcess } = await import( '../runtime' );
-	let killed = false;
-	let exited = false;
-	let listener: () => void = () => {};
-	const child = {
-		get exitCode() {
-			return exited ? 0 : null;
-		},
-		get signalCode() {
-			return null;
-		},
-		once: ( _event: string, fn: () => void ) => {
-			listener = fn;
-		},
-		off: () => {},
-		kill: () => {
-			killed = true;
-			exited = true;
-			listener();
-			return true;
-		},
-	};
-	expect( await settleNativeProcess( child, 10 ) ).toBe( true );
-	expect( killed ).toBe( true );
-} );
-
 it( 'deduplicates discovered model aliases by canonical ID without inventing effort levels', async () => {
 	const q = {
 		initializationResult: async () => ( { hooks_applied: true, hook_on_failure_supported: true } ),
@@ -1734,6 +1707,306 @@ it( 'keeps a conversation on the Claude account it started with, adopting it for
 			outcome: expect.objectContaining( { code: 'rebind_required' } ),
 			queried: 0,
 		} );
+	} finally {
+		await fixture.cleanup();
+	}
+} );
+
+// A native executable on disk, so the identity check before the spawn holds,
+// and an owned process that records what the runtime asks of it.
+async function ownedNativeFixture(
+	prefix: string,
+	owned: { ready?: boolean; clean?: boolean } = {}
+) {
+	const { EventEmitter } = await import( 'events' );
+	const { PassThrough } = await import( 'stream' );
+	const fixture = await runtimeFixture( prefix );
+	const executable = path.join( fixture.config, 'claude.exe' );
+	await writeFile( executable, 'native fixture' );
+	const found = await stat( executable, { bigint: true } );
+	const order: string[] = [];
+	const spawnOwned = vi.fn( () => {
+		const child = Object.assign( new EventEmitter(), {
+			pid: 4321,
+			exitCode: null,
+			signalCode: null,
+			stdin: new PassThrough(),
+			stdout: new PassThrough(),
+			stderr: new PassThrough(),
+		} );
+		return {
+			child,
+			ready: async () => {
+				order.push( 'owned-ready' );
+				return owned.ready ?? true;
+			},
+			identity: () => ( { pid: 4321, start: '1' } ),
+			inspect: async () => ( { live: [], uncertain: false } ),
+			requestShutdown: async () => {},
+			waitForExit: async () => true,
+			terminate: async () => owned.clean ?? true,
+			shutdown: async () => {
+				order.push( 'owned-shutdown' );
+				return owned.clean ?? true;
+			},
+		};
+	} );
+	return {
+		...fixture,
+		order,
+		spawnOwned:
+			spawnOwned as unknown as typeof import('@studio/common/lib/owned-process').spawnOwnedProcess,
+		connection: async () => ( { id: 'native', executablePath: executable } ),
+		prepare: async () => ( {
+			ok: true as const,
+			executablePath: executable,
+			executableIdentity: {
+				path: executable,
+				size: Number( found.size ),
+				device: found.dev.toString(),
+				inode: found.ino.toString(),
+				modified: found.mtimeNs.toString(),
+				changed: found.ctimeNs.toString(),
+				sha256: createHash( 'sha256' ).update( 'native fixture' ).digest( 'hex' ),
+			},
+			cwd: fixture.root,
+			configDirectory: fixture.config,
+			projectsDirectory: fixture.projects,
+			env: {},
+			identity: { email: 'user@example.com', subscriptionType: 'max' },
+		} ),
+		account: async () => ( {
+			state: 'signed-in' as const,
+			identity: { email: 'user@example.com', subscriptionType: 'max' },
+		} ),
+	};
+}
+
+// A mock SDK that launches its process the way the real one does, then runs `onTurn` after init.
+function spawningNativeTurn(
+	cwd: string,
+	onTurn: ( options: Record< string, unknown > ) => Promise< 'result' | 'end' >
+) {
+	return vi.fn(
+		( input: { prompt: AsyncIterable< unknown >; options: Record< string, unknown > } ) => {
+			const options = input.options;
+			( options.spawnClaudeCodeProcess as ( invocation: Record< string, unknown > ) => unknown )( {
+				command: options.pathToClaudeCodeExecutable,
+				args: [],
+				cwd: options.cwd,
+				env: options.env,
+				signal: new AbortController().signal,
+			} );
+			return {
+				initializationResult: async () => ( {
+					hooks_applied: true,
+					hook_on_failure_supported: true,
+				} ),
+				accountInfo: async () => nativeAccount( 'user@example.com' ),
+				mcpServerStatus: async () => [
+					{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+				],
+				supportedModels: async () => [
+					{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+				],
+				close: () => {},
+				async *[ Symbol.asyncIterator ]() {
+					for await ( const _prompt of input.prompt ) {
+						yield {
+							type: 'system',
+							subtype: 'init',
+							session_id: options.sessionId,
+							permissionMode: 'default',
+							plugins: [],
+							tools: [ 'Read', 'mcp__studio__wp_cli' ],
+							cwd,
+							apiKeySource: 'none',
+							claude_code_version: '2.1.319',
+							model: 'sonnet',
+							mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
+						};
+						if ( ( await onTurn( options ) ) === 'result' )
+							yield {
+								type: 'result',
+								subtype: 'success',
+								is_error: false,
+								num_turns: 1,
+								session_id: options.sessionId,
+							};
+					}
+				},
+			};
+		}
+	);
+}
+
+it( 'on cancel ends the pending approval before the native process hears of it, then stops the owned tree, and runs no queued host operation (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createNativeSessionStore } = await import( '../sessions' );
+	const { Client } = await import( '@modelcontextprotocol/sdk/client/index.js' );
+	// The SDK's wildcard export resolves at runtime, although the ESLint resolver misses it.
+	// eslint-disable-next-line import-x/no-unresolved
+	const { InMemoryTransport } = await import( '@modelcontextprotocol/sdk/inMemory.js' );
+	const fixture = await ownedNativeFixture( 'claude-cancel-' );
+	try {
+		const site = {
+			id: 'site',
+			path: fixture.root,
+			name: 'site',
+			url: 'http://localhost',
+			phpVersion: '8.4',
+		};
+		vi.mocked( fixture.host.sites.resolve ).mockResolvedValue( site );
+		const turn = new AbortController();
+		const query = spawningNativeTurn( fixture.root, async ( options ) => {
+			const stopped = new Promise< void >( ( resolve ) =>
+				( options.abortController as AbortController ).signal.addEventListener(
+					'abort',
+					() => {
+						fixture.order.push( 'native-abort' );
+						resolve();
+					},
+					{ once: true }
+				)
+			);
+			const [ clientTransport, serverTransport ] = InMemoryTransport.createLinkedPair();
+			const client = new Client( { name: 'studio-test', version: '1.0.0' } );
+			const server = (
+				options.mcpServers as { studio: { instance: { connect( t: unknown ): Promise< void > } } }
+			 ).studio.instance;
+			await Promise.all( [ server.connect( serverTransport ), client.connect( clientTransport ) ] );
+			void client
+				.callTool( {
+					name: 'wp_cli',
+					arguments: {
+						nameOrPath: 'site',
+						command: 'post create --post_status=draft --post_title=Hello',
+					},
+				} )
+				.catch( () => {} );
+			await stopped;
+			return 'end';
+		} );
+		const events: Array< { type: string; outcome?: { status: string } } > = [];
+		await runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'turn' ),
+			fixture.host,
+			{ prompt: 'hello', signal: turn.signal, onEvent: ( event ) => events.push( event ) },
+			{
+				storeRoot: fixture.storeRoot,
+				approve: ( _request, signal ) => {
+					fixture.order.push( 'approval-requested' );
+					signal.addEventListener( 'abort', () => fixture.order.push( 'approval-cancelled' ), {
+						once: true,
+					} );
+					// The user stops the turn while the approval waits.
+					queueMicrotask( () => turn.abort() );
+					return new Promise( () => {} );
+				},
+				verifyTarget: async () => true,
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				spawnOwned: fixture.spawnOwned,
+				connection: fixture.connection,
+				prepare: fixture.prepare,
+				account: fixture.account,
+			}
+		);
+		expect( fixture.order ).toEqual( [
+			'owned-ready',
+			'approval-requested',
+			'approval-cancelled',
+			'native-abort',
+			'owned-shutdown',
+		] );
+		expect( fixture.host.sites.wpCli ).not.toHaveBeenCalled();
+		expect( events.filter( ( event ) => event.type === 'turn.terminal' ) ).toEqual( [
+			expect.objectContaining( { outcome: expect.objectContaining( { status: 'interrupted' } ) } ),
+		] );
+		expect( events.map( ( event ) => event.type ) ).toContain( 'approval.resolved' );
+		await (
+			await createNativeSessionStore( fixture.storeRoot ).lockTurn( 'chat' )
+		)();
+	} finally {
+		await fixture.cleanup();
+	}
+} );
+
+it( 'reports no success and keeps the run lock when the owned tree cannot be confirmed gone (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createNativeSessionStore } = await import( '../sessions' );
+	const fixture = await ownedNativeFixture( 'claude-unclean-', { clean: false } );
+	try {
+		const events: Array< { type: string; outcome?: { status: string } } > = [];
+		await runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'turn' ),
+			fixture.host,
+			{
+				prompt: 'hello',
+				signal: new AbortController().signal,
+				onEvent: ( event ) => events.push( event ),
+			},
+			{
+				storeRoot: fixture.storeRoot,
+				approve: async () => 'deny',
+				verifyTarget: async () => true,
+				query: spawningNativeTurn(
+					fixture.root,
+					async () => 'result'
+				) as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				spawnOwned: fixture.spawnOwned,
+				connection: fixture.connection,
+				prepare: fixture.prepare,
+				account: fixture.account,
+			}
+		);
+		expect( fixture.order ).toEqual( [ 'owned-ready', 'owned-shutdown' ] );
+		expect( events.filter( ( event ) => event.type === 'turn.terminal' ) ).toEqual( [
+			expect.objectContaining( { outcome: expect.objectContaining( { status: 'error' } ) } ),
+		] );
+		await expect(
+			createNativeSessionStore( fixture.storeRoot ).lockTurn( 'chat' )
+		).rejects.toThrow();
+	} finally {
+		await fixture.cleanup();
+	}
+} );
+
+it( 'sends no prompt to a native process whose tree could not be owned (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const fixture = await ownedNativeFixture( 'claude-unowned-', { ready: false } );
+	try {
+		const onTurn = vi.fn( async () => 'result' as const );
+		const events: Array< { type: string; outcome?: { status: string } } > = [];
+		await runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'turn' ),
+			fixture.host,
+			{
+				prompt: 'hello',
+				signal: new AbortController().signal,
+				onEvent: ( event ) => events.push( event ),
+			},
+			{
+				storeRoot: fixture.storeRoot,
+				approve: async () => 'deny',
+				verifyTarget: async () => true,
+				query: spawningNativeTurn(
+					fixture.root,
+					onTurn
+				) as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				spawnOwned: fixture.spawnOwned,
+				connection: fixture.connection,
+				prepare: fixture.prepare,
+				account: fixture.account,
+			}
+		);
+		expect( onTurn ).not.toHaveBeenCalled();
+		expect( fixture.order ).toEqual( [ 'owned-ready', 'owned-shutdown' ] );
+		expect( events ).toEqual( [
+			expect.objectContaining( {
+				type: 'turn.terminal',
+				outcome: expect.objectContaining( { status: 'error' } ),
+			} ),
+		] );
 	} finally {
 		await fixture.cleanup();
 	}

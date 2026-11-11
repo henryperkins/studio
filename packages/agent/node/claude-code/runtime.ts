@@ -1,7 +1,7 @@
-import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
+import { spawnOwnedProcess } from '@studio/common/lib/owned-process';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
 import {
 	isClaudeEffort,
@@ -43,6 +43,7 @@ import type {
 } from '@studio/agent/protocol/backend-events';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type { ClaudeModelOption, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
+import type { OwnedProcess } from '@studio/common/lib/owned-process';
 
 interface StartupControl {
 	initializationResult(): Promise< {
@@ -169,35 +170,6 @@ export function isQualifiedClaudeSpawn(
 	return true;
 }
 
-export async function settleNativeProcess(
-	child: {
-		exitCode: number | null;
-		signalCode: NodeJS.Signals | null;
-		once( event: 'exit', listener: () => void ): unknown;
-		off( event: 'exit', listener: () => void ): unknown;
-		kill( signal: NodeJS.Signals ): boolean;
-	},
-	graceMs = 3000
-): Promise< boolean > {
-	const wait = () =>
-		new Promise< boolean >( ( resolve ) => {
-			if ( child.exitCode !== null || child.signalCode !== null ) return resolve( true );
-			const done = () => {
-				clearTimeout( timer );
-				child.off( 'exit', done );
-				resolve( true );
-			};
-			const timer = setTimeout( () => {
-				child.off( 'exit', done );
-				resolve( false );
-			}, graceMs );
-			child.once( 'exit', done );
-		} );
-	if ( await wait() ) return true;
-	child.kill( 'SIGKILL' );
-	return wait();
-}
-
 interface RuntimeInput {
 	prompt: string;
 	images?: StudioChatImage[];
@@ -228,6 +200,8 @@ interface RuntimeDependencies {
 	/** The native sign-in now, read with the prepared binary from the runtime's own status. */
 	account?: ( request: ClaudeAccountStatusRequest ) => Promise< ClaudeAccountStatus >;
 	clock?: () => number;
+	/** Starts the native process as an owned process tree. */
+	spawnOwned?: typeof spawnOwnedProcess;
 }
 
 interface RuntimeOptions extends RuntimeDependencies {
@@ -250,7 +224,8 @@ async function findSavedConnection( id: string ) {
 function nativeLaunchOptions(
 	prepared: Extract< Prepared, { ok: true } >,
 	controller: AbortController,
-	onChild: ( child: ReturnType< typeof spawn > ) => void
+	launch: { spawnOwned?: typeof spawnOwnedProcess; supervise: boolean },
+	onOwned: ( owned: OwnedProcess ) => void
 ): Options {
 	const env = { ...prepared.env, CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1' };
 	return {
@@ -268,16 +243,23 @@ function nativeLaunchOptions(
 				! isClaudeExecutableUnchanged( prepared.executableIdentity )
 			)
 				throw new Error( 'Unexpected native process invocation' );
-			const child = spawn( invocation.command, invocation.args, {
-				cwd: invocation.cwd,
-				env: invocation.env,
-				signal: invocation.signal,
-				windowsHide: true,
-				stdio: 'pipe',
+			const owned = ( launch.spawnOwned ?? spawnOwnedProcess )(
+				invocation.command,
+				invocation.args,
+				{
+					cwd: invocation.cwd,
+					env: invocation.env,
+					supervise: launch.supervise,
+				}
+			);
+			onOwned( owned );
+			// The SDK aborts this once it stops waiting for the process to exit;
+			// escalation stays with the owned shutdown, within the owned tree.
+			invocation.signal?.addEventListener( 'abort', () => void owned.requestShutdown(), {
+				once: true,
 			} );
-			onChild( child );
-			child.stderr.resume();
-			return child;
+			owned.child.stderr.resume();
+			return owned.child;
 		},
 		tools: claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, prepared.cwd ),
 		...( CLAUDE_SHELL_CONFINEMENT.mode === 'sandbox'
@@ -338,7 +320,7 @@ export async function discoverClaudeModels(
 ) {
 	const failed = { ok: false as const, blockers: [ 'native-runtime-unqualified' ] };
 	const controller = new AbortController();
-	let child: ReturnType< typeof spawn > | undefined;
+	let owned: OwnedProcess | undefined;
 	let sdk: ReturnType< typeof sdkQuery > | undefined;
 	let server: ReturnType< typeof createStudioClaudeMcpServer > | undefined;
 	const done = new Promise< IteratorResult< SDKUserMessage > >( ( resolve ) => {
@@ -369,9 +351,17 @@ export async function discoverClaudeModels(
 		sdk = ( dependencies.query ?? sdkQuery )( {
 			prompt: { [ Symbol.asyncIterator ]: () => ( { next: () => done } ) },
 			options: {
-				...nativeLaunchOptions( prepared, controller, ( process ) => {
-					child = process;
-				} ),
+				// Discovery sends no prompt, so nothing it starts can run a tool; it
+				// also runs in the Desktop's main process, which is not a Node binary
+				// a supervisor could run on.
+				...nativeLaunchOptions(
+					prepared,
+					controller,
+					{ spawnOwned: dependencies.spawnOwned, supervise: false },
+					( started ) => {
+						owned = started;
+					}
+				),
 				persistSession: false,
 				mcpServers: { studio: server },
 				hooks: {
@@ -403,7 +393,7 @@ export async function discoverClaudeModels(
 			result = failed;
 		}
 		try {
-			if ( child && ! ( await settleNativeProcess( child ) ) ) result = failed;
+			if ( owned && ! ( await owned.shutdown() ) ) result = failed;
 			await server?.instance.close();
 		} catch {
 			result = failed;
@@ -441,12 +431,18 @@ export async function runClaudeTurn(
 		},
 	} );
 	const controller = new AbortController();
-	const cancel = () => controller.abort();
+	let policy: ReturnType< typeof createClaudeExecutionPolicy > | undefined;
+	// Stopping first makes the policy refuse every new operation and end every
+	// pending approval; only then does the native process hear of it.
+	const cancel = () => {
+		policy?.dispose();
+		controller.abort();
+	};
 	input.signal.addEventListener( 'abort', cancel, { once: true } );
 	const timer = setTimeout( cancel, 30 * 60 * 1000 );
 	let release: ( () => Promise< void > ) | undefined;
 	let native: ReturnType< typeof sdkQuery > | undefined;
-	let ownedChild: ReturnType< typeof spawn > | undefined;
+	let owned: OwnedProcess | undefined;
 	let bridge: ReturnType< typeof createStudioClaudeToolBridge > | undefined;
 	let openGate: ( allow: boolean ) => void = () => {};
 	const gate = new Promise< boolean >( ( resolve ) => {
@@ -456,7 +452,7 @@ export async function runClaudeTurn(
 	let stopReason: 'detached' | 'account' | 'account-unverified' | undefined;
 	const stop = ( reason: 'detached' | 'account' | 'account-unverified' ) => {
 		stopReason ??= reason;
-		controller.abort();
+		cancel();
 	};
 	let connectionWatch: ReturnType< typeof setTimeout > | undefined;
 	const failIfSuccessful = () => {
@@ -649,11 +645,11 @@ export async function runClaudeTurn(
 				.then( () => journal!.append( event ) )
 				.catch( () => {
 					journalFailed = true;
-					controller.abort();
+					cancel();
 				} );
 			input.onEvent( event );
 		};
-		const policy = createClaudeExecutionPolicy( {
+		policy = createClaudeExecutionPolicy( {
 			runId,
 			turnId,
 			connectionId: selection.connectionId,
@@ -684,9 +680,10 @@ export async function runClaudeTurn(
 			verifyTarget: ( expected ) => options.verifyTarget( snapshot, expected ),
 			onEvent: emit,
 		} );
-		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy }, emit );
+		const guard = policy;
+		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy: guard }, emit );
 		const watchConnection = async () => {
-			const unchanged = ( await verifyConnection() ) && ( await policy.refreshAccount() );
+			const unchanged = ( await verifyConnection() ) && ( await guard.refreshAccount() );
 			if ( controller.signal.aborted || ! unchanged ) return;
 			connectionWatch = setTimeout( () => void watchConnection(), 1000 ).unref();
 		};
@@ -720,9 +717,14 @@ export async function runClaudeTurn(
 		native = ( options.query ?? sdkQuery )( {
 			prompt: nativeInput(),
 			options: {
-				...nativeLaunchOptions( prepared, controller, ( child ) => {
-					ownedChild = child;
-				} ),
+				...nativeLaunchOptions(
+					prepared,
+					controller,
+					{ spawnOwned: options.spawnOwned, supervise: true },
+					( started ) => {
+						owned = started;
+					}
+				),
 				...( existing
 					? { resume: session.nativeSessionId }
 					: { sessionId: session.nativeSessionId } ),
@@ -733,7 +735,7 @@ export async function runClaudeTurn(
 				// The hook and the permission request each apply the whole policy, so
 				// a native allow rule that skips one cannot skip the Studio guard.
 				canUseTool: async ( name, toolInput, { mcpServer, toolUseID, signal } ) =>
-					( await policy.authorizeToolUse(
+					( await guard.authorizeToolUse(
 						{ toolName: name, input: toolInput, toolUseId: toolUseID, mcpServer },
 						signal
 					) )
@@ -754,7 +756,7 @@ export async function runClaudeTurn(
 										hookEventName: 'PreToolUse',
 										permissionDecision:
 											hook.hook_event_name === 'PreToolUse' &&
-											( await policy.authorizeToolUse(
+											( await guard.authorizeToolUse(
 												{
 													toolName: hook.tool_name,
 													input: hook.tool_input,
@@ -782,6 +784,8 @@ export async function runClaudeTurn(
 		);
 		if ( ! qualification.ok || controller.signal.aborted || ! ( await stillConnected() ) )
 			throw new Error();
+		// No prompt reaches a native process whose tree Studio could not take ownership of.
+		if ( owned && ! ( await owned.ready() ) ) throw new Error();
 		if ( ! accountKey ) throw new Error();
 		if ( ! existing ) await store.create( session );
 		else if ( ! existing.accountKey )
@@ -843,6 +847,9 @@ export async function runClaudeTurn(
 				? { type: 'turn.terminal', runId, turnId, outcome: { status: 'interrupted' } }
 				: fail();
 	} finally {
+		// The policy first, then a graceful stop (the SDK ends the native input),
+		// then a bounded wait and escalation within the owned tree only.
+		policy?.dispose();
 		openGate( false );
 		controller.abort();
 		clearTimeout( connectionWatch );
@@ -853,7 +860,7 @@ export async function runClaudeTurn(
 		}
 		let stopped = true;
 		try {
-			if ( ownedChild ) stopped = await settleNativeProcess( ownedChild );
+			if ( owned ) stopped = await owned.shutdown();
 		} catch {
 			stopped = false;
 		}
