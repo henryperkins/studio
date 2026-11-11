@@ -8,6 +8,8 @@ import {
 	CLAUDE_STUDIO_TOOL_RULES,
 	HOST_OPERATION_CLASSES,
 	claudeNativeTools,
+	claudeStudioTools,
+	claudeTargetOrigin,
 	classifyWpCliArgs,
 	describeClaudeOperation,
 	hasWpCliOverrides,
@@ -16,12 +18,14 @@ import {
 	isInsideCanonicalRoot,
 	isLocalHostname,
 	isRecord,
+	normalizeHostname,
 	requiresClaudeApproval,
 	studioToolName,
 	wpCliOption,
 } from './execution-rules';
 import type {
 	ClaudeEnabledTools,
+	ClaudeNavigationConfinement,
 	ClaudeShellConfinement,
 	HostOperationName,
 } from './execution-rules';
@@ -99,6 +103,8 @@ export interface ClaudeExecutionContext {
 	enabledTools: ClaudeEnabledTools;
 	/** How the turn's launch confines shell commands. */
 	shellConfinement: ClaudeShellConfinement;
+	/** The browser-layer guard the turn's browser tools run under, if any. */
+	navigationConfinement: ClaudeNavigationConfinement;
 	signal: AbortSignal;
 	approve: ClaudeApprover;
 	approvalTimeoutMs: number;
@@ -226,7 +232,10 @@ export function createClaudeExecutionPolicy(
 			context.workspace.workingDirectory
 		)
 	);
-	const studioTools = new Set( context.enabledTools.studio );
+	const targetOrigin = claudeTargetOrigin( context.target, context.targetSite );
+	const studioTools = new Set(
+		claudeStudioTools( context.enabledTools, context.navigationConfinement, targetOrigin )
+	);
 	// The target the conversation should still have: the one sent, or the site
 	// this turn created, which it recorded for the next turn.
 	let persisted: ClaudeStudioTarget = context.target;
@@ -512,7 +521,8 @@ export function createClaudeExecutionPolicy(
 	// The origin a URL may be opened at, if any. Only http and https. A local
 	// address, or the address of any local site, must be the target site's own
 	// origin; a public page is an external read. A URL a site audit composes
-	// must be that site's own origin.
+	// must be that site's own origin. Host names are compared normalized; a name
+	// that resolves to a local address is the navigation guard's to refuse.
 	async function reachableOrigin(
 		host: StudioAgentHost,
 		url: string,
@@ -530,23 +540,15 @@ export function createClaudeExecutionPolicy(
 			parsed.password
 		)
 			return;
-		let targetOrigin: string | undefined;
-		try {
-			targetOrigin =
-				context.target.environment !== 'global' && context.targetSite?.url
-					? new URL( context.targetSite.url ).origin
-					: undefined;
-		} catch {
-			targetOrigin = undefined;
-		}
 		if ( parsed.origin === targetOrigin ) return parsed.origin;
 		if ( onSite ) return;
-		if ( isLocalHostname( parsed.hostname ) ) return;
+		const hostname = normalizeHostname( parsed.hostname );
+		if ( isLocalHostname( hostname ) ) return;
 		try {
 			const siteHosts = ( await host.sites.all() ).map( ( item ) =>
-				new URL( item.url ).hostname.toLowerCase()
+				normalizeHostname( new URL( item.url ).hostname )
 			);
-			if ( siteHosts.includes( parsed.hostname.toLowerCase() ) ) return;
+			if ( siteHosts.includes( hostname ) ) return;
 		} catch {
 			return;
 		}

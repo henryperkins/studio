@@ -1324,6 +1324,7 @@ it( 'stops the turn within the recheck bound when the stored sign-in changes or 
 		] ) {
 			let stored = status( 'user@example.com' );
 			const now = { value: 1_000 };
+			const preflight = 400;
 			const decisions: string[] = [];
 			const query = fakeNativeTurn( fixture.root, {
 				onTurn: async ( options ) => {
@@ -1357,7 +1358,8 @@ it( 'stops the turn within the recheck bound when the stored sign-in changes or 
 						);
 					await read();
 					stored = change;
-					now.value += CLAUDE_ACCOUNT_RECHECK_MS - 1;
+					// The bound counts from when the preflight read started.
+					now.value += CLAUDE_ACCOUNT_RECHECK_MS - 1 - preflight;
 					await read();
 					now.value += 1;
 					await read();
@@ -1389,15 +1391,18 @@ it( 'stops the turn within the recheck bound when the stored sign-in changes or 
 						readClaudeAccountStatus( executable, cwd, config, async () => ( { stdout: stored } ) ),
 					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
 					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
-					prepare: async () => ( {
-						ok: true,
-						executablePath: 'fake',
-						cwd: fixture.root,
-						configDirectory: fixture.config,
-						projectsDirectory: fixture.projects,
-						env: {},
-						identity: { email: 'user@example.com', subscriptionType: 'max' },
-					} ),
+					prepare: async () => {
+						now.value += preflight;
+						return {
+							ok: true,
+							executablePath: 'fake',
+							cwd: fixture.root,
+							configDirectory: fixture.config,
+							projectsDirectory: fixture.projects,
+							env: {},
+							identity: { email: 'user@example.com', subscriptionType: 'max' },
+						};
+					},
 				}
 			);
 			expect( decisions, code ).toEqual( [ 'allow', 'allow', 'deny' ] );

@@ -22,8 +22,10 @@ import {
 	CLAUDE_APPROVAL_TIMEOUT_MS,
 	CLAUDE_ENABLED_TOOLS,
 	CLAUDE_HOOK_TIMEOUT_SECONDS,
+	CLAUDE_NAVIGATION_CONFINEMENT,
 	CLAUDE_SHELL_CONFINEMENT,
 	claudeNativeTools,
+	claudeTargetOrigin,
 	claudeToolInventory,
 } from './execution-rules';
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
@@ -533,14 +535,14 @@ export async function runClaudeTurn(
 			}
 			targetSite = { id: target.siteId, path: sitePath, url: site.url };
 		}
+		const clock = options.clock ?? Date.now;
+		const accountVerifiedAt = clock();
 		const prepared = await ( options.prepare ?? prepareClaudeInvocation )(
 			connection.executablePath,
 			workspace.workingDirectory,
 			connection.configDirectory
 		);
 		if ( ! prepared.ok ) throw new Error();
-		const clock = options.clock ?? Date.now;
-		const accountVerifiedAt = clock();
 		if (
 			prepared.cwd !== workspace.workingDirectory ||
 			prepared.configDirectory !== workspace.configDirectory
@@ -661,6 +663,7 @@ export async function runClaudeTurn(
 					: [ prepared.cwd ],
 			enabledTools: CLAUDE_ENABLED_TOOLS,
 			shellConfinement: CLAUDE_SHELL_CONFINEMENT,
+			navigationConfinement: CLAUDE_NAVIGATION_CONFINEMENT,
 			signal: controller.signal,
 			approve: options.approve,
 			approvalTimeoutMs: CLAUDE_APPROVAL_TIMEOUT_MS,
@@ -785,7 +788,9 @@ export async function runClaudeTurn(
 		const inventory = claudeToolInventory(
 			CLAUDE_ENABLED_TOOLS,
 			CLAUDE_SHELL_CONFINEMENT,
-			prepared.cwd
+			prepared.cwd,
+			CLAUDE_NAVIGATION_CONFINEMENT,
+			claudeTargetOrigin( target, targetSite )
 		);
 		for await ( const message of native ) {
 			if ( controller.signal.aborted ) break;

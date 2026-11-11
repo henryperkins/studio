@@ -97,3 +97,115 @@ it( 'denies the requests that would reach another site or origin than they name'
 	] )
 		expect( scope( args ), JSON.stringify( args ) ).toBeUndefined();
 } );
+
+// The site in a path the server received, or `null` for an account path.
+function receivedScope( request: string ): { wpcomSiteId?: number } | null | undefined {
+	const route = /^\/(?:rest\/v1\.1|wp\/v2|wpcom\/v2)(\/[^?]*)/.exec( request )?.[ 1 ];
+	if ( route === undefined ) return;
+	const site = /^\/sites\/(\d+)(?:\/|$)/.exec( route )?.[ 1 ];
+	if ( site !== undefined ) return { wpcomSiteId: Number( site ) };
+	return [ '/me', '/plans/features' ].includes( route ) ? null : undefined;
+}
+
+it( 'denies paths the client would normalize onto another site, which it really does', async () => {
+	const scope = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+	for ( const args of [
+		{ siteId: 42, method: 'GET', path: '/.\t./7/posts' },
+		{ siteId: 42, method: 'GET', path: '/.\n./7/posts' },
+		{ siteId: 42, method: 'GET', path: '/.\r./7/posts' },
+		{ siteId: 42, method: 'GET', path: '!/sites/42/.\t./7/posts' },
+	] ) {
+		expect( await send( args ), JSON.stringify( args ) ).toEqual( [ '/wp/v2/sites/7/posts' ] );
+		expect( scope( args ), JSON.stringify( args ) ).toBeUndefined();
+	}
+} );
+
+it( 'either denies a hostile path or sends it to exactly the site it allowed', async () => {
+	const scope = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+	const suffixes = [
+		'/posts',
+		'posts',
+		'/./posts',
+		'/templates/twentytwentyfour//home',
+		'/media/caf%C3%A9',
+		'/.\t./7/posts',
+		'/.\n./7/posts',
+		'/.\r./7/posts',
+		'/\t../7/posts',
+		'/..\t/7/posts',
+		'/.\u000b./7/posts',
+		'/.\u000c./7/posts',
+		'/.\u0000./7/posts',
+		'/ ../7/posts',
+		'/.. /7/posts',
+		'/../7/posts',
+		'/./../7/posts',
+		'/%2e%2e/7/posts',
+		'/%2E%2E/7/posts',
+		'/.%2e/7/posts',
+		'/%2e./7/posts',
+		'/..%2f7/posts',
+		'/%2f..%2f7/posts',
+		'/..%5c7/posts',
+		'/..%5C7/posts',
+		'/..\\7/posts',
+		'\\..\\7\\posts',
+		'/..;/7/posts',
+		'/%252e%252e/7/posts',
+		'/.%09./7/posts',
+		'/.%0a./7/posts',
+		'/.%0D./7/posts',
+		'/.%00./7/posts',
+		'/.%7f./7/posts',
+		'/%c0%ae%c0%ae/7/posts',
+		'/%e0%80%ae%e0%80%ae/7/posts',
+		'/%ff/7/posts',
+		'/\u3002\u3002/7/posts',
+		'/\uff0e\uff0e/7/posts',
+		'/.\u00ad./7/posts',
+		'/..\u2028/7/posts',
+		'/posts#/../../7',
+		'/posts?/../../7',
+		'//7/posts',
+		'/../../../rest/v1.1/me',
+	];
+	const cases: Array< Record< string, unknown > > = [];
+	for ( const suffix of suffixes )
+		for ( const apiNamespace of [ undefined, '', 'wpcom/v2' ] ) {
+			cases.push( { siteId: 42, method: 'GET', path: suffix, apiNamespace } );
+			cases.push( { siteId: 42, method: 'GET', path: `!/sites/42${ suffix }`, apiNamespace } );
+		}
+	for ( const path of [
+		'!/sites/7/posts',
+		'!/sites/42',
+		'!//sites/7/posts',
+		'!/sites/042/posts',
+		'!/sites/+7/posts',
+		'!/sites/4\t2/posts',
+		'!/sites/42%2f..%2f7/posts',
+		'!/me',
+		'!/me/../sites/7/posts',
+		'!/me\t',
+		'!/ME',
+		'!/plans/features',
+		'!sites/7/posts',
+		'!/sites/9007199254740993/posts',
+	] )
+		cases.push( { siteId: 42, method: 'GET', path, apiNamespace: '' } );
+	for ( const siteId of [ '7', 42.5, -7, 0, 7, Number.MAX_SAFE_INTEGER + 2 ] )
+		cases.push( { siteId, method: 'GET', path: '/posts' } );
+
+	let allowed = 0;
+	for ( const args of cases ) {
+		const decided = scope( args );
+		if ( decided === undefined ) continue;
+		allowed++;
+		const received = await send( args );
+		expect( received, JSON.stringify( args ) ).toHaveLength( 1 );
+		expect( receivedScope( received[ 0 ] ), JSON.stringify( args ) ).toEqual(
+			decided.wpcomSiteId === undefined ? null : decided
+		);
+	}
+	// The table holds legitimate requests too, so the comparison above really ran.
+	expect( allowed ).toBeGreaterThanOrEqual( 30 );
+} );

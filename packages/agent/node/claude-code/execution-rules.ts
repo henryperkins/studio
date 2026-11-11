@@ -31,7 +31,7 @@ import { validateBlocksTool } from '../tools/validate-blocks';
 import { runWpCliTool } from '../tools/wp-cli';
 import { wpcomRequestTool } from '../tools/wpcom-request';
 import type { SandboxSettings } from '@anthropic-ai/claude-agent-sdk/core';
-import type { ClaudeOperationClass } from '@studio/agent/protocol/claude-code';
+import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
 // What each operation is, independent of any turn. The execution policy applies
 // these rules immediately before execution.
@@ -78,6 +78,107 @@ export type ClaudeShellConfinement =
 
 /** This build configures no shell confinement, so no shell tool can be enabled. */
 export const CLAUDE_SHELL_CONFINEMENT: ClaudeShellConfinement = Object.freeze( { mode: 'none' } );
+
+/** The revision of the origin rule a navigation guard must apply. */
+export const CLAUDE_NAVIGATION_RULE_REVISION = 1;
+
+/**
+ * What a browser-layer guard guarantees for every page a Studio tool opens. A
+ * host name check cannot bind a browser: a public name can resolve to this
+ * machine, and a page can redirect or load from anywhere. So a tool that opens
+ * a URL in a browser can be enabled only under a guard declaring all of these,
+ * for this rule revision and this turn's target.
+ */
+export interface ClaudeNavigationGuard {
+	/** `CLAUDE_NAVIGATION_RULE_REVISION`. */
+	readonly ruleRevision: number;
+	/** The target site's own origin, or null for a global target. */
+	readonly targetOrigin: string | null;
+	/**
+	 * Every request the browser sends for the tool passes the guard before it
+	 * connects: navigations, frames, subresources, fetches, workers, WebSockets
+	 * and prefetches, not only the first URL.
+	 */
+	readonly checksEveryRequest: true;
+	/** Each redirect hop is checked as a new request before it is followed. */
+	readonly checksEveryRedirect: true;
+	/**
+	 * The policy's origin rule, on host names normalized as `normalizeHostname`
+	 * does: http and https only, no credentials, and a local host name or a
+	 * local site's host name only at `targetOrigin`.
+	 */
+	readonly appliesOriginRule: true;
+	/**
+	 * The guard resolves every host name and refuses a loopback, unspecified,
+	 * private, shared, link-local or unique-local address, in any IPv4 or IPv6
+	 * form, unless the request is to `targetOrigin`.
+	 */
+	readonly checksResolvedAddresses: true;
+	/** The browser connects only to the address the guard checked; nothing resolves the name again. */
+	readonly pinsCheckedAddress: true;
+	/**
+	 * A refused or unverifiable request fails, and the tool reports an error; a
+	 * guard that cannot start stops the tool. Nothing is retried without it.
+	 */
+	readonly failsClosed: true;
+}
+
+export type ClaudeNavigationConfinement =
+	| { readonly mode: 'none' }
+	| { readonly mode: 'guarded'; readonly guard: ClaudeNavigationGuard | undefined };
+
+/** This build has no navigation guard, so no tool that opens a URL in a browser can be enabled. */
+export const CLAUDE_NAVIGATION_CONFINEMENT: ClaudeNavigationConfinement = Object.freeze( {
+	mode: 'none',
+} );
+
+const NAVIGATION_GUARANTEES = [
+	'checksEveryRequest',
+	'checksEveryRedirect',
+	'appliesOriginRule',
+	'checksResolvedAddresses',
+	'pinsCheckedAddress',
+	'failsClosed',
+] as const;
+const NAVIGATION_GUARD_KEYS: ReadonlySet< string > = new Set( [
+	'ruleRevision',
+	'targetOrigin',
+	...NAVIGATION_GUARANTEES,
+] );
+
+/**
+ * Whether a declared navigation guard can be verified: it states every
+ * guarantee and nothing else, applies this rule revision and is bound to this
+ * turn's target origin.
+ */
+export function isVerifiedNavigationGuard(
+	confinement: ClaudeNavigationConfinement,
+	targetOrigin: string | null
+): boolean {
+	if ( confinement.mode !== 'guarded' ) return false;
+	const guard: unknown = confinement.guard;
+	return (
+		isRecord( guard ) &&
+		Object.keys( guard ).every( ( key ) => NAVIGATION_GUARD_KEYS.has( key ) ) &&
+		guard.ruleRevision === CLAUDE_NAVIGATION_RULE_REVISION &&
+		guard.targetOrigin === targetOrigin &&
+		NAVIGATION_GUARANTEES.every( ( key ) => guard[ key ] === true )
+	);
+}
+
+/** The origin of a turn's target site, or null for a global target or a site without a URL. */
+export function claudeTargetOrigin(
+	target: ClaudeStudioTarget,
+	targetSite: { url?: string } | undefined
+): string | null {
+	if ( target.environment === 'global' || ! targetSite?.url ) return null;
+	try {
+		const { origin } = new URL( targetSite.url );
+		return origin === 'null' ? null : origin;
+	} catch {
+		return null;
+	}
+}
 
 const STUDIO_MCP_PREFIX = 'mcp__studio__';
 
@@ -128,6 +229,8 @@ export interface ClaudeStudioToolRule {
 	readonly urls?: ( args: unknown, siteUrl: string | undefined ) => string[] | undefined;
 	/** Every URL the call opens must be the named site's own origin. */
 	readonly urlsOnSite?: true;
+	/** Opens its URLs in a browser; it can be enabled only under a verified navigation guard. */
+	readonly navigates?: true;
 	/**
 	 * Where a call that needs approval is approved: at the host operation that
 	 * carries its effect, with that operation's exact arguments, or for the tool
@@ -173,11 +276,23 @@ function auditUrls( args: unknown, siteUrl: string | undefined ): string[] | und
 }
 
 /**
+ * A host name as every check compares it: lowercase, without IPv6 brackets and
+ * without trailing dots, which name the same host. `URL` has already applied
+ * IDNA, so a parsed host name is in its punycode form.
+ */
+export function normalizeHostname( hostname: string ): string {
+	return hostname
+		.toLowerCase()
+		.replace( /^\[|\]$/g, '' )
+		.replace( /\.+$/, '' );
+}
+
+/**
  * Whether a host name belongs to this machine or a private network: loopback,
  * private, link-local and unique-local addresses, `localhost` and `.local`.
  */
 export function isLocalHostname( hostname: string ): boolean {
-	const host = hostname.toLowerCase().replace( /^\[|\]$/g, '' );
+	const host = normalizeHostname( hostname );
 	if (
 		! host ||
 		host === 'localhost' ||
@@ -185,7 +300,10 @@ export function isLocalHostname( hostname: string ): boolean {
 		host.endsWith( '.local' )
 	)
 		return true;
-	const mapped = /^::ffff:(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/.exec( host );
+	// IPv4-mapped and IPv4-compatible IPv6 addresses carry an IPv4 address.
+	const mapped = /^::(?:ffff:)?(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/.exec(
+		host
+	);
 	const ipv4 = mapped
 		? mapped[ 1 ] ??
 		  [ parseInt( mapped[ 2 ], 16 ), parseInt( mapped[ 3 ], 16 ) ]
@@ -232,10 +350,30 @@ const WPCOM_TRANSPORT_KEYS: ReadonlySet< string > = new Set( [
 	'http_method_override',
 ] );
 
-// The WordPress.com scope of a `wpcom_request` call, decided from everything
-// the client builds the request from: the path, the namespace and the query.
-// A path that could step out of its site once the URL is normalized, or carry
-// its own query, is denied.
+// The origin the WordPress.com client sends to unless a transport option, which
+// the scope refuses, names another.
+const WPCOM_API_ORIGIN = 'https://public-api.wordpress.com';
+
+// A request path: printable ASCII path characters, and percent-escapes that do
+// not decode to whitespace, a control character, '%', '.', '/' or '\'. No
+// query, fragment, backslash or raw whitespace.
+const WPCOM_PATH =
+	/^(?:[A-Za-z0-9\-._~!$&'()*+,=:@/]|%(?![01][0-9a-f]|2[05ef]|5c|7f)[0-9a-f]{2})*$/i;
+
+function isWpcomPath( value: string ): boolean {
+	if ( ! WPCOM_PATH.test( value ) || value.includes( '..' ) ) return false;
+	try {
+		decodeURIComponent( value );
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// The WordPress.com scope of a `wpcom_request` call. The path must match the
+// grammar above; the URL is then composed exactly as the tool and client
+// compose it, parsed as the client parses it, and the scope is the site in
+// that parsed path, which for a relative path must be the site it names.
 function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefined {
 	if ( ! isRecord( args ) || typeof args.path !== 'string' ) return;
 	if (
@@ -249,19 +387,39 @@ function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefined {
 			Object.keys( args.query ).some( ( key ) => WPCOM_TRANSPORT_KEYS.has( key.toLowerCase() ) ) )
 	)
 		return;
-	const route = args.path;
-	if ( /\.\.|%2e|[\\?#]/i.test( route ) ) return;
-	if ( ! route.startsWith( '!' ) )
-		return Number.isSafeInteger( args.siteId ) ? { wpcomSiteId: args.siteId as number } : undefined;
-	const absolute = route.slice( 1 );
-	const site = /^\/sites\/([^/]+)(?:\/|$)/.exec( absolute );
+	const absolute = args.path.startsWith( '!' );
+	const requested = absolute ? args.path.slice( 1 ) : args.path;
+	if ( ( absolute && ! requested.startsWith( '/' ) ) || ! isWpcomPath( requested ) ) return;
+	const siteId = args.siteId;
+	if ( ! absolute && ! ( Number.isSafeInteger( siteId ) && ( siteId as number ) > 0 ) ) return;
+	const fullPath = absolute
+		? requested
+		: `/sites/${ siteId as number }${ requested.startsWith( '/' ) ? '' : '/' }${ requested }`;
+	const namespace = args.apiNamespace ?? 'wp/v2';
+	const base = namespace ? `/${ namespace }` : '/rest/v1.1';
+	let url: URL;
+	try {
+		url = new URL( `${ WPCOM_API_ORIGIN }${ base }${ fullPath }` );
+	} catch {
+		return;
+	}
+	if (
+		url.origin !== WPCOM_API_ORIGIN ||
+		url.username ||
+		url.password ||
+		url.search ||
+		url.hash ||
+		! url.pathname.startsWith( `${ base }/` )
+	)
+		return;
+	const route = url.pathname.slice( base.length );
+	const site = /^\/sites\/([1-9]\d*)(?:\/|$)/.exec( route );
 	if ( site ) {
 		const id = Number( site[ 1 ] );
-		return /^\d+$/.test( site[ 1 ] ) && Number.isSafeInteger( id )
-			? { wpcomSiteId: id }
-			: undefined;
+		if ( ! Number.isSafeInteger( id ) || ( ! absolute && id !== siteId ) ) return;
+		return { wpcomSiteId: id };
 	}
-	return args.method === 'GET' && WPCOM_ACCOUNT_READS.has( absolute ) ? {} : undefined;
+	return absolute && args.method === 'GET' && WPCOM_ACCOUNT_READS.has( route ) ? {} : undefined;
 }
 
 // Tool annotations describe these tools to hosts; they are hints. The classes
@@ -296,6 +454,7 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		takeScreenshotTool.name,
 		studioRule( 'local-change', {
 			urls: pageUrls,
+			navigates: true,
 			paths: ( args ) => {
 				const directory = isRecord( args ) ? args.themeScreenshot : undefined;
 				if ( directory === undefined ) return [];
@@ -304,7 +463,7 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 			},
 		} ),
 	],
-	[ inspectDesignTool.name, studioRule( 'read', { urls: pageUrls } ) ],
+	[ inspectDesignTool.name, studioRule( 'read', { urls: pageUrls, navigates: true } ) ],
 	[
 		generateImagesTool.name,
 		studioRule( 'remote-change', {
@@ -319,8 +478,11 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		} ),
 	],
 	[ installTaxonomyScriptsTool.name, onSite( 'local-change' ) ],
-	[ auditPerformanceTool.name, onSite( 'read', { urls: auditUrls, urlsOnSite: true } ) ],
-	[ auditSeoTool.name, onSite( 'read', { urls: auditUrls, urlsOnSite: true } ) ],
+	[
+		auditPerformanceTool.name,
+		onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ),
+	],
+	[ auditSeoTool.name, onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ) ],
 	[ listConnectedRemoteSitesTool.name, onSite( 'remote-read' ) ],
 	[
 		wpcomRequestTool.name,
@@ -338,7 +500,10 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	[ pullSiteTool.name, onSite( 'remote-overwrite', { approval: 'host' } ) ],
 	[ importSiteTool.name, onSite( 'local-overwrite', { approval: 'host' } ) ],
 	[ exportSiteTool.name, onSite( 'local-overwrite', { approval: 'host' } ) ],
-	[ openAnnotationBrowserTool.name, studioRule( 'local-change', { urls: pageUrls } ) ],
+	[
+		openAnnotationBrowserTool.name,
+		studioRule( 'local-change', { urls: pageUrls, navigates: true } ),
+	],
 	[ refreshBrowserTool.name, studioRule( 'read' ) ],
 	[ sendFeedbackTool.name, studioRule( 'external-message' ) ],
 	// Tools built by factories for the host's capabilities.
@@ -392,44 +557,50 @@ function isBoundedShellInput( input: Record< string, unknown > ): boolean {
 	);
 }
 
-const ABSOLUTE_START = /^(?:[~/\\]|[a-z]:)/i;
+// A file pattern: letters, digits, '.', '_', '-', '/', '*', '?' and brace
+// groups of two or more non-empty alternatives made of the same characters
+// without '/'. Nothing else: no backslash, extglob, '(', ')', '|', '[', '!',
+// '~', ':', whitespace, nested or unbalanced group.
+const GLOB_PATTERN = /^(?:[A-Za-z0-9._*?/-]|\{[A-Za-z0-9._*?-]+(?:,[A-Za-z0-9._*?-]+)+\})+$/;
+const GLOB_MAX_LENGTH = 512;
+const GLOB_MAX_EXPANSIONS = 256;
+
+// A segment with a leading dot whose wildcards can make it `..`. A shell lists
+// `.` and `..` for such a segment, so `.*/x` can reach the parent.
+function mayNameParent( segment: string ): boolean {
+	if ( ! segment.startsWith( '.' ) ) return false;
+	const source = segment.replace( /\./g, '\\.' ).replace( /\*+/g, '.*' ).replace( /\?/g, '.' );
+	return new RegExp( `^${ source }$` ).test( '..' );
+}
 
 /**
  * A file pattern that cannot match above the folder it is searched from, for
- * any glob engine: neither the pattern nor any alternative a brace or extglob
- * group expands to, at any depth, may be absolute or step up, and no character
- * class may match a separator.
+ * any glob engine: it is in the grammar above, it is relative, and none of the
+ * patterns its brace groups expand to contains `..`, an empty segment (an
+ * engine that drops a leading `./` would make `.//` absolute) or a segment
+ * that can match `..`. Stricter than any engine, so a legitimate pattern may
+ * need rewording.
  */
 export function isContainedPattern( pattern: unknown ): boolean {
 	if (
 		typeof pattern !== 'string' ||
-		! pattern.length ||
-		pattern.includes( '..' ) ||
-		ABSOLUTE_START.test( pattern ) ||
-		path.isAbsolute( pattern )
+		pattern.length > GLOB_MAX_LENGTH ||
+		pattern.startsWith( '/' ) ||
+		! GLOB_PATTERN.test( pattern )
 	)
 		return false;
-	const groups: string[] = [];
-	for ( let index = 0; index < pattern.length; index++ ) {
-		const character = pattern[ index ];
-		let alternative = false;
-		if ( character === '{' || character === '(' ) {
-			groups.push( character );
-			alternative = true;
-		} else if ( character === '}' || character === ')' ) {
-			groups.pop();
-		} else if (
-			( character === ',' && groups.at( -1 ) === '{' ) ||
-			( character === '|' && groups.at( -1 ) === '(' )
-		) {
-			alternative = true;
-		} else if ( character === '[' ) {
-			const end = pattern.indexOf( ']', index + 1 );
-			if ( end === -1 || /[/\\]/.test( pattern.slice( index + 1, end ) ) ) return false;
-		}
-		if ( alternative && ABSOLUTE_START.test( pattern.slice( index + 1 ) ) ) return false;
+	let expansions = [ '' ];
+	for ( const part of pattern.split( /(\{[^{}]*\})/ ) ) {
+		const choices = part.startsWith( '{' ) ? part.slice( 1, -1 ).split( ',' ) : [ part ];
+		if ( expansions.length * choices.length > GLOB_MAX_EXPANSIONS ) return false;
+		expansions = expansions.flatMap( ( prefix ) => choices.map( ( choice ) => prefix + choice ) );
 	}
-	return true;
+	return expansions.every(
+		( expansion ) =>
+			! expansion.includes( '..' ) &&
+			! expansion.includes( '//' ) &&
+			! expansion.split( '/' ).some( mayNameParent )
+	);
 }
 
 const filePath = { field: 'file_path', required: true, allowRoot: false } as const;
@@ -526,17 +697,31 @@ export function claudeNativeTools(
 	} );
 }
 
+/** The Studio tools a turn may run: enabled, known, and guarded when they open a browser. */
+export function claudeStudioTools(
+	enabled: ClaudeEnabledTools,
+	navigation: ClaudeNavigationConfinement,
+	targetOrigin: string | null
+): string[] {
+	return enabled.studio.filter( ( name ) => {
+		const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
+		return !! rule && ( ! rule.navigates || isVerifiedNavigationGuard( navigation, targetOrigin ) );
+	} );
+}
+
 /** Every tool name the native runtime may report for a turn. */
 export function claudeToolInventory(
 	enabled: ClaudeEnabledTools,
 	confinement: ClaudeShellConfinement,
-	workspace: string
+	workspace: string,
+	navigation: ClaudeNavigationConfinement,
+	targetOrigin: string | null
 ): string[] {
 	return [
 		...claudeNativeTools( enabled, confinement, workspace ),
-		...enabled.studio
-			.filter( ( name ) => CLAUDE_STUDIO_TOOL_RULES.has( name ) )
-			.map( ( name ) => STUDIO_MCP_PREFIX + name ),
+		...claudeStudioTools( enabled, navigation, targetOrigin ).map(
+			( name ) => STUDIO_MCP_PREFIX + name
+		),
 	];
 }
 

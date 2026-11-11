@@ -60,6 +60,7 @@ export async function createPolicyFixture(
 		localRoots: [ site ],
 		enabledTools: CLAUDE_ENABLED_TOOLS,
 		shellConfinement: { mode: 'none' },
+		navigationConfinement: { mode: 'none' },
 		signal: controller.signal,
 		approve: vi.fn( async () => 'allow' as const ),
 		approvalTimeoutMs: 100,
