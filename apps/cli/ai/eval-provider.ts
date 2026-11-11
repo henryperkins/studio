@@ -36,7 +36,7 @@ import {
 	type AiProviderId,
 } from '@studio/agent/protocol/providers';
 import { checkDedicatedProfile, type DedicatedProfileProblem } from './acceptance-isolation';
-import type { ObservedHost, ObservedRequest } from './chatgpt-acceptance-observer';
+import type { BearerIdentity, ObservedHost, ObservedRequest } from './chatgpt-acceptance-observer';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import type {
 	ConnectionRegistryEntry,
@@ -228,6 +228,11 @@ export interface EvalProviderPlan {
 	};
 	/** The record a subscription conversation names its connection by, before each turn. */
 	sessionContext?: StudioSessionContextData;
+	/**
+	 * Compares a route request's bearer with the selected connection's
+	 * identity, in memory: the observer keeps only its answer.
+	 */
+	bearerIdentity?: ( authorization: string | null ) => BearerIdentity;
 	/** What a reply on this route records, for seeded history. */
 	reply: { provider: string; api: string; model: string };
 }
@@ -255,6 +260,37 @@ export interface EvalProviderDeps {
 export type EvalProviderPlanResult =
 	| { ok: true; plan: EvalProviderPlan }
 	| { ok: false; failure: EvalProviderFailure };
+
+/**
+ * Whether the bearer in `authorization` names `subject`, the identity the
+ * selected registration recorded from its verified ID token: the `sub` claim
+ * of the bearer, read without verifying its signature. `unverified` when the
+ * bearer is not a token that carries one.
+ */
+export function compareBearerIdentity(
+	authorization: string | null,
+	subject: string
+): BearerIdentity {
+	const token = authorization?.match( /^\s*bearer\s+(\S+)\s*$/i )?.[ 1 ];
+	const payload = token?.split( '.' );
+	if ( ! subject || ! payload || payload.length !== 3 ) {
+		return 'unverified';
+	}
+	let claims: unknown;
+	try {
+		claims = JSON.parse( Buffer.from( payload[ 1 ], 'base64url' ).toString( 'utf8' ) );
+	} catch {
+		return 'unverified';
+	}
+	const claimed =
+		typeof claims === 'object' && claims !== null
+			? ( claims as Record< string, unknown > ).sub
+			: undefined;
+	if ( typeof claimed !== 'string' || ! claimed ) {
+		return 'unverified';
+	}
+	return claimed === subject ? 'match' : 'mismatch';
+}
 
 const PROFILE_PROBLEMS: Record< DedicatedProfileProblem, string > = {
 	'profile-relative': `${ EVAL_CHATGPT_PROFILE_ENV } must be an absolute path.`,
@@ -363,6 +399,7 @@ async function planChatGpt(
 		model,
 		reasoningEffort: reasoning.effort,
 	};
+	const { subject } = entry.identity;
 	return {
 		ok: true,
 		plan: {
@@ -385,6 +422,7 @@ async function planChatGpt(
 				chatGpt: { reasoningEffort: reasoning.effort },
 			},
 			sessionContext,
+			bearerIdentity: ( authorization ) => compareBearerIdentity( authorization, subject ),
 			reply: { provider: CHATGPT_PI_PROVIDER, api: REPLY_API[ 'chatgpt-oauth' ], model },
 		},
 	};
@@ -503,6 +541,12 @@ export interface ExecutedRoute {
 	 * every turn on; for a legacy provider, its implicit connection.
 	 */
 	connectionRef: string | null;
+	/**
+	 * For ChatGPT: true when every route request's bearer named the selected
+	 * registration's identity, false when any named another, `unverified` when
+	 * any could not be compared. Null for a legacy provider.
+	 */
+	connectionMatchesBearer: boolean | 'unverified' | null;
 	/** Up to 200 requests, in order. */
 	requests: ExecutedRequest[];
 }
@@ -561,9 +605,16 @@ export function summarizeExecutedRoute( {
 	const backend = backends.length === 1 ? backends[ 0 ] : backends.length ? 'mixed' : 'none';
 	const kind = backend === 'none' || backend === 'mixed' ? backend : PROVIDER_BY_BACKEND[ backend ];
 	let connectionRef: string | null = null;
+	let connectionMatchesBearer: ExecutedRoute[ 'connectionMatchesBearer' ] = null;
 	if ( kind === 'chatgpt-oauth' ) {
 		const recorded = readChatGptSessionSelection( entries )?.connectionId;
 		connectionRef = recorded ? evalConnectionRef( recorded ) : null;
+		const identities = inference.map( ( request ) => request.identity );
+		connectionMatchesBearer = identities.includes( 'mismatch' )
+			? false
+			: identities.every( ( identity ) => identity === 'match' )
+			? true
+			: 'unverified';
 	} else if ( kind !== 'none' && kind !== 'mixed' ) {
 		connectionRef = kind;
 	}
@@ -580,6 +631,7 @@ export function summarizeExecutedRoute( {
 			replies.map( ( reply ) => ( typeof reply.model === 'string' ? reply.model : undefined ) )
 		),
 		connectionRef,
+		connectionMatchesBearer,
 		requests: [ ...inference, ...imageService ]
 			.sort( ( a, b ) => a.startedAt - b.startedAt || a.id - b.id )
 			.slice( 0, 200 )

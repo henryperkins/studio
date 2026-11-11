@@ -812,7 +812,11 @@ export async function runEval( input: EvalRunnerInput ) {
 		observerFile = plan
 			? path.join( os.tmpdir(), `studio-eval-requests-${ Date.now() }-${ process.pid }.ndjson` )
 			: null;
-		uninstallObserver = observerFile ? installAcceptanceObserver( observerFile ) : null;
+		uninstallObserver = observerFile
+			? installAcceptanceObserver( observerFile, globalThis, {
+					bearerIdentity: plan?.bearerIdentity,
+			  } )
+			: null;
 		const replies: Array< { provider?: unknown; model?: unknown } > = [];
 
 		let inspections: Inspection[] = [];

@@ -23,6 +23,9 @@ export type ObservedHost =
 
 export type BearerShape = 'none' | 'api-key' | 'jwt' | 'opaque';
 
+/** Whether a route request's bearer belongs to the expected identity, decided in memory. */
+export type BearerIdentity = 'match' | 'mismatch' | 'unverified';
+
 export interface ObservedRequestSummary {
 	host: ObservedHost;
 	/** `images`: Studio's separate WordPress.com image service, which is not inference. */
@@ -43,6 +46,8 @@ export interface ObservedRequestSummary {
 	reasoningItems?: number;
 	imageInputs?: number;
 	imageToolOutputs?: number;
+	/** Only when the observer was given a comparison, for ChatGPT route requests. */
+	identity?: BearerIdentity;
 }
 
 export interface ObservedRequest extends ObservedRequestSummary {
@@ -259,10 +264,19 @@ export function summarizeResponseStream(
 	return summary;
 }
 
+export interface AcceptanceObserverOptions {
+	/**
+	 * Compares a ChatGPT route request's `authorization` header with the
+	 * identity the run expects; only its answer is kept.
+	 */
+	bearerIdentity?: ( authorization: string | null ) => BearerIdentity;
+}
+
 /** Appends request and response summaries to `file` for every `fetch` in this process. */
 export function installAcceptanceObserver(
 	file: string,
-	target: { fetch: typeof fetch } = globalThis
+	target: { fetch: typeof fetch } = globalThis,
+	options: AcceptanceObserverOptions = {}
 ): () => void {
 	const original = target.fetch;
 	let sequence = 0;
@@ -276,6 +290,9 @@ export function installAcceptanceObserver(
 	const observed = async ( input: Parameters< typeof fetch >[ 0 ], init?: RequestInit ) => {
 		const id = ++sequence;
 		const request = summarizeObservedRequest( input, init );
+		if ( request?.host === 'chatgpt-route' && options.bearerIdentity ) {
+			request.identity = options.bearerIdentity( readHeader( input, init, 'authorization' ) );
+		}
 		if ( request ) {
 			write( { kind: 'request', id, pid: process.pid, startedAt: Date.now(), ...request } );
 		}

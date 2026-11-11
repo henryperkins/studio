@@ -15,6 +15,7 @@ import {
 	evalConnectionRef,
 	readEvalProviderRequest,
 	resolveEvalProviderPlan,
+	compareBearerIdentity,
 	summarizeExecutedRoute,
 	type EvalProviderDeps,
 	type EvalProviderRequest,
@@ -26,7 +27,16 @@ import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections
 // Test values only; nothing here reaches OpenAI, Anthropic or WordPress.com.
 const CONNECTION_ID = '7c1e8a41-6d3b-4c55-9b8e-3f2d7c1eb2f0';
 const OTHER_CONNECTION_ID = '8d2f9b52-6d3b-4c55-9b8e-3f2d7c1eb2f1';
-const CHATGPT_TOKEN = 'test-chatgpt-route-token';
+const base64url = ( value: unknown ) =>
+	Buffer.from( JSON.stringify( value ) ).toString( 'base64url' );
+// An obviously fake, unsigned token shaped like the route's bearer.
+const fakeJwt = ( payload: Record< string, unknown > ) =>
+	`${ base64url( { alg: 'none', typ: 'JWT' } ) }.${ base64url( payload ) }.test-signature`;
+const CHATGPT_TOKEN = fakeJwt( {
+	sub: 'test-subject',
+	email: 'eval-person@example.test',
+	'https://api.openai.com/auth': { chatgpt_account_id: 'test-account-id' },
+} );
 const API_KEY = 'sk-proj-TESTONLY_eval_provider_aaaaaaaaaaaaaaaaaaaa';
 
 const paths = vi.hoisted( () => ( { root: '' } ) );
@@ -342,7 +352,9 @@ describe( 'eval provider selection', () => {
 			const session = SessionManager.create( sitesRoot, sessionDir );
 			session.appendCustomEntry( 'studio.session_context', plan.sessionContext );
 			const observerFile = path.join( paths.root, 'requests.ndjson' );
-			const uninstall = installAcceptanceObserver( observerFile );
+			const uninstall = installAcceptanceObserver( observerFile, globalThis, {
+				bearerIdentity: plan.bearerIdentity,
+			} );
 			const events: AgentSessionEvent[] = [];
 			try {
 				const turn = createAgent( { host: createFakeHost( sitesRoot ) } ).runTurn( {
@@ -381,12 +393,23 @@ describe( 'eval provider selection', () => {
 				backend: 'chatgpt-route',
 				apiKeyBearers: 0,
 				connectionRef: plan.requested.connectionRef,
+				connectionMatchesBearer: true,
 				models: [ 'gpt-6-luna' ],
 				efforts: [ 'low' ],
 				replyKinds: [ 'chatgpt-oauth' ],
 			} );
 			expect( executed.modelRequests ).toBe( seen.length );
 			expect( JSON.stringify( executed ) ).not.toContain( CHATGPT_TOKEN );
+			for ( const derived of [
+				'test-subject',
+				'eval-person',
+				'test-account-id',
+				CHATGPT_TOKEN.split( '.' )[ 1 ],
+			] ) {
+				expect( JSON.stringify( { requested: plan.requested, executed } ) ).not.toContain(
+					derived
+				);
+			}
 			expect( JSON.stringify( executed ) ).not.toContain( CONNECTION_ID );
 		} );
 	} );
@@ -563,6 +586,29 @@ describe( 'eval provider selection', () => {
 			expect( evalConnectionRef( CONNECTION_ID ) ).toMatch( /^conn-[0-9a-f]{12}$/ );
 		} );
 
+		it( 'says whether every route request carried the selected identity, keeping only that', () => {
+			const matches = ( identities: Array< ObservedRequest[ 'identity' ] > ) =>
+				summarizeExecutedRoute( {
+					requests: identities.map( ( identity, index ) => request( { id: index + 1, identity } ) ),
+					replies: [],
+					entries: pinned( CONNECTION_ID ),
+				} );
+			expect( matches( [ 'match', 'match' ] ).connectionMatchesBearer ).toBe( true );
+			expect( matches( [ 'match', 'mismatch', 'unverified' ] ).connectionMatchesBearer ).toBe(
+				false
+			);
+			expect( matches( [ 'match', 'unverified' ] ).connectionMatchesBearer ).toBe( 'unverified' );
+			expect( matches( [ 'match', undefined ] ).connectionMatchesBearer ).toBe( 'unverified' );
+			expect( JSON.stringify( matches( [ 'match' ] ).requests ) ).not.toMatch( /identity|match/ );
+			expect(
+				summarizeExecutedRoute( {
+					requests: [ request( { host: 'openai-api', bearer: 'api-key', identity: undefined } ) ],
+					replies: [],
+					entries: [],
+				} ).connectionMatchesBearer
+			).toBeNull();
+		} );
+
 		it( 'tells which user message each request belongs to', () => {
 			const executed = summarizeExecutedRoute( {
 				requests: [
@@ -616,6 +662,27 @@ describe( 'eval provider selection', () => {
 				modelRequests: 1,
 				imageServiceRequests: 1,
 			} );
+		} );
+	} );
+
+	describe( 'comparing the bearer with the selected identity', () => {
+		it( 'matches only the subject the registration recorded, and is unverified without one', () => {
+			const bearer = ( token: string ) => `Bearer ${ token }`;
+			expect( compareBearerIdentity( bearer( CHATGPT_TOKEN ), 'test-subject' ) ).toBe( 'match' );
+			expect(
+				compareBearerIdentity( bearer( fakeJwt( { sub: 'another-subject' } ) ), 'test-subject' )
+			).toBe( 'mismatch' );
+			for ( const authorization of [
+				bearer( 'test-opaque-route-token' ),
+				bearer( fakeJwt( { email: 'eval-person@example.test' } ) ),
+				bearer( fakeJwt( { sub: 7 } ) ),
+				bearer( 'eyJub3QganNvbg.!!!.sig' ),
+				'Basic dGVzdDp0ZXN0',
+				null,
+			] ) {
+				expect( compareBearerIdentity( authorization, 'test-subject' ) ).toBe( 'unverified' );
+			}
+			expect( compareBearerIdentity( bearer( CHATGPT_TOKEN ), '' ) ).toBe( 'unverified' );
 		} );
 	} );
 

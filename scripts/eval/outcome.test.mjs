@@ -716,6 +716,7 @@ describe( 'provider route checks', () => {
 		replyKinds: [ 'chatgpt-oauth' ],
 		replyModels: [ 'gpt-6-luna' ],
 		connectionRef: ref,
+		connectionMatchesBearer: true,
 		requests: [],
 		...overrides,
 	} );
@@ -767,6 +768,21 @@ describe( 'provider route checks', () => {
 			/mixed/,
 		],
 		[ 'another connection', routed( { connectionRef: 'conn-ffffffffffff' } ), /connection/ ],
+		[
+			'a bearer for another identity than the selected connection',
+			routed( { connectionMatchesBearer: false } ),
+			/^connection-mismatch:/,
+		],
+		[
+			'a bearer whose identity could not be compared',
+			routed( { connectionMatchesBearer: 'unverified' } ),
+			/^connection-unverified:/,
+		],
+		[
+			'a report without the comparison',
+			routed( { connectionMatchesBearer: undefined } ),
+			/^connection-unverified:/,
+		],
 		[ 'an API-key bearer', routed( { apiKeyBearers: 1 } ), /API-key/ ],
 		[ 'another model', routed( { models: [ 'gpt-6-luna', 'gpt-6.1-sol' ] } ), /gpt-6\.1-sol/ ],
 		[ 'another effort', routed( { efforts: [ 'low', 'medium' ] } ), /medium/ ],

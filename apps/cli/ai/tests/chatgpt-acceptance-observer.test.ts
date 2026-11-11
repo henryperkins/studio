@@ -203,6 +203,45 @@ describe( 'acceptance request observer', () => {
 			expect( readObservedLines( file ) ).toHaveLength( 2 );
 		} );
 
+		it( 'keeps only the answer of a bearer comparison it is given, for ChatGPT route requests alone', async () => {
+			const file = path.join( dir, 'observed.ndjson' );
+			const target = {
+				fetch: async () => new Response( '{}', { status: 200 } ),
+			} as unknown as { fetch: typeof fetch };
+			const seen: Array< string | null > = [];
+			const remove = installAcceptanceObserver( file, target, {
+				bearerIdentity: ( authorization ) => {
+					seen.push( authorization );
+					return 'match';
+				},
+			} );
+			await target.fetch( 'https://api.openai.com/v1/responses', {
+				method: 'POST',
+				headers: { authorization: `Bearer ${ JWT }` },
+				body: responsesBody(),
+			} );
+			await target.fetch( 'https://api.openai.com/v1/responses', {
+				method: 'POST',
+				headers: { authorization: `Bearer ${ API_KEY }` },
+				body: responsesBody(),
+			} );
+			await target.fetch( 'https://public-api.wordpress.com/rest/v1.1/me' );
+			remove();
+			expect( seen ).toEqual( [ `Bearer ${ JWT }` ] );
+			const requests = readObservedLines( file ).filter( ( line ) => line.kind === 'request' );
+			expect(
+				requests.map( ( line ) => [ line.host, 'identity' in line ? line.identity : null ] )
+			).toEqual( [
+				[ 'chatgpt-route', 'match' ],
+				[ 'openai-api', null ],
+				[ 'wpcom', null ],
+			] );
+			const raw = fs.readFileSync( file, 'utf8' );
+			for ( const secret of [ JWT, JWT.split( '.' )[ 1 ], API_KEY, 'user-1' ] ) {
+				expect( raw ).not.toContain( secret );
+			}
+		} );
+
 		it( 'records a failed fetch and passes its error on', async () => {
 			const file = path.join( dir, 'observed.ndjson' );
 			const target = {

@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -468,6 +469,51 @@ describe( 'eval runner provider selection', () => {
 			expect( process.env.E2E_SHARED_CONFIG_PATH ).toBeUndefined();
 			expect( process.env.E2E_CLI_CONFIG_PATH ).toBeUndefined();
 		} );
+
+		const base64url = ( value: unknown ) =>
+			Buffer.from( JSON.stringify( value ) ).toString( 'base64url' );
+		// Obviously fake, unsigned tokens shaped like the route's bearer.
+		const fakeJwt = ( payload: Record< string, unknown > ) =>
+			`${ base64url( { alg: 'none' } ) }.${ base64url( payload ) }.test-signature`;
+		const claims = {
+			email: 'eval-person@example.test',
+			'https://api.openai.com/auth': { chatgpt_account_id: 'test-account-id' },
+		};
+
+		it.each( [
+			[ 'the selected identity', fakeJwt( { sub: 'test-subject', ...claims } ), true ],
+			[ 'another identity', fakeJwt( { sub: 'test-other-subject', ...claims } ), false ],
+			[ 'an undecodable bearer', 'test-opaque-route-token', 'unverified' ],
+		] as const )(
+			'compares a bearer for %s with the selected registration in memory, and reports only the result',
+			async ( _name, token, expected ) => {
+				agent.behavior = {
+					request: {
+						url: 'https://api.openai.com/v1/responses',
+						authorization: `Bearer ${ token }`,
+						body: { model: 'gpt-6-luna', reasoning: { effort: 'medium' } },
+					},
+					replyProvider: 'studio-chatgpt',
+				};
+				const result = await runEval( input( {}, chatGptEnv() ) );
+				expect( result.providerRoute?.executed ).toMatchObject( {
+					kind: 'chatgpt-oauth',
+					connectionMatchesBearer: expected,
+				} );
+				const text = JSON.stringify( result );
+				for ( const derived of [
+					token,
+					'test-subject',
+					'test-other-subject',
+					'eval-person',
+					'test-account-id',
+					token.split( '.' )[ 1 ] ?? token,
+					createHash( 'sha256' ).update( 'test-subject' ).digest( 'hex' ).slice( 0, 12 ),
+				] ) {
+					expect( text ).not.toContain( derived );
+				}
+			}
+		);
 
 		it( 'restores fetch and removes its temporary folders when a run fails partway, at any stage', async () => {
 			agent.behavior = { replyProvider: 'studio-chatgpt' };

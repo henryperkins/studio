@@ -157,9 +157,12 @@ export const withinBudget = check( ( d, vars ) => {
 // The run executed on the provider, connection, model and effort it selected
 // (STUDIO_EVAL_PROVIDER and friends; see the README). `providerRoute.executed`
 // is read back from the run: the model requests the observer saw, the
-// providers the runtime stamped on its replies and the connection the
-// conversation's record names. A run with no selection is a legacy-provider
-// run: regression evidence only, never evidence for a provider route.
+// providers the runtime stamped on its replies, the connection the
+// conversation's record names, and whether every route request's bearer
+// named the selected connection's identity (compared in memory by the
+// request observer: only the answer is in the result). A run with no
+// selection is a legacy-provider run: regression evidence only, never
+// evidence for a provider route.
 export const ranOnRequestedRoute = check( ( d ) => {
 	const route = d.providerRoute;
 	if ( ! route )
@@ -179,6 +182,12 @@ export const ranOnRequestedRoute = check( ( d ) => {
 		problems.push( `served by ${ got.backend }, not ${ want.backend }` );
 	if ( got.connectionRef !== want.connectionRef )
 		problems.push( `on connection ${ got.connectionRef }, not ${ want.connectionRef }` );
+	if ( want.subscription && got.kind === want.kind && got.connectionMatchesBearer !== true )
+		problems.push(
+			got.connectionMatchesBearer === false
+				? 'connection-mismatch: a route request carried a bearer for another identity than the selected connection'
+				: 'connection-unverified: the bearers could not be compared with the selected connection, so nothing shows which account served the run'
+		);
 	if ( want.subscription && got.apiKeyBearers )
 		problems.push( `${ got.apiKeyBearers } request(s) carried an API-key bearer` );
 	const otherModels = want.wireModel
