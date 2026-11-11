@@ -10,7 +10,9 @@ import {
 	defaultClaudePlatformSeams,
 	isClaudeExecutableUnchanged,
 	isClaudeRuntimeSurfaceEnabled,
+	isSameClaudePath,
 	qualifyClaudeRuntime,
+	resolveClaudePathKey,
 	verifyClaudeExecutableIdentity,
 } from '../platform';
 import { linuxAdapter, readElfHeader } from '../platforms/linux';
@@ -811,3 +813,151 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 		} );
 	}
 );
+
+describe( 'Claude path identity', () => {
+	it( 'compares Windows paths regardless of letter case, as NTFS does, and resolves aliases', async () => {
+		const { fs, seams } = simulatedHost(
+			{ platform: 'win32', arch: 'x64' },
+			path.win32,
+			{},
+			{
+				caseInsensitive: [ 'C:\\' ],
+			}
+		);
+		fs.directory( 'C:\\Users\\Tester\\.claude' );
+		fs.directory( 'C:\\Users\\Tester\\.claude-work' );
+		fs.link( 'C:\\Users\\Tester\\profile', 'C:\\Users\\Tester\\.claude' );
+		const same = ( a: string, b: string ) => isSameClaudePath( a, b, seams );
+		await expect(
+			same( 'C:\\Users\\Tester\\.claude', 'c:\\users\\tester\\.CLAUDE' )
+		).resolves.toBe( true );
+		await expect(
+			same( 'C:\\Users\\Tester\\.claude\\projects', 'C:\\USERS\\tester\\.claude\\Projects' )
+		).resolves.toBe( true );
+		await expect(
+			same( 'C:\\Users\\Tester\\profile', 'C:\\Users\\Tester\\.claude' )
+		).resolves.toBe( true );
+		await expect(
+			same( 'C:\\Users\\Tester\\.claude', 'C:\\Users\\Tester\\.claude-work' )
+		).resolves.toBe( false );
+		await expect(
+			resolveClaudePathKey( 'c:\\users\\tester\\.claude', seams )
+		).resolves.toMatchObject( {
+			canonical: 'C:\\Users\\Tester\\.claude',
+			caseSensitive: false,
+			caseSource: 'probed',
+		} );
+	} );
+
+	it( 'keeps Linux paths that differ only in case distinct and never folds them, while resolving symlinks', async () => {
+		const { fs, seams } = simulatedHost(
+			{ platform: 'linux', arch: 'x64' },
+			path.posix,
+			{},
+			{
+				caseInsensitive: [ '/mnt/usb' ],
+			}
+		);
+		fs.directory( '/home/tester/Claude' );
+		fs.directory( '/home/tester/claude' );
+		fs.directory( '/home/tester/.claude' );
+		fs.link( '/home/tester/alias', '/home/tester/.claude' );
+		fs.directory( '/mnt/usb/Claude' );
+		const same = ( a: string, b: string ) => isSameClaudePath( a, b, seams );
+		await expect( same( '/home/tester/Claude', '/home/tester/claude' ) ).resolves.toBe( false );
+		await expect(
+			same( '/home/tester/.claude/projects', '/home/tester/.claude/Projects' )
+		).resolves.toBe( false );
+		await expect( same( '/home/tester/alias', '/home/tester/.claude' ) ).resolves.toBe( true );
+		await expect(
+			same( '/home/tester/alias/projects', '/home/tester/.claude/projects' )
+		).resolves.toBe( true );
+		await expect( same( '/mnt/usb/Claude', '/mnt/usb/claude' ) ).resolves.toBe( true );
+		await expect( same( '/mnt/usb/Claude/projects', '/mnt/usb/Claude/Projects' ) ).resolves.toBe(
+			false
+		);
+		await expect( resolveClaudePathKey( '/home/tester/Claude', seams ) ).resolves.toMatchObject( {
+			canonical: '/home/tester/Claude',
+			caseSensitive: true,
+			caseSource: 'os-default',
+		} );
+	} );
+
+	it( 'follows the macOS volume: default APFS ignores case, case-sensitive APFS does not', async () => {
+		const { fs, seams } = simulatedHost(
+			{ platform: 'darwin', arch: 'arm64' },
+			path.posix,
+			{},
+			{
+				caseInsensitive: [ '/Users' ],
+				devices: { '/Volumes/Sensitive': '9' },
+			}
+		);
+		fs.directory( '/Users/tester/.claude' );
+		fs.directory( '/Volumes/Sensitive/Claude' );
+		fs.directory( '/Volumes/Sensitive/claude' );
+		const same = ( a: string, b: string ) => isSameClaudePath( a, b, seams );
+		await expect( same( '/Users/tester/.claude', '/users/TESTER/.claude' ) ).resolves.toBe( true );
+		await expect(
+			same( '/Users/tester/.claude/projects', '/Users/tester/.claude/Projects' )
+		).resolves.toBe( true );
+		await expect( same( '/Volumes/Sensitive/Claude', '/Volumes/Sensitive/claude' ) ).resolves.toBe(
+			false
+		);
+		await expect(
+			same( '/Volumes/Sensitive/Claude/projects', '/Volumes/Sensitive/Claude/Projects' )
+		).resolves.toBe( false );
+		await expect( resolveClaudePathKey( '/Users/tester/.claude', seams ) ).resolves.toMatchObject( {
+			caseSensitive: false,
+			caseSource: 'probed',
+		} );
+		await expect(
+			resolveClaudePathKey( '/Volumes/Sensitive/Claude', seams )
+		).resolves.toMatchObject( { caseSensitive: true, caseSource: 'probed' } );
+	} );
+
+	it( 'falls back to the OS default only where the filesystem cannot answer', async () => {
+		for ( const [ host, pathModule, root, expected ] of [
+			[ { platform: 'darwin', arch: 'x64' }, path.posix, '/', false ],
+			[ { platform: 'win32', arch: 'x64' }, path.win32, 'C:\\', false ],
+			[ { platform: 'linux', arch: 'x64' }, path.posix, '/', true ],
+		] as const ) {
+			const { fs, seams } = simulatedHost( host, pathModule );
+			fs.directory( pathModule.join( root, '1234' ) );
+			await expect(
+				resolveClaudePathKey( pathModule.join( root, 'Missing', 'Child' ), seams ),
+				host.platform
+			).resolves.toMatchObject( { caseSensitive: expected, caseSource: 'os-default' } );
+			await expect(
+				isSameClaudePath(
+					pathModule.join( root, '1234', 'Child' ),
+					pathModule.join( root, '1234', 'child' ),
+					seams
+				),
+				host.platform
+			).resolves.toBe( ! expected );
+		}
+	} );
+
+	it( 'tells distinct folders on this machine apart and resolves its own aliases', async () => {
+		const root = await realpath( await mkdtemp( path.join( os.tmpdir(), 'Studio Claude Path ' ) ) );
+		try {
+			const first = path.join( root, 'Profile Ünï' );
+			const second = path.join( root, 'Profile Two' );
+			await mkdir( first );
+			await mkdir( second );
+			await symlink( first, path.join( root, 'alias' ), 'junction' );
+			await expect( isSameClaudePath( first, second ) ).resolves.toBe( false );
+			await expect( isSameClaudePath( path.join( root, 'alias' ), first ) ).resolves.toBe( true );
+			await expect(
+				isSameClaudePath( path.join( root, 'alias', 'projects' ), path.join( first, 'projects' ) )
+			).resolves.toBe( true );
+			if ( process.platform === 'win32' )
+				await expect( isSameClaudePath( first, first.toUpperCase() ) ).resolves.toBe( true );
+			if ( process.platform === 'linux' )
+				await expect( isSameClaudePath( first, first.toUpperCase() ) ).resolves.toBe( false );
+		} finally {
+			await rm( root, { recursive: true, force: true, maxRetries: 4 } );
+		}
+	} );
+} );

@@ -1,13 +1,123 @@
+import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isSameClaudeAccount } from '../auth-status';
-import { readClaudeAccountStatus, resolveClaudeConfigContext } from '../connection';
+import {
+	readClaudeAccountStatus,
+	resolveClaudeConfigContext,
+	resolveClaudeProjectsDirectory,
+} from '../connection';
+import { simulatedHost } from './fixtures/native-binaries';
 
 describe( 'Claude config context', () => {
-	it( 'preserves default mode and blocks conflicting inherited directories', () => {
-		expect( resolveClaudeConfigContext( undefined, {} ) ).toEqual( { mode: 'default' } );
-		expect(
+	it( 'preserves default mode and blocks conflicting inherited directories', async () => {
+		await expect( resolveClaudeConfigContext( undefined, {} ) ).resolves.toEqual( {
+			mode: 'default',
+		} );
+		await expect(
 			resolveClaudeConfigContext( 'C:\\selected', { CLAUDE_CONFIG_DIR: 'C:\\other' } )
-		).toEqual( { mode: 'conflict' } );
+		).resolves.toEqual( { mode: 'conflict' } );
+	} );
+
+	it( 'treats an inherited directory as the selected one only when the filesystem says so', async () => {
+		const windows = simulatedHost(
+			{ platform: 'win32', arch: 'x64' },
+			path.win32,
+			{},
+			{
+				caseInsensitive: [ 'C:\\' ],
+			}
+		);
+		windows.fs.directory( 'C:\\Users\\Tester\\Claude Profile' );
+		await expect(
+			resolveClaudeConfigContext(
+				'C:\\Users\\Tester\\Claude Profile',
+				{ claude_config_dir: 'c:\\users\\tester\\claude profile' },
+				windows.seams
+			)
+		).resolves.toEqual( { mode: 'explicit', directory: 'C:\\Users\\Tester\\Claude Profile' } );
+
+		const linux = simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix );
+		linux.fs.directory( '/home/tester/Claude' );
+		linux.fs.directory( '/home/tester/claude' );
+		linux.fs.link( '/home/tester/profile', '/home/tester/Claude' );
+		await expect(
+			resolveClaudeConfigContext(
+				'/home/tester/Claude',
+				{ CLAUDE_CONFIG_DIR: '/home/tester/claude' },
+				linux.seams
+			)
+		).resolves.toEqual( { mode: 'conflict' } );
+		await expect(
+			resolveClaudeConfigContext(
+				'/home/tester/Claude',
+				{ CLAUDE_CONFIG_DIR: '/home/tester/profile' },
+				linux.seams
+			)
+		).resolves.toEqual( { mode: 'explicit', directory: '/home/tester/Claude' } );
+		await expect(
+			resolveClaudeConfigContext(
+				'/home/tester/Claude',
+				{ claude_config_dir: '/home/tester/claude' },
+				linux.seams
+			)
+		).resolves.toEqual( { mode: 'explicit', directory: '/home/tester/Claude' } );
+	} );
+} );
+
+describe( 'Claude projects directory identity', () => {
+	it( 'accepts a reported projects folder that differs only in case on a case-insensitive volume', async () => {
+		const { fs, seams } = simulatedHost(
+			{ platform: 'win32', arch: 'x64' },
+			path.win32,
+			{},
+			{
+				caseInsensitive: [ 'C:\\' ],
+			}
+		);
+		fs.directory( 'C:\\Users\\Tester\\.claude' );
+		await expect(
+			resolveClaudeProjectsDirectory(
+				'C:\\Users\\Tester\\.claude',
+				'c:\\users\\tester\\.CLAUDE\\Projects',
+				seams
+			)
+		).resolves.toBe( 'C:\\Users\\Tester\\.claude\\projects' );
+		fs.directory( 'C:\\Users\\Tester\\.claude\\Projects' );
+		await expect(
+			resolveClaudeProjectsDirectory(
+				'C:\\Users\\Tester\\.claude',
+				'c:\\users\\tester\\.claude\\projects',
+				seams
+			)
+		).resolves.toBe( 'C:\\Users\\Tester\\.claude\\Projects' );
+	} );
+
+	it( 'refuses a case variant on Linux and a projects folder that leads elsewhere', async () => {
+		const { fs, seams } = simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix );
+		fs.directory( '/home/tester/.claude' );
+		fs.directory( '/home/tester/elsewhere' );
+		await expect(
+			resolveClaudeProjectsDirectory(
+				'/home/tester/.claude',
+				'/home/tester/.claude/Projects',
+				seams
+			)
+		).rejects.toThrow();
+		await expect(
+			resolveClaudeProjectsDirectory(
+				'/home/tester/.claude',
+				'/home/tester/.claude/projects',
+				seams
+			)
+		).resolves.toBe( '/home/tester/.claude/projects' );
+		fs.link( '/home/tester/.claude/projects', '/home/tester/elsewhere' );
+		await expect(
+			resolveClaudeProjectsDirectory(
+				'/home/tester/.claude',
+				'/home/tester/.claude/projects',
+				seams
+			)
+		).rejects.toThrow();
 	} );
 } );
 

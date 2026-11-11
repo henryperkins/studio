@@ -7,7 +7,17 @@ import { readSharedConfig, updateSharedConfigFrom } from '@studio/common/lib/sha
 import { assessClaudeAuth, buildClaudeEnvironment } from './auth-status';
 import { inspectClaudeConfiguration } from './configuration';
 import { inspectClaudeExecutable, trustedPowerShellPath } from './discovery';
+import {
+	claudeEnvironmentValues,
+	claudePathModule,
+	currentClaudeHost,
+	defaultClaudePlatformSeams,
+	isSameClaudePath,
+	isSameClaudePathText,
+	resolveClaudePathKey,
+} from './platform';
 import type { ClaudeAuthIdentity } from './auth-status';
+import type { ClaudePlatformSeams } from './platform';
 
 const execFileAsync = promisify( execFile );
 
@@ -78,45 +88,60 @@ function retiredIds( value: unknown ): string[] {
 		? value.filter( ( item ): item is string => typeof item === 'string' )
 		: [];
 }
-export function resolveClaudeConfigContext(
+export async function resolveClaudeConfigContext(
 	selected: string | undefined,
-	env: NodeJS.ProcessEnv
-): { mode: 'default' | 'explicit' | 'conflict'; directory?: string } {
-	const inherited = Object.entries( env ).find(
-		( [ key ] ) => key.toUpperCase() === 'CLAUDE_CONFIG_DIR'
-	)?.[ 1 ];
-	if ( selected && ! path.isAbsolute( selected ) ) return { mode: 'conflict' };
-	if (
-		selected &&
-		inherited &&
-		path.resolve( selected ).toLowerCase() !== path.resolve( inherited ).toLowerCase()
-	)
+	env: NodeJS.ProcessEnv,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< { mode: 'default' | 'explicit' | 'conflict'; directory?: string } > {
+	const host = overrides.host ?? currentClaudeHost();
+	const inheritedValues = claudeEnvironmentValues( env, 'CLAUDE_CONFIG_DIR', host );
+	if ( inheritedValues.length > 1 ) return { mode: 'conflict' };
+	const [ inherited ] = inheritedValues;
+	if ( selected && ! claudePathModule( host ).isAbsolute( selected ) ) return { mode: 'conflict' };
+	if ( selected && inherited && ! ( await isSameClaudePath( selected, inherited, overrides ) ) )
 		return { mode: 'conflict' };
 	const directory = selected ?? inherited;
 	return directory ? { mode: 'explicit', directory } : { mode: 'default' };
 }
 export async function resolveClaudeProjectsDirectory(
 	configDirectory: string,
-	reported: string
+	reported: string,
+	overrides: Partial< ClaudePlatformSeams > = {}
 ): Promise< string > {
-	const expected = path.join( configDirectory, 'projects' );
+	const seams = defaultClaudePlatformSeams( overrides );
+	const pathModule = claudePathModule( seams.host );
+	const expected = pathModule.join( configDirectory, 'projects' );
 	if (
-		! path.isAbsolute( reported ) ||
-		path.resolve( reported ).toLowerCase() !== expected.toLowerCase()
+		! pathModule.isAbsolute( reported ) ||
+		! ( await isSameClaudePath( reported, expected, seams ) )
 	)
 		throw new Error( 'Unexpected projects directory' );
+	let canonical: string;
 	try {
-		const canonical = await realpath( reported );
-		if (
-			canonical.toLowerCase() !== expected.toLowerCase() ||
-			! ( await stat( canonical ) ).isDirectory()
-		)
-			throw new Error( 'Unexpected projects directory' );
-		return canonical;
+		canonical = await seams.files.realpath( reported );
 	} catch ( error ) {
 		if ( ( error as NodeJS.ErrnoException ).code === 'ENOENT' ) return expected;
 		throw error;
 	}
+	// The folder must be the configuration directory's own entry, not a link elsewhere.
+	const { caseSensitive } = await resolveClaudePathKey( configDirectory, seams );
+	if (
+		! isSameClaudePathText(
+			pathModule.dirname( canonical ),
+			await seams.files.realpath( configDirectory ),
+			caseSensitive,
+			seams.host
+		) ||
+		! isSameClaudePathText(
+			pathModule.basename( canonical ),
+			'projects',
+			caseSensitive,
+			seams.host
+		) ||
+		( await seams.files.stat( canonical ) ).kind !== 'directory'
+	)
+		throw new Error( 'Unexpected projects directory' );
+	return canonical;
 }
 /** Runs a native command and returns its output; it rejects on a non-zero exit. */
 export type ClaudeProcessRunner = (
@@ -175,7 +200,7 @@ export async function prepareClaudeInvocation(
 	if ( process.env.STUDIO_EXPERIMENTAL_CLAUDE_CODE !== '1' )
 		return { ok: false as const, blockers: [ 'experimental-feature-disabled' ] };
 	const child = buildClaudeEnvironment( process.env );
-	const context = resolveClaudeConfigContext( configDirectory, process.env );
+	const context = await resolveClaudeConfigContext( configDirectory, process.env );
 	if ( child.conflicts.length )
 		return {
 			ok: false as const,
@@ -221,9 +246,7 @@ export async function prepareClaudeInvocation(
 			! path.isAbsolute( status.projectsDirectory )
 		)
 			return { ok: false as const, blockers: [ 'native-paths-unqualified' ], executable };
-		if (
-			( await realpath( status.configDirectory ) ).toLowerCase() !== resolvedConfig.toLowerCase()
-		)
+		if ( ! ( await isSameClaudePath( status.configDirectory, resolvedConfig ) ) )
 			return { ok: false as const, blockers: [ 'config-directory-mismatch' ], executable };
 		const projectsDirectory = await resolveClaudeProjectsDirectory(
 			resolvedConfig,
@@ -347,7 +370,7 @@ export async function readClaudeAccountStatus(
 	run: ClaudeProcessRunner = runNativeProcess
 ): Promise< ClaudeAccountStatus > {
 	const child = buildClaudeEnvironment( process.env );
-	const context = resolveClaudeConfigContext( configDirectory, process.env );
+	const context = await resolveClaudeConfigContext( configDirectory, process.env );
 	if ( child.conflicts.length || context.mode === 'conflict' ) return { state: 'unavailable' };
 	if ( context.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = context.directory;
 	let status: Record< string, unknown >;
@@ -377,7 +400,7 @@ export async function openClaudeNativeSignIn( connectionId: string ): Promise< v
 	if ( ! connection ) throw new Error( 'Unknown Claude connection' );
 	const executable = await inspectClaudeExecutable( connection.executablePath );
 	const child = buildClaudeEnvironment( process.env );
-	const config = resolveClaudeConfigContext( connection.configDirectory, process.env );
+	const config = await resolveClaudeConfigContext( connection.configDirectory, process.env );
 	if ( ! executable.ok || child.conflicts.length || config.mode === 'conflict' )
 		throw new Error( 'Claude connection is not qualified for sign-in' );
 	const configuration = await inspectClaudeConfiguration(

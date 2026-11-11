@@ -107,10 +107,12 @@ export function sha256( bytes: Buffer ): string {
 	return createHash( 'sha256' ).update( bytes ).digest( 'hex' );
 }
 
-type MemoryNode =
-	| { kind: 'file'; bytes: Buffer; inode: number; version: number; mode: number }
-	| { kind: 'directory'; inode: number }
-	| { kind: 'symlink'; target: string; inode: number };
+type MemoryEntry = { inode: number } & (
+	| { kind: 'file'; bytes: Buffer; version: number; mode: number }
+	| { kind: 'directory' }
+	| { kind: 'symlink'; target: string }
+);
+type MemoryNode = MemoryEntry & { path: string; device: string };
 
 function missing( target: string ): Error {
 	return Object.assign( new Error( `ENOENT: ${ target }` ), { code: 'ENOENT' } );
@@ -118,16 +120,49 @@ function missing( target: string ): Error {
 
 /**
  * A filesystem seam with symlinks that never touches the disk, for paths of
- * another OS than the one running the test.
+ * another OS than the one running the test. Paths under a prefix listed in
+ * `caseInsensitive` resolve whatever their letter case, keeping the case they
+ * were created with, as NTFS and default APFS volumes do.
  */
-export function memoryFileSystem( pathModule: PlatformPath ) {
+export function memoryFileSystem(
+	pathModule: PlatformPath,
+	options: { caseInsensitive?: string[]; devices?: Record< string, string > } = {}
+) {
 	const nodes = new Map< string, MemoryNode >();
 	let inodes = 100;
-	const key = ( target: string ) => pathModule.normalize( target );
+	const normalize = ( target: string ) => pathModule.normalize( target );
+	const insensitive = ( target: string ) =>
+		( options.caseInsensitive ?? [] ).some( ( prefix ) => {
+			const folded = normalize( target ).toLowerCase();
+			const base = normalize( prefix )
+				.toLowerCase()
+				.replace( /[\\/]+$/, '' );
+			return folded === base || folded.startsWith( base + pathModule.sep );
+		} );
+	const key = ( target: string ) =>
+		insensitive( target ) ? normalize( target ).toLowerCase() : normalize( target );
+	const deviceOf = ( target: string ) => {
+		let device = '7';
+		let longest = -1;
+		for ( const [ prefix, value ] of Object.entries( options.devices ?? {} ) )
+			if (
+				( key( target ) === key( prefix ) ||
+					key( target ).startsWith( key( prefix ) + pathModule.sep ) ) &&
+				prefix.length > longest
+			) {
+				device = value;
+				longest = prefix.length;
+			}
+		return device;
+	};
+	const set = ( target: string, node: MemoryEntry ) => {
+		const canonical = nodes.get( key( target ) )?.path ?? normalize( target );
+		nodes.set( key( target ), { ...node, path: canonical, device: deviceOf( target ) } );
+	};
 	const ensureParents = ( target: string ) => {
-		let parent = pathModule.dirname( key( target ) );
-		while ( ! nodes.has( parent ) ) {
-			nodes.set( parent, { kind: 'directory', inode: inodes++ } );
+		let parent = pathModule.dirname( normalize( target ) );
+		while ( ! nodes.has( key( parent ) ) ) {
+			set( parent, { kind: 'directory', inode: inodes++ } );
 			const next = pathModule.dirname( parent );
 			if ( next === parent ) break;
 			parent = next;
@@ -135,14 +170,14 @@ export function memoryFileSystem( pathModule: PlatformPath ) {
 	};
 	const resolve = ( target: string, followLast = true, depth = 0 ): string => {
 		if ( depth > 32 ) throw Object.assign( new Error( 'ELOOP' ), { code: 'ELOOP' } );
-		const normalized = key( target );
+		const normalized = normalize( target );
 		const { root } = pathModule.parse( normalized );
 		const parts = normalized.slice( root.length ).split( pathModule.sep ).filter( Boolean );
 		let current = root;
 		for ( let index = 0; index < parts.length; index++ ) {
-			current = pathModule.join( current, parts[ index ] );
-			const node = nodes.get( current );
+			const node = nodes.get( key( pathModule.join( current, parts[ index ] ) ) );
 			if ( ! node ) throw missing( target );
+			current = node.path;
 			if ( node.kind === 'symlink' && ( followLast || index < parts.length - 1 ) ) {
 				const linked = pathModule.resolve( pathModule.dirname( current ), node.target );
 				current = resolve( linked, true, depth + 1 );
@@ -151,12 +186,12 @@ export function memoryFileSystem( pathModule: PlatformPath ) {
 		return current;
 	};
 	const stat = ( resolved: string ): ClaudeFileStat => {
-		const node = nodes.get( resolved );
+		const node = nodes.get( key( resolved ) );
 		if ( ! node ) throw missing( resolved );
 		return {
 			kind: node.kind,
 			size: node.kind === 'file' ? node.bytes.length : 0,
-			device: '7',
+			device: node.device,
 			inode: String( node.inode ),
 			modified: String( node.kind === 'file' ? node.version : 0 ),
 			changed: String( node.kind === 'file' ? node.version : 0 ),
@@ -169,12 +204,12 @@ export function memoryFileSystem( pathModule: PlatformPath ) {
 		lstat: async ( target ) => stat( resolve( target, false ) ),
 		statSync: ( target ) => stat( resolve( target ) ),
 		read: async ( target, position, length ) => {
-			const node = nodes.get( resolve( target ) );
+			const node = nodes.get( key( resolve( target ) ) );
 			if ( node?.kind !== 'file' ) throw missing( target );
 			return Buffer.from( node.bytes.subarray( position, position + length ) );
 		},
 		sha256: async ( target ) => {
-			const node = nodes.get( resolve( target ) );
+			const node = nodes.get( key( resolve( target ) ) );
 			if ( node?.kind !== 'file' ) throw missing( target );
 			return sha256( node.bytes );
 		},
@@ -182,25 +217,25 @@ export function memoryFileSystem( pathModule: PlatformPath ) {
 	return {
 		files,
 		directory( target: string ) {
-			ensureParents( pathModule.join( target, 'x' ) );
-			nodes.set( key( target ), { kind: 'directory', inode: inodes++ } );
+			ensureParents( target );
+			set( target, { kind: 'directory', inode: inodes++ } );
 		},
 		/** Writes a file; `inPlace` keeps the inode, as an in-place edit does. */
-		write( target: string, bytes: Buffer, options: { mode?: number; inPlace?: boolean } = {} ) {
+		write( target: string, bytes: Buffer, write: { mode?: number; inPlace?: boolean } = {} ) {
 			ensureParents( target );
 			const previous = nodes.get( key( target ) );
-			const keep = options.inPlace && previous?.kind === 'file' ? previous : undefined;
-			nodes.set( key( target ), {
+			const keep = write.inPlace && previous?.kind === 'file' ? previous : undefined;
+			set( target, {
 				kind: 'file',
 				bytes,
 				inode: keep?.inode ?? inodes++,
 				version: ( keep?.version ?? 0 ) + 1,
-				mode: options.mode ?? keep?.mode ?? 0o755,
+				mode: write.mode ?? keep?.mode ?? 0o755,
 			} );
 		},
 		link( target: string, linked: string ) {
 			ensureParents( target );
-			nodes.set( key( target ), { kind: 'symlink', target: linked, inode: inodes++ } );
+			set( target, { kind: 'symlink', target: linked, inode: inodes++ } );
 		},
 		remove( target: string ) {
 			nodes.delete( key( target ) );
@@ -237,9 +272,10 @@ export function spawnFailure( code = 'ENOENT' ): Error {
 export function simulatedHost(
 	host: { platform: string; arch: string },
 	pathModule: PlatformPath,
-	seams: Partial< ClaudePlatformSeams > = {}
+	seams: Partial< ClaudePlatformSeams > = {},
+	volumes: Parameters< typeof memoryFileSystem >[ 1 ] = {}
 ): { fs: ReturnType< typeof memoryFileSystem >; seams: Partial< ClaudePlatformSeams > } {
-	const fs = memoryFileSystem( pathModule );
+	const fs = memoryFileSystem( pathModule, volumes );
 	return {
 		fs,
 		seams: {

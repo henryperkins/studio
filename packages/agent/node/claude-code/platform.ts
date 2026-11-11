@@ -482,3 +482,176 @@ export async function verifyClaudeExecutableIdentity(
 		return false;
 	}
 }
+
+/**
+ * The distinct non-empty values an environment gives a variable. Windows names
+ * ignore case, so `Path` and `PATH` are one variable there; elsewhere only the
+ * exact name counts.
+ */
+export function claudeEnvironmentValues(
+	env: NodeJS.ProcessEnv,
+	name: string,
+	host: ClaudeHost = currentClaudeHost()
+): string[] {
+	const values = Object.entries( env )
+		.filter(
+			( [ key, value ] ) =>
+				!! value && ( host.platform === 'win32' ? key.toUpperCase() === name : key === name )
+		)
+		.map( ( [ , value ] ) => value as string );
+	return [ ...new Set( values ) ];
+}
+
+export function claudePathModule( host: ClaudeHost ): PlatformPath {
+	return host.platform === 'win32' ? path.win32 : path.posix;
+}
+
+/** A path's identity on its filesystem, for comparisons that must not collapse distinct folders. */
+export interface ClaudePathKey {
+	/** The deepest existing ancestor, resolved through symlinks, with the rest of the path appended. */
+	canonical: string;
+	/** That ancestor's device and inode, or its folded canonical text where the filesystem has no inodes. */
+	anchor: string;
+	/** The part of the path that does not exist yet, folded when its volume ignores case. */
+	rest: string;
+	caseSensitive: boolean;
+	caseSource: 'probed' | 'os-default';
+}
+
+const MISSING = new Set( [ 'ENOENT', 'ENOTDIR' ] );
+
+function errorCode( error: unknown ): unknown {
+	return ( error as { code?: unknown } )?.code;
+}
+
+/** Changes the case of each character whose other case is a single character. */
+function mapCase( value: string, change: ( character: string ) => string ): string {
+	return Array.from( value, ( character ) => {
+		const changed = change( character );
+		return changed.length === character.length ? changed : character;
+	} ).join( '' );
+}
+
+function foldCase( value: string, host: ClaudeHost ): string {
+	// APFS also ignores Unicode normalization; NTFS does not.
+	return mapCase( host.platform === 'darwin' ? value.normalize( 'NFC' ) : value, ( character ) =>
+		character.toLowerCase()
+	);
+}
+
+/** Whether two texts name the same path on a volume with the given case sensitivity. */
+export function isSameClaudePathText(
+	a: string,
+	b: string,
+	caseSensitive: boolean,
+	host: ClaudeHost = currentClaudeHost()
+): boolean {
+	const pathModule = claudePathModule( host );
+	const left = pathModule.normalize( a );
+	const right = pathModule.normalize( b );
+	return caseSensitive ? left === right : foldCase( left, host ) === foldCase( right, host );
+}
+
+/**
+ * Asks the filesystem whether the volume holding `existing` ignores case: it
+ * looks up a name next to it with its letters' case swapped. Linux is never
+ * folded: its filesystems are case-sensitive apart from opt-in casefold
+ * folders, where existing aliases still resolve to one device and inode.
+ */
+async function probeCaseSensitivity(
+	existing: string,
+	host: ClaudeHost,
+	files: ClaudeFileAccess
+): Promise< Pick< ClaudePathKey, 'caseSensitive' | 'caseSource' > > {
+	if ( host.platform !== 'win32' && host.platform !== 'darwin' )
+		return { caseSensitive: true, caseSource: 'os-default' };
+	const pathModule = claudePathModule( host );
+	let candidate = existing;
+	for (;;) {
+		const name = pathModule.basename( candidate );
+		const swapped = mapCase( name, ( character ) =>
+			character === character.toLowerCase() ? character.toUpperCase() : character.toLowerCase()
+		);
+		if ( name && swapped !== name ) {
+			try {
+				const [ alias, original ] = await Promise.all( [
+					files.stat( pathModule.join( pathModule.dirname( candidate ), swapped ) ),
+					files.stat( candidate ),
+				] );
+				if ( alias.inode !== '0' && original.inode !== '0' )
+					return {
+						caseSensitive: alias.device !== original.device || alias.inode !== original.inode,
+						caseSource: 'probed',
+					};
+				break;
+			} catch ( error ) {
+				if ( MISSING.has( errorCode( error ) as string ) )
+					return { caseSensitive: true, caseSource: 'probed' };
+				break;
+			}
+		}
+		const parent = pathModule.dirname( candidate );
+		if ( parent === candidate ) break;
+		candidate = parent;
+	}
+	// Nothing on the way to the root has a letter to swap, or the filesystem
+	// cannot say: NTFS and APFS ignore case unless formatted otherwise.
+	return { caseSensitive: false, caseSource: 'os-default' };
+}
+
+export async function resolveClaudePathKey(
+	target: string,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudePathKey > {
+	const { host, files } = defaultClaudePlatformSeams( overrides );
+	const pathModule = claudePathModule( host );
+	let current = pathModule.resolve( target );
+	const missing: string[] = [];
+	for (;;) {
+		let real: string;
+		let found: ClaudeFileStat;
+		try {
+			real = await files.realpath( current );
+			found = await files.stat( real );
+		} catch ( error ) {
+			const parent = pathModule.dirname( current );
+			if ( ! MISSING.has( errorCode( error ) as string ) || parent === current ) throw error;
+			missing.unshift( pathModule.basename( current ) );
+			current = parent;
+			continue;
+		}
+		if ( missing.length && found.kind !== 'directory' )
+			throw Object.assign( new Error( 'Not a directory' ), { code: 'ENOTDIR' } );
+		const { caseSensitive, caseSource } = await probeCaseSensitivity( real, host, files );
+		const fold = ( value: string ) => ( caseSensitive ? value : foldCase( value, host ) );
+		const rest = missing.join( pathModule.sep );
+		return {
+			canonical: rest ? pathModule.join( real, rest ) : real,
+			anchor: found.inode !== '0' ? `${ found.device }:${ found.inode }` : fold( real ),
+			rest: fold( rest ),
+			caseSensitive,
+			caseSource,
+		};
+	}
+}
+
+/**
+ * Whether two paths name the same file or folder: the same device and inode
+ * after symlinks, with any part that does not exist yet compared as the
+ * volume compares names. Anything that cannot be resolved is not the same.
+ */
+export async function isSameClaudePath(
+	a: string,
+	b: string,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< boolean > {
+	try {
+		const [ left, right ] = await Promise.all( [
+			resolveClaudePathKey( a, overrides ),
+			resolveClaudePathKey( b, overrides ),
+		] );
+		return left.anchor === right.anchor && left.rest === right.rest;
+	} catch {
+		return false;
+	}
+}
