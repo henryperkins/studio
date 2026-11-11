@@ -98,9 +98,9 @@ import type { ChatGptSignInOutcome } from '@studio/agent/protocol/chatgpt';
 const CHATGPT_ACCEPTANCE_PROVIDER = 'chatgpt';
 
 type AcceptanceScenario = 'saved' | 'session';
-type AcceptanceGate = 'T1' | 'T2' | 'T3';
+type AcceptanceGate = 'T1' | 'T2' | 'T3' | 'T4';
 
-const GATES: readonly AcceptanceGate[] = [ 'T1', 'T2', 'T3' ];
+const GATES: readonly AcceptanceGate[] = [ 'T1', 'T2', 'T3', 'T4' ];
 const SITE_NAME = 'ChatGPT Acceptance';
 const SITE_FOLDER = 'chatgpt-acceptance';
 const EXIT_PASSED = 0;
@@ -984,6 +984,8 @@ interface StageDefinition {
 	name: string;
 	/** An optional gate: skipped unless requested, and its failure doesn't stop the run. */
 	gate?: AcceptanceGate;
+	/** What a numbered stage covers, for the plan. */
+	summary?: () => string;
 	run( ctx: StageContext, observations: Observations ): Promise< void >;
 }
 
@@ -1272,6 +1274,69 @@ const createMarker = () => {
 
 const READY_PROMPT = 'Reply with the single word READY. Do not use any tools.';
 
+/**
+ * Gate T4 for one pair of the route's qualified table: the pair, in a chat of
+ * its own with no site, answers a bounded read-only turn on the route at that
+ * model and effort. One model doesn't qualify the list, so each pair is its
+ * own stage and record. Pairs are numbered in the table's order (models, then
+ * each model's efforts) at the run's source commit: a stage named after a model
+ * slug would be long and digit-laden enough for the evidence guard to refuse it.
+ */
+function modelSmokeStage( model: string, effort: string, number: number ): StageDefinition {
+	const label = `smoke-${ number }`;
+	return {
+		name: `gate-t4-${ label }`,
+		gate: 'T4',
+		summary: () =>
+			sprintf(
+				/* translators: 1: ChatGPT model id, 2: reasoning effort such as low. */
+				__( '%1$s at %2$s effort' ),
+				model,
+				effort
+			),
+		async run( ctx, observations ) {
+			const account = await requireSignedInAccount( ctx );
+			const availability = await ctx.services.broker.readModels(
+				account.registrationId,
+				account.revision
+			);
+			observations.modelListed = Boolean(
+				availability.models?.some( ( item ) => item.id === model )
+			);
+			if ( ! observations.modelListed ) {
+				return block( 'model-not-listed' );
+			}
+			const sessionId = await ctx.services.sessions.create();
+			await ctx.services.sessions.select( sessionId, {
+				connectionId: account.registrationId,
+				revision: account.revision,
+				model,
+				reasoningEffort: effort,
+			} );
+			const policy: ToolPolicy = { tools: [] };
+			const result = await runTurn( ctx, {
+				label,
+				sessionId,
+				prompt: READY_PROMPT,
+				offerSessions: false,
+				ipc: true,
+				policy,
+			} );
+			const digest = judgeTurn( observations, result, policy );
+			observations.answeredReady = /\bREADY\b/.test( digest.finalText );
+			check( observations.completed === true, digest.failureCodes[ 0 ] ?? 'turn-failed' );
+			applyRouteAudit( observations, result, { model, effort } );
+			check( observations.answeredReady, 'ready-not-answered' );
+		},
+	};
+}
+
+const MODEL_SMOKE_STAGES: StageDefinition[] = Object.entries( CHATGPT_MODEL_CAPABILITIES )
+	.flatMap( ( [ model, capabilities ] ) =>
+		capabilities.reasoningEfforts.map( ( effort ) => ( { model, effort } ) )
+	)
+	.map( ( { model, effort }, index ) => modelSmokeStage( model, effort, index + 1 ) );
+
 async function readPosts( ctx: StageContext, sitePath: string ): Promise< WpPost[] > {
 	const listed = await ctx.services.processes.runCli( 'wp-post-list', [
 		'wp',
@@ -1373,6 +1438,7 @@ const SAVED_STAGES: StageDefinition[] = [
 			check( observations.selectedModelListed, 'model-not-listed' );
 		},
 	},
+	...MODEL_SMOKE_STAGES,
 	{
 		name: 'disposable-site',
 		async run( ctx, observations ) {
@@ -2228,7 +2294,7 @@ function describeArgumentProblem( problem: ArgumentProblem ): string {
 		case 'scenario-unknown':
 			return __( 'The scenario must be saved or session.' );
 		case 'gate-unknown':
-			return __( 'The optional gates are T1, T2 and T3.' );
+			return __( 'The optional gates are T1, T2, T3 and T4.' );
 		case 'option-not-for-session':
 			return __(
 				'The session scenario uses the model, effort and site of the saved run in the same directory, so it takes no --model, --effort or --gates.'
@@ -2296,7 +2362,7 @@ function describeSessionProblem( problem: SessionProblem ): string {
 
 function usage(): string {
 	return __(
-		'Usage: node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario saved|session --run-dir <absolute path> [--live] [--model <model>] [--effort <effort>] [--gates T1,T2,T3]'
+		'Usage: node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario saved|session --run-dir <absolute path> [--live] [--model <model>] [--effort <effort>] [--gates T1,T2,T3,T4]'
 	);
 }
 
@@ -2354,8 +2420,17 @@ function printPlan( print: ( line: string ) => void, options: ChatGptAcceptanceO
 		)
 	);
 	for ( const stage of stages ) {
+		const summary = stage.summary?.();
 		print(
-			stage.gate
+			stage.gate && summary
+				? sprintf(
+						/* translators: 1: stage name, 2: gate name such as T4, 3: what the stage covers. */
+						__( '  %1$s (optional: runs with --gates %2$s): %3$s' ),
+						stage.name,
+						stage.gate,
+						summary
+				  )
+				: stage.gate
 				? sprintf(
 						/* translators: 1: stage name, 2: gate name such as T1. */
 						__( '  %1$s (optional: runs with --gates %2$s)' ),

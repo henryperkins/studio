@@ -22,6 +22,7 @@ import {
 } from '@studio/agent/node/chatgpt/tests/fixtures/fake-authorization-server';
 import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { createFakeCredentialStore } from '@studio/agent/node/tests/fake-credential-store';
+import { CHATGPT_MODEL_CAPABILITIES } from '@studio/agent/protocol/chatgpt-models';
 import { describeConnectionSelectionError } from '@studio/agent/protocol/connections';
 import { getConfigDirectory } from '@studio/common/lib/well-known-paths';
 import nock from 'nock';
@@ -1582,6 +1583,152 @@ describe( 'ChatGPT acceptance runner', () => {
 			} );
 			// A failed optional gate doesn't stop the required stages after it.
 			expect( stageOf( 'blocked-after-sign-out' )[ 0 ].status ).toBe( 'passed' );
+		} );
+
+		describe( 'gate T4: a read-only smoke turn per qualified model and effort', () => {
+			// Numbered in the table's order: models, then each model's efforts.
+			const pairs = Object.entries( CHATGPT_MODEL_CAPABILITIES )
+				.flatMap( ( [ model, capability ] ) =>
+					capability.reasoningEfforts.map( ( effort ) => ( { model, effort } ) )
+				)
+				.map( ( pair, index ) => ( { ...pair, label: `smoke-${ index + 1 }` } ) );
+			const readyTurn =
+				( effortOnWire?: string ) =>
+				( options: TurnOptions ): AcceptanceTurn => {
+					const pair = pairs.find( ( item ) => item.label === options.label );
+					return finishedTurn(
+						turnResult( {
+							events: [ answered( 'READY' ), completed( 'success' ) ],
+							requests: [
+								routeRequest( {
+									model: pair?.model,
+									effort: effortOnWire ?? pair?.effort,
+								} ),
+							],
+						} )
+					);
+				};
+
+			it( 'is one stage per pair of the route’s table, skipped unless requested', async () => {
+				expect( pairs.length ).toBeGreaterThan( 1 );
+				for ( const { label } of pairs ) {
+					expect( SAVED_STAGE_NAMES ).toContain( `gate-t4-${ label }` );
+				}
+				expect( SAVED_STAGE_NAMES.indexOf( 'model-discovery' ) ).toBeLessThan(
+					SAVED_STAGE_NAMES.indexOf( `gate-t4-${ pairs[ 0 ].label }` )
+				);
+				expect(
+					parseChatGptAcceptanceArgs( [
+						'--scenario',
+						'saved',
+						'--run-dir',
+						runDir,
+						'--gates',
+						'T4',
+					] )
+				).toMatchObject( { ok: true, options: { gates: [ 'T4' ] } } );
+				printed = [];
+				await runChatGptAcceptance(
+					[ '--scenario', 'saved', '--run-dir', runDir ],
+					dependencies( undefined, { createServices: vi.fn() } )
+				);
+				for ( const { label, model, effort } of pairs ) {
+					expect( printed ).toContain(
+						`  gate-t4-${ label } (optional: runs with --gates T4): ${ model } at ${ effort } effort`
+					);
+				}
+				const { services, calls } = scriptedServices();
+				expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 0 );
+				for ( const { label } of pairs ) {
+					expect( stageOf( `gate-t4-${ label }` )[ 0 ] ).toMatchObject( {
+						status: 'skipped',
+						code: 'not-requested',
+					} );
+				}
+				expect( calls.log.filter( ( call ) => call.startsWith( 'turn:smoke-' ) ) ).toEqual( [] );
+			} );
+
+			it( 'smokes each pair in its own chat on the route, recording each separately', async () => {
+				const turns = Object.fromEntries( pairs.map( ( { label } ) => [ label, readyTurn() ] ) );
+				const { services, calls } = scriptedServices( {}, turns );
+				expect(
+					await runChatGptAcceptance( savedArgs( '--gates', 'T4' ), dependencies( services ) )
+				).toBe( 0 );
+				for ( const { label, effort } of pairs ) {
+					expect( stageOf( `gate-t4-${ label }` ) ).toEqual( [
+						expect.objectContaining( {
+							status: 'passed',
+							observations: expect.objectContaining( {
+								modelListed: true,
+								modelRequests: 1,
+								apiKeyBearers: 0,
+								otherProviderRequests: 0,
+								allOnSelectedModel: true,
+								allAtSelectedEffort: true,
+								answeredReady: true,
+								unexpectedToolCalls: 0,
+							} ),
+						} ),
+					] );
+					expect( calls.log ).toContain( `turn:${ label }` );
+					expect( calls.log ).toContain( `select:${ effort }` );
+					expect( calls.prompts[ label ] ).toMatch( /READY/ );
+				}
+				// Each pair in a chat of its own, with no site.
+				expect(
+					calls.log.filter( ( call ) => call === 'session:global' ).length
+				).toBeGreaterThanOrEqual( pairs.length );
+			} );
+
+			it( 'fails a pair whose requests used another effort, blocks one the account does not list, and goes on', async () => {
+				const [ substituted, ...rest ] = pairs;
+				const turns = Object.fromEntries(
+					pairs.map( ( { label } ) => [
+						label,
+						label === substituted.label ? readyTurn( 'xhigh' ) : readyTurn(),
+					] )
+				);
+				const { services } = scriptedServices( {}, turns );
+				expect(
+					await runChatGptAcceptance( savedArgs( '--gates', 'T4' ), dependencies( services ) )
+				).toBe( 1 );
+				expect( stageOf( `gate-t4-${ substituted.label }` )[ 0 ] ).toMatchObject( {
+					status: 'failed',
+					code: 'effort-substituted',
+				} );
+				for ( const { label } of rest ) {
+					expect( stageOf( `gate-t4-${ label }` )[ 0 ].status ).toBe( 'passed' );
+				}
+				expect( stageOf( 'blocked-after-sign-out' )[ 0 ].status ).toBe( 'passed' );
+
+				// Each pair reads the account's list again: here the run's own model is
+				// listed for discovery, and nothing is listed by the time the gate runs.
+				fs.rmSync( runDir, { recursive: true, force: true } );
+				const unlisted = scriptedServices( {}, turns );
+				let reads = 0;
+				unlisted.services.broker.readModels = async ( connectionId, revision ) => ( {
+					connectionId,
+					revision,
+					checkedAt: '',
+					models: reads++ === 0 ? [ { id: 'gpt-6-luna', label: 'GPT-6 Luna' } ] : [],
+					lastError: null,
+				} );
+				expect(
+					await runChatGptAcceptance(
+						savedArgs( '--gates', 'T4' ),
+						dependencies( unlisted.services )
+					)
+				).toBe( 0 );
+				for ( const { label } of pairs ) {
+					expect( stageOf( `gate-t4-${ label }` )[ 0 ] ).toMatchObject( {
+						status: 'blocked',
+						code: 'model-not-listed',
+					} );
+				}
+				expect( unlisted.calls.log.filter( ( call ) => call.startsWith( 'turn:smoke-' ) ) ).toEqual(
+					[]
+				);
+			} );
 		} );
 	} );
 

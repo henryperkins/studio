@@ -10,7 +10,7 @@ Sources: `apps/cli/ai/chatgpt-acceptance-entry.ts` (entry), `chatgpt-acceptance.
 
 ```text
 npm run cli:build
-node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario saved --run-dir <absolute-new-directory> [--model <model>] [--effort <effort>] [--gates T1,T2,T3] [--live]
+node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario saved --run-dir <absolute-new-directory> [--model <model>] [--effort <effort>] [--gates T1,T2,T3,T4] [--live]
 node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario session --run-dir <the-same-directory> [--live]
 ```
 
@@ -20,7 +20,7 @@ node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario session --run-dir <the-
 | `--run-dir <path>` | Required. Absolute, outside `~/.studio`. For `saved` it must not exist yet or be empty; for `session` it must hold that saved run. |
 | `--live` | Run against the real account. Without it, the runner only checks local prerequisites and prints its plan. |
 | `--model`, `--effort` | `saved` only. Default: the route's first qualified model and its default effort. Anything the route isn't qualified for (`packages/agent/protocol/chatgpt-models.ts`, today `gpt-6-luna` at `low` or `medium`) is refused with the reason. `session` uses the saved run's choice. |
-| `--gates T1,T2,T3` | `saved` only. Optional live gates, skipped (and recorded as skipped) unless named. |
+| `--gates T1,T2,T3,T4` | `saved` only. Optional live gates, skipped (and recorded as skipped) unless named. |
 
 Exit codes: `0` every required stage passed (a requested gate may be blocked); `1` a stage failed or was blocked, a requested gate failed, or cleanup failed; `2` refused before anything ran, which includes every run without `--live`; `130` interrupted. A second Ctrl+C exits without finishing cleanup (see "If a run is killed").
 
@@ -47,6 +47,7 @@ Every stage records `passed`, `failed`, `blocked` or `skipped`, a typed code and
 | `sign-in` | Browser sign-in, saved credential, new registration. | `browserOpened`, `completedAfterS`, `timeoutS`, `timedOut`, `storedInVault` |
 | `re-sign-in` | Browser sign-in again to the same registration. | `sameRegistration`, `sameRevision` |
 | `model-discovery` | Reads the account's model list. | `listedModels`, `selectedModelListed`, `unqualifiedModelsListed` |
+| `gate-t4-smoke-1`, `gate-t4-smoke-2`, … | T4: one stage per pair of the route's qualified table (`CHATGPT_MODEL_CAPABILITIES` in `packages/agent/protocol/chatgpt-models.ts`), numbered in its order (models, then each model's efforts; today `gpt-6-luna` at `low`, then at `medium`). Each pair reads the account's model list again (`blocked`, `model-not-listed`, when the pair's model isn't listed), then answers a read-only READY turn in a new chat with no site, selected at that model and effort, and gets the same route audit as `draft-request-audit`. A single model never qualifies the list: each pair passes or fails on its own record, and a failed pair doesn't stop the others. The plan printed without `--live` names each number's model and effort; the numbering is the table at the run's source commit, which the manifest records. | `modelListed`, `answeredReady`, `modelRequests`, `apiKeyBearers`, `otherProviderRequests`, `allOnSelectedModel`, `allAtSelectedEffort`, `noOutputCap`, `stateless` |
 | `disposable-site` | `site create` in the run directory; baseline post list over WP-CLI. | `siteCreated`, `baselinePosts` |
 | `draft-turn` | A forked CLI turn reads the site title and creates exactly one named draft. At least one WP-CLI read must have run and returned (`no-site-read` otherwise): a read is decided by the command's verb, as the tool policy decides it, so the draft's own `post create` never counts, nor does a write whose later words look like read verbs (`option update status x`). Tool calls outside the turn's policy (other sites, publishing, deleting, other tools) are interrupted and fail the stage. | `toolCalls`, `wpCliCalls`, `wpCliReads`, `unexpectedToolCalls`, `questionsAsked`, `completed` |
 | `draft-request-audit` | Every model request of that turn: on the route, the selected model and effort, streamed, stateless, no output cap, no API-key bearer, no other provider. | `modelRequests`, `apiKeyBearers`, `otherProviderRequests`, `allOnSelectedModel`, `allAtSelectedEffort`, `noOutputCap`, `stateless` |
