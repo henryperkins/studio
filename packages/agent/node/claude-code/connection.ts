@@ -1,5 +1,5 @@
 import { execFile } from 'child_process';
-import { lstat, realpath, stat } from 'fs/promises';
+import { realpath, stat } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
@@ -12,6 +12,7 @@ import {
 	claudePathModule,
 	currentClaudeHost,
 	defaultClaudePlatformSeams,
+	inspectClaudeManagedPolicy,
 	isSameClaudePath,
 	isSameClaudePathText,
 	resolveClaudePathKey,
@@ -22,33 +23,6 @@ import type { ClaudePlatformSeams } from './platform';
 const execFileAsync = promisify( execFile );
 
 export { inspectClaudeConfiguration } from './configuration';
-async function inspectManagedPolicy(): Promise< boolean > {
-	if ( process.platform !== 'win32' || ! process.env.ProgramFiles ) return false;
-	try {
-		const script = `$ErrorActionPreference='Stop'; if ((Test-Path 'HKLM:\\SOFTWARE\\Policies\\ClaudeCode') -or (Test-Path 'HKCU:\\SOFTWARE\\Policies\\ClaudeCode')) { exit 1 }`;
-		await execFileAsync(
-			trustedPowerShellPath(),
-			[
-				'-NoProfile',
-				'-NonInteractive',
-				'-EncodedCommand',
-				Buffer.from( script, 'utf16le' ).toString( 'base64' ),
-			],
-			{ env: buildClaudeEnvironment( process.env ).env, timeout: 10000, windowsHide: true }
-		);
-		for ( const name of [ 'managed-settings.json', 'managed-settings.d', 'managed-mcp.json' ] ) {
-			try {
-				await lstat( path.join( process.env.ProgramFiles, 'ClaudeCode', name ) );
-				return false;
-			} catch ( error ) {
-				if ( ( error as NodeJS.ErrnoException ).code !== 'ENOENT' ) return false;
-			}
-		}
-		return true;
-	} catch {
-		return false;
-	}
-}
 // `revision` moves each time Studio re-establishes the connection's sign-in; a
 // record that has never been re-established is at revision 1.
 export type ClaudeConnection = {
@@ -216,13 +190,15 @@ export async function prepareClaudeInvocation(
 		);
 		if ( ! ( await stat( resolvedConfig ) ).isDirectory() ) throw new Error();
 		const configuration = await inspectClaudeConfiguration( canonicalCwd, resolvedConfig );
-		if ( ! ( await inspectManagedPolicy() ) )
+		const managedPolicy = await inspectClaudeManagedPolicy();
+		if ( managedPolicy.state !== 'absent' )
 			configuration.blockers.push( 'managed-policy-unverified' );
 		if ( configuration.blockers.length )
 			return {
 				ok: false as const,
 				blockers: configuration.blockers,
 				findings: configuration.findings,
+				managedPolicy,
 			};
 		const executable = await inspectClaudeExecutable( executablePath );
 		if ( ! executable.ok )
@@ -270,6 +246,7 @@ export async function prepareClaudeInvocation(
 			version: executable.version,
 			executable,
 			executableIdentity: executable.identity,
+			managedPolicy,
 			findings: configuration.findings,
 		};
 	} catch {
@@ -285,6 +262,7 @@ export async function inspectClaudeConnection( executablePath: string, configDir
 		executable: result.executable,
 		config: { mode: result.configMode, directory: result.configDirectory },
 		auth: { qualified: true, method: 'claude.ai' },
+		managedPolicy: result.managedPolicy,
 		findings: result.findings,
 		blockers: [ 'runtime-inventory-unverified' ],
 	};
@@ -407,7 +385,7 @@ export async function openClaudeNativeSignIn( connectionId: string ): Promise< v
 		process.cwd(),
 		config.directory ?? path.join( os.homedir(), '.claude' )
 	);
-	if ( configuration.blockers.length || ! ( await inspectManagedPolicy() ) )
+	if ( configuration.blockers.length || ( await inspectClaudeManagedPolicy() ).state !== 'absent' )
 		throw new Error( 'Claude configuration is not qualified for sign-in' );
 	await markClaudeConnectionReestablished( connectionId );
 	if ( config.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = config.directory;

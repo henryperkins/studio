@@ -1,4 +1,5 @@
 import path from 'path';
+import { findPolicyLocations, managedPolicyFiles, policyFinding } from './policy';
 import type {
 	ClaudeArch,
 	ClaudeBinaryHeader,
@@ -118,5 +119,11 @@ export const linuxAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 				manifestRuntimeVersion: match.runtimeVersion,
 			},
 		};
+	},
+	/** The documented Linux sources (code.claude.com/docs/en/managed-settings): `/etc/claude-code`. */
+	async inspectManagedPolicy( seams ) {
+		const files = managedPolicyFiles( '/etc/claude-code', path.posix );
+		const { present, unreadable } = await findPolicyLocations( files, seams.files );
+		return policyFinding( files, present, unreadable );
 	},
 } );

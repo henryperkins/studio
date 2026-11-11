@@ -8,6 +8,7 @@ import {
 	CLAUDE_QUALIFICATION_MATRIX,
 	claudePlatformTarget,
 	defaultClaudePlatformSeams,
+	inspectClaudeManagedPolicy,
 	isClaudeExecutableUnchanged,
 	isClaudeRuntimeSurfaceEnabled,
 	isSameClaudePath,
@@ -959,5 +960,233 @@ describe( 'Claude path identity', () => {
 		} finally {
 			await rm( root, { recursive: true, force: true, maxRetries: 4 } );
 		}
+	} );
+} );
+
+function denied( files: ReturnType< typeof simulatedHost >[ 'fs' ][ 'files' ], blocked: string[] ) {
+	const contents = { read: 0 };
+	return {
+		contents,
+		files: {
+			...files,
+			lstat: async ( target: string ) => {
+				if ( blocked.some( ( prefix ) => target.startsWith( prefix ) ) )
+					throw Object.assign( new Error( 'EACCES' ), { code: 'EACCES' } );
+				return files.lstat( target );
+			},
+			read: async ( ...args: Parameters< typeof files.read > ) => {
+				contents.read++;
+				return files.read( ...args );
+			},
+			sha256: async ( target: string ) => {
+				contents.read++;
+				return files.sha256( target );
+			},
+		},
+	};
+}
+
+describe( 'Claude managed policy', () => {
+	const windowsFiles = [
+		'managed-settings.json',
+		'managed-settings.d',
+		'managed-mcp.json',
+	] as const;
+
+	function windows( registry: string | Error = '', programFiles = 'C:\\Program Files' ) {
+		const runner = recordingRunner( () => registry );
+		const host = simulatedHost( { platform: 'win32', arch: 'x64' }, path.win32, {
+			env: { SystemRoot: 'C:\\Windows', ProgramFiles: programFiles },
+			run: runner.run,
+		} );
+		return { ...host, calls: runner.calls };
+	}
+
+	it( 'finds no policy on Windows only after checking every documented file and both registry keys', async () => {
+		const { fs, seams, calls } = windows();
+		const guarded = denied( fs.files, [] );
+		fs.directory( 'C:\\Program Files\\ClaudeCode' );
+		const finding = await inspectClaudeManagedPolicy( { ...seams, files: guarded.files } );
+		expect( finding ).toEqual( {
+			state: 'absent',
+			present: [],
+			unreadable: [],
+			checked: [
+				...windowsFiles.map( ( name ) => ( {
+					kind: expect.any( String ),
+					scope: 'machine',
+					location: `C:\\Program Files\\ClaudeCode\\${ name }`,
+				} ) ),
+				{
+					kind: 'registry',
+					scope: 'machine',
+					location: 'HKLM\\SOFTWARE\\Policies\\ClaudeCode',
+				},
+				{ kind: 'registry', scope: 'user', location: 'HKCU\\SOFTWARE\\Policies\\ClaudeCode' },
+			],
+		} );
+		expect( guarded.contents.read ).toBe( 0 );
+		const script = decodedScript( calls[ 0 ].args );
+		expect( script ).toContain( "Test-Path -LiteralPath 'HKLM:\\SOFTWARE\\Policies\\ClaudeCode'" );
+		expect( script ).toContain( "Test-Path -LiteralPath 'HKCU:\\SOFTWARE\\Policies\\ClaudeCode'" );
+		expect( script ).not.toMatch( /Get-ItemProperty|Get-Content|credentials/i );
+	} );
+
+	it( 'reports each documented Windows source that is present, including a symlinked file', async () => {
+		for ( const [ name, kind ] of [
+			[ 'managed-settings.json', 'settings-file' ],
+			[ 'managed-settings.d', 'settings-directory' ],
+			[ 'managed-mcp.json', 'mcp-file' ],
+		] as const ) {
+			const { fs, seams } = windows();
+			if ( name === 'managed-settings.d' )
+				fs.directory( `C:\\Program Files\\ClaudeCode\\${ name }` );
+			else fs.link( `C:\\Program Files\\ClaudeCode\\${ name }`, 'C:\\Policies\\elsewhere.json' );
+			await expect( inspectClaudeManagedPolicy( seams ), name ).resolves.toMatchObject( {
+				state: 'present',
+				present: [
+					{ kind, scope: 'machine', location: `C:\\Program Files\\ClaudeCode\\${ name }` },
+				],
+			} );
+		}
+		for ( const [ exit, scopes ] of [
+			[ 11, [ 'machine' ] ],
+			[ 12, [ 'user' ] ],
+			[ 13, [ 'machine', 'user' ] ],
+		] as const ) {
+			const { seams } = windows( exitWith( exit ) );
+			const finding = await inspectClaudeManagedPolicy( seams );
+			expect( finding.state ).toBe( 'present' );
+			expect( finding.present.map( ( source ) => [ source.kind, source.scope ] ) ).toEqual(
+				scopes.map( ( scope ) => [ 'registry', scope ] )
+			);
+		}
+	} );
+
+	it( 'checks the documented C:\\Program Files folder too when Program Files lives elsewhere', async () => {
+		const { fs, seams } = windows( '', 'D:\\Program Files' );
+		fs.write( 'C:\\Program Files\\ClaudeCode\\managed-settings.json', Buffer.from( '{}' ) );
+		const finding = await inspectClaudeManagedPolicy( seams );
+		expect( finding.state ).toBe( 'present' );
+		expect( finding.checked.map( ( source ) => source.location ) ).toEqual(
+			expect.arrayContaining( [
+				'D:\\Program Files\\ClaudeCode\\managed-settings.json',
+				'C:\\Program Files\\ClaudeCode\\managed-settings.json',
+			] )
+		);
+	} );
+
+	it( 'cannot call a Windows policy absent when a location or the registry cannot be read', async () => {
+		for ( const registry of [ exitWith( 1 ), spawnFailure() ] ) {
+			const { seams } = windows( registry );
+			await expect( inspectClaudeManagedPolicy( seams ) ).resolves.toMatchObject( {
+				state: 'unverifiable',
+				unreadable: [
+					{ kind: 'registry', scope: 'machine' },
+					{ kind: 'registry', scope: 'user' },
+				],
+			} );
+		}
+		const { fs, seams } = windows();
+		await expect(
+			inspectClaudeManagedPolicy( {
+				...seams,
+				files: denied( fs.files, [ 'C:\\Program Files\\ClaudeCode' ] ).files,
+			} )
+		).resolves.toMatchObject( { state: 'unverifiable' } );
+		await expect(
+			inspectClaudeManagedPolicy( { ...seams, env: { ProgramFiles: 'C:\\Program Files' } } )
+		).resolves.toMatchObject( { state: 'unverifiable' } );
+	} );
+
+	it( 'inspects the macOS file locations and both managed preferences domains, never their contents', async () => {
+		const macos = () =>
+			simulatedHost( { platform: 'darwin', arch: 'arm64' }, path.posix, {
+				username: () => 'tester',
+			} );
+		const empty = macos();
+		const guarded = denied( empty.fs.files, [] );
+		await expect(
+			inspectClaudeManagedPolicy( { ...empty.seams, files: guarded.files } )
+		).resolves.toEqual( {
+			state: 'absent',
+			present: [],
+			unreadable: [],
+			checked: [
+				{
+					kind: 'settings-file',
+					scope: 'machine',
+					location: '/Library/Application Support/ClaudeCode/managed-settings.json',
+				},
+				{
+					kind: 'settings-directory',
+					scope: 'machine',
+					location: '/Library/Application Support/ClaudeCode/managed-settings.d',
+				},
+				{
+					kind: 'mcp-file',
+					scope: 'machine',
+					location: '/Library/Application Support/ClaudeCode/managed-mcp.json',
+				},
+				{
+					kind: 'managed-preferences',
+					scope: 'machine',
+					location: '/Library/Managed Preferences/com.anthropic.claudecode.plist',
+				},
+				{
+					kind: 'managed-preferences',
+					scope: 'user',
+					location: '/Library/Managed Preferences/tester/com.anthropic.claudecode.plist',
+				},
+			],
+		} );
+		expect( guarded.contents.read ).toBe( 0 );
+
+		const profile = macos();
+		profile.fs.write(
+			'/Library/Managed Preferences/tester/com.anthropic.claudecode.plist',
+			Buffer.from( 'plist' )
+		);
+		await expect( inspectClaudeManagedPolicy( profile.seams ) ).resolves.toMatchObject( {
+			state: 'present',
+			present: [ { kind: 'managed-preferences', scope: 'user' } ],
+		} );
+
+		const nameless = macos();
+		await expect(
+			inspectClaudeManagedPolicy( { ...nameless.seams, username: () => '' } )
+		).resolves.toMatchObject( { state: 'unverifiable' } );
+	} );
+
+	it( 'inspects the Linux file locations and fails closed when /etc/claude-code cannot be read', async () => {
+		const linux = () => simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix );
+		const empty = linux();
+		await expect( inspectClaudeManagedPolicy( empty.seams ) ).resolves.toMatchObject( {
+			state: 'absent',
+			checked: [
+				{ location: '/etc/claude-code/managed-settings.json' },
+				{ location: '/etc/claude-code/managed-settings.d' },
+				{ location: '/etc/claude-code/managed-mcp.json' },
+			],
+		} );
+		const mcp = linux();
+		mcp.fs.write( '/etc/claude-code/managed-mcp.json', Buffer.from( '{}' ) );
+		await expect( inspectClaudeManagedPolicy( mcp.seams ) ).resolves.toMatchObject( {
+			state: 'present',
+			present: [ { kind: 'mcp-file', location: '/etc/claude-code/managed-mcp.json' } ],
+		} );
+		const locked = linux();
+		await expect(
+			inspectClaudeManagedPolicy( {
+				...locked.seams,
+				files: denied( locked.fs.files, [ '/etc/claude-code' ] ).files,
+			} )
+		).resolves.toMatchObject( { state: 'unverifiable', unreadable: [ {}, {}, {} ] } );
+	} );
+
+	it( 'cannot vouch for a host outside the matrix', async () => {
+		await expect(
+			inspectClaudeManagedPolicy( { host: { platform: 'freebsd', arch: 'x64' } } )
+		).resolves.toEqual( { state: 'unverifiable', present: [], unreadable: [], checked: [] } );
 	} );
 } );

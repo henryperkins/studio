@@ -1,8 +1,10 @@
 import path from 'path';
+import { findPolicyLocations, managedPolicyFiles, policyFinding } from './policy';
 import type {
 	ClaudeArch,
 	ClaudeBinaryHeader,
 	ClaudeByteReader,
+	ClaudeManagedPolicySource,
 	ClaudePlatformAdapter,
 } from '../platform';
 
@@ -56,6 +58,8 @@ const CODESIGN = '/usr/bin/codesign';
 // codesign exits 1 when a signature is missing or broken and 3 when it does not
 // satisfy the requirement; anything else means it could not check.
 const CODESIGN_REFUSED = new Set( [ 1, 3 ] );
+const MANAGED_PREFERENCES = '/Library/Managed Preferences';
+const PREFERENCES_DOMAIN = 'com.anthropic.claudecode';
 
 export const macosAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatformAdapter >( {
 	os: 'macos',
@@ -103,5 +107,39 @@ export const macosAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 				vendorPlatform: input.records[ 0 ]?.vendorPlatform,
 			},
 		};
+	},
+	/**
+	 * The documented macOS sources (code.claude.com/docs/en/managed-settings): the
+	 * system directory's files and the `com.anthropic.claudecode` managed
+	 * preferences domain. The documentation names the domain, not a file; these
+	 * are where macOS stores device and per-user configuration-profile
+	 * preferences, and native qualification must confirm them.
+	 */
+	async inspectManagedPolicy( seams ) {
+		const files = managedPolicyFiles( '/Library/Application Support/ClaudeCode', path.posix );
+		const machine: ClaudeManagedPolicySource = {
+			kind: 'managed-preferences',
+			scope: 'machine',
+			location: `${ MANAGED_PREFERENCES }/${ PREFERENCES_DOMAIN }.plist`,
+		};
+		const username = seams.username();
+		const knownUser = !! username && ! username.includes( '/' ) && username !== '..';
+		const user: ClaudeManagedPolicySource = {
+			kind: 'managed-preferences',
+			scope: 'user',
+			location: `${ MANAGED_PREFERENCES }/${
+				knownUser ? username : '(unknown user)'
+			}/${ PREFERENCES_DOMAIN }.plist`,
+		};
+		const checked = [ ...files, machine, user ];
+		const found = await findPolicyLocations(
+			knownUser ? checked : [ ...files, machine ],
+			seams.files
+		);
+		return policyFinding(
+			checked,
+			found.present,
+			knownUser ? found.unreadable : [ ...found.unreadable, user ]
+		);
 	},
 } );

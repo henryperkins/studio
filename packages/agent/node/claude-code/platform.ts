@@ -316,6 +316,46 @@ export interface ClaudePlatformAdapter {
 		input: ClaudeBinaryVerificationInput,
 		seams: ClaudePlatformSeams
 	): Promise< ClaudeBinaryVerificationResult >;
+	/** Looks for the vendor's documented managed policy sources, never reading their contents. */
+	inspectManagedPolicy( seams: ClaudePlatformSeams ): Promise< ClaudeManagedPolicyFinding >;
+}
+
+/** A place the vendor documents for organization-managed Claude Code policy. */
+export interface ClaudeManagedPolicySource {
+	kind: 'settings-file' | 'settings-directory' | 'mcp-file' | 'registry' | 'managed-preferences';
+	scope: 'machine' | 'user';
+	location: string;
+}
+
+/**
+ * Whether managed policy applies here. Studio cannot tell what a policy would
+ * allow, so only `absent` lets it run; `unverifiable` means a location could
+ * not be checked.
+ */
+export interface ClaudeManagedPolicyFinding {
+	state: 'absent' | 'present' | 'unverifiable';
+	present: ClaudeManagedPolicySource[];
+	unreadable: ClaudeManagedPolicySource[];
+	checked: ClaudeManagedPolicySource[];
+}
+
+export async function inspectClaudeManagedPolicy(
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudeManagedPolicyFinding > {
+	const seams = defaultClaudePlatformSeams( overrides );
+	const adapter = selectClaudePlatformAdapter( seams.host );
+	const unverifiable: ClaudeManagedPolicyFinding = {
+		state: 'unverifiable',
+		present: [],
+		unreadable: [],
+		checked: [],
+	};
+	if ( ! adapter ) return unverifiable;
+	try {
+		return await adapter.inspectManagedPolicy( seams );
+	} catch {
+		return unverifiable;
+	}
 }
 
 export interface ClaudeEnvironmentRules {

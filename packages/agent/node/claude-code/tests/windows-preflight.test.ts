@@ -173,6 +173,28 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 			);
 		} );
 
+		it( 'stops before running the executable when a managed policy is deployed, saying where', async () => {
+			await mkdir( path.join( root, 'ClaudeCode' ) );
+			await writeFile( path.join( root, 'ClaudeCode', 'managed-settings.json' ), '{"secret":1}' );
+			const result = await prepareClaudeInvocation( executable, workspace, config );
+			expect( result ).toMatchObject( {
+				ok: false,
+				blockers: [ 'managed-policy-unverified' ],
+				managedPolicy: {
+					state: 'present',
+					present: [
+						{
+							kind: 'settings-file',
+							scope: 'machine',
+							location: path.join( root, 'ClaudeCode', 'managed-settings.json' ),
+						},
+					],
+				},
+			} );
+			expect( JSON.stringify( result ) ).not.toContain( 'secret' );
+			expect( invoke.mock.calls.some( ( [ file ] ) => file === executable ) ).toBe( false );
+		} );
+
 		it( 'requests a separate visible native console using the selected executable', async () => {
 			await saveClaudeConnection( {
 				id: 'native-login',

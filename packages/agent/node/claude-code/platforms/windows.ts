@@ -1,8 +1,10 @@
 import path from 'path';
+import { findPolicyLocations, managedPolicyFiles, policyFinding } from './policy';
 import type {
 	ClaudeArch,
 	ClaudeBinaryHeader,
 	ClaudeByteReader,
+	ClaudeManagedPolicySource,
 	ClaudePlatformAdapter,
 } from '../platform';
 
@@ -68,31 +70,51 @@ export async function readPeHeader(
 const WINDOWS_SIGNER = 'Anthropic, PBC';
 const SIGNATURE_REFUSED = 3;
 
+const WINDOWS_ENVIRONMENT: readonly string[] = Object.freeze( [
+	'PATH',
+	'SYSTEMROOT',
+	'WINDIR',
+	'COMSPEC',
+	'PATHEXT',
+	'USERPROFILE',
+	'HOMEDRIVE',
+	'HOMEPATH',
+	'APPDATA',
+	'LOCALAPPDATA',
+	'TEMP',
+	'TMP',
+	'PROGRAMFILES',
+	'PROGRAMFILES(X86)',
+	'PROGRAMDATA',
+	'CLAUDE_CODE_GIT_BASH_PATH',
+] );
+
+function environmentValue( env: NodeJS.ProcessEnv, name: string ): string | undefined {
+	return Object.entries( env ).find( ( [ key ] ) => key.toUpperCase() === name )?.[ 1 ];
+}
+
+function minimalEnvironment( env: NodeJS.ProcessEnv ): NodeJS.ProcessEnv {
+	return Object.fromEntries(
+		Object.entries( env ).filter( ( [ key ] ) => WINDOWS_ENVIRONMENT.includes( key.toUpperCase() ) )
+	);
+}
+
+/** The documented system directory; `%ProgramFiles%` is checked as well where it differs. */
+const DOCUMENTED_POLICY_DIRECTORY = 'C:\\Program Files\\ClaudeCode';
+const POLICY_KEY = 'SOFTWARE\\Policies\\ClaudeCode';
+// Exit codes for which documented registry keys exist; any other failure means
+// the registry could not be read.
+const REGISTRY_FOUND: Readonly< Record< number, Array< 'machine' | 'user' > > > = Object.freeze( {
+	11: [ 'machine' ],
+	12: [ 'user' ],
+	13: [ 'machine', 'user' ],
+} );
+
 export const windowsAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatformAdapter >( {
 	os: 'windows',
 	path: path.win32,
 	requiresExecutePermission: false,
-	environment: Object.freeze( {
-		allowed: Object.freeze( [
-			'PATH',
-			'SYSTEMROOT',
-			'WINDIR',
-			'COMSPEC',
-			'PATHEXT',
-			'USERPROFILE',
-			'HOMEDRIVE',
-			'HOMEPATH',
-			'APPDATA',
-			'LOCALAPPDATA',
-			'TEMP',
-			'TMP',
-			'PROGRAMFILES',
-			'PROGRAMFILES(X86)',
-			'PROGRAMDATA',
-			'CLAUDE_CODE_GIT_BASH_PATH',
-		] ),
-		caseInsensitiveNames: true,
-	} ),
+	environment: Object.freeze( { allowed: WINDOWS_ENVIRONMENT, caseInsensitiveNames: true } ),
 	isSelectablePath: ( selected: string ) =>
 		path.win32.isAbsolute( selected ) && path.win32.extname( selected ).toLowerCase() === '.exe',
 	readBinaryHeader: readPeHeader,
@@ -129,5 +151,43 @@ export const windowsAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatfo
 				vendorPlatform: input.records[ 0 ]?.vendorPlatform,
 			},
 		};
+	},
+	/**
+	 * The documented Windows sources (code.claude.com/docs/en/managed-settings):
+	 * the system directory's files and the `Settings` value under the HKLM and
+	 * HKCU policy keys. Any key there counts, whatever its values.
+	 */
+	async inspectManagedPolicy( seams ) {
+		const directories = new Map< string, string >( [
+			[ DOCUMENTED_POLICY_DIRECTORY.toLowerCase(), DOCUMENTED_POLICY_DIRECTORY ],
+		] );
+		const programFiles = environmentValue( seams.env, 'PROGRAMFILES' );
+		if ( programFiles && path.win32.isAbsolute( programFiles ) ) {
+			const directory = path.win32.join( programFiles, 'ClaudeCode' );
+			directories.set( directory.toLowerCase(), directory );
+		}
+		const files = [ ...directories.values() ].flatMap( ( directory ) =>
+			managedPolicyFiles( directory, path.win32 )
+		);
+		const registry: ClaudeManagedPolicySource[] = [
+			{ kind: 'registry', scope: 'machine', location: `HKLM\\${ POLICY_KEY }` },
+			{ kind: 'registry', scope: 'user', location: `HKCU\\${ POLICY_KEY }` },
+		];
+		const { present, unreadable } = await findPolicyLocations( files, seams.files );
+		const script = `$ErrorActionPreference='Stop'; $m=Test-Path -LiteralPath 'HKLM:\\${ POLICY_KEY }'; $u=Test-Path -LiteralPath 'HKCU:\\${ POLICY_KEY }'; if($m -and $u) { exit 13 }; if($m) { exit 11 }; if($u) { exit 12 }; exit 0`;
+		try {
+			await seams.run( trustedPowerShellPath( seams.env ), encodedPowerShellArgs( script ), {
+				env: minimalEnvironment( seams.env ),
+				timeout: 10000,
+				windowsHide: true,
+			} );
+		} catch ( error ) {
+			const code = ( error as { code?: unknown } ).code;
+			const found = typeof code === 'number' ? REGISTRY_FOUND[ code ] : undefined;
+			if ( found )
+				present.push( ...registry.filter( ( source ) => found.includes( source.scope ) ) );
+			else unreadable.push( ...registry );
+		}
+		return policyFinding( [ ...files, ...registry ], present, unreadable );
 	},
 } );
