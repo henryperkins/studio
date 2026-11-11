@@ -24,7 +24,7 @@ How to edit: the ChatGPT section (A), the Claude section (B) and the Platform se
 | Base branch | `trunk` (`8672a64e7daf368051db0b35989dc9dd89523ff9` on origin) | `add-chatgpt-plan-provider` |
 | Draft state | draft, open | draft, open |
 | Relation | | Contains #2 head `4ae1e38da` as an ancestor (`git merge-base` returns it); 14 commits ahead |
-| Experiment flag | `STUDIO_EXPERIMENTAL_CHATGPT` (`packages/agent/node/chatgpt/settings.ts`, off unless `=== '1'`) | `STUDIO_EXPERIMENTAL_CLAUDE_CODE` and additionally `process.platform === 'win32' && process.arch === 'x64'` (`packages/agent/node/claude-code/studio-surface.ts`) |
+| Experiment flag | `STUDIO_EXPERIMENTAL_CHATGPT` (`packages/agent/node/chatgpt/settings.ts`, off unless `=== '1'`) | `STUDIO_EXPERIMENTAL_CLAUDE_CODE`. Since P1a the surface is offered on the six targets of `CLAUDE_QUALIFICATION_MATRIX` (`isClaudeRuntimeSurfaceEnabled`, `packages/agent/node/claude-code/platform.ts`). Only the Windows x64 record is qualified, and inspection refuses every other target as `platform-unqualified`. |
 
 Dirty-work ownership at M1 start (not M1's, left untouched and unstaged):
 
@@ -201,6 +201,25 @@ Commits `4f824c88e`, `612ba6b86`, `13c5ef36f`, `e577663c3`, `be6c932ef`, `24cf1a
   - Shared steps: a re-check of the executable's identity before sign-in and at spawn; filesystem-based path identity; per-OS environment allowlists; documented managed-policy locations; argv-safe sign-in (ShellExecute, AppleScript `quoted form of`, Linux terminals that take a separate argv); shell-sandbox availability recorded as plain data.
 - **Windows x64 only:** the junction, spaces/Unicode and identity-change cases ran on this machine's filesystem with an injected runner. No real Claude executable was run and no sign-in was opened.
 - **Still open:** native runs on Windows ARM64, macOS x64/ARM64 and Linux x64/ARM64 (P4); a GPG-verified manifest checksum for each Linux record; confirmation of the macOS signer requirement and managed-preferences paths. The Settings display is P1b. No live gate is passed by this record.
+
+#### P1a fix round 1 (November 11, 2026)
+
+Commits `646753a68` and `b72c109b0`. No cell's status changes, and Windows x64 stays the only qualified record.
+
+- **Changes:**
+  - The mid-turn account re-check runs `auth status` only with the prepared binary. Before and after each read, the selected path must still resolve to that file with the same metadata. Otherwise nothing runs, and the turn stops as `account_unverified`.
+  - Preparation makes the same check before it reads the status.
+  - The Windows signer must be the certificate subject's single Organization attribute, alone in its RDN and ordinally equal to `Anthropic, PBC`. The previous check matched a pattern against the formatted subject.
+  - The target follows the machine architecture: IsWow64Process2 on Windows, `hw.optional.arm64` on macOS, uname on Linux. A translated process, or a machine the probe cannot establish, is `platform-unqualified`.
+  - On macOS and Linux, the terminal is handed only `/bin/sh` and the path of a Studio-owned 0700 script.
+  - The undocumented macOS managed-preferences paths count as unverifiable until a native run confirms them.
+  - The unqualified records list what their native run must confirm (`confirmationsRequired`).
+- **Remaining time-of-check to time-of-use windows:**
+  - **Pre-sign-in check to terminal launch.** A few seconds: writing the script and starting `osascript` or the terminal on macOS and Linux, or ShellExecute on Windows. The terminal then opens the executable by path, not by handle.
+  - **Metadata-only checks.** These are the checks before spawn, before and after each account re-check, and before preparation's status read. A writer that restores the size, the modification time and, on Windows, ChangeTime defeats them, and any same-user writer can reset ChangeTime. Content is re-hashed only at the end of preparation and before sign-in.
+  - **Account re-check.** Between the pre-check and the start of `auth status`, a swapped binary can still run once. The post-check then discards its answer and stops the turn.
+  - **Sign-in script.** The script exists from its write until its first line deletes it. It sits in a 0700 directory, so only the same user or root can change it in that time.
+  - **Probe blind spots.** uname cannot see Linux user-mode emulators (qemu-user, FEX, Box64). An Intel Mac without the `hw.optional.arm64` key gets `machine-architecture-unknown`. Both need native confirmation.
 
 ## D. Studio tool inventory (counted from code)
 
