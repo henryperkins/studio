@@ -178,7 +178,8 @@ const SHELL_TIMEOUT_LIMIT_MS = 10 * 60 * 1000;
 
 // A shell command is never judged safe by its text: every call needs approval
 // of the exact command. These bounds keep it in the foreground, where the turn's
-// cancellation reaches it, and inside the native sandbox.
+// cancellation reaches it, and refuse a request to leave the native sandbox.
+// They do not confine what the command touches; approval is the guard.
 function isBoundedShellInput( input: Record< string, unknown > ): boolean {
 	const {
 		command,
