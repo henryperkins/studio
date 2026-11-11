@@ -115,4 +115,35 @@ describe( 'ChatGPT acceptance child isolation', () => {
 			.map( ( [ key ] ) => key );
 		expect( escaping ).toEqual( [] );
 	} );
+
+	it( 'points WP-CLI’s config, cache and packages inside the run directory, leaving the home directory as it is', async () => {
+		const runDir = path.join( base, 'run' );
+		const realWpCli = path.join( os.homedir(), '.wp-cli' );
+		const shell: NodeJS.ProcessEnv = {
+			...process.env,
+			WP_CLI_CONFIG_PATH: path.join( realWpCli, 'config.yml' ),
+			WP_CLI_CACHE_DIR: path.join( realWpCli, 'cache' ),
+			WP_CLI_PACKAGES_DIR: path.join( realWpCli, 'packages' ),
+		};
+		expect(
+			applyAcceptanceIsolation( shell, { runDir, mustBeNew: true, home: os.homedir() } ).ok
+		).toBe( true );
+		const child = acceptanceChildEnvironment( shell );
+		for ( const key of Object.keys( process.env ) ) {
+			if ( ! ( key in child ) ) {
+				delete process.env[ key ];
+			}
+		}
+		Object.assign( process.env, child );
+		vi.resetModules();
+		// The environment the CLI gives the PHP process that runs WP-CLI.
+		const { getPhpChildEnv } = await import( 'cli/lib/native-php/php-process' );
+		const php = getPhpChildEnv();
+		for ( const name of [ 'WP_CLI_CONFIG_PATH', 'WP_CLI_CACHE_DIR', 'WP_CLI_PACKAGES_DIR' ] ) {
+			expect( php[ name ], name ).toBeDefined();
+			expect( isWithin( php[ name ] as string, runDir ), name ).toBe( true );
+		}
+		expect( php.HOME ).toBe( savedEnv.HOME );
+		expect( php.USERPROFILE ).toBe( savedEnv.USERPROFILE );
+	} );
 } );

@@ -20,6 +20,8 @@ export interface AcceptanceRunPaths {
 	appDataDir: string;
 	/** Per-turn request observations, read back into bounded counts. */
 	observerDir: string;
+	/** WP-CLI's global config, cache and packages, instead of `~/.wp-cli`. */
+	wpCliDir: string;
 }
 
 export type AcceptanceIsolationProblem =
@@ -59,6 +61,7 @@ export function acceptanceRunPaths( runDir: string ): AcceptanceRunPaths {
 		sitesDir: path.join( runDir, 'sites' ),
 		appDataDir: path.join( runDir, 'appdata' ),
 		observerDir: path.join( runDir, 'observer' ),
+		wpCliDir: path.join( runDir, 'wp-cli' ),
 	};
 }
 
@@ -114,6 +117,9 @@ export function checkAcceptanceRunDirectory(
 /**
  * The environment that keeps a run inside its directory. `E2E` arms every
  * `E2E_*` path the Studio path helpers read, so each of them is set here.
+ * WP-CLI, which the CLI runs with this environment, would otherwise read
+ * `~/.wp-cli/config.yml` and `~/.wp-cli/packages` and write `~/.wp-cli/cache`;
+ * the home directory itself stays as it is for the keychain and the browser.
  */
 function acceptanceIsolationEnvironment( paths: AcceptanceRunPaths ): Record< string, string > {
 	return {
@@ -125,13 +131,16 @@ function acceptanceIsolationEnvironment( paths: AcceptanceRunPaths ): Record< st
 		E2E_APP_DATA_PATH: paths.appDataDir,
 		E2E_CLI_CONFIG_PATH: paths.profileDir,
 		E2E_SHARED_CONFIG_PATH: paths.profileDir,
+		WP_CLI_CONFIG_PATH: path.join( paths.wpCliDir, 'config.yml' ),
+		WP_CLI_CACHE_DIR: path.join( paths.wpCliDir, 'cache' ),
+		WP_CLI_PACKAGES_DIR: path.join( paths.wpCliDir, 'packages' ),
 	};
 }
 
 /**
  * Checks the run directory and, only when it is acceptable, drops every
- * inherited `E2E_*` variable and points the profile, process manager, sites
- * and app data at it. Creates nothing.
+ * inherited `E2E_*` variable and points the profile, process manager, sites,
+ * app data and WP-CLI's own files at it. Creates nothing.
  */
 export function applyAcceptanceIsolation(
 	env: NodeJS.ProcessEnv,

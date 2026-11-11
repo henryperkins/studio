@@ -261,7 +261,7 @@ describe( 'acceptance run isolation', () => {
 		expect( readAcceptanceArgument( argv, '--model' ) ).toBeUndefined();
 	} );
 
-	it( 'puts the profile, process manager, sites and observations inside the run directory', () => {
+	it( 'puts the profile, process manager, sites, observations and WP-CLI files inside the run directory', () => {
 		const runDir = path.join( base, 'run' );
 		expect( acceptanceRunPaths( runDir ) ).toEqual( {
 			runDir,
@@ -270,6 +270,7 @@ describe( 'acceptance run isolation', () => {
 			sitesDir: path.join( runDir, 'sites' ),
 			appDataDir: path.join( runDir, 'appdata' ),
 			observerDir: path.join( runDir, 'observer' ),
+			wpCliDir: path.join( runDir, 'wp-cli' ),
 		} );
 	} );
 
@@ -318,6 +319,9 @@ describe( 'acceptance run isolation', () => {
 			E2E_APP_DATA_PATH: path.join( runDir, 'appdata' ),
 			E2E_CLI_CONFIG_PATH: path.join( runDir, 'profile' ),
 			E2E_SHARED_CONFIG_PATH: path.join( runDir, 'profile' ),
+			WP_CLI_CONFIG_PATH: path.join( runDir, 'wp-cli', 'config.yml' ),
+			WP_CLI_CACHE_DIR: path.join( runDir, 'wp-cli', 'cache' ),
+			WP_CLI_PACKAGES_DIR: path.join( runDir, 'wp-cli', 'packages' ),
 		} );
 		expect( fs.existsSync( runDir ) ).toBe( false );
 	} );

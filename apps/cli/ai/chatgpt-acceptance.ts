@@ -2458,6 +2458,7 @@ export async function runChatGptAcceptance(
 		paths.sitesDir,
 		paths.appDataDir,
 		paths.observerDir,
+		paths.wpCliDir,
 	] ) {
 		fs.mkdirSync( directory, { recursive: true } );
 	}
