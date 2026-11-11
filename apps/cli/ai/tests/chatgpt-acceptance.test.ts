@@ -15,6 +15,7 @@ import { createChatGptSignInFlow } from '@studio/agent/node/chatgpt/oauth';
 import { ChatGptSettingsError } from '@studio/agent/node/chatgpt/settings';
 import {
 	createSigningKey,
+	GRANTED_SCOPE,
 	startFakeAuthorizationServer,
 	type FakeAuthorizationServer,
 	type SigningKey,
@@ -28,10 +29,13 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { findUnsafeText, openAcceptanceEvidence } from 'cli/ai/acceptance-evidence';
 import { acceptanceRunPaths } from 'cli/ai/acceptance-isolation';
 import {
+	acceptancePlatform,
 	classifyToolCall,
 	classifyTurnFailure,
 	createAcceptanceTokenService,
 	digestTurnEvents,
+	isToolResultPersisted,
+	isWpCliReadCommand,
 	parseChatGptAcceptanceArgs,
 	parseWpPostList,
 	runChatGptAcceptance,
@@ -84,22 +88,37 @@ const toolEnd = ( id: string, toolName: string, details?: unknown, receivedAt = 
 		},
 		receivedAt
 	);
-const answered = ( text: string ) =>
-	message( {
-		type: 'agent_end',
-		messages: [ { role: 'assistant', stopReason: 'stop', content: [ { type: 'text', text } ] } ],
-	} );
-const failedWith = ( text: string ) =>
-	message( {
-		type: 'agent_end',
-		messages: [ { role: 'assistant', stopReason: 'error', errorMessage: text, content: [] } ],
-	} );
+const answered = ( text: string, receivedAt = at() ) =>
+	message(
+		{
+			type: 'agent_end',
+			messages: [ { role: 'assistant', stopReason: 'stop', content: [ { type: 'text', text } ] } ],
+		},
+		receivedAt
+	);
+const failedWith = ( text: string, receivedAt = at() ) =>
+	message(
+		{
+			type: 'agent_end',
+			messages: [ { role: 'assistant', stopReason: 'error', errorMessage: text, content: [] } ],
+		},
+		receivedAt
+	);
+// How the ChatGPT transport ends a turn whose own connection signal stopped it.
+const interruptedWith = ( text: string, receivedAt = at() ) =>
+	message(
+		{
+			type: 'agent_end',
+			messages: [ { role: 'assistant', stopReason: 'aborted', errorMessage: text, content: [] } ],
+		},
+		receivedAt
+	);
 const cliError = ( text: string ): TimedEvent => ( {
 	receivedAt: at(),
 	event: { type: 'error', timestamp: '', message: text },
 } );
-const completed = ( status: 'success' | 'error' ): TimedEvent => ( {
-	receivedAt: at(),
+const completed = ( status: 'success' | 'error', receivedAt = at() ): TimedEvent => ( {
+	receivedAt,
 	event: { type: 'turn.completed', status, sessionId: '', timestamp: '' } as never,
 } );
 
@@ -170,14 +189,18 @@ function scriptedServices(
 ): {
 	services: ChatGptAcceptanceServices;
 	calls: ScriptedCalls;
-	notifySignedOut: () => void;
+	/** When the first sign-out began, on the services' clock. */
+	signOutBegan: Promise< number >;
+	notifySignedOut: ( began: number ) => void;
 } {
 	const calls: ScriptedCalls = { log: [], prompts: {} };
 	let state: 'signed-in' | 'signed-out' | 'none' = 'none';
+	let storage: 'vault' | 'session' = 'vault';
+	let pendingStorage: 'vault' | 'session' = 'vault';
 	let draftTitle = '';
 	let draftContent = '';
 	let posts = 0;
-	const signedOut = deferred();
+	const signedOut = deferred< number >();
 	let pid = 100;
 	const defaultTurns: Record< string, ( options: TurnOptions ) => AcceptanceTurn > = {
 		draft: ( options ) => {
@@ -219,35 +242,31 @@ function scriptedServices(
 					],
 				} )
 			),
-		'active-run': () => {
-			const result = deferred< TurnResult >();
-			void signedOut.promise.then( () =>
-				result.resolve(
-					turnResult( {
-						pid: ++pid,
-						exitCode: 0,
-						exitedAt: Date.now() + 1_500,
-						events: [
-							toolStart(
-								'c',
-								'wp_cli',
-								{ nameOrPath: 'ChatGPT Acceptance', command: 'plugin list' },
-								0
-							),
-							toolEnd( 'c', 'wp_cli', undefined, 0 ),
-							failedWith( `${ signedOutText } (signed-out)` ),
-							completed( 'error' ),
-						],
-						requests: [ routeRequest( { startedAt: 0, effort: 'low' } ) ],
-					} )
-				)
-			);
-			return {
-				firstRequest: async () => true,
-				result: result.promise,
-				stop: async () => undefined,
-			};
-		},
+		// Stopped by its own turn handle about one watch poll after the sign-out began.
+		'active-run': () => ( {
+			firstRequest: async () => true,
+			result: signedOut.promise.then( ( began ) =>
+				turnResult( {
+					pid: ++pid,
+					exitCode: 0,
+					startedAt: began - 5_000,
+					exitedAt: began + 2_000,
+					events: [
+						toolStart(
+							'c',
+							'wp_cli',
+							{ nameOrPath: 'ChatGPT Acceptance', command: 'plugin list' },
+							began - 500
+						),
+						toolEnd( 'c', 'wp_cli', undefined, began + 300 ),
+						interruptedWith( signedOutText, began + 1_800 ),
+						completed( 'error', began + 1_900 ),
+					],
+					requests: [ routeRequest( { startedAt: began - 1_000, effort: 'low' } ) ],
+				} )
+			),
+			stop: async () => undefined,
+		} ),
 		'after-sign-out': () =>
 			finishedTurn(
 				turnResult( {
@@ -288,7 +307,7 @@ function scriptedServices(
 					label: 'Test',
 					revision: 1,
 					logoutGeneration: state === 'signed-out' ? 1 : 0,
-					storage: 'vault' as const,
+					storage,
 					state,
 					createdAt: '',
 					updatedAt: '',
@@ -310,10 +329,12 @@ function scriptedServices(
 			timeoutMs: 600_000,
 			begin: async ( _registrationId, options ) => {
 				calls.log.push( `begin:${ options.storage }` );
+				pendingStorage = options.storage;
 				return { attemptId: `attempt-${ ++attempts }` };
 			},
 			wait: async () => {
 				state = 'signed-in';
+				storage = pendingStorage;
 				return { ok: true, registrationId: REGISTRATION, label: 'Test', email: null };
 			},
 			cancel: () => {
@@ -326,13 +347,13 @@ function scriptedServices(
 			invalidateAccessToken: async () => undefined,
 			signOut: async () => {
 				calls.log.push( 'sign-out' );
+				signedOut.resolve( services.clock.now() );
 				state = 'signed-out';
-				signedOut.resolve();
 				return { localCleared: true, remoteRevocationConfirmed: true };
 			},
 			sessionForkEnvironment: () => ( {} ),
 			readAccount: async () => account(),
-			vaultRecordExists: () => state === 'signed-in',
+			vaultRecordExists: () => state === 'signed-in' && storage === 'vault',
 			readModels: async ( connectionId, revision ) => ( {
 				connectionId,
 				revision,
@@ -377,7 +398,12 @@ function scriptedServices(
 		imageServiceConfigured: async () => false,
 		...overrides,
 	};
-	return { services, calls, notifySignedOut: () => signedOut.resolve() };
+	return {
+		services,
+		calls,
+		signOutBegan: signedOut.promise,
+		notifySignedOut: ( began ) => signedOut.resolve( began ),
+	};
 }
 
 describe( 'ChatGPT acceptance runner', () => {
@@ -588,6 +614,36 @@ describe( 'ChatGPT acceptance runner', () => {
 			expect( create ).not.toHaveBeenCalled();
 			expect( printed.join( '\n' ) ).toMatch( /real Studio profile/ );
 		} );
+
+		it( 'refuses, without changing it, a real profile in which a child CLI would rename the process manager folder', async () => {
+			const studio = path.join( base, 'home', '.studio' );
+			fs.mkdirSync( path.join( studio, 'pm2' ), { recursive: true } );
+			for ( const argv of [
+				[ '--scenario', 'saved', '--run-dir', runDir ],
+				[ '--live', '--scenario', 'saved', '--run-dir', runDir ],
+			] ) {
+				printed = [];
+				const create = vi.fn();
+				expect(
+					await runChatGptAcceptance( argv, dependencies( undefined, { createServices: create } ) )
+				).toBe( 2 );
+				expect( create ).not.toHaveBeenCalled();
+				expect( printed.join( '\n' ) ).toMatch( /\.studio.pm2/ );
+				expect( printed.join( '\n' ) ).not.toMatch( /Dry check only/ );
+			}
+			expect( fs.existsSync( runDir ) ).toBe( false );
+			expect( fs.readdirSync( studio ) ).toEqual( [ 'pm2' ] );
+
+			fs.mkdirSync( path.join( studio, 'daemon' ) );
+			printed = [];
+			expect(
+				await runChatGptAcceptance(
+					[ '--scenario', 'saved', '--run-dir', runDir ],
+					dependencies( undefined, { createServices: vi.fn() } )
+				)
+			).toBe( 2 );
+			expect( printed.join( '\n' ) ).toMatch( /Dry check only/ );
+		} );
 	} );
 
 	describe( 'session prerequisites', () => {
@@ -697,8 +753,10 @@ describe( 'ChatGPT acceptance runner', () => {
 				localCleared: true,
 				remoteRevocationConfirmed: true,
 				routeRequestsAfterSignOut: 0,
-				toolRunsAfterSignOut: 0,
+				toolStartsAfterSignOut: 0,
 				reportedSignedOut: true,
+				stoppedByTurnHandle: true,
+				stopDelayS: 1.8,
 				ownerInterruptSent: false,
 			} );
 			expect( calls.log ).toEqual(
@@ -851,6 +909,35 @@ describe( 'ChatGPT acceptance runner', () => {
 				{ signOut: true, site: true },
 			],
 			[
+				'draft-turn',
+				'no-site-read',
+				'failed',
+				() =>
+					scriptedServices(
+						{},
+						{
+							// Its own post create is the only WP-CLI call: nothing read the site.
+							draft: ( options ) => {
+								const title = options.prompt.match( /titled "([^"]+)"/ )?.[ 1 ] ?? '';
+								return finishedTurn(
+									turnResult( {
+										events: [
+											toolStart( 'a', 'wp_cli', {
+												nameOrPath: 'ChatGPT Acceptance',
+												command: `post create --post_status=draft --post_title="${ title }"`,
+											} ),
+											toolEnd( 'a', 'wp_cli' ),
+											answered( 'Created post 7.' ),
+											completed( 'success' ),
+										],
+									} )
+								);
+							},
+						}
+					),
+				{ signOut: true, site: true },
+			],
+			[
 				'draft-request-audit',
 				'api-key-bearer',
 				'failed',
@@ -863,6 +950,11 @@ describe( 'ChatGPT acceptance runner', () => {
 								return finishedTurn(
 									turnResult( {
 										events: [
+											toolStart( 'r', 'wp_cli', {
+												nameOrPath: 'ChatGPT Acceptance',
+												command: 'option get blogname',
+											} ),
+											toolEnd( 'r', 'wp_cli' ),
 											toolStart( 'a', 'wp_cli', {
 												nameOrPath: 'ChatGPT Acceptance',
 												command: `post create --post_status=draft --post_title="${ title }"`,
@@ -959,6 +1051,21 @@ describe( 'ChatGPT acceptance runner', () => {
 				{ signOut: false, site: true },
 			],
 			[
+				'remote-revocation',
+				'nothing-revoked',
+				'blocked',
+				() => {
+					const scripted = scriptedServices();
+					scripted.services.tokens.probe = async () => ( {
+						tried: false,
+						rejected: false,
+						terminal: false,
+					} );
+					return scripted;
+				},
+				{ signOut: false, site: true },
+			],
+			[
 				'blocked-after-sign-out',
 				'inference-after-sign-out',
 				'failed',
@@ -1001,6 +1108,201 @@ describe( 'ChatGPT acceptance runner', () => {
 				expectNothingUnsafe( [ 'test-access-token' ] );
 			}
 		);
+
+		describe( 'an active run when the sign-out begins', () => {
+			const before = ( began: number ) => [
+				toolStart(
+					'c',
+					'wp_cli',
+					{ nameOrPath: 'ChatGPT Acceptance', command: 'plugin list' },
+					began - 500
+				),
+				toolEnd( 'c', 'wp_cli', undefined, began + 300 ),
+			];
+			// A sign-out whose remote revocation takes 4 s, with the turn's events stamped against it.
+			function activeRun(
+				events: ( began: number ) => TimedEvent[],
+				requests: ( began: number ) => ObservedRequest[] = ( began ) => [
+					routeRequest( { startedAt: began - 1_000, effort: 'low' } ),
+				]
+			) {
+				let now = Date.UTC( 2026, 10, 11, 12 );
+				const scripted = scriptedServices(
+					{},
+					{
+						'active-run': () => ( {
+							firstRequest: async () => true,
+							result: scripted.signOutBegan.then( ( began ) =>
+								turnResult( {
+									pid: 900,
+									startedAt: began - 5_000,
+									exitedAt: began + 6_000,
+									events: events( began ),
+									requests: requests( began ),
+								} )
+							),
+							stop: async () => undefined,
+						} ),
+					}
+				);
+				scripted.services.clock = { now: () => now, sleep: scripted.services.clock.sleep };
+				const signOut = scripted.services.broker.signOut;
+				scripted.services.broker.signOut = async ( id ) => {
+					const result = await signOut( id );
+					now += 4_000;
+					return result;
+				};
+				return scripted;
+			}
+
+			const cases: Array<
+				[
+					string,
+					( began: number ) => TimedEvent[],
+					( ( began: number ) => ObservedRequest[] ) | undefined,
+					{ status: string; code?: string; observations: Record< string, unknown > },
+				]
+			> = [
+				[
+					'stops by its own turn handle within the watch bound',
+					( began ) => [
+						...before( began ),
+						toolStart(
+							'd',
+							'wp_cli',
+							{ nameOrPath: 'ChatGPT Acceptance', command: 'theme list' },
+							began + 1_200
+						),
+						interruptedWith( signedOutText, began + 1_800 ),
+						completed( 'error', began + 1_900 ),
+					],
+					( began ) => [
+						routeRequest( { startedAt: began - 1_000, effort: 'low' } ),
+						routeRequest( { startedAt: began + 1_000, effort: 'low' } ),
+					],
+					{
+						status: 'passed',
+						observations: {
+							endedBeforeSignOut: false,
+							stopDelayS: 1.8,
+							watchPollS: 2,
+							toolStartsInWatchWindow: 1,
+							toolStartsAfterSignOut: 0,
+							routeRequestsInWatchWindow: 1,
+							routeRequestsAfterSignOut: 0,
+							reportedSignedOut: true,
+							stoppedByTurnHandle: true,
+							stoppedByBrokerErrorOnly: false,
+						},
+					},
+				],
+				[
+					'stops on a signed-out error from the broker alone',
+					( began ) => [
+						...before( began ),
+						failedWith( `${ signedOutText } (signed-out)`, began + 1_500 ),
+						completed( 'error', began + 1_600 ),
+					],
+					undefined,
+					{
+						status: 'passed',
+						observations: {
+							reportedSignedOut: true,
+							stoppedByTurnHandle: false,
+							stoppedByBrokerErrorOnly: true,
+						},
+					},
+				],
+				[
+					'completes successfully after the sign-out began',
+					( began ) => [
+						...before( began ),
+						answered( 'All six commands ran.', began + 3_000 ),
+						completed( 'success', began + 3_100 ),
+					],
+					undefined,
+					{
+						status: 'failed',
+						code: 'completed-after-sign-out',
+						observations: { endedSuccessfully: true, stopDelayS: 3 },
+					},
+				],
+				[
+					'stops for another reason after the sign-out began',
+					( began ) => [
+						...before( began ),
+						failedWith(
+							'Limit reached (HTTP 429, subscription_sharing_usage_limit_exceeded)',
+							began + 1_500
+						),
+						completed( 'error', began + 1_600 ),
+					],
+					undefined,
+					{
+						status: 'failed',
+						code: 'stopped-for-other-reason',
+						observations: { reportedSignedOut: false, endedSuccessfully: false },
+					},
+				],
+				[
+					'starts a tool after the watch bound that never finishes',
+					( began ) => [
+						...before( began ),
+						toolStart(
+							'e',
+							'wp_cli',
+							{ nameOrPath: 'ChatGPT Acceptance', command: 'theme list' },
+							began + 2_500
+						),
+						interruptedWith( signedOutText, began + 2_700 ),
+						completed( 'error', began + 2_800 ),
+					],
+					undefined,
+					{
+						status: 'failed',
+						code: 'tool-call-after-sign-out',
+						observations: { toolStartsAfterSignOut: 1, toolRunsAfterSignOut: 0 },
+					},
+				],
+				[
+					'ended before the sign-out began',
+					( began ) => [
+						toolStart(
+							'c',
+							'wp_cli',
+							{ nameOrPath: 'ChatGPT Acceptance', command: 'plugin list' },
+							began - 3_000
+						),
+						toolEnd( 'c', 'wp_cli', undefined, began - 2_500 ),
+						failedWith(
+							'Limit reached (HTTP 429, subscription_sharing_usage_limit_exceeded)',
+							began - 2_000
+						),
+						completed( 'error', began - 1_900 ),
+					],
+					( began ) => [ routeRequest( { startedAt: began - 4_000, effort: 'low' } ) ],
+					{
+						status: 'blocked',
+						code: 'run-ended-before-sign-out',
+						observations: { endedBeforeSignOut: true },
+					},
+				],
+			];
+
+			it.each( cases )( '%s', async ( _name, events, requests, expected ) => {
+				const { services } = activeRun( events, requests );
+				const code = await runChatGptAcceptance( savedArgs(), dependencies( services ) );
+				expect( code ).toBe( expected.status === 'passed' ? 0 : 1 );
+				const [ record ] = stageOf( 'active-run-stops-on-sign-out' );
+				expect( record ).toMatchObject( {
+					status: expected.status,
+					...( expected.code ? { code: expected.code } : {} ),
+					observations: expect.objectContaining( expected.observations ),
+				} );
+				expect( record.code === undefined ).toBe( expected.code === undefined );
+				expectNothingUnsafe( [ 'test-access-token' ] );
+			} );
+		} );
 
 		it( 'keeps the original failure when cleanup also fails', async () => {
 			const { services, calls } = scriptedServices(
@@ -1057,6 +1359,38 @@ describe( 'ChatGPT acceptance runner', () => {
 			} );
 			expect( calls.log ).toContain( 'cancel' );
 			expect( records().at( -1 )?.stage ).toBe( 'cleanup' );
+		} );
+
+		it( 'signs out a first sign-in that still commits after the interrupt cancelled it', async () => {
+			const { services, calls } = scriptedServices();
+			const signedIn = services.signIn.wait;
+			const outcome = deferred< Awaited< ReturnType< typeof signedIn > > >();
+			services.signIn.wait = () => outcome.promise;
+			services.signIn.cancel = ( attemptId ) => {
+				calls.log.push( 'cancel' );
+				// The browser came back while the cancel was on its way: the attempt saves.
+				void signedIn( attemptId ).then( outcome.resolve );
+				return true;
+			};
+			const running = runChatGptAcceptance( savedArgs(), dependencies( services ) );
+			await vi.waitFor( () => expect( calls.log ).toContain( 'begin:vault' ) );
+			await vi.waitFor( () => expect( interrupt ).not.toBeNull() );
+			interrupt?.();
+			expect( await running ).toBe( 130 );
+			expect( stageOf( 'sign-in' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'interrupted',
+			} );
+			expect( calls.log.indexOf( 'cancel' ) ).toBeLessThan( calls.log.indexOf( 'sign-out' ) );
+			expect( records().at( -1 ) ).toMatchObject( {
+				stage: 'cleanup',
+				status: 'passed',
+				observations: expect.objectContaining( { testRegistrationSignedOut: true } ),
+			} );
+			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readState() ).toMatchObject( {
+				registrationId: REGISTRATION,
+				storage: 'vault',
+			} );
 		} );
 
 		it( 'records a requested gate the image service can’t serve as blocked, never failed, and goes on', async () => {
@@ -1127,6 +1461,53 @@ describe( 'ChatGPT acceptance runner', () => {
 			} );
 		} );
 
+		it( 'passes gate T3 only when the service details arrive before the result is persisted', async () => {
+			const imageTurn = ( persistedAtReceipt: boolean ) => () =>
+				finishedTurn(
+					turnResult( {
+						events: [
+							toolStart( 'g', 'generate_images', { prompt: 'a plain blue square' } ),
+							{
+								...toolEnd( 'g', 'generate_images', { studioService: { service: 'images' } } ),
+								persistedAtReceipt,
+							},
+							answered( 'DONE' ),
+							completed( 'success' ),
+						],
+					} )
+				);
+			const early = scriptedServices(
+				{ imageServiceConfigured: async () => true },
+				{ 'gate-t3': imageTurn( false ) }
+			);
+			expect(
+				await runChatGptAcceptance( savedArgs( '--gates', 'T3' ), dependencies( early.services ) )
+			).toBe( 0 );
+			expect( stageOf( 'gate-t3-image-service-row' )[ 0 ] ).toMatchObject( {
+				status: 'passed',
+				observations: expect.objectContaining( {
+					generateImagesCalls: 1,
+					detailsDelivered: true,
+					deliveredBeforePersisted: true,
+				} ),
+			} );
+
+			fs.rmSync( runDir, { recursive: true, force: true } );
+			const late = scriptedServices(
+				{ imageServiceConfigured: async () => true },
+				{ 'gate-t3': imageTurn( true ) }
+			);
+			expect(
+				await runChatGptAcceptance( savedArgs( '--gates', 'T3' ), dependencies( late.services ) )
+			).toBe( 1 );
+			expect( stageOf( 'gate-t3-image-service-row' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'details-only-after-persisting',
+				observations: expect.objectContaining( { deliveredBeforePersisted: false } ),
+			} );
+			expect( stageOf( 'blocked-after-sign-out' )[ 0 ].status ).toBe( 'passed' );
+		} );
+
 		it( 'blocks gate T2 when no reasoning item was produced, and fails it when one was dropped', async () => {
 			const reasoningTurn = ( replayed: number, produced: number ) => () =>
 				finishedTurn(
@@ -1180,6 +1561,13 @@ describe( 'ChatGPT acceptance runner', () => {
 				status: 'blocked',
 				code: 'no-reasoning-item',
 			} );
+			// At the run's starting effort, before the chat moves to the other one.
+			const { log } = blocked.calls;
+			expect( log.indexOf( 'select:medium' ) ).toBeLessThan( log.indexOf( 'turn:gate-t2' ) );
+			expect( log.indexOf( 'turn:gate-t2' ) ).toBeLessThan( log.indexOf( 'select:low' ) );
+			expect( SAVED_STAGE_NAMES.indexOf( 'gate-t2-reasoning-replay' ) ).toBeLessThan(
+				SAVED_STAGE_NAMES.indexOf( 'effort-change' )
+			);
 
 			fs.rmSync( runDir, { recursive: true, force: true } );
 			const dropped = scriptedServices( {}, { 'gate-t2': reasoningTurn( 0, 1 ) } );
@@ -1192,6 +1580,271 @@ describe( 'ChatGPT acceptance runner', () => {
 			} );
 			// A failed optional gate doesn't stop the required stages after it.
 			expect( stageOf( 'blocked-after-sign-out' )[ 0 ].status ).toBe( 'passed' );
+		} );
+	} );
+
+	describe( 'session scenario with scripted services', () => {
+		const sessionArgs = () => [ '--live', '--scenario', 'session', '--run-dir', runDir ];
+
+		// A saved run's manifest and state, and session services that pass every stage.
+		function scriptedSession(
+			turns: Partial< Record< string, ( options: TurnOptions ) => AcceptanceTurn > > = {}
+		) {
+			fs.mkdirSync( runDir, { recursive: true } );
+			const evidence = openAcceptanceEvidence( runDir, 'chatgpt' );
+			evidence.startRun( {
+				scenario: 'saved',
+				createdOn: '2026-11-11',
+				source: { sha: SHA, dirty: false },
+				platform: { os: 'win32', release: '10.0.26320', arch: 'x64' },
+				runtime: { node: '24.22.1', npm: '11.13.0' },
+				build: { cliVersion: '1.7.3', buildId: 'a1b2c3d4e5f6' },
+				model: 'gpt-6-luna',
+				effort: 'medium',
+				gates: [],
+			} );
+			evidence.writeState( { schemaVersion: 1, registrationId: REGISTRATION, storage: 'vault' } );
+			const notOffered = () =>
+				finishedTurn(
+					turnResult( { exitCode: 1, events: [ cliError( disconnectedText ) ], requests: [] } )
+				);
+			const scripted = scriptedServices(
+				{},
+				{
+					'offered-fork': () =>
+						finishedTurn(
+							turnResult( {
+								tokenAsks: 1,
+								tokensHandedOut: 1,
+								events: [ answered( 'READY' ), completed( 'success' ) ],
+							} )
+						),
+					unoffered: notOffered,
+					'window-fork': notOffered,
+					...turns,
+				}
+			);
+			const { services, calls } = scripted;
+			// The held refresh's renewal waits for the release, then finds the account signed out.
+			let renewal: Promise< void > | null = null;
+			services.tokens = {
+				holdNextRefresh: () => {
+					const gate = deferred();
+					renewal = gate.promise;
+					calls.log.push( 'hold' );
+					return {
+						held: Promise.resolve( true ),
+						release: () => {
+							calls.log.push( 'release' );
+							gate.resolve();
+						},
+					};
+				},
+				probe: async () => ( { tried: true, rejected: true, terminal: true } ),
+				revocations: () => ( { total: 1, confirmed: 1, rotatedRevoked: true } ),
+				settle: async () => {
+					calls.log.push( 'settle' );
+				},
+			};
+			const readAccount = services.broker.readAccount;
+			services.broker.getAccessToken = async ( id ) => {
+				if ( renewal ) {
+					await renewal;
+					if ( ( await readAccount( id ) )?.state !== 'signed-in' ) {
+						throw new ChatGptConnectionError( 'signed-out' );
+					}
+				}
+				return 'test-access-token';
+			};
+			return scripted;
+		}
+
+		it( 'runs every session stage and cleans up after itself', async () => {
+			const { services, calls } = scriptedSession();
+			expect( await runChatGptAcceptance( sessionArgs(), dependencies( services ) ) ).toBe( 0 );
+			expect(
+				records()
+					.filter( ( record ) => record.run === 2 )
+					.map( ( record ) => [ record.stage, record.status ] )
+			).toEqual( [
+				...SESSION_STAGE_NAMES.map( ( stage ) => [ stage, 'passed' ] ),
+				[ 'cleanup', 'passed' ],
+			] );
+			expect( calls.log ).toEqual(
+				expect.arrayContaining( [ 'begin:session', 'hold', 'release' ] )
+			);
+			expect( calls.log.filter( ( call ) => call === 'sign-out' ) ).toHaveLength( 1 );
+			expectNothingUnsafe( [ 'test-access-token' ], [ REGISTRATION ] );
+		} );
+
+		const failures: Array<
+			[
+				string,
+				string,
+				'failed' | 'blocked',
+				() => ReturnType< typeof scriptedSession >,
+				{ signOut: boolean; cleanup?: Record< string, unknown > },
+			]
+		> = [
+			[
+				'returning-sign-in',
+				'denied',
+				'failed',
+				() => {
+					const scripted = scriptedSession();
+					scripted.services.signIn.wait = async () => ( {
+						ok: false,
+						code: 'denied',
+						message: 'denied',
+					} );
+					return scripted;
+				},
+				{ signOut: false },
+			],
+			[
+				'no-persisted-record',
+				'credential-record-persisted',
+				'failed',
+				() => {
+					const scripted = scriptedSession();
+					scripted.services.broker.vaultRecordExists = () => true;
+					return scripted;
+				},
+				{ signOut: true, cleanup: { testRegistrationSignedOut: true } },
+			],
+			[
+				'unoffered-process-fails',
+				'inference-without-offer',
+				'failed',
+				() =>
+					scriptedSession( {
+						unoffered: () =>
+							finishedTurn(
+								turnResult( {
+									exitCode: 0,
+									events: [ answered( 'READY' ), completed( 'success' ) ],
+								} )
+							),
+					} ),
+				{ signOut: true, cleanup: { testRegistrationSignedOut: true } },
+			],
+			[
+				'refresh-hold-across-sign-out',
+				'refresh-not-held',
+				'blocked',
+				() => {
+					const scripted = scriptedSession();
+					const hold = scripted.services.tokens.holdNextRefresh;
+					scripted.services.tokens.holdNextRefresh = () => ( {
+						...hold(),
+						held: Promise.resolve( false ),
+					} );
+					return scripted;
+				},
+				{
+					signOut: true,
+					cleanup: { heldRefreshReleased: true, testRegistrationSignedOut: true },
+				},
+			],
+		];
+
+		it.each( failures )(
+			'after %s fails with %s, keeps that record and cleans up what it owns',
+			async ( stage, code, status, make, expected ) => {
+				const { services, calls } = make();
+				expect( await runChatGptAcceptance( sessionArgs(), dependencies( services ) ) ).toBe( 1 );
+				const all = records().filter( ( record ) => record.run === 2 );
+				const failedAt = all.findIndex( ( record ) => record.stage === stage );
+				expect( all[ failedAt ] ).toMatchObject( { stage, status, code } );
+				expect( all.slice( failedAt + 1 ).map( ( record ) => record.stage ) ).toEqual( [
+					'cleanup',
+				] );
+				expect( all.at( -1 ) ).toMatchObject( {
+					stage: 'cleanup',
+					status: 'passed',
+					observations: expect.objectContaining( expected.cleanup ?? {} ),
+				} );
+				expect( calls.log ).toContain( 'stop-owned' );
+				expect( calls.log.filter( ( call ) => call === 'sign-out' ) ).toHaveLength(
+					expected.signOut ? 1 : 0
+				);
+				expectNothingUnsafe( [ 'test-access-token' ], [ REGISTRATION ] );
+			}
+		);
+
+		it( 'signs out a returning sign-in that still commits after the interrupt cancelled it', async () => {
+			const { services, calls } = scriptedSession();
+			const signedIn = services.signIn.wait;
+			const outcome = deferred< Awaited< ReturnType< typeof signedIn > > >();
+			services.signIn.wait = () => outcome.promise;
+			services.signIn.cancel = ( attemptId ) => {
+				calls.log.push( 'cancel' );
+				void signedIn( attemptId ).then( outcome.resolve );
+				return true;
+			};
+			const running = runChatGptAcceptance( sessionArgs(), dependencies( services ) );
+			await vi.waitFor( () => expect( calls.log ).toContain( 'begin:session' ) );
+			await vi.waitFor( () => expect( interrupt ).not.toBeNull() );
+			interrupt?.();
+			expect( await running ).toBe( 130 );
+			expect( stageOf( 'returning-sign-in' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'interrupted',
+			} );
+			expect( records().at( -1 ) ).toMatchObject( {
+				stage: 'cleanup',
+				status: 'passed',
+				observations: expect.objectContaining( { testRegistrationSignedOut: true } ),
+			} );
+			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readState() ).toMatchObject( {
+				registrationId: REGISTRATION,
+				storage: 'session',
+			} );
+		} );
+
+		it( 'stops waiting at once on an interrupt while a refresh is held, then releases it in cleanup', async () => {
+			const { services, calls } = scriptedSession( {
+				// A fork that is still running when the interrupt comes.
+				'window-fork': () => ( {
+					firstRequest: async () => false,
+					result: new Promise( ( resolve ) =>
+						setTimeout(
+							() =>
+								resolve(
+									turnResult( {
+										exitCode: 1,
+										events: [ cliError( disconnectedText ) ],
+										requests: [],
+									} )
+								),
+							4_000
+						)
+					),
+					stop: async () => undefined,
+				} ),
+			} );
+			const running = runChatGptAcceptance( sessionArgs(), dependencies( services ) );
+			await vi.waitFor( () => expect( calls.log ).toContain( 'turn:window-fork' ) );
+			interrupt?.();
+			expect(
+				await Promise.race( [
+					running,
+					new Promise( ( resolve ) => setTimeout( () => resolve( 'still waiting' ), 2_000 ) ),
+				] )
+			).toBe( 130 );
+			expect( calls.log.indexOf( 'release' ) ).toBeGreaterThan(
+				calls.log.indexOf( 'turn:window-fork' )
+			);
+			expect( stageOf( 'refresh-hold-across-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'interrupted',
+			} );
+			expect( records().at( -1 ) ).toMatchObject( {
+				stage: 'cleanup',
+				status: 'passed',
+				observations: expect.objectContaining( { heldRefreshReleased: true } ),
+			} );
+			expect( calls.log ).toContain( 'stop-owned' );
 		} );
 	} );
 
@@ -1321,6 +1974,9 @@ describe( 'ChatGPT acceptance runner', () => {
 		let keychain: ReturnType< typeof createFakeCredentialStore >;
 		const revoked = new Set< string >();
 		const spent = new Set< string >();
+		// Which grant each refresh token belongs to, and what this script issued.
+		const family = new Map< string, number >();
+		const issuedHere: string[] = [];
 
 		beforeAll( async () => {
 			signingKey = await createSigningKey( 'acceptance-key' );
@@ -1331,20 +1987,46 @@ describe( 'ChatGPT acceptance runner', () => {
 			fake = await startFakeAuthorizationServer( signingKey );
 			revoked.clear();
 			spent.clear();
-			// Refresh tokens rotate and work once; revoked ones never work again.
+			family.clear();
+			issuedHere.length = 0;
+			// Refresh tokens rotate and work once; revoked ones never work again; and
+			// presenting a spent one revokes its whole grant, rotated tokens included.
 			fake.script.token = ( form ) => {
 				if ( form.get( 'grant_type' ) !== 'refresh_token' ) {
 					return undefined;
 				}
 				const presented = form.get( 'refresh_token' ) ?? '';
+				if ( ! family.has( presented ) ) {
+					family.set( presented, family.size + 1 );
+				}
+				const grant = family.get( presented );
 				if ( revoked.has( presented ) ) {
 					return { status: 400, body: { error: 'invalid_grant' } };
 				}
 				if ( spent.has( presented ) ) {
+					for ( const [ token, of ] of family ) {
+						if ( of === grant ) {
+							revoked.add( token );
+						}
+					}
 					return { status: 400, body: { error: 'refresh_token_reused' } };
 				}
 				spent.add( presented );
-				return undefined;
+				const serial = issuedHere.length / 2 + 1;
+				const next = `test-rotated-refresh-token-${ serial }`;
+				const access = `test-rotated-access-token-${ serial }`;
+				issuedHere.push( next, access );
+				family.set( next, grant! );
+				return {
+					status: 200,
+					body: {
+						access_token: access,
+						refresh_token: next,
+						token_type: 'Bearer',
+						expires_in: 3600,
+						scope: GRANTED_SCOPE,
+					},
+				};
 			};
 			fake.script.revoke = ( form ) => {
 				revoked.add( form.get( 'token' ) ?? '' );
@@ -1389,8 +2071,9 @@ describe( 'ChatGPT acceptance runner', () => {
 					invalidateAccessToken: ( id: string, token: string ) =>
 						broker.invalidateAccessToken( id, token ),
 					signOut: async ( id: string ) => {
+						const began = services.clock.now();
 						const result = await broker.signOut( id );
-						notifySignedOut();
+						notifySignedOut( began );
 						return result;
 					},
 					sessionForkEnvironment: () => broker.getSessionForkEnvironment(),
@@ -1560,7 +2243,43 @@ describe( 'ChatGPT acceptance runner', () => {
 			);
 			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readManifest()?.runs ).toHaveLength( 2 );
 			expect( ( await readChatGptAccount( registrationId ) )?.state ).toBe( 'signed-out' );
-			expectNothingUnsafe( fake.secrets(), [ registrationId ] );
+			expectNothingUnsafe( [ ...fake.secrets(), ...issuedHere ], [ registrationId ] );
+		} );
+
+		it( 'fails the refresh hold when the sign-out leaves the rotated grant usable, though a reuse would revoke the grant', async () => {
+			const owner: { broker: ChatGptCredentialBroker | null } = { broker: null };
+			expect(
+				await runChatGptAcceptance(
+					[ '--live', '--scenario', 'saved', '--run-dir', runDir ],
+					dependencies( realServices( owner ) )
+				)
+			).toBe( 0 );
+			const { registrationId } = openAcceptanceEvidence( runDir, 'chatgpt' ).readState() as {
+				registrationId: string;
+			};
+			// From here the token service refuses every revocation the sign-out asks for.
+			fake.script.revoke = () => ( { status: 400, body: { error: 'unsupported_token_type' } } );
+			const session = realServices( owner );
+			session.processes = {
+				...session.processes,
+				startTurn: ( options ) => simulatedFork( owner.broker!, options, registrationId ),
+			};
+			printed = [];
+			expect(
+				await runChatGptAcceptance(
+					[ '--live', '--scenario', 'session', '--run-dir', runDir ],
+					dependencies( session )
+				)
+			).toBe( 1 );
+			expect( stageOf( 'refresh-hold-across-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'rotated-grant-usable',
+				observations: expect.objectContaining( {
+					rotatedRevokedBySignOut: false,
+					rotatedRefreshRejected: false,
+				} ),
+			} );
+			expectNothingUnsafe( [ ...fake.secrets(), ...issuedHere ], [ registrationId ] );
 		} );
 
 		it( 'signs out a session-only registration it signed in when a later session stage fails', async () => {
@@ -1643,6 +2362,26 @@ describe( 'acceptance turn digests', () => {
 		} );
 	} );
 
+	it( 'reads an interrupted ending: how it stopped, its typed codes and when it arrived', () => {
+		expect(
+			digestTurnEvents( [
+				message( { type: 'agent_end', willRetry: true, messages: [] }, 10 ),
+				interruptedWith( signedOutText, 30 ),
+				completed( 'error', 40 ),
+			] )
+		).toMatchObject( {
+			stopReason: 'aborted',
+			failureCodes: [ 'signed-out' ],
+			endedAt: 30,
+			status: 'error',
+			finalText: '',
+		} );
+		expect( digestTurnEvents( [ completed( 'error', 40 ) ] ) ).toMatchObject( {
+			stopReason: null,
+			endedAt: 40,
+		} );
+	} );
+
 	it( 'allows only the named test mutation on the test site', () => {
 		const policy = {
 			site: { name: 'ChatGPT Acceptance', path: '/run/sites/a' },
@@ -1661,6 +2400,36 @@ describe( 'acceptance turn digests', () => {
 				command: 'option get blogname',
 			} )
 		).toBe( 'allowed' );
+		for ( const command of [
+			'plugin list',
+			'user list --fields=ID',
+			'post list --post_type=page',
+			'post meta get 1 color',
+			'theme mod get header_textcolor',
+			'plugin auto-updates status --all',
+			'plugin path hello',
+			'core version',
+		] ) {
+			expect(
+				classifyToolCall( policy, 'wp_cli', { nameOrPath: 'ChatGPT Acceptance', command } )
+			).toBe( 'allowed' );
+			expect( isWpCliReadCommand( command ) ).toBe( true );
+		}
+		// Writes whose later words happen to be read verbs.
+		for ( const command of [
+			'option update status x',
+			'plugin install path',
+			'post update 1 --post_title=list',
+			'user create get reader',
+			'post create --post_title="T 1"',
+		] ) {
+			expect( isWpCliReadCommand( command ) ).toBe( false );
+		}
+		for ( const command of [ 'option update status x', 'plugin install path' ] ) {
+			expect(
+				classifyToolCall( policy, 'wp_cli', { nameOrPath: 'ChatGPT Acceptance', command } )
+			).toBe( 'unexpected' );
+		}
 		for ( const [ name, args ] of [
 			[ 'wp_cli', { nameOrPath: 'Other Site', command: 'option get blogname' } ],
 			[
@@ -1680,6 +2449,64 @@ describe( 'acceptance turn digests', () => {
 			[ 'Bash', { command: 'ls' } ],
 		] as const ) {
 			expect( classifyToolCall( policy, name, args ) ).toBe( 'unexpected' );
+		}
+	} );
+
+	it( 'describes the platform with a release the manifest accepts, or null when it can’t read one', () => {
+		for ( const release of [ '10.0.26320', '6.8.0-45-generic', '24.1.0' ] ) {
+			expect( acceptancePlatform( release ).release ).toBe( release );
+		}
+		for ( const release of [ '6.1.0+rpt-rpi-v8', 'Darwin 24', '', 'unknown' ] ) {
+			expect( acceptancePlatform( release ).release ).toBeNull();
+		}
+		const runDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-acceptance-platform-' ) );
+		try {
+			expect(
+				openAcceptanceEvidence( runDir, 'chatgpt' ).startRun( {
+					scenario: 'saved',
+					createdOn: '2026-11-11',
+					source: { sha: SHA, dirty: false },
+					platform: acceptancePlatform( '6.1.0+rpt-rpi-v8' ),
+					runtime: { node: '24.22.1', npm: '11.13.0' },
+					build: { cliVersion: '1.7.3', buildId: 'a1b2c3d4e5f6' },
+					model: 'gpt-6-luna',
+					effort: 'medium',
+					gates: [],
+				} )
+			).toBe( 1 );
+		} finally {
+			fs.rmSync( runDir, { recursive: true, force: true } );
+		}
+	} );
+
+	it( 'sees a tool result in a session file only once its tool result entry is written', () => {
+		const dir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-acceptance-session-file-' ) );
+		const file = path.join( dir, 'session.jsonl' );
+		try {
+			expect( isToolResultPersisted( file, 'call-1' ) ).toBe( false );
+			fs.writeFileSync(
+				file,
+				[
+					JSON.stringify( {
+						type: 'message',
+						message: { role: 'assistant', content: [ { type: 'toolCall', id: 'call-1' } ] },
+					} ),
+					'not json, but it names call-1',
+				].join( '\n' )
+			);
+			expect( isToolResultPersisted( file, 'call-1' ) ).toBe( false );
+			fs.appendFileSync(
+				file,
+				'\r\n' +
+					JSON.stringify( {
+						type: 'message',
+						message: { role: 'toolResult', toolCallId: 'call-1' },
+					} )
+			);
+			expect( isToolResultPersisted( file, 'call-1' ) ).toBe( true );
+			expect( isToolResultPersisted( file, 'call-2' ) ).toBe( false );
+		} finally {
+			fs.rmSync( dir, { recursive: true, force: true } );
 		}
 	} );
 

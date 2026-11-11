@@ -52,6 +52,7 @@ import { __, _n, sprintf } from '@wordpress/i18n';
 import {
 	AcceptanceManifestError,
 	findUnsafeText,
+	isManifestVersion,
 	openAcceptanceEvidence,
 	UnsafeEvidenceError,
 	type AcceptanceEvidence,
@@ -62,10 +63,12 @@ import {
 } from 'cli/ai/acceptance-evidence';
 import {
 	applyAcceptanceIsolation,
+	findRealProfileHazard,
 	findRealProfileLeak,
 	isInsideAcceptanceRun,
 	type AcceptanceIsolationProblem,
 	type AcceptanceRunPaths,
+	type RealProfileHazard,
 } from 'cli/ai/acceptance-isolation';
 import {
 	ACCEPTANCE_OBSERVER_FILE_ENV,
@@ -115,7 +118,6 @@ const SETTLE_WAIT_MS = 35_000;
 const SIGN_OUT_WAIT_MS = 90_000;
 const CLEANUP_STEP_MS = 120_000;
 const POLL_MS = 250;
-const TOOL_START_SLACK_MS = 1_000;
 
 interface ChatGptAcceptanceOptions {
 	live: boolean;
@@ -574,29 +576,44 @@ interface ToolCallDigest {
 export interface TurnDigest {
 	toolCalls: ToolCallDigest[];
 	finalText: string;
+	/** Typed codes from a failed or interrupted ending, never its text. */
 	failureCodes: string[];
 	status: string | null;
 	questions: number;
+	/**
+	 * How the turn's last assistant message stopped: `aborted` when the turn's
+	 * own ChatGPT connection signal ended it, `error` for a failure.
+	 */
+	stopReason: string | null;
+	/** When the runner received the event that ended the turn. */
+	endedAt: number | null;
 }
 
 const isRecord = ( value: unknown ): value is Record< string, unknown > =>
 	typeof value === 'object' && value !== null && ! Array.isArray( value );
 
-function finalAssistantText( event: Record< string, unknown > ): string | null {
+function lastAssistant( event: Record< string, unknown > ): Record< string, unknown > | null {
 	const messages = Array.isArray( event.messages ) ? event.messages : [];
 	for ( let index = messages.length - 1; index >= 0; index-- ) {
 		const message = messages[ index ];
-		if ( isRecord( message ) && message.role === 'assistant' && Array.isArray( message.content ) ) {
-			return message.content
-				.filter(
-					( block ): block is { type: 'text'; text: string } =>
-						isRecord( block ) && block.type === 'text' && typeof block.text === 'string'
-				)
-				.map( ( block ) => block.text )
-				.join( '\n' );
+		if ( isRecord( message ) && message.role === 'assistant' ) {
+			return message;
 		}
 	}
 	return null;
+}
+
+function assistantText( message: Record< string, unknown > | null ): string | null {
+	if ( ! message || ! Array.isArray( message.content ) ) {
+		return null;
+	}
+	return message.content
+		.filter(
+			( block ): block is { type: 'text'; text: string } =>
+				isRecord( block ) && block.type === 'text' && typeof block.text === 'string'
+		)
+		.map( ( block ) => block.text )
+		.join( '\n' );
 }
 
 export function digestTurnEvents( events: readonly TimedEvent[] ): TurnDigest {
@@ -606,6 +623,8 @@ export function digestTurnEvents( events: readonly TimedEvent[] ): TurnDigest {
 		failureCodes: [],
 		status: null,
 		questions: 0,
+		stopReason: null,
+		endedAt: null,
 	};
 	const codes = new Set< string >();
 	for ( const { receivedAt, event, persistedAtReceipt } of events ) {
@@ -631,18 +650,26 @@ export function digestTurnEvents( events: readonly TimedEvent[] ): TurnDigest {
 						call.persistedAtReceipt = persistedAtReceipt;
 					}
 				}
-			} else if ( inner.type === 'agent_end' ) {
+			} else if ( inner.type === 'agent_end' && inner.willRetry !== true ) {
+				const last = lastAssistant( inner );
+				digest.stopReason = typeof last?.stopReason === 'string' ? last.stopReason : null;
+				digest.endedAt = receivedAt;
 				const failure = getAgentEndFailure( event.message as AgentSessionEvent );
 				if ( failure ) {
 					classifyTurnFailure( failure.message ).forEach( ( code ) => codes.add( code ) );
+				} else if ( last?.stopReason === 'aborted' ) {
+					if ( typeof last.errorMessage === 'string' ) {
+						classifyTurnFailure( last.errorMessage ).forEach( ( code ) => codes.add( code ) );
+					}
 				} else {
-					digest.finalText = finalAssistantText( inner ) ?? digest.finalText;
+					digest.finalText = assistantText( last ) ?? digest.finalText;
 				}
 			}
 		} else if ( event.type === 'error' ) {
 			classifyTurnFailure( event.message ).forEach( ( code ) => codes.add( code ) );
 		} else if ( event.type === 'turn.completed' ) {
 			digest.status = event.status;
+			digest.endedAt ??= receivedAt;
 		} else if ( event.type === 'question.asked' ) {
 			digest.questions += event.questions.length;
 		}
@@ -730,6 +757,29 @@ function splitWpCliWords( command: string ): string[] {
 	return words;
 }
 
+// Command groups whose verb follows a second noun: `post meta get`, `theme mod list`.
+const WP_CLI_SUBCOMMAND_GROUPS = new Set( [ 'meta', 'term', 'mod', 'auto-updates', 'option' ] );
+
+const wpCliPositionals = ( words: readonly string[] ) =>
+	words.filter( ( word ) => ! word.startsWith( '-' ) );
+
+/** A WP-CLI command's verb: the word after its command, or after its sub-command group. */
+function wpCliVerb( positional: readonly string[] ): string | undefined {
+	return WP_CLI_SUBCOMMAND_GROUPS.has( positional[ 1 ] ) ? positional[ 2 ] : positional[ 1 ];
+}
+
+/** Whether a WP-CLI command only reads: decided by its verb, never by words after it. */
+export function isWpCliReadCommand( command: string ): boolean {
+	const positional = wpCliPositionals( splitWpCliWords( command ) );
+	const verb = wpCliVerb( positional );
+	return (
+		positional.length > 0 &&
+		! UNSAFE_WP_COMMANDS.has( positional[ 0 ] ) &&
+		verb !== undefined &&
+		READ_VERBS.has( verb )
+	);
+}
+
 function optionValue( words: readonly string[], name: string ): string | undefined {
 	const prefix = `${ name }=`;
 	const found = words.find( ( word ) => word.startsWith( prefix ) );
@@ -762,18 +812,15 @@ export function classifyToolCall(
 	if ( ! policy.site || typeof input.nameOrPath !== 'string' ) {
 		return 'unexpected';
 	}
-	const words = splitWpCliWords( typeof input.command === 'string' ? input.command : '' );
+	const command = typeof input.command === 'string' ? input.command : '';
+	const words = splitWpCliWords( command );
 	if ( words.some( ( word ) => /publish|future/i.test( word ) ) ) {
 		return 'unexpected';
 	}
-	const positional = words.filter( ( word ) => ! word.startsWith( '-' ) );
-	if (
-		positional.length > 0 &&
-		! UNSAFE_WP_COMMANDS.has( positional[ 0 ] ) &&
-		positional.slice( 1, 3 ).some( ( word ) => READ_VERBS.has( word ) )
-	) {
+	if ( isWpCliReadCommand( command ) ) {
 		return 'allowed';
 	}
+	const positional = wpCliPositionals( words );
 	if ( positional[ 0 ] === 'post' && positional[ 1 ] === 'create' && policy.draftTitle ) {
 		const status = optionValue( words, '--post_status' );
 		const type = optionValue( words, '--post_type' );
@@ -1026,7 +1073,9 @@ async function runCountdown(
 /**
  * One browser sign-in. The typed code of a failed outcome is the stage's code;
  * a pending attempt is cancelled, and waited for, on every way out, so one
- * that was already being saved finishes before anything signs out.
+ * that was already being saved finishes before anything signs out. Whenever
+ * an attempt commits, cancelled or not, its registration is kept in the
+ * state, so cleanup signs it out.
  */
 async function signInStage(
 	ctx: StageContext,
@@ -1043,6 +1092,11 @@ async function signInStage(
 	let settled = false;
 	const waiting = signIn.wait( attemptId ).then( ( outcome ) => {
 		settled = true;
+		if ( outcome.ok ) {
+			ctx.state.registrationId ??= outcome.registrationId;
+			ctx.state.storage = storage;
+			ctx.saveState();
+		}
 		return outcome;
 	} );
 	const settle = async () => {
@@ -1152,7 +1206,7 @@ async function runTurn( ctx: StageContext, options: TurnOptions ): Promise< Turn
 	return result;
 }
 
-function judgeTurn(
+function observeTurn(
 	observations: Observations,
 	result: TurnResult,
 	policy: ToolPolicy
@@ -1164,6 +1218,15 @@ function judgeTurn(
 	).length;
 	observations.questionsAsked = digest.questions;
 	observations.completed = digest.status === 'success';
+	return digest;
+}
+
+function judgeTurn(
+	observations: Observations,
+	result: TurnResult,
+	policy: ToolPolicy
+): TurnDigest {
+	const digest = observeTurn( observations, result, policy );
 	check( observations.unexpectedToolCalls === 0, 'unexpected-tool-call' );
 	return digest;
 }
@@ -1239,9 +1302,6 @@ const SAVED_STAGES: StageDefinition[] = [
 		async run( ctx, observations ) {
 			registerRegistrationCleanup( ctx );
 			const outcome = await signInStage( ctx, observations, undefined, 'vault' );
-			ctx.state.registrationId = outcome.registrationId;
-			ctx.state.storage = 'vault';
-			ctx.saveState();
 			const account = await ctx.services.broker.readAccount( outcome.registrationId );
 			observations.signedIn = account?.state === 'signed-in';
 			observations.storedInVault = ctx.services.broker.vaultRecordExists( outcome.registrationId );
@@ -1358,12 +1418,18 @@ const SAVED_STAGES: StageDefinition[] = [
 				policy,
 			} );
 			const digest = judgeTurn( observations, result, policy );
-			observations.wpCliCalls = digest.toolCalls.filter(
-				( call ) => call.name === 'wp_cli'
+			const wpCli = digest.toolCalls.filter( ( call ) => call.name === 'wp_cli' );
+			observations.wpCliCalls = wpCli.length;
+			observations.wpCliReads = wpCli.filter(
+				( call ) =>
+					call.isError === false &&
+					isRecord( call.args ) &&
+					typeof call.args.command === 'string' &&
+					isWpCliReadCommand( call.args.command )
 			).length;
 			observations.modelRequests = routeRequests( result ).length;
 			check( observations.completed === true, digest.failureCodes[ 0 ] ?? 'turn-failed' );
-			check( observations.wpCliCalls >= 1, 'no-site-read' );
+			check( observations.wpCliReads >= 1, 'no-site-read' );
 		},
 	},
 	{
@@ -1415,6 +1481,46 @@ const SAVED_STAGES: StageDefinition[] = [
 			check( observations.titleMatches, 'title-mismatch' );
 			check( observations.contentMatches, 'content-mismatch' );
 			check( observations.otherPostsUnchanged, 'other-posts-changed' );
+		},
+	},
+	{
+		name: 'gate-t2-reasoning-replay',
+		gate: 'T2',
+		async run( ctx, observations ) {
+			const site = requireSite( ctx );
+			const sessionId = ctx.state.draftSessionId ?? fail( 'no-draft-session' );
+			const policy: ToolPolicy = { site, tools: [] };
+			const result = await runTurn( ctx, {
+				label: 'gate-t2',
+				sessionId,
+				prompt:
+					'Think it through step by step before answering: which is larger, 17 × 23 or 19 × 21? Before you answer, call site_info for the active site to check that it is running. Then reply with the larger product and whether the site is running.',
+				offerSessions: false,
+				ipc: true,
+				policy,
+			} );
+			const digest = judgeTurn( observations, result, policy );
+			const route = routeRequests( result ).sort(
+				( a, b ) => a.startedAt - b.startedAt || a.id - b.id
+			);
+			const producing = route.findIndex(
+				( request ) => ( responseFor( result, request )?.reasoningOutputs ?? 0 ) > 0
+			);
+			const next = producing >= 0 ? route[ producing + 1 ] : undefined;
+			const nextResponse = next ? responseFor( result, next ) : undefined;
+			observations.reasoningItemsProduced = route.reduce(
+				( total, request ) => total + ( responseFor( result, request )?.reasoningOutputs ?? 0 ),
+				0
+			);
+			observations.reasoningItemsReplayed = next?.reasoningItems ?? 0;
+			observations.replayAccepted = nextResponse?.status === 200 && nextResponse.completed;
+			if ( producing < 0 ) {
+				return block( 'no-reasoning-item' );
+			}
+			check( next !== undefined, 'no-follow-up-request' );
+			check( observations.reasoningItemsReplayed > 0, 'reasoning-not-replayed' );
+			check( observations.replayAccepted, 'reasoning-replay-rejected' );
+			check( observations.completed === true, digest.failureCodes[ 0 ] ?? 'turn-failed' );
 		},
 	},
 	{
@@ -1532,46 +1638,6 @@ const SAVED_STAGES: StageDefinition[] = [
 		},
 	},
 	{
-		name: 'gate-t2-reasoning-replay',
-		gate: 'T2',
-		async run( ctx, observations ) {
-			const site = requireSite( ctx );
-			const sessionId = ctx.state.draftSessionId ?? fail( 'no-draft-session' );
-			const policy: ToolPolicy = { site, tools: [] };
-			const result = await runTurn( ctx, {
-				label: 'gate-t2',
-				sessionId,
-				prompt:
-					'Think it through step by step before answering: which is larger, 17 × 23 or 19 × 21? Before you answer, call site_info for the active site to check that it is running. Then reply with the larger product and whether the site is running.',
-				offerSessions: false,
-				ipc: true,
-				policy,
-			} );
-			const digest = judgeTurn( observations, result, policy );
-			const route = routeRequests( result ).sort(
-				( a, b ) => a.startedAt - b.startedAt || a.id - b.id
-			);
-			const producing = route.findIndex(
-				( request ) => ( responseFor( result, request )?.reasoningOutputs ?? 0 ) > 0
-			);
-			const next = producing >= 0 ? route[ producing + 1 ] : undefined;
-			const nextResponse = next ? responseFor( result, next ) : undefined;
-			observations.reasoningItemsProduced = route.reduce(
-				( total, request ) => total + ( responseFor( result, request )?.reasoningOutputs ?? 0 ),
-				0
-			);
-			observations.reasoningItemsReplayed = next?.reasoningItems ?? 0;
-			observations.replayAccepted = nextResponse?.status === 200 && nextResponse.completed;
-			if ( producing < 0 ) {
-				return block( 'no-reasoning-item' );
-			}
-			check( next !== undefined, 'no-follow-up-request' );
-			check( observations.reasoningItemsReplayed > 0, 'reasoning-not-replayed' );
-			check( observations.replayAccepted, 'reasoning-replay-rejected' );
-			check( observations.completed === true, digest.failureCodes[ 0 ] ?? 'turn-failed' );
-		},
-	},
-	{
 		name: 'gate-t3-image-service-row',
 		gate: 'T3',
 		async run( ctx, observations ) {
@@ -1626,12 +1692,18 @@ const SAVED_STAGES: StageDefinition[] = [
 				ctx.signal
 			);
 			observations.runActiveAtSignOut = active === true;
-			const signOutStartedAt = clock.now();
+			if ( active === null ) {
+				await turn.stop();
+				return fail( 'no-first-request' );
+			}
+			const signOutBeganAt = clock.now();
 			const signedOut = await ctx.services.broker.signOut( id );
-			const signOutEndedAt = clock.now();
 			ctx.signOutResult = signedOut;
 			observations.localCleared = signedOut.localCleared;
 			observations.remoteRevocationConfirmed = signedOut.remoteRevocationConfirmed;
+			observations.signOutTookS = round1(
+				Math.min( Math.max( 0, clock.now() - signOutBeganAt ), SIGN_OUT_WAIT_MS ) / 1000
+			);
 			observations.watchPollS = CHATGPT_TURN_WATCH_POLL_MS / 1000;
 			const result = await untilAborted( raceTimeout( turn.result, STOP_BOUND_MS ), ctx.signal );
 			observations.stoppedWithinBound = result !== null;
@@ -1640,24 +1712,53 @@ const SAVED_STAGES: StageDefinition[] = [
 				return fail( 'run-not-stopped' );
 			}
 			ctx.turns[ 'active-run' ] = result;
-			const digest = judgeTurn( observations, result, policy );
-			observations.stoppedAfterS = round1(
-				Math.max( 0, result.exitedAt - signOutStartedAt ) / 1000
+			const digest = observeTurn( observations, result, policy );
+			// Work that began before the sign-out may finish. A turn's own watch
+			// sees the sign-out within one poll of it beginning; anything that
+			// starts later ran on a connection that was gone.
+			const watchBoundAt = signOutBeganAt + CHATGPT_TURN_WATCH_POLL_MS;
+			const inWatchWindow = ( at: number ) => at >= signOutBeganAt && at <= watchBoundAt;
+			const endedAt = digest.endedAt ?? result.exitedAt;
+			const route = routeRequests( result );
+			observations.endedBeforeSignOut = endedAt < signOutBeganAt;
+			observations.stopDelayS = round1(
+				Math.min( Math.max( 0, endedAt - signOutBeganAt ), TURN_TIMEOUT_MS ) / 1000
 			);
-			observations.routeRequestsAfterSignOut = routeRequests( result ).filter(
-				( request ) => request.startedAt > signOutEndedAt
+			observations.routeRequestsInWatchWindow = route.filter( ( request ) =>
+				inWatchWindow( request.startedAt )
+			).length;
+			observations.routeRequestsAfterSignOut = route.filter(
+				( request ) => request.startedAt > watchBoundAt
+			).length;
+			observations.toolStartsInWatchWindow = digest.toolCalls.filter( ( call ) =>
+				inWatchWindow( call.startedAt )
+			).length;
+			observations.toolStartsAfterSignOut = digest.toolCalls.filter(
+				( call ) => call.startedAt > watchBoundAt
 			).length;
 			observations.toolRunsAfterSignOut = digest.toolCalls.filter(
-				( call ) => call.startedAt > signOutEndedAt + TOOL_START_SLACK_MS && call.isError === false
+				( call ) => call.startedAt > watchBoundAt && call.isError === false
 			).length;
+			observations.endedSuccessfully =
+				digest.status === 'success' || ( digest.status === null && digest.stopReason === 'stop' );
 			observations.reportedSignedOut = digest.failureCodes.includes( 'signed-out' );
+			// Stopped through the turn's own connection signal (its watch, or its
+			// handle before a request or tool), or only by an error the broker
+			// returned when the turn next asked it for a token.
+			observations.stoppedByTurnHandle =
+				observations.reportedSignedOut && digest.stopReason === 'aborted';
+			observations.stoppedByBrokerErrorOnly =
+				observations.reportedSignedOut && ! observations.stoppedByTurnHandle;
 			observations.ownerInterruptSent = result.interruptedByRunner;
 			check( observations.localCleared, 'local-not-cleared' );
-			if ( ! observations.runActiveAtSignOut || digest.status === 'success' ) {
+			check( observations.unexpectedToolCalls === 0, 'unexpected-tool-call' );
+			if ( ! observations.runActiveAtSignOut || observations.endedBeforeSignOut ) {
 				return block( 'run-ended-before-sign-out' );
 			}
 			check( observations.routeRequestsAfterSignOut === 0, 'request-after-sign-out' );
-			check( observations.toolRunsAfterSignOut === 0, 'tool-call-after-sign-out' );
+			check( observations.toolStartsAfterSignOut === 0, 'tool-call-after-sign-out' );
+			check( ! observations.endedSuccessfully, 'completed-after-sign-out' );
+			check( observations.reportedSignedOut, 'stopped-for-other-reason' );
 		},
 	},
 	{
@@ -1721,8 +1822,6 @@ const SESSION_STAGES: StageDefinition[] = [
 			const id = requireRegistration( ctx );
 			registerRegistrationCleanup( ctx );
 			const outcome = await signInStage( ctx, observations, id, 'session' );
-			ctx.state.storage = 'session';
-			ctx.saveState();
 			observations.sameRegistration = outcome.registrationId === id;
 			check( observations.sameRegistration, 'registration-changed' );
 		},
@@ -1818,12 +1917,25 @@ const SESSION_STAGES: StageDefinition[] = [
 			const sessionId = ctx.state.offeredSessionId ?? fail( 'no-offered-session' );
 			const current = await broker.getAccessToken( id );
 			const hold = tokens.holdNextRefresh();
+			let signingOut: Promise< void > | null = null;
 			ctx.cleanup.set( 'refresh', async ( report ) => {
 				hold.release();
 				await tokens.settle();
 				report.heldRefreshReleased = true;
+				// A sign-out this stage began revokes what the release returned.
+				if ( signingOut ) {
+					report.signOutSettled =
+						( await raceTimeout(
+							signingOut.then( () => true ),
+							SIGN_OUT_WAIT_MS
+						) ) === true;
+				}
 				return true;
 			} );
+			// The waits for the hold, the fork and the sign-out end at once on an
+			// interrupt; cleanup releases the hold. A probe isn't cut short: each
+			// one revokes whatever it was issued.
+			const abortable = < T >( promise: Promise< T > ) => untilAborted( promise, ctx.signal );
 			await broker.invalidateAccessToken( id, current );
 			let renewalError: unknown = null;
 			const renewal = broker.getAccessToken( id ).then(
@@ -1833,16 +1945,16 @@ const SESSION_STAGES: StageDefinition[] = [
 				}
 			);
 			observations.refreshHeld =
-				( await untilAborted( raceTimeout( hold.held, HOLD_WAIT_MS ), ctx.signal ) ) === true;
+				( await abortable( raceTimeout( hold.held, HOLD_WAIT_MS ) ) ) === true;
 			if ( ! observations.refreshHeld ) {
 				hold.release();
-				await raceTimeout( renewal, SETTLE_WAIT_MS );
+				await abortable( raceTimeout( renewal, SETTLE_WAIT_MS ) );
 				return block( 'refresh-not-held' );
 			}
 			const heldAt = clock.now();
 			let signOutResult: { localCleared: boolean; remoteRevocationConfirmed: boolean } | null =
 				null;
-			const signingOut = broker.signOut( id ).then(
+			signingOut = broker.signOut( id ).then(
 				( result ) => {
 					signOutResult = result;
 				},
@@ -1853,6 +1965,9 @@ const SESSION_STAGES: StageDefinition[] = [
 				async () => ( await broker.readAccount( id ) )?.state === 'signed-out',
 				Math.max( 0, HOLD_MAX_MS / 2 )
 			);
+			if ( ctx.signal.aborted ) {
+				throw new AcceptanceInterrupted();
+			}
 			// Not asserted: the offer may linger until the held refresh settles.
 			observations.offerAdvertisedDuringWindow = offeredRegistrations(
 				broker.sessionForkEnvironment()
@@ -1865,14 +1980,13 @@ const SESSION_STAGES: StageDefinition[] = [
 				ipc: true,
 				policy: { tools: [] },
 			} );
-			const early = await raceTimeout(
-				fork.result,
-				Math.max( 0, HOLD_MAX_MS - ( clock.now() - heldAt ) )
+			const early = await abortable(
+				raceTimeout( fork.result, Math.max( 0, HOLD_MAX_MS - ( clock.now() - heldAt ) ) )
 			);
 			observations.windowForkEndedBeforeRelease = early !== null;
 			hold.release();
-			await raceTimeout( renewal, SETTLE_WAIT_MS );
-			const forkResult = early ?? ( await raceTimeout( fork.result, STOP_BOUND_MS ) );
+			await abortable( raceTimeout( renewal, SETTLE_WAIT_MS ) );
+			const forkResult = early ?? ( await abortable( raceTimeout( fork.result, STOP_BOUND_MS ) ) );
 			if ( ! forkResult ) {
 				await fork.stop();
 			}
@@ -1881,7 +1995,7 @@ const SESSION_STAGES: StageDefinition[] = [
 			observations.windowForkRouteRequests = forkResult ? routeRequests( forkResult ).length : 0;
 			observations.heldRefreshRejectedSignedOut =
 				renewalError instanceof ChatGptConnectionError && renewalError.code === 'signed-out';
-			await raceTimeout( signingOut, SIGN_OUT_WAIT_MS );
+			await abortable( raceTimeout( signingOut, SIGN_OUT_WAIT_MS ) );
 			const signedOut = signOutResult as {
 				localCleared: boolean;
 				remoteRevocationConfirmed: boolean;
@@ -1893,10 +2007,13 @@ const SESSION_STAGES: StageDefinition[] = [
 				broker.sessionForkEnvironment()
 			).includes( id );
 			observations.rotatedRevokedBySignOut = tokens.revocations().rotatedRevoked;
-			const retired = await tokens.probe( 'retired' );
+			// The rotated token first: presenting the retired one can make the
+			// service revoke the whole grant as reused, which would say nothing
+			// about what the sign-out revoked.
 			const rotated = await tokens.probe( 'rotated' );
-			observations.retiredRefreshRejected = retired.tried && retired.rejected;
+			const retired = await tokens.probe( 'retired' );
 			observations.rotatedRefreshRejected = rotated.tried && rotated.rejected;
+			observations.retiredRefreshRejected = retired.tried && retired.rejected;
 			ctx.cleanup.delete( 'refresh' );
 			check( forkResult !== null, 'window-fork-not-stopped' );
 			check( observations.windowForkTokensHandedOut === 0, 'token-handed-out-during-window' );
@@ -1904,8 +2021,9 @@ const SESSION_STAGES: StageDefinition[] = [
 			check( observations.heldRefreshRejectedSignedOut, 'held-refresh-not-rejected' );
 			check( observations.localCleared, 'local-not-cleared' );
 			check( observations.offerGoneAfterSettle, 'offer-not-pruned' );
-			check( observations.retiredRefreshRejected, 'retired-refresh-accepted' );
 			check( observations.rotatedRefreshRejected, 'rotated-grant-usable' );
+			check( observations.rotatedRevokedBySignOut, 'rotated-not-revoked-by-sign-out' );
+			check( observations.retiredRefreshRejected, 'retired-refresh-accepted' );
 		},
 	},
 ];
@@ -2078,6 +2196,15 @@ function describeIsolationProblem( problem: AcceptanceIsolationProblem ): string
 	}
 }
 
+function describeRealProfileHazard( hazard: RealProfileHazard ): string {
+	switch ( hazard ) {
+		case 'legacy-process-manager-home':
+			return __(
+				'Your Studio profile still has the process manager folder of an older Studio version (.studio/pm2) and no .studio/daemon. Every Studio CLI process this runner starts would rename that folder in your real profile, outside the run directory, so nothing was run. Run any command of your installed Studio CLI once, for example “studio site list”, to finish that rename, then run this again.'
+			);
+	}
+}
+
 type SessionProblem =
 	| 'manifest-missing'
 	| 'manifest-unreadable'
@@ -2226,6 +2353,11 @@ export async function runChatGptAcceptance(
 		);
 		return EXIT_REFUSED;
 	}
+	const hazard = findRealProfileHazard( deps.home );
+	if ( hazard ) {
+		print( describeRealProfileHazard( hazard ) );
+		return EXIT_REFUSED;
+	}
 
 	const facts = await deps.collectFacts();
 	let state: AcceptanceState = { schemaVersion: 1 };
@@ -2263,6 +2395,7 @@ export async function runChatGptAcceptance(
 		paths.profileDir,
 		paths.daemonDir,
 		paths.sitesDir,
+		paths.appDataDir,
 		paths.observerDir,
 	] ) {
 		fs.mkdirSync( directory, { recursive: true } );
@@ -2387,8 +2520,11 @@ const PROVIDER_SECRET_VARIABLES = new Set( [
 	'STUDIO_WPCOM_API_KEY',
 ] );
 
-function childEnvironment(): NodeJS.ProcessEnv {
-	const env = { ...process.env };
+/** What every CLI process the runner starts gets: its own isolated environment, without provider keys. */
+export function acceptanceChildEnvironment(
+	base: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+	const env = { ...base };
 	for ( const name of Object.keys( env ) ) {
 		if ( PROVIDER_SECRET_VARIABLES.has( name.toUpperCase() ) ) {
 			delete env[ name ];
@@ -2410,7 +2546,8 @@ const sleep = ( ms: number, signal?: AbortSignal ) =>
 		);
 	} );
 
-function isToolResultPersisted( sessionFile: string, toolCallId: string ): boolean {
+/** Whether the session file already holds the result of a tool call. */
+export function isToolResultPersisted( sessionFile: string, toolCallId: string ): boolean {
 	let text: string;
 	try {
 		text = fs.readFileSync( sessionFile, 'utf8' );
@@ -2542,7 +2679,7 @@ function createLiveProcesses( {
 			);
 			const offer = getChatGptSessionForkEnvironment();
 			const env: NodeJS.ProcessEnv = {
-				...childEnvironment(),
+				...acceptanceChildEnvironment(),
 				[ ACCEPTANCE_OBSERVER_FILE_ENV ]: observerFile,
 			};
 			for ( const [ name, value ] of Object.entries( offer ) ) {
@@ -2685,7 +2822,7 @@ function createLiveProcesses( {
 		},
 		runCli( label, args ) {
 			const child = spawn( process.execPath, [ mainScript, ...args ], {
-				env: childEnvironment(),
+				env: acceptanceChildEnvironment(),
 				stdio: [ 'ignore', 'pipe', 'ignore' ],
 				windowsHide: true,
 			} );
@@ -2769,8 +2906,14 @@ async function createLiveServices( {
 	};
 }
 
-const LOOSE_VERSION = /^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$/;
-const STRICT_VERSION = /^[0-9]+(?:\.[0-9A-Za-z-]+){0,4}$/;
+/** This machine's platform as the manifest records it: a release it can't read is null. */
+export function acceptancePlatform( release: string = os.release() ): RunFacts[ 'platform' ] {
+	return {
+		os: process.platform,
+		release: isManifestVersion( release ) ? release : null,
+		arch: process.arch,
+	};
+}
 
 async function collectLiveFacts(): Promise< RunFacts > {
 	const cliDirectory = import.meta.dirname;
@@ -2788,24 +2931,19 @@ async function collectLiveFacts(): Promise< RunFacts > {
 	const status = sha ? run( 'git', [ 'status', '--porcelain' ] ) : null;
 	const npm = run( 'npm', [ '--version' ], true );
 	const mainScript = path.join( cliDirectory, 'main.mjs' );
-	const release = os.release();
 	return {
 		source: {
 			sha: sha && /^[0-9a-f]{40}$/.test( sha ) ? sha : null,
 			dirty: status === null ? null : status.length > 0,
 		},
-		platform: {
-			os: process.platform,
-			release: LOOSE_VERSION.test( release ) ? release : 'unknown',
-			arch: process.arch,
-		},
+		platform: acceptancePlatform(),
 		runtime: {
 			node: process.versions.node,
-			npm: npm && STRICT_VERSION.test( npm ) ? npm : null,
+			npm: npm && isManifestVersion( npm ) ? npm : null,
 		},
 		build: {
 			cliVersion:
-				typeof __STUDIO_CLI_VERSION__ === 'string' && STRICT_VERSION.test( __STUDIO_CLI_VERSION__ )
+				typeof __STUDIO_CLI_VERSION__ === 'string' && isManifestVersion( __STUDIO_CLI_VERSION__ )
 					? __STUDIO_CLI_VERSION__
 					: '0.0.0',
 			buildId: fs.existsSync( mainScript )
