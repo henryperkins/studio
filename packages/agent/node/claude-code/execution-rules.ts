@@ -1,6 +1,7 @@
 import { lstat, realpath } from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { types } from 'util';
 import { createPreviewTool } from '../tools/create-preview';
 import { createSiteTool } from '../tools/create-site';
 import { deletePreviewTool } from '../tools/delete-preview';
@@ -41,7 +42,11 @@ export interface ClaudeEnabledTools {
 	readonly studio: readonly string[];
 }
 
-/** What a Claude turn may run in this build. Widening it is a reviewed change. */
+/**
+ * What a Claude turn may run in this build. Widening it is a reviewed change,
+ * and listing a Studio tool here is not enough: it runs only once its rule is
+ * qualified.
+ */
 export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 	native: Object.freeze( [ 'Read' ] ),
 	studio: Object.freeze( [ runWpCliTool.name ] ),
@@ -79,14 +84,17 @@ export type ClaudeShellConfinement =
 /** This build configures no shell confinement, so no shell tool can be enabled. */
 export const CLAUDE_SHELL_CONFINEMENT: ClaudeShellConfinement = Object.freeze( { mode: 'none' } );
 
-/** The revision of the origin rule a navigation guard must apply. */
-export const CLAUDE_NAVIGATION_RULE_REVISION = 1;
+/**
+ * The revision of what a navigation guard must guarantee: the origin rule and
+ * the guarantees below. A guard built for an earlier revision does not verify.
+ */
+export const CLAUDE_NAVIGATION_RULE_REVISION = 2;
 
 /**
  * What a browser-layer guard guarantees for every page a Studio tool opens. A
  * host name check cannot bind a browser: a public name can resolve to this
- * machine, and a page can redirect or load from anywhere. So a tool that opens
- * a URL in a browser can be enabled only under a guard declaring all of these,
+ * machine, and a page can redirect or load from anywhere. So a tool that
+ * drives a browser can be enabled only under a guard declaring all of these,
  * for this rule revision and this turn's target.
  */
 export interface ClaudeNavigationGuard {
@@ -95,9 +103,11 @@ export interface ClaudeNavigationGuard {
 	/** The target site's own origin, or null for a global target. */
 	readonly targetOrigin: string | null;
 	/**
-	 * Every request the browser sends for the tool passes the guard before it
-	 * connects: navigations, frames, subresources, fetches, workers, WebSockets
-	 * and prefetches, not only the first URL.
+	 * Every HTTP, HTTPS and WebSocket request the browser sends for the tool
+	 * passes the guard before it connects: navigations, frames, subresources,
+	 * fetches, dedicated, shared and service workers, WebSockets and
+	 * prefetches, not only the first URL. Anything else a page can open is
+	 * `blocksUncheckedChannels`'s to stop.
 	 */
 	readonly checksEveryRequest: true;
 	/** Each redirect hop is checked as a new request before it is followed. */
@@ -105,7 +115,8 @@ export interface ClaudeNavigationGuard {
 	/**
 	 * The policy's origin rule, on host names normalized as `normalizeHostname`
 	 * does: http and https only, no credentials, and a local host name or a
-	 * local site's host name only at `targetOrigin`.
+	 * local site's host name only at `targetOrigin`. The one document
+	 * `confinesFileDocuments` admits is the only exception to the scheme.
 	 */
 	readonly appliesOriginRule: true;
 	/**
@@ -117,6 +128,24 @@ export interface ClaudeNavigationGuard {
 	/** The browser connects only to the address the guard checked; nothing resolves the name again. */
 	readonly pinsCheckedAddress: true;
 	/**
+	 * A `file:` URL loads only as the top-level document of a page the host
+	 * itself wrote for the call, which names that exact URL to the guard.
+	 * Everything that document then loads or opens (subresources, frames,
+	 * workers, fetches and navigations) passes the same origin rule as any
+	 * other request, so it reaches a local address only at `targetOrigin`, and
+	 * a `file:` subresource, frame, worker or navigation is refused. No other
+	 * page loads a `file:` URL at all.
+	 */
+	readonly confinesFileDocuments: true;
+	/**
+	 * Every way a page can reach the network other than the requests the guard
+	 * checks is disabled or refused: WebRTC (ICE, STUN and TURN), WebTransport
+	 * and QUIC, and any other channel the browser exposes. A request
+	 * interceptor or a proxy does not see these, so checking requests is not
+	 * enough.
+	 */
+	readonly blocksUncheckedChannels: true;
+	/**
 	 * A refused or unverifiable request fails, and the tool reports an error; a
 	 * guard that cannot start stops the tool. Nothing is retried without it.
 	 */
@@ -127,39 +156,121 @@ export type ClaudeNavigationConfinement =
 	| { readonly mode: 'none' }
 	| { readonly mode: 'guarded'; readonly guard: ClaudeNavigationGuard | undefined };
 
-/** This build has no navigation guard, so no tool that opens a URL in a browser can be enabled. */
+/** This build has no navigation guard, so no tool that drives a browser can be enabled. */
 export const CLAUDE_NAVIGATION_CONFINEMENT: ClaudeNavigationConfinement = Object.freeze( {
 	mode: 'none',
 } );
 
-const NAVIGATION_GUARANTEES = [
-	'checksEveryRequest',
-	'checksEveryRedirect',
-	'appliesOriginRule',
-	'checksResolvedAddresses',
-	'pinsCheckedAddress',
-	'failsClosed',
-] as const;
+const NAVIGATION_GUARANTEES = Object.keys( {
+	checksEveryRequest: true,
+	checksEveryRedirect: true,
+	appliesOriginRule: true,
+	checksResolvedAddresses: true,
+	pinsCheckedAddress: true,
+	confinesFileDocuments: true,
+	blocksUncheckedChannels: true,
+	failsClosed: true,
+} satisfies Record<
+	Exclude< keyof ClaudeNavigationGuard, 'ruleRevision' | 'targetOrigin' >,
+	true
+> );
 const NAVIGATION_GUARD_KEYS: ReadonlySet< string > = new Set( [
 	'ruleRevision',
 	'targetOrigin',
 	...NAVIGATION_GUARANTEES,
 ] );
+const NAVIGATION_CONFINEMENT_KEYS: ReadonlySet< string > = new Set( [ 'mode', 'guard' ] );
+
+function hasOwn( value: object, key: string ): boolean {
+	return Object.prototype.hasOwnProperty.call( value, key );
+}
 
 /**
- * Whether a declared navigation guard can be verified: it states every
- * guarantee and nothing else, applies this rule revision and is bound to this
- * turn's target origin.
+ * A declaration read as plain data: the own properties of an ordinary object,
+ * every one enumerable, named by a string and holding a value. An inherited
+ * value, an accessor, a hidden or symbol-named property, a proxy or an
+ * instance of a class is not what code that copies or serializes the object
+ * receives, so an object with any of them is no declaration. The result has
+ * no prototype, so reading it finds only what the object itself stated.
+ * Never throws.
+ */
+function plainData( value: unknown ): Record< string, unknown > | undefined {
+	try {
+		if ( typeof value !== 'object' || value === null || types.isProxy( value ) ) return;
+		const prototype: unknown = Object.getPrototypeOf( value );
+		if ( prototype !== Object.prototype && prototype !== null ) return;
+		const data: Record< string, unknown > = Object.create( null );
+		for ( const key of Reflect.ownKeys( value ) ) {
+			const property = Object.getOwnPropertyDescriptor( value, key );
+			if (
+				typeof key !== 'string' ||
+				! property ||
+				! hasOwn( property, 'value' ) ||
+				! property.enumerable
+			)
+				return;
+			data[ key ] = property.value;
+		}
+		return data;
+	} catch {
+		return;
+	}
+}
+
+/** A list read the same way: an ordinary array whose only properties are its items. */
+function plainList( value: unknown ): unknown[] | undefined {
+	try {
+		if (
+			! Array.isArray( value ) ||
+			types.isProxy( value ) ||
+			Object.getPrototypeOf( value ) !== Array.prototype
+		)
+			return;
+		const items: unknown[] = [];
+		// Every own key but `length` must be the next index.
+		const count = Reflect.ownKeys( value ).length - 1;
+		for ( let index = 0; index < count; index++ ) {
+			const property = Object.getOwnPropertyDescriptor( value, String( index ) );
+			if ( ! property || ! hasOwn( property, 'value' ) || ! property.enumerable ) return;
+			items.push( property.value );
+		}
+		return items.length === value.length ? items : undefined;
+	} catch {
+		return;
+	}
+}
+
+function plainStrings( value: unknown ): string[] | undefined {
+	const items = plainList( value );
+	return items?.every( ( item ) => typeof item === 'string' ) ? ( items as string[] ) : undefined;
+}
+
+function hasOnlyKeys( data: Record< string, unknown >, keys: ReadonlySet< string > ): boolean {
+	return Object.keys( data ).every( ( key ) => keys.has( key ) );
+}
+
+/**
+ * Whether a declared navigation guard can be verified: the declaration and its
+ * guard are plain data that state every guarantee and nothing else, apply
+ * this rule revision and are bound to this turn's target origin. Anything
+ * else is unverified; a malformed declaration never throws.
  */
 export function isVerifiedNavigationGuard(
 	confinement: ClaudeNavigationConfinement,
 	targetOrigin: string | null
 ): boolean {
-	if ( confinement.mode !== 'guarded' ) return false;
-	const guard: unknown = confinement.guard;
+	const declared = plainData( confinement );
+	if (
+		! declared ||
+		declared.mode !== 'guarded' ||
+		! hasOnlyKeys( declared, NAVIGATION_CONFINEMENT_KEYS ) ||
+		( targetOrigin !== null && typeof targetOrigin !== 'string' )
+	)
+		return false;
+	const guard = plainData( declared.guard );
 	return (
-		isRecord( guard ) &&
-		Object.keys( guard ).every( ( key ) => NAVIGATION_GUARD_KEYS.has( key ) ) &&
+		!! guard &&
+		hasOnlyKeys( guard, NAVIGATION_GUARD_KEYS ) &&
 		guard.ruleRevision === CLAUDE_NAVIGATION_RULE_REVISION &&
 		guard.targetOrigin === targetOrigin &&
 		NAVIGATION_GUARANTEES.every( ( key ) => guard[ key ] === true )
@@ -201,7 +312,71 @@ export function isRecord( value: unknown ): value is Record< string, unknown > {
 	return !! value && typeof value === 'object' && ! Array.isArray( value );
 }
 
+/**
+ * Every way a Studio tool's implementation can have an effect or learn
+ * something outside the conversation:
+ * - `readsLocalFiles`, `writesLocalFiles`: it reads, or creates, changes or
+ *   deletes, local files itself.
+ * - `drivesBrowser`: it opens or scripts a page in a browser.
+ * - `requestsNetwork`: it or a helper composes and sends a network request,
+ *   outside a browser.
+ * - `spawnsProcess`: it starts a process itself, other than through a host
+ *   operation.
+ * - `runsWpCli`: it runs a WP-CLI command on a site.
+ * - `callsHostOperation`: it calls an operation of the Studio host.
+ * - `reachesWpcom`: it reads or changes something on WordPress.com.
+ */
+export const CLAUDE_TOOL_CHANNELS = Object.freeze( [
+	'readsLocalFiles',
+	'writesLocalFiles',
+	'drivesBrowser',
+	'requestsNetwork',
+	'spawnsProcess',
+	'runsWpCli',
+	'callsHostOperation',
+	'reachesWpcom',
+] as const );
+
+export type ClaudeToolChannel = ( typeof CLAUDE_TOOL_CHANNELS )[ number ];
+
+/**
+ * What bounds a channel a tool uses, immediately before it runs:
+ * - `site`, `paths`, `urls`, `navigates`: that element of the tool's rule.
+ * - `scope`: the rule's `remote` element.
+ * - `class`: the rule's operation class, which asks the user to approve every
+ *   exact call.
+ * - `host`: the effect is a host operation, which runs only through
+ *   `guardHost`.
+ */
+export type ClaudeChannelBinding =
+	| 'site'
+	| 'paths'
+	| 'urls'
+	| 'navigates'
+	| 'scope'
+	| 'class'
+	| 'host';
+
+/** For every channel, `false` when the implementation does not use it, or what bounds it. */
+export type ClaudeToolChannelDeclaration = {
+	readonly [ Channel in ClaudeToolChannel ]: false | readonly ClaudeChannelBinding[];
+};
+
+/**
+ * Whether a tool has been qualified to run. Having a rule does not qualify it:
+ * a rule written before anyone traced the tool's implementation can miss a
+ * route through it. So a tool is unqualified until a reviewed change records,
+ * for every channel, that its implementation does not use it or what bounds
+ * it. `unbound` names channels an unqualified tool is known to use that
+ * nothing in its rule bounds yet.
+ */
+export type ClaudeToolQualification =
+	| { readonly qualified: false; readonly unbound?: readonly ClaudeToolChannel[] }
+	| { readonly qualified: true; readonly channels: ClaudeToolChannelDeclaration };
+
 export interface ClaudeStudioToolRule {
+	/** Whether the tool may be enabled at all. No host declaration replaces it. */
+	readonly qualification: ClaudeToolQualification;
 	/** The class, or for a tool classified by its arguments the widest class it can reach. */
 	readonly operationClass: ClaudeOperationClass;
 	/** Narrows the class from a call's arguments; undefined denies the call. */
@@ -229,7 +404,11 @@ export interface ClaudeStudioToolRule {
 	readonly urls?: ( args: unknown, siteUrl: string | undefined ) => string[] | undefined;
 	/** Every URL the call opens must be the named site's own origin. */
 	readonly urlsOnSite?: true;
-	/** Opens its URLs in a browser; it can be enabled only under a verified navigation guard. */
+	/**
+	 * Drives a browser, whether it opens a URL from its arguments, a page of the
+	 * named site or a document it wrote itself; it can be enabled only under a
+	 * verified navigation guard.
+	 */
 	readonly navigates?: true;
 	/**
 	 * Where a call that needs approval is approved: at the host operation that
@@ -243,18 +422,71 @@ function namedSite( args: unknown ): string | undefined {
 	return isRecord( args ) && typeof args.nameOrPath === 'string' ? args.nameOrPath : undefined;
 }
 
+type StudioRuleElements = Omit< ClaudeStudioToolRule, 'qualification' >;
+
 function studioRule(
 	operationClass: ClaudeOperationClass,
-	options: Partial< Omit< ClaudeStudioToolRule, 'operationClass' > > = {}
-): ClaudeStudioToolRule {
+	options: Partial< Omit< StudioRuleElements, 'operationClass' > > = {}
+): StudioRuleElements {
 	return { operationClass, approval: 'tool', ...options };
 }
 
 function onSite(
 	operationClass: ClaudeOperationClass,
-	options: Partial< Omit< ClaudeStudioToolRule, 'operationClass' > > = {}
-): ClaudeStudioToolRule {
+	options: Partial< Omit< StudioRuleElements, 'operationClass' > > = {}
+): StudioRuleElements {
 	return studioRule( operationClass, { site: namedSite, ...options } );
+}
+
+function unqualified(
+	rule: StudioRuleElements,
+	unbound?: readonly ClaudeToolChannel[]
+): ClaudeStudioToolRule {
+	return { ...rule, qualification: unbound ? { qualified: false, unbound } : { qualified: false } };
+}
+
+function qualified(
+	rule: StudioRuleElements,
+	channels: ClaudeToolChannelDeclaration
+): ClaudeStudioToolRule {
+	return { ...rule, qualification: { qualified: true, channels } };
+}
+
+function frozen< Value >( value: Value ): Value {
+	if ( value && typeof value === 'object' && ! Object.isFrozen( value ) ) {
+		Object.freeze( value );
+		for ( const item of Object.values( value ) ) frozen( item );
+	}
+	return value;
+}
+
+// A `Map` accepts `set` and `delete` whatever type it is declared with, so the
+// rule tables are exposed only as this frozen view, over frozen rules: nothing
+// can add, replace or loosen a rule at run time. A rule has no prototype
+// either, so it has no element but those it states.
+function ruleTable< Rule extends object >(
+	entries: ReadonlyArray< readonly [ string, Rule ] >
+): ReadonlyMap< string, Rule > {
+	const rules = new Map(
+		entries.map( ( [ name, rule ] ) => [
+			name,
+			frozen< Rule >( Object.assign( Object.create( null ), rule ) ),
+		] )
+	);
+	const table: ReadonlyMap< string, Rule > = {
+		get size() {
+			return rules.size;
+		},
+		get: ( name ) => rules.get( name ),
+		has: ( name ) => rules.has( name ),
+		forEach: ( callback, thisArg ) =>
+			rules.forEach( ( rule, name ) => callback.call( thisArg, rule, name, table ) ),
+		entries: () => rules.entries(),
+		keys: () => rules.keys(),
+		values: () => rules.values(),
+		[ Symbol.iterator ]: () => rules[ Symbol.iterator ](),
+	};
+	return Object.freeze( table );
 }
 
 function pageUrls( args: unknown ): string[] | undefined {
@@ -425,91 +657,136 @@ function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefined {
 // Tool annotations describe these tools to hosts; they are hints. The classes
 // here decide, and the tests require each to be at least as strict as the
 // tool's annotations.
-export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule > = new Map( [
-	[ createSiteTool.name, studioRule( 'local-change', { approval: 'host' } ) ],
-	[ listSitesTool.name, studioRule( 'remote-read' ) ],
-	[ getSiteInfoTool.name, onSite( 'read' ) ],
-	[ startSiteTool.name, onSite( 'local-change', { approval: 'host' } ) ],
-	[ stopSiteTool.name, onSite( 'local-change', { approval: 'host' } ) ],
-	[ deleteSiteTool.name, onSite( 'local-overwrite', { approval: 'host' } ) ],
-	[ createPreviewTool.name, onSite( 'remote-change', { approval: 'host' } ) ],
-	[ listPreviewsTool.name, onSite( 'read' ) ],
-	[ updatePreviewTool.name, onSite( 'remote-overwrite', { approval: 'host' } ) ],
-	[ deletePreviewTool.name, studioRule( 'remote-overwrite', { approval: 'host' } ) ],
-	[ runWpCliTool.name, onSite( 'command', { approval: 'host' } ) ],
-	[ scaffoldThemeTool.name, onSite( 'local-change' ) ],
-	[ pickDesignTool.name, studioRule( 'read' ) ],
+//
+// Only a qualified tool can be enabled. The rules of the unqualified tools are
+// where each one's qualification starts, not a claim that they are complete.
+export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule > = ruleTable( [
+	[ createSiteTool.name, unqualified( studioRule( 'local-change', { approval: 'host' } ) ) ],
+	[ listSitesTool.name, unqualified( studioRule( 'remote-read' ) ) ],
+	[ getSiteInfoTool.name, unqualified( onSite( 'read' ) ) ],
+	[ startSiteTool.name, unqualified( onSite( 'local-change', { approval: 'host' } ) ) ],
+	[ stopSiteTool.name, unqualified( onSite( 'local-change', { approval: 'host' } ) ) ],
+	[ deleteSiteTool.name, unqualified( onSite( 'local-overwrite', { approval: 'host' } ) ) ],
+	[ createPreviewTool.name, unqualified( onSite( 'remote-change', { approval: 'host' } ) ) ],
+	[ listPreviewsTool.name, unqualified( onSite( 'read' ) ) ],
+	[ updatePreviewTool.name, unqualified( onSite( 'remote-overwrite', { approval: 'host' } ) ) ],
+	[ deletePreviewTool.name, unqualified( studioRule( 'remote-overwrite', { approval: 'host' } ) ) ],
+	[
+		runWpCliTool.name,
+		// The tool only resolves the site it names and hands the command to the
+		// host, which classifies the command, binds it to the target and asks.
+		qualified( onSite( 'command', { approval: 'host' } ), {
+			readsLocalFiles: false,
+			writesLocalFiles: false,
+			drivesBrowser: false,
+			requestsNetwork: false,
+			spawnsProcess: false,
+			runsWpCli: [ 'site', 'host' ],
+			callsHostOperation: [ 'host' ],
+			reachesWpcom: false,
+		} ),
+	],
+	[ scaffoldThemeTool.name, unqualified( onSite( 'local-change' ) ) ],
+	[ pickDesignTool.name, unqualified( studioRule( 'read' ) ) ],
 	[
 		validateBlocksTool.name,
-		onSite( 'local-overwrite', {
-			paths: ( args, siteFolder ) => {
-				const file = isRecord( args ) ? args.filePath : undefined;
-				if ( file === undefined ) return [];
-				if ( typeof file !== 'string' || ! siteFolder ) return;
-				return [ path.resolve( siteFolder, file ) ];
-			},
-		} ),
+		// It checks the markup in the named site's block editor, which it opens
+		// signed in, in the shared browser.
+		unqualified(
+			onSite( 'local-overwrite', {
+				navigates: true,
+				paths: ( args, siteFolder ) => {
+					const file = isRecord( args ) ? args.filePath : undefined;
+					if ( file === undefined ) return [];
+					if ( typeof file !== 'string' || ! siteFolder ) return;
+					return [ path.resolve( siteFolder, file ) ];
+				},
+			} )
+		),
 	],
 	[
 		takeScreenshotTool.name,
-		studioRule( 'local-change', {
-			urls: pageUrls,
-			navigates: true,
-			paths: ( args ) => {
-				const directory = isRecord( args ) ? args.themeScreenshot : undefined;
-				if ( directory === undefined ) return [];
-				if ( typeof directory !== 'string' || ! path.isAbsolute( directory ) ) return;
-				return [ path.resolve( directory ) ];
-			},
-		} ),
+		unqualified(
+			studioRule( 'local-change', {
+				urls: pageUrls,
+				navigates: true,
+				paths: ( args ) => {
+					const directory = isRecord( args ) ? args.themeScreenshot : undefined;
+					if ( directory === undefined ) return [];
+					if ( typeof directory !== 'string' || ! path.isAbsolute( directory ) ) return;
+					return [ path.resolve( directory ) ];
+				},
+			} )
+		),
 	],
-	[ inspectDesignTool.name, studioRule( 'read', { urls: pageUrls, navigates: true } ) ],
+	[
+		inspectDesignTool.name,
+		unqualified( studioRule( 'read', { urls: pageUrls, navigates: true } ) ),
+	],
 	[
 		generateImagesTool.name,
-		studioRule( 'remote-change', {
-			paths: ( args ) => {
-				const images = isRecord( args ) ? args.images : undefined;
-				if ( ! Array.isArray( images ) ) return;
-				const files = images.map( ( image ) => ( isRecord( image ) ? image.path : undefined ) );
-				if ( ! files.every( ( file ) => typeof file === 'string' && path.isAbsolute( file ) ) )
-					return;
-				return ( files as string[] ).map( ( file ) => path.resolve( file ) );
-			},
-		} ),
+		unqualified(
+			studioRule( 'remote-change', {
+				paths: ( args ) => {
+					const images = isRecord( args ) ? args.images : undefined;
+					if ( ! Array.isArray( images ) ) return;
+					const files = images.map( ( image ) => ( isRecord( image ) ? image.path : undefined ) );
+					if ( ! files.every( ( file ) => typeof file === 'string' && path.isAbsolute( file ) ) )
+						return;
+					return ( files as string[] ).map( ( file ) => path.resolve( file ) );
+				},
+			} )
+		),
 	],
-	[ installTaxonomyScriptsTool.name, onSite( 'local-change' ) ],
+	[ installTaxonomyScriptsTool.name, unqualified( onSite( 'local-change' ) ) ],
 	[
 		auditPerformanceTool.name,
-		onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ),
+		unqualified( onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ) ),
 	],
-	[ auditSeoTool.name, onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ) ],
-	[ listConnectedRemoteSitesTool.name, onSite( 'remote-read' ) ],
+	[
+		auditSeoTool.name,
+		unqualified( onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ) ),
+	],
+	[ listConnectedRemoteSitesTool.name, unqualified( onSite( 'remote-read' ) ) ],
 	[
 		wpcomRequestTool.name,
-		studioRule( 'remote-overwrite', {
-			classify: ( args ) => {
-				const method = isRecord( args ) ? args.method : undefined;
-				if ( method === 'GET' ) return 'remote-read';
-				if ( method === 'POST' || method === 'PUT' || method === 'DELETE' )
-					return 'remote-overwrite';
-			},
-			remote: wpcomScope,
-		} ),
+		unqualified(
+			studioRule( 'remote-overwrite', {
+				classify: ( args ) => {
+					const method = isRecord( args ) ? args.method : undefined;
+					if ( method === 'GET' ) return 'remote-read';
+					if ( method === 'POST' || method === 'PUT' || method === 'DELETE' )
+						return 'remote-overwrite';
+				},
+				remote: wpcomScope,
+			} )
+		),
 	],
-	[ pushSiteTool.name, onSite( 'remote-overwrite', { approval: 'host' } ) ],
-	[ pullSiteTool.name, onSite( 'remote-overwrite', { approval: 'host' } ) ],
-	[ importSiteTool.name, onSite( 'local-overwrite', { approval: 'host' } ) ],
-	[ exportSiteTool.name, onSite( 'local-overwrite', { approval: 'host' } ) ],
+	[ pushSiteTool.name, unqualified( onSite( 'remote-overwrite', { approval: 'host' } ) ) ],
+	[ pullSiteTool.name, unqualified( onSite( 'remote-overwrite', { approval: 'host' } ) ) ],
+	[ importSiteTool.name, unqualified( onSite( 'local-overwrite', { approval: 'host' } ) ) ],
+	[ exportSiteTool.name, unqualified( onSite( 'local-overwrite', { approval: 'host' } ) ) ],
 	[
 		openAnnotationBrowserTool.name,
-		studioRule( 'local-change', { urls: pageUrls, navigates: true } ),
+		unqualified( studioRule( 'local-change', { urls: pageUrls, navigates: true } ) ),
 	],
-	[ refreshBrowserTool.name, studioRule( 'read' ) ],
-	[ sendFeedbackTool.name, studioRule( 'external-message' ) ],
+	[ refreshBrowserTool.name, unqualified( studioRule( 'read' ) ) ],
+	[ sendFeedbackTool.name, unqualified( studioRule( 'external-message' ) ) ],
 	// Tools built by factories for the host's capabilities.
-	[ 'AskUserQuestion', studioRule( 'read' ) ],
-	[ 'Skill', studioRule( 'read' ) ],
-	[ 'present_design_options', studioRule( 'local-change' ) ],
+	[ 'AskUserQuestion', unqualified( studioRule( 'read' ) ) ],
+	[ 'Skill', unqualified( studioRule( 'read' ) ) ],
+	[
+		'present_design_options',
+		// It renders HTML the model supplies: it writes that HTML to a file in the
+		// host's screenshot folder, loads the file in the shared browser, and
+		// first reads every image the HTML names by absolute path or `file:` URL.
+		// No argument names those files, so nothing in the rule bounds either
+		// file channel yet.
+		unqualified( studioRule( 'local-change', { navigates: true } ), [
+			'readsLocalFiles',
+			'writesLocalFiles',
+		] ),
+	],
 ] );
 
 export interface ClaudeNativeToolRule {
@@ -606,19 +883,17 @@ export function isContainedPattern( pattern: unknown ): boolean {
 const filePath = { field: 'file_path', required: true, allowRoot: false } as const;
 const searchPath = { field: 'path', required: false, allowRoot: true } as const;
 
-export const CLAUDE_NATIVE_TOOL_RULES: ReadonlyMap< string, ClaudeNativeToolRule > = new Map<
-	string,
-	ClaudeNativeToolRule
->( [
-	[ 'Read', { operationClass: 'read', path: filePath } ],
-	[ 'Grep', { operationClass: 'read', path: searchPath, patterns: [ 'glob' ] } ],
-	[ 'Glob', { operationClass: 'read', path: searchPath, patterns: [ 'pattern' ] } ],
-	[ 'LS', { operationClass: 'read', path: { ...searchPath, required: true } } ],
-	[ 'Write', { operationClass: 'local-change', path: filePath } ],
-	[ 'Edit', { operationClass: 'local-change', path: filePath } ],
-	[ 'MultiEdit', { operationClass: 'local-change', path: filePath } ],
-	[ 'Bash', { operationClass: 'command', accepts: isBoundedShellInput, shell: true } ],
-] );
+export const CLAUDE_NATIVE_TOOL_RULES: ReadonlyMap< string, ClaudeNativeToolRule > =
+	ruleTable< ClaudeNativeToolRule >( [
+		[ 'Read', { operationClass: 'read', path: filePath } ],
+		[ 'Grep', { operationClass: 'read', path: searchPath, patterns: [ 'glob' ] } ],
+		[ 'Glob', { operationClass: 'read', path: searchPath, patterns: [ 'pattern' ] } ],
+		[ 'LS', { operationClass: 'read', path: { ...searchPath, required: true } } ],
+		[ 'Write', { operationClass: 'local-change', path: filePath } ],
+		[ 'Edit', { operationClass: 'local-change', path: filePath } ],
+		[ 'MultiEdit', { operationClass: 'local-change', path: filePath } ],
+		[ 'Bash', { operationClass: 'command', accepts: isBoundedShellInput, shell: true } ],
+	] );
 
 function isInside( root: string, candidate: string ): boolean {
 	const relative = path.relative( root, candidate );
@@ -648,38 +923,39 @@ const SANDBOX_FILESYSTEM_KEYS: ReadonlySet< string > = new Set( [
 	'denyRead',
 ] );
 
-const isStringList = ( value: unknown ): value is string[] =>
-	Array.isArray( value ) && value.every( ( item ) => typeof item === 'string' );
+const SHELL_CONFINEMENT_KEYS: ReadonlySet< string > = new Set( [ 'mode', 'sandbox' ] );
 
 /**
  * Whether a declared confinement can be verified. A sandbox counts only when
  * it uses no setting outside a short list, is enabled, refuses to run without
  * its dependencies, never lets a command out, leaves every command to the
- * user's approval and writes only in the workspace.
+ * user's approval and writes only in the workspace. The declaration is read
+ * as plain data at every level, so what is verified is what the SDK receives;
+ * a malformed one is unverified and never throws.
  */
 export function isVerifiedShellConfinement(
 	confinement: ClaudeShellConfinement,
 	workspace: string
 ): boolean {
-	if ( confinement.mode === 'approval-only' ) return true;
-	if ( confinement.mode !== 'sandbox' ) return false;
-	const sandbox: unknown = confinement.sandbox;
-	if (
-		! isRecord( sandbox ) ||
-		Object.keys( sandbox ).some( ( key ) => ! SANDBOX_KEYS.has( key ) )
-	)
+	const declared = plainData( confinement );
+	if ( ! declared || typeof workspace !== 'string' ) return false;
+	if ( declared.mode === 'approval-only' ) return Object.keys( declared ).length === 1;
+	if ( declared.mode !== 'sandbox' || ! hasOnlyKeys( declared, SHELL_CONFINEMENT_KEYS ) )
 		return false;
-	const filesystem = sandbox.filesystem ?? {};
+	const sandbox = plainData( declared.sandbox );
+	if ( ! sandbox || ! hasOnlyKeys( sandbox, SANDBOX_KEYS ) ) return false;
+	const filesystem = sandbox.filesystem === undefined ? {} : plainData( sandbox.filesystem );
+	if ( ! filesystem || ! hasOnlyKeys( filesystem, SANDBOX_FILESYSTEM_KEYS ) ) return false;
+	const lists = new Map(
+		Object.entries( filesystem ).map( ( [ key, value ] ) => [ key, plainStrings( value ) ] )
+	);
 	return (
 		sandbox.enabled === true &&
 		( sandbox.failIfUnavailable === undefined || sandbox.failIfUnavailable === true ) &&
 		sandbox.allowUnsandboxedCommands === false &&
 		sandbox.autoAllowBashIfSandboxed === false &&
-		isRecord( filesystem ) &&
-		Object.entries( filesystem ).every(
-			( [ key, value ] ) => SANDBOX_FILESYSTEM_KEYS.has( key ) && isStringList( value )
-		) &&
-		( ( filesystem.allowWrite as string[] | undefined ) ?? [] ).every(
+		[ ...lists.values() ].every( ( list ) => !! list ) &&
+		( lists.get( 'allowWrite' ) ?? [] ).every(
 			( root ) => path.isAbsolute( root ) && isInside( workspace, path.resolve( root ) )
 		)
 	);
@@ -691,22 +967,184 @@ export function claudeNativeTools(
 	confinement: ClaudeShellConfinement,
 	workspace: string
 ): string[] {
-	return enabled.native.filter( ( name ) => {
+	let confined: boolean | undefined;
+	return ( plainStrings( plainData( enabled )?.native ) ?? [] ).filter( ( name ) => {
 		const rule = CLAUDE_NATIVE_TOOL_RULES.get( name );
-		return !! rule && ( ! rule.shell || isVerifiedShellConfinement( confinement, workspace ) );
+		return (
+			!! rule &&
+			( ! rule.shell || ( confined ??= isVerifiedShellConfinement( confinement, workspace ) ) )
+		);
 	} );
 }
 
-/** The Studio tools a turn may run: enabled, known, and guarded when they open a browser. */
+// The bindings that can bound each channel. `needs` must be among those a
+// declaration names: a browser is bounded only under the navigation guard, and
+// WP-CLI and host operations only through the host guard. A file is bounded by
+// checked paths, not by naming a site, and a request Studio sends by a scope
+// or an approval, not by a URL check, which cannot see where a name resolves.
+const CHANNEL_BOUNDS: Readonly<
+	Record<
+		ClaudeToolChannel,
+		{ readonly admits: readonly ClaudeChannelBinding[]; readonly needs?: ClaudeChannelBinding }
+	>
+> = {
+	readsLocalFiles: { admits: [ 'paths', 'class' ] },
+	writesLocalFiles: { admits: [ 'paths', 'class' ] },
+	drivesBrowser: { admits: [ 'navigates', 'urls', 'site' ], needs: 'navigates' },
+	requestsNetwork: { admits: [ 'scope', 'class' ] },
+	spawnsProcess: { admits: [ 'class' ] },
+	runsWpCli: { admits: [ 'host', 'site' ], needs: 'host' },
+	callsHostOperation: { admits: [ 'host', 'site' ], needs: 'host' },
+	reachesWpcom: { admits: [ 'scope', 'class', 'host' ] },
+};
+
+const QUALIFIED_KEYS: ReadonlySet< string > = new Set( [ 'qualified', 'channels' ] );
+
+// The elements a qualified rule may have, and whether each is a function or a mark.
+const RULE_ELEMENTS: Readonly<
+	Record< keyof ClaudeStudioToolRule, 'function' | 'mark' | 'other' >
+> = {
+	qualification: 'other',
+	operationClass: 'other',
+	approval: 'other',
+	classify: 'function',
+	site: 'function',
+	paths: 'function',
+	remote: 'function',
+	urls: 'function',
+	urlsOnSite: 'mark',
+	navigates: 'mark',
+};
+
+function isRuleElement( [ key, value ]: [ string, unknown ] ): boolean {
+	if ( ! hasOwn( RULE_ELEMENTS, key ) ) return false;
+	const kind = RULE_ELEMENTS[ key as keyof ClaudeStudioToolRule ];
+	return (
+		kind === 'other' ||
+		value === undefined ||
+		( kind === 'mark' ? value === true : typeof value === 'function' )
+	);
+}
+
+function isOperationClass( value: unknown ): value is ClaudeOperationClass {
+	return typeof value === 'string' && hasOwn( CLASS_DESCRIPTIONS, value );
+}
+
+// Whether a rule has what a binding names. `class` bounds a channel only when
+// every call is approved: the class asks, and no argument narrows it.
+function ruleHas( rule: Record< string, unknown >, binding: unknown ): boolean {
+	switch ( binding ) {
+		case 'site':
+			return typeof rule.site === 'function';
+		case 'paths':
+			return typeof rule.paths === 'function';
+		case 'urls':
+			return typeof rule.urls === 'function';
+		case 'navigates':
+			return rule.navigates === true;
+		case 'scope':
+			return typeof rule.remote === 'function';
+		case 'class':
+			return (
+				isOperationClass( rule.operationClass ) &&
+				requiresClaudeApproval( rule.operationClass ) &&
+				rule.classify === undefined
+			);
+		case 'host':
+			return true;
+		default:
+			return false;
+	}
+}
+
+// The elements of a rule that is qualified, or undefined. Read as plain data,
+// so a qualification cannot be inherited, computed or planted on a prototype.
+function qualifiedElements( rule: unknown ): Record< string, unknown > | undefined {
+	const elements = plainData( rule );
+	const qualification = plainData( elements?.qualification );
+	if (
+		! elements ||
+		! qualification ||
+		qualification.qualified !== true ||
+		! hasOnlyKeys( qualification, QUALIFIED_KEYS ) ||
+		! Object.entries( elements ).every( isRuleElement ) ||
+		! isOperationClass( elements.operationClass ) ||
+		( elements.approval !== 'host' && elements.approval !== 'tool' )
+	)
+		return;
+	const channels = plainData( qualification.channels );
+	if ( ! channels || Object.keys( channels ).length !== CLAUDE_TOOL_CHANNELS.length ) return;
+	const used = new Set< ClaudeToolChannel >();
+	for ( const channel of CLAUDE_TOOL_CHANNELS ) {
+		if ( ! hasOwn( channels, channel ) ) return;
+		if ( channels[ channel ] === false ) continue;
+		const bindings = plainList( channels[ channel ] );
+		const { admits, needs } = CHANNEL_BOUNDS[ channel ];
+		if (
+			! bindings?.length ||
+			! bindings.every(
+				( binding ) =>
+					admits.includes( binding as ClaudeChannelBinding ) && ruleHas( elements, binding )
+			) ||
+			( needs && ! bindings.includes( needs ) )
+		)
+			return;
+		used.add( channel );
+	}
+	// The declaration has to cover what the rule itself shows the tool does.
+	const covers =
+		( elements.navigates === true ) === used.has( 'drivesBrowser' ) &&
+		( elements.remote === undefined || used.has( 'reachesWpcom' ) ) &&
+		( elements.paths === undefined ||
+			used.has( 'readsLocalFiles' ) ||
+			used.has( 'writesLocalFiles' ) ) &&
+		( elements.urls === undefined ||
+			used.has( 'drivesBrowser' ) ||
+			used.has( 'requestsNetwork' ) ) &&
+		( elements.approval !== 'host' || used.has( 'callsHostOperation' ) ) &&
+		( ! used.has( 'runsWpCli' ) || used.has( 'callsHostOperation' ) );
+	return covers ? elements : undefined;
+}
+
+/**
+ * Whether a rule is qualified: marked so, with a declaration that covers every
+ * channel, binds each one it uses by something the rule has and that can bound
+ * that channel, and accounts for what the rule's own elements show.
+ */
+export function isQualifiedStudioRule( rule: unknown ): boolean {
+	return !! qualifiedElements( rule );
+}
+
+/**
+ * The tools of a rule table a turn may run: named by the host, qualified, and
+ * under a verified navigation guard when they drive a browser. Nothing the
+ * host, a confinement or a guard declares enables a tool that is not
+ * qualified, and a malformed list or declaration enables nothing.
+ */
+export function selectClaudeStudioTools(
+	rules: ReadonlyMap< string, ClaudeStudioToolRule >,
+	enabled: ClaudeEnabledTools,
+	navigation: ClaudeNavigationConfinement,
+	targetOrigin: string | null
+): string[] {
+	let guarded: boolean | undefined;
+	return ( plainStrings( plainData( enabled )?.studio ) ?? [] ).filter( ( name ) => {
+		const elements = qualifiedElements( rules.get( name ) );
+		return (
+			!! elements &&
+			( elements.navigates !== true ||
+				( guarded ??= isVerifiedNavigationGuard( navigation, targetOrigin ) ) )
+		);
+	} );
+}
+
+/** The Studio tools a turn may run in this build. */
 export function claudeStudioTools(
 	enabled: ClaudeEnabledTools,
 	navigation: ClaudeNavigationConfinement,
 	targetOrigin: string | null
 ): string[] {
-	return enabled.studio.filter( ( name ) => {
-		const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
-		return !! rule && ( ! rule.navigates || isVerifiedNavigationGuard( navigation, targetOrigin ) );
-	} );
+	return selectClaudeStudioTools( CLAUDE_STUDIO_TOOL_RULES, enabled, navigation, targetOrigin );
 }
 
 /** Every tool name the native runtime may report for a turn. */

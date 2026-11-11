@@ -24,11 +24,23 @@ import {
 	claudeStudioTools,
 	claudeToolInventory,
 	isLocalHostname,
+	isVerifiedNavigationGuard,
+	isVerifiedShellConfinement,
 	normalizeHostname,
 	requiresClaudeApproval,
 } from '../execution-rules';
 import { createNativeSessionStore } from '../sessions';
-import { createPolicyFixture } from './fixtures/execution-policy';
+import {
+	Declared,
+	completeGuard,
+	createPolicyFixture,
+	guarded,
+	inherit,
+	targetOrigin,
+	unverifiableNavigation,
+	withAccessor,
+	withHidden,
+} from './fixtures/execution-policy';
 import type { ClaudeOperation } from '../execution-policy';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { ClaudeOperationClass } from '@studio/agent/protocol/claude-code';
@@ -46,24 +58,6 @@ async function setup( ...args: Parameters< typeof createPolicyFixture > ) {
 const draftArgs = [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ];
 const skipFlags = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
 const studioServer = { name: 'studio', source: 'sdk' };
-
-const targetOrigin = new URL( fakeSite.url ).origin;
-// Everything a browser-layer guard must guarantee before a tool may open a URL.
-const guarantees = [
-	'checksEveryRequest',
-	'checksEveryRedirect',
-	'appliesOriginRule',
-	'checksResolvedAddresses',
-	'pinsCheckedAddress',
-	'failsClosed',
-] as const;
-const completeGuard = ( origin: string | null ) => ( {
-	ruleRevision: CLAUDE_NAVIGATION_RULE_REVISION,
-	targetOrigin: origin,
-	...Object.fromEntries( guarantees.map( ( key ) => [ key, true ] ) ),
-} );
-const guarded = ( origin: string | null ) =>
-	( { mode: 'guarded', guard: completeGuard( origin ) } ) as never;
 
 describe( 'Claude operation classes', () => {
 	it( 'classifies every registered Studio tool at least as strictly as its annotations', () => {
@@ -593,17 +587,6 @@ describe( 'Claude targets', () => {
 } );
 
 describe( 'Claude Studio tools that act outside the host', () => {
-	const enabledTools = {
-		native: [],
-		studio: [
-			'scaffold_theme',
-			'validate_blocks',
-			'generate_images',
-			'site_info',
-			'take_screenshot',
-		],
-	};
-
 	it( 'names what each tool with a site or path argument reaches', () => {
 		for ( const definition of studioToolDefinitions ) {
 			const { properties } = definition.parameters as { properties: Record< string, unknown > };
@@ -617,73 +600,17 @@ describe( 'Claude Studio tools that act outside the host', () => {
 			expect( CLAUDE_STUDIO_TOOL_RULES.get( name )?.paths, name ).toBeDefined();
 	} );
 
-	it( 'binds them to the target site and names that site and path in the approval', async () => {
-		const { policy, host, context, site, other } = await setup( () => ( {
-			enabledTools,
-			navigationConfinement: guarded( targetOrigin ),
-		} ) );
-		const call = ( name: string, args: Record< string, unknown > ) =>
-			policy.authorizeStudioCall( { host, name, args, toolCallId: randomUUID() } );
-		expect( await call( 'scaffold_theme', { nameOrPath: 'site', name: 'Theme' } ) ).toBe( true );
-		expect( await call( 'scaffold_theme', { nameOrPath: 'other', name: 'Theme' } ) ).toBe( false );
-		expect( await call( 'scaffold_theme', { name: 'Theme' } ) ).toBe( false );
-		expect( await call( 'site_info', { nameOrPath: other } ) ).toBe( false );
-		expect( context.approve ).not.toHaveBeenCalled();
-		expect(
-			await call( 'validate_blocks', { nameOrPath: 'site', filePath: 'templates/index.html' } )
-		).toBe( true );
-		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation ).toMatchObject( {
-			tool: 'validate_blocks',
-			siteId: fakeSite.id,
-			localPaths: [ path.join( site, 'templates', 'index.html' ) ],
-		} );
-		expect(
-			await call( 'validate_blocks', { nameOrPath: 'site', filePath: '../other/index.html' } )
-		).toBe( false );
-		const image = ( file: string ) => ( { images: [ { path: file, subject: 'Hero' } ] } );
-		expect( await call( 'generate_images', image( path.join( site, 'hero.png' ) ) ) ).toBe( true );
-		expect( await call( 'generate_images', image( path.join( other, 'hero.png' ) ) ) ).toBe(
-			false
-		);
-		expect( await call( 'generate_images', image( 'hero.png' ) ) ).toBe( false );
-		expect(
-			await call( 'take_screenshot', {
-				url: 'http://localhost:8888',
-				themeScreenshot: path.join( other, 'wp-content', 'themes', 'theme' ),
-			} )
-		).toBe( false );
-		expect( await call( 'take_screenshot', { url: 'http://localhost:8888' } ) ).toBe( true );
-		expect( context.approve ).toHaveBeenCalledTimes( 2 );
-	} );
-
-	it( 'binds them to no site in a global conversation', async () => {
-		const { policy, host, site } = await setup( ( paths ) => ( {
-			target: { environment: 'global' },
-			targetSite: undefined,
-			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
-			enabledTools,
-		} ) );
-		const call = ( name: string, args: Record< string, unknown > ) =>
-			policy.authorizeStudioCall( { host, name, args, toolCallId: randomUUID() } );
-		expect( await call( 'scaffold_theme', { nameOrPath: 'site', name: 'Theme' } ) ).toBe( false );
-		expect(
-			await call( 'generate_images', {
-				images: [ { path: path.join( site, 'a.png' ), subject: 'A' } ],
-			} )
-		).toBe( false );
-	} );
-
 	it( 'lets the host resolve only the target site', async () => {
 		const { policy, host, site, other } = await setup();
-		const guarded = policy.guardHost( host, 'call' );
-		await expect( guarded.sites.resolve( 'site' ) ).resolves.toMatchObject( { id: fakeSite.id } );
-		await expect( guarded.sites.resolve( 'other' ) ).rejects.toThrow();
-		await expect( guarded.sites.findByFolder( other ) ).rejects.toThrow();
-		await expect( guarded.sites.findByFolder( site ) ).resolves.toMatchObject( {
+		const fenced = policy.guardHost( host, 'call' );
+		await expect( fenced.sites.resolve( 'site' ) ).resolves.toMatchObject( { id: fakeSite.id } );
+		await expect( fenced.sites.resolve( 'other' ) ).rejects.toThrow();
+		await expect( fenced.sites.findByFolder( other ) ).rejects.toThrow();
+		await expect( fenced.sites.findByFolder( site ) ).resolves.toMatchObject( {
 			id: fakeSite.id,
 		} );
 		await expect(
-			guarded.sites.findByFolder( path.join( site, 'nowhere' ) )
+			fenced.sites.findByFolder( path.join( site, 'nowhere' ) )
 		).resolves.toBeUndefined();
 	} );
 } );
@@ -719,56 +646,6 @@ describe( 'Claude WordPress.com requests', () => {
 			{ method: 'GET', path: '!sites/100/posts' },
 		] )
 			expect( remote( { siteId: 1, ...args } ), args.path ).toBeUndefined();
-	} );
-
-	it( 'lets a WordPress.com request reach only the live target', async () => {
-		const enabledTools = { native: [], studio: [ 'wpcom_request' ] };
-		const live = await setup( () => ( {
-			target: { environment: 'live', siteId: fakeSite.id, wpcomSiteId: 42 },
-			enabledTools,
-		} ) );
-		const call = ( fixture: typeof live, args: Record< string, unknown > ) =>
-			fixture.policy.authorizeStudioCall( {
-				host: fixture.host,
-				name: 'wpcom_request',
-				args,
-				toolCallId: randomUUID(),
-			} );
-		expect( await call( live, { siteId: 42, method: 'GET', path: '/posts' } ) ).toBe( true );
-		expect( await call( live, { siteId: 42, method: 'GET', path: '!/sites/42/posts' } ) ).toBe(
-			true
-		);
-		expect( await call( live, { siteId: 7, method: 'GET', path: '/posts' } ) ).toBe( false );
-		expect( await call( live, { siteId: 42, method: 'GET', path: '!/sites/7/posts' } ) ).toBe(
-			false
-		);
-		expect( live.context.approve ).not.toHaveBeenCalled();
-		expect( await call( live, { siteId: 42, method: 'POST', path: '/posts' } ) ).toBe( true );
-		expect( await call( live, { siteId: 42, method: 'DELETE', path: '!/sites/7/posts/1' } ) ).toBe(
-			false
-		);
-		expect( live.context.approve ).toHaveBeenCalledOnce();
-		expect(
-			await live.policy.authorizeStudioCall( {
-				host: live.host,
-				name: 'wp_cli',
-				args: {},
-				toolCallId: 'call',
-			} )
-		).toBe( false );
-
-		const local = await setup( () => ( { enabledTools } ) );
-		expect( await call( local, { siteId: 42, method: 'GET', path: '/posts' } ) ).toBe( false );
-		const global = await setup( ( paths ) => ( {
-			target: { environment: 'global' },
-			targetSite: undefined,
-			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
-			enabledTools,
-		} ) );
-		expect( await call( global, { siteId: 42, method: 'GET', path: '!/sites/42/posts' } ) ).toBe(
-			false
-		);
-		expect( await call( global, { siteId: 42, method: 'GET', path: '!/me' } ) ).toBe( true );
 	} );
 } );
 
@@ -896,6 +773,113 @@ describe( 'Claude shell confinement', () => {
 		).toMatch( /in a sandbox that can write only in the workspace/ );
 	} );
 
+	it( 'verifies a shell confinement only from plain data, and never throws on a malformed one', () => {
+		const workspace = path.resolve( 'workspace' );
+		const inside = path.join( workspace, 'build' );
+		const outside = path.dirname( workspace );
+		const sandbox = { ...confinedSandbox, filesystem: { allowWrite: [ inside ] } };
+		const confined = ( settings: unknown ) => ( { mode: 'sandbox', sandbox: settings } );
+		const writes = ( allowWrite: unknown ) =>
+			confined( { ...confinedSandbox, filesystem: { allowWrite } } );
+		let reads = 0;
+		for ( const declared of [
+			{ mode: 'approval-only' },
+			confined( sandbox ),
+			confined( Object.freeze( sandbox ) ),
+			Object.assign( Object.create( null ), { mode: 'approval-only' } ),
+		] )
+			expect( isVerifiedShellConfinement( declared as never, workspace ) ).toBe( true );
+		const rejected: Array< [ string, unknown ] > = [
+			[ 'null', null ],
+			[ 'undefined', undefined ],
+			[ 'a string', 'approval-only' ],
+			[ 'an array', [ 'approval-only' ] ],
+			[ 'a Map', new Map( [ [ 'mode', 'approval-only' ] ] ) ],
+			[ 'a class instance', new Declared( { mode: 'approval-only' } ) ],
+			[ 'a proxy', new Proxy( { mode: 'approval-only' }, {} ) ],
+			[ 'an inherited mode', inherit( { mode: 'approval-only' } ) ],
+			[ 'an accessor mode', withAccessor( {}, 'mode', () => 'approval-only' ) ],
+			[ 'approval-only with a setting', { mode: 'approval-only', sandbox: { enabled: false } } ],
+			[ 'approval-only with a hidden key', withHidden( { mode: 'approval-only' }, 'sandbox', {} ) ],
+			[ 'approval-only with a symbol key', { mode: 'approval-only', [ Symbol( 'x' ) ]: 1 } ],
+			[ 'an extra top-level key', { ...confined( sandbox ), excludedCommands: [ '*' ] } ],
+			[ 'a hidden top-level key', withHidden( confined( sandbox ), 'excludedCommands', [ '*' ] ) ],
+			[ 'an inherited sandbox', inherit( { sandbox }, { mode: 'sandbox' } ) ],
+			[ 'an accessor sandbox', withAccessor( { mode: 'sandbox' }, 'sandbox', () => sandbox ) ],
+			[ 'inherited settings', confined( inherit( sandbox ) ) ],
+			[
+				'an inherited setting',
+				confined(
+					inherit(
+						{ enabled: true },
+						{ allowUnsandboxedCommands: false, autoAllowBashIfSandboxed: false }
+					)
+				),
+			],
+			[
+				'an accessor setting',
+				confined(
+					withAccessor(
+						{ allowUnsandboxedCommands: false, autoAllowBashIfSandboxed: false },
+						'enabled',
+						() => true
+					)
+				),
+			],
+			[ 'a hidden setting', confined( withHidden( sandbox, 'excludedCommands', [ '*' ] ) ) ],
+			[ 'a symbol setting', confined( { ...sandbox, [ Symbol( 'excludedCommands' ) ]: [ '*' ] } ) ],
+			[ 'settings as a class instance', confined( new Declared( sandbox ) ) ],
+			[ 'settings as a proxy', confined( new Proxy( { ...sandbox }, {} ) ) ],
+			[ 'settings as an array', confined( [ sandbox ] ) ],
+			[ 'a null filesystem', confined( { ...confinedSandbox, filesystem: null } ) ],
+			[ 'a filesystem as an array', confined( { ...confinedSandbox, filesystem: [] } ) ],
+			[
+				'an inherited filesystem',
+				confined( { ...confinedSandbox, filesystem: inherit( { allowWrite: [ outside ] } ) } ),
+			],
+			[
+				'a hidden write root',
+				confined( { ...confinedSandbox, filesystem: withHidden( {}, 'allowWrite', [ outside ] ) } ),
+			],
+			[
+				'write roots that change between reads',
+				confined( {
+					...confinedSandbox,
+					filesystem: withAccessor( {}, 'allowWrite', () =>
+						reads++ === 0 ? [ inside ] : [ outside ]
+					),
+				} ),
+			],
+			[ 'write roots outside the workspace', writes( [ inside, outside ] ) ],
+			[ 'write roots as a proxy', writes( new Proxy( [ inside ], {} ) ) ],
+			[ 'write roots with a gap', writes( Object.assign( new Array( 2 ), { 1: inside } ) ) ],
+			[
+				'write roots with an extra key',
+				writes( Object.assign( [ inside ], { extra: outside } ) ),
+			],
+			[
+				'a write root behind an accessor',
+				writes( Object.defineProperty( [ inside ], 0, { get: () => outside, enumerable: true } ) ),
+			],
+			[ 'write roots as a set', writes( new Set( [ inside ] ) ) ],
+			[ 'a write root that is not a string', writes( [ { toString: () => inside } ] ) ],
+		];
+		for ( const [ label, declared ] of rejected ) {
+			let verified: unknown;
+			let tools: unknown;
+			expect( () => {
+				verified = isVerifiedShellConfinement( declared as never, workspace );
+				tools = claudeNativeTools( shell, declared as never, workspace );
+			}, label ).not.toThrow();
+			expect( verified, label ).toBe( false );
+			expect( tools, label ).toEqual( [ 'Read' ] );
+		}
+		for ( const enabled of [ null, undefined, {}, { native: 'Read' }, { native: [ 'Read', 7 ] } ] )
+			expect( claudeNativeTools( enabled as never, { mode: 'approval-only' }, workspace ) ).toEqual(
+				[]
+			);
+	} );
+
 	it( 'in approval-only mode asks for every command, says it is unconfined, and never reuses an answer', async () => {
 		const { policy, context, events } = await setup( () => ( {
 			enabledTools: shell,
@@ -1003,18 +987,15 @@ describe( 'Claude account changes', () => {
 } );
 
 describe( 'Claude Studio tools that reach a site by URL', () => {
-	const enabledTools = {
-		native: [],
-		studio: [
-			'take_screenshot',
-			'inspect_design',
-			'open_annotation_browser',
-			'need_for_speed',
-			'rank_me_up',
-		],
-	};
+	const browserTools = [
+		'take_screenshot',
+		'inspect_design',
+		'open_annotation_browser',
+		'need_for_speed',
+		'rank_me_up',
+	];
 
-	it( 'names the URL each tool with a URL or site path reaches, and gates it on a navigation guard', () => {
+	it( 'names the URL each tool with a URL or site path reaches', () => {
 		for ( const definition of studioToolDefinitions ) {
 			const { properties } = definition.parameters as { properties: Record< string, unknown > };
 			if ( 'url' in properties || ( 'path' in properties && 'nameOrPath' in properties ) )
@@ -1023,45 +1004,73 @@ describe( 'Claude Studio tools that reach a site by URL', () => {
 					definition.name
 				).toBeDefined();
 		}
-		for ( const [ name, rule ] of CLAUDE_STUDIO_TOOL_RULES )
-			expect( rule.navigates === true, name ).toBe( enabledTools.studio.includes( name ) );
-		for ( const name of enabledTools.studio )
-			expect( CLAUDE_STUDIO_TOOL_RULES.get( name )?.urls, name ).toBeDefined();
 	} );
 
-	it( 'keeps browser tools disabled unless the turn declares a navigation guard the policy can verify', async () => {
+	it( 'verifies a navigation guard only when it declares every guarantee, and nothing else, as plain data', () => {
 		expect( CLAUDE_NAVIGATION_CONFINEMENT ).toEqual( { mode: 'none' } );
-		const withWpCli = { native: [ 'Read' ], studio: [ ...enabledTools.studio, 'wp_cli' ] };
-		const complete = completeGuard( targetOrigin );
-		const incomplete: unknown[] = [
-			{ mode: 'none' },
-			{ mode: 'guarded', guard: undefined },
-			{ mode: 'guarded', guard: null },
-			{ mode: 'guarded', guard: 'verified' },
-			{ mode: 'guarded', guard: [ complete ] },
-			{ mode: 'unknown', guard: complete },
-			...guarantees.flatMap( ( key ) => {
-				const { [ key ]: _omitted, ...missing } = complete as Record< string, unknown >;
-				return [
-					{ mode: 'guarded', guard: missing },
-					{ mode: 'guarded', guard: { ...complete, [ key ]: false } },
-					{ mode: 'guarded', guard: { ...complete, [ key ]: 'true' } },
-					{ mode: 'guarded', guard: { ...complete, [ key ]: 1 } },
-				];
-			} ),
-			{ mode: 'guarded', guard: { ...complete, ruleRevision: undefined } },
-			{
-				mode: 'guarded',
-				guard: { ...complete, ruleRevision: CLAUDE_NAVIGATION_RULE_REVISION + 1 },
-			},
-			{ mode: 'guarded', guard: { ...complete, targetOrigin: null } },
-			{ mode: 'guarded', guard: { ...complete, targetOrigin: 'http://localhost:8889' } },
-			{ mode: 'guarded', guard: { ...complete, targetOrigin: `${ targetOrigin }/` } },
-			{ mode: 'guarded', guard: { ...complete, allowPrivateAddresses: [ '127.0.0.1' ] } },
-			{ mode: 'guarded', guard: { ...complete, exceptions: [] } },
+		expect( CLAUDE_NAVIGATION_RULE_REVISION ).toBe( 2 );
+		for ( const origin of [ targetOrigin, null ] ) {
+			expect( isVerifiedNavigationGuard( guarded( origin ), origin ), String( origin ) ).toBe(
+				true
+			);
+			for ( const [ label, declared ] of unverifiableNavigation( origin ) ) {
+				let verified: unknown;
+				expect( () => {
+					verified = isVerifiedNavigationGuard( declared as never, origin );
+				}, label ).not.toThrow();
+				expect( verified, `${ label } for ${ origin }` ).toBe( false );
+			}
+		}
+		// A guard bound to another target does not count for this one.
+		expect( isVerifiedNavigationGuard( guarded( targetOrigin ), null ) ).toBe( false );
+		expect( isVerifiedNavigationGuard( guarded( null ), targetOrigin ) ).toBe( false );
+		// An origin the caller does not know verifies nothing, whatever the guard says.
+		for ( const origin of [ undefined, 0, false, {}, [ targetOrigin ] ] )
+			expect(
+				isVerifiedNavigationGuard(
+					{ mode: 'guarded', guard: { ...completeGuard( null ), targetOrigin: origin } } as never,
+					origin as never
+				),
+				String( origin )
+			).toBe( false );
+		// The guard of rule revision 1 states neither of the guarantees added since.
+		const {
+			confinesFileDocuments: _file,
+			blocksUncheckedChannels: _channels,
+			...revisionOne
+		} = completeGuard( targetOrigin ) as Record< string, unknown >;
+		expect(
+			isVerifiedNavigationGuard(
+				{ mode: 'guarded', guard: { ...revisionOne, ruleRevision: 1 } } as never,
+				targetOrigin
+			)
+		).toBe( false );
+		// Plain data without a prototype, or frozen, is still plain data.
+		const bare = ( fields: object ) => Object.assign( Object.create( null ), fields );
+		expect(
+			isVerifiedNavigationGuard(
+				bare( { mode: 'guarded', guard: bare( completeGuard( targetOrigin ) ) } ),
+				targetOrigin
+			)
+		).toBe( true );
+		expect(
+			isVerifiedNavigationGuard(
+				Object.freeze( {
+					mode: 'guarded',
+					guard: Object.freeze( completeGuard( targetOrigin ) ),
+				} ) as never,
+				targetOrigin
+			)
+		).toBe( true );
+	} );
+
+	it( 'keeps browser tools disabled, without throwing, whatever navigation guard the turn declares', async () => {
+		const withWpCli = { native: [ 'Read' ], studio: [ ...browserTools, 'wp_cli' ] };
+		const declarations: Array< [ string, unknown ] > = [
+			...unverifiableNavigation( targetOrigin ),
+			[ 'a complete guard', guarded( targetOrigin ) ],
 		];
-		for ( const navigationConfinement of incomplete ) {
-			const label = JSON.stringify( navigationConfinement );
+		for ( const [ label, navigationConfinement ] of declarations ) {
 			expect(
 				claudeStudioTools( withWpCli, navigationConfinement as never, targetOrigin ),
 				label
@@ -1110,37 +1119,18 @@ describe( 'Claude Studio tools that reach a site by URL', () => {
 					`${ name } ${ label }`
 				).toBe( false );
 			expect( context.approve ).not.toHaveBeenCalled();
+			expect(
+				await policy.authorizeToolUse( {
+					toolName: 'mcp__studio__wp_cli',
+					input: {},
+					mcpServer: studioServer,
+				} ),
+				label
+			).toBe( true );
 		}
-
-		expect( claudeStudioTools( withWpCli, guarded( targetOrigin ), targetOrigin ) ).toEqual(
-			withWpCli.studio
-		);
-		const { policy, host } = await setup( () => ( {
-			enabledTools: withWpCli,
-			navigationConfinement: guarded( targetOrigin ),
-		} ) );
-		expect(
-			await policy.authorizeStudioCall( {
-				host,
-				name: 'take_screenshot',
-				args: { url: `${ targetOrigin }/` },
-				toolCallId: randomUUID(),
-			} )
-		).toBe( true );
-		expect(
-			await policy.authorizeToolUse( {
-				toolName: 'mcp__studio__take_screenshot',
-				input: {},
-				mcpServer: studioServer,
-			} )
-		).toBe( true );
-
-		// A guard bound to another target does not count for this one.
-		expect( claudeStudioTools( withWpCli, guarded( targetOrigin ), null ) ).toEqual( [ 'wp_cli' ] );
-		expect( claudeStudioTools( withWpCli, guarded( null ), null ) ).toEqual( withWpCli.studio );
 	} );
 
-	it( 'compares host names lowercased, punycoded and without trailing dots', async () => {
+	it( 'compares host names lowercased, punycoded and without trailing dots', () => {
 		expect( normalizeHostname( 'LocalHost..' ) ).toBe( 'localhost' );
 		expect( normalizeHostname( '[::1]' ) ).toBe( '::1' );
 		for ( const hostname of [
@@ -1155,120 +1145,6 @@ describe( 'Claude Studio tools that reach a site by URL', () => {
 		] )
 			expect( isLocalHostname( hostname ), hostname ).toBe( true );
 		expect( isLocalHostname( 'example.com.' ) ).toBe( false );
-
-		const { policy, host } = await setup( () => ( {
-			enabledTools,
-			navigationConfinement: guarded( targetOrigin ),
-		} ) );
-		for ( const name of [ 'take_screenshot', 'inspect_design', 'open_annotation_browser' ] ) {
-			const at = ( url: string ) =>
-				policy.authorizeStudioCall( { host, name, args: { url }, toolCallId: randomUUID() } );
-			for ( const url of [
-				'http://localhost.:8882/',
-				'http://localhost.:8888/',
-				'http://localhost..:8888/',
-				'http://LOCALHOST%2E:8882/',
-				'http://localhost\u3002:8882/',
-				'http://\uff4c\uff4f\uff43\uff41\uff4c\uff48\uff4f\uff53\uff54.:8882/',
-				'http://site.localhost./',
-				'http://site.localhost../',
-				'http://printer.local./',
-				'http://other-site.example.:8890/',
-				'http://OTHER-SITE.example..:8890/',
-				'http://127.0.0.1.:8882/',
-				'http://[::127.0.0.1]:8882/',
-				'http://./',
-			] )
-				expect( await at( url ), `${ name } ${ url }` ).toBe( false );
-			expect( await at( 'https://example.com./' ), name ).toBe( true );
-			// A public name can resolve to a local address; only the browser-layer
-			// guard, which resolves it, can refuse it. Without that guard the tool is
-			// not enabled at all.
-			expect( await at( 'http://127.0.0.1.nip.io:8882/' ), name ).toBe( true );
-		}
-	} );
-
-	it( 'allows the target site and public pages, and denies other schemes and local origins', async () => {
-		const { policy, host } = await setup( () => ( {
-			enabledTools,
-			navigationConfinement: guarded( targetOrigin ),
-		} ) );
-		const call = ( name: string, args: Record< string, unknown > ) =>
-			policy.authorizeStudioCall( { host, name, args, toolCallId: randomUUID() } );
-		for ( const name of [ 'take_screenshot', 'inspect_design', 'open_annotation_browser' ] ) {
-			const at = ( url: string ) => call( name, { url, selectors: [ 'body' ] } );
-			expect( await at( 'http://localhost:8888/about' ), name ).toBe( true );
-			expect( await at( 'https://example.com/' ), name ).toBe( true );
-			for ( const url of [
-				'file:///C:/Windows/win.ini',
-				'file:///etc/passwd',
-				'data:text/html,<p>x</p>',
-				'javascript:alert(1)',
-				'chrome://settings',
-				'http://127.0.0.1:8882/',
-				'http://localhost:8889/',
-				'http://[::1]:8888/',
-				'http://2130706433/',
-				'http://192.168.1.10/',
-				'http://10.0.0.5/',
-				'http://172.20.0.1/',
-				'http://169.254.169.254/latest/meta-data/',
-				'http://[::ffff:127.0.0.1]:8888/',
-				'http://[fd00::1]/',
-				'http://printer.local/',
-				'http://other-site.example:8890/',
-				'not a url',
-			] )
-				expect( await at( url ), `${ name } ${ url }` ).toBe( false );
-		}
-	} );
-
-	it( 'keeps a site audit on the target site whatever path it is given', async () => {
-		const { policy, host } = await setup( () => ( {
-			enabledTools,
-			navigationConfinement: guarded( targetOrigin ),
-		} ) );
-		for ( const name of [ 'need_for_speed', 'rank_me_up' ] ) {
-			const audit = ( auditPath?: string ) =>
-				policy.authorizeStudioCall( {
-					host,
-					name,
-					args: { nameOrPath: 'site', ...( auditPath === undefined ? {} : { path: auditPath } ) },
-					toolCallId: randomUUID(),
-				} );
-			expect( await audit(), name ).toBe( true );
-			expect( await audit( '/about' ), name ).toBe( true );
-			expect( await audit( '/wp-admin/' ), name ).toBe( true );
-			for ( const auditPath of [
-				'@127.0.0.1:8882/',
-				'//evil.example/',
-				'http://evil.example/',
-				'/\\evil.example',
-				'\\\\evil.example',
-				'about',
-				'',
-			] )
-				expect( await audit( auditPath ), `${ name } ${ auditPath }` ).toBe( false );
-		}
-	} );
-
-	it( 'reaches no local site from a global conversation', async () => {
-		const { policy, host } = await setup( ( paths ) => ( {
-			target: { environment: 'global' },
-			targetSite: undefined,
-			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
-			enabledTools,
-			navigationConfinement: guarded( null ),
-		} ) );
-		const at = ( url: string ) =>
-			policy.authorizeStudioCall( {
-				host,
-				name: 'take_screenshot',
-				args: { url },
-				toolCallId: randomUUID(),
-			} );
-		expect( await at( 'http://localhost:8888/' ) ).toBe( false );
-		expect( await at( 'https://example.com/' ) ).toBe( true );
 	} );
 } );
 
