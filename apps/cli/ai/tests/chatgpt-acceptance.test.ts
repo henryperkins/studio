@@ -30,6 +30,7 @@ import { findUnsafeText, openAcceptanceEvidence } from 'cli/ai/acceptance-eviden
 import { acceptanceRunPaths } from 'cli/ai/acceptance-isolation';
 import {
 	acceptancePlatform,
+	askOwnerForSessionToken,
 	classifyToolCall,
 	classifyTurnFailure,
 	createAcceptanceTokenService,
@@ -352,6 +353,7 @@ function scriptedServices(
 				return { localCleared: true, remoteRevocationConfirmed: true };
 			},
 			sessionForkEnvironment: () => ( {} ),
+			askSessionToken: async () => false,
 			readAccount: async () => account(),
 			vaultRecordExists: () => state === 'signed-in' && storage === 'vault',
 			readModels: async ( connectionId, revision ) => ( {
@@ -1606,7 +1608,16 @@ describe( 'ChatGPT acceptance runner', () => {
 			evidence.writeState( { schemaVersion: 1, registrationId: REGISTRATION, storage: 'vault' } );
 			const notOffered = () =>
 				finishedTurn(
-					turnResult( { exitCode: 1, events: [ cliError( disconnectedText ) ], requests: [] } )
+					turnResult( {
+						exitCode: 1,
+						startedAt: at( 100 ),
+						exitedAt: at( 400 ),
+						events: [
+							{ ...cliError( disconnectedText ), receivedAt: at( 250 ) },
+							completed( 'error', at( 300 ) ),
+						],
+						requests: [],
+					} )
 				);
 			const scripted = scriptedServices(
 				{},
@@ -1656,6 +1667,27 @@ describe( 'ChatGPT acceptance runner', () => {
 				}
 				return 'test-access-token';
 			};
+			// The app still offers the session until the held refresh settles.
+			let released = false;
+			const hold = services.tokens.holdNextRefresh;
+			services.tokens.holdNextRefresh = () => {
+				const held = hold();
+				return {
+					...held,
+					release: () => {
+						released = true;
+						held.release();
+					},
+				};
+			};
+			services.broker.sessionForkEnvironment = (): Record< string, string > =>
+				released || ! renewal ? {} : { STUDIO_CHATGPT_SESSIONS_OFFERED: REGISTRATION };
+			// The owner answers an ask in the window only once the held refresh settles.
+			services.broker.askSessionToken = async ( _id, logoutGeneration ) => {
+				calls.log.push( `ask:${ logoutGeneration }` );
+				await renewal;
+				return false;
+			};
 			return scripted;
 		}
 
@@ -1674,6 +1706,20 @@ describe( 'ChatGPT acceptance runner', () => {
 				expect.arrayContaining( [ 'begin:session', 'hold', 'release' ] )
 			);
 			expect( calls.log.filter( ( call ) => call === 'sign-out' ) ).toHaveLength( 1 );
+			// The runner asks the owner in the window, with the generation the session was held at.
+			const { log } = calls;
+			expect( log.indexOf( 'sign-out' ) ).toBeLessThan( log.indexOf( 'ask:0' ) );
+			expect( log.indexOf( 'ask:0' ) ).toBeLessThan( log.indexOf( 'release' ) );
+			expect( stageOf( 'refresh-hold-across-sign-out' )[ 0 ].observations ).toMatchObject( {
+				offerAdvertisedDuringWindow: true,
+				windowDirectAskAnswered: true,
+				windowDirectAskRefused: true,
+				windowForkTokenAsks: 0,
+				windowForkRouteRequests: 0,
+				windowForkFallbackRequests: 0,
+				windowForkSucceeded: false,
+				windowForkReportedUnavailable: true,
+			} );
 			expectNothingUnsafe( [ 'test-access-token' ], [ REGISTRATION ] );
 		} );
 
@@ -1745,6 +1791,70 @@ describe( 'ChatGPT acceptance runner', () => {
 					signOut: true,
 					cleanup: { heldRefreshReleased: true, testRegistrationSignedOut: true },
 				},
+			],
+			[
+				'refresh-hold-across-sign-out',
+				'window-ask-got-token',
+				'failed',
+				() => {
+					const scripted = scriptedSession();
+					const ask = scripted.services.broker.askSessionToken;
+					scripted.services.broker.askSessionToken = async ( id, generation ) => {
+						await ask( id, generation );
+						return true;
+					};
+					return scripted;
+				},
+				{ signOut: true },
+			],
+			[
+				'refresh-hold-across-sign-out',
+				'window-ask-unanswered',
+				'failed',
+				() => {
+					const scripted = scriptedSession();
+					scripted.services.broker.askSessionToken = async () => null;
+					return scripted;
+				},
+				{ signOut: true },
+			],
+			[
+				'refresh-hold-across-sign-out',
+				'inference-during-window',
+				'failed',
+				() =>
+					scriptedSession( {
+						'window-fork': () =>
+							finishedTurn(
+								turnResult( {
+									exitCode: 0,
+									startedAt: at( 100 ),
+									exitedAt: at( 900 ),
+									events: [ answered( 'READY', at( 700 ) ), completed( 'success', at( 800 ) ) ],
+									requests: [ routeRequest( { startedAt: at( 400 ) } ) ],
+								} )
+							),
+					} ),
+				{ signOut: true },
+			],
+			[
+				'refresh-hold-across-sign-out',
+				'window-fork-completed',
+				'failed',
+				() =>
+					scriptedSession( {
+						'window-fork': () =>
+							finishedTurn(
+								turnResult( {
+									exitCode: 0,
+									startedAt: at( 100 ),
+									exitedAt: at( 600 ),
+									events: [ answered( 'READY', at( 400 ) ), completed( 'success', at( 500 ) ) ],
+									requests: [],
+								} )
+							),
+					} ),
+				{ signOut: true },
 			],
 		];
 
@@ -2077,6 +2187,12 @@ describe( 'ChatGPT acceptance runner', () => {
 						return result;
 					},
 					sessionForkEnvironment: () => broker.getSessionForkEnvironment(),
+					askSessionToken: ( id: string, logoutGeneration: number ) =>
+						askOwnerForSessionToken(
+							( message, reply ) => broker.answerSessionTokenRequest( message, reply ),
+							id,
+							logoutGeneration
+						),
 					readAccount: ( id: string ) => readChatGptAccount( id ),
 					vaultRecordExists: ( id: string ) =>
 						fs.existsSync( path.join( profileDir, 'chatgpt-credentials', `${ id }.vault` ) ),
@@ -2227,6 +2343,13 @@ describe( 'ChatGPT acceptance runner', () => {
 			expect( stageOf( 'refresh-hold-across-sign-out' )[ 0 ].observations ).toMatchObject( {
 				refreshHeld: true,
 				generationAdvancedDuringHold: true,
+				// The real owner, asked in the window, answers without a token.
+				offerAdvertisedDuringWindow: true,
+				windowDirectAskAnswered: true,
+				windowDirectAskRefused: true,
+				windowForkTokenAsks: 0,
+				windowForkSucceeded: false,
+				windowForkReportedUnavailable: true,
 				windowForkTokensHandedOut: 0,
 				windowForkRouteRequests: 0,
 				heldRefreshRejectedSignedOut: true,
@@ -2477,6 +2600,27 @@ describe( 'acceptance turn digests', () => {
 		} finally {
 			fs.rmSync( runDir, { recursive: true, force: true } );
 		}
+	} );
+
+	it( 'asks the session owner as a forked turn would, keeping only whether a token came back', async () => {
+		const asked: unknown[] = [];
+		const answering =
+			( accessToken: string | null ) =>
+			( message: unknown, reply: ( message: unknown ) => void ) => {
+				asked.push( message );
+				setTimeout( () => reply( { type: 'studio.chatgpt-session-token', accessToken } ), 5 );
+				return true;
+			};
+		expect( await askOwnerForSessionToken( answering( null ), REGISTRATION, 3 ) ).toBe( false );
+		expect(
+			await askOwnerForSessionToken( answering( 'test-access-token' ), REGISTRATION, 3 )
+		).toBe( true );
+		expect( await askOwnerForSessionToken( () => false, REGISTRATION, 3 ) ).toBeNull();
+		expect( asked[ 0 ] ).toMatchObject( {
+			type: 'studio.chatgpt-session-token.request',
+			connectionId: REGISTRATION,
+			logoutGeneration: 3,
+		} );
 	} );
 
 	it( 'sees a tool result in a session file only once its tool result entry is written', () => {

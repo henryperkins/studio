@@ -1,5 +1,5 @@
 import { fork, spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { createHash, randomInt } from 'node:crypto';
+import { createHash, randomInt, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -237,6 +237,11 @@ interface AcceptanceBroker {
 		connectionId: string
 	): Promise< { localCleared: boolean; remoteRevocationConfirmed: boolean } >;
 	sessionForkEnvironment(): Record< string, string >;
+	/**
+	 * Asks this app for a session-only token the way a forked turn's IPC
+	 * request reaches it: whether a token came back, or null without an answer.
+	 */
+	askSessionToken( connectionId: string, logoutGeneration: number ): Promise< boolean | null >;
 	readAccount( registrationId: string ): Promise< ChatGptAccount | null >;
 	vaultRecordExists( registrationId: string ): boolean;
 	readModels( connectionId: string, revision: number ): Promise< ChatGptModelAvailability >;
@@ -1148,6 +1153,33 @@ async function signInStage(
 	}
 }
 
+// The IPC message a forked turn sends its app for a session-only token.
+const SESSION_TOKEN_REQUEST_TYPE = 'studio.chatgpt-session-token.request';
+
+/**
+ * Asks a session's owner for a token through its answer path, with the
+ * message a forked turn sends. Keeps only whether a token came back; null
+ * when the owner didn't take the message.
+ */
+export function askOwnerForSessionToken(
+	answer: ( message: unknown, reply: ( message: unknown ) => void ) => boolean,
+	connectionId: string,
+	logoutGeneration: number
+): Promise< boolean | null > {
+	return new Promise( ( resolve ) => {
+		const taken = answer(
+			{ type: SESSION_TOKEN_REQUEST_TYPE, requestId: randomUUID(), connectionId, logoutGeneration },
+			( reply ) =>
+				resolve(
+					isRecord( reply ) && typeof reply.accessToken === 'string' && reply.accessToken !== ''
+				)
+		);
+		if ( ! taken ) {
+			resolve( null );
+		}
+	} );
+}
+
 function routeRequests( result: TurnResult ): ObservedRequest[] {
 	return result.requests.filter(
 		( request ) => request.host === 'chatgpt-route' && request.endpoint === 'responses'
@@ -1913,7 +1945,8 @@ const SESSION_STAGES: StageDefinition[] = [
 		async run( ctx, observations ) {
 			const { broker, tokens, clock, processes } = ctx.services;
 			const id = requireRegistration( ctx );
-			await requireSignedInAccount( ctx );
+			// The generation a fork offered this session would ask with.
+			const { logoutGeneration } = await requireSignedInAccount( ctx );
 			const sessionId = ctx.state.offeredSessionId ?? fail( 'no-offered-session' );
 			const current = await broker.getAccessToken( id );
 			const hold = tokens.holdNextRefresh();
@@ -1968,10 +2001,13 @@ const SESSION_STAGES: StageDefinition[] = [
 			if ( ctx.signal.aborted ) {
 				throw new AcceptanceInterrupted();
 			}
-			// Not asserted: the offer may linger until the held refresh settles.
+			// The offer may linger until the held refresh settles.
 			observations.offerAdvertisedDuringWindow = offeredRegistrations(
 				broker.sessionForkEnvironment()
 			).includes( id );
+			// A forked turn started now lists the account as disconnected and never
+			// asks, so the runner asks this app itself, as a fork's request would.
+			const ask = broker.askSessionToken( id, logoutGeneration );
 			const fork = processes.startTurn( {
 				label: 'window-fork',
 				sessionId,
@@ -1990,9 +2026,26 @@ const SESSION_STAGES: StageDefinition[] = [
 			if ( ! forkResult ) {
 				await fork.stop();
 			}
+			const asked = await abortable( raceTimeout( ask, SETTLE_WAIT_MS ) );
+			observations.windowDirectAskAnswered = asked !== null;
+			observations.windowDirectAskRefused = asked === false;
+			const forkDigest = forkResult ? digestTurnEvents( forkResult.events ) : null;
 			observations.windowForkTokenAsks = forkResult?.tokenAsks ?? 0;
 			observations.windowForkTokensHandedOut = forkResult?.tokensHandedOut ?? 0;
 			observations.windowForkRouteRequests = forkResult ? routeRequests( forkResult ).length : 0;
+			observations.windowForkFallbackRequests = forkResult
+				? forkResult.requests.filter(
+						( request ) =>
+							request.bearer === 'api-key' ||
+							[ 'openai-api', 'anthropic', 'wpcom-ai-proxy' ].includes( request.host )
+				  ).length
+				: 0;
+			observations.windowForkSucceeded = forkDigest?.status === 'success';
+			observations.windowForkReportedUnavailable = Boolean(
+				forkDigest?.failureCodes.some( ( code ) =>
+					[ 'connection-disconnected', 'session-unavailable', 'signed-out' ].includes( code )
+				)
+			);
 			observations.heldRefreshRejectedSignedOut =
 				renewalError instanceof ChatGptConnectionError && renewalError.code === 'signed-out';
 			await abortable( raceTimeout( signingOut, SIGN_OUT_WAIT_MS ) );
@@ -2017,7 +2070,15 @@ const SESSION_STAGES: StageDefinition[] = [
 			ctx.cleanup.delete( 'refresh' );
 			check( forkResult !== null, 'window-fork-not-stopped' );
 			check( observations.windowForkTokensHandedOut === 0, 'token-handed-out-during-window' );
-			check( observations.windowForkRouteRequests === 0, 'inference-during-window' );
+			check(
+				observations.windowForkRouteRequests === 0 && observations.windowForkFallbackRequests === 0,
+				'inference-during-window'
+			);
+			check( ! observations.windowForkSucceeded, 'window-fork-completed' );
+			if ( observations.offerAdvertisedDuringWindow ) {
+				check( observations.windowDirectAskAnswered, 'window-ask-unanswered' );
+				check( observations.windowDirectAskRefused, 'window-ask-got-token' );
+			}
 			check( observations.heldRefreshRejectedSignedOut, 'held-refresh-not-rejected' );
 			check( observations.localCleared, 'local-not-cleared' );
 			check( observations.offerGoneAfterSettle, 'offer-not-pruned' );
@@ -2884,6 +2945,8 @@ async function createLiveServices( {
 			invalidateAccessToken: invalidateChatGptAccessToken,
 			signOut: signOutChatGpt,
 			sessionForkEnvironment: getChatGptSessionForkEnvironment,
+			askSessionToken: ( id, logoutGeneration ) =>
+				askOwnerForSessionToken( answerChatGptSessionTokenRequest, id, logoutGeneration ),
 			readAccount: readChatGptAccount,
 			vaultRecordExists: ( id ) =>
 				fs.existsSync( path.join( getConfigDirectory(), 'chatgpt-credentials', `${ id }.vault` ) ),
