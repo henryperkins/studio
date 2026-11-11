@@ -693,3 +693,91 @@ test( 'list vars in the config are lists of objects', () => {
 	);
 	expect( scalarLists ).toEqual( [] );
 } );
+
+describe( 'provider route checks', () => {
+	const ref = 'conn-0123456789ab';
+	const requested = {
+		kind: 'chatgpt-oauth',
+		backend: 'chatgpt-route',
+		subscription: true,
+		connectionRef: ref,
+		model: 'gpt-6-luna',
+		wireModel: 'gpt-6-luna',
+		effort: 'low',
+	};
+	const executed = ( overrides = {} ) => ( {
+		kind: 'chatgpt-oauth',
+		backend: 'chatgpt-route',
+		modelRequests: 3,
+		apiKeyBearers: 0,
+		imageServiceRequests: 0,
+		models: [ 'gpt-6-luna' ],
+		efforts: [ 'low' ],
+		replyKinds: [ 'chatgpt-oauth' ],
+		replyModels: [ 'gpt-6-luna' ],
+		connectionRef: ref,
+		requests: [],
+		...overrides,
+	} );
+	const routed = ( overrides = {}, route = {} ) => ( {
+		providerRoute: { requested, executed: executed( overrides ), ...route },
+	} );
+
+	test( 'ranOnRequestedRoute passes only on the selected route, connection, model and effort', () => {
+		const ok = run( checks.ranOnRequestedRoute, routed() );
+		expect( ok.pass ).toBe( true );
+		expect( ok.reason ).toMatch( /3 model request/ );
+		// The separate image service is not inference and doesn't count against the route.
+		expect( run( checks.ranOnRequestedRoute, routed( { imageServiceRequests: 2 } ) ).pass ).toBe(
+			true
+		);
+	} );
+
+	test.each( [
+		[ 'a run on the default provider', { textSegments: [ 'Hi' ] }, /regression evidence only/ ],
+		[
+			'a refused run',
+			{
+				providerRoute: {
+					requested: null,
+					failure: { code: 'connection-signed-out', message: 'Not signed in.' },
+				},
+			},
+			/connection-signed-out/,
+		],
+		[
+			'no model request',
+			routed( { modelRequests: 0, kind: 'none', backend: 'none' } ),
+			/no model request/,
+		],
+		[
+			'the API route',
+			routed( {
+				kind: 'openai-api-key',
+				backend: 'openai-api',
+				apiKeyBearers: 3,
+				replyKinds: [ 'openai-api-key' ],
+				connectionRef: 'openai-api-key',
+			} ),
+			/openai-api-key/,
+		],
+		[
+			'a mix of routes',
+			routed( { kind: 'mixed', backend: 'mixed', connectionRef: null } ),
+			/mixed/,
+		],
+		[ 'another connection', routed( { connectionRef: 'conn-ffffffffffff' } ), /connection/ ],
+		[ 'an API-key bearer', routed( { apiKeyBearers: 1 } ), /API-key/ ],
+		[ 'another model', routed( { models: [ 'gpt-6-luna', 'gpt-6.1-sol' ] } ), /gpt-6\.1-sol/ ],
+		[ 'another effort', routed( { efforts: [ 'low', 'medium' ] } ), /medium/ ],
+		[
+			'replies another runtime recorded',
+			routed( { replyKinds: [ 'chatgpt-oauth', 'unknown' ] } ),
+			/unknown/,
+		],
+	] )( 'ranOnRequestedRoute fails %s', ( _name, result, reason ) => {
+		const verdict = run( checks.ranOnRequestedRoute, result );
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( reason );
+	} );
+} );

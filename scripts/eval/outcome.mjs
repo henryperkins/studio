@@ -152,6 +152,59 @@ export const withinBudget = check( ( d, vars ) => {
 		: pass( `${ calls } tool calls, ${ tokens } tokens` );
 } );
 
+// --- Provider route checks ---------------------------------------------------
+
+// The run executed on the provider, connection, model and effort it selected
+// (STUDIO_EVAL_PROVIDER and friends; see the README). `providerRoute.executed`
+// is read back from the run: the model requests the observer saw, the
+// providers the runtime stamped on its replies and the connection the
+// conversation's record names. A run with no selection is a legacy-provider
+// run: regression evidence only, never evidence for a provider route.
+export const ranOnRequestedRoute = check( ( d ) => {
+	const route = d.providerRoute;
+	if ( ! route )
+		return fail(
+			'no provider was selected for this run: a pass on the default provider is regression evidence only, never evidence for a provider route'
+		);
+	if ( route.failure )
+		return fail(
+			`refused before any model request (${ route.failure.code }): ${ route.failure.message }`
+		);
+	const want = route.requested;
+	const got = route.executed;
+	if ( ! got || got.modelRequests === 0 ) return fail( 'no model request ran' );
+	const problems = [];
+	if ( got.kind !== want.kind ) problems.push( `ran on ${ got.kind }, not ${ want.kind }` );
+	if ( got.backend !== want.backend )
+		problems.push( `served by ${ got.backend }, not ${ want.backend }` );
+	if ( got.connectionRef !== want.connectionRef )
+		problems.push( `on connection ${ got.connectionRef }, not ${ want.connectionRef }` );
+	if ( want.subscription && got.apiKeyBearers )
+		problems.push( `${ got.apiKeyBearers } request(s) carried an API-key bearer` );
+	const otherModels = want.wireModel
+		? got.models.filter( ( model ) => model !== want.wireModel )
+		: [];
+	if ( otherModels.length ) problems.push( `requests named ${ otherModels.join( ', ' ) }` );
+	const otherEfforts = want.effort
+		? got.efforts.filter( ( effort ) => effort !== want.effort )
+		: [];
+	if ( otherEfforts.length ) problems.push( `requests used ${ otherEfforts.join( ', ' ) } effort` );
+	const otherReplies = got.replyKinds.filter( ( kind ) => kind !== want.kind );
+	if ( otherReplies.length )
+		problems.push( `the runtime recorded replies from ${ otherReplies.join( ', ' ) }` );
+	return problems.length
+		? fail( problems.join( '; ' ) )
+		: pass(
+				`${ got.modelRequests } model request(s) on ${ got.backend } via ${ got.connectionRef }, ${
+					want.model
+				}${ want.effort ? ` at ${ want.effort }` : '' }${
+					got.imageServiceRequests
+						? `; ${ got.imageServiceRequests } image service request(s) kept apart`
+						: ''
+				}`
+		  );
+} );
+
 // --- Reply checks ---------------------------------------------------------
 
 export const identifiesAsStudio = check( ( d ) => {

@@ -25,7 +25,8 @@ export type BearerShape = 'none' | 'api-key' | 'jwt' | 'opaque';
 
 export interface ObservedRequestSummary {
 	host: ObservedHost;
-	endpoint: 'responses' | 'models' | 'other';
+	/** `images`: Studio's separate WordPress.com image service, which is not inference. */
+	endpoint: 'responses' | 'models' | 'images' | 'other';
 	bearer: BearerShape;
 	model?: string;
 	effort?: string;
@@ -95,9 +96,10 @@ function classifyHost( url: URL ): {
 		return { host: 'anthropic', endpoint: 'other' };
 	}
 	if ( host === 'public-api.wordpress.com' || host.endsWith( '.wordpress.com' ) ) {
+		const proxy = url.pathname.startsWith( '/wpcom/v2/ai-api-proxy' );
 		return {
-			host: url.pathname.startsWith( '/wpcom/v2/ai-api-proxy' ) ? 'wpcom-ai-proxy' : 'wpcom',
-			endpoint: 'other',
+			host: proxy ? 'wpcom-ai-proxy' : 'wpcom',
+			endpoint: proxy && url.pathname.includes( '/v1/images/' ) ? 'images' : 'other',
 		};
 	}
 	return { host: 'other', endpoint: 'other' };

@@ -105,7 +105,16 @@ describe( 'acceptance request observer', () => {
 		).toEqual( { host: 'openai-auth', endpoint: 'other', bearer: 'none' } );
 		expect(
 			summarizeObservedRequest( 'https://public-api.wordpress.com/wpcom/v2/ai-api-proxy/v1/x' )
-		).toMatchObject( { host: 'wpcom-ai-proxy' } );
+		).toMatchObject( { host: 'wpcom-ai-proxy', endpoint: 'other' } );
+		// Studio's separate image service shares the proxy but is not inference.
+		expect(
+			summarizeObservedRequest(
+				'https://public-api.wordpress.com/wpcom/v2/ai-api-proxy/v1/images/generations'
+			)
+		).toMatchObject( { host: 'wpcom-ai-proxy', endpoint: 'images' } );
+		expect(
+			summarizeObservedRequest( 'https://public-api.wordpress.com/rest/v1.1/v1/images/x' )
+		).toMatchObject( { host: 'wpcom', endpoint: 'other' } );
 		expect( summarizeObservedRequest( 'https://api.anthropic.com/v1/messages' ) ).toMatchObject( {
 			host: 'anthropic',
 		} );
