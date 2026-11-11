@@ -95,6 +95,10 @@
 	overflow-wrap: anywhere;
 }
 
+.imageServiceNote {
+	margin-top: var( --space-0_5 );
+}
+
 .reasoningMenu {
 	min-width: 220px;
 }

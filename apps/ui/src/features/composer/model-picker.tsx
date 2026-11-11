@@ -7,7 +7,7 @@ import {
 import { getStudioCodeAiAccessState } from '@studio/common/lib/studio-assistant-quota';
 import { useQueries } from '@tanstack/react-query';
 import { __, sprintf } from '@wordpress/i18n';
-import { PlugIcon, SparklesIcon } from 'lucide-react';
+import { InfoIcon, PlugIcon, SparklesIcon } from 'lucide-react';
 import { useRef, useState, type RefObject, ComponentType } from 'react';
 import { useConnector } from '@/data/core';
 import { useStudioAssistantQuota } from '@/data/queries/use-assistant-quota';
@@ -137,6 +137,38 @@ export function ModelPicker( {
 			}
 		}
 	};
+	const chatGptAccountItems = ( account: ChatGptAccountView, index: number ): Command[] =>
+		account.authStatus !== 'connected'
+			? [
+					{
+						value: `disconnected:${ account.connectionId }`,
+						label: __( 'Sign in to this ChatGPT account in Settings' ),
+						disabled: true,
+						icon: PlugIcon,
+					},
+			  ]
+			: chatGptCommands.some( ( command ) => command.account === account )
+			? chatGptCommands
+					.filter( ( command ) => command.account === account )
+					.map( ( command ) => ( {
+						value: command.value,
+						label: command.model.label,
+						description: `${ __( 'ChatGPT plan' ) } · ${ account.email ?? account.label }`,
+						icon: SparklesIcon,
+					} ) )
+			: [
+					{
+						value: `refresh:${ account.connectionId }`,
+						label: catalogs[ index ].isFetching
+							? __( 'Checking ChatGPT models…' )
+							: catalogs[ index ].isError
+							? __( 'Retry ChatGPT models' )
+							: __( 'No supported ChatGPT models. Refresh' ),
+						description: catalogs[ index ].error?.message,
+						disabled: catalogs[ index ].isFetching,
+						icon: SparklesIcon,
+					},
+			  ];
 	const groups: CommandGroup[] = [
 		{
 			label: __( 'Models' ),
@@ -169,38 +201,20 @@ export function ModelPicker( {
 			( account, index ): CommandGroup => ( {
 				label: `ChatGPT · ${ account.label } · ${ account.connectionId }`,
 				heading: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
-				items:
-					account.authStatus !== 'connected'
+				items: [
+					...chatGptAccountItems( account, index ),
+					// Says the account offers more without naming or offering those models.
+					...( account.authStatus === 'connected' && catalogs[ index ].data?.listsUnqualifiedModels
 						? [
 								{
-									value: `disconnected:${ account.connectionId }`,
-									label: __( 'Sign in to this ChatGPT account in Settings' ),
+									value: `unqualified:${ account.connectionId }`,
+									label: __( 'Some models this account offers aren’t supported in Studio yet' ),
 									disabled: true,
-									icon: PlugIcon,
+									icon: InfoIcon,
 								},
 						  ]
-						: chatGptCommands.some( ( command ) => command.account === account )
-						? chatGptCommands
-								.filter( ( command ) => command.account === account )
-								.map( ( command ) => ( {
-									value: command.value,
-									label: command.model.label,
-									description: `${ __( 'ChatGPT plan' ) } · ${ account.email ?? account.label }`,
-									icon: SparklesIcon,
-								} ) )
-						: [
-								{
-									value: `refresh:${ account.connectionId }`,
-									label: catalogs[ index ].isFetching
-										? __( 'Checking ChatGPT models…' )
-										: catalogs[ index ].isError
-										? __( 'Retry ChatGPT models' )
-										: __( 'No supported ChatGPT models. Refresh' ),
-									description: catalogs[ index ].error?.message,
-									disabled: catalogs[ index ].isFetching,
-									icon: SparklesIcon,
-								},
-						  ],
+						: [] ),
+				],
 			} )
 		),
 		{

@@ -7,9 +7,9 @@ import {
 	CHATGPT_MODELS_QUERY_KEY,
 	CHATGPT_SETTINGS_QUERY_KEY,
 } from '@/data/queries/use-chatgpt-settings';
-import { createFakeConnector, makeSession, makeSite } from '@/test/fake-connector';
+import { createFakeConnector, makeSession, makeSite, TEST_USER } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
-import type { SessionEntry } from '@/data/core';
+import type { AuthUser, SessionEntry } from '@/data/core';
 import type { ChatGptAccountView, ChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
 
@@ -53,10 +53,14 @@ function deferred< T >() {
 	} );
 	return { promise, resolve, reject };
 }
-async function setup( entries = [ pin( INITIAL ) ], withApi = false ) {
+async function setup(
+	entries = [ pin( INITIAL ) ],
+	withApi = false,
+	user: AuthUser | null = null
+) {
 	const connector = createFakeConnector(
 		{
-			user: null,
+			user,
 			sites: [ makeSite( { id: 'one', running: true } ) ],
 			chatGpt: {
 				enabled: true,
@@ -161,6 +165,79 @@ describe( 'ChatGPT chats', () => {
 		expect( runs[ 0 ].selection ).toEqual( { ...INITIAL, reasoningEffort: 'low' } );
 		expect( connector.setSessionOpenAiSelection ).not.toHaveBeenCalled();
 		expect( connector.setAiProvider ).not.toHaveBeenCalled();
+	} );
+
+	it( 'says images come from Studio’s WordPress.com image service as its account, not the ChatGPT plan', async () => {
+		await setup( undefined, false, TEST_USER );
+
+		expect(
+			await screen.findByText(
+				'Images: WordPress.com image service as Test User, not your ChatGPT plan'
+			)
+		).toBeVisible();
+		expect( screen.getByText( /ChatGPT plan · Personal/ ) ).toHaveTextContent( A.slice( 0, 8 ) );
+	} );
+
+	it( 'says images are off without the image service, and opens where to set it up', async () => {
+		const { connector } = await setup();
+
+		expect(
+			await screen.findByText(
+				/Images: off\. They need Studio’s WordPress\.com image service, not your ChatGPT plan\./
+			)
+		).toBeVisible();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Set up image generation' } ) );
+
+		const settings = await screen.findByRole( 'dialog', { name: 'Settings' } );
+		const group = await within( settings ).findByRole( 'group', { name: 'ChatGPT plan' } );
+		expect(
+			await within( group ).findByRole( 'button', { name: 'Log in to WordPress.com' } )
+		).toBeVisible();
+		expect( connector.authenticate ).not.toHaveBeenCalled();
+		expect( connector.beginChatGptSignIn ).not.toHaveBeenCalled();
+	} );
+
+	it( 'says in the picker when the account lists models Studio doesn’t support yet, naming and offering none of them', async () => {
+		const { connector, runs, queryClient } = await setup();
+		connector.getChatGptModels.mockImplementation( async ( connectionId, revision ) => ( {
+			connectionId,
+			revision,
+			checkedAt: new Date().toISOString(),
+			lastError: null,
+			models: connectionId === A ? [ { id: 'gpt-6-luna', label: 'GPT-6 Luna' } ] : [],
+			listsUnqualifiedModels: true,
+		} ) );
+		await act( () => queryClient.resetQueries( { queryKey: CHATGPT_MODELS_QUERY_KEY } ) );
+
+		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+		const personal = await screen.findByRole( 'group', { name: /ChatGPT · Personal/ } );
+		const note = await within( personal ).findByRole( 'option', {
+			name: /Some models this account offers aren’t supported in Studio yet/,
+		} );
+		const work = await screen.findByRole( 'group', { name: /ChatGPT · Work/ } );
+
+		expect( note ).toHaveAttribute( 'aria-disabled', 'true' );
+		expect( within( personal ).getAllByRole( 'option' ) ).toHaveLength( 2 );
+		expect(
+			await within( work ).findByRole( 'option', {
+				name: /Some models this account offers aren’t supported in Studio yet/,
+			} )
+		).toHaveAttribute( 'aria-disabled', 'true' );
+		fireEvent.click( note );
+		expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+		expect( runs ).toHaveLength( 0 );
+	} );
+
+	it( 'adds no note to the picker when the account lists only supported models', async () => {
+		await setup();
+
+		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+		const personal = await screen.findByRole( 'group', { name: /ChatGPT · Personal/ } );
+
+		expect( await within( personal ).findByRole( 'option', { name: /GPT-6 Luna/ } ) ).toBeVisible();
+		expect(
+			within( personal ).queryByRole( 'option', { name: /aren’t supported/ } )
+		).not.toBeInTheDocument();
 	} );
 
 	it( 'sends attached images and documents with the turn on the pinned ChatGPT selection', async () => {

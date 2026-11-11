@@ -10,6 +10,7 @@ import {
 } from '@/data/queries/use-chatgpt-settings';
 import { useOffline } from '@/lib/hooks';
 import { Badge, Button } from '@/lib/ui';
+import { ImageServiceSettingsRow } from './image-service-row';
 import { connectedBadge, SettingsGroup, SettingsRow, SettingsSelect } from './rows';
 import styles from './style.module.css';
 import type { ChatGptCredentialStorage } from '@studio/agent/protocol/chatgpt';
@@ -159,6 +160,9 @@ export function ChatGptSettingsGroup() {
 		( storage === 'session' || settings.data.secureStorage === 'available' );
 	const connected = account?.authStatus === 'connected';
 	const availability = models.data?.models;
+	const unqualifiedNote = models.data?.listsUnqualifiedModels
+		? ` ${ __( 'Some models this account offers aren’t supported in Studio yet.' ) }`
+		: '';
 
 	return (
 		<SettingsGroup
@@ -294,14 +298,15 @@ export function ChatGptSettingsGroup() {
 					error={ models.error?.message }
 					description={
 						availability
-							? availability.length
-								? sprintf(
-										/* translators: %s: comma-separated model names. */ __(
-											'This account lists %s.'
-										),
-										availability.map( ( model ) => model.label ).join( ', ' )
-								  )
-								: __( 'This account lists none of the models Studio supports.' )
+							? ( availability.length
+									? sprintf(
+											/* translators: %s: comma-separated model names. */ __(
+												'This account lists %s.'
+											),
+											availability.map( ( model ) => model.label ).join( ', ' )
+									  )
+									: __( 'This account lists none of the models Studio supports.' ) ) +
+							  unqualifiedNote
 							: __( 'Check which supported models this account can use.' )
 					}
 				>
@@ -316,6 +321,7 @@ export function ChatGptSettingsGroup() {
 					</Button>
 				</SettingsRow>
 			) : null }
+			<ImageServiceSettingsRow subscription={ __( 'ChatGPT plan' ) } />
 		</SettingsGroup>
 	);
 }

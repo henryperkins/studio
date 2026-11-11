@@ -18,6 +18,7 @@ import {
 import { createPortal } from 'react-dom';
 import { toast } from '@/data/app-messages';
 import { useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
+import { useImageService } from '@/data/queries/use-image-service';
 import { useIsOutOfAiCredits } from '@/data/queries/use-is-out-of-ai-credits';
 import { useSaveUserPreferences, useUserPreferences } from '@/data/queries/use-user-preferences';
 import { useOpenSettings } from '@/data/use-open-settings';
@@ -46,6 +47,7 @@ import { useDraftAttachments } from '@/features/composer/use-draft-attachments';
 import { useModelAccess } from '@/features/composer/use-model-access';
 import { useModelSwitch } from '@/features/composer/use-model-switch';
 import { AiCreditsPurchaseDialog } from '@/features/credits';
+import { ImageServiceNote } from '@/features/image-service';
 import { useSubmitFeedback } from '@/lib/hooks';
 import { PlusIcon, StartSiteIcon } from '@/lib/icons';
 import { isImeComposing } from '@/lib/keyboard';
@@ -216,6 +218,8 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		provider,
 	} );
 	const { data: chatGptSettings } = useChatGptSettings();
+	// Only a chat on a subscription plan says which service makes its images.
+	const { data: imageService } = useImageService( !! chatGpt );
 	const chatGptAccounts =
 		chatGptSettings?.enabled && onSwitchSession && ! isField ? chatGptSettings.accounts : [];
 	const canChooseModel = providers.length > 0 || chatGptAccounts.length > 0 || !! chatGpt;
@@ -731,6 +735,14 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 					{ chatGpt ? (
 						<div className={ styles.connectionLabel }>
 							{ __( 'ChatGPT plan' ) } · { chatGptLabel }
+							{ imageService ? (
+								<ImageServiceNote
+									className={ styles.imageServiceNote }
+									state={ imageService }
+									subscription={ __( 'ChatGPT plan' ) }
+									onSetUp={ () => openSettings( 'ai' ) }
+								/>
+							) : null }
 						</div>
 					) : null }
 				</InputGroup>
