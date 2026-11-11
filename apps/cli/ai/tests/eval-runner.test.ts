@@ -396,6 +396,35 @@ describe( 'eval runner provider selection', () => {
 			STUDIO_EVAL_MODEL: 'gpt-6-luna',
 		};
 
+		it( 'removes the linked ChatGPT sign-in as soon as the turns end, even when site cleanup then fails', async () => {
+			const present = ( file: string ) => {
+				try {
+					fs.lstatSync( file );
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			const caseLinks = () => {
+				const caseDir = process.env.E2E_SHARED_CONFIG_PATH ?? '';
+				return [ 'chatgpt-credentials', 'chatgpt-accounts.json' ].filter( ( name ) =>
+					present( path.join( caseDir, name ) )
+				);
+			};
+			agent.behavior = { replyProvider: 'studio-chatgpt' };
+			await runEval( input( {}, chatGptEnv ) );
+			expect( caseLinks() ).toEqual( [] );
+
+			// A bystander site that can't be deleted makes the run throw afterwards.
+			// The source profile is the test's again, not the last run's case profile.
+			delete process.env.E2E;
+			delete process.env.E2E_SHARED_CONFIG_PATH;
+			sites.remove.mockImplementationOnce( ( () => undefined ) as never );
+			await expect( runEval( input( {}, chatGptEnv ) ) ).rejects.toThrow();
+			expect( caseLinks() ).toEqual( [] );
+			expect( present( path.join( paths.root, 'profile', 'chatgpt-credentials' ) ) ).toBe( true );
+		} );
+
 		it( 'records every remote operation under remote: mock, never reaching the real host', async () => {
 			agent.behavior = {
 				replyProvider: 'studio-wpcom',

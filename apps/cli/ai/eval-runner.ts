@@ -962,6 +962,10 @@ export async function runEval( input: EvalRunnerInput ) {
 		error = caught instanceof Error ? caught.message : String( caught );
 	} finally {
 		clearTimeout( timeout );
+		// The turns are over: nothing after them may use the source profile's
+		// sign-in, and the route report covers the turns' requests only.
+		uninstallObserver?.();
+		unlinkChatGpt?.();
 		outcome = await captureTurnOutcome(
 			sitesBeforeTurn,
 			seeded?.activeSitePath,
@@ -974,8 +978,6 @@ export async function runEval( input: EvalRunnerInput ) {
 			await seeded.cleanup().catch( () => undefined );
 		}
 		await deleteSites( bystanderPaths );
-		uninstallObserver?.();
-		unlinkChatGpt?.();
 	}
 	phaseTimingsMs.total_eval_ms = elapsed();
 
