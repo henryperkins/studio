@@ -1083,6 +1083,10 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 	// with no output cap.
 	const expectPinned = ( effort: OpenAiReasoningEffort, token = TOKEN ) => {
 		expect( requests.length ).toBeGreaterThan( 0 );
+		expect( fakeBroker.handles.length ).toBeGreaterThan( 0 );
+		for ( const handle of fakeBroker.handles ) {
+			expect( handle.connectionId ).toBe( CONNECTION_ID );
+		}
 		for ( const request of requests ) {
 			expect( request.headers.get( 'authorization' ) ).toBe( `Bearer ${ token }` );
 			expect( request.body.model ).toBe( 'gpt-6-luna' );
