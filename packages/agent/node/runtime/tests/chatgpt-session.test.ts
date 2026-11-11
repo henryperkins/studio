@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAgent } from '@studio/agent/node/agent';
 import { ChatGptConnectionError } from '@studio/agent/node/chatgpt/account-store';
 import { buildAttachedFilesPromptBlock } from '@studio/agent/protocol/chat-files';
+import { getToolResultImageService } from '@studio/agent/protocol/image-service';
 import { OPENAI_MODEL_CAPABILITIES } from '@studio/agent/protocol/openai-models';
 import { readLastReplyProvider } from '@studio/agent/protocol/providers';
 import { formatVisualAnnotationsPrompt } from '@studio/agent/protocol/visual-annotations';
@@ -58,7 +59,7 @@ const seams = vi.hoisted( () => ( {
 	order: [] as string[],
 	captureScreenshotBuffer: vi.fn(),
 	annotateInBrowser: vi.fn(),
-	wpcomLogin: null as { accessToken: string } | null,
+	wpcomLogin: null as { accessToken: string; displayName: string; email: string } | null,
 } ) );
 
 vi.mock( '@studio/agent/node/tools/screenshot-helpers', async ( importOriginal ) => ( {
@@ -1443,23 +1444,33 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 
 		// Image generation is Studio's WordPress.com image service: offered on a
 		// ChatGPT turn when that service is configured, never through the
-		// ChatGPT sign-in.
+		// ChatGPT sign-in. Its guidance follows it, and its result records the
+		// service and account that made the images, for Studio to show only.
+		const IMAGE_ACCOUNT = { displayName: 'Image Account', email: 'images@example.test' };
 		it.each( [
-			[ 'no image service', {}, null, undefined ],
+			[ 'no image service', {}, null, undefined, undefined ],
 			[
 				'an image service token',
 				{ STUDIO_IMAGE_API_TOKEN: IMAGE_SERVICE_TOKEN },
 				null,
 				IMAGE_SERVICE_TOKEN,
+				{ service: 'wordpress-com', credential: 'environment-token', account: null },
 			],
-			[ 'a WordPress.com login', {}, 'test-wpcom-login-token', 'test-wpcom-login-token' ],
+			[
+				'a WordPress.com login',
+				{},
+				'test-wpcom-login-token',
+				'test-wpcom-login-token',
+				{ service: 'wordpress-com', credential: 'wordpress-com-login', account: IMAGE_ACCOUNT },
+			],
 		] as const )(
 			'offers image generation with %s, on its own credential',
-			async ( _name, env, login, imageToken ) => {
+			async ( _name, env, login, imageToken, expectedService ) => {
+				vi.stubEnv( 'STUDIO_IMAGE_API_TOKEN', '' );
 				for ( const [ name, value ] of Object.entries( env ) ) {
 					vi.stubEnv( name, value );
 				}
-				seams.wpcomLogin = login ? { accessToken: login } : null;
+				seams.wpcomLogin = login ? { accessToken: login, ...IMAGE_ACCOUNT } : null;
 				imageService = () =>
 					new Response( JSON.stringify( { data: [ { b64_json: TINY_PNG_BASE64 } ] } ) );
 				const selection = selectionFor();
@@ -1491,6 +1502,23 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				expect(
 					JSON.stringify( requests.map( ( request ) => [ ...request.headers ] ) )
 				).not.toMatch( /test-wpcom-/ );
+
+				const instructions = String( requests[ 0 ].body.instructions );
+				expect( instructions.includes( 'load the `imagery` skill' ) ).toBe( Boolean( imageToken ) );
+				expect( instructions.includes( 'You cannot make images in this conversation' ) ).toBe(
+					! imageToken
+				);
+				const result = turn.entries
+					.map( ( entry ) => ( entry as { message?: Record< string, unknown > } ).message )
+					.find(
+						( message ) => message?.role === 'toolResult' && message.toolName === 'generate_images'
+					);
+				expect( getToolResultImageService( result?.details ) ).toEqual( expectedService );
+				// The record is Studio's: no ChatGPT request carries it, nor the
+				// image service's credential.
+				expect( JSON.stringify( requests.map( ( request ) => request.body ) ) ).not.toMatch(
+					/Image Account|images@example\.test|wordpress-com|studioService|test-wpcom-/
+				);
 			}
 		);
 	} );

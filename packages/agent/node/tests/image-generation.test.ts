@@ -1,17 +1,111 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { updateSharedConfig } from '@studio/common/lib/shared-config';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	buildImageRequestBody,
 	composeImagePrompt,
 	fitToTokens,
 	ImageFilteredError,
 	interpretImageResponse,
+	isImageGenerationAvailable,
+	readImageServiceState,
+	resolveImageService,
 	resolveImageSize,
 	TransientImageError,
 } from '@studio/agent/node/image-generation';
 import { resolveImageFilePath } from '@studio/agent/node/tools/generate-images';
 
 const SITES_ROOT = path.resolve( '/studio-sites' );
+
+describe( 'the image service', () => {
+	// Test values only; nothing here reaches WordPress.com.
+	const LOGIN_TOKEN = 'test-wpcom-login-token';
+	const IMAGE_TOKEN = 'test-image-service-token';
+	let configDir: string;
+
+	beforeEach( async () => {
+		configDir = await fs.mkdtemp( path.join( os.tmpdir(), 'studio-image-service-' ) );
+		vi.stubEnv( 'DEV_CONFIG_DIR', configDir );
+		vi.stubEnv( 'STUDIO_IMAGE_API_TOKEN', '' );
+	} );
+
+	afterEach( async () => {
+		vi.unstubAllEnvs();
+		await fs.rm( configDir, { recursive: true, force: true } );
+	} );
+
+	const logIn = ( expirationTime = Date.now() + 60_000 ) =>
+		updateSharedConfig( {
+			authToken: {
+				accessToken: LOGIN_TOKEN,
+				expiresIn: 60,
+				expirationTime,
+				id: 42,
+				email: 'someone@example.test',
+				displayName: 'Someone',
+			},
+		} );
+
+	it( 'is unavailable without a WordPress.com login or a token, and says what sets it up', async () => {
+		await expect( readImageServiceState() ).resolves.toEqual( {
+			available: false,
+			service: 'wordpress-com',
+			reason: 'signed-out',
+			setup: 'wordpress-com-login',
+		} );
+		await expect( resolveImageService() ).resolves.toBeNull();
+		await expect( isImageGenerationAvailable() ).resolves.toBe( false );
+	} );
+
+	it( 'treats an expired login as no login', async () => {
+		await logIn( Date.now() - 1 );
+
+		await expect( readImageServiceState() ).resolves.toMatchObject( { available: false } );
+		await expect( isImageGenerationAvailable() ).resolves.toBe( false );
+	} );
+
+	it( 'acts as the WordPress.com login, naming its account as Studio shows it and nothing more', async () => {
+		await logIn();
+
+		const state = await readImageServiceState();
+
+		expect( state ).toEqual( {
+			available: true,
+			service: 'wordpress-com',
+			credential: 'wordpress-com-login',
+			account: { displayName: 'Someone', email: 'someone@example.test' },
+		} );
+		expect( JSON.stringify( state ) ).not.toContain( LOGIN_TOKEN );
+		expect( JSON.stringify( state ) ).not.toContain( '42' );
+		await expect( resolveImageService() ).resolves.toEqual( {
+			token: LOGIN_TOKEN,
+			use: {
+				service: 'wordpress-com',
+				credential: 'wordpress-com-login',
+				account: { displayName: 'Someone', email: 'someone@example.test' },
+			},
+		} );
+		await expect( isImageGenerationAvailable() ).resolves.toBe( true );
+	} );
+
+	it( 'prefers an image service token to the login, naming no account for it', async () => {
+		vi.stubEnv( 'STUDIO_IMAGE_API_TOKEN', ` ${ IMAGE_TOKEN } ` );
+		await logIn();
+
+		const state = await readImageServiceState();
+
+		expect( state ).toEqual( {
+			available: true,
+			service: 'wordpress-com',
+			credential: 'environment-token',
+			account: null,
+		} );
+		expect( JSON.stringify( state ) ).not.toContain( IMAGE_TOKEN );
+		await expect( resolveImageService() ).resolves.toMatchObject( { token: IMAGE_TOKEN } );
+	} );
+} );
 
 const PNG_BASE64 = Buffer.from( [
 	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00,

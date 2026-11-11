@@ -46,3 +46,29 @@ it( 'adds the declared settings of the core blocks a result shows, from the site
 	// Once per MCP session, as once per Studio Code turn.
 	expect( await notes( { nameOrPath: 'My Site' } ) ).toEqual( [] );
 } );
+
+it( 'never hands an MCP client the image service account a result was made with', async () => {
+	const tool = defineTool(
+		'make_images',
+		'Makes images.',
+		{},
+		async () => ( {
+			content: [ { type: 'text', text: 'Generating 1 image in the background.' } ],
+			studioService: {
+				service: 'wordpress-com',
+				credential: 'wordpress-com-login',
+				account: { displayName: 'Someone', email: 'someone@example.test' },
+			},
+		} ),
+		{ annotations: READ_ONLY }
+	);
+
+	const served = await runServedTool(
+		cliAgentHost,
+		bindTool( tool, cliAgentHost ),
+		{},
+		createResultNotes()
+	);
+
+	expect( JSON.stringify( served ) ).not.toMatch( /Someone|someone@example|wordpress-com/ );
+} );
