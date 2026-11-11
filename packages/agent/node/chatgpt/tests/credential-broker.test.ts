@@ -823,6 +823,59 @@ describe( 'ChatGPT credential broker', () => {
 				'test-access-token-3'
 			);
 		}, 60_000 );
+
+		it( 'never brings back a rotation lost when the app is killed while refreshing, and asks for a sign-in instead', async () => {
+			const tokenService = await startMockTokenService( { refreshToken: 'test-refresh-token-1' } );
+			onTestFinished( () => tokenService.close() );
+			const keychainFile = path.join( configDir, 'test-keychain.json' );
+			const options = {
+				credentialStore: createFileCredentialStore( keychainFile ),
+				tokenClient: createHttpTokenClient( tokenService.url ),
+				timing: { refreshLockStaleMs: 500 },
+			};
+			const { registrationId } = await startBroker( options ).saveSignIn(
+				signIn( { tokens: expiring() } )
+			);
+
+			const crashing = startBrokerProcess( [
+				'refresh-crash-before-vault-rename',
+				keychainFile,
+				tokenService.url,
+				registrationId,
+			] );
+			const exit = await crashing.exited;
+
+			// Killed holding the refresh lock, after the service rotated the token it presented.
+			expect( exit ).not.toEqual( { code: 0, signal: null } );
+			expect( crashing.output() ).toBe( '' );
+			expect( tokenService.refreshes ).toEqual( [ 'test-refresh-token-1' ] );
+			expect( vaultFiles() ).toEqual( [
+				`${ registrationId }.vault`,
+				expect.stringMatching( new RegExp( `^${ registrationId }\\.vault\\.tmp-` ) ),
+			] );
+
+			// Once that lock is stale, the next use presents the token the record kept, which was spent.
+			const survivor = startBroker( options );
+			await expect( survivor.getAccessToken( registrationId ) ).rejects.toMatchObject( {
+				code: 'needs-sign-in',
+			} );
+			expect( tokenService.refreshes ).toEqual( [
+				'test-refresh-token-1',
+				'test-refresh-token-1',
+			] );
+			expect( vaultFiles() ).toEqual( [] );
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				state: 'needs-sign-in',
+			} );
+			for ( const call of [
+				() => survivor.getAccessToken( registrationId ),
+				() => startBroker( options ).getAccessToken( registrationId ),
+				() => survivor.beginTurn( registrationId ),
+			] ) {
+				await expect( call() ).rejects.toMatchObject( { code: 'needs-sign-in' } );
+			}
+			expect( tokenService.refreshes ).toHaveLength( 2 );
+		}, 60_000 );
 	} );
 
 	describe( 'access tokens', () => {
@@ -1158,6 +1211,90 @@ describe( 'ChatGPT credential broker', () => {
 				] )
 			);
 		} );
+
+		it.each( [ 'vault', 'session' ] as const )(
+			'retires a %s refresh held across sign-out while a turn waits on a tool, which never runs',
+			async ( storage ) => {
+				const broker = startBroker();
+				const { registrationId } = await broker.saveSignIn( signIn( { storage } ) );
+				const handle = await broker.beginTurn( registrationId );
+				const log: string[] = [];
+				const approval = deferred< string >();
+				const turn = runTurn(
+					handle,
+					{
+						stream: async function* () {
+							yield 'calling a tool';
+						},
+						toolCall: () => approval.promise,
+					},
+					log
+				);
+				await vi.waitFor( () => expect( log ).toContain( 'text calling a tool' ) );
+				// Another request found its token rejected, and its refresh is still out.
+				await broker.invalidateAccessToken(
+					registrationId,
+					await broker.getAccessToken( registrationId )
+				);
+				const refresh = deferred< ChatGptTokenServiceResult< ChatGptTokenSet > >();
+				service.answerRefresh( () => refresh.promise );
+				const renewing = settled( broker.getAccessToken( registrationId ) );
+				await vi.waitFor( () => expect( service.refreshes ).toHaveLength( 1 ) );
+
+				const signingOut = broker.signOut( registrationId );
+				await vi.waitFor( () => expect( handle.signal.aborted ).toBe( true ) );
+				approval.resolve( 'delete_site' );
+				await turn;
+				expect( await broker.listConnections() ).toEqual( [
+					expect.objectContaining( { connectionId: registrationId, authStatus: 'disconnected' } ),
+				] );
+				// A turn forked meanwhile asks for the session's token, and gets none.
+				const forkReply = vi.fn();
+				broker.answerSessionTokenRequest(
+					{
+						type: 'studio.chatgpt-session-token.request',
+						requestId: 'request-during-sign-out',
+						connectionId: registrationId,
+						logoutGeneration: 0,
+					},
+					forkReply
+				);
+				refresh.resolve( { ok: true, value: tokens( 2 ) } );
+
+				expect( await renewing ).toEqual( {
+					error: expect.objectContaining( { code: 'signed-out' } ),
+				} );
+				await expect( signingOut ).resolves.toEqual( {
+					localCleared: true,
+					remoteRevocationConfirmed: true,
+				} );
+				expect( log ).toEqual( [ 'request', 'text calling a tool', 'stopped signed-out' ] );
+				await vi.waitFor( () =>
+					expect( forkReply ).toHaveBeenCalledWith(
+						expect.objectContaining( { requestId: 'request-during-sign-out', accessToken: null } )
+					)
+				);
+				// The rotated grant is revoked once; a vault sign-out also revokes the stored token it read.
+				await vi.waitFor( () =>
+					expect( service.revocations.map( ( request ) => request.refreshToken ).sort() ).toEqual(
+						storage === 'vault'
+							? [ 'test-refresh-token-1', 'test-refresh-token-2' ]
+							: [ 'test-refresh-token-2' ]
+					)
+				);
+				for ( const call of [
+					() => handle.getAccessToken(),
+					() => broker.getAccessToken( registrationId ),
+					() => startBroker().getAccessToken( registrationId ),
+				] ) {
+					await expect( call() ).rejects.toMatchObject( { code: 'signed-out' } );
+				}
+				expect( service.refreshes ).toHaveLength( 1 );
+				expect( vaultFiles() ).toEqual( [] );
+				expect( broker.getSessionForkEnvironment() ).toEqual( {} );
+				await expect( broker.readIdTokenHint( registrationId ) ).resolves.toBeNull();
+			}
+		);
 	} );
 
 	describe( 'a sign-in and a sign-out at once', () => {
@@ -2029,6 +2166,68 @@ describe( 'ChatGPT credential broker', () => {
 			await expect( turn.getAccessToken( account.registrationId ) ).rejects.toMatchObject( {
 				code: 'session-unavailable',
 			} );
+		} );
+
+		it( 'fails a forked turn closed once the app holding its session has exited, never falling back to a stored record', async () => {
+			const app = startBroker();
+			const account = await app.saveSignIn( signIn() );
+			const storedRecord = fs.readFileSync( vaultPath( account.registrationId ) );
+			await app.saveSignIn(
+				signIn( {
+					registrationId: account.registrationId,
+					storage: 'session',
+					tokens: tokens( 2 ),
+				} )
+			);
+			// The record from before the switch, put back where a fallback would find it.
+			fs.writeFileSync( vaultPath( account.registrationId ), storedRecord );
+			const offer = app.getSessionForkEnvironment();
+			let appExited = false;
+			const channel = Object.assign( new EventEmitter(), {
+				send: ( message: unknown, callback: ( error: Error | null ) => void ) => {
+					if ( appExited ) {
+						// What Node reports to a child sending after its parent's end has closed.
+						const closed = Object.assign( new Error( 'Channel closed' ), {
+							code: 'ERR_IPC_CHANNEL_CLOSED',
+						} );
+						process.nextTick( () => callback( closed ) );
+						return false;
+					}
+					app.answerSessionTokenRequest( message, ( reply ) =>
+						setImmediate( () => channel.emit( 'message', reply ) )
+					);
+					callback( null );
+					return true;
+				},
+			} );
+			const fork = startBroker();
+			fork.acceptSessionTokensFromParent( channel, { ...offer } );
+			const handed = await fork.getAccessToken( account.registrationId );
+			expect( handed ).toBe( 'test-access-token-2' );
+
+			appExited = true;
+			// The route then rejects the token the turn holds, and there is nowhere to get another.
+			await fork.invalidateAccessToken( account.registrationId, handed );
+
+			await expect( fork.getAccessToken( account.registrationId ) ).rejects.toMatchObject( {
+				code: 'session-unavailable',
+			} );
+			// A channel that throws once its app has gone fails the same way.
+			const orphan = startBroker();
+			orphan.acceptSessionTokensFromParent(
+				Object.assign( new EventEmitter(), {
+					send: () => {
+						throw new Error( 'Channel closed' );
+					},
+				} ),
+				{ ...offer }
+			);
+			await expect( orphan.getAccessToken( account.registrationId ) ).rejects.toMatchObject( {
+				code: 'session-unavailable',
+			} );
+			expect( service.refreshes ).toEqual( [] );
+			expect( service.revocations ).toEqual( [] );
+			expect( fs.readFileSync( vaultPath( account.registrationId ) ) ).toEqual( storedRecord );
 		} );
 	} );
 

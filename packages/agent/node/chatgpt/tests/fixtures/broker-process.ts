@@ -54,7 +54,10 @@ async function report( task: () => Promise< unknown > ): Promise< void > {
 }
 
 async function main(): Promise< void > {
-	if ( command === 'crash-before-vault-rename' ) {
+	if (
+		command === 'crash-before-vault-rename' ||
+		command === 'refresh-crash-before-vault-rename'
+	) {
 		// The app is killed after a record's temp file is written and before it
 		// replaces the record. Patched before the vault's file module loads.
 		const rename = fs.rename;
@@ -86,6 +89,10 @@ async function main(): Promise< void > {
 	} else if ( command === 'crash-before-vault-rename' ) {
 		const signIn = JSON.parse( await nextLine() );
 		await report( () => broker.saveSignIn( signIn ) );
+	} else if ( command === 'refresh-crash-before-vault-rename' ) {
+		// Killed once the token service has rotated the refresh token, before the
+		// record that holds the rotation replaces the one that doesn't.
+		await report( () => broker.getAccessToken( registrationId ) );
 	} else if ( command === 'hold-turn' ) {
 		const handle = await broker.beginTurn( registrationId );
 		await handle.getAccessToken();
