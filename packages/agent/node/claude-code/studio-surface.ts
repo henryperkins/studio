@@ -21,6 +21,7 @@ import {
 import { inspectClaudeExecutable } from './discovery';
 import { currentClaudeHost, isClaudeRuntimeSurfaceEnabled } from './platform';
 import { getClaudeGlobalWorkspace, getClaudeSessionStoreRoot } from './sessions';
+import type { ClaudeSignInRefusalReason } from './connection';
 import type { ClaudeSignInActionReason } from './platform';
 import type { ClaudeBackendTurnSnapshot } from '@studio/agent/protocol/backend-events';
 import type {
@@ -95,6 +96,7 @@ export async function configureClaudeRuntime( action: ClaudeRuntimeAction ): Pro
 		const result = await openClaudeNativeSignIn( action.connectionId );
 		if ( result.state === 'user-action-needed' )
 			throw new ClaudeSignInActionRequiredError( result.reason );
+		if ( result.state === 'refused' ) throw new ClaudeSignInRefusedError( result.reason );
 		return;
 	}
 	throw new Error( 'Invalid Claude Code connection action.' );
@@ -105,6 +107,17 @@ export class ClaudeSignInActionRequiredError extends Error {
 	constructor( readonly reason: ClaudeSignInActionReason ) {
 		super( `claude-sign-in-action-required:${ reason }` );
 		this.name = 'ClaudeSignInActionRequiredError';
+	}
+}
+
+/**
+ * Studio refused to open sign-in for this connection and changed nothing. The
+ * message is the typed code, since only an error's message crosses IPC.
+ */
+export class ClaudeSignInRefusedError extends Error {
+	constructor( readonly reason: ClaudeSignInRefusalReason ) {
+		super( `claude-sign-in-refused:${ reason }` );
+		this.name = 'ClaudeSignInRefusedError';
 	}
 }
 

@@ -6,7 +6,7 @@ import {
 	resolveClaudeConfigContext,
 	resolveClaudeProjectsDirectory,
 } from '../connection';
-import { simulatedHost } from './fixtures/native-binaries';
+import { memoryFileSystem, sha256, simulatedHost } from './fixtures/native-binaries';
 
 describe( 'Claude config context', () => {
 	it( 'preserves default mode and blocks conflicting inherited directories', async () => {
@@ -138,10 +138,36 @@ describe( 'Claude account status', () => {
 		email: 'user@example.com',
 		orgName: 'Studio',
 	};
-	const read = ( run: Parameters< typeof readClaudeAccountStatus >[ 3 ] ) =>
-		readClaudeAccountStatus( 'claude', process.cwd(), undefined, run );
+	const selected = '/home/tester/.local/bin/claude';
+	const inspected = '/home/tester/.local/share/claude/versions/2.1.319';
+	async function prepared() {
+		const disk = memoryFileSystem( path.posix );
+		disk.write( inspected, Buffer.from( 'inspected binary' ) );
+		disk.link( selected, inspected );
+		const found = await disk.files.stat( inspected );
+		const request = {
+			selectedPath: selected,
+			executablePath: inspected,
+			executableIdentity: {
+				path: inspected,
+				size: found.size,
+				device: found.device,
+				inode: found.inode,
+				modified: found.modified,
+				changed: found.changed,
+				sha256: sha256( Buffer.from( 'inspected binary' ) ),
+			},
+			cwd: process.cwd(),
+		};
+		return { disk, request };
+	}
+	type Runner = NonNullable< Parameters< typeof readClaudeAccountStatus >[ 1 ] >[ 'run' ];
+	const read = async ( run: Runner ) => {
+		const { disk, request } = await prepared();
+		return readClaudeAccountStatus( request, { run, files: disk.files } );
+	};
 
-	it( 'reads the signed-in account through `claude auth status`', async () => {
+	it( 'reads the signed-in account through `claude auth status` with the prepared binary', async () => {
 		isolate();
 		const run = vi.fn( async () => ( { stdout: JSON.stringify( signedIn ) } ) );
 		await expect( read( run ) ).resolves.toEqual( {
@@ -149,10 +175,61 @@ describe( 'Claude account status', () => {
 			identity: { email: 'user@example.com', organization: 'Studio', subscriptionType: 'max' },
 		} );
 		expect( run ).toHaveBeenCalledWith(
-			'claude',
+			inspected,
 			[ 'auth', 'status', '--json' ],
 			expect.objectContaining( { timeout: expect.any( Number ) } )
 		);
+	} );
+
+	it( 'runs nothing when the selected path no longer leads to the prepared, unchanged binary', async () => {
+		isolate();
+		const changes: Array< [ string, ( disk: ReturnType< typeof memoryFileSystem > ) => void ] > = [
+			[
+				're-pointed launcher',
+				( disk ) => {
+					disk.write( '/home/tester/.local/share/claude/versions/2.1.320', Buffer.from( 'next' ) );
+					disk.link( selected, '/home/tester/.local/share/claude/versions/2.1.320' );
+				},
+			],
+			[ 'replaced file', ( disk ) => disk.write( inspected, Buffer.from( 'replaced binary' ) ) ],
+			[
+				'edited in place',
+				( disk ) => disk.write( inspected, Buffer.from( 'inspected binary' ), { inPlace: true } ),
+			],
+			[ 'removed file', ( disk ) => disk.remove( inspected ) ],
+		];
+		for ( const [ name, change ] of changes ) {
+			const { disk, request } = await prepared();
+			change( disk );
+			const run = vi.fn( async () => ( { stdout: JSON.stringify( signedIn ) } ) );
+			await expect(
+				readClaudeAccountStatus( request, { run, files: disk.files } ),
+				name
+			).resolves.toEqual( { state: 'unavailable' } );
+			expect( run, name ).not.toHaveBeenCalled();
+		}
+		const { disk, request } = await prepared();
+		const run = vi.fn( async () => ( { stdout: JSON.stringify( signedIn ) } ) );
+		await expect(
+			readClaudeAccountStatus(
+				{ ...request, executablePath: selected },
+				{ run, files: disk.files }
+			)
+		).resolves.toEqual( { state: 'unavailable' } );
+		expect( run ).not.toHaveBeenCalled();
+	} );
+
+	it( 'discards a status read while the prepared binary was being replaced', async () => {
+		isolate();
+		const { disk, request } = await prepared();
+		const run = vi.fn( async () => {
+			disk.write( inspected, Buffer.from( 'auto-updated binary' ) );
+			return { stdout: JSON.stringify( signedIn ) };
+		} );
+		await expect( readClaudeAccountStatus( request, { run, files: disk.files } ) ).resolves.toEqual(
+			{ state: 'unavailable' }
+		);
+		expect( run ).toHaveBeenCalledOnce();
 	} );
 
 	it( 'tells a signed-out or unqualified account apart from a status it could not read', async () => {

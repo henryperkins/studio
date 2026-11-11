@@ -32,7 +32,7 @@ import { isClaudeExecutableUnchanged } from './platform';
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
 import { createStudioClaudeMcpServer, createStudioClaudeToolBridge } from './tool-bridge';
 import type { ClaudeAuthIdentity } from './auth-status';
-import type { ClaudeAccountStatus } from './connection';
+import type { ClaudeAccountStatus, ClaudeAccountStatusRequest } from './connection';
 import type { ClaudeAccountCheck, ClaudeApprover } from './execution-policy';
 import type { ClaudeExecutableIdentity } from './platform';
 import type { StudioAgentHost } from '../host';
@@ -225,8 +225,8 @@ interface RuntimeDependencies {
 		{ id: string; executablePath: string; configDirectory?: string; revision?: number } | undefined
 	>;
 	prepare?: ( exe: string, cwd: string, config?: string ) => Promise< Prepared >;
-	/** The native sign-in now, read from the runtime's own status. */
-	account?: ( exe: string, cwd: string, config?: string ) => Promise< ClaudeAccountStatus >;
+	/** The native sign-in now, read with the prepared binary from the runtime's own status. */
+	account?: ( request: ClaudeAccountStatusRequest ) => Promise< ClaudeAccountStatus >;
 	clock?: () => number;
 }
 
@@ -572,14 +572,18 @@ export async function runClaudeTurn(
 			stop( 'detached' );
 			return false;
 		};
-		// Reads the native sign-in the runtime would use now. Another account ends
-		// the turn; a status that cannot be read ends it too, but says so.
+		// Reads the native sign-in the runtime would use now, with the prepared
+		// binary only. Another account ends the turn; a status that cannot be
+		// read, or a selected path that no longer leads to that binary, ends it
+		// too, but says so.
 		const verifyAccount = async (): Promise< ClaudeAccountCheck > => {
-			const status = await ( options.account ?? readClaudeAccountStatus )(
-				connection.executablePath,
-				prepared.cwd,
-				connection.configDirectory
-			).catch( (): ClaudeAccountStatus => ( { state: 'unavailable' } ) );
+			const status = await ( options.account ?? readClaudeAccountStatus )( {
+				selectedPath: connection.executablePath,
+				executablePath: prepared.executablePath,
+				executableIdentity: prepared.executableIdentity,
+				cwd: prepared.cwd,
+				configDirectory: connection.configDirectory,
+			} ).catch( (): ClaudeAccountStatus => ( { state: 'unavailable' } ) );
 			if (
 				status.state === 'signed-in' &&
 				isSameClaudeAccount( prepared.identity, status.identity )

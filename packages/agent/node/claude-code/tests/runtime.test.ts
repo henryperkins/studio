@@ -1275,6 +1275,33 @@ function nativeAccount( email: string ) {
 	return { email, subscriptionType: 'max', apiProvider: 'firstParty' };
 }
 
+// A selected launcher that links to the binary a turn was prepared with, on a simulated disk.
+async function preparedBinary() {
+	const { memoryFileSystem, sha256 } = await import( './fixtures/native-binaries' );
+	const path = await import( 'path' );
+	const disk = memoryFileSystem( path.posix );
+	const selected = '/home/tester/.local/bin/claude';
+	const inspected = '/home/tester/.local/share/claude/versions/2.1.319';
+	const bytes = Buffer.from( 'inspected binary' );
+	disk.write( inspected, bytes );
+	disk.link( selected, inspected );
+	const found = await disk.files.stat( inspected );
+	return {
+		disk,
+		selected,
+		inspected,
+		executableIdentity: {
+			path: inspected,
+			size: found.size,
+			device: found.device,
+			inode: found.inode,
+			modified: found.modified,
+			changed: found.changed,
+			sha256: sha256( bytes ),
+		},
+	};
+}
+
 it( 'registers a PreToolUse hook that outlasts any approval and denies a cancelled hook (mock SDK)', async () => {
 	const { runClaudeTurn } = await import( '../runtime' );
 	const { CLAUDE_HOOK_TIMEOUT_SECONDS } = await import( '../execution-rules' );
@@ -1404,6 +1431,7 @@ it( 'stops the turn within the recheck bound when the stored sign-in changes or 
 			[ status( 'someone-else@example.com' ), 'account_changed' ],
 			[ 'unreadable output', 'account_unverified' ],
 		] ) {
+			const { disk, selected, inspected, executableIdentity } = await preparedBinary();
 			let stored = status( 'user@example.com' );
 			const now = { value: 1_000 };
 			const preflight = 400;
@@ -1469,16 +1497,19 @@ it( 'stops the turn within the recheck bound when the stored sign-in changes or 
 					approve: async () => 'deny',
 					verifyTarget: async () => true,
 					clock: () => now.value,
-					account: ( executable, cwd, config ) =>
-						readClaudeAccountStatus( executable, cwd, config, async () => ( { stdout: stored } ) ),
+					account: ( request ) =>
+						readClaudeAccountStatus( request, {
+							run: async () => ( { stdout: stored } ),
+							files: disk.files,
+						} ),
 					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+					connection: async () => ( { id: 'native', executablePath: selected } ),
 					prepare: async () => {
 						now.value += preflight;
 						return {
 							ok: true,
-							executablePath: 'fake',
-							executableIdentity: fakeIdentity,
+							executablePath: inspected,
+							executableIdentity,
 							cwd: fixture.root,
 							configDirectory: fixture.config,
 							projectsDirectory: fixture.projects,
@@ -1492,6 +1523,125 @@ it( 'stops the turn within the recheck bound when the stored sign-in changes or 
 			expect( events.at( -1 ) ).toMatchObject( {
 				type: 'turn.terminal',
 				outcome: { status: 'interrupted', code },
+			} );
+		}
+	} finally {
+		vi.unstubAllEnvs();
+		await fixture.cleanup();
+	}
+} );
+
+it( 'runs no account re-check against a binary the selected path was re-pointed or replaced to mid-turn, and stops as unverified (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { readClaudeAccountStatus } = await import( '../connection' );
+	const { CLAUDE_ACCOUNT_RECHECK_MS } = await import( '../execution-rules' );
+	const { recordingRunner } = await import( './fixtures/native-binaries' );
+	const path = await import( 'path' );
+	for ( const name of Object.keys( process.env ) )
+		if ( /^(ANTHROPIC_|AWS_|GOOGLE_|AZURE_|CLAUDE_)|_PROXY$/i.test( name ) ) vi.stubEnv( name, '' );
+	const fixture = await runtimeFixture( 'claude-repointed-' );
+	try {
+		for ( const change of [ 're-pointed', 'replaced' ] as const ) {
+			const { disk, selected, inspected, executableIdentity } = await preparedBinary();
+			const other = '/home/tester/.local/share/claude/versions/2.1.320';
+			disk.write( other, Buffer.from( 'another binary' ) );
+			const runner = recordingRunner( () =>
+				JSON.stringify( {
+					loggedIn: true,
+					authMethod: 'claude.ai',
+					apiProvider: 'firstParty',
+					storedClaudeAiLogin: true,
+					subscriptionType: 'max',
+					email: 'user@example.com',
+				} )
+			);
+			const now = { value: 1_000 };
+			const decisions: string[] = [];
+			const query = fakeNativeTurn( fixture.root, {
+				onTurn: async ( options ) => {
+					const hook = (
+						options.hooks as {
+							PreToolUse: Array< {
+								hooks: Array<
+									(
+										input: unknown,
+										id: string,
+										context: { signal: AbortSignal }
+									) => Promise< { hookSpecificOutput: { permissionDecision: string } } >
+								>;
+							} >;
+						}
+					 ).PreToolUse[ 0 ].hooks[ 0 ];
+					const read = async () =>
+						decisions.push(
+							(
+								await hook(
+									{
+										hook_event_name: 'PreToolUse',
+										tool_name: 'Read',
+										tool_input: { file_path: path.join( fixture.root, 'readme.txt' ) },
+										tool_use_id: 'read',
+									},
+									'read',
+									{ signal: new AbortController().signal }
+								)
+							).hookSpecificOutput.permissionDecision
+						);
+					await read();
+					now.value += CLAUDE_ACCOUNT_RECHECK_MS;
+					await read();
+					if ( change === 're-pointed' ) disk.link( selected, other );
+					else disk.write( inspected, Buffer.from( 'replaced binary' ) );
+					now.value += CLAUDE_ACCOUNT_RECHECK_MS;
+					await read();
+				},
+			} );
+			const events: Array< { type: string; outcome?: unknown } > = [];
+			await runClaudeTurn(
+				{
+					...turnSnapshot( fixture.root, fixture.config, change ),
+					workspace: {
+						conversationId: change,
+						siteId: 'site',
+						workingDirectory: fixture.root,
+						configDirectory: fixture.config,
+					},
+				},
+				fixture.host,
+				{
+					prompt: 'hello',
+					signal: new AbortController().signal,
+					onEvent: ( e ) => events.push( e ),
+				},
+				{
+					storeRoot: fixture.storeRoot,
+					approve: async () => 'deny',
+					verifyTarget: async () => true,
+					clock: () => now.value,
+					account: ( request ) =>
+						readClaudeAccountStatus( request, { run: runner.run, files: disk.files } ),
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					connection: async () => ( { id: 'native', executablePath: selected } ),
+					prepare: async () => ( {
+						ok: true,
+						executablePath: inspected,
+						executableIdentity,
+						cwd: fixture.root,
+						configDirectory: fixture.config,
+						projectsDirectory: fixture.projects,
+						env: {},
+						identity: { email: 'user@example.com', subscriptionType: 'max' },
+					} ),
+				}
+			);
+			expect(
+				runner.calls.map( ( { file, args } ) => [ file, ...args ] ),
+				change
+			).toEqual( [ [ inspected, 'auth', 'status', '--json' ] ] );
+			expect( decisions, change ).toEqual( [ 'allow', 'allow', 'deny' ] );
+			expect( events.at( -1 ), change ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'interrupted', code: 'account_unverified' },
 			} );
 		}
 	} finally {

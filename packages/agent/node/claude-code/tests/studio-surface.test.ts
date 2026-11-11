@@ -12,7 +12,7 @@ import {
 	deleteAiSession,
 	loadAiSession,
 } from '../../sessions/store';
-import { getClaudeConnections } from '../connection';
+import { getClaudeConnections, openClaudeNativeSignIn } from '../connection';
 import { claudePlatformTarget, currentClaudeHost } from '../platform';
 import { discoverClaudeModels } from '../runtime';
 import {
@@ -21,6 +21,7 @@ import {
 	getClaudeSessionStoreRoot,
 } from '../sessions';
 import {
+	configureClaudeRuntime,
 	createClaudeSession,
 	getClaudeRuntimeState,
 	setClaudeSessionSelection,
@@ -35,7 +36,10 @@ vi.mock( '@studio/common/sites/site-path', () => ( { readSite: vi.fn() } ) );
 vi.mock( '@studio/common/lib/connected-sites', () => ( {
 	getConnectedWpcomSitesForLocalSite: vi.fn(),
 } ) );
-vi.mock( '../connection', () => ( { getClaudeConnections: vi.fn() } ) );
+vi.mock( '../connection', () => ( {
+	getClaudeConnections: vi.fn(),
+	openClaudeNativeSignIn: vi.fn(),
+} ) );
 vi.mock( '../runtime', () => ( { discoverClaudeModels: vi.fn() } ) );
 
 const selection = { model: 'claude-model', effort: 'medium' } as const;
@@ -96,6 +100,46 @@ it.runIf( surfaceTarget )(
 		);
 		await setClaudeSessionSelection( root, summary.id, { ...selection, effort: 'high' } );
 		await expect( validateClaudeSendSelection( root, summary.id, selection ) ).rejects.toThrow();
+	}
+);
+
+it.runIf( surfaceTarget )(
+	'names why sign-in was refused or needs the user in the error message, which is what crosses IPC',
+	async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CLAUDE_CODE', '1' );
+		const signIn = { type: 'sign-in' as const, connectionId: 'connection' };
+		const messageOf = async ( action: Promise< void > ) => {
+			const error = await action.then(
+				() => undefined,
+				( thrown: unknown ) => thrown as Error
+			);
+			return structuredClone( { message: error?.message } ).message;
+		};
+		vi.mocked( openClaudeNativeSignIn ).mockResolvedValueOnce( {
+			state: 'refused',
+			reason: 'signature-invalid',
+		} );
+		await expect( messageOf( configureClaudeRuntime( signIn ) ) ).resolves.toBe(
+			'claude-sign-in-refused:signature-invalid'
+		);
+		vi.mocked( openClaudeNativeSignIn ).mockResolvedValueOnce( {
+			state: 'refused',
+			reason: 'managed-policy-unverified',
+		} );
+		await expect( configureClaudeRuntime( signIn ) ).rejects.toMatchObject( {
+			name: 'ClaudeSignInRefusedError',
+			reason: 'managed-policy-unverified',
+			message: 'claude-sign-in-refused:managed-policy-unverified',
+		} );
+		vi.mocked( openClaudeNativeSignIn ).mockResolvedValueOnce( {
+			state: 'user-action-needed',
+			reason: 'no-display',
+		} );
+		await expect( messageOf( configureClaudeRuntime( signIn ) ) ).resolves.toBe(
+			'claude-sign-in-action-required:no-display'
+		);
+		vi.mocked( openClaudeNativeSignIn ).mockResolvedValueOnce( { state: 'launched' } );
+		await expect( configureClaudeRuntime( signIn ) ).resolves.toBeUndefined();
 	}
 );
 

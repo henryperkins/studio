@@ -21,7 +21,13 @@ import {
 	verifyClaudeExecutableIdentity,
 } from './platform';
 import type { ClaudeAuthIdentity } from './auth-status';
-import type { ClaudePlatformSeams, ClaudeSignInResult } from './platform';
+import type { ClaudeExecutableReason } from './discovery';
+import type {
+	ClaudeExecutableIdentity,
+	ClaudeFileAccess,
+	ClaudePlatformSeams,
+	ClaudeSignInResult,
+} from './platform';
 
 const execFileAsync = promisify( execFile );
 
@@ -207,6 +213,13 @@ export async function prepareClaudeInvocation(
 		if ( ! executable.ok )
 			return { ok: false as const, blockers: [ executable.reason ], executable };
 		if ( context.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = context.directory;
+		if (
+			! ( await verifyClaudeExecutableIdentity( executable.identity, {
+				selectedPath: executablePath,
+				content: false,
+			} ) )
+		)
+			return { ok: false as const, blockers: [ 'executable-changed' ], executable };
 		const status = await readNativeStatus( executable.executablePath, canonicalCwd, child.env );
 		if (
 			! ( await verifyClaudeExecutableIdentity( executable.identity, {
@@ -350,19 +363,46 @@ export type ClaudeAccountStatus =
 	| { state: 'not-qualified' }
 	| { state: 'unavailable' };
 
+/** The binary a turn was prepared with, and the path the user selected for it. */
+export interface ClaudeAccountStatusRequest {
+	selectedPath: string;
+	executablePath: string;
+	executableIdentity: ClaudeExecutableIdentity;
+	cwd: string;
+	configDirectory?: string;
+}
+
+/**
+ * Reads the stored sign-in with the prepared binary only. The selected path
+ * must still lead to that file, unchanged, before and after the read;
+ * otherwise nothing is run, or the answer is discarded, and the status is
+ * unavailable.
+ */
 export async function readClaudeAccountStatus(
-	executablePath: string,
-	cwd: string,
-	configDirectory?: string,
-	run: ClaudeProcessRunner = runNativeProcess
+	request: ClaudeAccountStatusRequest,
+	options: { run?: ClaudeProcessRunner; files?: ClaudeFileAccess } = {}
 ): Promise< ClaudeAccountStatus > {
 	const child = buildClaudeEnvironment( process.env );
-	const context = await resolveClaudeConfigContext( configDirectory, process.env );
+	const context = await resolveClaudeConfigContext( request.configDirectory, process.env );
 	if ( child.conflicts.length || context.mode === 'conflict' ) return { state: 'unavailable' };
 	if ( context.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = context.directory;
+	const unchanged = async () =>
+		request.executablePath === request.executableIdentity.path &&
+		( await verifyClaudeExecutableIdentity( request.executableIdentity, {
+			selectedPath: request.selectedPath,
+			files: options.files,
+			content: false,
+		} ) );
 	let status: Record< string, unknown >;
 	try {
-		status = await readNativeStatus( executablePath, cwd, child.env, run );
+		if ( ! ( await unchanged() ) ) return { state: 'unavailable' };
+		status = await readNativeStatus(
+			request.executablePath,
+			request.cwd,
+			child.env,
+			options.run ?? runNativeProcess
+		);
+		if ( ! ( await unchanged() ) ) return { state: 'unavailable' };
 	} catch {
 		return { state: 'unavailable' };
 	}
@@ -379,16 +419,34 @@ export async function readClaudeAccountStatus(
 }
 
 /**
+ * Why Studio will not open the vendor sign-in for a connection: the
+ * executable's inspection result, a conflicting environment or configuration
+ * directory, an unqualified configuration, a managed policy, or a binary that
+ * changed after inspection. Nothing changes when sign-in is refused.
+ */
+export type ClaudeSignInRefusalReason =
+	| ClaudeExecutableReason
+	| 'environment-conflict'
+	| 'config-directory-conflict'
+	| 'configuration-unqualified'
+	| 'managed-policy-unverified';
+
+export type ClaudeNativeSignInResult =
+	| ClaudeSignInResult
+	| { state: 'refused'; reason: ClaudeSignInRefusalReason };
+
+/**
  * Opens the vendor's own `auth login` in a real terminal for the inspected
  * executable, user, working directory and configuration that execution uses.
  * The executable is checked again right before launch, so a binary swapped or
- * updated since inspection never signs in. Where no terminal, display or
- * browser can reach the user, nothing changes and the result says why.
+ * updated since inspection never signs in. Where Studio refuses, or no
+ * terminal, display or browser can reach the user, nothing changes and the
+ * result says why.
  */
 export async function openClaudeNativeSignIn(
 	connectionId: string,
 	overrides: Partial< ClaudePlatformSeams > = {}
-): Promise< ClaudeSignInResult > {
+): Promise< ClaudeNativeSignInResult > {
 	if ( process.env.STUDIO_EXPERIMENTAL_CLAUDE_CODE !== '1' )
 		throw new Error( 'Claude Code is disabled' );
 	const connection = connections( ( await readSharedConfig() ).claudeConnections ).find(
@@ -396,21 +454,21 @@ export async function openClaudeNativeSignIn(
 	);
 	if ( ! connection ) throw new Error( 'Unknown Claude connection' );
 	const seams = defaultClaudePlatformSeams( overrides );
+	const refuse = ( reason: ClaudeSignInRefusalReason ) => ( { state: 'refused', reason } ) as const;
 	const executable = await inspectClaudeExecutable( connection.executablePath, seams );
+	if ( ! executable.ok ) return refuse( executable.reason );
 	const child = buildClaudeEnvironment( seams.env, seams.host.platform );
+	if ( child.conflicts.length ) return refuse( 'environment-conflict' );
 	const config = await resolveClaudeConfigContext( connection.configDirectory, seams.env, seams );
-	if ( ! executable.ok || child.conflicts.length || config.mode === 'conflict' )
-		throw new Error( 'Claude connection is not qualified for sign-in' );
+	if ( config.mode === 'conflict' ) return refuse( 'config-directory-conflict' );
 	const cwd = await seams.files.realpath( process.cwd() );
 	const configuration = await inspectClaudeConfiguration(
 		cwd,
 		config.directory ?? path.join( os.homedir(), '.claude' )
 	);
-	if (
-		configuration.blockers.length ||
-		( await inspectClaudeManagedPolicy( seams ) ).state !== 'absent'
-	)
-		throw new Error( 'Claude configuration is not qualified for sign-in' );
+	if ( configuration.blockers.length ) return refuse( 'configuration-unqualified' );
+	if ( ( await inspectClaudeManagedPolicy( seams ) ).state !== 'absent' )
+		return refuse( 'managed-policy-unverified' );
 	if ( config.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = config.directory;
 	const plan = await planClaudeSignIn(
 		{ executablePath: executable.executablePath, args: [ 'auth', 'login' ], cwd, env: child.env },
@@ -423,7 +481,7 @@ export async function openClaudeNativeSignIn(
 			files: seams.files,
 		} ) )
 	)
-		throw new Error( 'The Claude executable changed after it was inspected' );
+		return refuse( 'executable-changed' );
 	await markClaudeConnectionReestablished( connectionId );
 	return executeClaudeSignIn( plan.launch, seams );
 }

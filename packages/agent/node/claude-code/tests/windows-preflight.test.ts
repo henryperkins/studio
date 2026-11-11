@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -42,6 +42,7 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 		let version: string;
 		let duringPowerShell: ( ( script: string ) => Promise< void > ) | undefined;
 		let duringAuthStatus: ( () => Promise< void > ) | undefined;
+		let duringVersion: ( () => Promise< void > ) | undefined;
 		const scripts = () =>
 			invoke.mock.calls
 				.filter( ( [ , args ] ) => args[ 2 ] === '-EncodedCommand' )
@@ -84,14 +85,20 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 			version = '2.1.319 (Claude Code)';
 			duringPowerShell = undefined;
 			duringAuthStatus = undefined;
+			duringVersion = undefined;
 			invoke.mockReset();
 			invoke.mockImplementation( async ( file, args ) => {
 				if ( args[ 0 ] === '-NoProfile' ) {
-					await duringPowerShell?.( Buffer.from( args[ 3 ], 'base64' ).toString( 'utf16le' ) );
+					const script = Buffer.from( args[ 3 ], 'base64' ).toString( 'utf16le' );
+					if ( script.includes( 'IsWow64Process2' ) ) return { stdout: '34404' };
+					await duringPowerShell?.( script );
 					return { stdout: '' };
 				}
 				expect( file ).toBe( executable );
-				if ( args[ 0 ] === '--version' ) return { stdout: version };
+				if ( args[ 0 ] === '--version' ) {
+					await duringVersion?.();
+					return { stdout: version };
+				}
 				expect( args ).toEqual( [ 'auth', 'status', '--json' ] );
 				await duringAuthStatus?.();
 				if ( authFailure ) throw authFailure;
@@ -238,11 +245,66 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 				if ( script.includes( 'Policies' ) )
 					await writeFile( executable, peBinary( { body: 'swapped' } ) );
 			};
-			await expect( openClaudeNativeSignIn( 'swapped' ) ).rejects.toThrow();
+			await expect( openClaudeNativeSignIn( 'swapped' ) ).resolves.toEqual( {
+				state: 'refused',
+				reason: 'executable-changed',
+			} );
 			expect( scripts().some( ( { script } ) => script.includes( 'ProcessStartInfo' ) ) ).toBe(
 				false
 			);
 			expect( ( await getClaudeConnections() )[ 0 ].revision ).toBeUndefined();
+		} );
+
+		it( 'refuses sign-in with a typed reason when the executable, configuration or policy is not qualified', async () => {
+			const refusedWith = async ( id: string, reason: string ) => {
+				await expect( openClaudeNativeSignIn( id ), reason ).resolves.toEqual( {
+					state: 'refused',
+					reason,
+				} );
+				expect(
+					scripts().some( ( { script } ) => script.includes( 'ProcessStartInfo' ) ),
+					reason
+				).toBe( false );
+				expect(
+					( await getClaudeConnections() ).find( ( item ) => item.id === id )?.revision,
+					reason
+				).toBeUndefined();
+			};
+			await saveClaudeConnection( { id: 'old', executablePath: executable } );
+			version = '2.1.318 (Claude Code)';
+			await refusedWith( 'old', 'version-unqualified' );
+			version = '2.1.319 (Claude Code)';
+
+			await saveClaudeConnection( { id: 'routed-environment', executablePath: executable } );
+			vi.stubEnv( 'ANTHROPIC_BASE_URL', 'https://gateway.example' );
+			await refusedWith( 'routed-environment', 'environment-conflict' );
+			vi.stubEnv( 'ANTHROPIC_BASE_URL', undefined );
+
+			await saveClaudeConnection( {
+				id: 'conflict',
+				executablePath: executable,
+				configDirectory: config,
+			} );
+			vi.stubEnv( 'CLAUDE_CONFIG_DIR', workspace );
+			await refusedWith( 'conflict', 'config-directory-conflict' );
+			vi.stubEnv( 'CLAUDE_CONFIG_DIR', undefined );
+
+			await saveClaudeConnection( {
+				id: 'routed',
+				executablePath: executable,
+				configDirectory: config,
+			} );
+			await writeFile(
+				path.join( config, 'settings.json' ),
+				JSON.stringify( { apiKeyHelper: 'helper' } )
+			);
+			await refusedWith( 'routed', 'configuration-unqualified' );
+			await rm( path.join( config, 'settings.json' ) );
+
+			await saveClaudeConnection( { id: 'managed', executablePath: executable } );
+			await mkdir( path.join( root, 'ClaudeCode' ) );
+			await writeFile( path.join( root, 'ClaudeCode', 'managed-settings.json' ), '{}' );
+			await refusedWith( 'managed', 'managed-policy-unverified' );
 		} );
 
 		it( 'asks for the user’s action over a remote session and changes nothing', async () => {
@@ -256,6 +318,25 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 				false
 			);
 			expect( ( await getClaudeConnections() )[ 0 ].revision ).toBeUndefined();
+		} );
+
+		it( 'reads no native status once the selected path leads to another binary after inspection', async () => {
+			const first = path.join( root, 'first' );
+			const second = path.join( root, 'second' );
+			const current = path.join( root, 'current' );
+			await Promise.all( [ mkdir( first ), mkdir( second ) ] );
+			executable = path.join( first, 'claude.exe' );
+			await writeFile( executable, peHeader( 0x8664 ) );
+			await writeFile( path.join( second, 'claude.exe' ), peBinary( { body: 'next version' } ) );
+			await symlink( first, current, 'junction' );
+			duringVersion = async () => {
+				await unlink( current );
+				await symlink( second, current, 'junction' );
+			};
+			await expect(
+				prepareClaudeInvocation( path.join( current, 'claude.exe' ), workspace, config )
+			).resolves.toMatchObject( { ok: false, blockers: [ 'executable-changed' ] } );
+			expect( invoke.mock.calls.some( ( [ , args ] ) => args[ 0 ] === 'auth' ) ).toBe( false );
 		} );
 
 		it( 'refuses a preparation whose executable changed while the native status was read', async () => {
