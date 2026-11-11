@@ -5,6 +5,7 @@ import {
 	claudePlatformTarget,
 	defaultClaudePlatformSeams,
 	qualifyClaudeRuntime,
+	resolveClaudeMachineTarget,
 	selectClaudePlatformAdapter,
 } from './platform';
 import type {
@@ -13,6 +14,7 @@ import type {
 	ClaudeExecutableFormat,
 	ClaudeExecutableIdentity,
 	ClaudeFileStat,
+	ClaudeHostFinding,
 	ClaudePlatformSeams,
 	ClaudePlatformTarget,
 	ClaudeProvenance,
@@ -71,6 +73,11 @@ export type ClaudeExecutableInspection =
 			reason: ClaudeExecutableReason;
 			/** On an unqualified platform: the check of the file that failed, if one did. */
 			check?: ClaudeExecutableCheck;
+			/**
+			 * With `platform-unqualified`: Studio's process runs translated on other
+			 * hardware, or the hardware could not be established. Nothing was run.
+			 */
+			host?: ClaudeHostFinding;
 			executable?: ClaudeExecutableMetadata;
 			qualification?: ClaudeQualificationResult;
 	  };
@@ -155,6 +162,28 @@ export async function inspectClaudeExecutable(
 	if ( header.libc ) executable.libc = header.libc;
 	if ( ! header.architectures.includes( seams.host.arch as ClaudeArch ) )
 		return fail( 'architecture-unqualified' );
+
+	const machine = await resolveClaudeMachineTarget( seams );
+	if ( ! machine.ok ) {
+		const machineRecords = CLAUDE_QUALIFICATION_MATRIX.filter(
+			( item ) => item.target === machine.target
+		);
+		const record =
+			machineRecords.find( ( item ) => item.sdkVersion === CLAUDE_AGENT_SDK_VERSION ) ??
+			machineRecords[ 0 ];
+		return {
+			ok: false,
+			reason: 'platform-unqualified',
+			host: machine.host,
+			executable,
+			qualification: {
+				state: 'unqualified',
+				reason: 'platform-unqualified',
+				...( record ? { record } : {} ),
+				supportedRuntimeVersions: [],
+			},
+		};
+	}
 
 	let sha256: string;
 	try {

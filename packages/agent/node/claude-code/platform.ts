@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'child_process';
 import { createHash } from 'crypto';
-import { createReadStream, statSync } from 'fs';
-import { lstat, open, realpath, stat } from 'fs/promises';
+import { constants as fsConstants, createReadStream, statSync } from 'fs';
+import { lstat, mkdir, open, realpath, rm, stat } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
@@ -39,12 +39,23 @@ export type ClaudeVendorPlatform =
 	| 'linux-x64'
 	| 'linux-arm64';
 
+/**
+ * A behavior Studio relies on that only a native run on the target can
+ * confirm: how the machine-architecture probe answers there, including under
+ * translation, and where macOS keeps managed preferences.
+ */
+export type ClaudeNativeConfirmation =
+	| 'machine-architecture-probe'
+	| 'managed-preferences-locations';
+
 interface ClaudeQualificationFacts {
 	sdkVersion: string;
 	runtimeVersion: string;
 	target: ClaudePlatformTarget;
 	vendorPlatform: ClaudeVendorPlatform;
 	verification: ClaudeBinaryVerification;
+	/** What this target's native qualification run must confirm before the record can be qualified. */
+	confirmationsRequired?: readonly ClaudeNativeConfirmation[];
 	/** Linux only: the C library the qualified binary and host use. */
 	libc?: 'glibc';
 	/**
@@ -61,7 +72,12 @@ export type ClaudeQualificationRecord = Readonly<
 >;
 
 function record( value: ClaudeQualificationRecord ): ClaudeQualificationRecord {
-	return Object.freeze( { ...value } );
+	return Object.freeze( {
+		...value,
+		...( value.confirmationsRequired
+			? { confirmationsRequired: Object.freeze( [ ...value.confirmationsRequired ] ) }
+			: {} ),
+	} );
 }
 
 const unqualified = { state: 'unqualified', reason: 'no-native-qualification-run' } as const;
@@ -85,6 +101,7 @@ export const CLAUDE_QUALIFICATION_MATRIX: readonly ClaudeQualificationRecord[] =
 		target: 'windows-arm64',
 		vendorPlatform: 'win32-arm64',
 		verification: 'authenticode',
+		confirmationsRequired: [ 'machine-architecture-probe' ],
 		...unqualified,
 	} ),
 	record( {
@@ -93,6 +110,7 @@ export const CLAUDE_QUALIFICATION_MATRIX: readonly ClaudeQualificationRecord[] =
 		target: 'macos-x64',
 		vendorPlatform: 'darwin-x64',
 		verification: 'apple-code-signature',
+		confirmationsRequired: [ 'machine-architecture-probe', 'managed-preferences-locations' ],
 		...unqualified,
 	} ),
 	record( {
@@ -101,6 +119,7 @@ export const CLAUDE_QUALIFICATION_MATRIX: readonly ClaudeQualificationRecord[] =
 		target: 'macos-arm64',
 		vendorPlatform: 'darwin-arm64',
 		verification: 'apple-code-signature',
+		confirmationsRequired: [ 'machine-architecture-probe', 'managed-preferences-locations' ],
 		...unqualified,
 	} ),
 	record( {
@@ -110,6 +129,7 @@ export const CLAUDE_QUALIFICATION_MATRIX: readonly ClaudeQualificationRecord[] =
 		vendorPlatform: 'linux-x64',
 		verification: 'signed-manifest-checksum',
 		libc: 'glibc',
+		confirmationsRequired: [ 'machine-architecture-probe' ],
 		...unqualified,
 	} ),
 	record( {
@@ -119,6 +139,7 @@ export const CLAUDE_QUALIFICATION_MATRIX: readonly ClaudeQualificationRecord[] =
 		vendorPlatform: 'linux-arm64',
 		verification: 'signed-manifest-checksum',
 		libc: 'glibc',
+		confirmationsRequired: [ 'machine-architecture-probe' ],
 		...unqualified,
 	} ),
 ] );
@@ -263,6 +284,33 @@ export interface ClaudePlatformSeams {
 	findOnPath( command: string ): string | null;
 	username(): string;
 	hostLibc(): 'glibc' | 'musl' | 'unknown';
+	/** The kernel's machine name, `uname -m` (`os.machine()`). */
+	osMachine(): string;
+	/** The per-user temporary directory (`os.tmpdir()`). */
+	tempDirectory(): string;
+	/**
+	 * Creates the script's directory, mode 0700, failing if anything is at that
+	 * path, then the script inside it, mode 0700 and also exclusively.
+	 */
+	writePrivateScript( script: ClaudePrivateScript ): Promise< void >;
+	removePrivateScript( directory: string ): Promise< void >;
+	/**
+	 * The hardware architecture under Studio's process, from the OS's own probe,
+	 * or undefined when it cannot be established. It differs from `host.arch`
+	 * when the process runs translated.
+	 */
+	machineArchitecture(): Promise< ClaudeArch | undefined >;
+}
+
+/** Why the machine under Studio's process rules out every target. */
+export type ClaudeHostCheck = 'process-translated' | 'machine-architecture-unknown';
+
+export interface ClaudeHostFinding {
+	check: ClaudeHostCheck;
+	/** The architecture Studio's process was built for. */
+	processArchitecture: string;
+	/** The hardware architecture, where the probe established it. */
+	machineArchitecture?: ClaudeArch;
 }
 
 /** The file inspection qualified: what sign-in and execution check again before using it. */
@@ -311,6 +359,12 @@ export interface ClaudePlatformAdapter {
 	/** Whether a selected path can name a native executable at all, before touching the file. */
 	isSelectablePath( selected: string ): boolean;
 	readBinaryHeader( read: ClaudeByteReader ): Promise< ClaudeBinaryHeader | undefined >;
+	/**
+	 * The hardware architecture, from a probe that an emulated or translated
+	 * process cannot mistake for its own; undefined when the answer is not one
+	 * Studio knows. It may throw.
+	 */
+	probeMachineArchitecture( seams: ClaudePlatformSeams ): Promise< ClaudeArch | undefined >;
 	/** Proves the binary is the vendor's published one, without running it. */
 	verifyBinary(
 		input: ClaudeBinaryVerificationInput,
@@ -341,6 +395,17 @@ export interface ClaudeSignInRequest {
 	env: NodeJS.ProcessEnv;
 }
 
+/**
+ * A POSIX sh script in a fresh directory of its own, at a path made only of
+ * characters no shell treats specially, so a terminal's login shell is asked
+ * to parse nothing that came from the user.
+ */
+export interface ClaudePrivateScript {
+	directory: string;
+	path: string;
+	contents: string;
+}
+
 export interface ClaudeSignInLaunch {
 	/** `run` waits for a launcher that returns once the window is open; `detached` starts a terminal. */
 	mode: 'run' | 'detached';
@@ -348,6 +413,8 @@ export interface ClaudeSignInLaunch {
 	args: string[];
 	env: NodeJS.ProcessEnv;
 	cwd: string;
+	/** Written right before launch; it removes itself when it runs, or Studio removes it if launch fails. */
+	script?: ClaudePrivateScript;
 }
 
 /** Why sign-in cannot open a terminal here, so the user must run the vendor's login themselves. */
@@ -385,20 +452,22 @@ export async function executeClaudeSignIn(
 	overrides: Partial< ClaudePlatformSeams > = {}
 ): Promise< ClaudeSignInResult > {
 	const seams = defaultClaudePlatformSeams( overrides );
-	if ( launch.mode === 'detached' ) {
-		await seams.launchDetached( launch.file, launch.args, { env: launch.env, cwd: launch.cwd } );
-		return { state: 'launched' };
-	}
+	const { script } = launch;
+	if ( script ) await seams.writePrivateScript( script );
 	try {
-		await seams.run( launch.file, launch.args, {
-			env: launch.env,
-			cwd: launch.cwd,
-			timeout: 30000,
-			windowsHide: true,
-		} );
+		if ( launch.mode === 'detached' )
+			await seams.launchDetached( launch.file, launch.args, { env: launch.env, cwd: launch.cwd } );
+		else
+			await seams.run( launch.file, launch.args, {
+				env: launch.env,
+				cwd: launch.cwd,
+				timeout: 30000,
+				windowsHide: true,
+			} );
 	} catch ( error ) {
+		if ( script ) await seams.removePrivateScript( script.directory ).catch( () => {} );
 		const detail = `${ ( error as { stderr?: unknown } ).stderr ?? '' }`;
-		if ( detail.includes( APPLE_EVENTS_DENIED ) )
+		if ( launch.mode === 'run' && detail.includes( APPLE_EVENTS_DENIED ) )
 			return { state: 'user-action-needed', reason: 'terminal-permission-denied' };
 		throw error;
 	}
@@ -572,11 +641,56 @@ function nodeHostLibc(): 'glibc' | 'musl' | 'unknown' {
 	return libc;
 }
 
+// mkdir fails on anything already at the path, a symlink included, and
+// O_CREAT | O_EXCL never follows one, so nothing planted there is written through.
+async function writePrivateScript( script: ClaudePrivateScript ): Promise< void > {
+	await mkdir( script.directory, { mode: 0o700 } );
+	try {
+		const handle = await open(
+			script.path,
+			fsConstants.O_WRONLY |
+				fsConstants.O_CREAT |
+				fsConstants.O_EXCL |
+				( fsConstants.O_NOFOLLOW ?? 0 ),
+			0o700
+		);
+		try {
+			await handle.writeFile( script.contents, 'utf8' );
+		} finally {
+			await handle.close();
+		}
+	} catch ( error ) {
+		await rm( script.directory, { recursive: true, force: true } ).catch( () => {} );
+		throw error;
+	}
+}
+
+async function probeMachine( seams: ClaudePlatformSeams ): Promise< ClaudeArch | undefined > {
+	const adapter = selectClaudePlatformAdapter( seams.host );
+	try {
+		return await adapter?.probeMachineArchitecture( seams );
+	} catch {
+		return undefined;
+	}
+}
+
+// The machine does not change while Studio runs, so this process's first
+// established answer is kept; a failed probe is tried again next time.
+let thisMachine: Promise< ClaudeArch | undefined > | undefined;
+function probeThisMachine( seams: ClaudePlatformSeams ): Promise< ClaudeArch | undefined > {
+	thisMachine ??= probeMachine( seams ).then( ( architecture ) => {
+		if ( ! architecture ) thisMachine = undefined;
+		return architecture;
+	} );
+	return thisMachine;
+}
+
 export function defaultClaudePlatformSeams(
 	overrides: Partial< ClaudePlatformSeams > = {}
 ): ClaudePlatformSeams {
 	const env = overrides.env ?? process.env;
-	return {
+	const real = ! overrides.host && ! overrides.env && ! overrides.run && ! overrides.osMachine;
+	const seams: ClaudePlatformSeams = {
 		host: currentClaudeHost(),
 		env,
 		files: nodeFiles,
@@ -591,8 +705,52 @@ export function defaultClaudePlatformSeams(
 			}
 		},
 		hostLibc: nodeHostLibc,
+		osMachine: () => os.machine(),
+		tempDirectory: () => os.tmpdir(),
+		writePrivateScript,
+		removePrivateScript: ( directory ) => rm( directory, { recursive: true, force: true } ),
 		...overrides,
+		machineArchitecture:
+			overrides.machineArchitecture ??
+			( () => ( real ? probeThisMachine( seams ) : probeMachine( seams ) ) ),
 	};
+	return seams;
+}
+
+/**
+ * The hardware architecture under Studio's process, from the OS's own probe:
+ * IsWow64Process2 on Windows, `hw.optional.arm64` on macOS and uname on
+ * Linux. Undefined when it cannot be established.
+ */
+export function probeClaudeMachineArchitecture(
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudeArch | undefined > {
+	return defaultClaudePlatformSeams( overrides ).machineArchitecture();
+}
+
+/**
+ * The target the machine itself is: the process's own target when it runs
+ * natively; otherwise the finding that rules every target out, with the
+ * machine's target where the probe established it.
+ */
+export async function resolveClaudeMachineTarget(
+	seams: ClaudePlatformSeams
+): Promise<
+	| { ok: true; target: ClaudePlatformTarget }
+	| { ok: false; host: ClaudeHostFinding; target?: ClaudePlatformTarget }
+> {
+	const machine = await seams.machineArchitecture().catch( () => undefined );
+	const processArchitecture = seams.host.arch;
+	if ( ! machine )
+		return { ok: false, host: { check: 'machine-architecture-unknown', processArchitecture } };
+	const target = claudePlatformTarget( { platform: seams.host.platform, arch: machine } );
+	if ( machine !== processArchitecture || ! target )
+		return {
+			ok: false,
+			host: { check: 'process-translated', processArchitecture, machineArchitecture: machine },
+			target,
+		};
+	return { ok: true, target };
 }
 
 function sameFile( identity: ClaudeExecutableIdentity, current: ClaudeFileStat ): boolean {

@@ -1,6 +1,6 @@
 import path from 'path';
 import { findPolicyLocations, managedPolicyFiles, policyFinding } from './policy';
-import { cleanEnvironmentCommand, isRemoteSession, sandboxFact } from './terminal';
+import { isRemoteSession, sandboxFact, signInScript } from './terminal';
 import type {
 	ClaudeArch,
 	ClaudeBinaryHeader,
@@ -56,6 +56,7 @@ export async function readMachOHeader(
 const MACOS_SIGNER = 'Anthropic PBC';
 const DEVELOPER_ID_REQUIREMENT = `anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.O] = "${ MACOS_SIGNER }"`;
 const CODESIGN = '/usr/bin/codesign';
+const SYSCTL = '/usr/sbin/sysctl';
 // codesign exits 1 when a signature is missing or broken and 3 when it does not
 // satisfy the requirement; anything else means it could not check.
 const CODESIGN_REFUSED = new Set( [ 1, 3 ] );
@@ -64,16 +65,13 @@ const PREFERENCES_DOMAIN = 'com.anthropic.claudecode';
 const TERMINAL_APP = '/System/Applications/Utilities/Terminal.app';
 const OPEN = '/usr/bin/open';
 const OSASCRIPT = '/usr/bin/osascript';
-// The first argument is the working directory; the rest are the command's arguments.
+// The only argument is the sign-in script's shell-inert path, the only part of
+// the line Terminal's login shell parses that is not fixed here.
 const TERMINAL_SCRIPT: readonly string[] = Object.freeze( [
 	'on run argv',
-	'set commandLine to "cd " & quoted form of (item 1 of argv) & " &&"',
-	'repeat with argument in rest of argv',
-	'set commandLine to commandLine & " " & quoted form of (argument as text)',
-	'end repeat',
 	'tell application "Terminal"',
 	'activate',
-	'do script commandLine',
+	'do script "exec /bin/sh " & (item 1 of argv)',
 	'end tell',
 	'end run',
 ] );
@@ -99,6 +97,25 @@ export const macosAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 	} ),
 	isSelectablePath: ( selected: string ) => path.posix.isAbsolute( selected ),
 	readBinaryHeader: readMachOHeader,
+	/**
+	 * `hw.optional.arm64` is 1 where "the platform uses the ARM ISA" (Apple,
+	 * "Determining Instruction Set Characteristics"), a fact about the
+	 * hardware that Rosetta does not translate, unlike `uname -m` and
+	 * `os.machine()`. `sysctl.proc_translated` describes only the process that
+	 * reads it, and that would be this child, not Studio. Only an explicit 0
+	 * means Intel: an Intel Mac without the key is not established.
+	 */
+	async probeMachineArchitecture( seams ) {
+		const { stdout } = await seams.run( SYSCTL, [ '-n', 'hw.optional.arm64' ], {
+			env: {},
+			timeout: 10000,
+			windowsHide: true,
+		} );
+		const value = stdout.trim();
+		if ( value === '1' ) return 'arm64';
+		if ( value === '0' ) return 'x64';
+		return undefined;
+	},
 	async verifyBinary( input, seams ) {
 		try {
 			await seams.run(
@@ -128,9 +145,11 @@ export const macosAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 	/**
 	 * The documented macOS sources (code.claude.com/docs/en/managed-settings): the
 	 * system directory's files and the `com.anthropic.claudecode` managed
-	 * preferences domain. The documentation names the domain, not a file; these
-	 * are where macOS stores device and per-user configuration-profile
-	 * preferences, and native qualification must confirm them.
+	 * preferences domain. The documentation names the domain, not a file. The
+	 * device and per-user paths below are where macOS stores configuration
+	 * profile preferences, but until a native qualification run confirms them a
+	 * missing file there proves nothing: each preferences source is reported
+	 * present when found and unreadable otherwise, never absent.
 	 */
 	async inspectManagedPolicy( seams ) {
 		const files = managedPolicyFiles( '/Library/Application Support/ClaudeCode', path.posix );
@@ -148,21 +167,21 @@ export const macosAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 				knownUser ? username : '(unknown user)'
 			}/${ PREFERENCES_DOMAIN }.plist`,
 		};
-		const checked = [ ...files, machine, user ];
-		const found = await findPolicyLocations(
-			knownUser ? checked : [ ...files, machine ],
-			seams.files
+		const preferences = knownUser ? [ machine, user ] : [ machine ];
+		const found = await findPolicyLocations( [ ...files, ...preferences ], seams.files );
+		const unconfirmed = [ machine, user ].filter(
+			( source ) => ! found.present.includes( source ) && ! found.unreadable.includes( source )
 		);
-		return policyFinding(
-			checked,
-			found.present,
-			knownUser ? found.unreadable : [ ...found.unreadable, user ]
-		);
+		return policyFinding( [ ...files, machine, user ], found.present, [
+			...found.unreadable,
+			...unconfirmed,
+		] );
 	},
 	/**
-	 * Asks Terminal to run the login. Terminal runs a command line, so the
-	 * arguments go to `osascript` as data and AppleScript's `quoted form of`
-	 * quotes each one; Studio never builds the line itself.
+	 * Asks Terminal to run the login. Terminal hands a command line to the
+	 * user's login shell, which may be fish or csh, where POSIX quoting is not
+	 * safe; so that line is `exec /bin/sh <script>`, and the user's paths and
+	 * values reach only `/bin/sh`, inside a Studio-owned script.
 	 */
 	async planSignIn( request, seams ) {
 		if ( isRemoteSession( seams.env ) )
@@ -177,16 +196,17 @@ export const macosAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 				return { state: 'user-action-needed', reason };
 			}
 		}
-		const command = cleanEnvironmentCommand( request );
-		if ( ! Array.isArray( command ) ) return command;
+		const prepared = await signInScript( request, seams );
+		if ( 'state' in prepared ) return prepared;
 		return {
 			state: 'ready',
 			launch: {
 				mode: 'run',
 				file: OSASCRIPT,
-				args: [ ...TERMINAL_SCRIPT.flatMap( ( line ) => [ '-e', line ] ), request.cwd, ...command ],
+				args: [ ...TERMINAL_SCRIPT.flatMap( ( line ) => [ '-e', line ] ), prepared.script.path ],
 				env: request.env,
 				cwd: request.cwd,
+				script: prepared.script,
 			},
 		};
 	},

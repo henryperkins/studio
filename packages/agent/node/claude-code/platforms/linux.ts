@@ -1,7 +1,7 @@
 import path from 'path';
 import { resolveLinuxTerminalCommandLaunch } from '@studio/common/lib/user-settings/terminal';
 import { findPolicyLocations, managedPolicyFiles, policyFinding } from './policy';
-import { cleanEnvironmentCommand, sandboxFact } from './terminal';
+import { sandboxFact, signInScript } from './terminal';
 import type {
 	ClaudeArch,
 	ClaudeBinaryHeader,
@@ -99,6 +99,18 @@ export const linuxAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 	isSelectablePath: ( selected: string ) => path.posix.isAbsolute( selected ),
 	readBinaryHeader: readElfHeader,
 	/**
+	 * The kernel's machine name. Linux has no system translation layer; a
+	 * user-mode emulator (qemu-user, FEX, Box64) reports its guest machine
+	 * here, which this probe cannot see through, so native qualification has
+	 * to record it.
+	 */
+	async probeMachineArchitecture( seams ) {
+		const machine = seams.osMachine();
+		if ( machine === 'x86_64' ) return 'x64';
+		if ( machine === 'aarch64' || machine === 'arm64' ) return 'arm64';
+		return undefined;
+	},
+	/**
 	 * Linux binaries carry no code signature; the vendor's integrity check is its
 	 * GPG-signed release manifest (code.claude.com/docs/en/setup). Studio has no
 	 * OpenPGP verifier, so a qualification run verifies the manifest's signature
@@ -129,19 +141,29 @@ export const linuxAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 		return policyFinding( files, present, unreadable );
 	},
 	/**
-	 * Starts a terminal that runs the login as separate arguments. The login
-	 * opens the browser with `xdg-open`; without a display, a terminal or that
-	 * opener the user has to run the login themselves.
+	 * Starts a terminal that runs `/bin/sh <script>`, in the script's shell-inert
+	 * temporary directory. Some terminals, or what `x-terminal-emulator` points
+	 * to, join their command into one string for a shell; every argument Studio
+	 * gives them is shell-inert, and the user's paths and values reach only
+	 * `/bin/sh`, inside the script. The login opens the browser with
+	 * `xdg-open`; without a display, a terminal or that opener the user has to
+	 * run the login themselves.
 	 */
 	async planSignIn( request, seams ) {
 		if ( ! seams.env.DISPLAY && ! seams.env.WAYLAND_DISPLAY )
 			return { state: 'user-action-needed', reason: 'no-display' };
-		const command = cleanEnvironmentCommand( request );
-		if ( ! Array.isArray( command ) ) return command;
-		const terminal = resolveLinuxTerminalCommandLaunch( request.cwd, command, seams.findOnPath );
-		if ( ! terminal ) return { state: 'user-action-needed', reason: 'no-terminal' };
+		if ( ! resolveLinuxTerminalCommandLaunch( '/', [], seams.findOnPath ) )
+			return { state: 'user-action-needed', reason: 'no-terminal' };
 		if ( ! seams.findOnPath( 'xdg-open' ) )
 			return { state: 'user-action-needed', reason: 'no-browser' };
+		const prepared = await signInScript( request, seams );
+		if ( 'state' in prepared ) return prepared;
+		const terminal = resolveLinuxTerminalCommandLaunch(
+			prepared.base,
+			prepared.command,
+			seams.findOnPath
+		);
+		if ( ! terminal ) return { state: 'user-action-needed', reason: 'no-terminal' };
 		return {
 			state: 'ready',
 			launch: {
@@ -150,6 +172,7 @@ export const linuxAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 				args: terminal.args,
 				env: request.env,
 				cwd: terminal.cwd,
+				script: prepared.script,
 			},
 		};
 	},

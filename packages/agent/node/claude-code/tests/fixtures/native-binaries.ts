@@ -285,11 +285,21 @@ export function simulatedHost(
 			hostLibc: () => 'glibc',
 			findOnPath: () => null,
 			username: () => 'tester',
+			osMachine: () => ( host.arch === 'arm64' ? 'aarch64' : 'x86_64' ),
+			machineArchitecture: async () =>
+				host.arch === 'x64' || host.arch === 'arm64' ? host.arch : undefined,
 			run: async () => {
 				throw new Error( 'Unexpected command' );
 			},
 			launchDetached: async () => {
 				throw new Error( 'Unexpected launch' );
+			},
+			tempDirectory: () => '/tmp',
+			writePrivateScript: async () => {
+				throw new Error( 'Unexpected script' );
+			},
+			removePrivateScript: async () => {
+				throw new Error( 'Unexpected script removal' );
 			},
 			...seams,
 		},

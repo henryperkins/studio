@@ -71,6 +71,70 @@ export async function readPeHeader(
 const WINDOWS_SIGNER = 'Anthropic, PBC';
 const SIGNATURE_REFUSED = 3;
 
+/**
+ * A PowerShell function that walks a certificate subject's DER encoding and is
+ * true only when it holds exactly one Organization (2.5.4.10) attribute, alone
+ * in its relative distinguished name, whose UTF8String, PrintableString or
+ * BMPString value is ordinally equal to the vendor's. Ordinal, because `-ceq`
+ * compares by culture and ignores characters such as a soft hyphen. Any
+ * encoding it cannot read throws, so the signer cannot be verified.
+ */
+export const AUTHENTICODE_SIGNER_CHECK = [
+	'function Test-StudioClaudeSigner([byte[]]$Name) {',
+	`$expected = '${ WINDOWS_SIGNER }'`,
+	'$utf8 = New-Object System.Text.UTF8Encoding($false, $true)',
+	'$bmp = New-Object System.Text.UnicodeEncoding($true, $false, $true)',
+	'function Read-Element([int]$At, [int]$End) {',
+	"if ($At + 2 -gt $End) { throw 'Truncated subject' }",
+	'$length = [int]$Name[$At + 1]',
+	'$start = $At + 2',
+	'if ($length -ge 0x80) {',
+	'$count = $length - 0x80',
+	"if ($count -lt 1 -or $count -gt 2 -or $start + $count -gt $End) { throw 'Unsupported length' }",
+	'$length = 0',
+	'for ($k = 0; $k -lt $count; $k++) { $length = $length * 256 + $Name[$start + $k] }',
+	'$start += $count',
+	'}',
+	"if ($start + $length -gt $End) { throw 'Truncated subject' }",
+	'return ,@([int]$Name[$At], $start, ($start + $length))',
+	'}',
+	'$subject = Read-Element 0 $Name.Length',
+	"if ($subject[0] -ne 0x30 -or $subject[2] -ne $Name.Length) { throw 'Not a subject' }",
+	'$organizations = 0',
+	'$matched = $false',
+	'$at = $subject[1]',
+	'while ($at -lt $subject[2]) {',
+	'$rdn = Read-Element $at $subject[2]',
+	"if ($rdn[0] -ne 0x31) { throw 'Not a relative distinguished name' }",
+	'$attributes = 0',
+	'$value = $null',
+	'$isOrganization = $false',
+	'$inner = $rdn[1]',
+	'while ($inner -lt $rdn[2]) {',
+	'$attribute = Read-Element $inner $rdn[2]',
+	"if ($attribute[0] -ne 0x30) { throw 'Not an attribute' }",
+	'$type = Read-Element $attribute[1] $attribute[2]',
+	"if ($type[0] -ne 0x06) { throw 'Not an attribute type' }",
+	'$data = Read-Element $type[2] $attribute[2]',
+	"if ($data[2] -ne $attribute[2]) { throw 'Unexpected attribute data' }",
+	'$attributes++',
+	'if ($type[2] - $type[1] -eq 3 -and $Name[$type[1]] -eq 0x55 -and $Name[$type[1] + 1] -eq 0x04 -and $Name[$type[1] + 2] -eq 0x0A) {',
+	'$organizations++',
+	'$isOrganization = $true',
+	'$length = $data[2] - $data[1]',
+	'if ($data[0] -eq 0x0C -or $data[0] -eq 0x13) { $value = $utf8.GetString($Name, $data[1], $length) }',
+	'elseif ($data[0] -eq 0x1E) { $value = $bmp.GetString($Name, $data[1], $length) }',
+	'}',
+	'$inner = $attribute[2]',
+	'}',
+	"if ($attributes -lt 1) { throw 'Empty relative distinguished name' }",
+	'if ($isOrganization -and $attributes -eq 1 -and $value -is [string] -and [string]::Equals($value, $expected, [System.StringComparison]::Ordinal)) { $matched = $true }',
+	'$at = $rdn[2]',
+	'}',
+	'return ($organizations -eq 1 -and $matched)',
+	'}',
+].join( '\n' );
+
 const WINDOWS_ENVIRONMENT: readonly string[] = Object.freeze( [
 	'PATH',
 	'SYSTEMROOT',
@@ -100,6 +164,26 @@ function minimalEnvironment( env: NodeJS.ProcessEnv ): NodeJS.ProcessEnv {
 	);
 }
 
+/**
+ * The IMAGE_FILE_MACHINE_* values IsWow64Process2 reports as the host's
+ * native machine. Its documentation defines that output as the native
+ * architecture of the host system, whatever the calling process is, while
+ * GetSystemInfo, GetNativeSystemInfo (and so `os.machine()`) and the process's
+ * PROCESSOR_ARCHITECTURE describe the emulated machine to an x64 process on ARM64.
+ */
+const NATIVE_MACHINES: Readonly< Record< string, ClaudeArch > > = Object.freeze( {
+	'34404': 'x64',
+	'43620': 'arm64',
+} );
+const NATIVE_MACHINE_PROBE = [
+	"$ErrorActionPreference='Stop'",
+	'Add-Type -Namespace StudioClaude -Name NativeMachine -MemberDefinition \'[DllImport("kernel32.dll", SetLastError = true)] public static extern bool IsWow64Process2(IntPtr process, out ushort processMachine, out ushort nativeMachine);\'',
+	'$process = [uint16]0',
+	'$native = [uint16]0',
+	'if (-not [StudioClaude.NativeMachine]::IsWow64Process2([System.Diagnostics.Process]::GetCurrentProcess().Handle, [ref]$process, [ref]$native)) { exit 2 }',
+	'[Console]::Out.Write($native)',
+].join( '\n' );
+
 /** The documented system directory; `%ProgramFiles%` is checked as well where it differs. */
 const DOCUMENTED_POLICY_DIRECTORY = 'C:\\Program Files\\ClaudeCode';
 const POLICY_KEY = 'SOFTWARE\\Policies\\ClaudeCode';
@@ -119,6 +203,17 @@ export const windowsAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatfo
 	isSelectablePath: ( selected: string ) =>
 		path.win32.isAbsolute( selected ) && path.win32.extname( selected ).toLowerCase() === '.exe',
 	readBinaryHeader: readPeHeader,
+	async probeMachineArchitecture( seams ) {
+		const { stdout } = await seams.run(
+			trustedPowerShellPath( seams.env ),
+			encodedPowerShellArgs( NATIVE_MACHINE_PROBE ),
+			{ env: minimalEnvironment( seams.env ), timeout: 30000, windowsHide: true }
+		);
+		const value = stdout.trim();
+		return Object.prototype.hasOwnProperty.call( NATIVE_MACHINES, value )
+			? NATIVE_MACHINES[ value ]
+			: undefined;
+	},
 	async verifyBinary( input, seams ) {
 		let powershell: string;
 		try {
@@ -126,9 +221,16 @@ export const windowsAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatfo
 		} catch {
 			return { ok: false, reason: 'signature-unverifiable' };
 		}
-		const script = `$ErrorActionPreference='Stop'; Import-Module "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1"; $p=${ powerShellString(
-			input.executablePath
-		) }; $s=Get-AuthenticodeSignature -LiteralPath $p; if($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notmatch '(^|,\\s*)O="?Anthropic, PBC"?(,|$)') { exit ${ SIGNATURE_REFUSED } }; exit 0`;
+		const script = [
+			"$ErrorActionPreference='Stop'",
+			'Import-Module "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1"',
+			AUTHENTICODE_SIGNER_CHECK,
+			`$p=${ powerShellString( input.executablePath ) }`,
+			'$s=Get-AuthenticodeSignature -LiteralPath $p',
+			`if ($s.Status -ne 'Valid' -or -not $s.SignerCertificate) { exit ${ SIGNATURE_REFUSED } }`,
+			`if (-not (Test-StudioClaudeSigner $s.SignerCertificate.SubjectName.RawData)) { exit ${ SIGNATURE_REFUSED } }`,
+			'exit 0',
+		].join( '\n' );
 		try {
 			await seams.run( powershell, encodedPowerShellArgs( script ), {
 				env: input.env,

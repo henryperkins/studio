@@ -1,3 +1,4 @@
+import { existsSync } from 'fs';
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -15,13 +16,19 @@ import {
 	isClaudeExecutableUnchanged,
 	isClaudeRuntimeSurfaceEnabled,
 	isSameClaudePath,
+	probeClaudeMachineArchitecture,
 	qualifyClaudeRuntime,
 	resolveClaudePathKey,
 	verifyClaudeExecutableIdentity,
 } from '../platform';
 import { linuxAdapter, readElfHeader } from '../platforms/linux';
 import { readMachOHeader } from '../platforms/macos';
-import { readPeHeader } from '../platforms/windows';
+import {
+	AUTHENTICODE_SIGNER_CHECK,
+	encodedPowerShellArgs,
+	readPeHeader,
+	trustedPowerShellPath,
+} from '../platforms/windows';
 import {
 	CPU_TYPE_ARM64,
 	CPU_TYPE_POWERPC64,
@@ -76,13 +83,20 @@ describe( 'Claude qualified runtime matrix', () => {
 			expect( record ).toMatchObject( {
 				state: 'unqualified',
 				reason: 'no-native-qualification-run',
+				confirmationsRequired: expect.arrayContaining( [ 'machine-architecture-probe' ] ),
 			} );
+		expect(
+			CLAUDE_QUALIFICATION_MATRIX.find( ( item ) => item.target === 'windows-x64' )
+		).not.toHaveProperty( 'confirmationsRequired' );
 	} );
 
 	it( 'cannot be changed at run time', () => {
 		expect( Object.isFrozen( CLAUDE_QUALIFICATION_MATRIX ) ).toBe( true );
-		for ( const record of CLAUDE_QUALIFICATION_MATRIX )
+		for ( const record of CLAUDE_QUALIFICATION_MATRIX ) {
 			expect( Object.isFrozen( record ) ).toBe( true );
+			if ( record.confirmationsRequired )
+				expect( Object.isFrozen( record.confirmationsRequired ) ).toBe( true );
+		}
 		expect( () =>
 			( CLAUDE_QUALIFICATION_MATRIX as unknown as unknown[] ).push( {
 				target: 'macos-arm64',
@@ -197,27 +211,246 @@ describe( 'Claude platform gates', () => {
 		);
 	} );
 
-	it( 'refuses an unqualified or unsupported host with a typed reason before running anything', async () => {
+	it( 'refuses an unqualified host with a typed reason and runs nothing for a missing file, and never touches a file on an unsupported host', async () => {
 		for ( const host of [
 			{ platform: 'win32', arch: 'arm64' },
 			{ platform: 'darwin', arch: 'x64' },
 			{ platform: 'darwin', arch: 'arm64' },
 			{ platform: 'linux', arch: 'x64' },
 			{ platform: 'linux', arch: 'arm64' },
-		] )
+		] ) {
+			const runner = recordingRunner( () => new Error( 'unexpected' ) );
+			const windows = host.platform === 'win32';
+			const { seams } = simulatedHost( host, windows ? path.win32 : path.posix, {
+				run: runner.run,
+			} );
 			await expect(
-				inspectClaudeExecutable( '/nonexistent/claude', { host } )
+				inspectClaudeExecutable(
+					windows ? 'C:\\nonexistent\\claude.exe' : '/nonexistent/claude',
+					seams
+				),
+				host.platform
 			).resolves.toMatchObject( {
 				ok: false,
 				reason: 'platform-unqualified',
+				check: 'executable-unavailable',
 				qualification: { state: 'unqualified', reason: 'platform-unqualified' },
 			} );
+			expect( runner.calls, `${ host.platform }-${ host.arch }` ).toEqual( [] );
+		}
+		const runner = recordingRunner( () => new Error( 'unexpected' ) );
+		const unsupported = simulatedHost( { platform: 'freebsd', arch: 'x64' }, path.posix, {
+			run: runner.run,
+		} );
+		const reads = denied( unsupported.fs.files, [] );
+		unsupported.fs.write(
+			'/usr/local/bin/claude',
+			elfBinary( EM_X86_64, { interpreter: GLIBC_X64 } )
+		);
 		await expect(
-			inspectClaudeExecutable( '/nonexistent/claude', {
-				host: { platform: 'freebsd', arch: 'x64' },
+			inspectClaudeExecutable( '/usr/local/bin/claude', {
+				...unsupported.seams,
+				files: reads.files,
 			} )
 		).resolves.toMatchObject( { ok: false, reason: 'platform-unsupported' } );
+		expect( runner.calls ).toEqual( [] );
+		expect( reads.contents.read ).toBe( 0 );
 	} );
+} );
+
+describe( 'Claude machine architecture', () => {
+	const powershell = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+
+	it( 'reads the Windows machine from IsWow64Process2, which names the native machine even to an emulated process', async () => {
+		for ( const [ answer, expected ] of [
+			[ '34404', 'x64' ],
+			[ '43620', 'arm64' ],
+			[ '332', undefined ],
+			[ '', undefined ],
+			[ '43620 ', 'arm64' ],
+			[ '0x8664', undefined ],
+			[ exitWith( 2 ), undefined ],
+			[ spawnFailure(), undefined ],
+		] as const ) {
+			const runner = recordingRunner( () => answer );
+			const { seams } = simulatedHost( { platform: 'win32', arch: 'x64' }, path.win32, {
+				env: { SystemRoot: 'C:\\Windows', PROCESSOR_ARCHITECTURE: 'AMD64', Secret: 'x' },
+				run: runner.run,
+				osMachine: () => 'x86_64',
+			} );
+			await expect(
+				probeClaudeMachineArchitecture( { ...seams, machineArchitecture: undefined } ),
+				String( answer )
+			).resolves.toBe( expected );
+			expect( runner.calls ).toHaveLength( 1 );
+			expect( runner.calls[ 0 ] ).toMatchObject( {
+				file: powershell,
+				env: { SystemRoot: 'C:\\Windows' },
+			} );
+			expect( runner.calls[ 0 ].env.Secret ).toBeUndefined();
+			const script = decodedScript( runner.calls[ 0 ].args );
+			expect( script ).toContain( 'IsWow64Process2' );
+			expect( script ).not.toMatch( /PROCESSOR_ARCHITECTURE|GetNativeSystemInfo/ );
+		}
+		const { seams } = simulatedHost( { platform: 'win32', arch: 'x64' }, path.win32, {
+			env: { PROCESSOR_ARCHITECTURE: 'AMD64' },
+		} );
+		await expect(
+			probeClaudeMachineArchitecture( { ...seams, machineArchitecture: undefined } )
+		).resolves.toBeUndefined();
+	} );
+
+	it( 'reads the Mac hardware from hw.optional.arm64, which Rosetta does not hide', async () => {
+		for ( const [ answer, expected ] of [
+			[ '1\n', 'arm64' ],
+			[ '0\n', 'x64' ],
+			[ exitWith( 1 ), undefined ],
+			[ 'yes', undefined ],
+			[ '', undefined ],
+		] as const ) {
+			const runner = recordingRunner( () => answer );
+			const { seams } = simulatedHost( { platform: 'darwin', arch: 'x64' }, path.posix, {
+				run: runner.run,
+				osMachine: () => 'x86_64',
+			} );
+			await expect(
+				probeClaudeMachineArchitecture( { ...seams, machineArchitecture: undefined } ),
+				String( answer )
+			).resolves.toBe( expected );
+			expect( runner.calls.map( ( { file, args } ) => [ file, ...args ] ) ).toEqual( [
+				[ '/usr/sbin/sysctl', '-n', 'hw.optional.arm64' ],
+			] );
+		}
+	} );
+
+	it( 'reads the Linux machine from uname, the only fact the kernel gives', async () => {
+		for ( const [ machine, expected ] of [
+			[ 'x86_64', 'x64' ],
+			[ 'aarch64', 'arm64' ],
+			[ 'armv7l', undefined ],
+			[ '', undefined ],
+		] as const ) {
+			const { seams } = simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix, {
+				osMachine: () => machine,
+			} );
+			await expect(
+				probeClaudeMachineArchitecture( { ...seams, machineArchitecture: undefined } ),
+				machine
+			).resolves.toBe( expected );
+		}
+		const { seams } = simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix, {
+			osMachine: () => {
+				throw new Error( 'uname failed' );
+			},
+		} );
+		await expect(
+			probeClaudeMachineArchitecture( { ...seams, machineArchitecture: undefined } )
+		).resolves.toBeUndefined();
+	} );
+
+	it( 'selects the target by the machine, and refuses a translated process or an unknown machine before running anything', async () => {
+		const windows = ( arch: 'x64' | 'arm64', machine: 'x64' | 'arm64' | undefined ) => {
+			const runner = recordingRunner( ( command ) =>
+				command.args[ 0 ] === '--version' ? versionOutput( '2.1.319' ) : authenticodeOk
+			);
+			const host = simulatedHost( { platform: 'win32', arch }, path.win32, {
+				env: { SystemRoot: 'C:\\Windows' },
+				run: runner.run,
+				machineArchitecture: async () => machine,
+			} );
+			host.fs.write(
+				'C:\\Claude\\claude.exe',
+				peBinary( { machine: arch === 'x64' ? 0x8664 : 0xaa64 } )
+			);
+			return { ...host, calls: runner.calls };
+		};
+		const native = windows( 'x64', 'x64' );
+		await expect(
+			inspectClaudeExecutable( 'C:\\Claude\\claude.exe', native.seams )
+		).resolves.toMatchObject( { ok: true, target: 'windows-x64' } );
+
+		const emulated = windows( 'x64', 'arm64' );
+		const translated = await inspectClaudeExecutable( 'C:\\Claude\\claude.exe', emulated.seams );
+		expect( translated ).toMatchObject( {
+			ok: false,
+			reason: 'platform-unqualified',
+			host: {
+				check: 'process-translated',
+				processArchitecture: 'x64',
+				machineArchitecture: 'arm64',
+			},
+			qualification: {
+				state: 'unqualified',
+				reason: 'platform-unqualified',
+				record: { target: 'windows-arm64', reason: 'no-native-qualification-run' },
+			},
+		} );
+		expect( emulated.calls ).toEqual( [] );
+
+		const rosetta = simulatedHost( { platform: 'darwin', arch: 'x64' }, path.posix, {
+			run: recordingRunner( () => new Error( 'unexpected' ) ).run,
+			machineArchitecture: async () => 'arm64',
+		} );
+		rosetta.fs.write( '/Users/tester/.local/bin/claude', machOBinary( CPU_TYPE_X86_64 ) );
+		await expect(
+			inspectClaudeExecutable( '/Users/tester/.local/bin/claude', rosetta.seams )
+		).resolves.toMatchObject( {
+			ok: false,
+			reason: 'platform-unqualified',
+			host: {
+				check: 'process-translated',
+				processArchitecture: 'x64',
+				machineArchitecture: 'arm64',
+			},
+			qualification: { record: { target: 'macos-arm64' } },
+		} );
+
+		const arm = windows( 'arm64', 'arm64' );
+		const nativeArm = await inspectClaudeExecutable( 'C:\\Claude\\claude.exe', arm.seams );
+		expect( nativeArm ).toMatchObject( {
+			ok: false,
+			reason: 'platform-unqualified',
+			qualification: { record: { target: 'windows-arm64' } },
+		} );
+		expect( nativeArm ).not.toHaveProperty( 'host' );
+
+		const unknown = windows( 'x64', undefined );
+		const unestablished = await inspectClaudeExecutable( 'C:\\Claude\\claude.exe', unknown.seams );
+		expect( unestablished ).toEqual( {
+			ok: false,
+			reason: 'platform-unqualified',
+			host: { check: 'machine-architecture-unknown', processArchitecture: 'x64' },
+			executable: expect.objectContaining( { format: 'pe', architectures: [ 'x64' ] } ),
+			qualification: {
+				state: 'unqualified',
+				reason: 'platform-unqualified',
+				supportedRuntimeVersions: [],
+			},
+		} );
+		expect( unknown.calls ).toEqual( [] );
+
+		const probed = recordingRunner( ( command ) =>
+			decodedScript( command.args ).includes( 'IsWow64Process2' ) ? '43620' : authenticodeOk
+		);
+		const wired = simulatedHost( { platform: 'win32', arch: 'x64' }, path.win32, {
+			env: { SystemRoot: 'C:\\Windows' },
+			run: probed.run,
+			machineArchitecture: undefined,
+		} );
+		wired.fs.write( 'C:\\Claude\\claude.exe', peBinary() );
+		await expect(
+			inspectClaudeExecutable( 'C:\\Claude\\claude.exe', wired.seams )
+		).resolves.toMatchObject( { host: { check: 'process-translated' } } );
+		expect( probed.calls ).toHaveLength( 1 );
+	} );
+
+	it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
+		'establishes this Windows x64 machine as x64 through the real probe',
+		async () => {
+			await expect( probeClaudeMachineArchitecture() ).resolves.toBe( 'x64' );
+			await expect( defaultClaudePlatformSeams().machineArchitecture() ).resolves.toBe( 'x64' );
+		}
+	);
 } );
 
 const reader = ( bytes: Buffer ) => async ( position: number, length: number ) =>
@@ -379,7 +612,12 @@ describe( 'Claude executable inspection on Windows', () => {
 		] );
 		const script = decodedScript( calls[ 0 ].args );
 		expect( script ).toContain( 'Get-AuthenticodeSignature -LiteralPath $p' );
-		expect( script ).toContain( 'Anthropic, PBC' );
+		expect( script ).toContain( AUTHENTICODE_SIGNER_CHECK );
+		expect( script ).toContain(
+			'Test-StudioClaudeSigner $s.SignerCertificate.SubjectName.RawData'
+		);
+		expect( script ).toContain( '[System.StringComparison]::Ordinal' );
+		expect( script ).not.toMatch( /-[ci]?(not)?(match|like)\b|\.Subject\b/i );
 		expect( script ).toContain( Buffer.from( selected, 'utf8' ).toString( 'base64' ) );
 		expect( script ).not.toContain( 'Ünïcode' );
 		expect( JSON.stringify( result ) ).not.toMatch( /token|secret|credential/i );
@@ -513,6 +751,139 @@ describe( 'Claude executable inspection on Windows', () => {
 		} );
 	} );
 } );
+
+describe.skipIf( process.platform !== 'win32' )(
+	'Authenticode signer check (Windows only: it runs the production PowerShell function natively)',
+	() => {
+		const der = ( tag: number, ...content: Buffer[] ) => {
+			const body = Buffer.concat( content );
+			let length = Buffer.from( [ body.length ] );
+			if ( body.length >= 0x100 )
+				length = Buffer.from( [ 0x82, body.length >> 8, body.length & 0xff ] );
+			else if ( body.length >= 0x80 ) length = Buffer.from( [ 0x81, body.length ] );
+			return Buffer.concat( [ Buffer.from( [ tag ] ), length, body ] );
+		};
+		const ORGANIZATION = Buffer.from( [ 0x06, 0x03, 0x55, 0x04, 0x0a ] );
+		const organization = ( tag: number, value: Buffer ) =>
+			der( 0x30, ORGANIZATION, der( tag, value ) );
+		const subject = ( ...attributes: Buffer[] ) =>
+			der( 0x30, ...attributes.map( ( attribute ) => der( 0x31, attribute ) ) );
+		const utf8 = ( value: string ) => Buffer.from( value, 'utf8' );
+		// The subject of the certificate that signs the vendor's 2.1.319 Windows binary.
+		const vendorSubject =
+			'3081cd31133011060b2b0601040182373c0201031302555331193017060b2b0601040182373c020102130844656c6177617265311d301b060355040f0c1450726976617465204f7267616e697a6174696f6e3110300e0603550405130734383630363231310b3009060355040613025553311330110603550408130a43616c69666f726e6961311630140603550407130d53616e204672616e636973636f31173015060355040a130e416e7468726f7069632c20504243311730150603550403130e416e7468726f7069632c20504243';
+		const exact = organization( 0x13, utf8( 'Anthropic, PBC' ) );
+
+		it( 'accepts only a subject whose one single-valued Organization is exactly the vendor’s, compared ordinally', async () => {
+			const samples: Array< [ string, { dn: string } | { der: Buffer }, string ] > = [
+				[ 'the vendor certificate', { der: Buffer.from( vendorSubject, 'hex' ) }, 'accepted' ],
+				[ 'exactly the vendor', { dn: 'O="Anthropic, PBC"' }, 'accepted' ],
+				[
+					'extra RDNs before and after',
+					{
+						dn: 'CN="Anthropic, PBC", O="Anthropic, PBC", L=San Francisco, S=California, C=US',
+					},
+					'accepted',
+				],
+				[
+					'a UTF8String value',
+					{ der: subject( organization( 0x0c, utf8( 'Anthropic, PBC' ) ) ) },
+					'accepted',
+				],
+				[
+					'a BMPString value',
+					{
+						der: subject(
+							organization( 0x1e, Buffer.from( 'Anthropic, PBC', 'utf16le' ).swap16() )
+						),
+					},
+					'accepted',
+				],
+				[
+					'O= inside another RDN, another O',
+					{ dn: 'CN="Evil, O=Anthropic, PBC", O=Evil Corp' },
+					'refused',
+				],
+				[ 'another case', { dn: 'O="ANTHROPIC, pbc"' }, 'refused' ],
+				[ 'a longer value', { dn: 'O="Anthropic, PBC Evil"' }, 'refused' ],
+				[ 'lower case', { dn: 'O="anthropic, pbc"' }, 'refused' ],
+				[ 'O= quoted inside OU', { dn: 'OU="O=Anthropic, PBC", CN=Evil' }, 'refused' ],
+				[ 'no Organization', { dn: 'CN="Anthropic, PBC"' }, 'refused' ],
+				[ 'a multi-valued RDN', { dn: 'C=US + O="Anthropic, PBC", CN=Claude' }, 'refused' ],
+				[ 'a second Organization', { dn: 'O="Anthropic, PBC", O=Evil Corp' }, 'refused' ],
+				[ 'the vendor twice', { der: subject( exact, exact ) }, 'refused' ],
+				[
+					'a soft hyphen',
+					{ der: subject( organization( 0x0c, utf8( 'Anthropic,­ PBC' ) ) ) },
+					'refused',
+				],
+				[
+					'a zero-width joiner',
+					{ der: subject( organization( 0x0c, utf8( 'Anthropic,‍ PBC' ) ) ) },
+					'refused',
+				],
+				[
+					'a trailing space',
+					{ der: subject( organization( 0x13, utf8( 'Anthropic, PBC ' ) ) ) },
+					'refused',
+				],
+				[
+					'a Cyrillic A',
+					{ der: subject( organization( 0x0c, utf8( 'Аnthropic, PBC' ) ) ) },
+					'refused',
+				],
+				[
+					'an undecoded string type',
+					{ der: subject( organization( 0x14, utf8( 'Anthropic, PBC' ) ) ) },
+					'refused',
+				],
+				[ 'a truncated name', { der: subject( exact ).subarray( 0, -1 ) }, 'cannot verify' ],
+				[
+					'data after the name',
+					{ der: Buffer.concat( [ subject( exact ), Buffer.from( [ 0 ] ) ] ) },
+					'cannot verify',
+				],
+				[ 'an empty RDN', { der: der( 0x30, der( 0x31 ), der( 0x31, exact ) ) }, 'cannot verify' ],
+				[
+					'invalid UTF-8',
+					{ der: subject( organization( 0x0c, Buffer.from( [ 0xc3, 0x28 ] ) ) ) },
+					'cannot verify',
+				],
+			];
+			const data = Buffer.from(
+				JSON.stringify(
+					samples.map( ( [ , sample ] ) =>
+						'der' in sample ? { der: sample.der.toString( 'base64' ) } : sample
+					)
+				),
+				'utf8'
+			).toString( 'base64' );
+			const harness = [
+				"$ErrorActionPreference='Stop'",
+				AUTHENTICODE_SIGNER_CHECK,
+				`$samples = ConvertFrom-Json ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ data }')))`,
+				'$results = foreach ($sample in $samples) {',
+				'try {',
+				'if ($sample.der) { $name = [Convert]::FromBase64String($sample.der) }',
+				'else { $name = (New-Object System.Security.Cryptography.X509Certificates.X500DistinguishedName($sample.dn)).RawData }',
+				"if (Test-StudioClaudeSigner $name) { 'accepted' } else { 'refused' }",
+				"} catch { 'cannot verify' }",
+				'}',
+				'[Console]::Out.Write($results -join [char]10)',
+			].join( '\n' );
+			const { execFile } = await import( 'child_process' );
+			const { promisify } = await import( 'util' );
+			const { stdout } = await promisify( execFile )(
+				trustedPowerShellPath( process.env ),
+				encodedPowerShellArgs( harness ),
+				{ windowsHide: true, timeout: 60000 }
+			);
+			expect(
+				samples.map( ( [ name ], index ) => [ name, stdout.split( '\n' )[ index ] ] )
+			).toEqual( samples.map( ( [ name, , expected ] ) => [ name, expected ] ) );
+		} );
+	}
+);
 
 describe( 'Claude executable inspection on macOS', () => {
 	const codesign = '/usr/bin/codesign';
@@ -795,7 +1166,10 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 					command.args[ 0 ] === '--version' ? versionOutput( '2.1.319' ) : authenticodeOk
 				);
 				const selectedPath = path.join( junction, 'claude.exe' );
-				const result = await inspectClaudeExecutable( selectedPath, { run: runner.run } );
+				const result = await inspectClaudeExecutable( selectedPath, {
+					run: runner.run,
+					machineArchitecture: () => probeClaudeMachineArchitecture(),
+				} );
 				expect( result ).toMatchObject( { ok: true, executablePath: executable } );
 				expect( runner.calls.at( -1 ) ).toMatchObject( {
 					file: executable,
@@ -1102,19 +1476,31 @@ describe( 'Claude managed policy', () => {
 		).resolves.toMatchObject( { state: 'unverifiable' } );
 	} );
 
-	it( 'inspects the macOS file locations and both managed preferences domains, never their contents', async () => {
+	it( 'inspects the macOS file locations, never calls the undocumented managed-preferences paths absent, and never reads contents', async () => {
 		const macos = () =>
 			simulatedHost( { platform: 'darwin', arch: 'arm64' }, path.posix, {
 				username: () => 'tester',
 			} );
+		const preferences = [
+			{
+				kind: 'managed-preferences',
+				scope: 'machine',
+				location: '/Library/Managed Preferences/com.anthropic.claudecode.plist',
+			},
+			{
+				kind: 'managed-preferences',
+				scope: 'user',
+				location: '/Library/Managed Preferences/tester/com.anthropic.claudecode.plist',
+			},
+		];
 		const empty = macos();
 		const guarded = denied( empty.fs.files, [] );
 		await expect(
 			inspectClaudeManagedPolicy( { ...empty.seams, files: guarded.files } )
 		).resolves.toEqual( {
-			state: 'absent',
+			state: 'unverifiable',
 			present: [],
-			unreadable: [],
+			unreadable: preferences,
 			checked: [
 				{
 					kind: 'settings-file',
@@ -1153,7 +1539,25 @@ describe( 'Claude managed policy', () => {
 		await expect( inspectClaudeManagedPolicy( profile.seams ) ).resolves.toMatchObject( {
 			state: 'present',
 			present: [ { kind: 'managed-preferences', scope: 'user' } ],
+			unreadable: [ preferences[ 0 ] ],
 		} );
+		const deployed = macos();
+		deployed.fs.write(
+			'/Library/Application Support/ClaudeCode/managed-settings.json',
+			Buffer.from( '{}' )
+		);
+		await expect( inspectClaudeManagedPolicy( deployed.seams ) ).resolves.toMatchObject( {
+			state: 'present',
+			present: [ { kind: 'settings-file' } ],
+		} );
+		expect(
+			CLAUDE_QUALIFICATION_MATRIX.filter( ( record ) => record.target.startsWith( 'macos-' ) ).map(
+				( record ) => record.confirmationsRequired
+			)
+		).toEqual( [
+			expect.arrayContaining( [ 'managed-preferences-locations' ] ),
+			expect.arrayContaining( [ 'managed-preferences-locations' ] ),
+		] );
 
 		const nameless = macos();
 		await expect(
@@ -1193,6 +1597,12 @@ describe( 'Claude managed policy', () => {
 		).resolves.toEqual( { state: 'unverifiable', present: [], unreadable: [], checked: [] } );
 	} );
 } );
+
+const posixShell = (
+	process.platform === 'win32'
+		? [ 'C:\\Program Files\\Git\\usr\\bin\\sh.exe', 'C:\\Program Files\\Git\\bin\\sh.exe' ]
+		: [ '/bin/sh' ]
+).find( ( candidate ) => existsSync( candidate ) );
 
 describe( 'Claude native sign-in launch', () => {
 	const hostile = 'Claude Édition $HOME `whoami` "quoted" \'single\' [1] & | ;';
@@ -1249,52 +1659,123 @@ describe( 'Claude native sign-in launch', () => {
 		}
 	} );
 
+	// Characters a login shell can act on: fish ends single quotes at \', csh
+	// expands ! inside them, and the rest are quoting, expansion and option syntax.
+	const shellHostile = '-lead \\\' ! $HOME `id` "q" [1] & | ; \nnext';
+	const SHELL_INERT_PATH = /^\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/;
+	const posixQuote = ( value: string ) => `'${ value.replace( /'/g, "'\\''" ) }'`;
+	const scriptFor = ( script: { directory: string; path: string }, cwd: string, argv: string[] ) =>
+		[
+			`/bin/rm -f -- ${ posixQuote( script.path ) }`,
+			`/bin/rmdir -- ${ posixQuote( script.directory ) }`,
+			`cd -- ${ posixQuote( cwd ) } || exit 1`,
+			`exec ${ argv.map( posixQuote ).join( ' ' ) }`,
+			'',
+		].join( '\n' );
+	const expectInert = ( parsed: string ) => {
+		for ( const character of [ '\\', "'", '!', '$', '`', '\n', '"', ';', '&', '|' ] )
+			expect( parsed, JSON.stringify( character ) ).not.toContain( character );
+		expect( parsed ).not.toMatch( /(^|\s)-/ );
+	};
+
 	function macos(
-		present: string[] = [ '/System/Applications/Utilities/Terminal.app', '/usr/bin/open' ]
+		present: string[] = [ '/System/Applications/Utilities/Terminal.app', '/usr/bin/open' ],
+		tempDirectory = '/var/folders/ab/T'
 	) {
+		const writes: Array< { directory: string; path: string; contents: string } > = [];
+		const removed: string[] = [];
 		const host = simulatedHost( { platform: 'darwin', arch: 'arm64' }, path.posix, {
 			env: { HOME: '/Users/tester', PATH: '/usr/bin:/bin' },
+			tempDirectory: () => tempDirectory,
+			writePrivateScript: async ( script ) => {
+				writes.push( script );
+			},
+			removePrivateScript: async ( directory ) => {
+				removed.push( directory );
+			},
 		} );
+		host.fs.directory( '/private/var/folders/ab/T' );
+		host.fs.link( '/var', '/private/var' );
+		host.fs.directory( '/private/tmp' );
+		host.fs.link( '/tmp', '/private/tmp' );
 		for ( const item of present ) host.fs.write( item, Buffer.from( 'x' ) );
-		return host;
+		return { ...host, writes, removed };
 	}
 
-	it( 'opens Terminal on macOS with every argument quoted by AppleScript, never by Studio', async () => {
-		const executablePath = `/Users/tester/${ hostile }/claude`;
-		const cwd = `/Users/tester/${ hostile }`;
+	it( 'has Terminal’s login shell parse only `exec /bin/sh` and a Studio-chosen script path on macOS', async () => {
+		const executablePath = `/Users/tester/${ shellHostile }/claude`;
+		const cwd = `/Users/tester/-${ shellHostile }`;
 		const env = {
 			HOME: '/Users/tester',
 			PATH: '/usr/bin:/bin',
-			CLAUDE_CONFIG_DIR: `/Users/tester/${ hostile }/config`,
+			LANG: `-${ shellHostile }`,
+			CLAUDE_CONFIG_DIR: `/Users/tester/${ shellHostile }/config`,
 		};
-		const { seams } = macos();
+		const runner = recordingRunner( () => '' );
+		const { seams, writes, removed } = macos();
 		const plan = await planClaudeSignIn(
 			{ executablePath, args: [ 'auth', 'login' ], cwd, env },
-			seams
+			{ ...seams, run: runner.run }
 		);
 		expect( plan.state ).toBe( 'ready' );
-		if ( plan.state !== 'ready' ) return;
-		expect( plan.launch.mode ).toBe( 'run' );
-		expect( plan.launch.file ).toBe( '/usr/bin/osascript' );
-		const separator = plan.launch.args.indexOf( cwd );
-		const script = plan.launch.args.slice( 0, separator );
-		expect(
-			script.filter( ( _, index ) => index % 2 === 0 ).every( ( flag ) => flag === '-e' )
-		).toBe( true );
-		expect( script.join( '\n' ) ).toContain( 'quoted form of' );
-		expect( script.join( '\n' ) ).toContain( 'tell application "Terminal"' );
-		expect( script.join( '\n' ) ).not.toContain( hostile );
-		expect( plan.launch.args.slice( separator ) ).toEqual( [
-			cwd,
-			'/usr/bin/env',
-			'-i',
-			`CLAUDE_CONFIG_DIR=/Users/tester/${ hostile }/config`,
-			'HOME=/Users/tester',
-			'PATH=/usr/bin:/bin',
-			executablePath,
-			'auth',
-			'login',
+		if ( plan.state !== 'ready' || ! plan.launch.script ) throw new Error( 'expected a script' );
+		const { script } = plan.launch;
+		expect( script.directory ).toMatch(
+			/^\/private\/var\/folders\/ab\/T\/studio-claude-sign-in-[0-9a-f]{16}$/
+		);
+		expect( script.path ).toBe( `${ script.directory }/sign-in.sh` );
+		expect( plan.launch ).toMatchObject( { mode: 'run', file: '/usr/bin/osascript', env } );
+		const appleScript = plan.launch.args.slice( 0, -1 );
+		expect( appleScript.filter( ( _, index ) => index % 2 === 0 ) ).toEqual(
+			appleScript.filter( ( _, index ) => index % 2 === 0 ).map( () => '-e' )
+		);
+		expect( appleScript ).toContain( 'do script "exec /bin/sh " & (item 1 of argv)' );
+		expect( appleScript.join( '\n' ) ).not.toContain( 'quoted form of' );
+		expect( plan.launch.args.at( -1 ) ).toBe( script.path );
+		const parsed = `exec /bin/sh ${ script.path }`;
+		expect( parsed ).toMatch( /^exec \/bin\/sh \/[A-Za-z0-9._/-]+$/ );
+		expect( SHELL_INERT_PATH.test( script.path ) ).toBe( true );
+		expectInert( parsed );
+		expect( script.contents ).toBe(
+			scriptFor( script, cwd, [
+				'/usr/bin/env',
+				'-i',
+				`CLAUDE_CONFIG_DIR=/Users/tester/${ shellHostile }/config`,
+				'HOME=/Users/tester',
+				`LANG=-${ shellHostile }`,
+				'PATH=/usr/bin:/bin',
+				executablePath,
+				'auth',
+				'login',
+			] )
+		);
+
+		await expect(
+			executeClaudeSignIn( plan.launch, { ...seams, run: runner.run } )
+		).resolves.toEqual( { state: 'launched' } );
+		expect( writes ).toEqual( [ script ] );
+		expect( runner.calls.map( ( { file, args } ) => [ file, args ] ) ).toEqual( [
+			[ '/usr/bin/osascript', plan.launch.args ],
 		] );
+		expect( removed ).toEqual( [] );
+	} );
+
+	it( 'falls back to /tmp for a temporary directory a shell could parse, and refuses when none is safe', async () => {
+		const request = {
+			executablePath: '/Users/tester/claude',
+			args: [ 'auth', 'login' ],
+			cwd: '/Users/tester',
+			env: {},
+		};
+		const quirky = macos( undefined, "/Users/tester/it's $TMP" );
+		quirky.fs.directory( "/Users/tester/it's $TMP" );
+		const plan = await planClaudeSignIn( request, quirky.seams );
+		expect( plan.state === 'ready' && plan.launch.script?.directory ).toMatch(
+			/^\/private\/tmp\/studio-claude-sign-in-[0-9a-f]{16}$/
+		);
+		const none = macos( undefined, '/missing' );
+		none.fs.remove( '/tmp' );
+		await expect( planClaudeSignIn( request, none.seams ) ).rejects.toThrow();
 	} );
 
 	it( 'asks for the user’s action on macOS without a display, Terminal, browser or Automation permission', async () => {
@@ -1346,58 +1827,202 @@ describe( 'Claude native sign-in launch', () => {
 				},
 			} )
 		).rejects.toThrow();
+		expect( denied.writes ).toHaveLength( 2 );
+		expect( denied.removed ).toEqual( [
+			plan.launch.script?.directory,
+			plan.launch.script?.directory,
+		] );
 	} );
 
-	function linux( commands: string[], env: NodeJS.ProcessEnv = { DISPLAY: ':0' } ) {
+	function linux(
+		commands: string[],
+		env: NodeJS.ProcessEnv = { DISPLAY: ':0' },
+		launch: ( file: string ) => void = () => {}
+	) {
 		const launches: Array< { file: string; args: string[]; env: NodeJS.ProcessEnv; cwd: string } > =
 			[];
+		const writes: Array< { directory: string; path: string; contents: string } > = [];
+		const removed: string[] = [];
 		const host = simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix, {
 			env,
 			findOnPath: ( command ) => ( commands.includes( command ) ? `/usr/bin/${ command }` : null ),
 			launchDetached: async ( file, args, options ) => {
+				launch( file );
 				launches.push( { file, args, ...options } );
 			},
+			tempDirectory: () => '/tmp',
+			writePrivateScript: async ( script ) => {
+				writes.push( script );
+			},
+			removePrivateScript: async ( directory ) => {
+				removed.push( directory );
+			},
 		} );
-		return { ...host, launches };
+		host.fs.directory( '/tmp' );
+		return { ...host, launches, writes, removed };
 	}
 
-	it( 'opens a Linux terminal with the login command as separate arguments in a cleared environment', async () => {
-		const executablePath = `/home/tester/${ hostile }/claude`;
-		const cwd = `/home/tester/${ hostile }`;
-		const env = { HOME: '/home/tester', DISPLAY: ':0', CLAUDE_CONFIG_DIR: '/home/tester/.claude' };
-		const { seams, launches } = linux( [ 'gnome-terminal', 'xdg-open' ], {
-			WAYLAND_DISPLAY: 'wayland-0',
-		} );
-		const plan = await planClaudeSignIn(
-			{ executablePath, args: [ 'auth', 'login' ], cwd, env },
-			seams
-		);
-		expect( plan ).toEqual( {
-			state: 'ready',
-			launch: {
+	it( 'gives every Linux terminal only `/bin/sh` and a Studio-chosen script path, which runs the login in a cleared environment', async () => {
+		const executablePath = `/home/tester/${ shellHostile }/claude`;
+		const cwd = `/home/tester/-${ shellHostile }`;
+		const env = {
+			HOME: '/home/tester',
+			DISPLAY: ':0',
+			LANG: `-${ shellHostile }`,
+			CLAUDE_CONFIG_DIR: '/home/tester/.claude',
+		};
+		for ( const terminal of [ 'gnome-terminal', 'x-terminal-emulator', 'konsole', 'xterm' ] ) {
+			const { seams, launches, writes } = linux( [ terminal, 'xdg-open' ], {
+				WAYLAND_DISPLAY: 'wayland-0',
+			} );
+			const plan = await planClaudeSignIn(
+				{ executablePath, args: [ 'auth', 'login' ], cwd, env },
+				seams
+			);
+			if ( plan.state !== 'ready' || ! plan.launch.script ) throw new Error( 'expected a script' );
+			const { script } = plan.launch;
+			expect( script.directory ).toMatch( /^\/tmp\/studio-claude-sign-in-[0-9a-f]{16}$/ );
+			expect( plan.launch ).toMatchObject( {
 				mode: 'detached',
-				file: '/usr/bin/gnome-terminal',
-				args: [
-					`--working-directory=${ cwd }`,
-					'--',
+				file: `/usr/bin/${ terminal }`,
+				env,
+				cwd: '/tmp',
+			} );
+			expect( plan.launch.args.slice( -2 ), terminal ).toEqual( [ '/bin/sh', script.path ] );
+			for ( const argument of plan.launch.args )
+				expect( argument, terminal ).toMatch( /^[A-Za-z0-9._/=:-]+$/ );
+			expectInert( plan.launch.args.slice( -2 ).join( ' ' ) );
+			expect( script.contents ).toBe(
+				scriptFor( script, cwd, [
 					'/usr/bin/env',
 					'-i',
 					'CLAUDE_CONFIG_DIR=/home/tester/.claude',
 					'DISPLAY=:0',
 					'HOME=/home/tester',
+					`LANG=-${ shellHostile }`,
 					executablePath,
 					'auth',
 					'login',
-				],
-				env,
-				cwd,
-			},
+				] )
+			);
+			await expect( executeClaudeSignIn( plan.launch, seams ) ).resolves.toEqual( {
+				state: 'launched',
+			} );
+			expect( writes ).toEqual( [ script ] );
+			expect( launches ).toEqual( [
+				{ file: plan.launch.file, args: plan.launch.args, env, cwd: '/tmp' },
+			] );
+		}
+		const failing = linux( [ 'xterm', 'xdg-open' ], undefined, () => {
+			throw new Error( 'spawn EACCES' );
 		} );
-		if ( plan.state !== 'ready' ) return;
-		await expect( executeClaudeSignIn( plan.launch, seams ) ).resolves.toEqual( {
-			state: 'launched',
-		} );
-		expect( launches ).toEqual( [ { file: plan.launch.file, args: plan.launch.args, env, cwd } ] );
+		const plan = await planClaudeSignIn(
+			{ executablePath, args: [ 'auth', 'login' ], cwd, env },
+			failing.seams
+		);
+		if ( plan.state !== 'ready' ) throw new Error( 'expected a plan' );
+		await expect( executeClaudeSignIn( plan.launch, failing.seams ) ).rejects.toThrow();
+		expect( failing.removed ).toEqual( [ plan.launch.script?.directory ] );
+	} );
+
+	it.skipIf( ! posixShell )(
+		`parses every quoted value back exactly in a real POSIX shell (${
+			posixShell ?? 'skipped: no POSIX sh on this machine'
+		})`,
+		async () => {
+			const { writes, seams } = linux( [ 'xterm', 'xdg-open' ] );
+			const values = [
+				shellHostile,
+				`-${ shellHostile }`,
+				"'",
+				"\\'",
+				'!!',
+				'$(id)',
+				'a\nb\n',
+				'',
+				'Édition',
+			];
+			const plan = await planClaudeSignIn(
+				{
+					executablePath: `/home/tester/${ shellHostile }/claude`,
+					args: [ 'auth', 'login' ],
+					cwd: `/home/tester/-${ shellHostile }`,
+					env: Object.fromEntries( values.map( ( value, index ) => [ `V${ index }`, value ] ) ),
+				},
+				seams
+			);
+			if ( plan.state !== 'ready' ) throw new Error( 'expected a plan' );
+			await executeClaudeSignIn( plan.launch, seams );
+			const { contents } = writes[ 0 ];
+			const words = contents.slice( contents.indexOf( '\nexec ' ) + '\nexec '.length );
+			const directory = await mkdtemp( path.join( os.tmpdir(), 'studio-claude-quoting-' ) );
+			try {
+				const probe = path.join( directory, 'probe.sh' );
+				await writeFile( probe, `printf '%s\\0' ${ words }` );
+				const { execFile } = await import( 'child_process' );
+				const { promisify } = await import( 'util' );
+				const { stdout } = await promisify( execFile )( posixShell!, [ probe ], {
+					encoding: 'utf8',
+					windowsHide: true,
+				} );
+				expect( stdout.split( '\0' ).slice( 0, -1 ) ).toEqual( [
+					'/usr/bin/env',
+					'-i',
+					...values.map( ( value, index ) => `V${ index }=${ value }` ).sort(),
+					`/home/tester/${ shellHostile }/claude`,
+					'auth',
+					'login',
+				] );
+			} finally {
+				await rm( directory, { recursive: true, force: true } );
+			}
+		}
+	);
+
+	it( 'writes the script exclusively, never through an existing entry, and only its owner can enter the folder', async () => {
+		const base = await realpath(
+			await mkdtemp( path.join( os.tmpdir(), 'studio-claude-script-' ) )
+		);
+		try {
+			const { writePrivateScript, removePrivateScript } = defaultClaudePlatformSeams();
+			const directory = path.join( base, 'studio-claude-sign-in-0123456789abcdef' );
+			const script = {
+				directory,
+				path: path.join( directory, 'sign-in.sh' ),
+				contents: 'exit 0\n',
+			};
+			await writePrivateScript( script );
+			await expect( readFile( script.path, 'utf8' ) ).resolves.toBe( 'exit 0\n' );
+			if ( process.platform !== 'win32' ) {
+				const { stat } = await import( 'fs/promises' );
+				expect( ( await stat( directory ) ).mode & 0o777 ).toBe( 0o700 );
+				expect( ( await stat( script.path ) ).mode & 0o077 ).toBe( 0 );
+			}
+			await expect( writePrivateScript( script ) ).rejects.toMatchObject( { code: 'EEXIST' } );
+			await removePrivateScript( directory );
+			await mkdir( directory );
+			await expect( writePrivateScript( script ) ).rejects.toMatchObject( { code: 'EEXIST' } );
+			expect( existsSync( directory ) ).toBe( true );
+			await rm( directory, { recursive: true } );
+			const elsewhere = path.join( base, 'elsewhere' );
+			await mkdir( elsewhere );
+			await symlink( elsewhere, directory, 'junction' );
+			await expect( writePrivateScript( script ) ).rejects.toMatchObject( { code: 'EEXIST' } );
+			await expect( readFile( path.join( elsewhere, 'sign-in.sh' ) ) ).rejects.toMatchObject( {
+				code: 'ENOENT',
+			} );
+			const abandoned = path.join( base, 'studio-claude-sign-in-fedcba9876543210' );
+			await expect(
+				writePrivateScript( {
+					directory: abandoned,
+					path: path.join( base, 'missing', 'sign-in.sh' ),
+					contents: '',
+				} )
+			).rejects.toMatchObject( { code: 'ENOENT' } );
+			expect( existsSync( abandoned ) ).toBe( false );
+		} finally {
+			await rm( base, { recursive: true, force: true, maxRetries: 4 } );
+		}
 	} );
 
 	it( 'asks for the user’s action on Linux without a display, a terminal or a browser opener', async () => {
