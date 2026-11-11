@@ -1,6 +1,7 @@
 import { once } from 'events';
 import path from 'path';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
+import { inspectClaudeExecutable } from '../../discovery';
 import { runClaudeTurn } from '../../runtime';
 import type { StudioAgentHost } from '../../../host';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
@@ -52,6 +53,8 @@ process.on( 'message', async ( command ) => {
 } );
 
 async function main() {
+	const inspected = await inspectClaudeExecutable( executablePath );
+	if ( ! inspected.ok ) throw new Error( `Native executable not qualified: ${ inspected.reason }` );
 	await runClaudeTurn(
 		{
 			backend: 'claude-code',
@@ -85,7 +88,8 @@ async function main() {
 			connection: async () => ( { id: 'offline', executablePath } ),
 			prepare: async () => ( {
 				ok: true,
-				executablePath,
+				executablePath: inspected.executablePath,
+				executableIdentity: inspected.identity,
 				cwd: root,
 				configDirectory: env.CLAUDE_CONFIG_DIR!,
 				projectsDirectory: path.join( env.CLAUDE_CONFIG_DIR!, 'projects' ),

@@ -21,6 +21,7 @@ import {
 import { inspectClaudeExecutable } from './discovery';
 import { currentClaudeHost, isClaudeRuntimeSurfaceEnabled } from './platform';
 import { getClaudeGlobalWorkspace, getClaudeSessionStoreRoot } from './sessions';
+import type { ClaudeSignInActionReason } from './platform';
 import type { ClaudeBackendTurnSnapshot } from '@studio/agent/protocol/backend-events';
 import type {
 	ClaudeModelCatalog,
@@ -87,11 +88,24 @@ export async function configureClaudeRuntime( action: ClaudeRuntimeAction ): Pro
 		( action?.type === 'sign-in' || action?.type === 'disconnect' ) &&
 		typeof action.connectionId === 'string'
 	) {
-		if ( action.type === 'sign-in' ) await openClaudeNativeSignIn( action.connectionId );
-		else await disconnectClaudeConnection( action.connectionId );
+		if ( action.type === 'disconnect' ) {
+			await disconnectClaudeConnection( action.connectionId );
+			return;
+		}
+		const result = await openClaudeNativeSignIn( action.connectionId );
+		if ( result.state === 'user-action-needed' )
+			throw new ClaudeSignInActionRequiredError( result.reason );
 		return;
 	}
 	throw new Error( 'Invalid Claude Code connection action.' );
+}
+
+/** Sign-in could not open a terminal here; `reason` says what the user has to provide or do. */
+export class ClaudeSignInActionRequiredError extends Error {
+	constructor( readonly reason: ClaudeSignInActionReason ) {
+		super( `claude-sign-in-action-required:${ reason }` );
+		this.name = 'ClaudeSignInActionRequiredError';
+	}
 }
 
 // The dedicated workspace all global conversations run in, created on first use.

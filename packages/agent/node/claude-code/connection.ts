@@ -6,19 +6,22 @@ import { promisify } from 'util';
 import { readSharedConfig, updateSharedConfigFrom } from '@studio/common/lib/shared-config';
 import { assessClaudeAuth, buildClaudeEnvironment } from './auth-status';
 import { inspectClaudeConfiguration } from './configuration';
-import { inspectClaudeExecutable, trustedPowerShellPath } from './discovery';
+import { inspectClaudeExecutable } from './discovery';
 import {
 	claudeEnvironmentValues,
 	claudePathModule,
 	currentClaudeHost,
 	defaultClaudePlatformSeams,
+	executeClaudeSignIn,
 	inspectClaudeManagedPolicy,
 	isSameClaudePath,
 	isSameClaudePathText,
+	planClaudeSignIn,
 	resolveClaudePathKey,
+	verifyClaudeExecutableIdentity,
 } from './platform';
 import type { ClaudeAuthIdentity } from './auth-status';
-import type { ClaudePlatformSeams } from './platform';
+import type { ClaudePlatformSeams, ClaudeSignInResult } from './platform';
 
 const execFileAsync = promisify( execFile );
 
@@ -205,6 +208,12 @@ export async function prepareClaudeInvocation(
 			return { ok: false as const, blockers: [ executable.reason ], executable };
 		if ( context.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = context.directory;
 		const status = await readNativeStatus( executable.executablePath, canonicalCwd, child.env );
+		if (
+			! ( await verifyClaudeExecutableIdentity( executable.identity, {
+				selectedPath: executablePath,
+			} ) )
+		)
+			return { ok: false as const, blockers: [ 'executable-changed' ], executable };
 		if ( ! assessClaudeAuth( status ).qualified )
 			return {
 				ok: false as const,
@@ -369,36 +378,52 @@ export async function readClaudeAccountStatus(
 	};
 }
 
-export async function openClaudeNativeSignIn( connectionId: string ): Promise< void > {
+/**
+ * Opens the vendor's own `auth login` in a real terminal for the inspected
+ * executable, user, working directory and configuration that execution uses.
+ * The executable is checked again right before launch, so a binary swapped or
+ * updated since inspection never signs in. Where no terminal, display or
+ * browser can reach the user, nothing changes and the result says why.
+ */
+export async function openClaudeNativeSignIn(
+	connectionId: string,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudeSignInResult > {
 	if ( process.env.STUDIO_EXPERIMENTAL_CLAUDE_CODE !== '1' )
 		throw new Error( 'Claude Code is disabled' );
 	const connection = connections( ( await readSharedConfig() ).claudeConnections ).find(
 		( item ) => item.id === connectionId
 	);
 	if ( ! connection ) throw new Error( 'Unknown Claude connection' );
-	const executable = await inspectClaudeExecutable( connection.executablePath );
-	const child = buildClaudeEnvironment( process.env );
-	const config = await resolveClaudeConfigContext( connection.configDirectory, process.env );
+	const seams = defaultClaudePlatformSeams( overrides );
+	const executable = await inspectClaudeExecutable( connection.executablePath, seams );
+	const child = buildClaudeEnvironment( seams.env, seams.host.platform );
+	const config = await resolveClaudeConfigContext( connection.configDirectory, seams.env, seams );
 	if ( ! executable.ok || child.conflicts.length || config.mode === 'conflict' )
 		throw new Error( 'Claude connection is not qualified for sign-in' );
+	const cwd = await seams.files.realpath( process.cwd() );
 	const configuration = await inspectClaudeConfiguration(
-		process.cwd(),
+		cwd,
 		config.directory ?? path.join( os.homedir(), '.claude' )
 	);
-	if ( configuration.blockers.length || ( await inspectClaudeManagedPolicy() ).state !== 'absent' )
+	if (
+		configuration.blockers.length ||
+		( await inspectClaudeManagedPolicy( seams ) ).state !== 'absent'
+	)
 		throw new Error( 'Claude configuration is not qualified for sign-in' );
-	await markClaudeConnectionReestablished( connectionId );
 	if ( config.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = config.directory;
-	const encodedPath = Buffer.from( executable.executablePath, 'utf8' ).toString( 'base64' );
-	const script = `Start-Process -FilePath ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ encodedPath }'))) -ArgumentList @('auth','login') -WindowStyle Normal -ErrorAction Stop`;
-	await execFileAsync(
-		trustedPowerShellPath(),
-		[
-			'-NoProfile',
-			'-NonInteractive',
-			'-EncodedCommand',
-			Buffer.from( script, 'utf16le' ).toString( 'base64' ),
-		],
-		{ env: child.env, timeout: 10000, windowsHide: true }
+	const plan = await planClaudeSignIn(
+		{ executablePath: executable.executablePath, args: [ 'auth', 'login' ], cwd, env: child.env },
+		seams
 	);
+	if ( plan.state !== 'ready' ) return plan;
+	if (
+		! ( await verifyClaudeExecutableIdentity( executable.identity, {
+			selectedPath: connection.executablePath,
+			files: seams.files,
+		} ) )
+	)
+		throw new Error( 'The Claude executable changed after it was inspected' );
+	await markClaudeConnectionReestablished( connectionId );
+	return executeClaudeSignIn( plan.launch, seams );
 }

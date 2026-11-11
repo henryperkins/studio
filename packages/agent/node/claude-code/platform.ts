@@ -318,6 +318,112 @@ export interface ClaudePlatformAdapter {
 	): Promise< ClaudeBinaryVerificationResult >;
 	/** Looks for the vendor's documented managed policy sources, never reading their contents. */
 	inspectManagedPolicy( seams: ClaudePlatformSeams ): Promise< ClaudeManagedPolicyFinding >;
+	/**
+	 * How to open the vendor's own command in a real interactive terminal,
+	 * passing every path as a separate argument and never through a shell
+	 * string Studio builds; or why the user has to act instead.
+	 */
+	planSignIn(
+		request: ClaudeSignInRequest,
+		seams: ClaudePlatformSeams
+	): Promise< ClaudeSignInPlan >;
+	/** Whether this OS can confine shell commands in an OS-level sandbox, from the vendor's sources. */
+	readonly shellSandbox: ClaudeShellSandboxFact;
+}
+
+export interface ClaudeSignInRequest {
+	/** The inspected executable's real path. */
+	executablePath: string;
+	/** The vendor's own subcommand, `auth login`. */
+	args: readonly string[];
+	cwd: string;
+	/** The allowlisted environment, with the selected configuration directory. */
+	env: NodeJS.ProcessEnv;
+}
+
+export interface ClaudeSignInLaunch {
+	/** `run` waits for a launcher that returns once the window is open; `detached` starts a terminal. */
+	mode: 'run' | 'detached';
+	file: string;
+	args: string[];
+	env: NodeJS.ProcessEnv;
+	cwd: string;
+}
+
+/** Why sign-in cannot open a terminal here, so the user must run the vendor's login themselves. */
+export type ClaudeSignInActionReason =
+	| 'no-interactive-desktop'
+	| 'no-display'
+	| 'no-terminal'
+	| 'no-browser'
+	| 'terminal-permission-denied'
+	| 'executable-path-unsupported';
+
+export type ClaudeSignInPlan =
+	| { state: 'ready'; launch: ClaudeSignInLaunch }
+	| { state: 'user-action-needed'; reason: ClaudeSignInActionReason };
+
+export type ClaudeSignInResult =
+	| { state: 'launched' }
+	| { state: 'user-action-needed'; reason: ClaudeSignInActionReason };
+
+export async function planClaudeSignIn(
+	request: ClaudeSignInRequest,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudeSignInPlan > {
+	const seams = defaultClaudePlatformSeams( overrides );
+	const adapter = selectClaudePlatformAdapter( seams.host );
+	if ( ! adapter ) throw new Error( 'Claude sign-in is not supported on this platform' );
+	return adapter.planSignIn( request, seams );
+}
+
+// AppleScript's error when the user has not let Studio control Terminal.
+const APPLE_EVENTS_DENIED = '(-1743)';
+
+export async function executeClaudeSignIn(
+	launch: ClaudeSignInLaunch,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudeSignInResult > {
+	const seams = defaultClaudePlatformSeams( overrides );
+	if ( launch.mode === 'detached' ) {
+		await seams.launchDetached( launch.file, launch.args, { env: launch.env, cwd: launch.cwd } );
+		return { state: 'launched' };
+	}
+	try {
+		await seams.run( launch.file, launch.args, {
+			env: launch.env,
+			cwd: launch.cwd,
+			timeout: 30000,
+			windowsHide: true,
+		} );
+	} catch ( error ) {
+		const detail = `${ ( error as { stderr?: unknown } ).stderr ?? '' }`;
+		if ( detail.includes( APPLE_EVENTS_DENIED ) )
+			return { state: 'user-action-needed', reason: 'terminal-permission-denied' };
+		throw error;
+	}
+	return { state: 'launched' };
+}
+
+/**
+ * Plain data for choosing a shell confinement: whether the vendor runtime can
+ * sandbox shell commands on an OS, what it needs, and where that is stated.
+ * Nothing reads this to enable a tool.
+ */
+export interface ClaudeShellSandboxFact {
+	readonly available: boolean;
+	readonly mechanism?: 'seatbelt' | 'bubblewrap';
+	/** System packages the vendor documents as required. */
+	readonly requires: readonly string[];
+	/** Additions the vendor documents as optional. */
+	readonly optional: readonly string[];
+	/** Documented conditions that stop it or weaken it. */
+	readonly limitations: readonly string[];
+	readonly sources: readonly string[];
+}
+
+export function claudeShellSandbox( host: ClaudeHost ): ClaudeShellSandboxFact | undefined {
+	return selectClaudePlatformAdapter( host )?.shellSandbox;
 }
 
 /** A place the vendor documents for organization-managed Claude Code policy. */

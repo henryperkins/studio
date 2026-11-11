@@ -7,8 +7,11 @@ import {
 	CLAUDE_AGENT_SDK_VERSION,
 	CLAUDE_QUALIFICATION_MATRIX,
 	claudePlatformTarget,
+	claudeShellSandbox,
 	defaultClaudePlatformSeams,
+	executeClaudeSignIn,
 	inspectClaudeManagedPolicy,
+	planClaudeSignIn,
 	isClaudeExecutableUnchanged,
 	isClaudeRuntimeSurfaceEnabled,
 	isSameClaudePath,
@@ -1188,5 +1191,262 @@ describe( 'Claude managed policy', () => {
 		await expect(
 			inspectClaudeManagedPolicy( { host: { platform: 'freebsd', arch: 'x64' } } )
 		).resolves.toEqual( { state: 'unverifiable', present: [], unreadable: [], checked: [] } );
+	} );
+} );
+
+describe( 'Claude native sign-in launch', () => {
+	const hostile = 'Claude Édition $HOME `whoami` "quoted" \'single\' [1] & | ;';
+
+	it( 'opens the vendor login in a new Windows console through ShellExecute, with no path in the script', async () => {
+		const executablePath = `C:\\Users\\Tester\\${ hostile }\\claude.exe`;
+		const cwd = `C:\\Users\\Tester\\${ hostile }`;
+		const env = { SystemRoot: 'C:\\Windows', CLAUDE_CONFIG_DIR: 'C:\\Users\\Tester\\.claude' };
+		const runner = recordingRunner( () => '' );
+		const { seams } = simulatedHost( { platform: 'win32', arch: 'x64' }, path.win32, {
+			env: { SystemRoot: 'C:\\Windows' },
+			run: runner.run,
+		} );
+		const plan = await planClaudeSignIn(
+			{ executablePath, args: [ 'auth', 'login' ], cwd, env },
+			seams
+		);
+		expect( plan ).toMatchObject( {
+			state: 'ready',
+			launch: {
+				mode: 'run',
+				file: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+				env,
+			},
+		} );
+		if ( plan.state !== 'ready' ) return;
+		await expect( executeClaudeSignIn( plan.launch, seams ) ).resolves.toEqual( {
+			state: 'launched',
+		} );
+		const script = decodedScript( runner.calls[ 0 ].args );
+		expect( script ).toContain( 'System.Diagnostics.ProcessStartInfo' );
+		expect( script ).toContain( '$i.UseShellExecute=$true' );
+		expect( script ).toContain( "$i.Arguments='auth login'" );
+		expect( script ).toContain( '[System.Diagnostics.ProcessWindowStyle]::Normal' );
+		expect( script ).toContain( Buffer.from( executablePath, 'utf8' ).toString( 'base64' ) );
+		expect( script ).toContain( Buffer.from( cwd, 'utf8' ).toString( 'base64' ) );
+		expect( script ).not.toContain( 'Édition' );
+		expect( script ).not.toContain( 'Start-Process' );
+		expect( script ).not.toMatch( /wsl/i );
+		expect( runner.calls[ 0 ].env ).toEqual( env );
+	} );
+
+	it( 'asks for the user’s action instead of opening an invisible Windows console', async () => {
+		for ( const name of [ 'SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY' ] ) {
+			const { seams } = simulatedHost( { platform: 'win32', arch: 'x64' }, path.win32, {
+				env: { SystemRoot: 'C:\\Windows', [ name ]: '10.0.0.2 50000 10.0.0.1 22' },
+			} );
+			await expect(
+				planClaudeSignIn(
+					{ executablePath: 'C:\\c\\claude.exe', args: [ 'auth', 'login' ], cwd: 'C:\\', env: {} },
+					seams
+				)
+			).resolves.toEqual( { state: 'user-action-needed', reason: 'no-interactive-desktop' } );
+		}
+	} );
+
+	function macos(
+		present: string[] = [ '/System/Applications/Utilities/Terminal.app', '/usr/bin/open' ]
+	) {
+		const host = simulatedHost( { platform: 'darwin', arch: 'arm64' }, path.posix, {
+			env: { HOME: '/Users/tester', PATH: '/usr/bin:/bin' },
+		} );
+		for ( const item of present ) host.fs.write( item, Buffer.from( 'x' ) );
+		return host;
+	}
+
+	it( 'opens Terminal on macOS with every argument quoted by AppleScript, never by Studio', async () => {
+		const executablePath = `/Users/tester/${ hostile }/claude`;
+		const cwd = `/Users/tester/${ hostile }`;
+		const env = {
+			HOME: '/Users/tester',
+			PATH: '/usr/bin:/bin',
+			CLAUDE_CONFIG_DIR: `/Users/tester/${ hostile }/config`,
+		};
+		const { seams } = macos();
+		const plan = await planClaudeSignIn(
+			{ executablePath, args: [ 'auth', 'login' ], cwd, env },
+			seams
+		);
+		expect( plan.state ).toBe( 'ready' );
+		if ( plan.state !== 'ready' ) return;
+		expect( plan.launch.mode ).toBe( 'run' );
+		expect( plan.launch.file ).toBe( '/usr/bin/osascript' );
+		const separator = plan.launch.args.indexOf( cwd );
+		const script = plan.launch.args.slice( 0, separator );
+		expect(
+			script.filter( ( _, index ) => index % 2 === 0 ).every( ( flag ) => flag === '-e' )
+		).toBe( true );
+		expect( script.join( '\n' ) ).toContain( 'quoted form of' );
+		expect( script.join( '\n' ) ).toContain( 'tell application "Terminal"' );
+		expect( script.join( '\n' ) ).not.toContain( hostile );
+		expect( plan.launch.args.slice( separator ) ).toEqual( [
+			cwd,
+			'/usr/bin/env',
+			'-i',
+			`CLAUDE_CONFIG_DIR=/Users/tester/${ hostile }/config`,
+			'HOME=/Users/tester',
+			'PATH=/usr/bin:/bin',
+			executablePath,
+			'auth',
+			'login',
+		] );
+	} );
+
+	it( 'asks for the user’s action on macOS without a display, Terminal, browser or Automation permission', async () => {
+		const request = {
+			executablePath: '/Users/tester/claude',
+			args: [ 'auth', 'login' ],
+			cwd: '/Users/tester',
+			env: {},
+		};
+		const remote = macos();
+		await expect(
+			planClaudeSignIn( request, {
+				...remote.seams,
+				env: { SSH_CONNECTION: '10.0.0.2 50000 10.0.0.1 22' },
+			} )
+		).resolves.toEqual( { state: 'user-action-needed', reason: 'no-display' } );
+		await expect(
+			planClaudeSignIn( request, macos( [ '/usr/bin/open' ] ).seams )
+		).resolves.toEqual( {
+			state: 'user-action-needed',
+			reason: 'no-terminal',
+		} );
+		await expect(
+			planClaudeSignIn( request, macos( [ '/System/Applications/Utilities/Terminal.app' ] ).seams )
+		).resolves.toEqual( { state: 'user-action-needed', reason: 'no-browser' } );
+		await expect(
+			planClaudeSignIn( { ...request, executablePath: '/Users/tester/a=b/claude' }, macos().seams )
+		).resolves.toEqual( { state: 'user-action-needed', reason: 'executable-path-unsupported' } );
+
+		const denied = macos();
+		const plan = await planClaudeSignIn( request, denied.seams );
+		if ( plan.state !== 'ready' ) throw new Error( 'expected a plan' );
+		await expect(
+			executeClaudeSignIn( plan.launch, {
+				...denied.seams,
+				run: async () => {
+					throw Object.assign( new Error( 'exit 1' ), {
+						code: 1,
+						stderr: 'execution error: Not authorized to send Apple events to Terminal. (-1743)',
+					} );
+				},
+			} )
+		).resolves.toEqual( { state: 'user-action-needed', reason: 'terminal-permission-denied' } );
+		await expect(
+			executeClaudeSignIn( plan.launch, {
+				...denied.seams,
+				run: async () => {
+					throw Object.assign( new Error( 'exit 1' ), { code: 1, stderr: 'other failure' } );
+				},
+			} )
+		).rejects.toThrow();
+	} );
+
+	function linux( commands: string[], env: NodeJS.ProcessEnv = { DISPLAY: ':0' } ) {
+		const launches: Array< { file: string; args: string[]; env: NodeJS.ProcessEnv; cwd: string } > =
+			[];
+		const host = simulatedHost( { platform: 'linux', arch: 'x64' }, path.posix, {
+			env,
+			findOnPath: ( command ) => ( commands.includes( command ) ? `/usr/bin/${ command }` : null ),
+			launchDetached: async ( file, args, options ) => {
+				launches.push( { file, args, ...options } );
+			},
+		} );
+		return { ...host, launches };
+	}
+
+	it( 'opens a Linux terminal with the login command as separate arguments in a cleared environment', async () => {
+		const executablePath = `/home/tester/${ hostile }/claude`;
+		const cwd = `/home/tester/${ hostile }`;
+		const env = { HOME: '/home/tester', DISPLAY: ':0', CLAUDE_CONFIG_DIR: '/home/tester/.claude' };
+		const { seams, launches } = linux( [ 'gnome-terminal', 'xdg-open' ], {
+			WAYLAND_DISPLAY: 'wayland-0',
+		} );
+		const plan = await planClaudeSignIn(
+			{ executablePath, args: [ 'auth', 'login' ], cwd, env },
+			seams
+		);
+		expect( plan ).toEqual( {
+			state: 'ready',
+			launch: {
+				mode: 'detached',
+				file: '/usr/bin/gnome-terminal',
+				args: [
+					`--working-directory=${ cwd }`,
+					'--',
+					'/usr/bin/env',
+					'-i',
+					'CLAUDE_CONFIG_DIR=/home/tester/.claude',
+					'DISPLAY=:0',
+					'HOME=/home/tester',
+					executablePath,
+					'auth',
+					'login',
+				],
+				env,
+				cwd,
+			},
+		} );
+		if ( plan.state !== 'ready' ) return;
+		await expect( executeClaudeSignIn( plan.launch, seams ) ).resolves.toEqual( {
+			state: 'launched',
+		} );
+		expect( launches ).toEqual( [ { file: plan.launch.file, args: plan.launch.args, env, cwd } ] );
+	} );
+
+	it( 'asks for the user’s action on Linux without a display, a terminal or a browser opener', async () => {
+		const request = {
+			executablePath: '/home/tester/claude',
+			args: [ 'auth', 'login' ],
+			cwd: '/home/tester',
+			env: {},
+		};
+		for ( const [ commands, env, reason ] of [
+			[ [ 'xterm', 'xdg-open' ], {}, 'no-display' ],
+			[ [ 'xdg-open' ], { DISPLAY: ':0' }, 'no-terminal' ],
+			[ [ 'tilix', 'xdg-open' ], { DISPLAY: ':0' }, 'no-terminal' ],
+			[ [ 'xterm' ], { WAYLAND_DISPLAY: 'wayland-0' }, 'no-browser' ],
+		] as const ) {
+			const { seams, launches } = linux( [ ...commands ], env );
+			await expect( planClaudeSignIn( request, seams ), reason ).resolves.toEqual( {
+				state: 'user-action-needed',
+				reason,
+			} );
+			expect( launches ).toEqual( [] );
+		}
+	} );
+} );
+
+describe( 'Claude shell sandbox facts', () => {
+	it( 'records, as plain data from the vendor sources, whether shell commands can be confined on each OS', () => {
+		const windows = claudeShellSandbox( { platform: 'win32', arch: 'x64' } )!;
+		expect( windows ).toMatchObject( { available: false, requires: [] } );
+		expect( windows.sources.join( ' ' ) ).toContain( 'code.claude.com/docs/en/sandboxing' );
+		expect( claudeShellSandbox( { platform: 'win32', arch: 'arm64' } ) ).toEqual( windows );
+
+		const macos = claudeShellSandbox( { platform: 'darwin', arch: 'arm64' } )!;
+		expect( macos ).toMatchObject( { available: true, mechanism: 'seatbelt', requires: [] } );
+
+		const linux = claudeShellSandbox( { platform: 'linux', arch: 'x64' } )!;
+		expect( linux ).toMatchObject( {
+			available: true,
+			mechanism: 'bubblewrap',
+			requires: [ 'bubblewrap', 'socat' ],
+		} );
+		expect( linux.limitations ).toEqual(
+			expect.arrayContaining( [ 'ubuntu-apparmor-user-namespaces', 'unprivileged-container-proc' ] )
+		);
+		for ( const fact of [ windows, macos, linux ] ) {
+			expect( JSON.parse( JSON.stringify( fact ) ) ).toEqual( fact );
+			expect( Object.isFrozen( fact ) ).toBe( true );
+			expect( fact.sources.length ).toBeGreaterThan( 0 );
+		}
+		expect( claudeShellSandbox( { platform: 'freebsd', arch: 'x64' } ) ).toBeUndefined();
 	} );
 } );

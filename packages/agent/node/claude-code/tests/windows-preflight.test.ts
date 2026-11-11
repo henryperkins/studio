@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+	getClaudeConnections,
 	openClaudeNativeSignIn,
 	prepareClaudeInvocation,
 	saveClaudeConnection,
@@ -39,6 +40,15 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 		let stdout: string;
 		let authFailure: Error | undefined;
 		let version: string;
+		let duringPowerShell: ( ( script: string ) => Promise< void > ) | undefined;
+		let duringAuthStatus: ( () => Promise< void > ) | undefined;
+		const scripts = () =>
+			invoke.mock.calls
+				.filter( ( [ , args ] ) => args[ 2 ] === '-EncodedCommand' )
+				.map( ( [ , args, options ] ) => ( {
+					script: Buffer.from( args[ 3 ], 'base64' ).toString( 'utf16le' ),
+					options,
+				} ) );
 
 		beforeEach( async () => {
 			root = await mkdtemp( path.join( os.tmpdir(), 'Studio Claude Évidence ' ) );
@@ -72,12 +82,18 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 			} );
 			authFailure = undefined;
 			version = '2.1.319 (Claude Code)';
+			duringPowerShell = undefined;
+			duringAuthStatus = undefined;
 			invoke.mockReset();
 			invoke.mockImplementation( async ( file, args ) => {
-				if ( args[ 0 ] === '-NoProfile' ) return { stdout: '' };
+				if ( args[ 0 ] === '-NoProfile' ) {
+					await duringPowerShell?.( Buffer.from( args[ 3 ], 'base64' ).toString( 'utf16le' ) );
+					return { stdout: '' };
+				}
 				expect( file ).toBe( executable );
 				if ( args[ 0 ] === '--version' ) return { stdout: version };
 				expect( args ).toEqual( [ 'auth', 'status', '--json' ] );
+				await duringAuthStatus?.();
 				if ( authFailure ) throw authFailure;
 				return { stdout };
 			} );
@@ -201,20 +217,54 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 				executablePath: executable,
 				configDirectory: config,
 			} );
-			await openClaudeNativeSignIn( 'native-login' );
+			await expect( openClaudeNativeSignIn( 'native-login' ) ).resolves.toEqual( {
+				state: 'launched',
+			} );
 
-			const commands = invoke.mock.calls
-				.filter( ( [ , args ] ) => args[ 2 ] === '-EncodedCommand' )
-				.map( ( [ , args, options ] ) => ( {
-					script: Buffer.from( args[ 3 ], 'base64' ).toString( 'utf16le' ),
-					options,
-				} ) );
-			const launch = commands.find( ( { script } ) => script.includes( 'Start-Process' ) )!;
-			expect( launch.script ).toContain( '-WindowStyle Normal' );
-			expect( launch.script ).toContain( '-ErrorAction Stop' );
-			expect( launch.script ).toContain( "-ArgumentList @('auth','login')" );
+			const launch = scripts().find( ( { script } ) => script.includes( 'ProcessStartInfo' ) )!;
+			expect( launch.script ).toContain( '$i.UseShellExecute=$true' );
+			expect( launch.script ).toContain( '[System.Diagnostics.ProcessWindowStyle]::Normal' );
+			expect( launch.script ).toContain( "$i.Arguments='auth login'" );
 			expect( launch.script ).toContain( Buffer.from( executable, 'utf8' ).toString( 'base64' ) );
+			expect( launch.script ).not.toContain( 'Start-Process' );
 			expect( launch.options.env?.CLAUDE_CONFIG_DIR ).toBe( config );
+			expect( launch.options.env?.STUDIO_OPENAI_API_KEY ).toBeUndefined();
+			expect( ( await getClaudeConnections() )[ 0 ].revision ).toBe( 2 );
+		} );
+
+		it( 'launches no sign-in and keeps the connection when the executable changed after inspection', async () => {
+			await saveClaudeConnection( { id: 'swapped', executablePath: executable } );
+			duringPowerShell = async ( script ) => {
+				if ( script.includes( 'Policies' ) )
+					await writeFile( executable, peBinary( { body: 'swapped' } ) );
+			};
+			await expect( openClaudeNativeSignIn( 'swapped' ) ).rejects.toThrow();
+			expect( scripts().some( ( { script } ) => script.includes( 'ProcessStartInfo' ) ) ).toBe(
+				false
+			);
+			expect( ( await getClaudeConnections() )[ 0 ].revision ).toBeUndefined();
+		} );
+
+		it( 'asks for the user’s action over a remote session and changes nothing', async () => {
+			await saveClaudeConnection( { id: 'remote', executablePath: executable } );
+			vi.stubEnv( 'SSH_CONNECTION', '10.0.0.2 50000 10.0.0.1 22' );
+			await expect( openClaudeNativeSignIn( 'remote' ) ).resolves.toEqual( {
+				state: 'user-action-needed',
+				reason: 'no-interactive-desktop',
+			} );
+			expect( scripts().some( ( { script } ) => script.includes( 'ProcessStartInfo' ) ) ).toBe(
+				false
+			);
+			expect( ( await getClaudeConnections() )[ 0 ].revision ).toBeUndefined();
+		} );
+
+		it( 'refuses a preparation whose executable changed while the native status was read', async () => {
+			duringAuthStatus = async () => {
+				await writeFile( executable, peBinary( { body: 'auto-updated' } ) );
+			};
+			await expect(
+				prepareClaudeInvocation( executable, workspace, config )
+			).resolves.toMatchObject( { ok: false, blockers: [ 'executable-changed' ] } );
 		} );
 	}
 );

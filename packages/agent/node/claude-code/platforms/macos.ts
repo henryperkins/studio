@@ -1,5 +1,6 @@
 import path from 'path';
 import { findPolicyLocations, managedPolicyFiles, policyFinding } from './policy';
+import { cleanEnvironmentCommand, isRemoteSession, sandboxFact } from './terminal';
 import type {
 	ClaudeArch,
 	ClaudeBinaryHeader,
@@ -60,6 +61,22 @@ const CODESIGN = '/usr/bin/codesign';
 const CODESIGN_REFUSED = new Set( [ 1, 3 ] );
 const MANAGED_PREFERENCES = '/Library/Managed Preferences';
 const PREFERENCES_DOMAIN = 'com.anthropic.claudecode';
+const TERMINAL_APP = '/System/Applications/Utilities/Terminal.app';
+const OPEN = '/usr/bin/open';
+const OSASCRIPT = '/usr/bin/osascript';
+// The first argument is the working directory; the rest are the command's arguments.
+const TERMINAL_SCRIPT: readonly string[] = Object.freeze( [
+	'on run argv',
+	'set commandLine to "cd " & quoted form of (item 1 of argv) & " &&"',
+	'repeat with argument in rest of argv',
+	'set commandLine to commandLine & " " & quoted form of (argument as text)',
+	'end repeat',
+	'tell application "Terminal"',
+	'activate',
+	'do script commandLine',
+	'end tell',
+	'end run',
+] );
 
 export const macosAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatformAdapter >( {
 	os: 'macos',
@@ -142,4 +159,46 @@ export const macosAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 			knownUser ? found.unreadable : [ ...found.unreadable, user ]
 		);
 	},
+	/**
+	 * Asks Terminal to run the login. Terminal runs a command line, so the
+	 * arguments go to `osascript` as data and AppleScript's `quoted form of`
+	 * quotes each one; Studio never builds the line itself.
+	 */
+	async planSignIn( request, seams ) {
+		if ( isRemoteSession( seams.env ) )
+			return { state: 'user-action-needed', reason: 'no-display' };
+		for ( const [ required, reason ] of [
+			[ TERMINAL_APP, 'no-terminal' ],
+			[ OPEN, 'no-browser' ],
+		] as const ) {
+			try {
+				await seams.files.stat( required );
+			} catch {
+				return { state: 'user-action-needed', reason };
+			}
+		}
+		const command = cleanEnvironmentCommand( request );
+		if ( ! Array.isArray( command ) ) return command;
+		return {
+			state: 'ready',
+			launch: {
+				mode: 'run',
+				file: OSASCRIPT,
+				args: [ ...TERMINAL_SCRIPT.flatMap( ( line ) => [ '-e', line ] ), request.cwd, ...command ],
+				env: request.env,
+				cwd: request.cwd,
+			},
+		};
+	},
+	shellSandbox: sandboxFact( {
+		available: true,
+		mechanism: 'seatbelt',
+		requires: [],
+		optional: [],
+		limitations: [
+			'reads-outside-workspace-by-default',
+			'ssh-git-remotes-fail',
+			'tls-verification-may-fail',
+		],
+	} ),
 } );

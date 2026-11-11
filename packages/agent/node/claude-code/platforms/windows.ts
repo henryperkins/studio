@@ -1,5 +1,6 @@
 import path from 'path';
 import { findPolicyLocations, managedPolicyFiles, policyFinding } from './policy';
+import { isRemoteSession, sandboxFact } from './terminal';
 import type {
 	ClaudeArch,
 	ClaudeBinaryHeader,
@@ -190,4 +191,39 @@ export const windowsAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatfo
 		}
 		return policyFinding( [ ...files, ...registry ], present, unreadable );
 	},
+	/**
+	 * Opens the login in a new console window through ShellExecute, as
+	 * `Start-Process` does, but by `ProcessStartInfo`: `Start-Process -FilePath`
+	 * expands wildcards, so a path with `[1]` could start another program. The
+	 * paths reach PowerShell only as base64 data. A remote session's window would
+	 * open on a desktop the user cannot see, so it asks the user to act instead.
+	 * There is no WSL fallback.
+	 */
+	async planSignIn( request, seams ) {
+		if ( isRemoteSession( seams.env ) )
+			return { state: 'user-action-needed', reason: 'no-interactive-desktop' };
+		if ( ! request.args.every( ( argument ) => /^[a-z][a-z-]*$/.test( argument ) ) )
+			throw new Error( 'Unexpected sign-in arguments' );
+		const script = `$ErrorActionPreference='Stop'; $i=New-Object System.Diagnostics.ProcessStartInfo; $i.FileName=${ powerShellString(
+			request.executablePath
+		) }; $i.Arguments='${ request.args.join( ' ' ) }'; $i.WorkingDirectory=${ powerShellString(
+			request.cwd
+		) }; $i.UseShellExecute=$true; $i.WindowStyle=[System.Diagnostics.ProcessWindowStyle]::Normal; [void][System.Diagnostics.Process]::Start($i)`;
+		return {
+			state: 'ready',
+			launch: {
+				mode: 'run',
+				file: trustedPowerShellPath( seams.env ),
+				args: encodedPowerShellArgs( script ),
+				env: request.env,
+				cwd: request.cwd,
+			},
+		};
+	},
+	shellSandbox: sandboxFact( {
+		available: false,
+		requires: [],
+		optional: [],
+		limitations: [ 'native-windows-runs-commands-unsandboxed' ],
+	} ),
 } );

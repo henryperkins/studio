@@ -28,11 +28,13 @@ import {
 	claudeTargetOrigin,
 	claudeToolInventory,
 } from './execution-rules';
+import { isClaudeExecutableUnchanged } from './platform';
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
 import { createStudioClaudeMcpServer, createStudioClaudeToolBridge } from './tool-bridge';
 import type { ClaudeAuthIdentity } from './auth-status';
 import type { ClaudeAccountStatus } from './connection';
 import type { ClaudeAccountCheck, ClaudeApprover } from './execution-policy';
+import type { ClaudeExecutableIdentity } from './platform';
 import type { StudioAgentHost } from '../host';
 import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk/core';
 import type {
@@ -206,6 +208,8 @@ type Prepared =
 	| {
 			ok: true;
 			executablePath: string;
+			/** The file inspection qualified; the native process is spawned only while it is unchanged. */
+			executableIdentity: ClaudeExecutableIdentity;
 			cwd: string;
 			configDirectory: string;
 			projectsDirectory: string;
@@ -260,7 +264,8 @@ function nativeLaunchOptions(
 					command: prepared.executablePath,
 					cwd: prepared.cwd,
 					env,
-				} )
+				} ) ||
+				! isClaudeExecutableUnchanged( prepared.executableIdentity )
 			)
 				throw new Error( 'Unexpected native process invocation' );
 			const child = spawn( invocation.command, invocation.args, {

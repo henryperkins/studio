@@ -1,5 +1,7 @@
 import path from 'path';
+import { resolveLinuxTerminalCommandLaunch } from '@studio/common/lib/user-settings/terminal';
 import { findPolicyLocations, managedPolicyFiles, policyFinding } from './policy';
+import { cleanEnvironmentCommand, sandboxFact } from './terminal';
 import type {
 	ClaudeArch,
 	ClaudeBinaryHeader,
@@ -126,4 +128,40 @@ export const linuxAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 		const { present, unreadable } = await findPolicyLocations( files, seams.files );
 		return policyFinding( files, present, unreadable );
 	},
+	/**
+	 * Starts a terminal that runs the login as separate arguments. The login
+	 * opens the browser with `xdg-open`; without a display, a terminal or that
+	 * opener the user has to run the login themselves.
+	 */
+	async planSignIn( request, seams ) {
+		if ( ! seams.env.DISPLAY && ! seams.env.WAYLAND_DISPLAY )
+			return { state: 'user-action-needed', reason: 'no-display' };
+		const command = cleanEnvironmentCommand( request );
+		if ( ! Array.isArray( command ) ) return command;
+		const terminal = resolveLinuxTerminalCommandLaunch( request.cwd, command, seams.findOnPath );
+		if ( ! terminal ) return { state: 'user-action-needed', reason: 'no-terminal' };
+		if ( ! seams.findOnPath( 'xdg-open' ) )
+			return { state: 'user-action-needed', reason: 'no-browser' };
+		return {
+			state: 'ready',
+			launch: {
+				mode: 'detached',
+				file: terminal.file,
+				args: terminal.args,
+				env: request.env,
+				cwd: terminal.cwd,
+			},
+		};
+	},
+	shellSandbox: sandboxFact( {
+		available: true,
+		mechanism: 'bubblewrap',
+		requires: [ 'bubblewrap', 'socat' ],
+		optional: [ 'seccomp-filter' ],
+		limitations: [
+			'reads-outside-workspace-by-default',
+			'ubuntu-apparmor-user-namespaces',
+			'unprivileged-container-proc',
+		],
+	} ),
 } );

@@ -1,5 +1,19 @@
+import { createHash } from 'crypto';
+import { mkdtemp, realpath, rm, stat, writeFile } from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import { discoverClaudeModels, qualifyClaudeStartup } from '../runtime';
+
+const fakeIdentity = {
+	path: 'fake',
+	size: 0,
+	device: '0',
+	inode: '0',
+	modified: '0',
+	changed: '0',
+	sha256: '',
+};
 
 describe( 'Claude SDK startup (mock control responses)', () => {
 	const identity = { email: 'user@example.com', subscriptionType: 'max' };
@@ -82,6 +96,7 @@ describe( 'Claude SDK startup (mock control responses)', () => {
 				prepare: async () => ( {
 					ok: true as const,
 					executablePath: 'fake',
+					executableIdentity: fakeIdentity,
 					cwd: '.',
 					configDirectory: '.',
 					projectsDirectory: '.',
@@ -99,6 +114,64 @@ describe( 'Claude SDK startup (mock control responses)', () => {
 		expect( launch?.model ).toBeUndefined();
 		expect( closed ).toBe( true );
 		await expect( input ).resolves.toMatchObject( { done: true } );
+	} );
+
+	it( 'refuses to spawn an executable that changed after it was prepared', async () => {
+		const directory = await realpath(
+			await mkdtemp( path.join( os.tmpdir(), 'Studio Claude Spawn ' ) )
+		);
+		try {
+			const executable = path.join( directory, 'claude.exe' );
+			await writeFile( executable, 'prepared binary' );
+			const found = await stat( executable, { bigint: true } );
+			const executableIdentity = {
+				path: executable,
+				size: Number( found.size ),
+				device: found.dev.toString(),
+				inode: found.ino.toString(),
+				modified: found.mtimeNs.toString(),
+				changed: found.ctimeNs.toString(),
+				sha256: createHash( 'sha256' ).update( 'prepared binary' ).digest( 'hex' ),
+			};
+			let launch: Record< string, unknown > | undefined;
+			const query = ( request: { options: Record< string, unknown > } ) => {
+				launch = request.options;
+				return { ...good(), close: () => {} };
+			};
+			await discoverClaudeModels( 'connection', directory, {
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				connection: async () => ( { id: 'connection', executablePath: executable } ),
+				prepare: async () => ( {
+					ok: true as const,
+					executablePath: executable,
+					executableIdentity,
+					cwd: directory,
+					configDirectory: directory,
+					projectsDirectory: directory,
+					env: {},
+					identity,
+				} ),
+			} );
+			await writeFile( executable, 'auto-updated binary' );
+			const spawnNative = launch?.spawnClaudeCodeProcess as ( invocation: {
+				command: string;
+				args: string[];
+				cwd: string;
+				env: NodeJS.ProcessEnv;
+				signal: AbortSignal;
+			} ) => unknown;
+			expect( () =>
+				spawnNative( {
+					command: executable,
+					args: [],
+					cwd: directory,
+					env: launch?.env as NodeJS.ProcessEnv,
+					signal: new AbortController().signal,
+				} )
+			).toThrow( 'Unexpected native process invocation' );
+		} finally {
+			await rm( directory, { recursive: true, force: true, maxRetries: 4 } );
+		}
 	} );
 } );
 
@@ -195,6 +268,7 @@ it.each( [ 'missing native reference', 'moved workspace' ] )(
 					prepare: async () => ( {
 						ok: true,
 						executablePath: 'fake',
+						executableIdentity: fakeIdentity,
 						cwd: root,
 						configDirectory: root,
 						projectsDirectory: root,
@@ -327,6 +401,7 @@ it( 'resumes the exact native session after restart with the next model and effo
 					prepare: async () => ( {
 						ok: true,
 						executablePath: 'fake',
+						executableIdentity: fakeIdentity,
 						cwd: root,
 						configDirectory: root,
 						projectsDirectory: projects,
@@ -428,6 +503,7 @@ it( 'releases no prompt and reports startup failure even if closing the SDK thro
 			prepare: async () => ( {
 				ok: true as const,
 				executablePath: 'fake',
+				executableIdentity: fakeIdentity,
 				cwd: process.cwd(),
 				configDirectory: process.cwd(),
 				projectsDirectory: process.cwd(),
@@ -571,6 +647,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 					prepare: async () => ( {
 						ok: true as const,
 						executablePath: 'fake',
+						executableIdentity: fakeIdentity,
 						cwd: root,
 						configDirectory: root,
 						projectsDirectory: path.join( root, 'projects' ),
@@ -707,6 +784,7 @@ it( 'denies native tools until system init has been verified (mock SDK)', async 
 				prepare: async () => ( {
 					ok: true as const,
 					executablePath: 'fake',
+					executableIdentity: fakeIdentity,
 					cwd: root,
 					configDirectory: root,
 					projectsDirectory: path.join( root, 'projects' ),
@@ -1013,6 +1091,7 @@ it( 'runs a global conversation only in the dedicated global workspace (mock SDK
 					prepare: async () => ( {
 						ok: true,
 						executablePath: 'fake',
+						executableIdentity: fakeIdentity,
 						cwd: workingDirectory,
 						configDirectory: root,
 						projectsDirectory: path.join( root, 'projects' ),
@@ -1127,6 +1206,7 @@ it( 'routes the SDK hook and native permission request through the execution pol
 				prepare: async () => ( {
 					ok: true,
 					executablePath: 'fake',
+					executableIdentity: fakeIdentity,
 					cwd: site,
 					configDirectory: config,
 					projectsDirectory: path.join( config, 'projects' ),
@@ -1248,6 +1328,7 @@ it( 'registers a PreToolUse hook that outlasts any approval and denies a cancell
 				prepare: async () => ( {
 					ok: true,
 					executablePath: 'fake',
+					executableIdentity: fakeIdentity,
 					cwd: fixture.root,
 					configDirectory: fixture.config,
 					projectsDirectory: fixture.projects,
@@ -1282,6 +1363,7 @@ it( 'refuses a turn sent on an earlier connection revision (mock SDK)', async ()
 				prepare: async () => ( {
 					ok: true,
 					executablePath: 'fake',
+					executableIdentity: fakeIdentity,
 					cwd: fixture.root,
 					configDirectory: fixture.config,
 					projectsDirectory: fixture.projects,
@@ -1396,6 +1478,7 @@ it( 'stops the turn within the recheck bound when the stored sign-in changes or 
 						return {
 							ok: true,
 							executablePath: 'fake',
+							executableIdentity: fakeIdentity,
 							cwd: fixture.root,
 							configDirectory: fixture.config,
 							projectsDirectory: fixture.projects,
@@ -1454,6 +1537,7 @@ it( 'keeps a conversation on the Claude account it started with, adopting it for
 					prepare: async () => ( {
 						ok: true,
 						executablePath: 'fake',
+						executableIdentity: fakeIdentity,
 						cwd: fixture.root,
 						configDirectory: fixture.config,
 						projectsDirectory: fixture.projects,
