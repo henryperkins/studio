@@ -6,7 +6,6 @@ import {
 	createOsCredentialStore,
 	type OsCredentialStore,
 } from '@studio/common/lib/os-credential-store';
-import { getConfigDirectory } from '@studio/common/lib/well-known-paths';
 import { __ } from '@wordpress/i18n';
 import { readFile } from 'atomically';
 import {
@@ -28,6 +27,7 @@ import {
 	type ChatGptAccount,
 	type ChatGptAccountSignIn,
 } from '@studio/agent/node/chatgpt/account-store';
+import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
 import type { ParentChannel } from '@studio/agent/node/openai-credentials';
 import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections';
 
@@ -565,7 +565,7 @@ export function createChatGptCredentialBroker(
 		! sessions.has( registrationId ) &&
 		! reachableParent();
 
-	const credentialsDirectory = () => path.join( getConfigDirectory(), CREDENTIALS_DIRECTORY );
+	const credentialsDirectory = () => path.join( getChatGptStateDirectory(), CREDENTIALS_DIRECTORY );
 	const recordFile = ( registrationId: string ) => `${ registrationId }.vault`;
 
 	function vaultUnavailable( error: unknown, secret?: string ): ChatGptConnectionError {
