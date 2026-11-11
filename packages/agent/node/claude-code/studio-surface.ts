@@ -11,6 +11,7 @@ import {
 import { createHydratedAiSession, reconcileSessionEnvironment } from '../sessions/manage';
 import { appendStudioEntry, loadAiSession } from '../sessions/store';
 import {
+	claudeConnectionRevision,
 	disconnectClaudeConnection,
 	getClaudeConnections,
 	inspectClaudeConnection,
@@ -261,6 +262,15 @@ async function loadBoundSession( root: string, snapshot: ClaudeBackendTurnSnapsh
 	} catch {
 		// An unreadable conversation cannot confirm anything.
 	}
+}
+
+/**
+ * The connection revision a turn is sent with. A connection that no longer
+ * exists has none, and a turn sent with 0 never starts.
+ */
+export async function getClaudeTurnConnectionRevision( connectionId: string ): Promise< number > {
+	const connection = ( await getClaudeConnections() ).find( ( item ) => item.id === connectionId );
+	return connection ? claudeConnectionRevision( connection ) : 0;
 }
 
 /** Whether a turn can start: the conversation still has its binding, selection and target. */

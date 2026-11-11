@@ -14,9 +14,14 @@ afterEach( async () => {
 async function setup(
 	approve: ClaudeApprover = vi.fn( async () => 'allow' as const ),
 	stillConnected = vi.fn( async () => true ),
-	onEvent: ( event: BackendTurnEvent ) => void = () => {}
+	onEvent: ( event: BackendTurnEvent ) => void = () => {},
+	approvalTimeoutMs = 100
 ) {
-	const fixture = await createPolicyFixture( () => ( { approve, stillConnected } ) );
+	const fixture = await createPolicyFixture( () => ( {
+		approve,
+		stillConnected,
+		approvalTimeoutMs,
+	} ) );
 	cleanups.push( fixture.cleanup );
 	const bridge = createStudioClaudeToolBridge(
 		fixture.host,
@@ -219,4 +224,28 @@ it( 'exposes the canonical schema through the actual in-process SDK MCP server',
 		await client.close();
 		await bridge.dispose();
 	}
+} );
+
+it( 'cancels a pending approval when the SDK cancels the MCP call', async () => {
+	let approvalSignal: AbortSignal | undefined;
+	const { bridge, host } = await setup(
+		vi.fn( ( _request, signal: AbortSignal ) => {
+			approvalSignal = signal;
+			return new Promise< 'allow' >( () => {} );
+		} ),
+		vi.fn( async () => true ),
+		() => {},
+		60_000
+	);
+	const call = new AbortController();
+	const pending = bridge.invoke(
+		'wp_cli',
+		{ nameOrPath: 'site', command: 'post create --post_status=draft --post_title=Hello' },
+		call.signal
+	);
+	await vi.waitFor( () => expect( approvalSignal ).toBeDefined() );
+	call.abort();
+	expect( ( await pending ).isError ).toBe( true );
+	expect( approvalSignal!.aborted ).toBe( true );
+	expect( host.sites.wpCli ).not.toHaveBeenCalled();
 } );

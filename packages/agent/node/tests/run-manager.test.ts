@@ -443,16 +443,27 @@ it( 'scopes Claude approvals and treats an exit without a terminal event as unkn
 		requestId: 'req',
 		toolCallId: 'tool',
 		description: 'Approve',
+		operation: {
+			tool: 'sites.wpCli',
+			operationClass: 'command',
+			target: { environment: 'local', siteId: 'site' },
+			args: '[]',
+			localPaths: [],
+		},
 	};
 	child.emit( 'message', {
 		type: 'backend.event',
 		timestamp: '',
 		event: { ...approval, runId: 'wrong' },
 	} );
+	const { operation: _operation, ...legacy } = { ...approval, requestId: 'legacy' };
+	child.emit( 'message', { type: 'backend.event', timestamp: '', event: legacy } );
 	child.emit( 'message', { type: 'backend.event', timestamp: '', event: approval } );
 	await vi.waitFor( () =>
 		expect( manager.listActiveAgentRuns()[ 0 ].pendingClaudeApprovals ).toEqual( [ approval ] )
 	);
+	manager.answerAgentRun( runId, { legacy: 'allow' } );
+	expect( child.send ).not.toHaveBeenCalled();
 	manager.answerAgentRun( runId, { req: 'allow' } );
 	manager.answerAgentRun( runId, { req: 'allow' } );
 	expect( child.send ).toHaveBeenCalledTimes( 1 );

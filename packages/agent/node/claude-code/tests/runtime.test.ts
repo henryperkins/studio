@@ -756,7 +756,7 @@ it( 'blocks native reads of credential-bearing files and the native config tree'
 			'config/state.json',
 		] )
 			await fs.writeFile( path.join( root, file ), 'fixture' );
-		const { isAllowedNativePath } = await import( '../execution-policy' );
+		const { isAllowedNativePath } = await import( '../execution-rules' );
 		expect( await isAllowedNativePath( path.join( root, 'safe.txt' ), [ root ], config ) ).toBe(
 			true
 		);
@@ -898,7 +898,19 @@ it( 'deduplicates discovered model aliases by canonical ID without inventing eff
 
 function fakeNativeTurn(
 	cwd: string,
-	onTurn: ( options: Record< string, unknown > ) => Promise< void > = async () => {}
+	{
+		onTurn = async () => {},
+		account = () => ( {
+			email: 'user@example.com',
+			subscriptionType: 'max',
+			apiProvider: 'firstParty',
+		} ),
+		projects,
+	}: {
+		onTurn?: ( options: Record< string, unknown > ) => Promise< void >;
+		account?: () => Record< string, string >;
+		projects?: string;
+	} = {}
 ) {
 	return vi.fn(
 		( input: { prompt: AsyncIterable< unknown >; options: Record< string, unknown > } ) => ( {
@@ -906,11 +918,7 @@ function fakeNativeTurn(
 				hooks_applied: true,
 				hook_on_failure_supported: true,
 			} ),
-			accountInfo: async () => ( {
-				email: 'user@example.com',
-				subscriptionType: 'max',
-				apiProvider: 'firstParty',
-			} ),
+			accountInfo: async () => account(),
 			mcpServerStatus: async () => [
 				{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
 			],
@@ -921,6 +929,14 @@ function fakeNativeTurn(
 			async *[ Symbol.asyncIterator ]() {
 				const sessionId = input.options.resume ?? input.options.sessionId;
 				for await ( const _prompt of input.prompt ) {
+					if ( projects ) {
+						const { appendFile } = await import( 'fs/promises' );
+						const { join } = await import( 'path' );
+						await appendFile(
+							join( projects, `${ sessionId }.jsonl` ),
+							JSON.stringify( { sessionId, cwd } ) + '\n'
+						);
+					}
 					yield {
 						type: 'system',
 						subtype: 'init',
@@ -1047,36 +1063,38 @@ it( 'routes the SDK hook and native permission request through the execution pol
 			input: Record< string, unknown >,
 			options: Record< string, unknown >
 		) => Promise< { behavior: string } >;
-		const query = fakeNativeTurn( site, async ( options ) => {
-			const hooks = options.hooks as { PreToolUse: Array< { hooks: Hook[] } > };
-			const hook = ( toolName: string, toolInput: unknown ) =>
-				hooks.PreToolUse[ 0 ].hooks[ 0 ]( {
-					hook_event_name: 'PreToolUse',
-					tool_name: toolName,
-					tool_input: toolInput,
-					tool_use_id: toolName,
-				} );
-			const permission = options.canUseTool as Permission;
-			const signal = new AbortController().signal;
-			decisions.push( ( await hook( 'Read', readme ) ).hookSpecificOutput );
-			decisions.push( ( await permission( 'Read', readme, { signal } ) ).behavior );
-			decisions.push(
-				( await hook( 'Write', { ...readme, content: 'changed' } ) ).hookSpecificOutput
-			);
-			decisions.push(
-				(
-					await permission(
-						'mcp__studio__wp_cli',
-						{},
-						{
-							signal,
-							mcpServer: { name: 'studio', source: 'project' },
-						}
-					)
-				).behavior
-			);
-			targetUnchanged = false;
-			decisions.push( ( await hook( 'Read', readme ) ).hookSpecificOutput );
+		const query = fakeNativeTurn( site, {
+			onTurn: async ( options ) => {
+				const hooks = options.hooks as { PreToolUse: Array< { hooks: Hook[] } > };
+				const hook = ( toolName: string, toolInput: unknown ) =>
+					hooks.PreToolUse[ 0 ].hooks[ 0 ]( {
+						hook_event_name: 'PreToolUse',
+						tool_name: toolName,
+						tool_input: toolInput,
+						tool_use_id: toolName,
+					} );
+				const permission = options.canUseTool as Permission;
+				const signal = new AbortController().signal;
+				decisions.push( ( await hook( 'Read', readme ) ).hookSpecificOutput );
+				decisions.push( ( await permission( 'Read', readme, { signal } ) ).behavior );
+				decisions.push(
+					( await hook( 'Write', { ...readme, content: 'changed' } ) ).hookSpecificOutput
+				);
+				decisions.push(
+					(
+						await permission(
+							'mcp__studio__wp_cli',
+							{},
+							{
+								signal,
+								mcpServer: { name: 'studio', source: 'project' },
+							}
+						)
+					).behavior
+				);
+				targetUnchanged = false;
+				decisions.push( ( await hook( 'Read', readme ) ).hookSpecificOutput );
+			},
 		} );
 		await runClaudeTurn(
 			{
@@ -1122,5 +1140,302 @@ it( 'routes the SDK hook and native permission request through the execution pol
 		expect( decisions ).toEqual( [ allow, 'allow', deny, 'deny', deny ] );
 	} finally {
 		await fs.rm( root, { recursive: true, force: true } );
+	}
+} );
+
+async function runtimeFixture( prefix: string ) {
+	const { createFakeHost } = await import( '../../tests/fake-host' );
+	const fs = await import( 'fs/promises' );
+	const os = await import( 'os' );
+	const path = await import( 'path' );
+	const parent = await fs.realpath( await fs.mkdtemp( path.join( os.tmpdir(), prefix ) ) );
+	const root = path.join( parent, 'site' );
+	const config = path.join( parent, 'config' );
+	const projects = path.join( config, 'projects' );
+	await fs.mkdir( root );
+	await fs.mkdir( projects, { recursive: true } );
+	await fs.writeFile( path.join( root, 'readme.txt' ), 'fixture' );
+	const host = createFakeHost();
+	host.sites.all = async () => [
+		{ id: 'site', path: root, name: 'site', url: 'http://localhost', phpVersion: '8.4' },
+	];
+	return {
+		root,
+		config,
+		projects,
+		host,
+		storeRoot: path.join( parent, 'store' ),
+		cleanup: () => fs.rm( parent, { recursive: true, force: true } ),
+	};
+}
+
+function turnSnapshot( root: string, config: string, id: string, revision = 1 ) {
+	return {
+		backend: 'claude-code' as const,
+		runId: id,
+		turnId: id,
+		effort: 'medium',
+		permissionPolicyRevision: 1,
+		selection: {
+			connectionId: 'native',
+			model: { providerId: 'claude-code' as const, modelId: 'sonnet' },
+			revision,
+		},
+		workspace: {
+			conversationId: 'chat',
+			siteId: 'site',
+			workingDirectory: root,
+			configDirectory: config,
+		},
+		target: { environment: 'local' as const, siteId: 'site' },
+	};
+}
+
+function nativeAccount( email: string ) {
+	return { email, subscriptionType: 'max', apiProvider: 'firstParty' };
+}
+
+it( 'registers a PreToolUse hook that outlasts any approval and denies a cancelled hook (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { CLAUDE_HOOK_TIMEOUT_SECONDS } = await import( '../execution-rules' );
+	const path = await import( 'path' );
+	const fixture = await runtimeFixture( 'claude-hook-' );
+	try {
+		const decisions: unknown[] = [];
+		let timeout: unknown;
+		const query = fakeNativeTurn( fixture.root, {
+			onTurn: async ( options ) => {
+				const matcher = (
+					options.hooks as {
+						PreToolUse: Array< {
+							timeout?: number;
+							hooks: Array<
+								(
+									input: unknown,
+									id: string,
+									context: { signal: AbortSignal }
+								) => Promise< { hookSpecificOutput: { permissionDecision: string } } >
+							>;
+						} >;
+					}
+				 ).PreToolUse[ 0 ];
+				timeout = matcher.timeout;
+				const read = {
+					hook_event_name: 'PreToolUse',
+					tool_name: 'Read',
+					tool_input: { file_path: path.join( fixture.root, 'readme.txt' ) },
+					tool_use_id: 'read',
+				};
+				const cancelled = new AbortController();
+				cancelled.abort();
+				for ( const signal of [ new AbortController().signal, cancelled.signal ] )
+					decisions.push(
+						( await matcher.hooks[ 0 ]( read, 'read', { signal } ) ).hookSpecificOutput
+							.permissionDecision
+					);
+			},
+		} );
+		await runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'turn' ),
+			fixture.host,
+			{ prompt: 'hello', signal: new AbortController().signal, onEvent: () => {} },
+			{
+				storeRoot: fixture.storeRoot,
+				approve: async () => 'deny',
+				verifyTarget: async () => true,
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+				prepare: async () => ( {
+					ok: true,
+					executablePath: 'fake',
+					cwd: fixture.root,
+					configDirectory: fixture.config,
+					projectsDirectory: fixture.projects,
+					env: {},
+					identity: { email: 'user@example.com', subscriptionType: 'max' },
+				} ),
+			}
+		);
+		expect( timeout ).toBe( CLAUDE_HOOK_TIMEOUT_SECONDS );
+		expect( decisions ).toEqual( [ 'allow', 'deny' ] );
+	} finally {
+		await fixture.cleanup();
+	}
+} );
+
+it( 'stops the turn when the connection revision or the native account changes (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const path = await import( 'path' );
+	const fixture = await runtimeFixture( 'claude-account-' );
+	try {
+		const options = (
+			query: unknown,
+			connection: { id: string; executablePath: string; revision?: number }
+		) => ( {
+			storeRoot: fixture.storeRoot,
+			approve: async () => 'deny' as const,
+			verifyTarget: async () => true,
+			query: query as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+			connection: async () => connection,
+			prepare: async () => ( {
+				ok: true as const,
+				executablePath: 'fake',
+				cwd: fixture.root,
+				configDirectory: fixture.config,
+				projectsDirectory: fixture.projects,
+				env: {},
+				identity: { email: 'user@example.com', subscriptionType: 'max' },
+			} ),
+		} );
+		const reestablished = vi.fn();
+		const events: Array< { type: string; outcome?: { status: string; message?: string } } > = [];
+		await runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'stale' ),
+			fixture.host,
+			{ prompt: 'hello', signal: new AbortController().signal, onEvent: ( e ) => events.push( e ) },
+			options( reestablished, { id: 'native', executablePath: 'fake', revision: 2 } )
+		);
+		expect( reestablished ).not.toHaveBeenCalled();
+		expect( events.at( -1 ) ).toMatchObject( {
+			type: 'turn.terminal',
+			outcome: { status: 'error', message: expect.stringContaining( 'changed' ) },
+		} );
+
+		let email = 'user@example.com';
+		const decisions: unknown[] = [];
+		const query = fakeNativeTurn( fixture.root, {
+			account: () => nativeAccount( email ),
+			onTurn: async ( turnOptions ) => {
+				const hook = (
+					turnOptions.hooks as {
+						PreToolUse: Array< {
+							hooks: Array<
+								(
+									input: unknown,
+									id: string,
+									context: { signal: AbortSignal }
+								) => Promise< { hookSpecificOutput: { permissionDecision: string } } >
+							>;
+						} >;
+					}
+				 ).PreToolUse[ 0 ].hooks[ 0 ];
+				const read = () =>
+					hook(
+						{
+							hook_event_name: 'PreToolUse',
+							tool_name: 'Read',
+							tool_input: { file_path: path.join( fixture.root, 'readme.txt' ) },
+							tool_use_id: 'read',
+						},
+						'read',
+						{ signal: new AbortController().signal }
+					);
+				decisions.push( ( await read() ).hookSpecificOutput.permissionDecision );
+				email = 'someone-else@example.com';
+				decisions.push( ( await read() ).hookSpecificOutput.permissionDecision );
+			},
+		} );
+		events.length = 0;
+		await runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'switched' ),
+			fixture.host,
+			{ prompt: 'hello', signal: new AbortController().signal, onEvent: ( e ) => events.push( e ) },
+			options( query, { id: 'native', executablePath: 'fake' } )
+		);
+		expect( decisions ).toEqual( [ 'allow', 'deny' ] );
+		expect( events.at( -1 ) ).toMatchObject( {
+			type: 'turn.terminal',
+			outcome: { status: 'interrupted', message: expect.stringContaining( 'account' ) },
+		} );
+	} finally {
+		await fixture.cleanup();
+	}
+} );
+
+it( 'keeps a conversation on the Claude account it started with, adopting it for older conversations (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createNativeSessionStore } = await import( '../sessions' );
+	const { randomUUID } = await import( 'crypto' );
+	const fixture = await runtimeFixture( 'claude-bound-' );
+	try {
+		const run = async ( conversationId: string, email: string ) => {
+			const events: Array< { type: string; outcome?: { status: string; code?: string } } > = [];
+			const query = fakeNativeTurn( fixture.root, {
+				account: () => nativeAccount( email ),
+				projects: fixture.projects,
+			} );
+			await runClaudeTurn(
+				{
+					...turnSnapshot( fixture.root, fixture.config, randomUUID() ),
+					workspace: {
+						conversationId,
+						siteId: 'site',
+						workingDirectory: fixture.root,
+						configDirectory: fixture.config,
+					},
+				},
+				fixture.host,
+				{
+					prompt: 'hello',
+					signal: new AbortController().signal,
+					onEvent: ( e ) => events.push( e ),
+				},
+				{
+					storeRoot: fixture.storeRoot,
+					approve: async () => 'deny',
+					verifyTarget: async () => true,
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+					prepare: async () => ( {
+						ok: true,
+						executablePath: 'fake',
+						cwd: fixture.root,
+						configDirectory: fixture.config,
+						projectsDirectory: fixture.projects,
+						env: {},
+						identity: { email, subscriptionType: 'max' },
+					} ),
+				}
+			);
+			return { outcome: events.at( -1 )?.outcome, queried: query.mock.calls.length };
+		};
+		expect( await run( 'chat', 'user@example.com' ) ).toMatchObject( {
+			outcome: { status: 'success' },
+		} );
+		expect( await run( 'chat', 'user@example.com' ) ).toMatchObject( {
+			outcome: { status: 'success' },
+		} );
+		expect( await run( 'chat', 'someone-else@example.com' ) ).toEqual( {
+			outcome: expect.objectContaining( { code: 'rebind_required' } ),
+			queried: 0,
+		} );
+
+		const store = createNativeSessionStore( fixture.storeRoot );
+		await store.create( {
+			backend: 'claude-code',
+			nativeSessionId: randomUUID(),
+			connectionId: 'native',
+			conversationId: 'older',
+			siteId: 'site',
+			workingDirectory: fixture.root,
+			configDirectory: fixture.config,
+		} );
+		const fs = await import( 'fs/promises' );
+		const path = await import( 'path' );
+		const older = ( await store.load( 'older' ) )!;
+		await fs.writeFile(
+			path.join( fixture.projects, `${ older.nativeSessionId }.jsonl` ),
+			JSON.stringify( { sessionId: older.nativeSessionId, cwd: fixture.root } ) + '\n'
+		);
+		expect( await run( 'older', 'user@example.com' ) ).toMatchObject( {
+			outcome: { status: 'success' },
+		} );
+		expect( ( await store.load( 'older' ) )?.accountKey ).toMatch( /^[0-9a-f]{64}$/ );
+		expect( await run( 'older', 'someone-else@example.com' ) ).toEqual( {
+			outcome: expect.objectContaining( { code: 'rebind_required' } ),
+			queried: 0,
+		} );
+	} finally {
+		await fixture.cleanup();
 	}
 } );

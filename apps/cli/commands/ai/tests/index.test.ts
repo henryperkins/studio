@@ -1,5 +1,6 @@
 vi.mock( '@studio/agent/node/claude-code/studio-surface', () => ( {
 	getClaudeSessionStoreRoot: () => 'root',
+	getClaudeTurnConnectionRevision: vi.fn( async () => 3 ),
 	validateClaudeSendSelection: vi.fn(),
 } ) );
 vi.mock( '@studio/agent/node/claude-code/runtime', () => ( { runClaudeTurn: vi.fn() } ) );
@@ -1043,7 +1044,12 @@ it( 'routes marked Claude sessions before Pi provider selection', async () => {
 		} );
 		expect( resolveInitialAiProvider ).not.toHaveBeenCalled();
 		expect( runClaudeTurn ).toHaveBeenCalledWith(
-			expect.objectContaining( { backend: 'claude-code', runId: 'run', turnId: 'turn' } ),
+			expect.objectContaining( {
+				backend: 'claude-code',
+				runId: 'run',
+				turnId: 'turn',
+				selection: expect.objectContaining( { connectionId: 'connection', revision: 3 } ),
+			} ),
 			expect.anything(),
 			expect.anything(),
 			expect.anything()

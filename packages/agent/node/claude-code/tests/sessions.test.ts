@@ -308,3 +308,32 @@ it( 'retains the run lock when its owner process exits without proving the nativ
 	const files = await fs.readdir( dir );
 	expect( files.some( ( name ) => name.endsWith( '.json.lock' ) ) ).toBe( true );
 } );
+
+it( 'reads approvals journaled before they named their operation as display-only legacy events', async () => {
+	const dir = await realpath( await mkdtemp( path.join( os.tmpdir(), 'claude-store-' ) ) );
+	dirs.push( dir );
+	const store = createNativeSessionStore( dir );
+	const ids = { runId: 'run', turnId: 'turn', toolCallId: 'tool', requestId: 'request' };
+	const draft = { siteName: 'Site', title: 'Draft', content: 'Body' };
+	const journal = store.journal( 'conversation', 'turn' );
+	await journal.append( { type: 'turn.prompt', runId: 'run', turnId: 'turn', text: 'Hello' } );
+	await journal.append( {
+		type: 'approval.requested',
+		...ids,
+		description: 'Create a draft post on the current local site',
+		draft,
+	} as unknown as Parameters< typeof journal.append >[ 0 ] );
+	await journal.append( { type: 'approval.resolved', ...ids } );
+	const [ events ] = await store.readJournals( 'conversation' );
+	expect( events ).toEqual( [
+		{ type: 'turn.prompt', runId: 'run', turnId: 'turn', text: 'Hello' },
+		{
+			type: 'approval.legacy',
+			...ids,
+			description: 'Create a draft post on the current local site',
+			draft,
+		},
+		{ type: 'approval.resolved', ...ids },
+	] );
+	expect( await journal.read() ).toEqual( events );
+} );

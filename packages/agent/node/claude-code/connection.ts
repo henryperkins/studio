@@ -7,6 +7,7 @@ import { readSharedConfig, updateSharedConfigFrom } from '@studio/common/lib/sha
 import { assessClaudeAuth, buildClaudeEnvironment } from './auth-status';
 import { inspectClaudeConfiguration } from './configuration';
 import { inspectClaudeExecutable, trustedPowerShellPath } from './discovery';
+import type { ClaudeAuthIdentity } from './auth-status';
 
 const execFileAsync = promisify( execFile );
 
@@ -38,7 +39,14 @@ async function inspectManagedPolicy(): Promise< boolean > {
 		return false;
 	}
 }
-export type ClaudeConnection = { id: string; executablePath: string; configDirectory?: string };
+// `revision` moves each time Studio re-establishes the connection's sign-in; a
+// record that has never been re-established is at revision 1.
+export type ClaudeConnection = {
+	id: string;
+	executablePath: string;
+	configDirectory?: string;
+	revision?: number;
+};
 function connections( value: unknown ): ClaudeConnection[] {
 	if ( ! Array.isArray( value ) ) return [];
 	return value
@@ -54,7 +62,16 @@ function connections( value: unknown ): ClaudeConnection[] {
 			id: item.id,
 			executablePath: item.executablePath,
 			...( item.configDirectory === undefined ? {} : { configDirectory: item.configDirectory } ),
+			...( Number.isSafeInteger( item.revision ) && ( item.revision as number ) > 1
+				? { revision: item.revision }
+				: {} ),
 		} ) );
+}
+
+export function claudeConnectionRevision(
+	connection: Pick< ClaudeConnection, 'revision' >
+): number {
+	return connection.revision ?? 1;
 }
 function retiredIds( value: unknown ): string[] {
 	return Array.isArray( value )
@@ -282,6 +299,46 @@ export async function disconnectClaudeConnection( connectionId: string ): Promis
 		};
 	} );
 }
+/** Moves a connection to its next revision, ending turns and approvals made on the last one. */
+export async function markClaudeConnectionReestablished( connectionId: string ): Promise< void > {
+	await updateSharedConfigFrom( ( config ) => {
+		const existing = connections( config.claudeConnections );
+		if ( ! existing.some( ( item ) => item.id === connectionId ) )
+			throw new Error( 'Unknown Claude connection' );
+		return {
+			claudeConnections: existing.map( ( item ) =>
+				item.id === connectionId
+					? { ...item, revision: claudeConnectionRevision( item ) + 1 }
+					: item
+			),
+		};
+	} );
+}
+
+/** The account the native runtime is signed in to now, if it qualifies. */
+export async function readClaudeAccountIdentity(
+	executablePath: string,
+	cwd: string,
+	configDirectory?: string
+): Promise< ClaudeAuthIdentity | undefined > {
+	const child = buildClaudeEnvironment( process.env );
+	const context = resolveClaudeConfigContext( configDirectory, process.env );
+	if ( child.conflicts.length || context.mode === 'conflict' ) return;
+	if ( context.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = context.directory;
+	try {
+		const status = await readNativeStatus( executablePath, cwd, child.env );
+		if ( ! assessClaudeAuth( status ).qualified ) return;
+		return {
+			email: typeof status.email === 'string' ? status.email : undefined,
+			organization: typeof status.orgName === 'string' ? status.orgName : undefined,
+			subscriptionType:
+				typeof status.subscriptionType === 'string' ? status.subscriptionType : undefined,
+		};
+	} catch {
+		return;
+	}
+}
+
 export async function openClaudeNativeSignIn( connectionId: string ): Promise< void > {
 	if ( process.env.STUDIO_EXPERIMENTAL_CLAUDE_CODE !== '1' )
 		throw new Error( 'Claude Code is disabled' );
@@ -300,6 +357,7 @@ export async function openClaudeNativeSignIn( connectionId: string ): Promise< v
 	);
 	if ( configuration.blockers.length || ! ( await inspectManagedPolicy() ) )
 		throw new Error( 'Claude configuration is not qualified for sign-in' );
+	await markClaudeConnectionReestablished( connectionId );
 	if ( config.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = config.directory;
 	const encodedPath = Buffer.from( executable.executablePath, 'utf8' ).toString( 'base64' );
 	const script = `Start-Process -FilePath ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ encodedPath }'))) -ArgumentList @('auth','login') -WindowStyle Normal -ErrorAction Stop`;

@@ -117,3 +117,17 @@ export type BackendTurnEvent = BackendTurnIds &
 		| { type: 'preview.reload' }
 		| { type: 'turn.terminal'; outcome: BackendTurnOutcome }
 	);
+
+/**
+ * An approval request journaled before requests named their operation. Kept
+ * for display only: it is never pending and can never be answered.
+ */
+export interface LegacyApprovalRequestedEvent extends BackendTurnIds, ToolCall {
+	type: 'approval.legacy';
+	requestId: string;
+	description: string;
+	draft?: { siteName: string; title: string; content?: string };
+}
+
+/** What a Claude conversation's display journal holds once read back. */
+export type ClaudeJournalEvent = BackendTurnEvent | LegacyApprovalRequestedEvent;

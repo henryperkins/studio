@@ -4,13 +4,17 @@ import { Value } from 'typebox/value';
 import { z } from 'zod';
 import { bindTool } from '../tools/define-tool';
 import { runWpCliTool } from '../tools/wp-cli';
+import { isRecord } from './execution-rules';
 import type { ClaudeExecutionPolicy } from './execution-policy';
 import type { StudioAgentHost } from '../host';
 import type { ToolResult } from '../tools/define-tool';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 
 export function createStudioClaudeMcpServer(
-	invoke: ( args: unknown ) => Promise< { content: ToolResult[ 'content' ]; isError: boolean } >
+	invoke: (
+		args: unknown,
+		extra?: unknown
+	) => Promise< { content: ToolResult[ 'content' ]; isError: boolean } >
 ) {
 	const schema = z.fromJSONSchema(
 		runWpCliTool.parameters as unknown as Parameters< typeof z.fromJSONSchema >[ 0 ]
@@ -39,7 +43,7 @@ export function createStudioClaudeToolBridge(
 ) {
 	const { runId, turnId, policy } = turn;
 	const active = new Set< Promise< unknown > >();
-	async function execute( name: string, args: unknown ) {
+	async function execute( name: string, args: unknown, signal?: AbortSignal ) {
 		const toolCallId = randomUUID();
 		onEvent( { type: 'tool.started', runId, turnId, toolCallId, name } );
 		const fail = () => {
@@ -52,12 +56,13 @@ export function createStudioClaudeToolBridge(
 		try {
 			if (
 				policy.signal.aborted ||
+				signal?.aborted ||
 				name !== runWpCliTool.name ||
 				! Value.Check( runWpCliTool.parameters, args ) ||
-				! ( await policy.authorizeStudioCall( name, args, toolCallId ) )
+				! ( await policy.authorizeStudioCall( { host, name, args, toolCallId, signal } ) )
 			)
 				return fail();
-			const bound = bindTool( runWpCliTool, policy.guardHost( host, toolCallId ) );
+			const bound = bindTool( runWpCliTool, policy.guardHost( host, toolCallId, signal ) );
 			const result = await bound.rawHandler( args, {
 				onProgress: ( message, update ) =>
 					onEvent( { type: 'tool.progress', runId, turnId, toolCallId, message, update } ),
@@ -74,8 +79,10 @@ export function createStudioClaudeToolBridge(
 			return fail();
 		}
 	}
-	async function invoke( name: string, args: unknown ) {
-		const operation = execute( name, args );
+	// `signal` is the MCP call's own: the SDK aborts it when the native runtime
+	// gives up on the call, which cancels its approval and anything not yet started.
+	async function invoke( name: string, args: unknown, signal?: AbortSignal ) {
+		const operation = execute( name, args, signal );
 		active.add( operation );
 		try {
 			return await operation;
@@ -83,7 +90,10 @@ export function createStudioClaudeToolBridge(
 			active.delete( operation );
 		}
 	}
-	const server = createStudioClaudeMcpServer( ( args ) => invoke( runWpCliTool.name, args ) );
+	const server = createStudioClaudeMcpServer( ( args, extra ) => {
+		const signal = isRecord( extra ) ? extra.signal : undefined;
+		return invoke( runWpCliTool.name, args, signal instanceof AbortSignal ? signal : undefined );
+	} );
 	return {
 		server,
 		invoke,

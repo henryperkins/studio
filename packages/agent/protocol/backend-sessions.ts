@@ -21,6 +21,12 @@ export interface ClaudeBackendSessionRef extends ClaudeBackendSessionBinding {
 	nativeSessionId: string;
 	/** Canonical path of the native transcript, once independently verified. */
 	transcriptPath?: string;
+	/**
+	 * Hash of the Claude account the conversation runs on. Another account
+	 * cannot continue it. Absent on conversations created before accounts were
+	 * recorded, until their next verified turn.
+	 */
+	accountKey?: string;
 }
 
 export type BackendSessionRef = PiBackendSessionRef | ClaudeBackendSessionRef;

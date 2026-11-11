@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 const conflicts = new Set( [
 	'ANTHROPIC_API_KEY',
 	'ANTHROPIC_AUTH_TOKEN',
@@ -73,6 +74,32 @@ export function assessClaudeAuth( status: Record< string, unknown > ): { qualifi
 			/^(pro|max)$/i.test( status.subscriptionType ),
 	};
 }
+function samePlan( a: string | undefined, b: string | undefined ): boolean {
+	const plan = ( value: string | undefined ) =>
+		/^(?:claude )?(pro|max)(?: plan)?$/i.exec( value ?? '' )?.[ 1 ]?.toLowerCase();
+	return !! plan( a ) && plan( a ) === plan( b );
+}
+
+/** Whether two native sign-ins are the same account on the same plan. */
+export function isSameClaudeAccount( a: ClaudeAuthIdentity, b: ClaudeAuthIdentity ): boolean {
+	return (
+		!! a.email &&
+		a.email.toLowerCase() === b.email?.toLowerCase() &&
+		( a.organization ?? '' ).toLowerCase() === ( b.organization ?? '' ).toLowerCase() &&
+		samePlan( a.subscriptionType, b.subscriptionType )
+	);
+}
+
+/** A stable key for the account a conversation runs on, without storing the address. */
+export function claudeAccountKey( identity: ClaudeAuthIdentity ): string | undefined {
+	if ( ! identity.email ) return;
+	return createHash( 'sha256' )
+		.update(
+			`${ identity.email.toLowerCase() }\n${ ( identity.organization ?? '' ).toLowerCase() }`
+		)
+		.digest( 'hex' );
+}
+
 export function compareClaudeExecutionAuth(
 	preflight: ClaudeAuthIdentity,
 	current: ClaudeAuthIdentity

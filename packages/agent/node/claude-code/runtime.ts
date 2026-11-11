@@ -8,15 +8,24 @@ import {
 	isClaudeModelId,
 	isClaudeTargetAllowed,
 } from '@studio/agent/protocol/claude-code';
-import { compareClaudeExecutionAuth } from './auth-status';
-import { getClaudeConnections, prepareClaudeInvocation } from './connection';
+import { claudeAccountKey, compareClaudeExecutionAuth, isSameClaudeAccount } from './auth-status';
+import {
+	claudeConnectionRevision,
+	getClaudeConnections,
+	prepareClaudeInvocation,
+	readClaudeAccountIdentity,
+} from './connection';
 import { QUALIFIED_CLAUDE_CODE_VERSION } from './discovery';
 import { createClaudeEventAdapter } from './event-adapter';
+import { createClaudeExecutionPolicy } from './execution-policy';
 import {
+	CLAUDE_APPROVAL_TIMEOUT_MS,
 	CLAUDE_ENABLED_TOOLS,
-	createClaudeExecutionPolicy,
-	isEnabledClaudeTool,
-} from './execution-policy';
+	CLAUDE_HOOK_TIMEOUT_SECONDS,
+	CLAUDE_SHELL_CONFINEMENT,
+	claudeNativeTools,
+	claudeToolInventory,
+} from './execution-rules';
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
 import { createStudioClaudeMcpServer, createStudioClaudeToolBridge } from './tool-bridge';
 import type { ClaudeAuthIdentity } from './auth-status';
@@ -205,8 +214,16 @@ interface RuntimeDependencies {
 	query?: typeof sdkQuery;
 	connection?: (
 		id: string
-	) => Promise< { id: string; executablePath: string; configDirectory?: string } | undefined >;
+	) => Promise<
+		{ id: string; executablePath: string; configDirectory?: string; revision?: number } | undefined
+	>;
 	prepare?: ( exe: string, cwd: string, config?: string ) => Promise< Prepared >;
+	/** The account the native runtime is signed in to now, read from its own status. */
+	account?: (
+		exe: string,
+		cwd: string,
+		config?: string
+	) => Promise< ClaudeAuthIdentity | undefined >;
 }
 
 interface RuntimeOptions extends RuntimeDependencies {
@@ -257,7 +274,10 @@ function nativeLaunchOptions(
 			child.stderr.resume();
 			return child;
 		},
-		tools: [ ...CLAUDE_ENABLED_TOOLS.native ],
+		tools: claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, prepared.cwd ),
+		...( CLAUDE_SHELL_CONFINEMENT.mode === 'sandbox'
+			? { sandbox: CLAUDE_SHELL_CONFINEMENT.sandbox }
+			: {} ),
 		strictMcpConfig: true,
 		settingSources: [],
 		settings: {
@@ -428,7 +448,11 @@ export async function runClaudeTurn(
 		openGate = resolve;
 	} );
 	let terminal: TerminalEvent | undefined;
-	let detached = false;
+	let stopReason: 'detached' | 'account' | undefined;
+	const stop = ( reason: 'detached' | 'account' ) => {
+		stopReason ??= reason;
+		controller.abort();
+	};
 	let connectionWatch: ReturnType< typeof setTimeout > | undefined;
 	const failIfSuccessful = () => {
 		if ( ! terminal || terminal.outcome.status === 'success' ) terminal = fail();
@@ -463,6 +487,18 @@ export async function runClaudeTurn(
 			terminal = rebind(
 				'This Claude Code connection was detached. Select a connection and start a new Claude chat.'
 			);
+			return;
+		}
+		if ( claudeConnectionRevision( connection ) !== selection.revision ) {
+			terminal = {
+				type: 'turn.terminal',
+				runId,
+				turnId,
+				outcome: {
+					status: 'error',
+					message: 'The Claude Code connection changed after this message was sent. Send it again.',
+				},
+			};
 			return;
 		}
 		const canonical = ( directory: string ) => realpath( directory ).catch( () => undefined );
@@ -512,22 +548,57 @@ export async function runClaudeTurn(
 			terminal = rebind();
 			return;
 		}
+		const accountKey = claudeAccountKey( prepared.identity );
 		const stillConnected = async () => {
 			const current = await findConnection( selection.connectionId );
 			return (
 				!! current &&
 				current.executablePath === connection.executablePath &&
-				current.configDirectory === connection.configDirectory
+				current.configDirectory === connection.configDirectory &&
+				claudeConnectionRevision( current ) === selection.revision
 			);
 		};
-		const watchConnection = async () => {
-			const connected = await stillConnected().catch( () => false );
-			if ( controller.signal.aborted ) return;
-			if ( ! connected ) {
-				detached = true;
-				controller.abort();
-				return;
+		// The running native process still uses the turn's account.
+		const accountUnchanged = async () => {
+			try {
+				return (
+					!! native && compareClaudeExecutionAuth( prepared.identity, await native.accountInfo() )
+				);
+			} catch {
+				return false;
 			}
+		};
+		// Ends the turn, and with it every pending approval, as soon as the
+		// connection or the account it runs on changes.
+		const verifyConnection = async () => {
+			if ( ! ( await stillConnected().catch( () => false ) ) ) {
+				stop( 'detached' );
+				return false;
+			}
+			if ( ! ( await accountUnchanged() ) ) {
+				stop( 'account' );
+				return false;
+			}
+			return true;
+		};
+		// The sign-in on disk is still the turn's account, so the native runtime
+		// cannot pick up another account while an operation waits.
+		const verifyAccount = async () => {
+			const current = await ( options.account ?? readClaudeAccountIdentity )(
+				connection.executablePath,
+				prepared.cwd,
+				connection.configDirectory
+			).catch( () => undefined );
+			if ( current && isSameClaudeAccount( prepared.identity, current ) ) return true;
+			stop( 'account' );
+			return false;
+		};
+		let watchTicks = 0;
+		const watchConnection = async () => {
+			watchTicks++;
+			const unchanged =
+				( await verifyConnection() ) && ( watchTicks % 10 !== 0 || ( await verifyAccount() ) );
+			if ( controller.signal.aborted || ! unchanged ) return;
 			connectionWatch = setTimeout( () => void watchConnection(), 1000 ).unref();
 		};
 		let existing;
@@ -548,6 +619,12 @@ export async function runClaudeTurn(
 			terminal = rebind();
 			return;
 		}
+		if ( existing?.accountKey && existing.accountKey !== accountKey ) {
+			terminal = rebind(
+				'This chat belongs to another Claude account. Sign that account back in, or start a new chat.'
+			);
+			return;
+		}
 		const binding = {
 			connectionId: selection.connectionId,
 			conversationId: workspace.conversationId,
@@ -566,6 +643,7 @@ export async function runClaudeTurn(
 			backend: 'claude-code' as const,
 			...binding,
 			nativeSessionId: randomUUID(),
+			...( accountKey ? { accountKey } : {} ),
 		};
 		const emit = ( event: BackendTurnEvent ) => {
 			if ( event.type === 'turn.terminal' ) {
@@ -598,11 +676,13 @@ export async function runClaudeTurn(
 					? [ prepared.cwd, targetSite.path ]
 					: [ prepared.cwd ],
 			enabledTools: CLAUDE_ENABLED_TOOLS,
+			shellConfinement: CLAUDE_SHELL_CONFINEMENT,
 			signal: controller.signal,
 			approve: options.approve,
-			approvalTimeoutMs: 120000,
+			approvalTimeoutMs: CLAUDE_APPROVAL_TIMEOUT_MS,
 			ready: () => nativeInitAccepted,
-			stillConnected,
+			stillConnected: verifyConnection,
+			verifyAccount,
 			verifyTarget: ( expected ) => options.verifyTarget( snapshot, expected ),
 			onEvent: emit,
 		} );
@@ -649,31 +729,37 @@ export async function runClaudeTurn(
 				mcpServers: { studio: bridge.server },
 				// The hook and the permission request each apply the whole policy, so
 				// a native allow rule that skips one cannot skip the Studio guard.
-				canUseTool: async ( name, toolInput, { mcpServer, toolUseID } ) =>
-					( await policy.authorizeToolUse( {
-						toolName: name,
-						input: toolInput,
-						toolUseId: toolUseID,
-						mcpServer,
-					} ) )
+				canUseTool: async ( name, toolInput, { mcpServer, toolUseID, signal } ) =>
+					( await policy.authorizeToolUse(
+						{ toolName: name, input: toolInput, toolUseId: toolUseID, mcpServer },
+						signal
+					) )
 						? { behavior: 'allow', updatedInput: toolInput }
 						: { behavior: 'deny', message: 'Tool unavailable.' },
 				hooks: {
 					PreToolUse: [
 						{
 							onFailure: 'block',
+							// An approval waits inside this hook, so the hook outlasts it.
+							// If Claude Code still gives up on the hook, the hook's
+							// signal cancels the approval and the tool use is never
+							// asked about again.
+							timeout: CLAUDE_HOOK_TIMEOUT_SECONDS,
 							hooks: [
-								async ( hook ) => ( {
+								async ( hook, _toolUseId, context ) => ( {
 									hookSpecificOutput: {
 										hookEventName: 'PreToolUse',
 										permissionDecision:
 											hook.hook_event_name === 'PreToolUse' &&
-											( await policy.authorizeToolUse( {
-												toolName: hook.tool_name,
-												input: hook.tool_input,
-												toolUseId: hook.tool_use_id,
-												mcpServer: hook.mcp_server,
-											} ) )
+											( await policy.authorizeToolUse(
+												{
+													toolName: hook.tool_name,
+													input: hook.tool_input,
+													toolUseId: hook.tool_use_id,
+													mcpServer: hook.mcp_server,
+												},
+												context?.signal
+											) )
 												? 'allow'
 												: 'deny',
 									},
@@ -693,7 +779,10 @@ export async function runClaudeTurn(
 		);
 		if ( ! qualification.ok || controller.signal.aborted || ! ( await stillConnected() ) )
 			throw new Error();
+		if ( ! accountKey ) throw new Error();
 		if ( ! existing ) await store.create( session );
+		else if ( ! existing.accountKey )
+			await store.bindAccount( workspace.conversationId, accountKey );
 		if ( controller.signal.aborted || ! ( await stillConnected() ) ) throw new Error();
 		const submitted = { type: 'turn.prompt' as const, runId, turnId, text: input.prompt };
 		await journal.append( submitted );
@@ -702,6 +791,11 @@ export async function runClaudeTurn(
 		connectionWatch = setTimeout( () => void watchConnection(), 1000 ).unref();
 		openGate( true );
 		const adapter = createClaudeEventAdapter( runId, turnId, emit );
+		const inventory = claudeToolInventory(
+			CLAUDE_ENABLED_TOOLS,
+			CLAUDE_SHELL_CONFINEMENT,
+			prepared.cwd
+		);
 		for await ( const message of native ) {
 			if ( controller.signal.aborted ) break;
 			if (
@@ -715,7 +809,7 @@ export async function runClaudeTurn(
 					message.permissionMode !== 'default' ||
 					! isQualifiedClaudePlugins( message.plugins ) ||
 					message.plugin_errors?.length ||
-					message.tools.some( ( name ) => ! isEnabledClaudeTool( name ) ) ||
+					message.tools.some( ( name ) => ! inventory.includes( name ) ) ||
 					message.cwd !== prepared.cwd ||
 					message.apiKeySource !== 'none' ||
 					message.claude_code_version !== QUALIFIED_CLAUDE_CODE_VERSION ||
@@ -740,7 +834,7 @@ export async function runClaudeTurn(
 		}
 	} catch {
 		terminal ??=
-			input.signal.aborted || detached
+			input.signal.aborted || stopReason
 				? { type: 'turn.terminal', runId, turnId, outcome: { status: 'interrupted' } }
 				: fail();
 	} finally {
@@ -768,11 +862,14 @@ export async function runClaudeTurn(
 			runId,
 			turnId,
 			outcome: {
-				status: input.signal.aborted || detached ? 'interrupted' : 'unknown_process_exit',
+				status: input.signal.aborted || stopReason ? 'interrupted' : 'unknown_process_exit',
 			},
 		};
-		if ( detached && terminal.outcome.status === 'interrupted' ) {
-			terminal.outcome.message = 'Claude Code was detached during this turn.';
+		if ( stopReason && terminal.outcome.status === 'interrupted' ) {
+			terminal.outcome.message =
+				stopReason === 'account'
+					? 'The Claude account changed during this turn. Sign the original account back in, or start a new chat.'
+					: 'Claude Code was detached during this turn.';
 		}
 		if ( ! stopped ) failIfSuccessful();
 		try {

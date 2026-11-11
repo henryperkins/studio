@@ -388,7 +388,14 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 						return;
 					if ( event.event.type === 'approval.requested' ) {
 						const approval = event.event;
-						if ( run.seenClaudeApprovals.has( approval.requestId ) ) return;
+						// A request that does not name its operation can never be answered.
+						if (
+							! approval.operation ||
+							typeof approval.operation !== 'object' ||
+							typeof approval.operation.tool !== 'string' ||
+							run.seenClaudeApprovals.has( approval.requestId )
+						)
+							return;
 						run.seenClaudeApprovals.add( approval.requestId );
 						run.pendingClaudeApprovals.push( event.event );
 					}

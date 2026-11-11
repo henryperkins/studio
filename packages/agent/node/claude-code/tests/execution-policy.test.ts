@@ -9,13 +9,17 @@ import { studioToolDefinitions } from '../../tools';
 import { createAskUserQuestionTool } from '../../tools/ask-user-question';
 import { createPresentDesignOptionsTool } from '../../tools/present-design-options';
 import { createSkillTool } from '../../tools/skill';
+import { CLAUDE_EXECUTION_POLICY_REVISION } from '../execution-policy';
 import {
+	CLAUDE_APPROVAL_TIMEOUT_MS,
 	CLAUDE_ENABLED_TOOLS,
-	CLAUDE_EXECUTION_POLICY_REVISION,
+	CLAUDE_HOOK_TIMEOUT_SECONDS,
 	CLAUDE_NATIVE_TOOL_RULES,
+	CLAUDE_SHELL_CONFINEMENT,
 	CLAUDE_STUDIO_TOOL_RULES,
+	claudeNativeTools,
 	requiresClaudeApproval,
-} from '../execution-policy';
+} from '../execution-rules';
 import { createNativeSessionStore } from '../sessions';
 import { createPolicyFixture } from './fixtures/execution-policy';
 import type { ClaudeOperation } from '../execution-policy';
@@ -169,6 +173,7 @@ describe( 'Claude tool use at the SDK hook and native permission request', () =>
 	it( 'asks for a bounded approval of the exact shell command, whatever the command says', async () => {
 		const { policy, context, events } = await setup( () => ( {
 			enabledTools: { native: [ 'Read', 'Bash' ], studio: [] },
+			shellConfinement: { mode: 'approval-only' },
 		} ) );
 		const input = { command: 'echo hi', description: 'Say hi' };
 		expect( await policy.authorizeToolUse( { toolName: 'Bash', input, toolUseId: 'use-1' } ) ).toBe(
@@ -545,29 +550,6 @@ describe( 'Claude targets', () => {
 		expect( siteConversation.host.sites.create ).not.toHaveBeenCalled();
 	} );
 
-	it( 'lets a WordPress.com request reach only the live target', async () => {
-		const enabledTools = { native: [], studio: [ 'wpcom_request' ] };
-		const live = await setup( () => ( {
-			target: { environment: 'live', siteId: fakeSite.id, wpcomSiteId: 42 },
-			enabledTools,
-		} ) );
-		const call = ( policy: typeof live.policy, args: Record< string, unknown > ) =>
-			policy.authorizeStudioCall( 'wpcom_request', args, randomUUID() );
-		expect( await call( live.policy, { siteId: 42, method: 'GET', path: '/posts' } ) ).toBe( true );
-		expect( await call( live.policy, { siteId: 7, method: 'GET', path: '/posts' } ) ).toBe( false );
-		expect( live.context.approve ).not.toHaveBeenCalled();
-		expect( await call( live.policy, { siteId: 42, method: 'POST', path: '/posts' } ) ).toBe(
-			true
-		);
-		expect( live.context.approve ).toHaveBeenCalledOnce();
-		expect( await live.policy.authorizeStudioCall( 'wp_cli', {}, 'call' ) ).toBe( false );
-
-		const local = await setup( () => ( { enabledTools } ) );
-		expect( await call( local.policy, { siteId: 42, method: 'GET', path: '/posts' } ) ).toBe(
-			false
-		);
-	} );
-
 	it( 'reads in the target site of a global conversation as well as its own workspace', async () => {
 		const { policy, site, parent } = await setup( ( paths ) => ( {
 			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
@@ -582,5 +564,364 @@ describe( 'Claude targets', () => {
 		expect( await read( path.join( parent, 'workspace', 'notes.md' ) ) ).toBe( true );
 		expect( await read( path.join( site, 'readme.txt' ) ) ).toBe( true );
 		expect( await read( path.join( parent, 'elsewhere.txt' ) ) ).toBe( false );
+	} );
+} );
+
+describe( 'Claude Studio tools that act outside the host', () => {
+	const enabledTools = {
+		native: [],
+		studio: [
+			'scaffold_theme',
+			'validate_blocks',
+			'generate_images',
+			'site_info',
+			'take_screenshot',
+		],
+	};
+
+	it( 'names what each tool with a site or path argument reaches', () => {
+		for ( const definition of studioToolDefinitions ) {
+			const { properties } = definition.parameters as { properties: Record< string, unknown > };
+			if ( 'nameOrPath' in properties )
+				expect(
+					CLAUDE_STUDIO_TOOL_RULES.get( definition.name )?.site,
+					definition.name
+				).toBeDefined();
+		}
+		for ( const name of [ 'validate_blocks', 'generate_images', 'take_screenshot' ] )
+			expect( CLAUDE_STUDIO_TOOL_RULES.get( name )?.paths, name ).toBeDefined();
+	} );
+
+	it( 'binds them to the target site and names that site and path in the approval', async () => {
+		const { policy, host, context, site, other } = await setup( () => ( { enabledTools } ) );
+		const call = ( name: string, args: Record< string, unknown > ) =>
+			policy.authorizeStudioCall( { host, name, args, toolCallId: randomUUID() } );
+		expect( await call( 'scaffold_theme', { nameOrPath: 'site', name: 'Theme' } ) ).toBe( true );
+		expect( await call( 'scaffold_theme', { nameOrPath: 'other', name: 'Theme' } ) ).toBe( false );
+		expect( await call( 'scaffold_theme', { name: 'Theme' } ) ).toBe( false );
+		expect( await call( 'site_info', { nameOrPath: other } ) ).toBe( false );
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect(
+			await call( 'validate_blocks', { nameOrPath: 'site', filePath: 'templates/index.html' } )
+		).toBe( true );
+		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation ).toMatchObject( {
+			tool: 'validate_blocks',
+			siteId: fakeSite.id,
+			localPaths: [ path.join( site, 'templates', 'index.html' ) ],
+		} );
+		expect(
+			await call( 'validate_blocks', { nameOrPath: 'site', filePath: '../other/index.html' } )
+		).toBe( false );
+		const image = ( file: string ) => ( { images: [ { path: file, subject: 'Hero' } ] } );
+		expect( await call( 'generate_images', image( path.join( site, 'hero.png' ) ) ) ).toBe( true );
+		expect( await call( 'generate_images', image( path.join( other, 'hero.png' ) ) ) ).toBe(
+			false
+		);
+		expect( await call( 'generate_images', image( 'hero.png' ) ) ).toBe( false );
+		expect(
+			await call( 'take_screenshot', {
+				url: 'http://localhost:8888',
+				themeScreenshot: path.join( other, 'wp-content', 'themes', 'theme' ),
+			} )
+		).toBe( false );
+		expect( await call( 'take_screenshot', { url: 'http://localhost:8888' } ) ).toBe( true );
+		expect( context.approve ).toHaveBeenCalledTimes( 2 );
+	} );
+
+	it( 'binds them to no site in a global conversation', async () => {
+		const { policy, host, site } = await setup( ( paths ) => ( {
+			target: { environment: 'global' },
+			targetSite: undefined,
+			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
+			enabledTools,
+		} ) );
+		const call = ( name: string, args: Record< string, unknown > ) =>
+			policy.authorizeStudioCall( { host, name, args, toolCallId: randomUUID() } );
+		expect( await call( 'scaffold_theme', { nameOrPath: 'site', name: 'Theme' } ) ).toBe( false );
+		expect(
+			await call( 'generate_images', {
+				images: [ { path: path.join( site, 'a.png' ), subject: 'A' } ],
+			} )
+		).toBe( false );
+	} );
+
+	it( 'lets the host resolve only the target site', async () => {
+		const { policy, host, site, other } = await setup();
+		const guarded = policy.guardHost( host, 'call' );
+		await expect( guarded.sites.resolve( 'site' ) ).resolves.toMatchObject( { id: fakeSite.id } );
+		await expect( guarded.sites.resolve( 'other' ) ).rejects.toThrow();
+		await expect( guarded.sites.findByFolder( other ) ).rejects.toThrow();
+		await expect( guarded.sites.findByFolder( site ) ).resolves.toMatchObject( {
+			id: fakeSite.id,
+		} );
+		await expect(
+			guarded.sites.findByFolder( path.join( site, 'nowhere' ) )
+		).resolves.toBeUndefined();
+	} );
+} );
+
+describe( 'Claude WordPress.com requests', () => {
+	it( 'matches absolute site paths to a site and allows only listed account reads', () => {
+		const remote = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+		expect( remote( { siteId: 1, method: 'GET', path: '/posts' } ) ).toEqual( { wpcomSiteId: 1 } );
+		expect( remote( { siteId: 1, method: 'GET', path: '!/sites/99/posts' } ) ).toEqual( {
+			wpcomSiteId: 99,
+		} );
+		expect( remote( { siteId: 1, method: 'GET', path: '!/me' } ) ).toEqual( {} );
+		expect( remote( { siteId: 1, method: 'GET', path: '!/plans/features' } ) ).toEqual( {} );
+		for ( const args of [
+			{ method: 'POST', path: '!/me' },
+			{ method: 'GET', path: '!/me/settings' },
+			{ method: 'GET', path: '!/read/following' },
+			{ method: 'GET', path: '!/sites/example.wordpress.com/posts' },
+			{ method: 'GET', path: '!/sites/99/../100/posts' },
+			{ method: 'GET', path: '/../../sites/100/posts' },
+			{ method: 'GET', path: '/posts/%2e%2e/%2E%2E/sites/100' },
+			{ method: 'GET', path: '/posts?context=edit' },
+		] )
+			expect( remote( { siteId: 1, ...args } ), args.path ).toBeUndefined();
+	} );
+
+	it( 'lets a WordPress.com request reach only the live target', async () => {
+		const enabledTools = { native: [], studio: [ 'wpcom_request' ] };
+		const live = await setup( () => ( {
+			target: { environment: 'live', siteId: fakeSite.id, wpcomSiteId: 42 },
+			enabledTools,
+		} ) );
+		const call = ( fixture: typeof live, args: Record< string, unknown > ) =>
+			fixture.policy.authorizeStudioCall( {
+				host: fixture.host,
+				name: 'wpcom_request',
+				args,
+				toolCallId: randomUUID(),
+			} );
+		expect( await call( live, { siteId: 42, method: 'GET', path: '/posts' } ) ).toBe( true );
+		expect( await call( live, { siteId: 42, method: 'GET', path: '!/sites/42/posts' } ) ).toBe(
+			true
+		);
+		expect( await call( live, { siteId: 7, method: 'GET', path: '/posts' } ) ).toBe( false );
+		expect( await call( live, { siteId: 42, method: 'GET', path: '!/sites/7/posts' } ) ).toBe(
+			false
+		);
+		expect( live.context.approve ).not.toHaveBeenCalled();
+		expect( await call( live, { siteId: 42, method: 'POST', path: '/posts' } ) ).toBe( true );
+		expect( await call( live, { siteId: 42, method: 'DELETE', path: '!/sites/7/posts/1' } ) ).toBe(
+			false
+		);
+		expect( live.context.approve ).toHaveBeenCalledOnce();
+		expect(
+			await live.policy.authorizeStudioCall( {
+				host: live.host,
+				name: 'wp_cli',
+				args: {},
+				toolCallId: 'call',
+			} )
+		).toBe( false );
+
+		const local = await setup( () => ( { enabledTools } ) );
+		expect( await call( local, { siteId: 42, method: 'GET', path: '/posts' } ) ).toBe( false );
+		const global = await setup( ( paths ) => ( {
+			target: { environment: 'global' },
+			targetSite: undefined,
+			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
+			enabledTools,
+		} ) );
+		expect( await call( global, { siteId: 42, method: 'GET', path: '!/sites/42/posts' } ) ).toBe(
+			false
+		);
+		expect( await call( global, { siteId: 42, method: 'GET', path: '!/me' } ) ).toBe( true );
+	} );
+} );
+
+describe( 'Claude native search tools', () => {
+	it( 'keeps Glob and Grep patterns inside the target folders', async () => {
+		const { policy, site } = await setup( () => ( {
+			enabledTools: { native: [ 'Glob', 'Grep' ], studio: [] },
+		} ) );
+		const use = ( toolName: string, input: Record< string, unknown > ) =>
+			policy.authorizeToolUse( { toolName, input, toolUseId: randomUUID() } );
+		expect( await use( 'Glob', { pattern: '**/*.php' } ) ).toBe( true );
+		expect( await use( 'Glob', { pattern: '**/*.php', path: site } ) ).toBe( true );
+		expect( await use( 'Grep', { pattern: 'add_action', glob: '*.php' } ) ).toBe( true );
+		const outside: Array< [ string, Record< string, unknown > ] > = [
+			[ 'Glob', { pattern: '../**' } ],
+			[ 'Glob', { pattern: 'wp-content/../../**' } ],
+			[ 'Glob', { pattern: '{..,x}/**' } ],
+			[ 'Glob', { pattern: path.join( site, '**' ) } ],
+			[ 'Glob', { pattern: '/etc/**' } ],
+			[ 'Glob', { pattern: '~/**' } ],
+			[ 'Glob', { pattern: '**', path: '..' } ],
+			[ 'Grep', { pattern: 'x', glob: '../**' } ],
+			[ 'Grep', { pattern: 'x', glob: 'C:/**' } ],
+			[ 'Grep', { pattern: 'x', path: path.join( site, '..' ) } ],
+		];
+		for ( const [ toolName, input ] of outside )
+			expect( await use( toolName, input ), JSON.stringify( input ) ).toBe( false );
+	} );
+} );
+
+describe( 'Claude shell confinement', () => {
+	const shell = { native: [ 'Read', 'Bash' ], studio: [] };
+	const echo = ( toolUseId?: string ) => ( {
+		toolName: 'Bash',
+		input: { command: 'echo hi' },
+		toolUseId,
+	} );
+
+	it( 'keeps shell tools disabled unless the turn declares a confinement the policy can verify', async () => {
+		expect( CLAUDE_SHELL_CONFINEMENT ).toEqual( { mode: 'none' } );
+		const unconfined = await setup( () => ( { enabledTools: shell } ) );
+		const workspace = unconfined.site;
+		expect(
+			claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, workspace )
+		).toEqual( [ 'Read' ] );
+		expect( claudeNativeTools( shell, { mode: 'none' }, workspace ) ).toEqual( [ 'Read' ] );
+		expect( await unconfined.policy.authorizeToolUse( echo( 'use' ) ) ).toBe( false );
+		expect( unconfined.context.approve ).not.toHaveBeenCalled();
+		for ( const sandbox of [
+			undefined,
+			{ enabled: false },
+			{ enabled: true },
+			{ enabled: true, allowUnsandboxedCommands: false, failIfUnavailable: false },
+			{ enabled: true, allowUnsandboxedCommands: false, autoAllowBashIfSandboxed: true },
+			{ enabled: true, allowUnsandboxedCommands: false, filesystem: { disabled: true } },
+			{
+				enabled: true,
+				allowUnsandboxedCommands: false,
+				filesystem: { allowWrite: [ path.dirname( workspace ) ] },
+			},
+		] ) {
+			const declared = { mode: 'sandbox' as const, sandbox };
+			expect( claudeNativeTools( shell, declared, workspace ), JSON.stringify( sandbox ) ).toEqual(
+				[ 'Read' ]
+			);
+			const unconfigured = await setup( () => ( {
+				enabledTools: shell,
+				shellConfinement: declared,
+			} ) );
+			expect( await unconfigured.policy.authorizeToolUse( echo( 'use' ) ) ).toBe( false );
+			expect( unconfigured.context.approve ).not.toHaveBeenCalled();
+		}
+		const confined = await setup( ( paths ) => ( {
+			enabledTools: shell,
+			shellConfinement: {
+				mode: 'sandbox',
+				sandbox: {
+					enabled: true,
+					allowUnsandboxedCommands: false,
+					filesystem: { allowWrite: [ paths.site ] },
+				},
+			},
+		} ) );
+		expect( claudeNativeTools( shell, confined.context.shellConfinement, confined.site ) ).toEqual(
+			[ 'Read', 'Bash' ]
+		);
+		expect( await confined.policy.authorizeToolUse( echo( 'use' ) ) ).toBe( true );
+		expect( confined.context.approve ).toHaveBeenCalledOnce();
+	} );
+
+	it( 'in approval-only mode asks for every command, says it is unconfined, and never reuses an answer', async () => {
+		const { policy, context, events } = await setup( () => ( {
+			enabledTools: shell,
+			shellConfinement: { mode: 'approval-only' },
+		} ) );
+		expect( await policy.authorizeToolUse( echo( 'use-1' ) ) ).toBe( true );
+		expect( await policy.authorizeToolUse( echo( 'use-1' ) ) ).toBe( false );
+		expect( await policy.authorizeToolUse( echo( 'use-2' ) ) ).toBe( true );
+		expect( await policy.authorizeToolUse( echo() ) ).toBe( false );
+		expect( context.approve ).toHaveBeenCalledTimes( 2 );
+		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation.description ).toMatch(
+			/not confined to the workspace/
+		);
+		expect( events[ 0 ] ).toMatchObject( {
+			type: 'approval.requested',
+			description: expect.stringMatching( /not confined to the workspace/ ),
+		} );
+	} );
+} );
+
+describe( 'Claude approvals that outlive their caller', () => {
+	it( 'keeps every approval shorter than the hook that waits for it', () => {
+		expect( CLAUDE_HOOK_TIMEOUT_SECONDS * 1000 ).toBeGreaterThanOrEqual(
+			CLAUDE_APPROVAL_TIMEOUT_MS + 30_000
+		);
+	} );
+
+	it( 'denies when the hook is cancelled, and the permission request cannot ask again for that tool use', async () => {
+		let approvalSignal: AbortSignal | undefined;
+		const { policy, context, site } = await setup( () => ( {
+			enabledTools: { native: [ 'Read', 'Bash' ], studio: [] },
+			shellConfinement: { mode: 'approval-only' },
+			approvalTimeoutMs: 60_000,
+			approve: vi.fn( ( _request, signal: AbortSignal ) => {
+				approvalSignal = signal;
+				return new Promise< 'allow' >( () => {} );
+			} ),
+		} ) );
+		const hook = new AbortController();
+		const use = { toolName: 'Bash', input: { command: 'echo hi' }, toolUseId: 'use' };
+		const pending = policy.authorizeToolUse( use, hook.signal );
+		await vi.waitFor( () => expect( approvalSignal ).toBeDefined() );
+		hook.abort();
+		await expect( pending ).resolves.toBe( false );
+		expect( approvalSignal!.aborted ).toBe( true );
+		expect( await policy.authorizeToolUse( use, new AbortController().signal ) ).toBe( false );
+		expect( context.approve ).toHaveBeenCalledOnce();
+		expect( policy.signal.aborted ).toBe( false );
+		await writeFile( path.join( site, 'readme.txt' ), 'fixture' );
+		expect(
+			await policy.authorizeToolUse(
+				{
+					toolName: 'Read',
+					input: { file_path: path.join( site, 'readme.txt' ) },
+					toolUseId: 'read',
+				},
+				hook.signal
+			)
+		).toBe( false );
+	} );
+
+	it( 'cancels a Studio tool approval when its MCP call is cancelled', async () => {
+		let approvalSignal: AbortSignal | undefined;
+		const { policy, host, localSite } = await setup( () => ( {
+			approvalTimeoutMs: 60_000,
+			approve: vi.fn( ( _request, signal: AbortSignal ) => {
+				approvalSignal = signal;
+				return new Promise< 'allow' >( () => {} );
+			} ),
+		} ) );
+		const call = new AbortController();
+		const pending = policy
+			.guardHost( host, 'call', call.signal )
+			.sites.wpCli( localSite, draftArgs );
+		await vi.waitFor( () => expect( approvalSignal ).toBeDefined() );
+		call.abort();
+		await expect( pending ).rejects.toThrow();
+		expect( approvalSignal!.aborted ).toBe( true );
+		expect( host.sites.wpCli ).not.toHaveBeenCalled();
+		expect( policy.signal.aborted ).toBe( false );
+	} );
+} );
+
+describe( 'Claude account changes', () => {
+	it( 'asks for nothing and runs nothing once the native account changed', async () => {
+		const before = await setup();
+		vi.mocked( before.context.verifyAccount ).mockResolvedValue( false );
+		await expect(
+			before.policy.guardHost( before.host, 'call' ).sites.wpCli( before.localSite, draftArgs )
+		).rejects.toThrow();
+		expect( before.context.approve ).not.toHaveBeenCalled();
+		expect( before.policy.signal.aborted ).toBe( true );
+
+		const during = await setup();
+		vi.mocked( during.context.approve ).mockImplementationOnce( async () => {
+			vi.mocked( during.context.verifyAccount ).mockResolvedValue( false );
+			return 'allow';
+		} );
+		await expect(
+			during.policy.guardHost( during.host, 'call' ).sites.wpCli( during.localSite, draftArgs )
+		).rejects.toThrow();
+		expect( during.host.sites.wpCli ).not.toHaveBeenCalled();
+		expect( during.policy.signal.aborted ).toBe( true );
 	} );
 } );

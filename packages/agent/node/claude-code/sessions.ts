@@ -17,7 +17,7 @@ import { createInterface } from 'readline';
 import { writeFile as atomicWriteFile } from 'atomically';
 import { resolveClaudeResume } from '../backends/resume';
 import type { ClaudeTranscriptCandidate } from '../backends/resume';
-import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
+import type { BackendTurnEvent, ClaudeJournalEvent } from '@studio/agent/protocol/backend-events';
 import type {
 	ClaudeBackendSessionBinding,
 	ClaudeBackendSessionRef,
@@ -28,11 +28,35 @@ function key( conversationId: string ) {
 	return createHash( 'sha256' ).update( conversationId ).digest( 'hex' );
 }
 
-async function readJournalFile( file: string ): Promise< BackendTurnEvent[] > {
+// An approval journaled before requests named their operation is kept for
+// display only, under its own type, so it can never be taken for a live request.
+function readJournalEvent( line: string ): ClaudeJournalEvent {
+	const event = JSON.parse( line ) as BackendTurnEvent;
+	if ( event.type !== 'approval.requested' ) return event;
+	const operation: unknown = event.operation;
+	if (
+		operation &&
+		typeof operation === 'object' &&
+		typeof ( operation as { tool?: unknown } ).tool === 'string'
+	)
+		return event;
+	const { runId, turnId, toolCallId, requestId, description, draft } = event;
+	return {
+		type: 'approval.legacy',
+		runId,
+		turnId,
+		toolCallId,
+		requestId,
+		description: typeof description === 'string' ? description : '',
+		...( draft ? { draft } : {} ),
+	};
+}
+
+async function readJournalFile( file: string ): Promise< ClaudeJournalEvent[] > {
 	const lines = ( await readFile( file, 'utf8' ) ).split( '\n' );
 	// Every committed entry ends with a newline. A killed writer can leave a partial tail.
 	lines.pop();
-	return lines.filter( Boolean ).map( ( line ) => JSON.parse( line ) as BackendTurnEvent );
+	return lines.filter( Boolean ).map( readJournalEvent );
 }
 function validate( value: unknown ): ClaudeBackendSessionRef {
 	if ( ! value || typeof value !== 'object' ) throw new Error( 'Invalid native session' );
@@ -53,7 +77,10 @@ function validate( value: unknown ): ClaudeBackendSessionRef {
 		typeof record.configDirectory !== 'string' ||
 		! path.isAbsolute( record.configDirectory ) ||
 		( record.transcriptPath !== undefined &&
-			( typeof record.transcriptPath !== 'string' || ! path.isAbsolute( record.transcriptPath ) ) )
+			( typeof record.transcriptPath !== 'string' ||
+				! path.isAbsolute( record.transcriptPath ) ) ) ||
+		( record.accountKey !== undefined &&
+			( typeof record.accountKey !== 'string' || ! /^[0-9a-f]{64}$/.test( record.accountKey ) ) )
 	)
 		throw new Error( 'Invalid native session' );
 	return {
@@ -65,6 +92,7 @@ function validate( value: unknown ): ClaudeBackendSessionRef {
 		workingDirectory: record.workingDirectory,
 		configDirectory: record.configDirectory,
 		...( record.transcriptPath ? { transcriptPath: record.transcriptPath as string } : {} ),
+		...( record.accountKey ? { accountKey: record.accountKey as string } : {} ),
 	};
 }
 export function getClaudeSessionStoreRoot( sessionsRoot: string ): string {
@@ -172,7 +200,7 @@ export function createNativeSessionStore( root: string ) {
 			await removeSession();
 			await rm( marker, { force: true } );
 		},
-		async readJournals( conversationId: string ): Promise< BackendTurnEvent[][] > {
+		async readJournals( conversationId: string ): Promise< ClaudeJournalEvent[][] > {
 			const names = await orderedNames( conversationId );
 			const entries = await Promise.all(
 				names.map( async ( name ) => {
@@ -184,7 +212,7 @@ export function createNativeSessionStore( root: string ) {
 					}
 				} )
 			);
-			return entries.filter( ( entry ): entry is BackendTurnEvent[] => entry !== undefined );
+			return entries.filter( ( entry ): entry is ClaudeJournalEvent[] => entry !== undefined );
 		},
 		journal( conversationId: string, turnId: string ) {
 			const journalPath = path.join(
@@ -213,7 +241,7 @@ export function createNativeSessionStore( root: string ) {
 					} );
 					return pending;
 				},
-				async read(): Promise< BackendTurnEvent[] > {
+				async read(): Promise< ClaudeJournalEvent[] > {
 					await pending;
 					try {
 						return await readJournalFile( journalPath );
@@ -294,6 +322,18 @@ export function createNativeSessionStore( root: string ) {
 				flag: 'wx',
 				mode: 0o600,
 			} );
+		},
+		/**
+		 * Records the account a conversation that predates account binding runs on.
+		 * A conversation already bound to an account keeps it.
+		 */
+		async bindAccount( conversationId: string, accountKey: string ): Promise< void > {
+			const record = validate( JSON.parse( await readFile( filename( conversationId ), 'utf8' ) ) );
+			if ( record.conversationId !== conversationId ) throw new Error( 'Conversation mismatch' );
+			if ( record.accountKey === accountKey ) return;
+			if ( record.accountKey ) throw new Error( 'Conversation bound to another account' );
+			const bound = validate( { ...record, accountKey } );
+			await atomicWriteFile( filename( conversationId ), JSON.stringify( bound ), { mode: 0o600 } );
 		},
 		async load( conversationId: string ): Promise< ClaudeBackendSessionRef | undefined > {
 			try {

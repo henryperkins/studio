@@ -16,6 +16,7 @@ import {
 import { CLAUDE_EXECUTION_POLICY_REVISION } from '@studio/agent/node/claude-code/execution-policy';
 import {
 	getClaudeSessionStoreRoot,
+	getClaudeTurnConnectionRevision,
 	validateClaudeSendSelection,
 	verifyClaudeTurnSession,
 	verifyClaudeTurnTarget,
@@ -410,6 +411,7 @@ export async function runCommand( options: {
 		const turnId = options.initialTurnId ?? randomUUID();
 		const conversationId = options.resumeSession?.summary.id ?? resumedById!.getSessionId();
 		await validateClaudeSendSelection( getSessionsDirectory(), conversationId, selection );
+		const connectionRevision = await getClaudeTurnConnectionRevision( claude.binding.connectionId );
 		const approvals = createClaudeApprovalRouter( {
 			viaIpc: typeof process.send === 'function',
 			local: options.approveClaude,
@@ -435,7 +437,7 @@ export async function runCommand( options: {
 				permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 				selection: {
 					connectionId: claude.binding.connectionId,
-					revision: 0,
+					revision: connectionRevision,
 					model: { providerId: 'claude-code', modelId: selection.model },
 				},
 				workspace: { ...claude.binding, conversationId },
