@@ -13,7 +13,6 @@ import {
 } from 'cli/ai/chatgpt-acceptance-observer';
 import {
 	evalConnectionRef,
-	linkChatGptState,
 	readEvalProviderRequest,
 	resolveEvalProviderPlan,
 	summarizeExecutedRoute,
@@ -104,11 +103,22 @@ function legacyProviders( globalKey = API_KEY ) {
 	};
 }
 
+const profileUse = vi.hoisted( () => ( { used: [] as string[] } ) );
+
 function deps( overrides: Partial< EvalProviderDeps > = {} ): EvalProviderDeps {
 	return {
 		isChatGptEnabled: () => true,
-		listChatGptConnections: async () => broker.connections,
+		listChatGptConnections: async () => {
+			// Read from the dedicated profile, never before it is in use.
+			expect( profileUse.used ).toEqual( [ path.join( paths.root, 'dedicated' ) ] );
+			return broker.connections;
+		},
 		provider: legacyProviders().provider,
+		home: path.join( paths.root, 'home' ),
+		configDirectory: () => path.join( paths.root, 'config' ),
+		useChatGptProfile: ( directory ) => {
+			profileUse.used.push( directory );
+		},
 		...overrides,
 	};
 }
@@ -175,6 +185,9 @@ describe( 'eval provider selection', () => {
 	beforeEach( () => {
 		paths.root = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-eval-provider-' ) );
 		fs.mkdirSync( path.join( paths.root, 'config' ), { recursive: true } );
+		fs.mkdirSync( path.join( paths.root, 'dedicated' ), { recursive: true } );
+		fs.mkdirSync( path.join( paths.root, 'home', '.studio' ), { recursive: true } );
+		profileUse.used = [];
 		broker.connections = [ connection() ];
 		broker.begun = [];
 		seen = [];
@@ -213,16 +226,18 @@ describe( 'eval provider selection', () => {
 					env: {
 						STUDIO_EVAL_PROVIDER: 'chatgpt-oauth',
 						STUDIO_EVAL_CONNECTION: CONNECTION_ID,
+						STUDIO_EVAL_CHATGPT_PROFILE: '/profiles/eval',
 						STUDIO_EVAL_EFFORT: 'low',
 						STUDIO_EVAL_MODEL: 'gpt-6-luna',
 					},
-					vars: {},
+					vars: { chatGptProfile: '/somewhere/else' },
 				} )
 			).toEqual( {
 				ok: true,
 				request: {
 					provider: 'chatgpt-oauth',
 					connectionId: CONNECTION_ID,
+					chatGptProfile: '/profiles/eval',
 					model: 'gpt-6-luna',
 					effort: 'low',
 				},
@@ -248,6 +263,7 @@ describe( 'eval provider selection', () => {
 			[ 'provider-required', {}, { requireProvider: true } ],
 			[ 'selection-without-provider', { STUDIO_EVAL_CONNECTION: CONNECTION_ID }, {} ],
 			[ 'selection-without-provider', { STUDIO_EVAL_EFFORT: 'low' }, {} ],
+			[ 'selection-without-provider', { STUDIO_EVAL_CHATGPT_PROFILE: '/profiles/eval' }, {} ],
 		] )( 'refuses %s', ( code, env, vars ) => {
 			const result = readEvalProviderRequest( { env, vars } );
 			expect( result ).toMatchObject( { ok: false, failure: { code } } );
@@ -284,7 +300,7 @@ describe( 'eval provider selection', () => {
 		it( 'never resolves or falls back to the global API-key provider', async () => {
 			const legacy = legacyProviders();
 			const resolved = await resolveEvalProviderPlan(
-				row.request,
+				{ ...row.request, chatGptProfile: path.join( paths.root, 'dedicated' ) },
 				deps( { provider: legacy.provider } )
 			);
 			expect( legacy.resolveEnv ).not.toHaveBeenCalled();
@@ -382,6 +398,11 @@ describe( 'eval provider selection', () => {
 			model: 'gpt-6-luna',
 			...overrides,
 		} );
+		// The rows are listed before any test makes its folders.
+		const withProfile = ( request: EvalProviderRequest ): EvalProviderRequest =>
+			request.provider === 'chatgpt-oauth'
+				? { chatGptProfile: path.join( paths.root, 'dedicated' ), ...request }
+				: request;
 
 		it.each( [
 			[ 'experimental-flag-off', chatGpt(), { isChatGptEnabled: () => false } ],
@@ -429,10 +450,15 @@ describe( 'eval provider selection', () => {
 				{ provider: 'openai-api-key', model: 'claude-sonnet-5' } as EvalProviderRequest,
 				{},
 			],
+			[
+				'profile-not-applicable',
+				{ provider: 'openai-api-key', chatGptProfile: '/profiles/eval' } as EvalProviderRequest,
+				{},
+			],
 		] as Array< [ string, EvalProviderRequest, Partial< EvalProviderDeps > ] > )(
 			'refuses %s before any model request',
 			async ( code, request, overrides ) => {
-				const result = await resolveEvalProviderPlan( request, deps( overrides ) );
+				const result = await resolveEvalProviderPlan( withProfile( request ), deps( overrides ) );
 				expect( result ).toMatchObject( { ok: false, failure: { code } } );
 				expect( result.ok === false && result.failure.message ).toMatch( /\w/ );
 				expect( fetchSpy ).not.toHaveBeenCalled();
@@ -593,43 +619,87 @@ describe( 'eval provider selection', () => {
 		} );
 	} );
 
-	describe( 'linking a ChatGPT sign-in into an isolated case profile', () => {
-		it( 'reads and refreshes through the source profile, and removes only its links afterwards', () => {
-			const source = path.join( paths.root, 'source' );
-			const caseDir = path.join( paths.root, 'case' );
-			fs.mkdirSync( path.join( source, 'chatgpt-credentials' ), { recursive: true } );
-			fs.mkdirSync( caseDir );
-			fs.writeFileSync( path.join( source, 'chatgpt-accounts.json' ), '{"version":1}' );
-			fs.writeFileSync( path.join( source, 'chatgpt-credentials', 'record.vault' ), 'sealed' );
-
-			const unlink = linkChatGptState( source, caseDir );
-			expect( fs.readFileSync( path.join( caseDir, 'chatgpt-accounts.json' ), 'utf8' ) ).toBe(
-				'{"version":1}'
+	describe( 'the dedicated ChatGPT test profile', () => {
+		const chatGpt = ( chatGptProfile?: string ): EvalProviderRequest => ( {
+			provider: 'chatgpt-oauth',
+			connectionId: CONNECTION_ID,
+			model: 'gpt-6-luna',
+			...( chatGptProfile === undefined ? {} : { chatGptProfile } ),
+		} );
+		const refused = async (
+			request: EvalProviderRequest,
+			code: string,
+			overrides: Partial< EvalProviderDeps > = {}
+		) => {
+			const listed = vi.fn( async () => broker.connections );
+			const result = await resolveEvalProviderPlan(
+				request,
+				deps( { listChatGptConnections: listed, ...overrides } )
 			);
-			// A refresh written in the case profile lands in the source's records.
-			fs.writeFileSync( path.join( caseDir, 'chatgpt-credentials', 'record.vault' ), 'rotated' );
-			expect(
-				fs.readFileSync( path.join( source, 'chatgpt-credentials', 'record.vault' ), 'utf8' )
-			).toBe( 'rotated' );
+			expect( result ).toMatchObject( { ok: false, failure: { code } } );
+			expect( result.ok === false && result.failure.message ).toMatch( /\w/ );
+			// Refused before any ChatGPT state was read or pointed anywhere.
+			expect( listed ).not.toHaveBeenCalled();
+			expect( profileUse.used ).toEqual( [] );
+			expect( fetchSpy ).not.toHaveBeenCalled();
+		};
 
-			unlink();
-			expect( fs.existsSync( path.join( caseDir, 'chatgpt-credentials' ) ) ).toBe( false );
-			expect( fs.existsSync( path.join( caseDir, 'chatgpt-accounts.json' ) ) ).toBe( false );
-			expect( fs.readdirSync( path.join( source, 'chatgpt-credentials' ) ) ).toEqual( [
-				'record.vault',
-			] );
-			expect( fs.readFileSync( path.join( source, 'chatgpt-accounts.json' ), 'utf8' ) ).toBe(
-				'{"version":1}'
-			);
+		it( 'is required, as an absolute path to a directory that exists', async () => {
+			await refused( chatGpt(), 'profile-required' );
+			await refused( chatGpt( 'relative/profile' ), 'profile-relative' );
+			await refused( chatGpt( path.join( paths.root, 'missing' ) ), 'profile-not-found' );
+			const file = path.join( paths.root, 'a-file' );
+			fs.writeFileSync( file, '' );
+			await refused( chatGpt( file ), 'profile-not-found' );
 		} );
 
-		it( 'links nothing when the source profile has no ChatGPT sign-in', () => {
-			const source = path.join( paths.root, 'empty-source' );
-			const caseDir = path.join( paths.root, 'empty-case' );
-			fs.mkdirSync( source );
-			fs.mkdirSync( caseDir );
-			linkChatGptState( source, caseDir )();
-			expect( fs.readdirSync( caseDir ) ).toEqual( [] );
+		it( 'is never the Studio profile, inside it, or a link that resolves into it', async () => {
+			const studio = path.join( paths.root, 'home', '.studio' );
+			await refused( chatGpt( studio ), 'profile-in-studio-profile' );
+			fs.mkdirSync( path.join( studio, 'eval' ) );
+			await refused( chatGpt( path.join( studio, 'eval' ) ), 'profile-in-studio-profile' );
+			const link = path.join( paths.root, 'looks-dedicated' );
+			fs.symlinkSync( studio, link, process.platform === 'win32' ? 'junction' : 'dir' );
+			try {
+				await refused( chatGpt( link ), 'profile-in-studio-profile' );
+			} finally {
+				fs.unlinkSync( link );
+			}
+		} );
+
+		it( 'is never the directory this process keeps its own Studio config in', async () => {
+			const dedicated = path.join( paths.root, 'dedicated' );
+			await refused( chatGpt( dedicated ), 'profile-is-config-directory', {
+				configDirectory: () => dedicated,
+			} );
+			await refused( chatGpt( dedicated ), 'profile-is-config-directory', {
+				configDirectory: () => path.join( dedicated, 'nested' ),
+			} );
+		} );
+
+		it( 'is put in use for this process before its connections are read, and must hold the selected one', async () => {
+			const dedicated = path.join( paths.root, 'dedicated' );
+			expect( ( await resolveEvalProviderPlan( chatGpt( dedicated ), deps() ) ).ok ).toBe( true );
+			expect( profileUse.used ).toEqual( [ dedicated ] );
+
+			profileUse.used = [];
+			expect(
+				await resolveEvalProviderPlan(
+					chatGpt( dedicated ),
+					deps( {
+						useChatGptProfile: () => {
+							throw new Error( 'in use' );
+						},
+					} )
+				)
+			).toMatchObject( { ok: false, failure: { code: 'profile-unavailable' } } );
+
+			profileUse.used = [];
+			broker.connections = [];
+			expect( await resolveEvalProviderPlan( chatGpt( dedicated ), deps() ) ).toMatchObject( {
+				ok: false,
+				failure: { code: 'connection-unknown' },
+			} );
 		} );
 	} );
 } );

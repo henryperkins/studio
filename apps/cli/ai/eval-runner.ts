@@ -12,7 +12,10 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	rmdirSync,
+	rmSync,
 	symlinkSync,
+	unlinkSync,
 	writeFileSync,
 	writeSync as fsWriteSync,
 } from 'node:fs';
@@ -32,6 +35,7 @@ import {
 	setChatGptTokenClient,
 } from '@studio/agent/node/chatgpt/credential-broker';
 import { isChatGptEnabled } from '@studio/agent/node/chatgpt/settings';
+import { setChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
 import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { writeGlobalInstructions } from '@studio/agent/node/global-instructions';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
@@ -64,7 +68,6 @@ import {
 import { parseEvalRunnerVars, type EvalRunnerVars, type EvalSeed } from 'cli/ai/eval-input';
 import { captureTurnOutcome, fingerprintSites, type TurnOutcome } from 'cli/ai/eval-outcome';
 import {
-	linkChatGptState,
 	readEvalProviderRequest,
 	resolveEvalProviderPlan,
 	summarizeExecutedRoute,
@@ -132,7 +135,7 @@ const REGISTRY_PREFIX = 'studio-eval-registry-';
 // other Studio sessions on this machine create never enter the turn, and
 // concurrent cases do not see each other's sites. Ports already given to the
 // user's sites and to other eval registries stay reserved.
-async function isolateSiteRegistry() {
+async function isolateSiteRegistry(): Promise< string > {
 	const ports = ( await readCliConfig() ).sites.map( ( site ) => site.port );
 	for ( const entry of readdirSync( os.tmpdir() ) ) {
 		if ( ! entry.startsWith( REGISTRY_PREFIX ) ) continue;
@@ -150,6 +153,7 @@ async function isolateSiteRegistry() {
 	}
 	process.env.E2E = '1';
 	process.env.E2E_CLI_CONFIG_PATH = mkdtempSync( path.join( os.tmpdir(), REGISTRY_PREFIX ) );
+	return process.env.E2E_CLI_CONFIG_PATH;
 }
 
 // What Studio downloads once per machine, which every eval reads as the user's
@@ -160,10 +164,7 @@ const STUDIO_DOWNLOADS = [ 'server-files', 'php-bin', 'import-runtime', 'mu-plug
 // user, so what a case seeds (global instructions, WordPress.com connections)
 // and what its turn changes stay in the case: concurrent cases and the user's
 // own Studio never see them.
-function isolateStudioConfig( { withoutWpcomLogin = false } = {} ): {
-	userDir: string;
-	dir: string;
-} {
+function isolateStudioConfig( { withoutWpcomLogin = false } = {} ): string {
 	const userDir = getConfigDirectory();
 	const shared = JSON.parse( readFileSync( getSharedConfigPath(), 'utf8' ) ) as Record<
 		string,
@@ -183,7 +184,38 @@ function isolateStudioConfig( { withoutWpcomLogin = false } = {} ): {
 		JSON.stringify( { version, authToken, aiProvider } )
 	);
 	process.env.E2E_SHARED_CONFIG_PATH = dir;
-	return { userDir, dir };
+	return dir;
+}
+
+// A case's own folder, removed with the case. Its links to Studio's downloads
+// are removed as links first, so nothing they point to is ever touched.
+function removeCaseFolder( dir: string ): void {
+	try {
+		for ( const entry of readdirSync( dir, { withFileTypes: true } ) ) {
+			if ( entry.isSymbolicLink() ) {
+				unlinkSync( path.join( dir, entry.name ) );
+			}
+		}
+		rmSync( dir, { recursive: true, force: true, maxRetries: 5 } );
+	} catch {
+		// Already gone, or held open: a temporary folder the system clears.
+	}
+}
+
+// The environment a case points at its own folders, as it was before the case.
+const CASE_ENVIRONMENT = [ 'E2E', 'E2E_CLI_CONFIG_PATH', 'E2E_SHARED_CONFIG_PATH' ] as const;
+
+function saveCaseEnvironment(): () => void {
+	const saved = CASE_ENVIRONMENT.map( ( name ) => [ name, process.env[ name ] ] as const );
+	return () => {
+		for ( const [ name, value ] of saved ) {
+			if ( value === undefined ) {
+				delete process.env[ name ];
+			} else {
+				process.env[ name ] = value;
+			}
+		}
+	};
 }
 
 // Stopped sites the request is not about, as a user with a few sites has, so
@@ -508,6 +540,11 @@ const liveProviderDeps: EvalProviderDeps = {
 	isChatGptEnabled,
 	listChatGptConnections,
 	provider: ( id ) => getAiProviderDefinition( id ),
+	get home() {
+		return os.homedir();
+	},
+	configDirectory: getConfigDirectory,
+	useChatGptProfile: setChatGptStateDirectory,
 };
 
 interface EvalRefusal {
@@ -743,296 +780,316 @@ export async function runEval( input: EvalRunnerInput ) {
 	// token cost of prompt variants, not just their outcomes.
 	const usage = createTokenUsage();
 
-	await isolateSiteRegistry();
-	const config = isolateStudioConfig( { withoutWpcomLogin: input.imageService === 'off' } );
-	// As the runtime decides it: whether this run offers generate_images.
-	const imageServiceConfigured = input.imageService
-		? await isImageGenerationAvailable()
-		: undefined;
-	if ( input.imageService === 'off' && imageServiceConfigured ) {
-		return providerRefusal( {
-			code: 'image-service-still-configured',
-			message:
-				'This case needs Studio’s image service off, but it is still configured (a DEV_CONFIG_DIR profile with a WordPress.com login, say).',
-		} );
-	}
-	if ( input.imageService === 'required' && ! imageServiceConfigured ) {
-		return providerRefusal( {
-			code: 'image-service-not-configured',
-			message:
-				'This case needs Studio’s separate WordPress.com image service: log in to WordPress.com or set STUDIO_IMAGE_API_TOKEN.',
-		} );
-	}
-	// A selected ChatGPT connection is the source profile's sign-in, reached from the case's profile.
-	const unlinkChatGpt =
-		plan?.requested.kind === 'chatgpt-oauth'
-			? linkChatGptState( config.userDir, config.dir )
-			: null;
-	// What the run's model requests really were, read back into `providerRoute.executed`.
-	const observerFile = plan
-		? path.join( os.tmpdir(), `studio-eval-requests-${ Date.now() }-${ process.pid }.ndjson` )
-		: null;
-	const uninstallObserver = observerFile ? installAcceptanceObserver( observerFile ) : null;
-	const replies: Array< { provider?: unknown; model?: unknown } > = [];
-
-	let bystanderPaths: string[];
+	const restoreCaseEnvironment = saveCaseEnvironment();
+	const caseFolders: string[] = [];
+	let observerFile: string | null = null;
+	let uninstallObserver: ( () => void ) | null = null;
+	let bystanderPaths: string[] = [];
 	let seeded: SeededFixtures | null = null;
-	let inspections: Inspection[] = [];
-	let outcome: TurnOutcome | { error: string } | null = null;
-	const prompt = `${ input.prompt.trim() }${ attachments?.promptBlock ?? '' }`;
+	let sitesDeleted = false;
 	try {
+		caseFolders.push( await isolateSiteRegistry() );
+		caseFolders.push( isolateStudioConfig( { withoutWpcomLogin: input.imageService === 'off' } ) );
+		// As the runtime decides it: whether this run offers generate_images.
+		const imageServiceConfigured = input.imageService
+			? await isImageGenerationAvailable()
+			: undefined;
+		if ( input.imageService === 'off' && imageServiceConfigured ) {
+			return providerRefusal( {
+				code: 'image-service-still-configured',
+				message:
+					'This case needs Studio’s image service off, but it is still configured (a DEV_CONFIG_DIR profile with a WordPress.com login, say).',
+			} );
+		}
+		if ( input.imageService === 'required' && ! imageServiceConfigured ) {
+			return providerRefusal( {
+				code: 'image-service-not-configured',
+				message:
+					'This case needs Studio’s separate WordPress.com image service: log in to WordPress.com or set STUDIO_IMAGE_API_TOKEN.',
+			} );
+		}
+		// What the run's model requests really were, read back into `providerRoute.executed`.
+		observerFile = plan
+			? path.join( os.tmpdir(), `studio-eval-requests-${ Date.now() }-${ process.pid }.ndjson` )
+			: null;
+		uninstallObserver = observerFile ? installAcceptanceObserver( observerFile ) : null;
+		const replies: Array< { provider?: unknown; model?: unknown } > = [];
+
+		let inspections: Inspection[] = [];
+		let outcome: TurnOutcome | { error: string } | null = null;
+		const prompt = `${ input.prompt.trim() }${ attachments?.promptBlock ?? '' }`;
 		bystanderPaths = await createBystanderSites();
 		if ( seed ) {
 			seeded = await seedFixtures( seed );
 		}
-	} catch ( setupError ) {
-		uninstallObserver?.();
-		unlinkChatGpt?.();
-		throw setupError;
-	}
 
-	phaseStartedAt = Date.now();
-	// Every run keeps its session JSONL (the full transcript) and reports its
-	// path as `sessionFile`; STUDIO_EVAL_SESSION_DIR picks the directory.
-	const sessionDir =
-		process.env.STUDIO_EVAL_SESSION_DIR?.trim() || path.join( os.tmpdir(), 'studio-eval-sessions' );
-	mkdirSync( sessionDir, { recursive: true } );
-	let session = SessionManager.create( STUDIO_SITES_ROOT, sessionDir );
-	if ( plan && seed?.history?.length ) {
-		for ( const message of evalHistoryMessages( seed.history, plan.reply ) ) {
-			session.appendMessage( message );
-		}
-	}
-	// Where each user message's turn starts in the run's records.
-	const turns: Array< {
-		reopened: boolean;
-		startedAtMs: number;
-		toolCallsStart: number;
-		textSegmentsStart: number;
-		questionsStart: number;
-	} > = [];
-	const queryStartedAt = Date.now();
-	let turnStart = queryStartedAt;
-
-	const handleEvent = ( event: AgentSessionEvent ): void => {
-		if ( event.type === 'message_end' && event.message.role === 'assistant' ) {
-			replies.push( { provider: event.message.provider, model: event.message.model } );
-			const messageUsage = addAssistantMessageUsage( usage, event );
-			const now = Date.now();
-			// pi stamps the assistant message just before it sends the request.
-			const requestStartedAt = event.message.timestamp || turnStart;
-			requests.push( {
-				startedAtMs: requestStartedAt - evalStartedAt,
-				endedAtMs: now - evalStartedAt,
-				durationMs: now - requestStartedAt,
-				contextTokens: messageUsage
-					? messageUsage.input + messageUsage.cacheRead + messageUsage.cacheWrite
-					: 0,
-				outputTokens: messageUsage?.output ?? 0,
-				stopReason: event.message.stopReason,
-				...( event.message.errorMessage ? { errorMessage: event.message.errorMessage } : {} ),
-				hasText: event.message.content.some(
-					( block ) => block.type === 'text' && block.text.trim() !== ''
-				),
-				toolCalls: event.message.content.filter( ( block ) => block.type === 'toolCall' ).length,
-			} );
-			turnDurationsMs.push( now - turnStart );
-			turnIndex += 1;
-			if ( turnIndex === 1 ) {
-				phaseTimingsMs.first_assistant_message_ms = now - queryStartedAt;
+		phaseStartedAt = Date.now();
+		// Every run keeps its session JSONL (the full transcript) and reports its
+		// path as `sessionFile`; STUDIO_EVAL_SESSION_DIR picks the directory.
+		const sessionDir =
+			process.env.STUDIO_EVAL_SESSION_DIR?.trim() ||
+			path.join( os.tmpdir(), 'studio-eval-sessions' );
+		mkdirSync( sessionDir, { recursive: true } );
+		let session = SessionManager.create( STUDIO_SITES_ROOT, sessionDir );
+		if ( plan && seed?.history?.length ) {
+			for ( const message of evalHistoryMessages( seed.history, plan.reply ) ) {
+				session.appendMessage( message );
 			}
-			turnStart = now;
 		}
-		for ( const tc of extractToolCalls( event ) ) {
-			if ( input.stopAt && ! stoppedAt && matchesStopRule( tc, input.stopAt ) ) {
-				stoppedAt = { toolUseId: tc.id, toolName: tc.name, index: toolCalls.length };
-				void query.interrupt();
-			}
-			toolCalls.push( tc );
-			toolNameById.set( tc.id, tc.name );
-			const evt: ToolEvent = {
-				toolUseId: tc.id,
-				toolName: tc.name,
-				input: tc.input,
-				startedAtMs: elapsed(),
-				turnIndex,
-			};
-			toolEvents.push( evt );
-			toolEventById.set( tc.id, evt );
-		}
-		textSegments.push( ...extractTextSegments( event ) );
+		// Where each user message's turn starts in the run's records.
+		const turns: Array< {
+			reopened: boolean;
+			startedAtMs: number;
+			toolCallsStart: number;
+			textSegmentsStart: number;
+			questionsStart: number;
+		} > = [];
+		const queryStartedAt = Date.now();
+		let turnStart = queryStartedAt;
 
-		if ( event.type === 'tool_execution_end' ) {
-			const tr = extractToolResult( event );
-			if ( tr ) {
-				const id = tr.toolUseId;
-				const evt = toolEventById.get( id );
-				if ( evt ) {
-					evt.endedAtMs = elapsed();
-					evt.durationMs = evt.endedAtMs - evt.startedAtMs;
-					evt.isError = tr.isError;
-					evt.outputChars = tr.text?.length ?? 0;
+		const handleEvent = ( event: AgentSessionEvent ): void => {
+			if ( event.type === 'message_end' && event.message.role === 'assistant' ) {
+				replies.push( { provider: event.message.provider, model: event.message.model } );
+				const messageUsage = addAssistantMessageUsage( usage, event );
+				const now = Date.now();
+				// pi stamps the assistant message just before it sends the request.
+				const requestStartedAt = event.message.timestamp || turnStart;
+				requests.push( {
+					startedAtMs: requestStartedAt - evalStartedAt,
+					endedAtMs: now - evalStartedAt,
+					durationMs: now - requestStartedAt,
+					contextTokens: messageUsage
+						? messageUsage.input + messageUsage.cacheRead + messageUsage.cacheWrite
+						: 0,
+					outputTokens: messageUsage?.output ?? 0,
+					stopReason: event.message.stopReason,
+					...( event.message.errorMessage ? { errorMessage: event.message.errorMessage } : {} ),
+					hasText: event.message.content.some(
+						( block ) => block.type === 'text' && block.text.trim() !== ''
+					),
+					toolCalls: event.message.content.filter( ( block ) => block.type === 'toolCall' ).length,
+				} );
+				turnDurationsMs.push( now - turnStart );
+				turnIndex += 1;
+				if ( turnIndex === 1 ) {
+					phaseTimingsMs.first_assistant_message_ms = now - queryStartedAt;
 				}
-				if ( tr.isError && ! firstToolError ) {
-					firstToolError = {
+				turnStart = now;
+			}
+			for ( const tc of extractToolCalls( event ) ) {
+				if ( input.stopAt && ! stoppedAt && matchesStopRule( tc, input.stopAt ) ) {
+					stoppedAt = { toolUseId: tc.id, toolName: tc.name, index: toolCalls.length };
+					void query.interrupt();
+				}
+				toolCalls.push( tc );
+				toolNameById.set( tc.id, tc.name );
+				const evt: ToolEvent = {
+					toolUseId: tc.id,
+					toolName: tc.name,
+					input: tc.input,
+					startedAtMs: elapsed(),
+					turnIndex,
+				};
+				toolEvents.push( evt );
+				toolEventById.set( tc.id, evt );
+			}
+			textSegments.push( ...extractTextSegments( event ) );
+
+			if ( event.type === 'tool_execution_end' ) {
+				const tr = extractToolResult( event );
+				if ( tr ) {
+					const id = tr.toolUseId;
+					const evt = toolEventById.get( id );
+					if ( evt ) {
+						evt.endedAtMs = elapsed();
+						evt.durationMs = evt.endedAtMs - evt.startedAtMs;
+						evt.isError = tr.isError;
+						evt.outputChars = tr.text?.length ?? 0;
+					}
+					if ( tr.isError && ! firstToolError ) {
+						firstToolError = {
+							toolUseId: id,
+							toolName: toolNameById.get( id ) ?? null,
+							...( evt?.input ? { input: evt.input } : {} ),
+							error: tr.text ?? 'Tool returned an error result.',
+							turnIndex,
+						};
+					}
+					toolResults.push( {
 						toolUseId: id,
 						toolName: toolNameById.get( id ) ?? null,
-						...( evt?.input ? { input: evt.input } : {} ),
-						error: tr.text ?? 'Tool returned an error result.',
-						turnIndex,
-					};
+						isError: tr.isError,
+						...( tr.text ? { text: tr.text } : {} ),
+						...( tr.images ? { images: tr.images } : {} ),
+						...( tr.details !== undefined ? { details: tr.details } : {} ),
+					} );
 				}
-				toolResults.push( {
-					toolUseId: id,
-					toolName: toolNameById.get( id ) ?? null,
-					isError: tr.isError,
-					...( tr.text ? { text: tr.text } : {} ),
-					...( tr.images ? { images: tr.images } : {} ),
-					...( tr.details !== undefined ? { details: tr.details } : {} ),
-				} );
 			}
-		}
 
-		if ( event.type === 'turn_end' ) {
-			numTurns += 1;
-		}
-
-		if ( event.type === 'agent_end' ) {
-			const lastAssistant = findLastAssistant( event.messages );
-			success =
-				! lastAssistant ||
-				( lastAssistant.stopReason !== 'error' && lastAssistant.stopReason !== 'aborted' );
-			numTurnsResult = numTurns;
-			stopReason = lastAssistant?.stopReason ?? null;
-			errorMessage = lastAssistant?.errorMessage ?? null;
-		}
-	};
-
-	const runTurn = (
-		turnPrompt: string,
-		{ images, reopen = false }: { images?: StudioChatImage[]; reopen?: boolean } = {}
-	) => {
-		const sessionFile = session.getSessionFile();
-		if ( reopen && sessionFile ) {
-			// As a resumed chat: the conversation read back from its file, in a fresh agent.
-			session = SessionManager.open( sessionFile, sessionDir );
-			agent = createAgent( { host } );
-		}
-		turns.push( {
-			reopened: reopen,
-			startedAtMs: elapsed(),
-			toolCallsStart: toolCalls.length,
-			textSegmentsStart: textSegments.length,
-			questionsStart: questions.length,
-		} );
-		// As the CLI does before each turn: the conversation names the connection it runs on.
-		if ( plan?.sessionContext ) {
-			session.appendCustomEntry( 'studio.session_context', plan.sessionContext );
-		}
-		return agent.runTurn( {
-			prompt: turnPrompt,
-			...( images?.length ? { images } : {} ),
-			env,
-			session,
-			activeSite: seeded?.activeSite,
-			onEvent: handleEvent,
-			onAskUser,
-			...( plan ? plan.turn : input.model ? { model: input.model } : {} ),
-		} );
-	};
-	const sitesBeforeTurn = await fingerprintSites();
-	let query = runTurn( prompt, { images: attachments?.images } );
-	phaseTimingsMs.start_ai_agent_ms = Date.now() - phaseStartedAt;
-
-	const timeout = setTimeout( () => {
-		timedOut = true;
-		void query.interrupt();
-	}, input.timeoutMs ?? 300000 );
-
-	try {
-		await query.result;
-		for ( const followUp of input.followUps ?? [] ) {
-			if ( timedOut || ( stoppedAt && ! input.resumeAfterStop ) ) {
-				break;
+			if ( event.type === 'turn_end' ) {
+				numTurns += 1;
 			}
-			query = runTurn( followUp.prompt, { reopen: followUp.reopen } );
+
+			if ( event.type === 'agent_end' ) {
+				const lastAssistant = findLastAssistant( event.messages );
+				success =
+					! lastAssistant ||
+					( lastAssistant.stopReason !== 'error' && lastAssistant.stopReason !== 'aborted' );
+				numTurnsResult = numTurns;
+				stopReason = lastAssistant?.stopReason ?? null;
+				errorMessage = lastAssistant?.errorMessage ?? null;
+			}
+		};
+
+		const runTurn = (
+			turnPrompt: string,
+			{ images, reopen = false }: { images?: StudioChatImage[]; reopen?: boolean } = {}
+		) => {
+			const sessionFile = session.getSessionFile();
+			if ( reopen && sessionFile ) {
+				// As a resumed chat: the conversation read back from its file, in a fresh agent.
+				session = SessionManager.open( sessionFile, sessionDir );
+				agent = createAgent( { host } );
+			}
+			turns.push( {
+				reopened: reopen,
+				startedAtMs: elapsed(),
+				toolCallsStart: toolCalls.length,
+				textSegmentsStart: textSegments.length,
+				questionsStart: questions.length,
+			} );
+			// As the CLI does before each turn: the conversation names the connection it runs on.
+			if ( plan?.sessionContext ) {
+				session.appendCustomEntry( 'studio.session_context', plan.sessionContext );
+			}
+			return agent.runTurn( {
+				prompt: turnPrompt,
+				...( images?.length ? { images } : {} ),
+				env,
+				session,
+				activeSite: seeded?.activeSite,
+				onEvent: handleEvent,
+				onAskUser,
+				...( plan ? plan.turn : input.model ? { model: input.model } : {} ),
+			} );
+		};
+		const sitesBeforeTurn = await fingerprintSites();
+		let query = runTurn( prompt, { images: attachments?.images } );
+		phaseTimingsMs.start_ai_agent_ms = Date.now() - phaseStartedAt;
+
+		const timeout = setTimeout( () => {
+			timedOut = true;
+			void query.interrupt();
+		}, input.timeoutMs ?? 300000 );
+
+		try {
 			await query.result;
+			for ( const followUp of input.followUps ?? [] ) {
+				if ( timedOut || ( stoppedAt && ! input.resumeAfterStop ) ) {
+					break;
+				}
+				query = runTurn( followUp.prompt, { reopen: followUp.reopen } );
+				await query.result;
+			}
+		} catch ( caught ) {
+			error = caught instanceof Error ? caught.message : String( caught );
+		} finally {
+			clearTimeout( timeout );
+			// The turns are over: the route report covers their requests only.
+			uninstallObserver?.();
+			uninstallObserver = null;
+			outcome = await captureTurnOutcome(
+				sitesBeforeTurn,
+				seeded?.activeSitePath,
+				mkdtempSync( path.join( os.tmpdir(), 'studio-eval-outcome-' ) )
+			).catch( ( caught ) => ( {
+				error: caught instanceof Error ? caught.message : String( caught ),
+			} ) );
+			sitesDeleted = true;
+			if ( seeded ) {
+				inspections = await seeded.inspect().catch( () => [] );
+				await seeded.cleanup().catch( () => undefined );
+			}
+			await deleteSites( bystanderPaths );
 		}
-	} catch ( caught ) {
-		error = caught instanceof Error ? caught.message : String( caught );
+		phaseTimingsMs.total_eval_ms = elapsed();
+
+		const providerRoute: ProviderRouteReport | null =
+			plan && observerFile
+				? {
+						requested: plan.requested,
+						executed: summarizeExecutedRoute( {
+							requests: readObservedLines( observerFile ).filter(
+								( line ): line is ObservedRequest => line.kind === 'request'
+							),
+							replies,
+							entries: session.getEntries(),
+							turnStartedAt: turns.map( ( turn ) => evalStartedAt + turn.startedAtMs ),
+						} ),
+				  }
+				: null;
+
+		return {
+			...( providerRoute ? { providerRoute } : {} ),
+			...( input.remote ? { remoteCalls } : {} ),
+			...( input.ui ? { uiEvents } : {} ),
+			...( input.imageService ? { imageService: { configured: imageServiceConfigured } } : {} ),
+			...( attachments ? { attachments: attachments.summary } : {} ),
+			turns,
+			compactions: session.getEntries().filter( ( entry ) => entry.type === 'compaction' ).length,
+			success,
+			error,
+			timedOut,
+			stoppedAt,
+			model: resolvedModel,
+			numTurns: numTurnsResult,
+			stopReason,
+			errorMessage,
+			usage,
+			sessionFile: session.getSessionFile() ?? null,
+			phaseTimingsMs,
+			timing: summarizeTiming( requests, toolEvents ),
+			requests,
+			turnDurationsMs,
+			toolCalls,
+			toolResults,
+			toolEvents,
+			firstToolError,
+			textSegments,
+			questions,
+			inspections,
+			outcome,
+		};
 	} finally {
-		clearTimeout( timeout );
-		// The turns are over: nothing after them may use the source profile's
-		// sign-in, and the route report covers the turns' requests only.
 		uninstallObserver?.();
-		unlinkChatGpt?.();
-		outcome = await captureTurnOutcome(
-			sitesBeforeTurn,
-			seeded?.activeSitePath,
-			mkdtempSync( path.join( os.tmpdir(), 'studio-eval-outcome-' ) )
-		).catch( ( caught ) => ( {
-			error: caught instanceof Error ? caught.message : String( caught ),
-		} ) );
-		if ( seeded ) {
-			inspections = await seeded.inspect().catch( () => [] );
-			await seeded.cleanup().catch( () => undefined );
+		if ( ! sitesDeleted ) {
+			await seeded?.cleanup().catch( () => undefined );
+			await deleteSites( bystanderPaths ).catch( () => undefined );
 		}
-		await deleteSites( bystanderPaths );
+		if ( observerFile ) {
+			await rm( observerFile, { force: true } );
+		}
+		restoreCaseEnvironment();
+		for ( const dir of caseFolders ) {
+			removeCaseFolder( dir );
+		}
 	}
-	phaseTimingsMs.total_eval_ms = elapsed();
-
-	const providerRoute: ProviderRouteReport | null =
-		plan && observerFile
-			? {
-					requested: plan.requested,
-					executed: summarizeExecutedRoute( {
-						requests: readObservedLines( observerFile ).filter(
-							( line ): line is ObservedRequest => line.kind === 'request'
-						),
-						replies,
-						entries: session.getEntries(),
-						turnStartedAt: turns.map( ( turn ) => evalStartedAt + turn.startedAtMs ),
-					} ),
-			  }
-			: null;
-	if ( observerFile ) {
-		await rm( observerFile, { force: true } );
-	}
-
-	return {
-		...( providerRoute ? { providerRoute } : {} ),
-		...( input.remote ? { remoteCalls } : {} ),
-		...( input.ui ? { uiEvents } : {} ),
-		...( input.imageService ? { imageService: { configured: imageServiceConfigured } } : {} ),
-		...( attachments ? { attachments: attachments.summary } : {} ),
-		turns,
-		compactions: session.getEntries().filter( ( entry ) => entry.type === 'compaction' ).length,
-		success,
-		error,
-		timedOut,
-		stoppedAt,
-		model: resolvedModel,
-		numTurns: numTurnsResult,
-		stopReason,
-		errorMessage,
-		usage,
-		sessionFile: session.getSessionFile() ?? null,
-		phaseTimingsMs,
-		timing: summarizeTiming( requests, toolEvents ),
-		requests,
-		turnDurationsMs,
-		toolCalls,
-		toolResults,
-		toolEvents,
-		firstToolError,
-		textSegments,
-		questions,
-		inspections,
-		outcome,
-	};
 }
 
 const RESULT_PREFIX = 'EVAL_RUNNER_RESULT_FILE=';
+
+// The folder the entry made for this case's sites, once nothing is left in it.
+// A site the turn created and kept stays, with its folder.
+function removeEmptySitesRoot(): void {
+	const sitesRoot = process.env.E2E_SITES_ROOT;
+	if ( sitesRoot && path.basename( sitesRoot ).startsWith( 'studio-eval-sites-' ) ) {
+		try {
+			rmdirSync( sitesRoot );
+		} catch {
+			// Not empty, or already gone.
+		}
+	}
+}
 
 // Studio tools and the Agent SDK freely print to stdout (pi-tui spinners,
 // daemon status, …). promptfoo's `exec:` provider wraps us in
@@ -1067,6 +1124,7 @@ export async function main() {
 		emit( { success: false, error: error instanceof Error ? error.message : String( error ) } );
 		exitCode = 1;
 	}
+	removeEmptySitesRoot();
 	// The Agent SDK keeps internal handles open past conversation end; bail out
 	// rather than leaving promptfoo waiting on its exec child.
 	process.exit( exitCode );

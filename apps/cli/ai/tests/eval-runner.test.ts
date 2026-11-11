@@ -2,7 +2,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { evalConnectionRef } from 'cli/ai/eval-provider';
 import { readEvalRunnerInput, runEval as runEvalUntyped } from 'cli/ai/eval-runner';
 import type { AgentSessionEvent, SessionManager } from '@earendil-works/pi-coding-agent';
@@ -79,10 +80,15 @@ vi.mock( 'cli/ai/host', async () => {
 const broker = vi.hoisted( () => ( {
 	connections: [] as ConnectionRegistryEntry[],
 	setTokenClient: vi.fn(),
+	// Where the ChatGPT store read its connections from, each time it was asked.
+	readFrom: [] as string[],
 } ) );
 vi.mock( '@studio/agent/node/chatgpt/credential-broker', async ( importOriginal ) => ( {
 	...( await importOriginal< typeof import('@studio/agent/node/chatgpt/credential-broker') >() ),
-	listChatGptConnections: async () => broker.connections,
+	listChatGptConnections: async () => {
+		broker.readFrom.push( getChatGptStateDirectory() );
+		return broker.connections;
+	},
 	setChatGptTokenClient: broker.setTokenClient,
 } ) );
 
@@ -192,12 +198,32 @@ const input = ( vars: Record< string, unknown > = {}, env: NodeJS.ProcessEnv = {
 		env
 	);
 
+// One dedicated ChatGPT profile for the whole file: a process keeps its ChatGPT
+// state in one directory once it has used it.
+const dedicated = { dir: '' };
+beforeAll( () => {
+	dedicated.dir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-eval-dedicated-' ) );
+} );
+afterAll( () => {
+	fs.rmSync( dedicated.dir, { recursive: true, force: true, maxRetries: 5 } );
+} );
+
+// The runner's temporary folders and files, in the test's own temporary folder.
+const leftovers = () =>
+	fs
+		.readdirSync( path.join( paths.root, 'tmp' ) )
+		.filter( ( name ) => /^studio-eval-(config|registry|requests)-/.test( name ) );
+
 describe( 'eval runner provider selection', () => {
 	const savedEnv = { ...process.env };
 	let fetchSpy: ReturnType< typeof vi.spyOn >;
 
 	beforeEach( () => {
 		paths.root = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-eval-runner-' ) );
+		fs.mkdirSync( path.join( paths.root, 'tmp' ) );
+		for ( const name of [ 'TEMP', 'TMP', 'TMPDIR' ] ) {
+			process.env[ name ] = path.join( paths.root, 'tmp' );
+		}
 		const profile = path.join( paths.root, 'profile' );
 		fs.mkdirSync( path.join( profile, 'chatgpt-credentials' ), { recursive: true } );
 		fs.writeFileSync(
@@ -205,6 +231,7 @@ describe( 'eval runner provider selection', () => {
 			JSON.stringify( { version: 1, aiProvider: 'openai-api-key', authToken: WPCOM_LOGIN } )
 		);
 		fs.writeFileSync( path.join( profile, 'chatgpt-accounts.json' ), '{}' );
+		broker.readFrom = [];
 		for ( const name of [
 			'DEV_CONFIG_DIR',
 			'E2E',
@@ -229,6 +256,8 @@ describe( 'eval runner provider selection', () => {
 		agent.behavior = null;
 		agent.created = 0;
 		imageService.configured = false;
+		sites.create.mockReset().mockImplementation( async () => undefined );
+		sites.remove.mockReset().mockImplementation( async () => undefined );
 		// The global provider is OpenAI with a saved key.
 		legacy.resolveInitialAiProvider.mockResolvedValue( 'openai-api-key' );
 		legacy.resolveUnavailableAiProvider.mockResolvedValue( undefined );
@@ -278,6 +307,7 @@ describe( 'eval runner provider selection', () => {
 				{
 					STUDIO_EVAL_PROVIDER: 'chatgpt-oauth',
 					STUDIO_EVAL_CONNECTION: CONNECTION_ID,
+					STUDIO_EVAL_CHATGPT_PROFILE: dedicated.dir,
 					STUDIO_EVAL_MODEL: 'gpt-6-luna',
 					STUDIO_EVAL_EFFORT: 'low',
 				}
@@ -332,7 +362,7 @@ describe( 'eval runner provider selection', () => {
 		const result = await runEval(
 			input(
 				{ provider: 'chatgpt-oauth', model: 'gpt-6-luna', effort: 'low' },
-				{ STUDIO_EVAL_CONNECTION: CONNECTION_ID }
+				{ STUDIO_EVAL_CONNECTION: CONNECTION_ID, STUDIO_EVAL_CHATGPT_PROFILE: dedicated.dir }
 			)
 		);
 		expect( result.providerRoute?.requested?.kind ).toBe( 'chatgpt-oauth' );
@@ -352,20 +382,30 @@ describe( 'eval runner provider selection', () => {
 		[ 'model-not-qualified', { STUDIO_EVAL_MODEL: 'gpt-6.1-sol' } ],
 		[ 'effort-not-qualified', { STUDIO_EVAL_EFFORT: 'high' } ],
 		[ 'provider-unknown', { STUDIO_EVAL_PROVIDER: 'chatgpt-plan' } ],
+		[ 'profile-required', { STUDIO_EVAL_CHATGPT_PROFILE: '' } ],
+		[ 'profile-in-studio-profile', { STUDIO_EVAL_CHATGPT_PROFILE: 'HOME_STUDIO' } ],
 	] as Array< [ string, NodeJS.ProcessEnv ] > )(
 		'refuses %s with its code, before any site, turn or model request',
 		async ( code, env ) => {
 			if ( env.STUDIO_EXPERIMENTAL_CHATGPT === '' ) {
 				delete process.env.STUDIO_EXPERIMENTAL_CHATGPT;
 			}
+			// The user's own Studio profile, under a home directory of the test's.
+			const studio = path.join( paths.root, 'home', '.studio' );
+			fs.mkdirSync( studio, { recursive: true } );
+			process.env.USERPROFILE = process.env.HOME = path.join( paths.root, 'home' );
 			const result = await runEval(
 				input(
 					{},
 					{
 						STUDIO_EVAL_PROVIDER: 'chatgpt-oauth',
 						STUDIO_EVAL_CONNECTION: CONNECTION_ID,
+						STUDIO_EVAL_CHATGPT_PROFILE: dedicated.dir,
 						STUDIO_EVAL_MODEL: 'gpt-6-luna',
 						...env,
+						...( env.STUDIO_EVAL_CHATGPT_PROFILE === 'HOME_STUDIO'
+							? { STUDIO_EVAL_CHATGPT_PROFILE: studio }
+							: {} ),
 					}
 				)
 			);
@@ -379,6 +419,7 @@ describe( 'eval runner provider selection', () => {
 			expect( sites.create ).not.toHaveBeenCalled();
 			expect( fetchSpy ).not.toHaveBeenCalled();
 			expect( legacy.resolveAiEnvironment ).not.toHaveBeenCalled();
+			expect( leftovers() ).toEqual( [] );
 		}
 	);
 
@@ -390,39 +431,82 @@ describe( 'eval runner provider selection', () => {
 	} );
 
 	describe( 'what a parity case sets up and captures', () => {
-		const chatGptEnv = {
+		const chatGptEnv = () => ( {
 			STUDIO_EVAL_PROVIDER: 'chatgpt-oauth',
 			STUDIO_EVAL_CONNECTION: CONNECTION_ID,
+			STUDIO_EVAL_CHATGPT_PROFILE: dedicated.dir,
 			STUDIO_EVAL_MODEL: 'gpt-6-luna',
-		};
+		} );
 
-		it( 'removes the linked ChatGPT sign-in as soon as the turns end, even when site cleanup then fails', async () => {
-			const present = ( file: string ) => {
-				try {
-					fs.lstatSync( file );
-					return true;
-				} catch {
-					return false;
-				}
+		it( 'reads the ChatGPT connection in the dedicated profile itself: nothing of it in the case profile, linked or copied', async () => {
+			const seenInTurn: Array< { stateDirectory: string; caseEntries: string[] } > = [];
+			agent.behavior = {
+				replyProvider: 'studio-chatgpt',
+				act: async () => {
+					const caseDir = process.env.E2E_SHARED_CONFIG_PATH ?? '';
+					seenInTurn.push( {
+						stateDirectory: getChatGptStateDirectory(),
+						caseEntries: fs.readdirSync( caseDir ),
+					} );
+				},
 			};
-			const caseLinks = () => {
-				const caseDir = process.env.E2E_SHARED_CONFIG_PATH ?? '';
-				return [ 'chatgpt-credentials', 'chatgpt-accounts.json' ].filter( ( name ) =>
-					present( path.join( caseDir, name ) )
-				);
-			};
+			const result = await runEval( input( {}, chatGptEnv() ) );
+			expect( result.success ).toBe( true );
+			expect( broker.readFrom ).toEqual( [ dedicated.dir ] );
+			expect( seenInTurn ).toHaveLength( 1 );
+			expect( seenInTurn[ 0 ].stateDirectory ).toBe( dedicated.dir );
+			expect( seenInTurn[ 0 ].caseEntries.filter( ( name ) => /chatgpt/i.test( name ) ) ).toEqual(
+				[]
+			);
+			// The source profile is untouched, and nothing points into it.
+			expect( fs.readdirSync( path.join( paths.root, 'profile' ) ).sort() ).toEqual( [
+				'chatgpt-accounts.json',
+				'chatgpt-credentials',
+				'shared.json',
+			] );
+			expect( leftovers() ).toEqual( [] );
+			expect( process.env.E2E_SHARED_CONFIG_PATH ).toBeUndefined();
+			expect( process.env.E2E_CLI_CONFIG_PATH ).toBeUndefined();
+		} );
+
+		it( 'restores fetch and removes its temporary folders when a run fails partway, at any stage', async () => {
 			agent.behavior = { replyProvider: 'studio-chatgpt' };
-			await runEval( input( {}, chatGptEnv ) );
-			expect( caseLinks() ).toEqual( [] );
-
-			// A bystander site that can't be deleted makes the run throw afterwards.
-			// The source profile is the test's again, not the last run's case profile.
-			delete process.env.E2E;
-			delete process.env.E2E_SHARED_CONFIG_PATH;
+			// A bystander site that can't be deleted makes the run throw after its turns.
 			sites.remove.mockImplementationOnce( ( () => undefined ) as never );
-			await expect( runEval( input( {}, chatGptEnv ) ) ).rejects.toThrow();
-			expect( caseLinks() ).toEqual( [] );
-			expect( present( path.join( paths.root, 'profile', 'chatgpt-credentials' ) ) ).toBe( true );
+			await expect( runEval( input( {}, chatGptEnv() ) ) ).rejects.toThrow();
+			expect( globalThis.fetch ).toBe( fetchSpy );
+			expect( leftovers() ).toEqual( [] );
+
+			// Setup failing before any turn: the bystander sites it made are deleted too.
+			sites.remove.mockClear();
+			sites.create
+				.mockImplementationOnce( async () => undefined )
+				.mockImplementationOnce( async () => undefined )
+				.mockImplementationOnce( async () => {
+					throw new Error( 'site create failed' );
+				} );
+			await expect(
+				runEval( input( { seed: { activeSite: { name: 'Fails' } } }, chatGptEnv() ) )
+			).rejects.toThrow( 'site create failed' );
+			expect( globalThis.fetch ).toBe( fetchSpy );
+			expect( leftovers() ).toEqual( [] );
+			expect( sites.remove.mock.calls.length ).toBeGreaterThanOrEqual( 2 );
+
+			// A refusal after the case's profile was made.
+			const refused = await runEval( input( { imageService: 'required' }, chatGptEnv() ) );
+			expect( refused ).toMatchObject( { refusal: { code: 'image-service-not-configured' } } );
+			expect( leftovers() ).toEqual( [] );
+			expect( globalThis.fetch ).toBe( fetchSpy );
+		} );
+
+		it( 'removes the links to Studio downloads as links, leaving what they point to', async () => {
+			const downloads = path.join( paths.root, 'profile', 'server-files' );
+			fs.mkdirSync( downloads );
+			fs.writeFileSync( path.join( downloads, 'kept.txt' ), 'kept' );
+			agent.behavior = { replyProvider: 'studio-wpcom' };
+			await runEval( input() );
+			expect( leftovers() ).toEqual( [] );
+			expect( fs.readFileSync( path.join( downloads, 'kept.txt' ), 'utf8' ) ).toBe( 'kept' );
 		} );
 
 		it( 'records every remote operation under remote: mock, never reaching the real host', async () => {
@@ -473,14 +557,21 @@ describe( 'eval runner provider selection', () => {
 		} );
 
 		it( 'runs imageService: off without the WordPress.com login, and refuses when the service stays on', async () => {
+			let caseShared: unknown;
+			agent.behavior = {
+				replyProvider: 'studio-wpcom',
+				act: async () => {
+					caseShared = JSON.parse(
+						fs.readFileSync(
+							path.join( process.env.E2E_SHARED_CONFIG_PATH ?? '', 'shared.json' ),
+							'utf8'
+						)
+					);
+				},
+			};
 			const result = await runEval( input( { imageService: 'off' } ) );
 			expect( result.imageService ).toEqual( { configured: false } );
-			const caseShared = JSON.parse(
-				fs.readFileSync(
-					path.join( process.env.E2E_SHARED_CONFIG_PATH ?? '', 'shared.json' ),
-					'utf8'
-				)
-			);
+			expect( caseShared ).toMatchObject( { version: 1 } );
 			expect( caseShared ).not.toHaveProperty( 'authToken' );
 
 			agent.turns = [];
@@ -517,7 +608,7 @@ describe( 'eval runner provider selection', () => {
 		it( 'reopens the conversation from its file for a follow-up marked reopen', async () => {
 			agent.behavior = { replyProvider: 'studio-chatgpt' };
 			const result = await runEval(
-				input( { followUps: [ { prompt: 'What was it?', reopen: true } ] }, chatGptEnv )
+				input( { followUps: [ { prompt: 'What was it?', reopen: true } ] }, chatGptEnv() )
 			);
 			const [ first, second ] = agent.turns;
 			expect( second.session ).not.toBe( first.session );
@@ -582,7 +673,7 @@ describe( 'eval runner provider selection', () => {
 				{ role: 'assistant', text: 'Noted.', contextTokens: 190000 },
 			];
 			agent.behavior = { replyProvider: 'studio-chatgpt' };
-			await runEval( input( { seed: { history } }, chatGptEnv ) );
+			await runEval( input( { seed: { history } }, chatGptEnv() ) );
 			const entries = JSON.stringify( agent.turns[ 0 ].entriesAtStart );
 			expect( entries ).toContain( 'AURORA-7' );
 			expect( entries ).toContain( '"provider":"studio-chatgpt"' );

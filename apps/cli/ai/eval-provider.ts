@@ -9,10 +9,12 @@
  * model request. What executed is read back from the run itself: the model
  * requests the request observer saw, the providers the runtime stamped on its
  * replies and the connection the conversation's record names.
+ *
+ * A ChatGPT connection is always one signed in to a dedicated test profile
+ * the run names, never the user's own Studio profile; its sign-ins are read
+ * and written there, in place.
  */
 import { createHash } from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
 import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import {
 	CHATGPT_MODEL_CAPABILITIES,
@@ -33,6 +35,7 @@ import {
 	isAiProviderId,
 	type AiProviderId,
 } from '@studio/agent/protocol/providers';
+import { checkDedicatedProfile, type DedicatedProfileProblem } from './acceptance-isolation';
 import type { ObservedHost, ObservedRequest } from './chatgpt-acceptance-observer';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import type {
@@ -43,6 +46,7 @@ import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/e
 
 const EVAL_PROVIDER_ENV = 'STUDIO_EVAL_PROVIDER';
 const EVAL_CONNECTION_ENV = 'STUDIO_EVAL_CONNECTION';
+const EVAL_CHATGPT_PROFILE_ENV = 'STUDIO_EVAL_CHATGPT_PROFILE';
 const EVAL_EFFORT_ENV = 'STUDIO_EVAL_EFFORT';
 
 /** The pi provider id WordPress.com replies carry (the runtime's `studio-wpcom`). */
@@ -91,7 +95,11 @@ type EvalProviderFailureCode =
 	| 'effort-not-qualified'
 	| 'effort-not-applicable'
 	| 'model-provider-mismatch'
-	| 'provider-not-ready';
+	| 'provider-not-ready'
+	| 'profile-required'
+	| 'profile-not-applicable'
+	| 'profile-unavailable'
+	| DedicatedProfileProblem;
 
 export interface EvalProviderFailure {
 	code: EvalProviderFailureCode;
@@ -101,6 +109,8 @@ export interface EvalProviderFailure {
 export interface EvalProviderRequest {
 	provider: AiProviderId;
 	connectionId?: string;
+	/** The dedicated test profile a subscription connection is signed in to. */
+	chatGptProfile?: string;
 	model?: string;
 	effort?: string;
 }
@@ -120,8 +130,9 @@ const text = ( value: unknown ): string | undefined =>
 /**
  * The provider selection a run names, or null when it names none and takes
  * the default path. The provider comes from `STUDIO_EVAL_PROVIDER` or the
- * case's `provider` var, which must agree; the connection only from
- * `STUDIO_EVAL_CONNECTION`, so no config holds one; the effort from the case's
+ * case's `provider` var, which must agree; the connection and its dedicated
+ * test profile only from `STUDIO_EVAL_CONNECTION` and
+ * `STUDIO_EVAL_CHATGPT_PROFILE`, so no config holds either; the effort from the case's
  * `effort` var or `STUDIO_EVAL_EFFORT`; the model from the case's `model` var
  * or `STUDIO_EVAL_MODEL`, as on the default path.
  */
@@ -135,6 +146,7 @@ export function readEvalProviderRequest( {
 	const fromEnv = text( env[ EVAL_PROVIDER_ENV ] );
 	const fromCase = text( vars.provider );
 	const connectionId = text( env[ EVAL_CONNECTION_ENV ] );
+	const chatGptProfile = text( env[ EVAL_CHATGPT_PROFILE_ENV ] );
 	const effort = text( vars.effort ) ?? text( env[ EVAL_EFFORT_ENV ] );
 	const model = text( vars.model ) ?? text( env.STUDIO_EVAL_MODEL );
 	if ( fromEnv && fromCase && fromEnv !== fromCase ) {
@@ -151,11 +163,15 @@ export function readEvalProviderRequest( {
 				`This case runs only on an explicitly selected provider. Set ${ EVAL_PROVIDER_ENV } (and ${ EVAL_CONNECTION_ENV } for a subscription provider); the global provider is never used for it.`
 			);
 		}
-		if ( connectionId || effort ) {
+		if ( connectionId || chatGptProfile || effort ) {
 			return failure(
 				'selection-without-provider',
 				`${
-					connectionId ? EVAL_CONNECTION_ENV : EVAL_EFFORT_ENV
+					connectionId
+						? EVAL_CONNECTION_ENV
+						: chatGptProfile
+						? EVAL_CHATGPT_PROFILE_ENV
+						: EVAL_EFFORT_ENV
 				} is set but no provider is selected. Set ${ EVAL_PROVIDER_ENV } too.`
 			);
 		}
@@ -172,6 +188,7 @@ export function readEvalProviderRequest( {
 		request: {
 			provider,
 			...( connectionId ? { connectionId } : {} ),
+			...( chatGptProfile ? { chatGptProfile } : {} ),
 			...( model ? { model } : {} ),
 			...( effort ? { effort } : {} ),
 		},
@@ -227,11 +244,25 @@ export interface EvalProviderDeps {
 	isChatGptEnabled(): boolean;
 	listChatGptConnections(): Promise< ConnectionRegistryEntry[] >;
 	provider( id: AiProviderId ): EvalLegacyProvider;
+	/** The user's home directory, whose `.studio` is their own Studio profile. */
+	home: string;
+	/** Where this process keeps its own Studio config. */
+	configDirectory(): string;
+	/** Reads and writes this process's ChatGPT sign-ins in `directory` from now on. */
+	useChatGptProfile( directory: string ): void;
 }
 
 export type EvalProviderPlanResult =
 	| { ok: true; plan: EvalProviderPlan }
 	| { ok: false; failure: EvalProviderFailure };
+
+const PROFILE_PROBLEMS: Record< DedicatedProfileProblem, string > = {
+	'profile-relative': `${ EVAL_CHATGPT_PROFILE_ENV } must be an absolute path.`,
+	'profile-not-found': `${ EVAL_CHATGPT_PROFILE_ENV } names no directory.`,
+	'profile-in-studio-profile': `${ EVAL_CHATGPT_PROFILE_ENV } is your own Studio profile, inside it, or resolves into it. Use a dedicated test profile.`,
+	'profile-is-config-directory':
+		'This process keeps its own Studio config in the dedicated test profile (DEV_CONFIG_DIR), so a case would seed it. Run the eval without pointing DEV_CONFIG_DIR there.',
+};
 
 const REPLY_API: Record< AiProviderId, string > = {
 	wpcom: 'openai-completions',
@@ -255,8 +286,22 @@ async function planChatGpt(
 	if ( ! connectionId ) {
 		return failure(
 			'connection-required',
-			`A ChatGPT eval runs on one signed-in ChatGPT connection: set ${ EVAL_CONNECTION_ENV } to its registration id (shown by /chatgpt → Select saved account).`
+			`A ChatGPT eval runs on one signed-in ChatGPT connection: set ${ EVAL_CONNECTION_ENV } to its registration id (the dedicated profile's run directory names it in state.json).`
 		);
+	}
+	const profile = request.chatGptProfile;
+	if ( ! profile ) {
+		return failure(
+			'profile-required',
+			`A ChatGPT eval takes its connection from a dedicated test profile, never your own Studio profile: set ${ EVAL_CHATGPT_PROFILE_ENV } to its absolute path.`
+		);
+	}
+	const problem = checkDedicatedProfile( profile, {
+		home: deps.home,
+		configDirectory: deps.configDirectory(),
+	} );
+	if ( problem ) {
+		return failure( problem, PROFILE_PROBLEMS[ problem ] );
 	}
 	if ( ! deps.isChatGptEnabled() ) {
 		return failure(
@@ -275,20 +320,28 @@ async function planChatGpt(
 			describeChatGptReasoningProblem( reasoning.problem )
 		);
 	}
+	try {
+		deps.useChatGptProfile( profile );
+	} catch {
+		return failure(
+			'profile-unavailable',
+			'This process already reads ChatGPT sign-ins from another directory, so the eval did not run.'
+		);
+	}
 	let connections: ConnectionRegistryEntry[];
 	try {
 		connections = await deps.listChatGptConnections();
 	} catch {
 		return failure(
 			'connection-state-unavailable',
-			'Studio couldn’t read the ChatGPT connections in this profile, so the eval did not run.'
+			'Studio couldn’t read the ChatGPT connections in the dedicated profile, so the eval did not run.'
 		);
 	}
 	const entry = connections.find( ( item ) => item.connectionId === connectionId );
 	if ( ! entry ) {
 		return failure(
 			'connection-unknown',
-			`No ChatGPT connection with the id in ${ EVAL_CONNECTION_ENV } is saved in this Studio profile.`
+			`No ChatGPT connection with the id in ${ EVAL_CONNECTION_ENV } is saved in the dedicated profile.`
 		);
 	}
 	if ( entry.providerId !== 'chatgpt-oauth' || entry.backend !== 'pi' ) {
@@ -300,7 +353,7 @@ async function planChatGpt(
 	if ( entry.authStatus !== 'connected' || ! entry.identity?.subject ) {
 		return failure(
 			'connection-signed-out',
-			'That ChatGPT connection is not signed in here. Sign in again with secure storage: a session-only sign-in lives only in the app that holds it.'
+			'That ChatGPT connection is not signed in to the dedicated profile. Sign in again with secure storage: a session-only sign-in lives only in the app that holds it.'
 		);
 	}
 	const sessionContext: StudioSessionContextData = {
@@ -346,6 +399,12 @@ async function planLegacy(
 		return failure(
 			'connection-not-applicable',
 			`${ kind } has one implicit connection; unset ${ EVAL_CONNECTION_ENV }.`
+		);
+	}
+	if ( request.chatGptProfile ) {
+		return failure(
+			'profile-not-applicable',
+			`${ kind } takes no ChatGPT profile; unset ${ EVAL_CHATGPT_PROFILE_ENV }.`
 		);
 	}
 	if ( request.effort ) {
@@ -536,45 +595,5 @@ export function summarizeExecutedRoute( {
 				reasoningItems: request.reasoningItems,
 				turn: turnOf( request.startedAt ),
 			} ) ),
-	};
-}
-
-const CHATGPT_ACCOUNTS_FILE = 'chatgpt-accounts.json';
-const CHATGPT_CREDENTIALS_DIRECTORY = 'chatgpt-credentials';
-
-/**
- * Makes the ChatGPT sign-ins of `sourceDir` usable from an eval case's own
- * profile: its credential records by a directory link, so a refresh and its
- * lockfiles land in the source's records (copying them would leave the
- * source with a refresh token the service has since retired), and its account
- * list by a file link, or a copy where links are refused. The returned
- * function removes those links, never anything they point to.
- */
-export function linkChatGptState( sourceDir: string, caseDir: string ): () => void {
-	const made: string[] = [];
-	const credentials = path.join( sourceDir, CHATGPT_CREDENTIALS_DIRECTORY );
-	if ( fs.existsSync( credentials ) ) {
-		const link = path.join( caseDir, CHATGPT_CREDENTIALS_DIRECTORY );
-		fs.symlinkSync( credentials, link, process.platform === 'win32' ? 'junction' : 'dir' );
-		made.push( link );
-	}
-	const accounts = path.join( sourceDir, CHATGPT_ACCOUNTS_FILE );
-	if ( fs.existsSync( accounts ) ) {
-		const link = path.join( caseDir, CHATGPT_ACCOUNTS_FILE );
-		try {
-			fs.symlinkSync( accounts, link, 'file' );
-		} catch {
-			fs.copyFileSync( accounts, link );
-		}
-		made.push( link );
-	}
-	return () => {
-		for ( const link of made ) {
-			try {
-				fs.unlinkSync( link );
-			} catch {
-				// Already gone.
-			}
-		}
 	};
 }

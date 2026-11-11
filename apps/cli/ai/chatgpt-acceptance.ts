@@ -62,6 +62,7 @@ import {
 	type StageStatus,
 } from 'cli/ai/acceptance-evidence';
 import {
+	acceptanceStartsNewRun,
 	applyAcceptanceIsolation,
 	findRealProfileHazard,
 	findRealProfileLeak,
@@ -97,7 +98,8 @@ import type { ChatGptSignInOutcome } from '@studio/agent/protocol/chatgpt';
 
 const CHATGPT_ACCEPTANCE_PROVIDER = 'chatgpt';
 
-type AcceptanceScenario = 'saved' | 'session';
+type AcceptanceScenario = 'saved' | 'session' | 'provision' | 'retire';
+const SCENARIOS: readonly AcceptanceScenario[] = [ 'saved', 'session', 'provision', 'retire' ];
 type AcceptanceGate = 'T1' | 'T2' | 'T3' | 'T4';
 
 const GATES: readonly AcceptanceGate[] = [ 'T1', 'T2', 'T3', 'T4' ];
@@ -133,6 +135,7 @@ type ArgumentProblem =
 	| 'scenario-unknown'
 	| 'gate-unknown'
 	| 'option-not-for-session'
+	| 'option-not-for-profile'
 	| 'option-unknown'
 	| 'option-value-missing';
 
@@ -180,14 +183,17 @@ export function parseChatGptAcceptanceArgs( argv: readonly string[] ): ParsedAcc
 	if ( ! scenario ) {
 		return { ok: false, problem: 'scenario-missing' };
 	}
-	if ( scenario !== 'saved' && scenario !== 'session' ) {
+	if ( ! SCENARIOS.includes( scenario as AcceptanceScenario ) ) {
 		return { ok: false, problem: 'scenario-unknown' };
 	}
 	if (
-		scenario === 'session' &&
+		scenario !== 'saved' &&
 		[ '--model', '--effort', '--gates' ].some( ( name ) => name in values )
 	) {
-		return { ok: false, problem: 'option-not-for-session' };
+		return {
+			ok: false,
+			problem: scenario === 'session' ? 'option-not-for-session' : 'option-not-for-profile',
+		};
 	}
 	const gates = ( values[ '--gates' ] ?? '' )
 		.split( ',' )
@@ -201,7 +207,7 @@ export function parseChatGptAcceptanceArgs( argv: readonly string[] ): ParsedAcc
 		ok: true,
 		options: {
 			live,
-			scenario,
+			scenario: scenario as AcceptanceScenario,
 			runDir: values[ '--run-dir' ] ?? '',
 			model,
 			effort: values[ '--effort' ] ?? getDefaultChatGptReasoningEffort( model ),
@@ -1382,7 +1388,7 @@ const prerequisitesStage: StageDefinition = {
 		if ( ! observations.buildPresent ) {
 			block( 'build-missing' );
 		}
-		if ( ctx.options.scenario === 'saved' ) {
+		if ( ctx.options.scenario !== 'session' ) {
 			observations.secureStorageAvailable = await ctx.services.secureStorageAvailable();
 			if ( ! observations.secureStorageAvailable ) {
 				block( 'secure-storage-unavailable' );
@@ -1912,6 +1918,48 @@ const SAVED_STAGES: StageDefinition[] = [
 	},
 ];
 
+// A dedicated eval profile: one registration signed in to the run's own
+// profile with secure storage, left signed in for provider-qualified evals.
+const PROVISION_STAGES: StageDefinition[] = [
+	prerequisitesStage,
+	{
+		name: 'profile-sign-in',
+		async run( ctx, observations ) {
+			registerRegistrationCleanup( ctx );
+			const outcome = await signInStage( ctx, observations, undefined, 'vault' );
+			const account = await ctx.services.broker.readAccount( outcome.registrationId );
+			observations.signedIn = account?.state === 'signed-in';
+			observations.storedInVault = ctx.services.broker.vaultRecordExists( outcome.registrationId );
+			check( observations.signedIn, 'not-signed-in' );
+			check( observations.storedInVault, 'vault-record-missing' );
+			// Ready for evals: only a failure before here signs it out again.
+			ctx.cleanup.delete( 'registration' );
+			observations.leftSignedIn = true;
+		},
+	},
+];
+
+// Retires a dedicated eval profile: its registration signed out, locally and at ChatGPT.
+const RETIRE_STAGES: StageDefinition[] = [
+	prerequisitesStage,
+	{
+		name: 'profile-sign-out',
+		async run( ctx, observations ) {
+			const id = requireRegistration( ctx );
+			const account = await ctx.services.broker.readAccount( id );
+			observations.wasSignedIn = account?.state === 'signed-in';
+			if ( ! observations.wasSignedIn ) {
+				block( 'already-signed-out' );
+			}
+			const result = await ctx.services.broker.signOut( id );
+			observations.localCleared = result.localCleared;
+			observations.remoteRevocationConfirmed = result.remoteRevocationConfirmed;
+			check( result.localCleared, 'local-not-cleared' );
+			check( result.remoteRevocationConfirmed, 'remote-revocation-unconfirmed' );
+		},
+	},
+];
+
 const SESSION_STAGES: StageDefinition[] = [
 	prerequisitesStage,
 	{
@@ -2157,6 +2205,17 @@ const SESSION_STAGES: StageDefinition[] = [
 
 export const SAVED_STAGE_NAMES: readonly string[] = SAVED_STAGES.map( ( stage ) => stage.name );
 export const SESSION_STAGE_NAMES: readonly string[] = SESSION_STAGES.map( ( stage ) => stage.name );
+export const PROVISION_STAGE_NAMES: readonly string[] = PROVISION_STAGES.map(
+	( stage ) => stage.name
+);
+export const RETIRE_STAGE_NAMES: readonly string[] = RETIRE_STAGES.map( ( stage ) => stage.name );
+
+const STAGES: Record< AcceptanceScenario, StageDefinition[] > = {
+	saved: SAVED_STAGES,
+	session: SESSION_STAGES,
+	provision: PROVISION_STAGES,
+	retire: RETIRE_STAGES,
+};
 
 function verdictOf(
 	error: unknown,
@@ -2290,14 +2349,20 @@ async function runCleanup( ctx: StageContext ): Promise< StageRecord > {
 function describeArgumentProblem( problem: ArgumentProblem ): string {
 	switch ( problem ) {
 		case 'scenario-missing':
-			return __( 'Choose a scenario with --scenario saved or --scenario session.' );
+			return __(
+				'Choose a scenario with --scenario saved, session, provision (a dedicated eval profile) or retire (its sign-out).'
+			);
 		case 'scenario-unknown':
-			return __( 'The scenario must be saved or session.' );
+			return __( 'The scenario must be saved, session, provision or retire.' );
 		case 'gate-unknown':
 			return __( 'The optional gates are T1, T2, T3 and T4.' );
 		case 'option-not-for-session':
 			return __(
 				'The session scenario uses the model, effort and site of the saved run in the same directory, so it takes no --model, --effort or --gates.'
+			);
+		case 'option-not-for-profile':
+			return __(
+				'The provision and retire scenarios only sign a dedicated eval profile in or out, so they take no --model, --effort or --gates.'
 			);
 		case 'option-unknown':
 			return __( 'That option isn’t one this runner takes.' );
@@ -2314,10 +2379,12 @@ function describeIsolationProblem( problem: AcceptanceIsolationProblem ): string
 			return __( 'The run directory must be an absolute path.' );
 		case 'run-dir-not-empty':
 			return __(
-				'The saved scenario starts a new run: choose a run directory that doesn’t exist yet or is empty.'
+				'The saved and provision scenarios start a new run: choose a run directory that doesn’t exist yet or is empty.'
 			);
 		case 'run-dir-not-found':
-			return __( 'The session scenario continues a saved run: pass that run’s directory.' );
+			return __(
+				'The session and retire scenarios continue an earlier run: pass that run’s directory.'
+			);
 		case 'run-dir-in-studio-profile':
 			return __( 'The run directory can’t be inside your Studio profile.' );
 	}
@@ -2336,6 +2403,7 @@ type SessionProblem =
 	| 'manifest-missing'
 	| 'manifest-unreadable'
 	| 'no-saved-run'
+	| 'no-provision-run'
 	| 'source-changed'
 	| 'registration-missing';
 
@@ -2343,12 +2411,16 @@ function describeSessionProblem( problem: SessionProblem ): string {
 	switch ( problem ) {
 		case 'manifest-missing':
 			return __(
-				'This run directory has no manifest from a saved run, so there is nothing to continue. Run the saved scenario in it first.'
+				'This run directory has no manifest from an earlier run, so there is nothing to continue. Run the saved or provision scenario in it first.'
 			);
 		case 'manifest-unreadable':
 			return __( 'Studio can’t read this run directory’s manifest, so nothing was run.' );
 		case 'no-saved-run':
 			return __( 'This run directory has no saved run to continue.' );
+		case 'no-provision-run':
+			return __(
+				'This run directory holds no dedicated eval profile: run the provision scenario in a new directory first.'
+			);
 		case 'source-changed':
 			return __(
 				'The saved run in this directory used a different source commit. Run both scenarios from the same commit.'
@@ -2362,13 +2434,14 @@ function describeSessionProblem( problem: SessionProblem ): string {
 
 function usage(): string {
 	return __(
-		'Usage: node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario saved|session --run-dir <absolute path> [--live] [--model <model>] [--effort <effort>] [--gates T1,T2,T3,T4]'
+		'Usage: node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario saved|session|provision|retire --run-dir <absolute path> [--live] [--model <model>] [--effort <effort>] [--gates T1,T2,T3,T4]'
 	);
 }
 
-function checkSessionCompatibility(
+function checkContinuedRun(
 	evidence: AcceptanceEvidence,
-	facts: RunFacts
+	facts: RunFacts,
+	from: 'saved' | 'provision'
 ):
 	| { ok: true; saved: ManifestRun; state: AcceptanceState }
 	| { ok: false; problem: SessionProblem } {
@@ -2385,11 +2458,12 @@ function checkSessionCompatibility(
 		}
 		throw error;
 	}
-	const saved = [ ...runs ].reverse().find( ( run ) => run.scenario === 'saved' );
+	const saved = [ ...runs ].reverse().find( ( run ) => run.scenario === from );
 	if ( ! saved ) {
-		return { ok: false, problem: 'no-saved-run' };
+		return { ok: false, problem: from === 'saved' ? 'no-saved-run' : 'no-provision-run' };
 	}
-	if ( ! facts.source.sha || saved.source.sha !== facts.source.sha ) {
+	// A sign-out works from any commit; a session continues the saved run's.
+	if ( from === 'saved' && ( ! facts.source.sha || saved.source.sha !== facts.source.sha ) ) {
 		return { ok: false, problem: 'source-changed' };
 	}
 	let state: Record< string, unknown > | null;
@@ -2409,7 +2483,7 @@ function checkSessionCompatibility(
 }
 
 function printPlan( print: ( line: string ) => void, options: ChatGptAcceptanceOptions ): void {
-	const stages = options.scenario === 'saved' ? SAVED_STAGES : SESSION_STAGES;
+	const stages = STAGES[ options.scenario ];
 	print(
 		sprintf(
 			/* translators: 1: scenario name, 2: model, 3: reasoning effort. */
@@ -2468,7 +2542,7 @@ export async function runChatGptAcceptance(
 	const options = { ...parsed.options };
 	const isolation = applyAcceptanceIsolation( deps.env, {
 		runDir: options.runDir,
-		mustBeNew: options.scenario === 'saved',
+		mustBeNew: acceptanceStartsNewRun( options.scenario ),
 		home: deps.home,
 	} );
 	if ( ! isolation.ok ) {
@@ -2497,10 +2571,11 @@ export async function runChatGptAcceptance(
 
 	const facts = await deps.collectFacts();
 	let state: AcceptanceState = { schemaVersion: 1 };
-	if ( options.scenario === 'session' ) {
-		const compatible = checkSessionCompatibility(
+	if ( options.scenario === 'session' || options.scenario === 'retire' ) {
+		const compatible = checkContinuedRun(
 			openAcceptanceEvidence( paths.runDir, CHATGPT_ACCEPTANCE_PROVIDER ),
-			facts
+			facts,
+			options.scenario === 'session' ? 'saved' : 'provision'
 		);
 		if ( ! compatible.ok ) {
 			print( describeSessionProblem( compatible.problem ) );
@@ -2589,7 +2664,7 @@ export async function runChatGptAcceptance(
 		let gateFailed = false;
 		let cleanup: StageRecord;
 		try {
-			for ( const definition of options.scenario === 'saved' ? SAVED_STAGES : SESSION_STAGES ) {
+			for ( const definition of STAGES[ options.scenario ] ) {
 				const record = await executeStage( ctx, definition );
 				if ( record.status !== 'failed' && record.status !== 'blocked' ) {
 					continue;
@@ -2626,6 +2701,13 @@ export async function runChatGptAcceptance(
 					? __( 'Result: the required stages passed; a requested gate failed.' )
 					: __( 'Result: every required stage passed.' )
 			);
+			if ( options.scenario === 'provision' ) {
+				print(
+					__(
+						'The dedicated eval profile is ready and stays signed in. For a provider-qualified eval, set STUDIO_EVAL_CHATGPT_PROFILE to the profile folder of this run directory and STUDIO_EVAL_CONNECTION to the registrationId in its state.json. Retire it with --scenario retire and the same run directory.'
+					)
+				);
+			}
 		}
 		if ( interrupted ) {
 			return EXIT_INTERRUPTED;

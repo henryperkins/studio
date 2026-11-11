@@ -49,48 +49,58 @@ describe( 'ChatGPT acceptance entry', () => {
 		expect( source.indexOf( 'applyAcceptanceIsolation(' ) ).toBeLessThan( runnerImport );
 	} );
 
-	it( 'points the profile and process manager at the run directory before the runner loads', async () => {
-		const runDir = path.join( base, 'run' );
-		const seen: Record< string, string | undefined > = {};
-		const run = vi.fn( async () => 2 );
-		vi.doMock( 'cli/ai/chatgpt-acceptance', () => {
-			for ( const name of [
-				'DEV_CONFIG_DIR',
-				'STUDIO_PROCESS_MANAGER_HOME',
-				'E2E_APP_DATA_PATH',
-				'E2E_CLI_CONFIG_PATH',
-				'E2E_HOME_PATH',
-			] ) {
-				seen[ name ] = process.env[ name ];
-			}
-			return {
-				runChatGptAcceptance: run,
-				createLiveChatGptAcceptanceDependencies: () => ( { live: true } ),
-			};
-		} );
-		const exit = vi.spyOn( process, 'exit' ).mockImplementation( () => undefined as never );
-		process.env.DEV_CONFIG_DIR = path.join( os.homedir(), '.studio' );
-		delete process.env.STUDIO_PROCESS_MANAGER_HOME;
-		process.env.E2E_CLI_CONFIG_PATH = path.join( base, 'outside' );
-		process.env.E2E_HOME_PATH = path.join( base, 'outside' );
-		process.argv = [ 'node', 'chatgpt-acceptance.mjs', '--scenario', 'saved', '--run-dir', runDir ];
+	it.each( [ 'saved', 'provision' ] )(
+		'points the profile and process manager at a new %s run directory before the runner loads',
+		async ( scenario ) => {
+			const runDir = path.join( base, 'run' );
+			const seen: Record< string, string | undefined > = {};
+			const run = vi.fn( async () => 2 );
+			vi.doMock( 'cli/ai/chatgpt-acceptance', () => {
+				for ( const name of [
+					'DEV_CONFIG_DIR',
+					'STUDIO_PROCESS_MANAGER_HOME',
+					'E2E_APP_DATA_PATH',
+					'E2E_CLI_CONFIG_PATH',
+					'E2E_HOME_PATH',
+				] ) {
+					seen[ name ] = process.env[ name ];
+				}
+				return {
+					runChatGptAcceptance: run,
+					createLiveChatGptAcceptanceDependencies: () => ( { live: true } ),
+				};
+			} );
+			const exit = vi.spyOn( process, 'exit' ).mockImplementation( () => undefined as never );
+			process.env.DEV_CONFIG_DIR = path.join( os.homedir(), '.studio' );
+			delete process.env.STUDIO_PROCESS_MANAGER_HOME;
+			process.env.E2E_CLI_CONFIG_PATH = path.join( base, 'outside' );
+			process.env.E2E_HOME_PATH = path.join( base, 'outside' );
+			process.argv = [
+				'node',
+				'chatgpt-acceptance.mjs',
+				'--scenario',
+				scenario,
+				'--run-dir',
+				runDir,
+			];
 
-		await import( 'cli/ai/chatgpt-acceptance-entry' );
-		await vi.waitFor( () => expect( exit ).toHaveBeenCalledWith( 2 ) );
+			await import( 'cli/ai/chatgpt-acceptance-entry' );
+			await vi.waitFor( () => expect( exit ).toHaveBeenCalledWith( 2 ) );
 
-		const paths = acceptanceRunPaths( runDir );
-		expect( seen ).toEqual( {
-			DEV_CONFIG_DIR: paths.profileDir,
-			STUDIO_PROCESS_MANAGER_HOME: paths.daemonDir,
-			E2E_APP_DATA_PATH: paths.appDataDir,
-			E2E_CLI_CONFIG_PATH: paths.profileDir,
-			E2E_HOME_PATH: undefined,
-		} );
-		expect( run ).toHaveBeenCalledWith( [ '--scenario', 'saved', '--run-dir', runDir ], {
-			live: true,
-		} );
-		expect( fs.existsSync( runDir ) ).toBe( false );
-	} );
+			const paths = acceptanceRunPaths( runDir );
+			expect( seen ).toEqual( {
+				DEV_CONFIG_DIR: paths.profileDir,
+				STUDIO_PROCESS_MANAGER_HOME: paths.daemonDir,
+				E2E_APP_DATA_PATH: paths.appDataDir,
+				E2E_CLI_CONFIG_PATH: paths.profileDir,
+				E2E_HOME_PATH: undefined,
+			} );
+			expect( run ).toHaveBeenCalledWith( [ '--scenario', scenario, '--run-dir', runDir ], {
+				live: true,
+			} );
+			expect( fs.existsSync( runDir ) ).toBe( false );
+		}
+	);
 } );
 
 describe( 'CLI build configurations', () => {

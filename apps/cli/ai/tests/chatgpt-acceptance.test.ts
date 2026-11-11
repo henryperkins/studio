@@ -28,7 +28,7 @@ import { getConfigDirectory } from '@studio/common/lib/well-known-paths';
 import nock from 'nock';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { findUnsafeText, openAcceptanceEvidence } from 'cli/ai/acceptance-evidence';
-import { acceptanceRunPaths } from 'cli/ai/acceptance-isolation';
+import { acceptanceRunPaths, acceptanceStartsNewRun } from 'cli/ai/acceptance-isolation';
 import {
 	acceptancePlatform,
 	askOwnerForSessionToken,
@@ -40,6 +40,8 @@ import {
 	isWpCliReadCommand,
 	parseChatGptAcceptanceArgs,
 	parseWpPostList,
+	PROVISION_STAGE_NAMES,
+	RETIRE_STAGE_NAMES,
 	runChatGptAcceptance,
 	SAVED_STAGE_NAMES,
 	SESSION_STAGE_NAMES,
@@ -1728,6 +1730,233 @@ describe( 'ChatGPT acceptance runner', () => {
 				expect( unlisted.calls.log.filter( ( call ) => call.startsWith( 'turn:smoke-' ) ) ).toEqual(
 					[]
 				);
+			} );
+		} );
+	} );
+
+	describe( 'a dedicated eval profile: provision and retire', () => {
+		const provisionArgs = () => [ '--live', '--scenario', 'provision', '--run-dir', runDir ];
+		const retireArgs = () => [ '--live', '--scenario', 'retire', '--run-dir', runDir ];
+
+		it( 'takes no model, effort or gates, and starts or continues a run as each scenario does', async () => {
+			for ( const scenario of [ 'provision', 'retire' ] ) {
+				expect(
+					parseChatGptAcceptanceArgs( [
+						'--scenario',
+						scenario,
+						'--run-dir',
+						runDir,
+						'--gates',
+						'T1',
+					] )
+				).toMatchObject( { ok: false, problem: 'option-not-for-profile' } );
+				expect(
+					parseChatGptAcceptanceArgs( [ '--scenario', scenario, '--run-dir', runDir ] )
+				).toMatchObject( { ok: true, options: { scenario, gates: [] } } );
+			}
+			expect( acceptanceStartsNewRun( 'provision' ) ).toBe( true );
+			expect( acceptanceStartsNewRun( 'saved' ) ).toBe( true );
+			expect( acceptanceStartsNewRun( 'retire' ) ).toBe( false );
+			expect( acceptanceStartsNewRun( 'session' ) ).toBe( false );
+
+			fs.mkdirSync( runDir, { recursive: true } );
+			fs.writeFileSync( path.join( runDir, 'left-over' ), '' );
+			expect( await runChatGptAcceptance( provisionArgs(), dependencies() ) ).toBe( 2 );
+			expect( printed.join( '\n' ) ).toMatch( /empty/ );
+		} );
+
+		it( 'without --live, prints the provision plan and creates nothing', async () => {
+			const create = vi.fn();
+			expect(
+				await runChatGptAcceptance(
+					[ '--scenario', 'provision', '--run-dir', runDir ],
+					dependencies( undefined, { createServices: create } )
+				)
+			).toBe( 2 );
+			expect( create ).not.toHaveBeenCalled();
+			expect( fs.existsSync( runDir ) ).toBe( false );
+			const output = printed.join( '\n' );
+			expect( output ).toMatch( /Dry check only/ );
+			for ( const stage of PROVISION_STAGE_NAMES ) {
+				expect( output ).toContain( stage );
+			}
+		} );
+
+		it( 'provisions: signs one registration in to the run’s profile with secure storage and leaves it signed in', async () => {
+			const { services, calls } = scriptedServices();
+			expect( await runChatGptAcceptance( provisionArgs(), dependencies( services ) ) ).toBe( 0 );
+			expect( records().map( ( record ) => [ record.stage, record.status ] ) ).toEqual( [
+				...PROVISION_STAGE_NAMES.map( ( stage ) => [ stage, 'passed' ] ),
+				[ 'cleanup', 'passed' ],
+			] );
+			expect( stageOf( 'profile-sign-in' )[ 0 ].observations ).toMatchObject( {
+				signedIn: true,
+				storedInVault: true,
+				leftSignedIn: true,
+			} );
+			expect( calls.log.filter( ( call ) => call.startsWith( 'begin:' ) ) ).toEqual( [
+				'begin:vault',
+			] );
+			expect( calls.log ).not.toContain( 'sign-out' );
+			expect( calls.log.some( ( call ) => call.startsWith( 'turn:' ) ) ).toBe( false );
+			expect( calls.log.some( ( call ) => call.startsWith( 'cli:' ) ) ).toBe( false );
+			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readState() ).toMatchObject( {
+				registrationId: REGISTRATION,
+				storage: 'vault',
+			} );
+			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readManifest()?.runs ).toEqual( [
+				expect.objectContaining( { run: 1, scenario: 'provision', gates: [] } ),
+			] );
+			expect( process.env.DEV_CONFIG_DIR ).toBe( acceptanceRunPaths( runDir ).profileDir );
+			expect( printed.join( '\n' ) ).toMatch( /STUDIO_EVAL_CHATGPT_PROFILE/ );
+			expectNothingUnsafe( [ 'test-access-token' ] );
+		} );
+
+		it( 'signs a registration it signed in back out when provisioning fails', async () => {
+			const { services, calls } = scriptedServices();
+			services.broker.vaultRecordExists = () => false;
+			expect( await runChatGptAcceptance( provisionArgs(), dependencies( services ) ) ).toBe( 1 );
+			expect( stageOf( 'profile-sign-in' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'vault-record-missing',
+			} );
+			expect( calls.log.filter( ( call ) => call === 'sign-out' ) ).toHaveLength( 1 );
+			expect( stageOf( 'cleanup' )[ 0 ].observations ).toMatchObject( {
+				testRegistrationSignedOut: true,
+			} );
+		} );
+
+		describe( 'retire', () => {
+			function provisioned() {
+				fs.mkdirSync( runDir, { recursive: true } );
+				const evidence = openAcceptanceEvidence( runDir, 'chatgpt' );
+				evidence.startRun( {
+					scenario: 'provision',
+					createdOn: '2026-11-11',
+					source: { sha: 'f'.repeat( 40 ), dirty: false },
+					platform: { os: 'win32', release: '10.0.26320', arch: 'x64' },
+					runtime: { node: '24.22.1', npm: '11.13.0' },
+					build: { cliVersion: '1.7.3', buildId: 'a1b2c3d4e5f6' },
+					model: 'gpt-6-luna',
+					effort: 'medium',
+					gates: [],
+				} );
+				evidence.writeState( { schemaVersion: 1, registrationId: REGISTRATION, storage: 'vault' } );
+			}
+
+			// Scripted services with the provisioned registration signed in.
+			function signedIn( overrides: Partial< ChatGptAcceptanceServices[ 'broker' ] > = {} ) {
+				const scripted = scriptedServices();
+				const { services } = scripted;
+				const signedInAccount = {
+					registrationId: REGISTRATION,
+					issuer: 'https://auth.openai.com',
+					subject: 'test-subject',
+					email: null,
+					clientId: 'test-client',
+					label: 'Test',
+					revision: 1,
+					logoutGeneration: 0,
+					storage: 'vault' as const,
+					state: 'signed-in' as const,
+					createdAt: '',
+					updatedAt: '',
+				};
+				let signedOut = false;
+				services.broker = {
+					...services.broker,
+					readAccount: async () =>
+						signedOut ? { ...signedInAccount, state: 'signed-out' as const } : signedInAccount,
+					signOut: async () => {
+						scripted.calls.log.push( 'sign-out' );
+						signedOut = true;
+						return { localCleared: true, remoteRevocationConfirmed: true };
+					},
+					...overrides,
+				};
+				return scripted;
+			}
+
+			it( 'refuses a run directory without a provisioned profile, before anything runs', async () => {
+				const create = vi.fn();
+				expect(
+					await runChatGptAcceptance(
+						retireArgs(),
+						dependencies( undefined, { createServices: create } )
+					)
+				).toBe( 2 );
+				fs.mkdirSync( runDir, { recursive: true } );
+				printed = [];
+				expect(
+					await runChatGptAcceptance(
+						retireArgs(),
+						dependencies( undefined, { createServices: create } )
+					)
+				).toBe( 2 );
+				expect( printed.join( '\n' ) ).toMatch( /no manifest/i );
+
+				openAcceptanceEvidence( runDir, 'chatgpt' ).startRun( {
+					scenario: 'saved',
+					createdOn: '2026-11-11',
+					source: { sha: SHA, dirty: false },
+					platform: { os: 'win32', release: '10.0.26320', arch: 'x64' },
+					runtime: { node: '24.22.1', npm: '11.13.0' },
+					build: { cliVersion: '1.7.3', buildId: 'a1b2c3d4e5f6' },
+					model: 'gpt-6-luna',
+					effort: 'medium',
+					gates: [],
+				} );
+				printed = [];
+				expect(
+					await runChatGptAcceptance(
+						retireArgs(),
+						dependencies( undefined, { createServices: create } )
+					)
+				).toBe( 2 );
+				expect( printed.join( '\n' ) ).toMatch( /no dedicated eval profile/ );
+				expect( create ).not.toHaveBeenCalled();
+			} );
+
+			it( 'signs the profile’s registration out, from any commit, and reports the remote revocation', async () => {
+				provisioned();
+				const { services, calls } = signedIn();
+				expect( await runChatGptAcceptance( retireArgs(), dependencies( services ) ) ).toBe( 0 );
+				expect( records().map( ( record ) => [ record.stage, record.status ] ) ).toEqual( [
+					...RETIRE_STAGE_NAMES.map( ( stage ) => [ stage, 'passed' ] ),
+					[ 'cleanup', 'passed' ],
+				] );
+				expect( stageOf( 'profile-sign-out' )[ 0 ].observations ).toMatchObject( {
+					wasSignedIn: true,
+					localCleared: true,
+					remoteRevocationConfirmed: true,
+				} );
+				expect( calls.log.filter( ( call ) => call === 'sign-out' ) ).toHaveLength( 1 );
+				expect( calls.log.some( ( call ) => call.startsWith( 'begin:' ) ) ).toBe( false );
+				expectNothingUnsafe( [ 'test-access-token' ] );
+			} );
+
+			it( 'fails when the remote revocation is not confirmed, and blocks a profile already signed out', async () => {
+				provisioned();
+				const unconfirmed = signedIn( {
+					signOut: async () => ( { localCleared: true, remoteRevocationConfirmed: false } ),
+				} );
+				expect(
+					await runChatGptAcceptance( retireArgs(), dependencies( unconfirmed.services ) )
+				).toBe( 1 );
+				expect( stageOf( 'profile-sign-out' )[ 0 ] ).toMatchObject( {
+					status: 'failed',
+					code: 'remote-revocation-unconfirmed',
+					observations: { localCleared: true, remoteRevocationConfirmed: false },
+				} );
+
+				const { services } = signedIn( {
+					readAccount: async () => null,
+				} );
+				expect( await runChatGptAcceptance( retireArgs(), dependencies( services ) ) ).toBe( 1 );
+				expect( stageOf( 'profile-sign-out' )[ 1 ] ).toMatchObject( {
+					status: 'blocked',
+					code: 'already-signed-out',
+				} );
 			} );
 		} );
 	} );

@@ -35,6 +35,11 @@ export type AcceptanceRunDirectoryCheck =
 	| { ok: true; paths: AcceptanceRunPaths }
 	| { ok: false; problem: AcceptanceIsolationProblem };
 
+/** Whether a scenario starts a run, in a new or empty directory, rather than continuing one. */
+export function acceptanceStartsNewRun( scenario: string | undefined ): boolean {
+	return scenario === 'saved' || scenario === 'provision';
+}
+
 /** The value of `--name value` or `--name=value`, without parsing anything else. */
 export function readAcceptanceArgument(
 	argv: readonly string[],
@@ -194,4 +199,54 @@ export function findRealProfileLeak(
 /** Whether `inner` is inside `outer`, as the run's checks compare paths. */
 export function isInsideAcceptanceRun( inner: string, outer: string ): boolean {
 	return isWithin( inner, outer );
+}
+
+export type DedicatedProfileProblem =
+	| 'profile-relative'
+	| 'profile-not-found'
+	| 'profile-in-studio-profile'
+	| 'profile-is-config-directory';
+
+const resolvedPath = ( value: string ) => {
+	try {
+		return fs.realpathSync.native( value );
+	} catch {
+		return path.resolve( value );
+	}
+};
+
+/**
+ * Checks, without changing anything, a dedicated test profile a development
+ * runner signs in to for testing: absolute, an existing directory, neither
+ * the user's Studio profile nor inside it (also once links resolve), and not
+ * where this process keeps its own Studio config, which would put what a run
+ * seeds into the test profile.
+ */
+export function checkDedicatedProfile(
+	profileDir: string,
+	{ home, configDirectory }: { home: string; configDirectory: string }
+): DedicatedProfileProblem | null {
+	if ( ! path.isAbsolute( profileDir ) ) {
+		return 'profile-relative';
+	}
+	try {
+		if ( ! fs.statSync( profileDir ).isDirectory() ) {
+			return 'profile-not-found';
+		}
+	} catch {
+		return 'profile-not-found';
+	}
+	const profile = resolvedPath( profileDir );
+	const studio = realStudioProfile( home );
+	if (
+		[ studio, resolvedPath( studio ) ].some(
+			( outer ) => isWithin( profileDir, outer ) || isWithin( profile, outer )
+		)
+	) {
+		return 'profile-in-studio-profile';
+	}
+	return isWithin( resolvedPath( configDirectory ), profile ) ||
+		isWithin( configDirectory, profileDir )
+		? 'profile-is-config-directory'
+		: null;
 }

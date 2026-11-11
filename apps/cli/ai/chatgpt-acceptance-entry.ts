@@ -1,6 +1,10 @@
 import os from 'node:os';
 import { __ } from '@wordpress/i18n';
-import { applyAcceptanceIsolation, readAcceptanceArgument } from './acceptance-isolation';
+import {
+	acceptanceStartsNewRun,
+	applyAcceptanceIsolation,
+	readAcceptanceArgument,
+} from './acceptance-isolation';
 
 // Development only. The run's Studio profile, process manager and sites are
 // set before any application module loads: some of them read their paths from
@@ -9,7 +13,7 @@ import { applyAcceptanceIsolation, readAcceptanceArgument } from './acceptance-i
 const argv = process.argv.slice( 2 );
 applyAcceptanceIsolation( process.env, {
 	runDir: readAcceptanceArgument( argv, '--run-dir' ),
-	mustBeNew: readAcceptanceArgument( argv, '--scenario' ) === 'saved',
+	mustBeNew: acceptanceStartsNewRun( readAcceptanceArgument( argv, '--scenario' ) ),
 	home: os.homedir(),
 } );
 
