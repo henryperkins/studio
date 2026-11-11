@@ -406,3 +406,37 @@ it( 'passes the exact dispatched turn ID through the existing input payload', ()
 	} );
 	child.emit( 'exit', 0 );
 } );
+
+it( 'hands attached images and files to the turn in the input payload, never on the command line', () => {
+	const child = createChild();
+	mockFork.mockReturnValueOnce( child as never );
+	const manager = createAgentRunManager( {
+		cliBinary: '/cli.mjs',
+		surface: 'desktop',
+		emit: vi.fn(),
+	} );
+	const image = {
+		id: 'image-1',
+		name: 'moodboard.png',
+		mimeType: 'image/png' as const,
+		size: 11,
+		dataBase64: 'aW1hZ2UtYnl0ZXM=',
+	};
+	const file = { id: 'file-1', name: 'brief.md', path: '/files/brief.md' };
+	manager.startAgentRun( {
+		sessionId: 'attachments',
+		prompt: 'Use these',
+		images: [ image ],
+		files: [ file ],
+	} );
+	const args = mockFork.mock.calls.at( -1 )![ 1 ] as string[];
+	expect( args ).not.toContain( 'Use these' );
+	expect( JSON.stringify( args ) ).not.toContain( image.dataBase64 );
+	const input = args[ args.indexOf( '--input-payload' ) + 1 ];
+	expect( JSON.parse( fs.readFileSync( input, 'utf8' ) ) ).toMatchObject( {
+		prompt: 'Use these',
+		images: [ image ],
+		files: [ file ],
+	} );
+	child.emit( 'exit', 0 );
+} );

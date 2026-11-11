@@ -324,6 +324,40 @@ describe( 'ChatGPT interactive CLI', () => {
 		expect( offered ).toEqual( [ [ 'GPT-6 Luna · gpt-6-luna' ], [ 'Low', 'Medium' ] ] );
 	} );
 
+	it( 'runs a turn with attached images and files on the chat’s pinned connection, model and effort', async () => {
+		const old = await previousChat();
+		const image = {
+			id: 'image-1',
+			name: 'moodboard.png',
+			mimeType: 'image/png' as const,
+			size: 11,
+			dataBase64: 'aW1hZ2UtYnl0ZXM=',
+		};
+		const brief = path.join( root, 'brief.md' );
+		const ui = terminal( [], [] );
+		await runCommand( {
+			adapter: ui,
+			resumeSession: resume( old ),
+			initialMessage: 'Use these',
+			initialImages: [ image ],
+			initialFiles: [ { id: 'file-1', name: 'brief.md', path: brief } ],
+		} );
+		expect( ui.showError ).not.toHaveBeenCalled();
+		expect( runs ).toHaveLength( 1 );
+		const { config } = runs[ 0 ];
+		expect( config.images ).toEqual( [ image ] );
+		expect( config.prompt ).toBe(
+			`Use these\n\nAttached files (read them as needed):\n- ${ brief }`
+		);
+		expect( config.connection ).toEqual( {
+			connectionId: A,
+			revision: 1,
+			model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' },
+		} );
+		expect( config.chatGpt ).toEqual( { reasoningEffort: 'medium' } );
+		expect( config.openAi ).toBeUndefined();
+	} );
+
 	it( 'preserves the account on /clear while dropping the previous conversation', async () => {
 		const old = await previousChat();
 		await runCommand( {

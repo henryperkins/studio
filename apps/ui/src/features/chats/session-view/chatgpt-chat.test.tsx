@@ -100,12 +100,20 @@ async function setup( entries = [ pin( INITIAL ) ], withApi = false ) {
 		id: string;
 		selection: ReturnType< typeof readChatGptSessionSelection >;
 		entries: SessionEntry[];
+		prompt: string;
+		options: Parameters< typeof connector.continueSession >[ 2 ];
 	} > = [];
-	connector.continueSession.mockImplementation( async ( id ) => {
+	connector.continueSession.mockImplementation( async ( id, prompt, options ) => {
 		const entries = structuredClone(
 			connector.state.sessions.find( ( item ) => item.summary.id === id )!.entries
 		);
-		runs.push( { id, entries, selection: readChatGptSessionSelection( entries ) } );
+		runs.push( {
+			id,
+			entries,
+			selection: readChatGptSessionSelection( entries ),
+			prompt,
+			options,
+		} );
 		return { runId: `run-${ runs.length }` };
 	} );
 	const view = renderApp( { connector, path: '/sessions/chat' } );
@@ -153,6 +161,34 @@ describe( 'ChatGPT chats', () => {
 		expect( runs[ 0 ].selection ).toEqual( { ...INITIAL, reasoningEffort: 'low' } );
 		expect( connector.setSessionOpenAiSelection ).not.toHaveBeenCalled();
 		expect( connector.setAiProvider ).not.toHaveBeenCalled();
+	} );
+
+	it( 'sends attached images and documents with the turn on the pinned ChatGPT selection', async () => {
+		const { runs } = await setup();
+		fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
+			target: {
+				files: [
+					new File( [ 'image-bytes' ], 'moodboard.png', { type: 'image/png' } ),
+					new File( [ '# Brief' ], 'brief.md', { type: 'text/markdown' } ),
+				],
+			},
+		} );
+		await screen.findByRole( 'listitem', { name: /^moodboard\.png/ } );
+		await screen.findByRole( 'listitem', { name: /^brief\.md/ } );
+		send( 'Use these' );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( runs[ 0 ].selection ).toEqual( INITIAL );
+		expect( runs[ 0 ].prompt ).toBe( 'Use these' );
+		expect( runs[ 0 ].options?.images ).toEqual( [
+			expect.objectContaining( {
+				name: 'moodboard.png',
+				mimeType: 'image/png',
+				dataBase64: btoa( 'image-bytes' ),
+			} ),
+		] );
+		expect( runs[ 0 ].options?.files ).toEqual( [
+			expect.objectContaining( { name: 'brief.md', path: expect.stringMatching( /brief\.md$/ ) } ),
+		] );
 	} );
 
 	it( 'waits for the shown save and holds choices made after Send for the following turn', async () => {

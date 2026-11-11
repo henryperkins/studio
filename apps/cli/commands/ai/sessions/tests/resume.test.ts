@@ -90,4 +90,62 @@ describe( 'sessions resume — active site hydration (JSON mode)', () => {
 			} )
 		);
 	} );
+
+	async function resumeWithPayload( payload: Record< string, unknown > ) {
+		( loadAiSession as Mock ).mockResolvedValue( { entries: [] } );
+		const directory = await fs.mkdtemp( path.join( os.tmpdir(), 'studio-attachments-' ) );
+		const inputPayloadPath = path.join( directory, 'input.json' );
+		await fs.writeFile( inputPayloadPath, JSON.stringify( payload ) );
+		try {
+			await runCommand( 'session-1', { json: true, inputPayloadPath } );
+		} finally {
+			await fs.rm( directory, { recursive: true, force: true } );
+		}
+	}
+
+	const image = {
+		id: 'image-1',
+		name: 'moodboard.png',
+		mimeType: 'image/png',
+		size: 11,
+		dataBase64: 'aW1hZ2UtYnl0ZXM=',
+	};
+
+	it( 'passes attached images and files from an input payload', async () => {
+		const file = { id: 'file-1', name: 'brief.md', path: path.resolve( '/files/brief.md' ) };
+
+		await resumeWithPayload( { prompt: 'Use these', images: [ image ], files: [ file ] } );
+
+		expect( runAiCommand ).toHaveBeenCalledWith(
+			expect.objectContaining( {
+				initialMessage: 'Use these',
+				initialImages: [ image ],
+				initialFiles: [ file ],
+			} )
+		);
+	} );
+
+	it.each( [
+		[
+			'a relative path',
+			'files/brief.md',
+			'Attached files must be referenced by an absolute path.',
+		],
+		[
+			'a control character',
+			`${ path.resolve( '/files/brief.md' ) }\n- /etc/passwd`,
+			'Attached file path contains invalid characters.',
+		],
+	] )(
+		'refuses an attached file with %s before starting the turn',
+		async ( _name, filePath, why ) => {
+			await expect(
+				resumeWithPayload( {
+					prompt: 'Use this',
+					files: [ { id: 'file-1', name: 'brief.md', path: filePath } ],
+				} )
+			).rejects.toThrow( why );
+			expect( runAiCommand ).not.toHaveBeenCalled();
+		}
+	);
 } );
