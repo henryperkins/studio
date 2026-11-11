@@ -73,6 +73,12 @@ Owners are plan tasks. Test files are under `packages/agent/` unless noted.
 
 Image generation (spec boundary, recorded only): see section G.
 
+### G1 record (November 11, 2026)
+
+- **Session-only failure diagnosis: not reproduced offline; live diagnosis pending in G3.** The last two records of the retained `evidence.ndjson` are `session-only-browser-opened` and `session-only-acceptance` (`ok: false`, `assertion-failed`). The assertion that failed was the harness's own `outcome.ok` check, made before the outcome's code was recorded. The failure record follows the browser record by 599.5 s, against the attempt's 600 s bound, so the outcome was almost certainly `timed-out`: no callback with a valid state reached the loopback listener within 10 minutes. Denial, provider errors sent back to the callback, code/ID-token/identity/permission rejections and save failures would have ended the attempt when the callback arrived. Why the browser leg didn't finish (user, browser or provider page) can't be told offline. The earlier `sign-in-failed` and `prepare` records come from harness versions edited afterwards; their causes are not established.
+- **Offline reproduction:** the same sequence (saved-account sign-in, sign-out, returning sign-in with `storage: 'session'`) succeeds against the local fake authorization server.
+- **Regressions:** `node/chatgpt/tests/oauth.test.ts` (the reproduction, and a typed code with no URL or token for every failure ending of a returning session-only sign-in, `timed-out` included); `node/chatgpt/tests/credential-broker.test.ts` (refresh held across sign-out with a pending tool, vault and session; forked turn after its app exits; app killed during a refresh's vault write, two processes). Commit `449258a07`. Product source unchanged from `cd172dd08`. Status `offline-tested`; no live gate is passed by this record.
+
 ## B. Claude capability rows (PR #3, source SHA `ce4eea5dc`)
 
 Test files are under `packages/agent/node/claude-code/tests/` in the Claude worktree unless noted.
