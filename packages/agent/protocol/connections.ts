@@ -110,6 +110,8 @@ export interface ChatGptModelAvailability {
 	checkedAt: string | null;
 	/** The listed models Studio supports, in the list's order, or null while unknown. */
 	models: Array< { id: string; label: string } > | null;
+	/** The list also has models Studio hasn't qualified for this route, left out of `models`. */
+	listsUnqualifiedModels?: boolean;
 	/** Why the latest read failed, or null. A failed read keeps the list read at the same revision. */
 	lastError: ChatGptErrorSummary | null;
 }

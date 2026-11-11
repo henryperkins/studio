@@ -170,6 +170,45 @@ describe( 'fetchChatGptModels', () => {
 					capabilities: CHATGPT_MODEL_CAPABILITIES[ 'gpt-6-luna' ],
 				},
 			],
+			listsUnqualifiedModels: true,
+		} );
+	} );
+
+	it( 'says only whether the account lists models Studio hasn’t qualified, never which', async () => {
+		captureFetch( () =>
+			json( {
+				models: [
+					listed( 'gpt-6-luna', 'GPT-6 Luna' ),
+					listed( 'gpt-6.1-sol', 'GPT-6.1 Sol', { visibility: 'hide' } ),
+					{ display_name: 'No slug', visibility: 'list' },
+				],
+			} )
+		);
+		const qualifiedOnly = await fetchChatGptModels( ACCOUNT_A );
+		captureFetch( () =>
+			json( {
+				models: [ listed( 'gpt-7-nova', 'GPT-7 Nova' ), listed( 'gpt-6-luna', 'GPT-6 Luna' ) ],
+			} )
+		);
+		const withUnqualified = await fetchChatGptModels( ACCOUNT_A );
+
+		expect( qualifiedOnly ).not.toHaveProperty( 'listsUnqualifiedModels' );
+		expect( withUnqualified ).toMatchObject( { ok: true, listsUnqualifiedModels: true } );
+		expect( JSON.stringify( withUnqualified ) ).not.toMatch( /nova/i );
+		expect(
+			applyChatGptModelList(
+				null,
+				{ connectionId: ACCOUNT_A, revision: 1 },
+				withUnqualified,
+				'2026-11-08T10:00:00.000Z'
+			)
+		).toEqual( {
+			connectionId: ACCOUNT_A,
+			revision: 1,
+			checkedAt: '2026-11-08T10:00:00.000Z',
+			models: [ { id: 'gpt-6-luna', label: 'GPT-6 Luna' } ],
+			listsUnqualifiedModels: true,
+			lastError: null,
 		} );
 	} );
 
@@ -406,9 +445,10 @@ describe( 'fetchChatGptModels', () => {
 			const good = applyChatGptModelList(
 				null,
 				{ connectionId: ACCOUNT_A, revision: 1 },
-				goodList,
+				{ ...goodList, listsUnqualifiedModels: true } as ChatGptModelListResult,
 				'2026-11-08T10:00:00.000Z'
 			);
+			expect( good.listsUnqualifiedModels ).toBe( true );
 
 			expect(
 				applyChatGptModelList( good, { connectionId: ACCOUNT_A, revision: 1 }, failed )
