@@ -160,9 +160,33 @@ export function ChatGptSettingsGroup() {
 		( storage === 'session' || settings.data.secureStorage === 'available' );
 	const connected = account?.authStatus === 'connected';
 	const availability = models.data?.models;
-	const unqualifiedNote = models.data?.listsUnqualifiedModels
-		? ` ${ __( 'Some models this account offers aren’t supported in Studio yet.' ) }`
-		: '';
+	const listsUnqualified = !! models.data?.listsUnqualifiedModels;
+	const availabilityDescription = () => {
+		if ( ! availability ) {
+			return __( 'Check which supported models this account can use.' );
+		}
+		const names = availability.map( ( model ) => model.label ).join( ', ' );
+		if ( availability.length ) {
+			return listsUnqualified
+				? sprintf(
+						/* translators: %s: comma-separated model names. */
+						__(
+							'This account lists %s. Some models this account offers aren’t supported in Studio yet.'
+						),
+						names
+				  )
+				: sprintf(
+						/* translators: %s: comma-separated model names. */
+						__( 'This account lists %s.' ),
+						names
+				  );
+		}
+		return listsUnqualified
+			? __(
+					'This account lists none of the models Studio supports. Some models this account offers aren’t supported in Studio yet.'
+			  )
+			: __( 'This account lists none of the models Studio supports.' );
+	};
 
 	return (
 		<SettingsGroup
@@ -296,19 +320,7 @@ export function ChatGptSettingsGroup() {
 				<SettingsRow
 					title={ __( 'Available ChatGPT models' ) }
 					error={ models.error?.message }
-					description={
-						availability
-							? ( availability.length
-									? sprintf(
-											/* translators: %s: comma-separated model names. */ __(
-												'This account lists %s.'
-											),
-											availability.map( ( model ) => model.label ).join( ', ' )
-									  )
-									: __( 'This account lists none of the models Studio supports.' ) ) +
-							  unqualifiedNote
-							: __( 'Check which supported models this account can use.' )
-					}
+					description={ availabilityDescription() }
 				>
 					<Button
 						variant="outline"

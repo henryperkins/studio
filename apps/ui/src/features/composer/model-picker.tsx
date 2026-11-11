@@ -16,7 +16,8 @@ import { useUserPreferences } from '@/data/queries/use-user-preferences';
 import { useOpenSettings } from '@/data/use-open-settings';
 import { getCreditsLabel, getModelDescription } from '@/features/composer/model-options';
 import { PlusIcon, ChevronDownIcon, ClaudeIcon, WordPressIcon } from '@/lib/icons';
-import { Button, CommandSheet, Popover, type Command, type CommandGroup } from '@/lib/ui';
+import { Button, CommandList, Popover, type Command, type CommandGroup } from '@/lib/ui';
+import styles from './style.module.css';
 import type { AiModelId } from '@/data/core';
 import type { ModelLockReason } from '@/features/composer/use-model-access';
 import type { ChatGptAccountView } from '@studio/agent/protocol/chatgpt';
@@ -169,6 +170,18 @@ export function ModelPicker( {
 						icon: SparklesIcon,
 					},
 			  ];
+	// Says an account offers more without naming or offering those models. Kept outside the
+	// option list so it wraps and can't be chosen.
+	const unqualifiedNotes = chatGptAccounts.flatMap( ( account, index ) =>
+		account.authStatus === 'connected' && catalogs[ index ].data?.listsUnqualifiedModels
+			? [
+					{
+						connectionId: account.connectionId,
+						heading: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
+					},
+			  ]
+			: []
+	);
 	const groups: CommandGroup[] = [
 		{
 			label: __( 'Models' ),
@@ -201,20 +214,7 @@ export function ModelPicker( {
 			( account, index ): CommandGroup => ( {
 				label: `ChatGPT · ${ account.label } · ${ account.connectionId }`,
 				heading: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
-				items: [
-					...chatGptAccountItems( account, index ),
-					// Says the account offers more without naming or offering those models.
-					...( account.authStatus === 'connected' && catalogs[ index ].data?.listsUnqualifiedModels
-						? [
-								{
-									value: `unqualified:${ account.connectionId }`,
-									label: __( 'Some models this account offers aren’t supported in Studio yet' ),
-									disabled: true,
-									icon: InfoIcon,
-								},
-						  ]
-						: [] ),
-				],
+				items: chatGptAccountItems( account, index ),
 			} )
 		),
 		{
@@ -274,17 +274,39 @@ export function ModelPicker( {
 				<span>{ modelLabel }</span>
 				<ChevronDownIcon data-icon="inline-end" data-dropdown-indicator />
 			</Popover.Trigger>
-			<CommandSheet
-				label={ __( 'Choose a model' ) }
-				groups={ groups }
-				highlighted={ highlight }
-				onHighlight={ setHighlight }
-				onSelect={ pickCommand }
-				listRef={ listRef }
+			<Popover.Popup
+				variant="commands"
+				side="top"
 				anchor={ anchor }
 				initialFocus={ listRef }
 				finalFocus={ triggerRef }
-			/>
+				aria-label={ __( 'Choose a model' ) }
+			>
+				<CommandList
+					label={ __( 'Choose a model' ) }
+					groups={ groups }
+					highlighted={ highlight }
+					onHighlight={ setHighlight }
+					onSelect={ pickCommand }
+					listRef={ listRef }
+					className={ styles.pickerList }
+				/>
+				{ unqualifiedNotes.length ? (
+					<div className={ styles.pickerNotes }>
+						{ unqualifiedNotes.map( ( { connectionId, heading } ) => (
+							<p key={ connectionId } role="note" className={ styles.pickerNote }>
+								<InfoIcon className={ styles.pickerNoteIcon } aria-hidden="true" />
+								<span>
+									{ unqualifiedNotes.length > 1 ? (
+										<span className={ styles.pickerNoteAccount }>{ heading } </span>
+									) : null }
+									{ __( 'Some models this account offers aren’t supported in Studio yet' ) }
+								</span>
+							</p>
+						) ) }
+					</div>
+				) : null }
+			</Popover.Popup>
 		</Popover.Root>
 	);
 }

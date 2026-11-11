@@ -211,19 +211,19 @@ describe( 'ChatGPT chats', () => {
 
 		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
 		const personal = await screen.findByRole( 'group', { name: /ChatGPT · Personal/ } );
-		const note = await within( personal ).findByRole( 'option', {
-			name: /Some models this account offers aren’t supported in Studio yet/,
-		} );
 		const work = await screen.findByRole( 'group', { name: /ChatGPT · Work/ } );
+		const sentence = 'Some models this account offers aren’t supported in Studio yet';
+		await waitFor( () => expect( screen.getAllByRole( 'note' ) ).toHaveLength( 2 ) );
+		const notes = screen.getAllByRole( 'note' );
 
-		expect( note ).toHaveAttribute( 'aria-disabled', 'true' );
-		expect( within( personal ).getAllByRole( 'option' ) ).toHaveLength( 2 );
-		expect(
-			await within( work ).findByRole( 'option', {
-				name: /Some models this account offers aren’t supported in Studio yet/,
-			} )
-		).toHaveAttribute( 'aria-disabled', 'true' );
-		fireEvent.click( note );
+		expect( notes ).toHaveLength( 2 );
+		notes.forEach( ( note ) => expect( note ).toHaveTextContent( sentence ) );
+		expect( notes[ 0 ] ).toHaveTextContent( /Personal/ );
+		expect( notes[ 1 ] ).toHaveTextContent( /Work/ );
+		expect( screen.queryByRole( 'option', { name: /aren’t supported/ } ) ).not.toBeInTheDocument();
+		expect( within( personal ).getAllByRole( 'option' ) ).toHaveLength( 1 );
+		expect( within( work ).getAllByRole( 'option' ) ).toHaveLength( 1 );
+		fireEvent.click( notes[ 0 ] );
 		expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
 		expect( runs ).toHaveLength( 0 );
 	} );
@@ -235,9 +235,7 @@ describe( 'ChatGPT chats', () => {
 		const personal = await screen.findByRole( 'group', { name: /ChatGPT · Personal/ } );
 
 		expect( await within( personal ).findByRole( 'option', { name: /GPT-6 Luna/ } ) ).toBeVisible();
-		expect(
-			within( personal ).queryByRole( 'option', { name: /aren’t supported/ } )
-		).not.toBeInTheDocument();
+		expect( screen.queryByRole( 'note' ) ).not.toBeInTheDocument();
 	} );
 
 	it( 'sends attached images and documents with the turn on the pinned ChatGPT selection', async () => {
