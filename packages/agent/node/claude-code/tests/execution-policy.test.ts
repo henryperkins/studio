@@ -11,6 +11,7 @@ import { createPresentDesignOptionsTool } from '../../tools/present-design-optio
 import { createSkillTool } from '../../tools/skill';
 import { CLAUDE_EXECUTION_POLICY_REVISION } from '../execution-policy';
 import {
+	CLAUDE_ACCOUNT_RECHECK_MS,
 	CLAUDE_APPROVAL_TIMEOUT_MS,
 	CLAUDE_ENABLED_TOOLS,
 	CLAUDE_HOOK_TIMEOUT_SECONDS,
@@ -747,6 +748,15 @@ describe( 'Claude native search tools', () => {
 			[ 'Glob', { pattern: '../**' } ],
 			[ 'Glob', { pattern: 'wp-content/../../**' } ],
 			[ 'Glob', { pattern: '{..,x}/**' } ],
+			[ 'Glob', { pattern: '{/etc,x}/**' } ],
+			[ 'Glob', { pattern: '{C:/Users,x}/**' } ],
+			[ 'Glob', { pattern: '@(/etc)/**' } ],
+			[ 'Glob', { pattern: '{C:\\Users,x}/**' } ],
+			[ 'Glob', { pattern: '{\\\\server\\share,x}/**' } ],
+			[ 'Glob', { pattern: 'a{b,{x,/etc}}/**' } ],
+			[ 'Glob', { pattern: '+(x|/etc)/**' } ],
+			[ 'Glob', { pattern: '{x,~/.ssh}/**' } ],
+			[ 'Glob', { pattern: '[/]etc/**' } ],
 			[ 'Glob', { pattern: path.join( site, '**' ) } ],
 			[ 'Glob', { pattern: '/etc/**' } ],
 			[ 'Glob', { pattern: '~/**' } ],
@@ -768,6 +778,12 @@ describe( 'Claude shell confinement', () => {
 		toolUseId,
 	} );
 
+	const confinedSandbox = {
+		enabled: true,
+		allowUnsandboxedCommands: false,
+		autoAllowBashIfSandboxed: false,
+	};
+
 	it( 'keeps shell tools disabled unless the turn declares a confinement the policy can verify', async () => {
 		expect( CLAUDE_SHELL_CONFINEMENT ).toEqual( { mode: 'none' } );
 		const unconfined = await setup( () => ( { enabledTools: shell } ) );
@@ -783,13 +799,26 @@ describe( 'Claude shell confinement', () => {
 			{ enabled: false },
 			{ enabled: true },
 			{ enabled: true, allowUnsandboxedCommands: false, failIfUnavailable: false },
-			{ enabled: true, allowUnsandboxedCommands: false, autoAllowBashIfSandboxed: true },
-			{ enabled: true, allowUnsandboxedCommands: false, filesystem: { disabled: true } },
-			{
-				enabled: true,
-				allowUnsandboxedCommands: false,
-				filesystem: { allowWrite: [ path.dirname( workspace ) ] },
-			},
+			{ enabled: true, allowUnsandboxedCommands: false },
+			{ ...confinedSandbox, autoAllowBashIfSandboxed: true },
+			{ ...confinedSandbox, allowUnsandboxedCommands: true },
+			{ ...confinedSandbox, failIfUnavailable: false },
+			{ ...confinedSandbox, excludedCommands: [ '*' ] },
+			{ ...confinedSandbox, excludedCommands: [] },
+			{ ...confinedSandbox, allowNestedUserNamespaces: true },
+			{ ...confinedSandbox, allowAppleEvents: true },
+			{ ...confinedSandbox, enableWeakerNestedSandbox: true },
+			{ ...confinedSandbox, enableWeakerNetworkIsolation: true },
+			{ ...confinedSandbox, ignoreViolations: { file: [ '*' ] } },
+			{ ...confinedSandbox, bwrapPath: '/tmp/bwrap' },
+			{ ...confinedSandbox, ripgrep: { command: '/tmp/rg' } },
+			{ ...confinedSandbox, network: { allowLocalBinding: true } },
+			{ ...confinedSandbox, credentials: {} },
+			{ ...confinedSandbox, unknownSetting: true },
+			{ ...confinedSandbox, filesystem: { disabled: true } },
+			{ ...confinedSandbox, filesystem: { allowRead: [ '/' ] } },
+			{ ...confinedSandbox, filesystem: { allowWrite: [ path.dirname( workspace ) ] } },
+			{ ...confinedSandbox, filesystem: { allowWrite: [ 'relative' ] } },
 		] ) {
 			const declared = { mode: 'sandbox' as const, sandbox };
 			expect( claudeNativeTools( shell, declared, workspace ), JSON.stringify( sandbox ) ).toEqual(
@@ -807,9 +836,9 @@ describe( 'Claude shell confinement', () => {
 			shellConfinement: {
 				mode: 'sandbox',
 				sandbox: {
-					enabled: true,
-					allowUnsandboxedCommands: false,
-					filesystem: { allowWrite: [ paths.site ] },
+					...confinedSandbox,
+					failIfUnavailable: true,
+					filesystem: { allowWrite: [ paths.site ], denyRead: [ paths.config ] },
 				},
 			},
 		} ) );
@@ -818,6 +847,9 @@ describe( 'Claude shell confinement', () => {
 		);
 		expect( await confined.policy.authorizeToolUse( echo( 'use' ) ) ).toBe( true );
 		expect( confined.context.approve ).toHaveBeenCalledOnce();
+		expect(
+			vi.mocked( confined.context.approve ).mock.calls[ 0 ][ 0 ].operation.description
+		).toMatch( /in a sandbox that can write only in the workspace/ );
 	} );
 
 	it( 'in approval-only mode asks for every command, says it is unconfined, and never reuses an answer', async () => {
@@ -906,7 +938,7 @@ describe( 'Claude approvals that outlive their caller', () => {
 describe( 'Claude account changes', () => {
 	it( 'asks for nothing and runs nothing once the native account changed', async () => {
 		const before = await setup();
-		vi.mocked( before.context.verifyAccount ).mockResolvedValue( false );
+		vi.mocked( before.context.verifyAccount ).mockResolvedValue( 'changed' );
 		await expect(
 			before.policy.guardHost( before.host, 'call' ).sites.wpCli( before.localSite, draftArgs )
 		).rejects.toThrow();
@@ -915,7 +947,7 @@ describe( 'Claude account changes', () => {
 
 		const during = await setup();
 		vi.mocked( during.context.approve ).mockImplementationOnce( async () => {
-			vi.mocked( during.context.verifyAccount ).mockResolvedValue( false );
+			vi.mocked( during.context.verifyAccount ).mockResolvedValue( 'changed' );
 			return 'allow';
 		} );
 		await expect(
@@ -923,5 +955,200 @@ describe( 'Claude account changes', () => {
 		).rejects.toThrow();
 		expect( during.host.sites.wpCli ).not.toHaveBeenCalled();
 		expect( during.policy.signal.aborted ).toBe( true );
+	} );
+} );
+
+describe( 'Claude Studio tools that reach a site by URL', () => {
+	const enabledTools = {
+		native: [],
+		studio: [
+			'take_screenshot',
+			'inspect_design',
+			'open_annotation_browser',
+			'need_for_speed',
+			'rank_me_up',
+		],
+	};
+
+	it( 'names the URL each tool with a URL or site path reaches', () => {
+		for ( const definition of studioToolDefinitions ) {
+			const { properties } = definition.parameters as { properties: Record< string, unknown > };
+			if ( 'url' in properties || ( 'path' in properties && 'nameOrPath' in properties ) )
+				expect(
+					CLAUDE_STUDIO_TOOL_RULES.get( definition.name )?.urls,
+					definition.name
+				).toBeDefined();
+		}
+	} );
+
+	it( 'allows the target site and public pages, and denies other schemes and local origins', async () => {
+		const { policy, host } = await setup( () => ( { enabledTools } ) );
+		const call = ( name: string, args: Record< string, unknown > ) =>
+			policy.authorizeStudioCall( { host, name, args, toolCallId: randomUUID() } );
+		for ( const name of [ 'take_screenshot', 'inspect_design', 'open_annotation_browser' ] ) {
+			const at = ( url: string ) => call( name, { url, selectors: [ 'body' ] } );
+			expect( await at( 'http://localhost:8888/about' ), name ).toBe( true );
+			expect( await at( 'https://example.com/' ), name ).toBe( true );
+			for ( const url of [
+				'file:///C:/Windows/win.ini',
+				'file:///etc/passwd',
+				'data:text/html,<p>x</p>',
+				'javascript:alert(1)',
+				'chrome://settings',
+				'http://127.0.0.1:8882/',
+				'http://localhost:8889/',
+				'http://[::1]:8888/',
+				'http://2130706433/',
+				'http://192.168.1.10/',
+				'http://10.0.0.5/',
+				'http://172.20.0.1/',
+				'http://169.254.169.254/latest/meta-data/',
+				'http://[::ffff:127.0.0.1]:8888/',
+				'http://[fd00::1]/',
+				'http://printer.local/',
+				'http://other-site.example:8890/',
+				'not a url',
+			] )
+				expect( await at( url ), `${ name } ${ url }` ).toBe( false );
+		}
+	} );
+
+	it( 'keeps a site audit on the target site whatever path it is given', async () => {
+		const { policy, host } = await setup( () => ( { enabledTools } ) );
+		for ( const name of [ 'need_for_speed', 'rank_me_up' ] ) {
+			const audit = ( auditPath?: string ) =>
+				policy.authorizeStudioCall( {
+					host,
+					name,
+					args: { nameOrPath: 'site', ...( auditPath === undefined ? {} : { path: auditPath } ) },
+					toolCallId: randomUUID(),
+				} );
+			expect( await audit(), name ).toBe( true );
+			expect( await audit( '/about' ), name ).toBe( true );
+			expect( await audit( '/wp-admin/' ), name ).toBe( true );
+			for ( const auditPath of [
+				'@127.0.0.1:8882/',
+				'//evil.example/',
+				'http://evil.example/',
+				'/\\evil.example',
+				'\\\\evil.example',
+				'about',
+				'',
+			] )
+				expect( await audit( auditPath ), `${ name } ${ auditPath }` ).toBe( false );
+		}
+	} );
+
+	it( 'reaches no local site from a global conversation', async () => {
+		const { policy, host } = await setup( ( paths ) => ( {
+			target: { environment: 'global' },
+			targetSite: undefined,
+			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
+			enabledTools,
+		} ) );
+		const at = ( url: string ) =>
+			policy.authorizeStudioCall( {
+				host,
+				name: 'take_screenshot',
+				args: { url },
+				toolCallId: randomUUID(),
+			} );
+		expect( await at( 'http://localhost:8888/' ) ).toBe( false );
+		expect( await at( 'https://example.com/' ) ).toBe( true );
+	} );
+} );
+
+describe( 'Claude WordPress.com request transport options', () => {
+	const remote = () => CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+
+	it( 'allows only real API namespaces and no query keys the client turns into transport options', () => {
+		const get = ( extra: Record< string, unknown > ) =>
+			remote()( { siteId: 42, method: 'GET', path: '/posts', ...extra } );
+		for ( const apiNamespace of [ undefined, '', 'wp/v2', 'wpcom/v2' ] )
+			expect( get( { apiNamespace } ), String( apiNamespace ) ).toEqual( { wpcomSiteId: 42 } );
+		expect( get( { query: { per_page: 20, _fields: 'id,title' } } ) ).toEqual( {
+			wpcomSiteId: 42,
+		} );
+		for ( const extra of [
+			{ apiNamespace: 'wp/v2/sites/7/posts#' },
+			{ apiNamespace: 'wp/v2/sites/7/posts?x=' },
+			{ apiNamespace: 'rest/v1.1/sites/7/posts#' },
+			{ apiNamespace: 'wpcom/v3' },
+			{ apiNamespace: 'wp/v2/' },
+			{ apiNamespace: 7 },
+			{ query: { proxyOrigin: 'http://127.0.0.1:9' } },
+			{ query: { apiVersion: '1.1/sites/7' } },
+			{ query: { apiNamespace: 'wp/v2' } },
+			{ query: { _method: 'POST' } },
+			{ query: { method: 'DELETE' } },
+			{ query: 'per_page=20' },
+		] )
+			expect( get( extra ), JSON.stringify( extra ) ).toBeUndefined();
+		expect(
+			remote()( {
+				siteId: 1,
+				method: 'GET',
+				path: '!/me',
+				apiNamespace: 'rest/v1.1/sites/7/posts#',
+			} )
+		).toBeUndefined();
+	} );
+} );
+
+describe( 'Claude account checks during a turn', () => {
+	it( 'verifies the account before an unprompted operation once the last check is older than the bound', async () => {
+		const { policy, site, context, clock } = await setup();
+		await writeFile( path.join( site, 'readme.txt' ), 'fixture' );
+		const read = () =>
+			policy.authorizeToolUse( {
+				toolName: 'Read',
+				input: { file_path: path.join( site, 'readme.txt' ) },
+				toolUseId: randomUUID(),
+			} );
+		clock.now = CLAUDE_ACCOUNT_RECHECK_MS - 1;
+		expect( await read() ).toBe( true );
+		expect( context.verifyAccount ).not.toHaveBeenCalled();
+		clock.now = CLAUDE_ACCOUNT_RECHECK_MS;
+		expect( await read() ).toBe( true );
+		expect( context.verifyAccount ).toHaveBeenCalledOnce();
+		clock.now = CLAUDE_ACCOUNT_RECHECK_MS * 2 - 1;
+		expect( await read() ).toBe( true );
+		expect( context.verifyAccount ).toHaveBeenCalledOnce();
+		clock.now = CLAUDE_ACCOUNT_RECHECK_MS * 2;
+		vi.mocked( context.verifyAccount ).mockResolvedValueOnce( 'changed' );
+		expect( await read() ).toBe( false );
+		expect( policy.signal.aborted ).toBe( true );
+
+		const unverified = await setup();
+		await writeFile( path.join( unverified.site, 'readme.txt' ), 'fixture' );
+		unverified.clock.now = CLAUDE_ACCOUNT_RECHECK_MS;
+		vi.mocked( unverified.context.verifyAccount ).mockResolvedValueOnce( 'unverified' );
+		expect(
+			await unverified.policy.authorizeToolUse( {
+				toolName: 'Read',
+				input: { file_path: path.join( unverified.site, 'readme.txt' ) },
+				toolUseId: 'use',
+			} )
+		).toBe( false );
+	} );
+
+	it( 'ends a pending approval when a periodic check finds another account', async () => {
+		let approvalSignal: AbortSignal | undefined;
+		const { policy, host, localSite, context, clock } = await setup( () => ( {
+			approvalTimeoutMs: 60_000,
+			approve: vi.fn( ( _request, signal: AbortSignal ) => {
+				approvalSignal = signal;
+				return new Promise< 'allow' >( () => {} );
+			} ),
+		} ) );
+		const pending = policy.guardHost( host, 'call' ).sites.wpCli( localSite, draftArgs );
+		await vi.waitFor( () => expect( approvalSignal ).toBeDefined() );
+		expect( await policy.refreshAccount() ).toBe( true );
+		clock.now = CLAUDE_ACCOUNT_RECHECK_MS;
+		vi.mocked( context.verifyAccount ).mockResolvedValue( 'changed' );
+		expect( await policy.refreshAccount() ).toBe( false );
+		await expect( pending ).rejects.toThrow();
+		expect( approvalSignal!.aborted ).toBe( true );
+		expect( host.sites.wpCli ).not.toHaveBeenCalled();
 	} );
 } );

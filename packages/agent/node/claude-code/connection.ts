@@ -118,15 +118,34 @@ export async function resolveClaudeProjectsDirectory(
 		throw error;
 	}
 }
+/** Runs a native command and returns its output; it rejects on a non-zero exit. */
+export type ClaudeProcessRunner = (
+	file: string,
+	args: string[],
+	options: {
+		cwd: string;
+		env: NodeJS.ProcessEnv;
+		timeout: number;
+		maxBuffer: number;
+		windowsHide: boolean;
+	}
+) => Promise< { stdout: string } >;
+
+const runNativeProcess: ClaudeProcessRunner = async ( file, args, options ) => {
+	const { stdout } = await execFileAsync( file, args, { ...options, encoding: 'utf8' } );
+	return { stdout };
+};
+
 async function readNativeStatus(
 	executablePath: string,
 	cwd: string,
-	env: NodeJS.ProcessEnv
+	env: NodeJS.ProcessEnv,
+	run: ClaudeProcessRunner = runNativeProcess
 ): Promise< Record< string, unknown > > {
 	let stdout: string;
 	let signedOutExit = false;
 	try {
-		( { stdout } = await execFileAsync( executablePath, [ 'auth', 'status', '--json' ], {
+		( { stdout } = await run( executablePath, [ 'auth', 'status', '--json' ], {
 			cwd,
 			env,
 			timeout: 10000,
@@ -315,28 +334,42 @@ export async function markClaudeConnectionReestablished( connectionId: string ):
 	} );
 }
 
-/** The account the native runtime is signed in to now, if it qualifies. */
-export async function readClaudeAccountIdentity(
+/**
+ * The native sign-in now: a qualified account, no qualified account (signed
+ * out, or another kind of sign-in), or a status that could not be read, which
+ * proves nothing either way.
+ */
+export type ClaudeAccountStatus =
+	| { state: 'signed-in'; identity: ClaudeAuthIdentity }
+	| { state: 'not-qualified' }
+	| { state: 'unavailable' };
+
+export async function readClaudeAccountStatus(
 	executablePath: string,
 	cwd: string,
-	configDirectory?: string
-): Promise< ClaudeAuthIdentity | undefined > {
+	configDirectory?: string,
+	run: ClaudeProcessRunner = runNativeProcess
+): Promise< ClaudeAccountStatus > {
 	const child = buildClaudeEnvironment( process.env );
 	const context = resolveClaudeConfigContext( configDirectory, process.env );
-	if ( child.conflicts.length || context.mode === 'conflict' ) return;
+	if ( child.conflicts.length || context.mode === 'conflict' ) return { state: 'unavailable' };
 	if ( context.mode === 'explicit' ) child.env.CLAUDE_CONFIG_DIR = context.directory;
+	let status: Record< string, unknown >;
 	try {
-		const status = await readNativeStatus( executablePath, cwd, child.env );
-		if ( ! assessClaudeAuth( status ).qualified ) return;
-		return {
+		status = await readNativeStatus( executablePath, cwd, child.env, run );
+	} catch {
+		return { state: 'unavailable' };
+	}
+	if ( ! assessClaudeAuth( status ).qualified ) return { state: 'not-qualified' };
+	return {
+		state: 'signed-in',
+		identity: {
 			email: typeof status.email === 'string' ? status.email : undefined,
 			organization: typeof status.orgName === 'string' ? status.orgName : undefined,
 			subscriptionType:
 				typeof status.subscriptionType === 'string' ? status.subscriptionType : undefined,
-		};
-	} catch {
-		return;
-	}
+		},
+	};
 }
 
 export async function openClaudeNativeSignIn( connectionId: string ): Promise< void > {

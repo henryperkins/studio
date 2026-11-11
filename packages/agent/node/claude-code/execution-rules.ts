@@ -58,6 +58,14 @@ export const CLAUDE_APPROVAL_TIMEOUT_MS = 120_000;
 export const CLAUDE_HOOK_TIMEOUT_SECONDS = 180;
 
 /**
+ * How long an operation that needs no approval may rely on the last real check
+ * of the native sign-in. Once it is older, the policy reads the sign-in again
+ * before allowing anything, so no operation runs longer than this after the
+ * stored account changes.
+ */
+export const CLAUDE_ACCOUNT_RECHECK_MS = 10_000;
+
+/**
  * How shell commands are confined. A shell tool can be enabled only under a
  * mode the policy verifies: an SDK sandbox whose writes stay in the workspace,
  * or `approval-only`, where every command needs its own approval and the user
@@ -113,6 +121,14 @@ export interface ClaudeStudioToolRule {
 	 */
 	readonly remote?: ( args: unknown ) => { wpcomSiteId?: number } | undefined;
 	/**
+	 * The URLs a call opens, given the named site's URL; undefined denies the call.
+	 * Only http and https are allowed. A local address must be the target site's
+	 * own origin; a public page is an external read.
+	 */
+	readonly urls?: ( args: unknown, siteUrl: string | undefined ) => string[] | undefined;
+	/** Every URL the call opens must be the named site's own origin. */
+	readonly urlsOnSite?: true;
+	/**
 	 * Where a call that needs approval is approved: at the host operation that
 	 * carries its effect, with that operation's exact arguments, or for the tool
 	 * call itself when its effect does not go through the host.
@@ -138,13 +154,101 @@ function onSite(
 	return studioRule( operationClass, { site: namedSite, ...options } );
 }
 
+function pageUrls( args: unknown ): string[] | undefined {
+	return isRecord( args ) && typeof args.url === 'string' ? [ args.url ] : undefined;
+}
+
+// A site audit opens `${ siteUrl }${ path }`. The path must be a plain path on
+// that site, which the policy then checks again on the composed URL.
+function auditUrls( args: unknown, siteUrl: string | undefined ): string[] | undefined {
+	const urlPath = isRecord( args ) && args.path !== undefined ? args.path : '/';
+	if (
+		! siteUrl ||
+		typeof urlPath !== 'string' ||
+		! /^\/(?![/\\])[^\\\s]*$/.test( urlPath ) ||
+		[ ...urlPath ].some( ( character ) => character < ' ' || character === '\u007f' )
+	)
+		return;
+	return [ `${ siteUrl.replace( /\/+$/, '' ) }${ urlPath }` ];
+}
+
+/**
+ * Whether a host name belongs to this machine or a private network: loopback,
+ * private, link-local and unique-local addresses, `localhost` and `.local`.
+ */
+export function isLocalHostname( hostname: string ): boolean {
+	const host = hostname.toLowerCase().replace( /^\[|\]$/g, '' );
+	if (
+		! host ||
+		host === 'localhost' ||
+		host.endsWith( '.localhost' ) ||
+		host.endsWith( '.local' )
+	)
+		return true;
+	const mapped = /^::ffff:(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/.exec( host );
+	const ipv4 = mapped
+		? mapped[ 1 ] ??
+		  [ parseInt( mapped[ 2 ], 16 ), parseInt( mapped[ 3 ], 16 ) ]
+				.flatMap( ( word ) => [ word >> 8, word & 255 ] )
+				.join( '.' )
+		: host;
+	const octets = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec( ipv4 )?.slice( 1 ).map( Number );
+	if ( octets ) {
+		const [ a, b ] = octets;
+		return (
+			a === 0 ||
+			a === 10 ||
+			a === 127 ||
+			( a === 100 && b >= 64 && b <= 127 ) ||
+			( a === 169 && b === 254 ) ||
+			( a === 172 && b >= 16 && b <= 31 ) ||
+			( a === 192 && b === 168 )
+		);
+	}
+	return (
+		host.includes( ':' ) &&
+		( host === '::' ||
+			host === '::1' ||
+			/^f[cd][0-9a-f]{0,2}:/.test( host ) ||
+			/^fe[89ab][0-9a-f]?:/.test( host ) )
+	);
+}
+
 // The only account endpoints a request may reach: reads the bundled skills use.
 const WPCOM_ACCOUNT_READS: ReadonlySet< string > = new Set( [ '/me', '/plans/features' ] );
 
-// The WordPress.com scope of a `wpcom_request` call. A path that could step
-// out of its site once the URL is normalized, or carry its own query, is denied.
+// API namespaces a request may use. An absent namespace means the tool's own
+// default; an empty one means WordPress.com REST v1.1.
+const WPCOM_NAMESPACES: ReadonlySet< string > = new Set( [ '', 'wp/v2', 'wpcom/v2' ] );
+
+// Query keys the WordPress.com client turns into where the request goes, or
+// that WordPress reads as another method.
+const WPCOM_TRANSPORT_KEYS: ReadonlySet< string > = new Set( [
+	'apinamespace',
+	'apiversion',
+	'proxyorigin',
+	'_method',
+	'method',
+	'http_method_override',
+] );
+
+// The WordPress.com scope of a `wpcom_request` call, decided from everything
+// the client builds the request from: the path, the namespace and the query.
+// A path that could step out of its site once the URL is normalized, or carry
+// its own query, is denied.
 function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefined {
 	if ( ! isRecord( args ) || typeof args.path !== 'string' ) return;
+	if (
+		args.apiNamespace !== undefined &&
+		( typeof args.apiNamespace !== 'string' || ! WPCOM_NAMESPACES.has( args.apiNamespace ) )
+	)
+		return;
+	if (
+		args.query !== undefined &&
+		( ! isRecord( args.query ) ||
+			Object.keys( args.query ).some( ( key ) => WPCOM_TRANSPORT_KEYS.has( key.toLowerCase() ) ) )
+	)
+		return;
 	const route = args.path;
 	if ( /\.\.|%2e|[\\?#]/i.test( route ) ) return;
 	if ( ! route.startsWith( '!' ) )
@@ -191,6 +295,7 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	[
 		takeScreenshotTool.name,
 		studioRule( 'local-change', {
+			urls: pageUrls,
 			paths: ( args ) => {
 				const directory = isRecord( args ) ? args.themeScreenshot : undefined;
 				if ( directory === undefined ) return [];
@@ -199,7 +304,7 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 			},
 		} ),
 	],
-	[ inspectDesignTool.name, studioRule( 'read' ) ],
+	[ inspectDesignTool.name, studioRule( 'read', { urls: pageUrls } ) ],
 	[
 		generateImagesTool.name,
 		studioRule( 'remote-change', {
@@ -214,8 +319,8 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		} ),
 	],
 	[ installTaxonomyScriptsTool.name, onSite( 'local-change' ) ],
-	[ auditPerformanceTool.name, onSite( 'read' ) ],
-	[ auditSeoTool.name, onSite( 'read' ) ],
+	[ auditPerformanceTool.name, onSite( 'read', { urls: auditUrls, urlsOnSite: true } ) ],
+	[ auditSeoTool.name, onSite( 'read', { urls: auditUrls, urlsOnSite: true } ) ],
 	[ listConnectedRemoteSitesTool.name, onSite( 'remote-read' ) ],
 	[
 		wpcomRequestTool.name,
@@ -233,7 +338,7 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	[ pullSiteTool.name, onSite( 'remote-overwrite', { approval: 'host' } ) ],
 	[ importSiteTool.name, onSite( 'local-overwrite', { approval: 'host' } ) ],
 	[ exportSiteTool.name, onSite( 'local-overwrite', { approval: 'host' } ) ],
-	[ openAnnotationBrowserTool.name, studioRule( 'local-change' ) ],
+	[ openAnnotationBrowserTool.name, studioRule( 'local-change', { urls: pageUrls } ) ],
 	[ refreshBrowserTool.name, studioRule( 'read' ) ],
 	[ sendFeedbackTool.name, studioRule( 'external-message' ) ],
 	// Tools built by factories for the host's capabilities.
@@ -287,16 +392,44 @@ function isBoundedShellInput( input: Record< string, unknown > ): boolean {
 	);
 }
 
-/** A file pattern that cannot match above the folder it is searched from. */
+const ABSOLUTE_START = /^(?:[~/\\]|[a-z]:)/i;
+
+/**
+ * A file pattern that cannot match above the folder it is searched from, for
+ * any glob engine: neither the pattern nor any alternative a brace or extglob
+ * group expands to, at any depth, may be absolute or step up, and no character
+ * class may match a separator.
+ */
 export function isContainedPattern( pattern: unknown ): boolean {
-	return (
-		typeof pattern === 'string' &&
-		pattern.length > 0 &&
-		! pattern.includes( '..' ) &&
-		! /^[~/\\]/.test( pattern ) &&
-		! /^[a-z]:/i.test( pattern ) &&
-		! path.isAbsolute( pattern )
-	);
+	if (
+		typeof pattern !== 'string' ||
+		! pattern.length ||
+		pattern.includes( '..' ) ||
+		ABSOLUTE_START.test( pattern ) ||
+		path.isAbsolute( pattern )
+	)
+		return false;
+	const groups: string[] = [];
+	for ( let index = 0; index < pattern.length; index++ ) {
+		const character = pattern[ index ];
+		let alternative = false;
+		if ( character === '{' || character === '(' ) {
+			groups.push( character );
+			alternative = true;
+		} else if ( character === '}' || character === ')' ) {
+			groups.pop();
+		} else if (
+			( character === ',' && groups.at( -1 ) === '{' ) ||
+			( character === '|' && groups.at( -1 ) === '(' )
+		) {
+			alternative = true;
+		} else if ( character === '[' ) {
+			const end = pattern.indexOf( ']', index + 1 );
+			if ( end === -1 || /[/\\]/.test( pattern.slice( index + 1, end ) ) ) return false;
+		}
+		if ( alternative && ABSOLUTE_START.test( pattern.slice( index + 1 ) ) ) return false;
+	}
+	return true;
 }
 
 const filePath = { field: 'file_path', required: true, allowRoot: false } as const;
@@ -326,10 +459,32 @@ function isInside( root: string, candidate: string ): boolean {
 	);
 }
 
+// The sandbox settings a verified confinement may use. Everything else is
+// refused, including what the SDK describes as weakening isolation or letting
+// commands out (excludedCommands, allowNestedUserNamespaces, allowAppleEvents,
+// enableWeakerNestedSandbox, enableWeakerNetworkIsolation, ignoreViolations,
+// filesystem.disabled, network exceptions, and replaced sandbox binaries).
+const SANDBOX_KEYS: ReadonlySet< string > = new Set( [
+	'enabled',
+	'failIfUnavailable',
+	'autoAllowBashIfSandboxed',
+	'allowUnsandboxedCommands',
+	'filesystem',
+] );
+const SANDBOX_FILESYSTEM_KEYS: ReadonlySet< string > = new Set( [
+	'allowWrite',
+	'denyWrite',
+	'denyRead',
+] );
+
+const isStringList = ( value: unknown ): value is string[] =>
+	Array.isArray( value ) && value.every( ( item ) => typeof item === 'string' );
+
 /**
  * Whether a declared confinement can be verified. A sandbox counts only when
- * it is enabled, refuses to run without its dependencies, never lets a command
- * out, does not approve commands on its own and writes only in the workspace.
+ * it uses no setting outside a short list, is enabled, refuses to run without
+ * its dependencies, never lets a command out, leaves every command to the
+ * user's approval and writes only in the workspace.
  */
 export function isVerifiedShellConfinement(
 	confinement: ClaudeShellConfinement,
@@ -337,15 +492,23 @@ export function isVerifiedShellConfinement(
 ): boolean {
 	if ( confinement.mode === 'approval-only' ) return true;
 	if ( confinement.mode !== 'sandbox' ) return false;
-	const { sandbox } = confinement;
+	const sandbox: unknown = confinement.sandbox;
+	if (
+		! isRecord( sandbox ) ||
+		Object.keys( sandbox ).some( ( key ) => ! SANDBOX_KEYS.has( key ) )
+	)
+		return false;
+	const filesystem = sandbox.filesystem ?? {};
 	return (
-		!! sandbox &&
 		sandbox.enabled === true &&
-		sandbox.failIfUnavailable !== false &&
+		( sandbox.failIfUnavailable === undefined || sandbox.failIfUnavailable === true ) &&
 		sandbox.allowUnsandboxedCommands === false &&
-		sandbox.autoAllowBashIfSandboxed !== true &&
-		sandbox.filesystem?.disabled !== true &&
-		( sandbox.filesystem?.allowWrite ?? [] ).every(
+		sandbox.autoAllowBashIfSandboxed === false &&
+		isRecord( filesystem ) &&
+		Object.entries( filesystem ).every(
+			( [ key, value ] ) => SANDBOX_FILESYSTEM_KEYS.has( key ) && isStringList( value )
+		) &&
+		( ( filesystem.allowWrite as string[] | undefined ) ?? [] ).every(
 			( root ) => path.isAbsolute( root ) && isInside( workspace, path.resolve( root ) )
 		)
 	);

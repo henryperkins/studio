@@ -3,6 +3,7 @@ import { realpath } from 'fs/promises';
 import path from 'path';
 import { escapeClaudeApprovalText } from '@studio/agent/protocol/claude-code';
 import {
+	CLAUDE_ACCOUNT_RECHECK_MS,
 	CLAUDE_NATIVE_TOOL_RULES,
 	CLAUDE_STUDIO_TOOL_RULES,
 	HOST_OPERATION_CLASSES,
@@ -13,6 +14,7 @@ import {
 	isAllowedNativePath,
 	isContainedPattern,
 	isInsideCanonicalRoot,
+	isLocalHostname,
 	isRecord,
 	requiresClaudeApproval,
 	studioToolName,
@@ -90,8 +92,8 @@ export interface ClaudeExecutionContext {
 	target: ClaudeStudioTarget;
 	/** The native workspace: its site (null when global) and canonical folders. */
 	workspace: { siteId: string | null; workingDirectory: string; configDirectory: string };
-	/** The target site and its canonical folder; absent for a global target. */
-	targetSite?: { id: string; path: string };
+	/** The target site, its canonical folder and its URL; absent for a global target. */
+	targetSite?: { id: string; path: string; url?: string };
 	/** Canonical folders native file tools may reach. */
 	localRoots: readonly string[];
 	enabledTools: ClaudeEnabledTools;
@@ -102,17 +104,23 @@ export interface ClaudeExecutionContext {
 	approvalTimeoutMs: number;
 	/** Native startup was verified; nothing runs before it. */
 	ready: () => boolean;
-	/**
-	 * The connection the turn started on is still attached, at the same revision,
-	 * and the running native process still uses the turn's account.
-	 */
+	/** The connection the turn started on is still attached, at the same revision. */
 	stillConnected: () => Promise< boolean >;
-	/** The native sign-in on disk is still the turn's account; checked around approvals. */
-	verifyAccount: () => Promise< boolean >;
+	/** Reads the native sign-in now and compares it with the turn's account. */
+	verifyAccount: () => Promise< ClaudeAccountCheck >;
+	/** When the turn last read the native sign-in, by `now`. */
+	accountVerifiedAt: number;
+	now: () => number;
 	/** The conversation still has the turn's native binding and this persisted target. */
 	verifyTarget: ( expected: ClaudeStudioTarget ) => Promise< boolean >;
 	onEvent: ( event: BackendTurnEvent ) => void;
 }
+
+/**
+ * The outcome of reading the native sign-in: the turn's account, another
+ * account or none, or a read that failed and so proves nothing.
+ */
+export type ClaudeAccountCheck = 'same' | 'changed' | 'unverified';
 
 export interface ClaudeToolUse {
 	toolName: string;
@@ -155,6 +163,11 @@ export interface ClaudeExecutionPolicy {
 		toolCallId: string,
 		signal?: AbortSignal
 	): Promise< boolean >;
+	/**
+	 * Reads the native sign-in again when the last read is older than the bound.
+	 * A different or unreadable account ends the turn's authority.
+	 */
+	refreshAccount(): Promise< boolean >;
 	dispose(): void;
 }
 
@@ -219,7 +232,33 @@ export function createClaudeExecutionPolicy(
 	let persisted: ClaudeStudioTarget = context.target;
 	signal.addEventListener( 'abort', () => grants.clear(), { once: true } );
 
-	async function checkpoint( callSignal?: AbortSignal ): Promise< boolean > {
+	let accountVerifiedAt = context.accountVerifiedAt;
+	let accountRead: Promise< boolean > | undefined;
+
+	async function readAccount(): Promise< boolean > {
+		const startedAt = context.now();
+		const result = await context.verifyAccount().catch( () => 'unverified' as const );
+		if ( result !== 'same' ) {
+			controller.abort();
+			return false;
+		}
+		accountVerifiedAt = Math.max( accountVerifiedAt, startedAt );
+		return ! signal.aborted;
+	}
+
+	// `fresh` reads the sign-in now; otherwise a read younger than the bound is
+	// enough, and concurrent operations share one read.
+	async function accountIsCurrent( fresh: boolean ): Promise< boolean > {
+		if ( signal.aborted ) return false;
+		if ( fresh ) return readAccount();
+		if ( context.now() - accountVerifiedAt < CLAUDE_ACCOUNT_RECHECK_MS ) return true;
+		accountRead ??= readAccount().finally( () => {
+			accountRead = undefined;
+		} );
+		return accountRead;
+	}
+
+	async function checkpoint( callSignal?: AbortSignal, freshAccount = false ): Promise< boolean > {
 		if (
 			signal.aborted ||
 			callSignal?.aborted ||
@@ -235,16 +274,14 @@ export function createClaudeExecutionPolicy(
 			controller.abort();
 			return false;
 		}
+		if ( ! ( await accountIsCurrent( freshAccount ) ) ) return false;
 		return ! signal.aborted && ! callSignal?.aborted;
 	}
 
-	async function accountCheckpoint( callSignal?: AbortSignal ): Promise< boolean > {
-		if ( ! ( await checkpoint( callSignal ) ) ) return false;
-		if ( ! ( await context.verifyAccount().catch( () => false ) ) ) {
-			controller.abort();
-			return false;
-		}
-		return ! signal.aborted && ! callSignal?.aborted;
+	// Everything an approval-class operation needs immediately before it runs,
+	// including a read of the native sign-in.
+	function accountCheckpoint( callSignal?: AbortSignal ): Promise< boolean > {
+		return checkpoint( callSignal, true );
 	}
 
 	function fingerprint( operation: ClaudeOperation, toolCallId: string ): string {
@@ -472,6 +509,50 @@ export function createClaudeExecutionPolicy(
 		}
 	}
 
+	// The origin a URL may be opened at, if any. Only http and https. A local
+	// address, or the address of any local site, must be the target site's own
+	// origin; a public page is an external read. A URL a site audit composes
+	// must be that site's own origin.
+	async function reachableOrigin(
+		host: StudioAgentHost,
+		url: string,
+		onSite: boolean
+	): Promise< string | undefined > {
+		let parsed: URL;
+		try {
+			parsed = new URL( url );
+		} catch {
+			return;
+		}
+		if (
+			( parsed.protocol !== 'http:' && parsed.protocol !== 'https:' ) ||
+			parsed.username ||
+			parsed.password
+		)
+			return;
+		let targetOrigin: string | undefined;
+		try {
+			targetOrigin =
+				context.target.environment !== 'global' && context.targetSite?.url
+					? new URL( context.targetSite.url ).origin
+					: undefined;
+		} catch {
+			targetOrigin = undefined;
+		}
+		if ( parsed.origin === targetOrigin ) return parsed.origin;
+		if ( onSite ) return;
+		if ( isLocalHostname( parsed.hostname ) ) return;
+		try {
+			const siteHosts = ( await host.sites.all() ).map( ( item ) =>
+				new URL( item.url ).hostname.toLowerCase()
+			);
+			if ( siteHosts.includes( parsed.hostname.toLowerCase() ) ) return;
+		} catch {
+			return;
+		}
+		return parsed.origin;
+	}
+
 	async function authorizeStudioCall( call: ClaudeStudioCall ): Promise< boolean > {
 		const { host, name, args, toolCallId, signal: callSignal } = call;
 		if ( callSignal?.aborted ) return false;
@@ -498,6 +579,15 @@ export function createClaudeExecutionPolicy(
 			localPaths = paths;
 		}
 		let remote: string | undefined;
+		if ( rule.urls ) {
+			const urls = rule.urls( args, site?.url );
+			if ( ! urls ) return false;
+			for ( const url of urls ) {
+				const origin = await reachableOrigin( host, url, rule.urlsOnSite === true );
+				if ( ! origin ) return false;
+				remote ??= origin;
+			}
+		}
 		if ( rule.remote ) {
 			const scope = rule.remote( args );
 			if ( ! scope ) return false;
@@ -766,6 +856,7 @@ export function createClaudeExecutionPolicy(
 		guardHost,
 		requestApproval,
 		authorizeExecution,
+		refreshAccount: () => accountIsCurrent( false ),
 		dispose: () => controller.abort(),
 	};
 }

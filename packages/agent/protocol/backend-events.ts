@@ -59,7 +59,12 @@ export interface BackendTurnOutcome {
 		| 'unknown_process_exit';
 	/** Display-safe information supplied by the backend. */
 	message?: string;
-	code?: 'rebind_required';
+	/**
+	 * Why the turn stopped, for an app to explain in its own words:
+	 * `account_changed` when the native sign-in became another account or none,
+	 * `account_unverified` when it could not be read.
+	 */
+	code?: 'rebind_required' | 'account_changed' | 'account_unverified';
 }
 
 interface ContentBlock {

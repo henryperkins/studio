@@ -13,7 +13,7 @@ import {
 	claudeConnectionRevision,
 	getClaudeConnections,
 	prepareClaudeInvocation,
-	readClaudeAccountIdentity,
+	readClaudeAccountStatus,
 } from './connection';
 import { QUALIFIED_CLAUDE_CODE_VERSION } from './discovery';
 import { createClaudeEventAdapter } from './event-adapter';
@@ -29,7 +29,8 @@ import {
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
 import { createStudioClaudeMcpServer, createStudioClaudeToolBridge } from './tool-bridge';
 import type { ClaudeAuthIdentity } from './auth-status';
-import type { ClaudeApprover } from './execution-policy';
+import type { ClaudeAccountStatus } from './connection';
+import type { ClaudeAccountCheck, ClaudeApprover } from './execution-policy';
 import type { StudioAgentHost } from '../host';
 import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk/core';
 import type {
@@ -218,12 +219,9 @@ interface RuntimeDependencies {
 		{ id: string; executablePath: string; configDirectory?: string; revision?: number } | undefined
 	>;
 	prepare?: ( exe: string, cwd: string, config?: string ) => Promise< Prepared >;
-	/** The account the native runtime is signed in to now, read from its own status. */
-	account?: (
-		exe: string,
-		cwd: string,
-		config?: string
-	) => Promise< ClaudeAuthIdentity | undefined >;
+	/** The native sign-in now, read from the runtime's own status. */
+	account?: ( exe: string, cwd: string, config?: string ) => Promise< ClaudeAccountStatus >;
+	clock?: () => number;
 }
 
 interface RuntimeOptions extends RuntimeDependencies {
@@ -448,8 +446,8 @@ export async function runClaudeTurn(
 		openGate = resolve;
 	} );
 	let terminal: TerminalEvent | undefined;
-	let stopReason: 'detached' | 'account' | undefined;
-	const stop = ( reason: 'detached' | 'account' ) => {
+	let stopReason: 'detached' | 'account' | 'account-unverified' | undefined;
+	const stop = ( reason: 'detached' | 'account' | 'account-unverified' ) => {
 		stopReason ??= reason;
 		controller.abort();
 	};
@@ -516,7 +514,7 @@ export async function runClaudeTurn(
 			terminal = rebind();
 			return;
 		}
-		let targetSite: { id: string; path: string } | undefined;
+		let targetSite: { id: string; path: string; url: string } | undefined;
 		if ( target.environment !== 'global' ) {
 			const site = sites.find( ( candidate ) => candidate.id === target.siteId );
 			const sitePath = site && ( await canonical( site.path ) );
@@ -533,7 +531,7 @@ export async function runClaudeTurn(
 				};
 				return;
 			}
-			targetSite = { id: target.siteId, path: sitePath };
+			targetSite = { id: target.siteId, path: sitePath, url: site.url };
 		}
 		const prepared = await ( options.prepare ?? prepareClaudeInvocation )(
 			connection.executablePath,
@@ -541,6 +539,8 @@ export async function runClaudeTurn(
 			connection.configDirectory
 		);
 		if ( ! prepared.ok ) throw new Error();
+		const clock = options.clock ?? Date.now;
+		const accountVerifiedAt = clock();
 		if (
 			prepared.cwd !== workspace.workingDirectory ||
 			prepared.configDirectory !== workspace.configDirectory
@@ -558,48 +558,32 @@ export async function runClaudeTurn(
 				claudeConnectionRevision( current ) === selection.revision
 			);
 		};
-		// The running native process still uses the turn's account.
-		const accountUnchanged = async () => {
-			try {
-				return (
-					!! native && compareClaudeExecutionAuth( prepared.identity, await native.accountInfo() )
-				);
-			} catch {
-				return false;
-			}
-		};
-		// Ends the turn, and with it every pending approval, as soon as the
-		// connection or the account it runs on changes.
+		// Ends the turn, and with it every pending approval, once the connection
+		// is detached or re-established.
 		const verifyConnection = async () => {
-			if ( ! ( await stillConnected().catch( () => false ) ) ) {
-				stop( 'detached' );
-				return false;
-			}
-			if ( ! ( await accountUnchanged() ) ) {
-				stop( 'account' );
-				return false;
-			}
-			return true;
+			if ( await stillConnected().catch( () => false ) ) return true;
+			stop( 'detached' );
+			return false;
 		};
-		// The sign-in on disk is still the turn's account, so the native runtime
-		// cannot pick up another account while an operation waits.
-		const verifyAccount = async () => {
-			const current = await ( options.account ?? readClaudeAccountIdentity )(
+		// Reads the native sign-in the runtime would use now. Another account ends
+		// the turn; a status that cannot be read ends it too, but says so.
+		const verifyAccount = async (): Promise< ClaudeAccountCheck > => {
+			const status = await ( options.account ?? readClaudeAccountStatus )(
 				connection.executablePath,
 				prepared.cwd,
 				connection.configDirectory
-			).catch( () => undefined );
-			if ( current && isSameClaudeAccount( prepared.identity, current ) ) return true;
+			).catch( (): ClaudeAccountStatus => ( { state: 'unavailable' } ) );
+			if (
+				status.state === 'signed-in' &&
+				isSameClaudeAccount( prepared.identity, status.identity )
+			)
+				return 'same';
+			if ( status.state === 'unavailable' ) {
+				stop( 'account-unverified' );
+				return 'unverified';
+			}
 			stop( 'account' );
-			return false;
-		};
-		let watchTicks = 0;
-		const watchConnection = async () => {
-			watchTicks++;
-			const unchanged =
-				( await verifyConnection() ) && ( watchTicks % 10 !== 0 || ( await verifyAccount() ) );
-			if ( controller.signal.aborted || ! unchanged ) return;
-			connectionWatch = setTimeout( () => void watchConnection(), 1000 ).unref();
+			return 'changed';
 		};
 		let existing;
 		try {
@@ -683,10 +667,17 @@ export async function runClaudeTurn(
 			ready: () => nativeInitAccepted,
 			stillConnected: verifyConnection,
 			verifyAccount,
+			accountVerifiedAt,
+			now: clock,
 			verifyTarget: ( expected ) => options.verifyTarget( snapshot, expected ),
 			onEvent: emit,
 		} );
 		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy }, emit );
+		const watchConnection = async () => {
+			const unchanged = ( await verifyConnection() ) && ( await policy.refreshAccount() );
+			if ( controller.signal.aborted || ! unchanged ) return;
+			connectionWatch = setTimeout( () => void watchConnection(), 1000 ).unref();
+		};
 		const nativeInput = async function* (): AsyncGenerator< SDKUserMessage > {
 			if ( ( await gate ) && ! controller.signal.aborted )
 				yield {
@@ -866,10 +857,15 @@ export async function runClaudeTurn(
 			},
 		};
 		if ( stopReason && terminal.outcome.status === 'interrupted' ) {
-			terminal.outcome.message =
-				stopReason === 'account'
-					? 'The Claude account changed during this turn. Sign the original account back in, or start a new chat.'
-					: 'Claude Code was detached during this turn.';
+			if ( stopReason === 'account' ) {
+				terminal.outcome.code = 'account_changed';
+				terminal.outcome.message =
+					'The Claude account changed during this turn. Sign the original account back in, or start a new chat.';
+			} else if ( stopReason === 'account-unverified' ) {
+				terminal.outcome.code = 'account_unverified';
+				terminal.outcome.message =
+					'Studio could not verify the Claude account, so this turn stopped. Check the Claude Code sign-in and send again.';
+			} else terminal.outcome.message = 'Claude Code was detached during this turn.';
 		}
 		if ( ! stopped ) failIfSuccessful();
 		try {

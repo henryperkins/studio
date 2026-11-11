@@ -1263,91 +1263,151 @@ it( 'registers a PreToolUse hook that outlasts any approval and denies a cancell
 	}
 } );
 
-it( 'stops the turn when the connection revision or the native account changes (mock SDK)', async () => {
+it( 'refuses a turn sent on an earlier connection revision (mock SDK)', async () => {
 	const { runClaudeTurn } = await import( '../runtime' );
-	const path = await import( 'path' );
-	const fixture = await runtimeFixture( 'claude-account-' );
+	const fixture = await runtimeFixture( 'claude-revision-' );
 	try {
-		const options = (
-			query: unknown,
-			connection: { id: string; executablePath: string; revision?: number }
-		) => ( {
-			storeRoot: fixture.storeRoot,
-			approve: async () => 'deny' as const,
-			verifyTarget: async () => true,
-			query: query as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-			connection: async () => connection,
-			prepare: async () => ( {
-				ok: true as const,
-				executablePath: 'fake',
-				cwd: fixture.root,
-				configDirectory: fixture.config,
-				projectsDirectory: fixture.projects,
-				env: {},
-				identity: { email: 'user@example.com', subscriptionType: 'max' },
-			} ),
-		} );
-		const reestablished = vi.fn();
+		const query = vi.fn();
 		const events: Array< { type: string; outcome?: { status: string; message?: string } } > = [];
 		await runClaudeTurn(
 			turnSnapshot( fixture.root, fixture.config, 'stale' ),
 			fixture.host,
 			{ prompt: 'hello', signal: new AbortController().signal, onEvent: ( e ) => events.push( e ) },
-			options( reestablished, { id: 'native', executablePath: 'fake', revision: 2 } )
+			{
+				storeRoot: fixture.storeRoot,
+				approve: async () => 'deny',
+				verifyTarget: async () => true,
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				connection: async () => ( { id: 'native', executablePath: 'fake', revision: 2 } ),
+				prepare: async () => ( {
+					ok: true,
+					executablePath: 'fake',
+					cwd: fixture.root,
+					configDirectory: fixture.config,
+					projectsDirectory: fixture.projects,
+					env: {},
+					identity: { email: 'user@example.com', subscriptionType: 'max' },
+				} ),
+			}
 		);
-		expect( reestablished ).not.toHaveBeenCalled();
+		expect( query ).not.toHaveBeenCalled();
 		expect( events.at( -1 ) ).toMatchObject( {
 			type: 'turn.terminal',
 			outcome: { status: 'error', message: expect.stringContaining( 'changed' ) },
 		} );
-
-		let email = 'user@example.com';
-		const decisions: unknown[] = [];
-		const query = fakeNativeTurn( fixture.root, {
-			account: () => nativeAccount( email ),
-			onTurn: async ( turnOptions ) => {
-				const hook = (
-					turnOptions.hooks as {
-						PreToolUse: Array< {
-							hooks: Array<
-								(
-									input: unknown,
-									id: string,
-									context: { signal: AbortSignal }
-								) => Promise< { hookSpecificOutput: { permissionDecision: string } } >
-							>;
-						} >;
-					}
-				 ).PreToolUse[ 0 ].hooks[ 0 ];
-				const read = () =>
-					hook(
-						{
-							hook_event_name: 'PreToolUse',
-							tool_name: 'Read',
-							tool_input: { file_path: path.join( fixture.root, 'readme.txt' ) },
-							tool_use_id: 'read',
-						},
-						'read',
-						{ signal: new AbortController().signal }
-					);
-				decisions.push( ( await read() ).hookSpecificOutput.permissionDecision );
-				email = 'someone-else@example.com';
-				decisions.push( ( await read() ).hookSpecificOutput.permissionDecision );
-			},
-		} );
-		events.length = 0;
-		await runClaudeTurn(
-			turnSnapshot( fixture.root, fixture.config, 'switched' ),
-			fixture.host,
-			{ prompt: 'hello', signal: new AbortController().signal, onEvent: ( e ) => events.push( e ) },
-			options( query, { id: 'native', executablePath: 'fake' } )
-		);
-		expect( decisions ).toEqual( [ 'allow', 'deny' ] );
-		expect( events.at( -1 ) ).toMatchObject( {
-			type: 'turn.terminal',
-			outcome: { status: 'interrupted', message: expect.stringContaining( 'account' ) },
-		} );
 	} finally {
+		await fixture.cleanup();
+	}
+} );
+
+it( 'stops the turn within the recheck bound when the stored sign-in changes or cannot be read (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { readClaudeAccountStatus } = await import( '../connection' );
+	const { CLAUDE_ACCOUNT_RECHECK_MS } = await import( '../execution-rules' );
+	const path = await import( 'path' );
+	for ( const name of Object.keys( process.env ) )
+		if ( /^(ANTHROPIC_|AWS_|GOOGLE_|AZURE_|CLAUDE_)|_PROXY$/i.test( name ) ) vi.stubEnv( name, '' );
+	const fixture = await runtimeFixture( 'claude-signin-' );
+	try {
+		const status = ( email: string ) =>
+			JSON.stringify( {
+				loggedIn: true,
+				authMethod: 'claude.ai',
+				apiProvider: 'firstParty',
+				storedClaudeAiLogin: true,
+				subscriptionType: 'max',
+				email,
+			} );
+		for ( const [ change, code ] of [
+			[ status( 'someone-else@example.com' ), 'account_changed' ],
+			[ 'unreadable output', 'account_unverified' ],
+		] ) {
+			let stored = status( 'user@example.com' );
+			const now = { value: 1_000 };
+			const decisions: string[] = [];
+			const query = fakeNativeTurn( fixture.root, {
+				onTurn: async ( options ) => {
+					const hook = (
+						options.hooks as {
+							PreToolUse: Array< {
+								hooks: Array<
+									(
+										input: unknown,
+										id: string,
+										context: { signal: AbortSignal }
+									) => Promise< { hookSpecificOutput: { permissionDecision: string } } >
+								>;
+							} >;
+						}
+					 ).PreToolUse[ 0 ].hooks[ 0 ];
+					const read = async () =>
+						decisions.push(
+							(
+								await hook(
+									{
+										hook_event_name: 'PreToolUse',
+										tool_name: 'Read',
+										tool_input: { file_path: path.join( fixture.root, 'readme.txt' ) },
+										tool_use_id: 'read',
+									},
+									'read',
+									{ signal: new AbortController().signal }
+								)
+							).hookSpecificOutput.permissionDecision
+						);
+					await read();
+					stored = change;
+					now.value += CLAUDE_ACCOUNT_RECHECK_MS - 1;
+					await read();
+					now.value += 1;
+					await read();
+				},
+			} );
+			const events: Array< { type: string; outcome?: unknown } > = [];
+			await runClaudeTurn(
+				{
+					...turnSnapshot( fixture.root, fixture.config, code ),
+					workspace: {
+						conversationId: code,
+						siteId: 'site',
+						workingDirectory: fixture.root,
+						configDirectory: fixture.config,
+					},
+				},
+				fixture.host,
+				{
+					prompt: 'hello',
+					signal: new AbortController().signal,
+					onEvent: ( e ) => events.push( e ),
+				},
+				{
+					storeRoot: fixture.storeRoot,
+					approve: async () => 'deny',
+					verifyTarget: async () => true,
+					clock: () => now.value,
+					account: ( executable, cwd, config ) =>
+						readClaudeAccountStatus( executable, cwd, config, async () => ( { stdout: stored } ) ),
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+					prepare: async () => ( {
+						ok: true,
+						executablePath: 'fake',
+						cwd: fixture.root,
+						configDirectory: fixture.config,
+						projectsDirectory: fixture.projects,
+						env: {},
+						identity: { email: 'user@example.com', subscriptionType: 'max' },
+					} ),
+				}
+			);
+			expect( decisions, code ).toEqual( [ 'allow', 'allow', 'deny' ] );
+			expect( events.at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'interrupted', code },
+			} );
+		}
+	} finally {
+		vi.unstubAllEnvs();
 		await fixture.cleanup();
 	}
 } );

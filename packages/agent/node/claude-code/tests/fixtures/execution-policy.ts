@@ -31,7 +31,13 @@ export async function createPolicyFixture(
 	await mkdir( config );
 	const host = createFakeHost( parent );
 	const localSite = { ...fakeSite, path: site };
-	const otherSite = { ...fakeSite, id: 'other-site', name: 'Other', path: other };
+	const otherSite = {
+		...fakeSite,
+		id: 'other-site',
+		name: 'Other',
+		path: other,
+		url: 'http://other-site.example:8890',
+	};
 	const byReference = ( reference: string ) =>
 		reference === 'other' || path.resolve( reference ) === other ? otherSite : localSite;
 	host.sites.resolve = vi.fn( async ( reference: string ) => byReference( reference ) );
@@ -41,6 +47,7 @@ export async function createPolicyFixture(
 	host.sites.all = vi.fn( async () => [ localSite, otherSite ] );
 	const controller = new AbortController();
 	const events: BackendTurnEvent[] = [];
+	const clock = { now: 0 };
 	const context: ClaudeExecutionContext = {
 		runId: 'run',
 		turnId: 'turn',
@@ -49,7 +56,7 @@ export async function createPolicyFixture(
 		policyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 		target: { environment: 'local', siteId: fakeSite.id },
 		workspace: { siteId: fakeSite.id, workingDirectory: site, configDirectory: config },
-		targetSite: { id: fakeSite.id, path: site },
+		targetSite: { id: fakeSite.id, path: site, url: fakeSite.url },
 		localRoots: [ site ],
 		enabledTools: CLAUDE_ENABLED_TOOLS,
 		shellConfinement: { mode: 'none' },
@@ -58,7 +65,9 @@ export async function createPolicyFixture(
 		approvalTimeoutMs: 100,
 		ready: () => true,
 		stillConnected: vi.fn( async () => true ),
-		verifyAccount: vi.fn( async () => true ),
+		verifyAccount: vi.fn( async () => 'same' as const ),
+		accountVerifiedAt: 0,
+		now: () => clock.now,
 		verifyTarget: vi.fn( async () => true ),
 		onEvent: ( event ) => events.push( event ),
 		...overrides( { site, config, parent } ),
@@ -71,6 +80,7 @@ export async function createPolicyFixture(
 		otherSite,
 		controller,
 		events,
+		clock,
 		site,
 		other,
 		config,
