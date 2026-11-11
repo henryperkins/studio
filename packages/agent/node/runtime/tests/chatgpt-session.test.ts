@@ -1441,9 +1441,9 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( fs.readFileSync( hero ).toString( 'base64' ) ).toBe( TINY_PNG_BASE64 );
 		} );
 
-		// Today's behavior, which G2b builds on: image generation is Studio's
-		// WordPress.com image service, offered on a ChatGPT turn when that
-		// service is configured, and it never uses the ChatGPT sign-in.
+		// Image generation is Studio's WordPress.com image service: offered on a
+		// ChatGPT turn when that service is configured, never through the
+		// ChatGPT sign-in.
 		it.each( [
 			[ 'no image service', {}, null, undefined ],
 			[
