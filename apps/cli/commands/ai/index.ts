@@ -13,10 +13,12 @@ import {
 	chatGptSettingsAction,
 	validateChatGptSelection,
 } from '@studio/agent/node/chatgpt/settings';
+import { CLAUDE_EXECUTION_POLICY_REVISION } from '@studio/agent/node/claude-code/execution-policy';
 import {
 	getClaudeSessionStoreRoot,
 	validateClaudeSendSelection,
 	verifyClaudeTurnSession,
+	verifyClaudeTurnTarget,
 } from '@studio/agent/node/claude-code/studio-surface';
 import { assertSessionSelection } from '@studio/agent/node/sessions/selection';
 import {
@@ -81,7 +83,7 @@ import {
 	resolveUnavailableAiProvider,
 	saveSelectedAiProvider,
 } from 'cli/ai/auth';
-import { getTerminalClaudeApprover } from 'cli/ai/claude-approval';
+import { createClaudeApprovalRouter, getTerminalClaudeApprover } from 'cli/ai/claude-approval';
 import { cliAgentHost } from 'cli/ai/host';
 import { emitEvent } from 'cli/ai/json-events';
 import { type AiOutputAdapter, JsonAdapter } from 'cli/ai/output-adapter';
@@ -110,7 +112,7 @@ import {
 import { Logger, LoggerError } from 'cli/logger';
 import { StudioArgv } from 'cli/types';
 import type { SessionManager } from '@earendil-works/pi-coding-agent';
-import type { ClaudeToolPolicy } from '@studio/agent/node/claude-code/tool-bridge';
+import type { ClaudeApprover } from '@studio/agent/node/claude-code/execution-policy';
 import type {
 	StudioCustomEntryDataMap,
 	StudioCustomEntryType,
@@ -298,7 +300,7 @@ async function resolveChatGptConnection( sm: SessionManager ): Promise< Connecti
 
 export async function runCommand( options: {
 	adapter: AiOutputAdapter;
-	approveClaude?: ClaudeToolPolicy[ 'approve' ];
+	approveClaude?: ClaudeApprover;
 	startupSignal?: AbortSignal;
 	initialMessage?: string;
 	initialTurnId?: string;
@@ -408,34 +410,20 @@ export async function runCommand( options: {
 		const turnId = options.initialTurnId ?? randomUUID();
 		const conversationId = options.resumeSession?.summary.id ?? resumedById!.getSessionId();
 		await validateClaudeSendSelection( getSessionsDirectory(), conversationId, selection );
-		const pending = new Map< string, ( answer: 'allow' | 'deny' ) => void >();
-		const approve = async (
-			request: Parameters< ClaudeToolPolicy[ 'approve' ] >[ 0 ],
-			signal: AbortSignal
-		): Promise< 'allow' | 'deny' > => {
-			if ( signal.aborted ) return 'deny';
-			if ( typeof process.send !== 'function' )
-				return options.approveClaude?.( request, signal ) ?? 'deny';
-			return new Promise( ( resolve ) => {
-				const done = ( answer: 'allow' | 'deny' ) => {
-					pending.delete( request.operationId );
-					signal.removeEventListener( 'abort', abort );
-					resolve( answer );
-				};
-				const abort = () => done( 'deny' );
-				pending.set( request.operationId, done );
-				signal.addEventListener( 'abort', abort, { once: true } );
-				if ( signal.aborted ) abort();
-			} );
-		};
+		const approvals = createClaudeApprovalRouter( {
+			viaIpc: typeof process.send === 'function',
+			local: options.approveClaude,
+		} );
 		const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
 		const claudeAgent = createAgent( {
 			host,
 			claudeCode: ( snapshot, input ) =>
 				runClaudeTurn( snapshot, host, input, {
 					storeRoot: getClaudeSessionStoreRoot( getSessionsDirectory() ),
-					approve,
+					approve: approvals.approve,
 					verifySession: ( turn ) => verifyClaudeTurnSession( getSessionsDirectory(), turn ),
+					verifyTarget: ( turn, expected ) =>
+						verifyClaudeTurnTarget( getSessionsDirectory(), turn, expected ),
 				} ),
 		} );
 		const turn = claudeAgent.runBackendTurn(
@@ -444,13 +432,14 @@ export async function runCommand( options: {
 				runId,
 				turnId,
 				effort: selection.effort,
-				permissionPolicyRevision: 0,
+				permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 				selection: {
 					connectionId: claude.binding.connectionId,
 					revision: 0,
 					model: { providerId: 'claude-code', modelId: selection.model },
 				},
 				workspace: { ...claude.binding, conversationId },
+				target: claude.target,
 			},
 			{
 				backend: 'claude-code',
@@ -468,14 +457,13 @@ export async function runCommand( options: {
 		);
 		const onMessage = ( value: unknown ) => {
 			if ( ! value || typeof value !== 'object' ) return;
-			const message = value as { type?: string; answers?: Record< string, string > };
+			const message = value as { type?: string; answers?: unknown };
 			if ( message.type === 'interrupt' ) void turn.interrupt();
-			if ( message.type === 'answer' && message.answers )
-				for ( const [ id, answer ] of Object.entries( message.answers ) ) {
-					if ( answer === 'allow' || answer === 'deny' ) pending.get( id )?.( answer );
-				}
+			if ( message.type === 'answer' && message.answers && typeof message.answers === 'object' )
+				approvals.answer( message.answers as Record< string, unknown > );
 		};
 		const interrupt = () => {
+			approvals.cancelAll();
 			void turn.interrupt();
 		};
 		process.on( 'message', onMessage );
@@ -491,7 +479,7 @@ export async function runCommand( options: {
 			process.off( 'disconnect', interrupt );
 			process.off( 'SIGINT', interrupt );
 			options.startupSignal?.removeEventListener( 'abort', interrupt );
-			for ( const resolve of pending.values() ) resolve( 'deny' );
+			approvals.cancelAll();
 		}
 		return;
 	}

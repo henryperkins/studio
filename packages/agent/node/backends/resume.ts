@@ -49,7 +49,7 @@ export async function resolveClaudeResume(
 		! recorded.nativeSessionId ||
 		! recorded.connectionId ||
 		! recorded.conversationId ||
-		! recorded.siteId ||
+		( recorded.siteId !== null && ! recorded.siteId ) ||
 		recorded.connectionId !== current.connectionId ||
 		recorded.conversationId !== current.conversationId ||
 		recorded.siteId !== current.siteId ||

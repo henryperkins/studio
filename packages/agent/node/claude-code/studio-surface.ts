@@ -1,6 +1,10 @@
 import { randomUUID } from 'crypto';
+import { mkdir } from 'fs/promises';
+import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
+import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { readSite } from '@studio/common/sites/site-path';
 import {
+	isSameClaudeTarget,
 	parseClaudeSessionSelection,
 	resolveClaudeSession,
 } from '@studio/agent/protocol/claude-code';
@@ -14,12 +18,14 @@ import {
 	saveClaudeConnection,
 } from './connection';
 import { inspectClaudeExecutable } from './discovery';
+import { getClaudeGlobalWorkspace, getClaudeSessionStoreRoot } from './sessions';
 import type { ClaudeBackendTurnSnapshot } from '@studio/agent/protocol/backend-events';
 import type {
 	ClaudeModelCatalog,
 	ClaudeRuntimeAction,
 	ClaudeRuntimeState,
 	ClaudeSessionSelection,
+	ClaudeStudioTarget,
 	CreateClaudeSessionRequest,
 } from '@studio/agent/protocol/claude-code';
 
@@ -90,17 +96,39 @@ export async function configureClaudeRuntime( action: ClaudeRuntimeAction ): Pro
 	throw new Error( 'Invalid Claude Code connection action.' );
 }
 
-export async function getClaudeModelCatalog(
+// The dedicated workspace all global conversations run in, created on first use.
+async function ensureGlobalWorkspace( sessionsRoot: string ): Promise< string > {
+	const workspace = getClaudeGlobalWorkspace( getClaudeSessionStoreRoot( sessionsRoot ) );
+	await mkdir( workspace, { recursive: true, mode: 0o700 } );
+	return workspace;
+}
+
+async function getModelCatalog(
 	connectionId: string,
-	siteId: string
+	siteId: string | null | undefined,
+	sessionsRoot: string
 ): Promise< ClaudeModelCatalog > {
 	if ( ! isClaudeRuntimeEnabled() )
 		return { ok: false, blockers: [ 'experimental-feature-disabled' ] };
-	const site = await readSite( siteId );
-	if ( ! site ) return { ok: false, blockers: [ 'local-site-not-found' ] };
+	let workspace: string;
+	if ( siteId === null || siteId === undefined ) {
+		workspace = await ensureGlobalWorkspace( sessionsRoot );
+	} else {
+		const site = await readSite( siteId );
+		if ( ! site ) return { ok: false, blockers: [ 'local-site-not-found' ] };
+		workspace = site.path;
+	}
 	const { discoverClaudeModels } = await import( './runtime' );
-	const result = await discoverClaudeModels( connectionId, site.path );
+	const result = await discoverClaudeModels( connectionId, workspace );
 	return result.ok ? { ok: true, models: result.models } : result;
+}
+
+/** Models a connection offers in a site's workspace, or the global one without a site. */
+export function getClaudeModelCatalog(
+	connectionId: string,
+	siteId?: string | null
+): Promise< ClaudeModelCatalog > {
+	return getModelCatalog( connectionId, siteId, getSessionsDirectory() );
 }
 
 function requireSupportedSelection(
@@ -118,23 +146,38 @@ function requireSupportedSelection(
 	}
 }
 
+/**
+ * Creates a Claude conversation on a local site, working in that site's folder,
+ * or without a site as a global conversation in the dedicated global workspace.
+ */
 export async function createClaudeSession( root: string, request: CreateClaudeSessionRequest ) {
 	requireClaudeRuntime();
-	if ( typeof request?.siteId !== 'string' || typeof request.connectionId !== 'string' ) {
-		throw new Error( 'Select a Claude Code connection and a local site.' );
+	const siteId: unknown = request?.siteId;
+	if (
+		typeof request?.connectionId !== 'string' ||
+		( siteId !== undefined && siteId !== null && typeof siteId !== 'string' )
+	) {
+		throw new Error( 'Select a Claude Code connection.' );
 	}
 	const selection = parseClaudeSessionSelection( request.selection );
-	const site = await readSite( request.siteId );
-	if ( ! site ) throw new Error( 'This local site is unavailable.' );
+	let site: Awaited< ReturnType< typeof readSite > > | undefined;
+	let workspace: string;
+	if ( typeof siteId === 'string' ) {
+		site = await readSite( siteId );
+		if ( ! site ) throw new Error( 'This local site is unavailable.' );
+		workspace = site.path;
+	} else {
+		workspace = await ensureGlobalWorkspace( root );
+	}
 	const { discoverClaudeModels } = await import( './runtime' );
-	const catalog = await discoverClaudeModels( request.connectionId, site.path );
+	const catalog = await discoverClaudeModels( request.connectionId, workspace );
 	requireSupportedSelection( catalog, selection );
 	return createHydratedAiSession( root, {
-		site,
+		site: site ?? undefined,
 		claude: {
 			binding: {
 				connectionId: request.connectionId,
-				siteId: site.id,
+				siteId: site?.id ?? null,
 				workingDirectory: catalog.workingDirectory,
 				configDirectory: catalog.configDirectory,
 			},
@@ -153,9 +196,10 @@ export async function setClaudeSessionSelection(
 	const { summary, entries } = await loadAiSession( root, sessionId );
 	const context = resolveClaudeSession( entries );
 	if ( ! context ) throw new Error( 'This chat does not use Claude Code.' );
-	const catalog = await getClaudeModelCatalog(
+	const catalog = await getModelCatalog(
 		context.binding.connectionId,
-		context.binding.siteId
+		context.binding.siteId,
+		root
 	);
 	requireSupportedSelection( catalog, selection );
 	await appendStudioEntry( root, summary.id, 'studio.claude_selection', selection );
@@ -184,29 +228,65 @@ export async function validateClaudeSendSelection(
 	) {
 		throw new Error( 'Claude Code settings changed. Reload this chat and send again.' );
 	}
+	const { target } = context;
+	if (
+		target.environment === 'live' &&
+		! ( await getConnectedWpcomSitesForLocalSite( target.siteId ) ).some(
+			( site ) => site.id === target.wpcomSiteId
+		)
+	) {
+		throw new Error(
+			'The live site this chat works on is no longer connected. Switch the chat to Local and send again.'
+		);
+	}
 	return selected;
 }
 
-export async function verifyClaudeTurnSession(
-	root: string,
-	snapshot: ClaudeBackendTurnSnapshot
-): Promise< boolean > {
-	if ( ! isClaudeRuntimeEnabled() ) return false;
-	const { workspace, selection, effort } = snapshot;
+// The conversation as it is now, if it still has the turn's native binding.
+async function loadBoundSession( root: string, snapshot: ClaudeBackendTurnSnapshot ) {
+	if ( ! isClaudeRuntimeEnabled() ) return;
+	const { workspace, selection } = snapshot;
 	try {
 		const { entries, summary } = await loadAiSession( root, workspace.conversationId );
 		const session = resolveClaudeSession( entries );
-		return (
-			!! session &&
+		if (
+			session &&
 			summary.id === workspace.conversationId &&
 			session.binding.connectionId === selection.connectionId &&
 			session.binding.siteId === workspace.siteId &&
 			session.binding.workingDirectory === workspace.workingDirectory &&
-			session.binding.configDirectory === workspace.configDirectory &&
-			session.selection.model === selection.model.modelId &&
-			session.selection.effort === effort
-		);
+			session.binding.configDirectory === workspace.configDirectory
+		)
+			return session;
 	} catch {
-		return false;
+		// An unreadable conversation cannot confirm anything.
 	}
+}
+
+/** Whether a turn can start: the conversation still has its binding, selection and target. */
+export async function verifyClaudeTurnSession(
+	root: string,
+	snapshot: ClaudeBackendTurnSnapshot
+): Promise< boolean > {
+	const session = await loadBoundSession( root, snapshot );
+	return (
+		!! session &&
+		session.selection.model === snapshot.selection.model.modelId &&
+		session.selection.effort === snapshot.effort &&
+		isSameClaudeTarget( session.target, snapshot.target )
+	);
+}
+
+/**
+ * Whether a running turn may still execute: the conversation keeps its binding
+ * and has the expected target. A model or effort change waits for the next turn
+ * and does not stop this one; a target change does.
+ */
+export async function verifyClaudeTurnTarget(
+	root: string,
+	snapshot: ClaudeBackendTurnSnapshot,
+	expected: ClaudeStudioTarget
+): Promise< boolean > {
+	const session = await loadBoundSession( root, snapshot );
+	return !! session && isSameClaudeTarget( session.target, expected );
 }

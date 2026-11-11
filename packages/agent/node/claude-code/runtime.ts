@@ -1,18 +1,26 @@
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
-import path from 'path';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
-import { isClaudeEffort, isClaudeModelId } from '@studio/agent/protocol/claude-code';
+import {
+	isClaudeEffort,
+	isClaudeModelId,
+	isClaudeTargetAllowed,
+} from '@studio/agent/protocol/claude-code';
 import { compareClaudeExecutionAuth } from './auth-status';
 import { getClaudeConnections, prepareClaudeInvocation } from './connection';
 import { QUALIFIED_CLAUDE_CODE_VERSION } from './discovery';
 import { createClaudeEventAdapter } from './event-adapter';
-import { createNativeSessionStore } from './sessions';
+import {
+	CLAUDE_ENABLED_TOOLS,
+	createClaudeExecutionPolicy,
+	isEnabledClaudeTool,
+} from './execution-policy';
+import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
 import { createStudioClaudeMcpServer, createStudioClaudeToolBridge } from './tool-bridge';
 import type { ClaudeAuthIdentity } from './auth-status';
-import type { ClaudeToolPolicy } from './tool-bridge';
+import type { ClaudeApprover } from './execution-policy';
 import type { StudioAgentHost } from '../host';
 import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk/core';
 import type {
@@ -20,7 +28,7 @@ import type {
 	ClaudeBackendTurnSnapshot,
 } from '@studio/agent/protocol/backend-events';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
-import type { ClaudeModelOption } from '@studio/agent/protocol/claude-code';
+import type { ClaudeModelOption, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
 interface StartupControl {
 	initializationResult(): Promise< {
@@ -176,43 +184,6 @@ export async function settleNativeProcess(
 	return wait();
 }
 
-export async function isAllowedNativeRead(
-	file: string,
-	workspace: string,
-	config: string
-): Promise< boolean > {
-	if ( ! path.isAbsolute( file ) ) return false;
-	try {
-		const canonical = await realpath( file );
-		const inside = ( root: string, candidate: string ) => {
-			const relative = path.relative( root, candidate );
-			return (
-				relative === '' ||
-				( relative !== '..' &&
-					! relative.startsWith( '..' + path.sep ) &&
-					! path.isAbsolute( relative ) )
-			);
-		};
-		const sensitive = ( candidate: string ) =>
-			candidate
-				.split( /[\\/]/ )
-				.some( ( part ) =>
-					/^(?:\.env(?:\..*)?|wp-config\.php|\.credentials(?:\..*)?|\.ssh|database|.*secret.*|.*credential.*|.*\.(?:pem|key|p12|pfx))$/i.test(
-						part
-					)
-				);
-		return (
-			inside( workspace, canonical ) &&
-			canonical !== workspace &&
-			! inside( config, canonical ) &&
-			! sensitive( file ) &&
-			! sensitive( canonical )
-		);
-	} catch {
-		return false;
-	}
-}
-
 interface RuntimeInput {
 	prompt: string;
 	images?: StudioChatImage[];
@@ -240,8 +211,13 @@ interface RuntimeDependencies {
 
 interface RuntimeOptions extends RuntimeDependencies {
 	storeRoot: string;
-	approve: ClaudeToolPolicy[ 'approve' ];
+	approve: ClaudeApprover;
 	verifySession?: ( snapshot: ClaudeBackendTurnSnapshot ) => Promise< boolean >;
+	/** Whether the conversation still has the turn's native binding and the expected target. */
+	verifyTarget: (
+		snapshot: ClaudeBackendTurnSnapshot,
+		expected: ClaudeStudioTarget
+	) => Promise< boolean >;
 }
 
 type TerminalEvent = Extract< BackendTurnEvent, { type: 'turn.terminal' } >;
@@ -281,7 +257,7 @@ function nativeLaunchOptions(
 			child.stderr.resume();
 			return child;
 		},
-		tools: [ 'Read' ],
+		tools: [ ...CLAUDE_ENABLED_TOOLS.native ],
 		strictMcpConfig: true,
 		settingSources: [],
 		settings: {
@@ -417,7 +393,7 @@ export async function runClaudeTurn(
 	input: RuntimeInput,
 	options: RuntimeOptions
 ): Promise< void > {
-	const { runId, turnId, workspace, selection } = snapshot;
+	const { runId, turnId, workspace, selection, target } = snapshot;
 	const fail = (): TerminalEvent => ( {
 		type: 'turn.terminal',
 		runId,
@@ -489,17 +465,39 @@ export async function runClaudeTurn(
 			);
 			return;
 		}
-		const site = ( await host.sites.all() ).find(
-			( candidate ) => candidate.id === workspace.siteId
-		);
+		const canonical = ( directory: string ) => realpath( directory ).catch( () => undefined );
+		const sites = await host.sites.all();
+		const expectedWorkspace =
+			workspace.siteId === null
+				? getClaudeGlobalWorkspace( options.storeRoot )
+				: sites.find( ( candidate ) => candidate.id === workspace.siteId )?.path;
 		if (
-			! site ||
-			( await realpath( site.path ).catch( () => undefined ) ) !== workspace.workingDirectory ||
-			( await realpath( workspace.configDirectory ).catch( () => undefined ) ) !==
-				workspace.configDirectory
+			! isClaudeTargetAllowed( workspace.siteId, target ) ||
+			! expectedWorkspace ||
+			( await canonical( expectedWorkspace ) ) !== workspace.workingDirectory ||
+			( await canonical( workspace.configDirectory ) ) !== workspace.configDirectory
 		) {
 			terminal = rebind();
 			return;
+		}
+		let targetSite: { id: string; path: string } | undefined;
+		if ( target.environment !== 'global' ) {
+			const site = sites.find( ( candidate ) => candidate.id === target.siteId );
+			const sitePath = site && ( await canonical( site.path ) );
+			if ( ! sitePath ) {
+				terminal = {
+					type: 'turn.terminal',
+					runId,
+					turnId,
+					outcome: {
+						status: 'error',
+						message:
+							'The site this chat works on is unavailable. Choose another target or start a new chat.',
+					},
+				};
+				return;
+			}
+			targetSite = { id: target.siteId, path: sitePath };
 		}
 		const prepared = await ( options.prepare ?? prepareClaudeInvocation )(
 			connection.executablePath,
@@ -582,20 +580,33 @@ export async function runClaudeTurn(
 				} );
 			input.onEvent( event );
 		};
-		bridge = createStudioClaudeToolBridge(
-			host,
-			{
-				runId,
-				turnId,
+		const policy = createClaudeExecutionPolicy( {
+			runId,
+			turnId,
+			connectionId: selection.connectionId,
+			connectionRevision: selection.revision,
+			policyRevision: snapshot.permissionPolicyRevision,
+			target,
+			workspace: {
 				siteId: workspace.siteId,
 				workingDirectory: prepared.cwd,
-				signal: controller.signal,
-				approve: options.approve,
-				approvalTimeoutMs: 120000,
-				stillConnected: async () => nativeInitAccepted && ( await stillConnected() ),
+				configDirectory: prepared.configDirectory,
 			},
-			emit
-		);
+			targetSite,
+			localRoots:
+				targetSite && targetSite.path !== prepared.cwd
+					? [ prepared.cwd, targetSite.path ]
+					: [ prepared.cwd ],
+			enabledTools: CLAUDE_ENABLED_TOOLS,
+			signal: controller.signal,
+			approve: options.approve,
+			approvalTimeoutMs: 120000,
+			ready: () => nativeInitAccepted,
+			stillConnected,
+			verifyTarget: ( expected ) => options.verifyTarget( snapshot, expected ),
+			onEvent: emit,
+		} );
+		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy }, emit );
 		const nativeInput = async function* (): AsyncGenerator< SDKUserMessage > {
 			if ( ( await gate ) && ! controller.signal.aborted )
 				yield {
@@ -636,8 +647,15 @@ export async function runClaudeTurn(
 				effort,
 				includePartialMessages: true,
 				mcpServers: { studio: bridge.server },
-				canUseTool: async ( name, toolInput ) =>
-					name === 'Read' || name === 'mcp__studio__wp_cli'
+				// The hook and the permission request each apply the whole policy, so
+				// a native allow rule that skips one cannot skip the Studio guard.
+				canUseTool: async ( name, toolInput, { mcpServer, toolUseID } ) =>
+					( await policy.authorizeToolUse( {
+						toolName: name,
+						input: toolInput,
+						toolUseId: toolUseID,
+						mcpServer,
+					} ) )
 						? { behavior: 'allow', updatedInput: toolInput }
 						: { behavior: 'deny', message: 'Tool unavailable.' },
 				hooks: {
@@ -645,40 +663,21 @@ export async function runClaudeTurn(
 						{
 							onFailure: 'block',
 							hooks: [
-								async ( hook ) => {
-									let allowed = false;
-									if (
-										nativeInitAccepted &&
-										hook.hook_event_name === 'PreToolUse' &&
-										! controller.signal.aborted
-									) {
-										if ( hook.tool_name === 'mcp__studio__wp_cli' )
-											allowed =
-												hook.mcp_server?.name === 'studio' && hook.mcp_server?.source === 'sdk';
-										else if (
-											hook.tool_name === 'Read' &&
-											hook.tool_input &&
-											typeof hook.tool_input === 'object'
-										) {
-											const file = ( hook.tool_input as Record< string, unknown > ).file_path;
-											if ( typeof file === 'string' )
-												allowed =
-													( await isAllowedNativeRead(
-														file,
-														prepared.cwd,
-														prepared.configDirectory
-													) ) &&
-													( await stillConnected() ) &&
-													! controller.signal.aborted;
-										}
-									}
-									return {
-										hookSpecificOutput: {
-											hookEventName: 'PreToolUse',
-											permissionDecision: allowed ? 'allow' : 'deny',
-										},
-									};
-								},
+								async ( hook ) => ( {
+									hookSpecificOutput: {
+										hookEventName: 'PreToolUse',
+										permissionDecision:
+											hook.hook_event_name === 'PreToolUse' &&
+											( await policy.authorizeToolUse( {
+												toolName: hook.tool_name,
+												input: hook.tool_input,
+												toolUseId: hook.tool_use_id,
+												mcpServer: hook.mcp_server,
+											} ) )
+												? 'allow'
+												: 'deny',
+									},
+								} ),
 							],
 						},
 					],
@@ -716,7 +715,7 @@ export async function runClaudeTurn(
 					message.permissionMode !== 'default' ||
 					! isQualifiedClaudePlugins( message.plugins ) ||
 					message.plugin_errors?.length ||
-					message.tools.some( ( name ) => name !== 'Read' && name !== 'mcp__studio__wp_cli' ) ||
+					message.tools.some( ( name ) => ! isEnabledClaudeTool( name ) ) ||
 					message.cwd !== prepared.cwd ||
 					message.apiKeySource !== 'none' ||
 					message.claude_code_version !== QUALIFIED_CLAUDE_CODE_VERSION ||

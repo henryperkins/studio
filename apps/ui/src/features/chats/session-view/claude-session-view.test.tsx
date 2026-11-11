@@ -407,6 +407,13 @@ describe( 'Claude selection and approval recovery', () => {
 		requestId: 'request-1',
 		toolCallId: 'tool-1',
 		description: 'Create a restored draft',
+		operation: {
+			tool: 'sites.wpCli',
+			operationClass: 'command',
+			target: { environment: 'local', siteId: 'site' },
+			args: '[]',
+			localPaths: [] as string[],
+		},
 		draft: { siteName: 'My site', title: 'Restored draft', content: 'Exact restored content' },
 	} as const;
 	const active = () => [
@@ -578,6 +585,13 @@ it( 'shows the exact draft scope and denies the pending request by its ID', asyn
 					requestId: 'request-1',
 					toolCallId: 'tool',
 					description: 'Create a draft',
+					operation: {
+						tool: 'sites.wpCli',
+						operationClass: 'command',
+						target: { environment: 'local', siteId: 'site' },
+						args: '[]',
+						localPaths: [],
+					},
 					draft: { siteName: 'My site', title: 'Draft title', content: 'Draft content' },
 				},
 			},

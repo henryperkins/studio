@@ -1,4 +1,5 @@
 import type { StudioChatArtifactData } from './chat-artifacts';
+import type { ClaudeOperationClass, ClaudeStudioTarget } from './claude-code';
 import type { ConnectionBackend, ConnectionSelection } from './connections';
 import type { AiProviderId } from './providers';
 
@@ -35,7 +36,14 @@ export interface PiBackendTurnSnapshot extends TurnSnapshot< 'pi', AiProviderId 
 }
 
 export interface ClaudeBackendTurnSnapshot extends TurnSnapshot< 'claude-code', 'claude-code' > {
-	readonly workspace: Readonly< TurnWorkspace & { siteId: string; configDirectory: string } >;
+	/**
+	 * The conversation's native identity, which never moves: its workspace, the
+	 * site that folder belongs to (null for the global workspace) and the native
+	 * configuration that holds its history.
+	 */
+	readonly workspace: Readonly< TurnWorkspace & { configDirectory: string } >;
+	/** The Studio target selected at Send. A later selection applies to a later turn. */
+	readonly target: Readonly< ClaudeStudioTarget >;
 }
 
 export type BackendTurnSnapshot = PiBackendTurnSnapshot | ClaudeBackendTurnSnapshot;
@@ -65,6 +73,18 @@ interface ToolCall {
 	toolCallId: string;
 }
 
+/** Display-safe copy of the one operation an approval covers. */
+export interface BackendApprovalOperation {
+	/** Canonical Studio tool, native tool or host operation name. */
+	tool: string;
+	operationClass: ClaudeOperationClass;
+	target: ClaudeStudioTarget;
+	/** The exact arguments, as escaped JSON. */
+	args: string;
+	localPaths: string[];
+	remote?: string;
+}
+
 /** Events sent by a backend using Studio's display protocol. */
 export type BackendTurnEvent = BackendTurnIds &
 	// Cumulative text, ordered by sequence within the block.
@@ -79,6 +99,7 @@ export type BackendTurnEvent = BackendTurnIds &
 				type: 'approval.requested';
 				requestId: string;
 				description: string;
+				operation: BackendApprovalOperation;
 				draft?: { siteName: string; title: string; content?: string };
 		  } & ToolCall )
 		| ( { type: 'approval.resolved'; requestId: string } & ToolCall )

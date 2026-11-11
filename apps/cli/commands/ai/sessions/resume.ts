@@ -13,7 +13,7 @@ import { runCommand as runAiCommand } from 'cli/commands/ai';
 import { chooseSessionForAction } from 'cli/commands/ai/sessions/helpers';
 import { Logger, LoggerError } from 'cli/logger';
 import { StudioArgv } from 'cli/types';
-import type { ClaudeToolPolicy } from '@studio/agent/node/claude-code/tool-bridge';
+import type { ClaudeApprover } from '@studio/agent/node/claude-code/execution-policy';
 import type { StudioAiSessionInputPayload } from '@studio/agent/protocol/chat-images';
 import type { AiOutputAdapter } from 'cli/ai/output-adapter';
 
@@ -38,7 +38,7 @@ async function readInputPayload( path: string ): Promise< StudioAiSessionInputPa
 export async function runCommand(
 	sessionIdOrPrefix?: string,
 	options: {
-		approveClaude?: ClaudeToolPolicy[ 'approve' ];
+		approveClaude?: ClaudeApprover;
 		message?: string;
 		displayMessage?: string;
 		inputPayloadPath?: string;

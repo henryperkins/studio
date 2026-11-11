@@ -172,6 +172,7 @@ it.each( [ 'missing native reference', 'moved workspace' ] )(
 					},
 					effort: 'medium',
 					permissionPolicyRevision: 1,
+					target: { environment: 'local' as const, siteId: 'site' },
 					workspace: {
 						conversationId: 'chat',
 						siteId: 'site',
@@ -189,6 +190,7 @@ it.each( [ 'missing native reference', 'moved workspace' ] )(
 					storeRoot: root,
 					query,
 					approve: async () => 'deny',
+					verifyTarget: async () => true,
 					connection: async () => ( { id: 'connection', executablePath: 'fake' } ),
 					prepare: async () => ( {
 						ok: true,
@@ -297,6 +299,7 @@ it( 'resumes the exact native session after restart with the next model and effo
 					turnId: model,
 					effort,
 					permissionPolicyRevision: 1,
+					target: { environment: 'local' as const, siteId: 'site' },
 					selection: {
 						connectionId: 'native',
 						model: { providerId: 'claude-code', modelId: model },
@@ -318,6 +321,7 @@ it( 'resumes the exact native session after restart with the next model and effo
 				{
 					storeRoot,
 					approve: async () => 'deny',
+					verifyTarget: async () => true,
 					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
 					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
 					prepare: async () => ( {
@@ -397,6 +401,7 @@ it( 'releases no prompt and reports startup failure even if closing the SDK thro
 		},
 		effort: 'medium',
 		permissionPolicyRevision: 1,
+		target: { environment: 'local' as const, siteId: 'site' },
 		workspace: {
 			conversationId: 'chat',
 			siteId: 'site',
@@ -431,6 +436,7 @@ it( 'releases no prompt and reports startup failure even if closing the SDK thro
 			} ),
 			storeRoot,
 			approve: async () => 'deny',
+			verifyTarget: async () => true,
 		}
 	);
 	expect( promptRead ).toBe( false );
@@ -467,6 +473,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 				},
 				effort: 'medium',
 				permissionPolicyRevision: 1,
+				target: { environment: 'local' as const, siteId: 'site' },
 				workspace: {
 					conversationId: 'chat',
 					siteId: 'site',
@@ -572,6 +579,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 					} ),
 					storeRoot: path.join( root, 'store' ),
 					approve: async () => 'deny',
+					verifyTarget: async () => true,
 				}
 			);
 			expect( emittedPrompt ).toBe( true );
@@ -639,6 +647,7 @@ it( 'denies native tools until system init has been verified (mock SDK)', async 
 			},
 			effort: 'medium',
 			permissionPolicyRevision: 1,
+			target: { environment: 'local' as const, siteId: 'site' },
 			workspace: {
 				conversationId: 'chat',
 				siteId: 'site',
@@ -706,6 +715,7 @@ it( 'denies native tools until system init has been verified (mock SDK)', async 
 				} ),
 				storeRoot: path.join( root, 'store' ),
 				approve: async () => 'deny',
+				verifyTarget: async () => true,
 			}
 		);
 		expect( before ).toMatchObject( { hookSpecificOutput: { permissionDecision: 'deny' } } );
@@ -746,10 +756,14 @@ it( 'blocks native reads of credential-bearing files and the native config tree'
 			'config/state.json',
 		] )
 			await fs.writeFile( path.join( root, file ), 'fixture' );
-		const { isAllowedNativeRead } = await import( '../runtime' );
-		expect( await isAllowedNativeRead( path.join( root, 'safe.txt' ), root, config ) ).toBe( true );
+		const { isAllowedNativePath } = await import( '../execution-policy' );
+		expect( await isAllowedNativePath( path.join( root, 'safe.txt' ), [ root ], config ) ).toBe(
+			true
+		);
 		for ( const file of [ '.env', 'wp-config.php', '.credentials.json', 'config/state.json' ] )
-			expect( await isAllowedNativeRead( path.join( root, file ), root, config ) ).toBe( false );
+			expect( await isAllowedNativePath( path.join( root, file ), [ root ], config ) ).toBe(
+				false
+			);
 	} finally {
 		await fs.rm( root, { recursive: true, force: true } );
 	}
@@ -880,4 +894,233 @@ it( 'deduplicates discovered model aliases by canonical ID without inventing eff
 	expect( result.ok && result.models ).toEqual( [
 		{ id: 'canonical', displayName: 'Sonnet', efforts: [ 'medium' ] },
 	] );
+} );
+
+function fakeNativeTurn(
+	cwd: string,
+	onTurn: ( options: Record< string, unknown > ) => Promise< void > = async () => {}
+) {
+	return vi.fn(
+		( input: { prompt: AsyncIterable< unknown >; options: Record< string, unknown > } ) => ( {
+			initializationResult: async () => ( {
+				hooks_applied: true,
+				hook_on_failure_supported: true,
+			} ),
+			accountInfo: async () => ( {
+				email: 'user@example.com',
+				subscriptionType: 'max',
+				apiProvider: 'firstParty',
+			} ),
+			mcpServerStatus: async () => [
+				{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+			],
+			supportedModels: async () => [
+				{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+			],
+			close: () => {},
+			async *[ Symbol.asyncIterator ]() {
+				const sessionId = input.options.resume ?? input.options.sessionId;
+				for await ( const _prompt of input.prompt ) {
+					yield {
+						type: 'system',
+						subtype: 'init',
+						session_id: sessionId,
+						permissionMode: 'default',
+						plugins: [],
+						tools: [ 'Read', 'mcp__studio__wp_cli' ],
+						cwd,
+						apiKeySource: 'none',
+						claude_code_version: '2.1.319',
+						model: 'sonnet',
+						mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
+					};
+					await onTurn( input.options );
+					yield {
+						type: 'result',
+						subtype: 'success',
+						is_error: false,
+						num_turns: 1,
+						session_id: sessionId,
+					};
+				}
+			},
+		} )
+	);
+}
+
+it( 'runs a global conversation only in the dedicated global workspace (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createFakeHost } = await import( '../../tests/fake-host' );
+	const { getClaudeGlobalWorkspace } = await import( '../sessions' );
+	const fs = await import( 'fs/promises' );
+	const os = await import( 'os' );
+	const path = await import( 'path' );
+	const root = await fs.realpath( await fs.mkdtemp( path.join( os.tmpdir(), 'claude-global-' ) ) );
+	try {
+		const storeRoot = path.join( root, 'store' );
+		await fs.mkdir( getClaudeGlobalWorkspace( storeRoot ), { recursive: true } );
+		const workspace = await fs.realpath( getClaudeGlobalWorkspace( storeRoot ) );
+		const elsewhere = path.join( root, 'elsewhere' );
+		await fs.mkdir( elsewhere );
+		const host = createFakeHost();
+		host.sites.all = async () => [];
+		const query = fakeNativeTurn( workspace );
+		const run = async ( conversationId: string, workingDirectory: string ) => {
+			const events: Array< { type: string; outcome?: unknown } > = [];
+			await runClaudeTurn(
+				{
+					backend: 'claude-code',
+					runId: conversationId,
+					turnId: conversationId,
+					effort: 'medium',
+					permissionPolicyRevision: 1,
+					selection: {
+						connectionId: 'native',
+						model: { providerId: 'claude-code', modelId: 'sonnet' },
+						revision: 1,
+					},
+					workspace: { conversationId, siteId: null, workingDirectory, configDirectory: root },
+					target: { environment: 'global' },
+				},
+				host,
+				{
+					prompt: 'hello',
+					signal: new AbortController().signal,
+					onEvent: ( event ) => events.push( event ),
+				},
+				{
+					storeRoot,
+					approve: async () => 'deny',
+					verifyTarget: async () => true,
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+					prepare: async () => ( {
+						ok: true,
+						executablePath: 'fake',
+						cwd: workingDirectory,
+						configDirectory: root,
+						projectsDirectory: path.join( root, 'projects' ),
+						env: {},
+						identity: { email: 'user@example.com', subscriptionType: 'max' },
+					} ),
+				}
+			);
+			return events;
+		};
+		expect( ( await run( 'global', workspace ) ).at( -1 ) ).toMatchObject( {
+			type: 'turn.terminal',
+			outcome: { status: 'success' },
+		} );
+		expect( query.mock.calls[ 0 ][ 0 ].options ).toMatchObject( { cwd: workspace } );
+		expect( await run( 'moved', elsewhere ) ).toMatchObject( [
+			{ type: 'turn.terminal', outcome: { code: 'rebind_required' } },
+		] );
+		expect( query ).toHaveBeenCalledOnce();
+	} finally {
+		await fs.rm( root, { recursive: true, force: true } );
+	}
+} );
+
+it( 'routes the SDK hook and native permission request through the execution policy (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createFakeHost } = await import( '../../tests/fake-host' );
+	const fs = await import( 'fs/promises' );
+	const os = await import( 'os' );
+	const path = await import( 'path' );
+	const root = await fs.realpath( await fs.mkdtemp( path.join( os.tmpdir(), 'claude-policy-' ) ) );
+	try {
+		const site = path.join( root, 'site' );
+		const config = path.join( root, 'config' );
+		await fs.mkdir( site );
+		await fs.mkdir( config );
+		await fs.writeFile( path.join( site, 'readme.txt' ), 'fixture' );
+		const host = createFakeHost();
+		host.sites.all = async () => [
+			{ id: 'site', path: site, name: 'site', url: 'http://localhost', phpVersion: '8.4' },
+		];
+		let targetUnchanged = true;
+		const decisions: unknown[] = [];
+		const readme = { file_path: path.join( site, 'readme.txt' ) };
+		type Hook = ( input: unknown ) => Promise< { hookSpecificOutput: unknown } >;
+		type Permission = (
+			name: string,
+			input: Record< string, unknown >,
+			options: Record< string, unknown >
+		) => Promise< { behavior: string } >;
+		const query = fakeNativeTurn( site, async ( options ) => {
+			const hooks = options.hooks as { PreToolUse: Array< { hooks: Hook[] } > };
+			const hook = ( toolName: string, toolInput: unknown ) =>
+				hooks.PreToolUse[ 0 ].hooks[ 0 ]( {
+					hook_event_name: 'PreToolUse',
+					tool_name: toolName,
+					tool_input: toolInput,
+					tool_use_id: toolName,
+				} );
+			const permission = options.canUseTool as Permission;
+			const signal = new AbortController().signal;
+			decisions.push( ( await hook( 'Read', readme ) ).hookSpecificOutput );
+			decisions.push( ( await permission( 'Read', readme, { signal } ) ).behavior );
+			decisions.push(
+				( await hook( 'Write', { ...readme, content: 'changed' } ) ).hookSpecificOutput
+			);
+			decisions.push(
+				(
+					await permission(
+						'mcp__studio__wp_cli',
+						{},
+						{
+							signal,
+							mcpServer: { name: 'studio', source: 'project' },
+						}
+					)
+				).behavior
+			);
+			targetUnchanged = false;
+			decisions.push( ( await hook( 'Read', readme ) ).hookSpecificOutput );
+		} );
+		await runClaudeTurn(
+			{
+				backend: 'claude-code',
+				runId: 'run',
+				turnId: 'turn',
+				effort: 'medium',
+				permissionPolicyRevision: 1,
+				selection: {
+					connectionId: 'native',
+					model: { providerId: 'claude-code', modelId: 'sonnet' },
+					revision: 1,
+				},
+				workspace: {
+					conversationId: 'chat',
+					siteId: 'site',
+					workingDirectory: site,
+					configDirectory: config,
+				},
+				target: { environment: 'local', siteId: 'site' },
+			},
+			host,
+			{ prompt: 'hello', signal: new AbortController().signal, onEvent: () => {} },
+			{
+				storeRoot: path.join( root, 'store' ),
+				approve: async () => 'deny',
+				verifyTarget: async () => targetUnchanged,
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+				prepare: async () => ( {
+					ok: true,
+					executablePath: 'fake',
+					cwd: site,
+					configDirectory: config,
+					projectsDirectory: path.join( config, 'projects' ),
+					env: {},
+					identity: { email: 'user@example.com', subscriptionType: 'max' },
+				} ),
+			}
+		);
+		const allow = { hookEventName: 'PreToolUse', permissionDecision: 'allow' };
+		const deny = { hookEventName: 'PreToolUse', permissionDecision: 'deny' };
+		expect( decisions ).toEqual( [ allow, 'allow', deny, 'deny', deny ] );
+	} finally {
+		await fs.rm( root, { recursive: true, force: true } );
+	}
 } );

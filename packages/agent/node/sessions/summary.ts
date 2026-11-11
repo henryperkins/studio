@@ -142,8 +142,8 @@ export async function readAiSessionSummaryFromEntries(
 		ownerSitePath: undefined,
 		ownerSiteName: undefined,
 		selectedSiteName,
-		activeEnvironment: isClaude ? 'local' : activeEnvironment,
-		lastSelectedWpcomSiteId: isClaude ? undefined : lastSelectedWpcomSiteId,
+		activeEnvironment,
+		lastSelectedWpcomSiteId,
 		endReason,
 		eventCount: entryCount,
 	};

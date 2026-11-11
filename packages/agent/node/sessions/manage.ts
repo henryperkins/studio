@@ -22,6 +22,7 @@ import {
 	listAiSessions,
 	loadAiSession,
 } from '@studio/agent/node/sessions/store';
+import { resolveClaudeSession } from '@studio/agent/protocol/claude-code';
 import {
 	deriveEffectiveEnvironment,
 	pickLiveSite,
@@ -166,7 +167,9 @@ export async function createHydratedAiSession(
 ): Promise< AiSessionSummary > {
 	const { site } = options;
 	if ( ! site ) {
-		return hydrateAiSessionSummary( await createAiSession( rootDirectory ) );
+		return hydrateAiSessionSummary(
+			await createAiSession( rootDirectory, options.claude ? { claude: options.claude } : {} )
+		);
 	}
 
 	const created = await createAiSession( rootDirectory, {
@@ -216,19 +219,27 @@ export async function reconcileSessionEnvironment(
 /**
  * Points the chat's next turn at its owner site, locally or on its connected
  * WordPress.com site. Recorded as the same `studio.site_selected` entry the
- * agent writes, so the CLI resumes on it.
+ * agent writes, so the CLI resumes on it. A Claude chat keeps its native
+ * workspace and history: one started on a site can only switch between that site
+ * and its live site.
  */
 export async function setSessionEnvironment(
 	root: string,
 	sessionId: string,
 	environment: 'local' | 'live'
 ): Promise< void > {
-	const { summary } = await loadHydratedAiSession( root, sessionId );
-	if ( summary.backend === 'claude-code' )
-		throw new Error( 'Claude Code chats are bound to their original local workspace.' );
+	const { summary, entries } = await loadHydratedAiSession( root, sessionId );
+	const claude = resolveClaudeSession( entries );
+	if ( summary.backend === 'claude-code' && ! claude )
+		throw new Error( 'The Claude Code workspace binding is missing.' );
 	const ownerSite = findAiSessionOwnerSite( await readSites(), summary );
 	if ( ! ownerSite ) {
 		throw new Error( 'This chat is not attached to a site.' );
+	}
+	if ( claude && claude.binding.siteId !== null && claude.binding.siteId !== ownerSite.id ) {
+		throw new Error(
+			'This Claude chat works in the folder of the site it started on. Start a new chat to work on another site.'
+		);
 	}
 	if ( environment === 'local' ) {
 		await appendStudioEntry( root, sessionId, 'studio.site_selected', {

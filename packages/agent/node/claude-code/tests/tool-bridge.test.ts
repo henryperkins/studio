@@ -1,44 +1,29 @@
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'fs/promises';
-import os from 'os';
+import { writeFile } from 'fs/promises';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createFakeHost, fakeSite } from '../../tests/fake-host';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
-import type { ClaudeToolPolicy } from '../tool-bridge';
+import { createPolicyFixture } from './fixtures/execution-policy';
+import type { ClaudeApprover } from '../execution-policy';
+import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 
-const dirs: string[] = [];
+const cleanups: Array< () => Promise< void > > = [];
 afterEach( async () => {
 	vi.unstubAllEnvs();
-	await Promise.all(
-		dirs.splice( 0 ).map( ( dir ) => rm( dir, { recursive: true, force: true } ) )
-	);
+	await Promise.all( cleanups.splice( 0 ).map( ( cleanup ) => cleanup() ) );
 } );
 async function setup(
-	approve: ClaudeToolPolicy[ 'approve' ] = vi.fn( async () => 'allow' as const ),
-	stillConnected = vi.fn( async () => true )
+	approve: ClaudeApprover = vi.fn( async () => 'allow' as const ),
+	stillConnected = vi.fn( async () => true ),
+	onEvent: ( event: BackendTurnEvent ) => void = () => {}
 ) {
-	const parent = await realpath( await mkdtemp( path.join( os.tmpdir(), 'studio-claude-' ) ) );
-	dirs.push( parent );
-	const dir = path.join( parent, 'site' );
-	await mkdir( dir );
-	const host = createFakeHost();
-	host.sites.resolve = vi.fn( async () => ( { ...fakeSite, path: dir } ) );
-	const controller = new AbortController();
+	const fixture = await createPolicyFixture( () => ( { approve, stillConnected } ) );
+	cleanups.push( fixture.cleanup );
 	const bridge = createStudioClaudeToolBridge(
-		host,
-		{
-			runId: 'run',
-			turnId: 'turn',
-			siteId: fakeSite.id,
-			workingDirectory: dir,
-			signal: controller.signal,
-			approve,
-			approvalTimeoutMs: 100,
-			stillConnected,
-		},
-		() => {}
+		fixture.host,
+		{ runId: 'run', turnId: 'turn', policy: fixture.policy },
+		onEvent
 	);
-	return { host, bridge, approve, controller, parent };
+	return { ...fixture, bridge, approve };
 }
 describe( 'Claude Studio tool boundary (mock host)', () => {
 	it( 'runs canonical local read and denies other routes and invalid schema', async () => {
@@ -102,7 +87,7 @@ it( 'blocks WP-CLI environment overrides before reaching the host', async () => 
 it( 'expires a pending draft approval, rejects a late allow, and exposes the exact proposed arguments', async () => {
 	let release!: ( value: 'allow' ) => void;
 	const approve = vi.fn(
-		( _request: Parameters< ClaudeToolPolicy[ 'approve' ] >[ 0 ] ) =>
+		( ..._args: Parameters< ClaudeApprover > ) =>
 			new Promise< 'allow' >( ( resolve ) => {
 				release = resolve;
 			} )
@@ -118,7 +103,7 @@ it( 'expires a pending draft approval, rejects a late allow, and exposes the exa
 	await Promise.resolve();
 	expect( host.sites.wpCli ).not.toHaveBeenCalled();
 	expect( approve.mock.calls[ 0 ][ 0 ] ).toMatchObject( {
-		args: [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ],
+		operation: { args: [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ] },
 	} );
 } );
 
@@ -191,26 +176,15 @@ it( 'aborts a running host operation and waits for it to settle before disposing
 } );
 
 it( 'reports the lifecycle of a Studio tool invocation without exposing exception text', async () => {
-	const { host, controller } = await setup();
-	const events: import('@studio/agent/protocol/backend-events').BackendTurnEvent[] = [];
+	const events: BackendTurnEvent[] = [];
+	const { host, bridge } = await setup(
+		async () => 'deny',
+		vi.fn( async () => true ),
+		( event ) => events.push( event )
+	);
 	host.sites.wpCli = vi.fn( async () => {
 		throw new Error( 'secret diagnostic' );
 	} );
-	const site = await host.sites.resolve( 'site' );
-	const bridge = createStudioClaudeToolBridge(
-		host,
-		{
-			runId: 'run',
-			turnId: 'turn',
-			siteId: site.id,
-			workingDirectory: site.path,
-			signal: controller.signal,
-			approve: async () => 'deny',
-			approvalTimeoutMs: 100,
-			stillConnected: async () => true,
-		},
-		( event ) => events.push( event )
-	);
 	const result = await bridge.invoke( 'wp_cli', {
 		nameOrPath: 'site',
 		command: 'option get blogname',

@@ -8,6 +8,7 @@ import type {
 	PiBackendTurnSnapshot,
 } from '@studio/agent/protocol/backend-events';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
+import type { ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
 interface ClaudeBackendTurnInput {
 	prompt: string;
@@ -57,6 +58,13 @@ function freezeClaudeTurn( snapshot: ClaudeBackendTurnSnapshot ): ClaudeBackendT
 	const { runId, turnId, effort, permissionPolicyRevision } = snapshot;
 	const { connectionId, model, revision } = snapshot.selection;
 	const { conversationId, siteId, workingDirectory, configDirectory } = snapshot.workspace;
+	const selected = snapshot.target;
+	const target: ClaudeStudioTarget =
+		selected.environment === 'global'
+			? { environment: 'global' }
+			: selected.environment === 'local'
+			? { environment: 'local', siteId: selected.siteId }
+			: { environment: 'live', siteId: selected.siteId, wpcomSiteId: selected.wpcomSiteId };
 	return Object.freeze( {
 		backend: 'claude-code',
 		runId,
@@ -69,6 +77,7 @@ function freezeClaudeTurn( snapshot: ClaudeBackendTurnSnapshot ): ClaudeBackendT
 			revision,
 		} ),
 		workspace: Object.freeze( { conversationId, siteId, workingDirectory, configDirectory } ),
+		target: Object.freeze( target ),
 	} );
 }
 

@@ -3,10 +3,15 @@ export interface PiBackendSessionRef {
 	filePath: string;
 }
 
+/** A Claude conversation's native identity. It never changes for a conversation. */
 export interface ClaudeBackendSessionBinding {
 	connectionId: string;
 	conversationId: string;
-	siteId: string;
+	/**
+	 * The local site whose folder is the native workspace, or null for the
+	 * dedicated global workspace. Not the Studio target a turn acts on.
+	 */
+	siteId: string | null;
 	workingDirectory: string;
 	configDirectory: string;
 }

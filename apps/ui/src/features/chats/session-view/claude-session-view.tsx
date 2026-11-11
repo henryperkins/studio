@@ -43,11 +43,13 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 	} catch {
 		session = undefined;
 	}
+	// A global chat has no site; this view only offers site chats for now.
+	const workspaceSiteId = session?.binding.siteId ?? undefined;
 	const catalog = useQuery( {
-		queryKey: [ 'claude-models', session?.binding.connectionId, session?.binding.siteId ],
+		queryKey: [ 'claude-models', session?.binding.connectionId, workspaceSiteId ],
 		queryFn: () =>
-			connector.getClaudeModelCatalog( session!.binding.connectionId, session!.binding.siteId ),
-		enabled: !! session,
+			connector.getClaudeModelCatalog( session!.binding.connectionId, workspaceSiteId! ),
+		enabled: !! session && !! workspaceSiteId,
 	} );
 	const state = useQuery( {
 		queryKey: [ 'claude-runtime' ],
@@ -310,8 +312,8 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 										'The native session is unavailable. Start a new conversation to reconnect; this history will remain available.'
 								  ) }
 						</p>
-						{ recovery !== 'deletion-pending' && (
-							<ClaudeNewChat siteId={ session.binding.siteId } />
+						{ recovery !== 'deletion-pending' && workspaceSiteId && (
+							<ClaudeNewChat siteId={ workspaceSiteId } />
 						) }
 					</>
 				) : null }

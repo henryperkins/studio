@@ -47,8 +47,7 @@ function validate( value: unknown ): ClaudeBackendSessionRef {
 		! record.connectionId ||
 		typeof record.conversationId !== 'string' ||
 		! record.conversationId ||
-		typeof record.siteId !== 'string' ||
-		! record.siteId ||
+		! ( record.siteId === null || ( typeof record.siteId === 'string' && record.siteId ) ) ||
 		typeof record.workingDirectory !== 'string' ||
 		! path.isAbsolute( record.workingDirectory ) ||
 		typeof record.configDirectory !== 'string' ||
@@ -62,7 +61,7 @@ function validate( value: unknown ): ClaudeBackendSessionRef {
 		nativeSessionId: record.nativeSessionId,
 		connectionId: record.connectionId,
 		conversationId: record.conversationId,
-		siteId: record.siteId,
+		siteId: record.siteId as string | null,
 		workingDirectory: record.workingDirectory,
 		configDirectory: record.configDirectory,
 		...( record.transcriptPath ? { transcriptPath: record.transcriptPath as string } : {} ),
@@ -70,6 +69,11 @@ function validate( value: unknown ): ClaudeBackendSessionRef {
 }
 export function getClaudeSessionStoreRoot( sessionsRoot: string ): string {
 	return `${ sessionsRoot }.claude-code`;
+}
+
+/** The native workspace every global Claude conversation runs in. */
+export function getClaudeGlobalWorkspace( storeRoot: string ): string {
+	return path.join( storeRoot, 'global-workspace' );
 }
 
 export function createNativeSessionStore( root: string ) {

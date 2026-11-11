@@ -6,6 +6,7 @@ import type {
 	BackendTurnEvent,
 	ClaudeBackendTurnSnapshot,
 } from '@studio/agent/protocol/backend-events';
+import type { ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
 function deferred() {
 	let resolve!: () => void;
@@ -32,6 +33,7 @@ const initial = () => ( {
 		conversationId: 'chat',
 		siteId: 'site',
 	},
+	target: { environment: 'local', siteId: 'site' } as ClaudeStudioTarget,
 } );
 
 function start( claudeCode: ClaudeCodeBackend, snapshot: ClaudeBackendTurnSnapshot = initial() ) {
@@ -157,7 +159,7 @@ describe( 'dispatching a Claude turn', () => {
 	it( 'retains the selection at Send across an awaited tool and uses the new selection next turn', async () => {
 		const selection = initial();
 		const tool = deferred();
-		const observed: Array< [ string, string | null, string, number, number ] > = [];
+		const observed: Array< [ string, string | null, string, number, number, string ] > = [];
 		const claudeCode: ClaudeCodeBackend = async ( snapshot, { onEvent } ) => {
 			const { runId, turnId } = snapshot;
 			onEvent( { type: 'tool.started', runId, turnId, toolCallId: 'tool', name: 'Read' } );
@@ -168,6 +170,7 @@ describe( 'dispatching a Claude turn', () => {
 				snapshot.workspace.workingDirectory,
 				snapshot.permissionPolicyRevision,
 				snapshot.selection.revision,
+				snapshot.target.environment,
 			] );
 			onEvent( { type: 'turn.terminal', runId, turnId, outcome: { status: 'success' } } );
 		};
@@ -180,13 +183,14 @@ describe( 'dispatching a Claude turn', () => {
 		selection.effort = 'high';
 		selection.workspace.workingDirectory = '/new-workspace';
 		selection.permissionPolicyRevision = 2;
+		selection.target = { environment: 'live', siteId: 'site', wpcomSiteId: 42 };
 		tool.resolve();
 		await first.handle.result;
 		await start( claudeCode, { ...selection, runId: 'run-2', turnId: 'turn-2' } ).handle.result;
 
 		expect( observed ).toEqual( [
-			[ 'A', 'medium', '/workspace', 1, 1 ],
-			[ 'B', 'high', '/new-workspace', 2, 2 ],
+			[ 'A', 'medium', '/workspace', 1, 1, 'local' ],
+			[ 'B', 'high', '/new-workspace', 2, 2, 'live' ],
 		] );
 	} );
 

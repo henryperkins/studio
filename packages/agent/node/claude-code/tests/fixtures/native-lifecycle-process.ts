@@ -59,6 +59,7 @@ async function main() {
 			turnId: 'turn',
 			effort: 'medium',
 			permissionPolicyRevision: 1,
+			target: { environment: 'local' as const, siteId: 'site' },
 			selection: {
 				connectionId: 'offline',
 				revision: 1,
@@ -80,6 +81,7 @@ async function main() {
 		{
 			storeRoot: path.join( root, 'store' ),
 			approve: async () => 'deny',
+			verifyTarget: async () => true,
 			connection: async () => ( { id: 'offline', executablePath } ),
 			prepare: async () => ( {
 				ok: true,
