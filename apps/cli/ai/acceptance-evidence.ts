@@ -42,7 +42,8 @@ export interface ManifestRun {
 	/** The day the run started, `YYYY-MM-DD`. */
 	createdOn: string;
 	source: { sha: string | null; dirty: boolean | null };
-	platform: { os: string; release: string; arch: string };
+	/** `release` is null when the system's release string isn't a plain version. */
+	platform: { os: string; release: string | null; arch: string };
 	runtime: { node: string; npm: string | null };
 	build: { cliVersion: string; buildId: string | null };
 	model: string;
@@ -224,6 +225,11 @@ const DAY = /^\d{4}-\d{2}-\d{2}$/;
 const SLUG = /^[a-z0-9][a-z0-9.+-]{0,63}$/;
 const GATE = /^[A-Z][0-9]{1,2}$/;
 
+/** Whether a version string is one a manifest may hold. */
+export function isManifestVersion( value: string ): boolean {
+	return VERSION.test( value );
+}
+
 /** The first field of a manifest run that isn't one of its known, bounded values, or null. */
 function findUnsafeManifestRun( run: unknown ): UnsafeFinding | null {
 	const shape = ( fieldPath: string ): UnsafeFinding => ( { path: fieldPath, kind: 'shape' } );
@@ -252,8 +258,10 @@ function findUnsafeManifestRun( run: unknown ): UnsafeFinding | null {
 		! [ platform.os, platform.arch ].every(
 			( value ) => typeof value === 'string' && SLUG.test( value )
 		) ||
-		typeof platform.release !== 'string' ||
-		! VERSION.test( platform.release )
+		! (
+			platform.release === null ||
+			( typeof platform.release === 'string' && VERSION.test( platform.release ) )
+		)
 	) {
 		return shape( 'platform' );
 	}

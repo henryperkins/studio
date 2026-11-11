@@ -7,6 +7,7 @@ import {
 	ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
 	findUnsafeRecord,
 	findUnsafeText,
+	isManifestVersion,
 	openAcceptanceEvidence,
 	UnsafeEvidenceError,
 	type ManifestRun,
@@ -15,6 +16,7 @@ import {
 	acceptanceRunPaths,
 	applyAcceptanceIsolation,
 	checkAcceptanceRunDirectory,
+	findRealProfileHazard,
 	findRealProfileLeak,
 	readAcceptanceArgument,
 } from 'cli/ai/acceptance-isolation';
@@ -156,6 +158,20 @@ describe( 'acceptance evidence store', () => {
 		expect( fs.existsSync( path.join( runDir, 'manifest.json' ) ) ).toBe( false );
 	} );
 
+	it( 'accepts an operating system release it can’t read as null, never as free text', () => {
+		const evidence = openAcceptanceEvidence( runDir, 'chatgpt' );
+		const unread = manifestRun( { platform: { os: 'linux', release: null, arch: 'arm64' } } );
+		expect( evidence.startRun( unread ) ).toBe( 1 );
+		expect( evidence.readManifest()?.runs[ 0 ].platform.release ).toBeNull();
+		expect( () =>
+			evidence.startRun(
+				manifestRun( { platform: { os: 'linux', release: 'unknown', arch: 'x64' } } )
+			)
+		).toThrow( UnsafeEvidenceError );
+		expect( isManifestVersion( '6.8.0-45-generic' ) ).toBe( true );
+		expect( isManifestVersion( '6.1.0+rpt-rpi-v8' ) ).toBe( false );
+	} );
+
 	it( 'appends one record per stage and never rewrites earlier ones', () => {
 		const evidence = openAcceptanceEvidence( runDir, 'chatgpt' );
 		evidence.record( {
@@ -252,6 +268,7 @@ describe( 'acceptance run isolation', () => {
 			profileDir: path.join( runDir, 'profile' ),
 			daemonDir: path.join( runDir, 'daemon' ),
 			sitesDir: path.join( runDir, 'sites' ),
+			appDataDir: path.join( runDir, 'appdata' ),
 			observerDir: path.join( runDir, 'observer' ),
 		} );
 	} );
@@ -293,13 +310,54 @@ describe( 'acceptance run isolation', () => {
 
 		const runDir = path.join( base, 'run' );
 		expect( applyAcceptanceIsolation( env, { runDir, mustBeNew: true, home } ).ok ).toBe( true );
-		expect( env ).toMatchObject( {
+		expect( env ).toEqual( {
 			DEV_CONFIG_DIR: path.join( runDir, 'profile' ),
 			STUDIO_PROCESS_MANAGER_HOME: path.join( runDir, 'daemon' ),
 			E2E: '1',
 			E2E_SITES_ROOT: path.join( runDir, 'sites' ),
+			E2E_APP_DATA_PATH: path.join( runDir, 'appdata' ),
+			E2E_CLI_CONFIG_PATH: path.join( runDir, 'profile' ),
+			E2E_SHARED_CONFIG_PATH: path.join( runDir, 'profile' ),
 		} );
 		expect( fs.existsSync( runDir ) ).toBe( false );
+	} );
+
+	it( 'drops every inherited E2E_ variable before pointing the ones Studio reads at the run', () => {
+		const outside = path.join( base, 'outside' );
+		const env: NodeJS.ProcessEnv = {
+			PATH: 'kept',
+			E2E_CLI_CONFIG_PATH: outside,
+			E2E_SHARED_CONFIG_PATH: outside,
+			E2E_APP_DATA_PATH: outside,
+			E2E_SITES_ROOT: outside,
+			E2E_HOME_PATH: outside,
+			e2e_daemon_logs_dir: outside,
+		};
+		const runDir = path.join( base, 'run' );
+		expect( applyAcceptanceIsolation( env, { runDir, mustBeNew: true, home } ).ok ).toBe( true );
+		expect( env.PATH ).toBe( 'kept' );
+		const e2e = Object.entries( env ).filter( ( [ name ] ) => /^e2e_/i.test( name ) );
+		expect( e2e.map( ( [ name ] ) => name ).sort() ).toEqual( [
+			'E2E_APP_DATA_PATH',
+			'E2E_CLI_CONFIG_PATH',
+			'E2E_SHARED_CONFIG_PATH',
+			'E2E_SITES_ROOT',
+		] );
+		for ( const [ , value ] of e2e ) {
+			expect( path.relative( runDir, value ?? '' ).startsWith( '..' ) ).toBe( false );
+		}
+	} );
+
+	it( 'finds, without changing anything, a real profile a CLI migration would rename in', () => {
+		const realHome = path.join( base, 'home' );
+		const studio = path.join( realHome, '.studio' );
+		expect( findRealProfileHazard( realHome ) ).toBeNull();
+		fs.mkdirSync( path.join( studio, 'pm2' ), { recursive: true } );
+		expect( findRealProfileHazard( realHome ) ).toBe( 'legacy-process-manager-home' );
+		expect( fs.readdirSync( studio ) ).toEqual( [ 'pm2' ] );
+		fs.mkdirSync( path.join( studio, 'daemon' ) );
+		expect( findRealProfileHazard( realHome ) ).toBeNull();
+		expect( fs.readdirSync( studio ).sort() ).toEqual( [ 'daemon', 'pm2' ] );
 	} );
 
 	it( "finds either variable resolving to the user's real Studio profile", () => {
