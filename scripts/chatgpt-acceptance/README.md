@@ -24,7 +24,7 @@ node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario session --run-dir <the-
 
 Exit codes: `0` every required stage passed (a requested gate may be blocked); `1` a stage failed or was blocked, a requested gate failed, or cleanup failed; `2` refused before anything ran, which includes every run without `--live`; `130` interrupted. A second Ctrl+C exits without finishing cleanup (see "If a run is killed").
 
-**Without `--live` (dry check):** the runner validates the arguments, the run directory, the isolated environment, the model and effort, and for `session` the saved run's manifest, source commit and registration. It reads only the run directory and runs `git` and `npm --version` locally. It prints the stages it would run, creates nothing and exits `2`.
+**Without `--live` (dry check):** the runner validates the arguments, the run directory, the isolated environment, the state of your real Studio profile (see "Isolation"), the model and effort, and for `session` the saved run's manifest, source commit and registration. It reads only the run directory and whether two folders exist in your Studio profile, and runs `git` and `npm --version` locally. It prints the stages it would run, creates nothing and exits `2`.
 
 ## What the account owner does
 
@@ -48,17 +48,24 @@ Every stage records `passed`, `failed`, `blocked` or `skipped`, a typed code and
 | `re-sign-in` | Browser sign-in again to the same registration. | `sameRegistration`, `sameRevision` |
 | `model-discovery` | Reads the account's model list. | `listedModels`, `selectedModelListed`, `unqualifiedModelsListed` |
 | `disposable-site` | `site create` in the run directory; baseline post list over WP-CLI. | `siteCreated`, `baselinePosts` |
-| `draft-turn` | A forked CLI turn reads the site title and creates exactly one named draft. Tool calls outside the turn's policy (other sites, publishing, deleting, other tools) are interrupted and fail the stage. | `toolCalls`, `wpCliCalls`, `unexpectedToolCalls`, `questionsAsked`, `completed` |
+| `draft-turn` | A forked CLI turn reads the site title and creates exactly one named draft. At least one WP-CLI read must have run and returned (`no-site-read` otherwise): a read is decided by the command's verb, as the tool policy decides it, so the draft's own `post create` never counts, nor does a write whose later words look like read verbs (`option update status x`). Tool calls outside the turn's policy (other sites, publishing, deleting, other tools) are interrupted and fail the stage. | `toolCalls`, `wpCliCalls`, `wpCliReads`, `unexpectedToolCalls`, `questionsAsked`, `completed` |
 | `draft-request-audit` | Every model request of that turn: on the route, the selected model and effort, streamed, stateless, no output cap, no API-key bearer, no other provider. | `modelRequests`, `apiKeyBearers`, `otherProviderRequests`, `allOnSelectedModel`, `allAtSelectedEffort`, `noOutputCap`, `stateless` |
 | `draft-readback` | Independent WP-CLI readback. | `newPosts`, `statusDraft`, `titleMatches`, `contentMatches`, `otherPostsUnchanged` |
+| `gate-t2-reasoning-replay` | T2: a turn whose first response produces a reasoning item, replayed in the next request and accepted. It runs before the effort change, at the run's starting effort (`medium` unless `--effort` says otherwise), where a reasoning item is likely. `blocked` (`no-reasoning-item`) when the model produced none. | `reasoningItemsProduced`, `reasoningItemsReplayed`, `replayAccepted` |
 | `effort-change` | Moves the chat to the other qualified effort. | `effortChanged` |
 | `resume` | A fresh CLI process resumes the chat and recalls the draft's marker with no tools. | `freshProcess`, `historyReplayed`, `requestsAtNewEffort`, `markerRecovered` |
 | `gate-t1-image-tool-result` | T1: sets the site title to a marker, takes a screenshot, and the reply must read the marker from the image. | `imageToolOutputsSent`, `routeAcceptedImageResult`, `markerReadFromImage`, `otherToolCalls` |
-| `gate-t2-reasoning-replay` | T2: a turn whose first response produces a reasoning item, replayed in the next request and accepted. `blocked` (`no-reasoning-item`) when the model produced none. | `reasoningItemsProduced`, `reasoningItemsReplayed`, `replayAccepted` |
 | `gate-t3-image-service-row` | T3: a `generate_images` tool row carries `details.studioService` when its event arrives, before the session persists the result. `blocked` (`image-service-not-configured`), never failed, without Studio's separate WordPress.com image service (for example `STUDIO_IMAGE_API_TOKEN`). | `detailsDelivered`, `deliveredBeforePersisted` |
-| `active-run-stops-on-sign-out` | Signs out while a real forked turn is running. The runner never interrupts it: the turn has to stop by itself. | `localCleared`, `remoteRevocationConfirmed`, `stoppedAfterS`, `watchPollS`, `routeRequestsAfterSignOut`, `toolRunsAfterSignOut`, `reportedSignedOut`, `ownerInterruptSent` |
+| `active-run-stops-on-sign-out` | Signs out while a real forked turn is running. The runner never interrupts it: the turn has to stop by itself. See below. | see below |
 | `remote-revocation` | Separately from the local clear: a refresh with the token the sign-out revoked (kept in memory only) must be refused. | `revokedRefreshRejected`, `rejectionTerminal` |
 | `blocked-after-sign-out` | A later turn fails before any inference, with no fallback. | `routeRequests`, `apiKeyBearers`, `otherProviderRequests`, `reportedSignedOut` |
+
+The active run is judged from the moment the sign-out **begins**, against the product's own bound, the turn watch poll (`CHATGPT_TURN_WATCH_POLL_MS`, 2 s, recorded as `watchPollS`):
+
+- A model request or tool call that started before the sign-out began may finish. One that starts within the watch bound is counted (`routeRequestsInWatchWindow`, `toolStartsInWatchWindow`) and allowed. One that starts later fails the stage (`request-after-sign-out`, `tool-call-after-sign-out`), counting tool **starts** whether or not the call finished (`toolStartsAfterSignOut`; `toolRunsAfterSignOut` counts those that also ran to a result).
+- The turn must end with the signed-out outcome (`reportedSignedOut`). A turn that ends successfully after the sign-out began fails with `completed-after-sign-out`; one that stops for any other reason fails with `stopped-for-other-reason`. The stage is `blocked` (`run-ended-before-sign-out`) only when the turn ended before the sign-out began (`endedBeforeSignOut`).
+- `stopDelayS` is how long after the sign-out began the turn ended (expected: about one watch poll); `signOutTookS` is how long the sign-out itself took, remote revocation included.
+- `stoppedByTurnHandle` means the turn's own ChatGPT connection signal ended it (its account watch, or its handle refusing the next request or tool), which the transport reports as an interrupted stop naming the sign-out. `stoppedByBrokerErrorOnly` means only an error the broker returned, when the turn next asked it for a token, reported the sign-out. Both are recorded, neither is judged, so a live run shows which one stopped the turn.
 
 ### `session`
 
@@ -71,35 +78,61 @@ Every stage records `passed`, `failed`, `blocked` or `skipped`, a typed code and
 | `unoffered-process-fails` | A process started without the offer or an IPC channel fails before inference, with no other account or API key. | `routeRequests`, `tokenAsks`, `reportedUnavailable` |
 | `refresh-hold-across-sign-out` | Holds a real refresh result in memory through the injectable token client, signs out, starts a fork while it is held, releases it. | see below |
 
-The refresh hold records: `refreshHeld`, `generationAdvancedDuringHold`, `offerAdvertisedDuringWindow` (informational: the fork offer may linger until the held refresh settles, so it is **not** asserted), `windowForkTokensHandedOut` (must be 0), `windowForkRouteRequests` (must be 0), `heldRefreshRejectedSignedOut`, `offerGoneAfterSettle`, `localCleared`, `remoteRevocationConfirmed`, `rotatedRevokedBySignOut`, `retiredRefreshRejected`, `rotatedRefreshRejected`. The hold is released within 20 s, under the broker's 30 s refresh timeout; if the broker gives up on a held result anyway, the runner revokes what it was issued.
+The refresh hold records: `refreshHeld`, `generationAdvancedDuringHold`, `offerAdvertisedDuringWindow` (informational: the fork offer may linger until the held refresh settles, so it is **not** asserted), `windowForkTokenAsks`, `windowForkTokensHandedOut` (must be 0), `windowForkRouteRequests` (must be 0), `heldRefreshRejectedSignedOut`, `offerGoneAfterSettle`, `localCleared`, `remoteRevocationConfirmed`, `rotatedRevokedBySignOut` (must be true: the sign-out's revocation of the grant the held refresh rotated to was confirmed), `rotatedRefreshRejected`, `retiredRefreshRejected`. The rotated refresh token is probed **before** the retired one: presenting a spent token can make the service revoke the whole grant as reused, which would hide whether the sign-out revoked anything. The hold is released within 20 s, under the broker's 30 s refresh timeout; if the broker gives up on a held result anyway, the runner revokes what it was issued. The waits for the hold, the window fork and the sign-out end at once on Ctrl+C; cleanup then releases the hold and waits for the sign-out the stage began. The two probes at the end are not cut short, since each revokes whatever it was issued (at most 30 s each).
 
 ## Evidence
 
-All in the run directory:
+**Only `manifest.json`, `evidence.ndjson` and `observer/` may leave this machine.** Everything else in the run directory is private and stays where it is.
 
-- `manifest.json`: `schemaVersion`, `provider`, and one entry per run in `runs`: `run`, `scenario`, `createdOn` (a date), `source` (`sha`, `dirty`), `platform` (`os`, `release`, `arch`), `runtime` (`node`, `npm`), `build` (`cliVersion`, `buildId`: the first 12 hex digits of the SHA-256 of `main.mjs`), `model`, `effort`, `gates`. Runs are appended, never replaced.
+Shareable:
+
+- `manifest.json`: `schemaVersion`, `provider`, and one entry per run in `runs`: `run`, `scenario`, `createdOn` (a date), `source` (`sha`, `dirty`), `platform` (`os`, `release` (`null` when the system's release string isn't a plain version), `arch`), `runtime` (`node`, `npm`), `build` (`cliVersion`, `buildId`: the first 12 hex digits of the SHA-256 of `main.mjs`), `model`, `effort`, `gates`. Runs are appended, never replaced.
 - `evidence.ndjson`: append-only, one line per stage: `schemaVersion`, `run`, `scenario`, `stage`, `status`, `code` (typed, never a message), `durationS`, `observations` (counts, booleans and durations only). Each run ends with a `cleanup` record. An earlier failure stays in the file when a scenario is run again.
-- `state.json`: local test identifiers (registration id, site path, chat ids, the draft marker). **Keep it on this machine.**
 - `observer/*.ndjson`: per-turn request summaries (destination class, bearer shape, model, effort, item counts). Read back into the counts above.
-- `profile/`, `daemon/`, `sites/`: the run's own Studio profile, process manager and disposable site.
+
+Private, never shared:
+
+- `state.json`: local test identifiers (registration id, site path, chat ids, the draft marker).
+- `profile/`: the run's Studio profile, holding the ChatGPT account store (with the account's email address and subject identifier) and the sealed credential records.
+- `appdata/`: the full transcripts of every chat the run held.
+- `daemon/`, `sites/`: the run's process manager and its disposable site.
 
 Before anything is written, `acceptance-evidence.ts` refuses: any field outside the record's shape; a string that looks like a token (JWT, API key, bearer header, long opaque run), a URL (scheme, loopback address, host name, OAuth query parameter), an email address, an account or registration identifier (UUID) or a local path; and non-finite or out-of-range numbers. The refusal names the field, never its value. `state.json` may hold identifiers and paths but no token, URL or email. Console lines go through the same check. Authorization URLs go only to the browser; tokens stay in memory.
 
 ## Isolation and cleanup
 
-- The entry points `DEV_CONFIG_DIR`, `STUDIO_PROCESS_MANAGER_HOME`, `E2E` and `E2E_SITES_ROOT` at the run directory before any application module loads, and the runner refuses to run if the profile or process manager would resolve to `~/.studio`. It never reads the normal Studio profile.
-- Children get no provider API keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and the like are removed from their environment), so any API-key bearer the observer sees is a real fallback.
+- **Environment.** Before any application module loads, the entry (and the runner again) removes every inherited `E2E_*` variable, then sets `DEV_CONFIG_DIR=<run>/profile`, `STUDIO_PROCESS_MANAGER_HOME=<run>/daemon`, `E2E=1`, `E2E_SITES_ROOT=<run>/sites`, `E2E_APP_DATA_PATH=<run>/appdata`, `E2E_CLI_CONFIG_PATH=<run>/profile` and `E2E_SHARED_CONFIG_PATH=<run>/profile`. `E2E=1` arms every `E2E_*` path the Studio path helpers read, so each is pointed at the run. The CLI processes the runner starts get that environment without `OPENAI_API_KEY`, `STUDIO_OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `STUDIO_WPCOM_API_KEY`; a turn also gets its observer file, and a turn that is not offered the session gets no session offer. `HOME`, `USERPROFILE` and `APPDATA` are left as they are: the system keychain and the browser opener need them. An offline test (`apps/cli/ai/tests/chatgpt-acceptance-isolation.test.ts`) checks that, under exactly that environment, every path the helpers in `packages/common/lib/well-known-paths.ts`, `apps/cli/lib/appdata.ts`, `paths.ts`, `site-paths.ts` and `dependency-management/paths.ts` export resolves inside the run directory (or to files that ship with the CLI), so a helper added later that escapes fails it.
+- **Refusals before anything runs.** The runner refuses when the profile or process manager would resolve to `~/.studio`, and when your real profile has `.studio/pm2` but no `.studio/daemon`: every CLI process renames that folder under your home directory whatever its environment (CLI migration 03). Run any command of your installed Studio CLI once, for example `studio site list`, to finish that rename, then run the runner again. The check only reads whether the two folders exist.
+- **What still reaches outside the run directory.** The system keychain: the ChatGPT vault's wrapping key is one machine-wide item shared by every Studio profile; on a machine that has none yet, the first run creates it, and the runner never deletes it. A saved OpenAI API key in the keychain is also still reachable from the children: nothing hides it. Instead the request observer classifies every request a turn makes by destination and bearer shape, and the audit stages fail on any request with an API-key bearer or to the OpenAI API, Anthropic or the WordPress.com AI proxy (`api-key-bearer`, `provider-fallback`, `fallback-attempted`). Also outside: the system temporary folder (WordPress downloads and Blueprint files while `site create` runs), the system browser (sign-in pages), and `~/.studio/pulls`, which only `studio pull` uses and no stage runs.
 - On every way out (pass, failed stage, thrown error, Ctrl+C) cleanup runs in this order: cancel a pending sign-in and wait for it to settle; release a held refresh and wait for it; stop the processes this runner started (by their own handles, interrupt first, then the child's own process tree by its PID); stop and unregister the disposable site and the run's own process manager (its control pipe is keyed to the run directory, so no other Studio process is touched); sign out the test registration if it is still signed in. A cleanup failure is recorded in the `cleanup` record and never replaces the stage that failed first.
-- The vault's wrapping key in the system keychain is shared with every Studio profile on the machine. The runner never deletes it, and never touches other registrations.
-- **Sign-in and sign-out ordering.** A returning sign-in begun before a sign-out still commits if it completes afterwards (the broker counts a sign-in when it is saved). So the runner never signs out while an attempt is pending: each sign-in stage waits for its outcome, and cleanup cancels and waits for a pending attempt before it signs out.
-- **Session-only sign-ins end with the runner.** The session scenario's credential lives in the runner's memory. A fork that loses its IPC channel drops its token at its next broker call (or within the 2 s account poll of an active turn) and stops with `session-unavailable`.
+- The runner never touches other registrations, and never deletes the vault's wrapping key.
+- **Sign-in and sign-out ordering.** A returning sign-in begun before a sign-out still commits if it completes afterwards (the broker counts a sign-in when it is saved). So the runner never signs out while an attempt is pending: each sign-in stage waits for its outcome, and cleanup cancels and waits for a pending attempt before it signs out. An attempt that commits although it was cancelled (Ctrl+C while the browser was already coming back) is kept in `state.json` like any other, and cleanup signs it out.
+- **Session-only sign-ins.** The session scenario's credential lives only in the runner's memory. That a fork's session-only token ends with the app that holds it (the fork drops it at its next broker call, or within the 2 s account poll of an active turn, and stops with `session-unavailable`) is product behaviour pinned by unit tests in `packages/agent/node/chatgpt/tests/credential-broker.test.ts` ("fails a forked turn whose app no longer holds its session…", "ends a forked turn's session-only sign-in once sending to the app that held it fails…", "ends a forked turn's session-only sign-in with the app that held it…"). This runner does not observe it: no stage ends the runner while a fork is running.
 
 ## If a run is killed
 
-If the runner is killed before cleanup finishes, from the repository root, with the run directory in place of `<run>`:
+If the runner is killed before cleanup finishes, stop what it started from the repository root, in a new terminal, with the same environment the runner gives its children. Replace the run directory below with yours.
 
-```text
-DEV_CONFIG_DIR=<run>/profile STUDIO_PROCESS_MANAGER_HOME=<run>/daemon node apps/cli/dist/cli/main.mjs site stop --all
+PowerShell (Windows):
+
+```powershell
+$run = 'C:\absolute\run\directory'
+Get-ChildItem env: | Where-Object Name -like 'E2E_*' | ForEach-Object { Remove-Item "env:$($_.Name)" }
+$env:DEV_CONFIG_DIR = "$run\profile"; $env:STUDIO_PROCESS_MANAGER_HOME = "$run\daemon"; $env:E2E = '1'
+$env:E2E_SITES_ROOT = "$run\sites"; $env:E2E_APP_DATA_PATH = "$run\appdata"
+$env:E2E_CLI_CONFIG_PATH = "$run\profile"; $env:E2E_SHARED_CONFIG_PATH = "$run\profile"
+node apps/cli/dist/cli/main.mjs site stop --all
 ```
 
-Then sign the test registration out: run `node apps/cli/dist/cli/main.mjs code` with the same two variables and `STUDIO_EXPERIMENTAL_CHATGPT=1`, and use `/chatgpt` → Sign out. You can also remove WordPress Studio's access in ChatGPT's settings. A session-only sign-in ends with the runner's process.
+POSIX shells:
+
+```sh
+run=/absolute/run/directory
+unset $(env | sed -n 's/^\(E2E_[^=]*\)=.*/\1/p')
+DEV_CONFIG_DIR="$run/profile" STUDIO_PROCESS_MANAGER_HOME="$run/daemon" E2E=1 \
+E2E_SITES_ROOT="$run/sites" E2E_APP_DATA_PATH="$run/appdata" \
+E2E_CLI_CONFIG_PATH="$run/profile" E2E_SHARED_CONFIG_PATH="$run/profile" \
+node apps/cli/dist/cli/main.mjs site stop --all
+```
+
+Then sign the test registration out: in the same terminal, with the same variables and `STUDIO_EXPERIMENTAL_CHATGPT=1` (PowerShell: `$env:STUDIO_EXPERIMENTAL_CHATGPT = '1'`), run `node apps/cli/dist/cli/main.mjs code` and use `/chatgpt` → Sign out. You can also remove WordPress Studio's access in ChatGPT's settings. A session-only sign-in lives only in the runner's memory, so it went with the runner's process. In PowerShell the variables stay set until you close that terminal.
