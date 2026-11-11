@@ -1628,7 +1628,11 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			const turnRequests = requests.filter( ( request ) => ! isSummaryRequest( request ) );
 			expect( turnRequests ).toHaveLength( 1 );
 			expect( toolRuns( third ) ).toBe( 0 );
-			if ( ! compacted( third ) ) {
+			if ( compacted( third ) ) {
+				expect( JSON.stringify( turnRequests[ 0 ].body.input ) ).toContain(
+					'the database name is studio'
+				);
+			} else {
 				expect( itemsOfType( turnRequests[ 0 ], 'function_call' ) ).toEqual( [
 					expect.objectContaining( { call_id: read.callIds[ 0 ] } ),
 				] );

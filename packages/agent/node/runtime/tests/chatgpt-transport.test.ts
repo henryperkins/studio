@@ -463,9 +463,9 @@ describe( 'the ChatGPT transport', () => {
 
 		// `include` is undocumented for this route: it is sent because pi asks for
 		// encrypted reasoning to replay it statelessly, as on the public API. The
-		// captured run's requests carried it at both qualified efforts. Without a
-		// reasoning effort pi asks for none, and none is sent.
-		it( 'asks for encrypted reasoning exactly when pi does, for stateless replay (undocumented for this route)', async () => {
+		// captured run's requests carried it at both qualified efforts. The
+		// serializer adds no `include` of its own.
+		it( 'asks for encrypted reasoning when pi does, and the serializer adds no include of its own (undocumented for this route)', async () => {
 			const turn = await registerChatGpt( snapshotFor( 'low' ) );
 			const http = captureFetch( [ () => sse( textReply( 'a' ) ), () => sse( textReply( 'b' ) ) ] );
 
