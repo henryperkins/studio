@@ -7,7 +7,7 @@ import { fetchSyncableSites } from '@studio/common/lib/sync/sync-api';
 import { vi } from 'vitest';
 import { validateBlocks } from '@studio/agent/node/block-validator';
 import { getSharedBrowser } from '@studio/agent/node/browser-utils';
-import { generateImages, isImageGenerationAvailable } from '@studio/agent/node/image-generation';
+import { generateImages, resolveImageService } from '@studio/agent/node/image-generation';
 import {
 	resolveStudioTools,
 	studioToolDefinitions,
@@ -25,6 +25,7 @@ import {
 import { enrichPreviewListOutput } from '@studio/agent/node/tools/list-previews';
 import { createTakeScreenshotTool } from '@studio/agent/node/tools/take-screenshot';
 import { splitCommandArgs } from '@studio/agent/node/tools/wp-cli';
+import { getToolResultImageService } from '@studio/agent/protocol/image-service';
 import { createFakeHost, fakeSite } from './fake-host';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 
@@ -39,7 +40,7 @@ vi.mock( '@studio/agent/node/browser-utils', () => ( {
 vi.mock( '@studio/agent/node/image-generation', async () => ( {
 	...( await vi.importActual( '@studio/agent/node/image-generation' ) ),
 	generateImages: vi.fn(),
-	isImageGenerationAvailable: vi.fn(),
+	resolveImageService: vi.fn(),
 } ) );
 
 vi.mock( '@studio/common/lib/connected-sites', () => ( {
@@ -822,7 +823,10 @@ describe( 'Studio AI MCP tools', () => {
 		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );
 		const urlOf = ( name: string ) => `http://localhost:8888/wp-content/uploads/2026/09/${ name }`;
 		vi.mocked( host.sites.all ).mockResolvedValue( [ mockSite, site ] );
-		vi.mocked( isImageGenerationAvailable ).mockResolvedValue( true );
+		vi.mocked( resolveImageService ).mockResolvedValue( {
+			token: 'test-image-service-token',
+			use: { service: 'wordpress-com', credential: 'environment-token', account: null },
+		} );
 		vi.mocked( generateImages ).mockResolvedValue( [
 			{ ok: true, bytes: Buffer.from( 'jpeg' ) },
 			{ ok: false, error: 'Timed out' },
@@ -866,9 +870,54 @@ describe( 'Studio AI MCP tools', () => {
 					Buffer.from( finalize.match( /base64_decode\( '([^']+)' \)/ )![ 1 ], 'base64' ).toString()
 				)
 			).toEqual( { ready: [ 7 ], failed: [ 8 ] } );
+			expect( generateImages ).toHaveBeenCalledWith(
+				expect.any( String ),
+				'test-image-service-token',
+				expect.any( Array )
+			);
 		} finally {
 			await rm( sitePath, { recursive: true, force: true } );
 		}
+	} );
+
+	it( 'keeps the image service and account that made the images with the result, out of what the model reads', async () => {
+		const sitePath = await mkdtemp( path.join( os.tmpdir(), 'studio-generate-images-' ) );
+		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );
+		const use = {
+			service: 'wordpress-com' as const,
+			credential: 'wordpress-com-login' as const,
+			account: { displayName: 'Someone', email: 'someone@example.test' },
+		};
+		vi.mocked( resolveImageService ).mockResolvedValue( { token: 'test-wpcom-login-token', use } );
+		vi.mocked( generateImages ).mockResolvedValue( [ { ok: true, bytes: Buffer.from( 'png' ) } ] );
+		const args = { images: [ { path: themeImage, subject: 'Pebbles on a beach' } ] };
+
+		try {
+			const raw = await getTool( 'generate_images' ).rawHandler( args as never );
+			await raw.pending;
+			const executed = await executeTool( getTool( 'generate_images' ), args );
+			await ( executed.details as { pending?: Promise< unknown > } ).pending;
+
+			expect( raw.studioService ).toEqual( use );
+			expect( getToolResultImageService( executed.details ) ).toEqual( use );
+			for ( const content of [ raw.content, executed.content ] ) {
+				expect( JSON.stringify( content ) ).not.toMatch( /Someone|someone@example|wordpress-com/ );
+			}
+		} finally {
+			await rm( sitePath, { recursive: true, force: true } );
+		}
+	} );
+
+	it( 'gives other tools’ results no image service', async () => {
+		vi.mocked( host.sites.resolve ).mockResolvedValue( mockSite );
+		vi.mocked( host.sites.wpCli ).mockResolvedValue( { exitCode: 0, stdout: 'ok', stderr: '' } );
+
+		const executed = await executeTool( getTool( 'wp_cli' ), {
+			nameOrPath: mockSite.name,
+			command: 'option get blogname',
+		} );
+
+		expect( getToolResultImageService( executed.details ) ).toBeUndefined();
 	} );
 
 	describe( 'scaffold_theme', () => {

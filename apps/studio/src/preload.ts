@@ -202,6 +202,7 @@ const api: IpcApi = {
 	signOutChatGpt: ( connectionId ) => ipcRendererInvoke( 'signOutChatGpt', connectionId ),
 	getChatGptModels: ( connectionId, revision ) =>
 		ipcRendererInvoke( 'getChatGptModels', connectionId, revision ),
+	getImageServiceState: () => ipcRendererInvoke( 'getImageServiceState' ),
 	setAiSessionEnvironment: ( sessionId, environment ) =>
 		ipcRendererInvoke( 'setAiSessionEnvironment', sessionId, environment ),
 	interruptAiAgentRun: ( runId ) => ipcRendererInvoke( 'interruptAiAgentRun', runId ),

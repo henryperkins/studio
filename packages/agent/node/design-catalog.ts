@@ -32,8 +32,8 @@ export const MAX_CHOSEN_LAYOUTS = 2;
 
 const cachedCatalogs = new Map< DesignCatalogKind, DesignEntry[] >();
 
-function parseDesignEntry( contents: string ): DesignEntry | null {
-	const match = contents.match( /^---\n([\s\S]*?)\n---\n([\s\S]*)$/ );
+export function parseDesignEntry( contents: string ): DesignEntry | null {
+	const match = contents.replace( /\r\n/g, '\n' ).match( /^---\n([\s\S]*?)\n---\n([\s\S]*)$/ );
 	if ( ! match ) return null;
 	const { title, description } = parse( match[ 1 ] ) ?? {};
 	const details = match[ 2 ].trim();

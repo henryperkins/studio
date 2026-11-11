@@ -34,7 +34,7 @@ const ID = 'f84d75a0-4e60-4168-a1ab-3134542c637a';
 const ATTEMPT = 'b69a1ddf-d1a2-4ff6-b293-75c358ff42df';
 const PRIVATE_HINT = 'TEST_ONLY_PRIVATE_RETURNING_ID_TOKEN';
 const PRIVATE_URL = `https://auth.example.test/authorize?id_token_hint=${ PRIVATE_HINT }`;
-const SELECTION = { connectionId: ID, revision: 1, model: 'gpt-6-luna', reasoningEffort: 'high' };
+const SELECTION = { connectionId: ID, revision: 1, model: 'gpt-6-luna', reasoningEffort: 'low' };
 let root: string;
 let server: LocalServer;
 
@@ -210,6 +210,26 @@ describe( 'ChatGPT HTTP boundary', () => {
 			request( `/sessions/${ id }/model`, { model: 'gpt-6-astra' } ),
 		] );
 		expect( requests.map( ( response ) => response.status ) ).toEqual( [ 400, 400, 400 ] );
+		expect( readChatGptSessionSelection( ( await loadAiSession( root, id ) ).entries ) ).toEqual(
+			SELECTION
+		);
+	} );
+
+	it( 'refuses a model or effort the route isn’t qualified for, keeping the saved choice', async () => {
+		const { id } = await createAiSession( root );
+		await request( `/sessions/${ id }/chatgpt-selection`, SELECTION );
+
+		const refused = await Promise.all( [
+			request( `/sessions/${ id }/chatgpt-selection`, { ...SELECTION, model: 'gpt-6.1-sol' } ),
+			request( `/sessions/${ id }/chatgpt-selection`, { ...SELECTION, reasoningEffort: 'high' } ),
+		] );
+
+		expect( refused.map( ( response ) => response.status ) ).toEqual( [ 400, 400 ] );
+		const messages = await Promise.all(
+			refused.map( async ( response ) => JSON.stringify( await response.json() ) )
+		);
+		expect( messages[ 0 ] ).toContain( 'isn’t qualified for use with a ChatGPT plan' );
+		expect( messages[ 1 ] ).toContain( 'isn’t qualified for use with a ChatGPT plan' );
 		expect( readChatGptSessionSelection( ( await loadAiSession( root, id ) ).entries ) ).toEqual(
 			SELECTION
 		);

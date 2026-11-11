@@ -912,7 +912,7 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 				connectionId: 'conn-1',
 				revision: 1,
 				model: 'gpt-6-luna',
-				reasoningEffort: 'high',
+				reasoningEffort: 'low',
 			} )
 		);
 
@@ -925,7 +925,7 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 				model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' },
 				revision: 1,
 			},
-			chatGpt: { reasoningEffort: 'high' },
+			chatGpt: { reasoningEffort: 'low' },
 		} );
 		expect( turnConfig()?.openAi ).toBeUndefined();
 		expect( appendCustomEntry ).toHaveBeenCalledWith( 'studio.session_context', {
@@ -933,7 +933,7 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 			connectionId: 'conn-1',
 			revision: 1,
 			model: 'gpt-6-luna',
-			reasoningEffort: 'high',
+			reasoningEffort: 'low',
 		} );
 	} );
 

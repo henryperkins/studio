@@ -26,6 +26,7 @@ import {
 	type ChatGptErrorSummary,
 } from '@studio/agent/protocol/chatgpt-errors';
 import {
+	CHATGPT_LOCAL_CONTEXT_BUDGET,
 	describeChatGptReasoningProblem,
 	getChatGptModelCapabilities,
 	resolveChatGptReasoning,
@@ -49,9 +50,6 @@ import type { ProviderModelRef } from '@studio/agent/protocol/connections';
 
 type ProviderConfigInput = Parameters< ModelRuntime[ 'registerProvider' ] >[ 1 ];
 
-// Compaction keeps context under this local budget, as on Studio's other
-// providers. The route documents no context window of its own.
-const CHATGPT_CONTEXT_BUDGET = 200_000;
 // pi's models carry an output cap, which it would send as `max_output_tokens`.
 // The route takes no such field (`supportsMaxOutputTokens: false` stops pi,
 // and the serializer would drop it anyway), so this only feeds pi's estimates.
@@ -371,7 +369,7 @@ export function buildChatGptModel(
 		reasoning: true,
 		input: capabilities.imageInput ? [ 'text', 'image' ] : [ 'text' ],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: CHATGPT_CONTEXT_BUDGET,
+		contextWindow: CHATGPT_LOCAL_CONTEXT_BUDGET,
 		maxTokens: LOCAL_MAX_OUTPUT_TOKENS,
 		thinkingLevelMap: buildThinkingLevelMap( capabilities.reasoningEfforts ),
 		compat: {

@@ -7,6 +7,7 @@ import path from 'node:path';
 import { base64url, SignJWT, type JWTPayload } from 'jose';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+	ChatGptConnectionError,
 	getChatGptHostId,
 	readChatGptAccount,
 	readChatGptAccounts,
@@ -23,6 +24,7 @@ import {
 	CHATGPT_SIGN_IN_TIMEOUT_MS,
 	ChatGptSignInError,
 	createChatGptSignInFlow,
+	type ChatGptSignInFailureCode,
 	type ChatGptSignInFlow,
 	type ChatGptSignInFlowOptions,
 	type ChatGptSignInOptions,
@@ -466,6 +468,43 @@ describe( 'Signing in to ChatGPT', () => {
 			expect( ( await readChatGptAccount( existing.registrationId ) )?.state ).toBe( 'signed-in' );
 		} );
 
+		it( 'signs a saved account that was signed out in again for this app session only', async () => {
+			const existing = await signInExisting();
+			await broker.signOut( existing.registrationId );
+
+			const { outcome } = await signIn( existing.registrationId, { storage: 'session' } );
+
+			expect( query( 1 ) ).toMatchObject( {
+				client_id: 'test-issued-client-1',
+				login_hint: 'someone@example.com',
+			} );
+			expect( query( 1 ) ).not.toHaveProperty( 'id_token_hint' );
+			expect( outcome ).toEqual( {
+				ok: true,
+				registrationId: existing.registrationId,
+				label: 'someone@example.com',
+				email: 'someone@example.com',
+			} );
+			expect( await readChatGptAccount( existing.registrationId ) ).toMatchObject( {
+				state: 'signed-in',
+				storage: 'session',
+				revision: 1,
+				logoutGeneration: 1,
+			} );
+			expect( vaultFiles() ).toEqual( [] );
+			await expect( broker.getAccessToken( existing.registrationId ) ).resolves.toBe(
+				fake.issued[ 1 ].accessToken
+			);
+			// Offered to this app's forks; any other process has nothing to use.
+			expect( broker.getSessionForkEnvironment() ).toEqual( {
+				STUDIO_CHATGPT_SESSIONS_OFFERED: existing.registrationId,
+			} );
+			await expect( startBroker().getAccessToken( existing.registrationId ) ).rejects.toMatchObject(
+				{ code: 'session-unavailable' }
+			);
+			expectNoSecrets( outcome );
+		} );
+
 		it( 'keeps a registration kept in memory there when it signs in again without being told otherwise', async () => {
 			const registrationId = registrationOf(
 				( await signIn( undefined, { storage: 'session' } ) ).outcome
@@ -792,6 +831,159 @@ describe( 'Signing in to ChatGPT', () => {
 				expect( unverified.outcome ).toEqual( failed( 'id-token-invalid' ) );
 				await expectUntouched( existing );
 			} );
+		} );
+
+		describe( 'on a returning sign-in for this app session only, after a sign-out', () => {
+			type Ending = 'callback' | 'cancel' | 'none';
+			// Each way the attempt can end badly, set up once the account is signed out.
+			const endings: Array<
+				[ string, ChatGptSignInFailureCode, Ending, () => ChatGptSignInFlow | void ]
+			> = [
+				[ 'no callback in time', 'timed-out', 'none', () => startFlow( { timeoutMs: 150 } ) ],
+				[ 'a cancel', 'cancelled', 'cancel', () => undefined ],
+				[
+					'a denial',
+					'denied',
+					'callback',
+					() => {
+						fake.script.callback = ( params ) => ( {
+							state: params.state,
+							error: 'access_denied',
+						} );
+					},
+				],
+				[
+					'another error sent back',
+					'authorization-failed',
+					'callback',
+					() => {
+						fake.script.callback = ( params ) => ( { ...params, error: 'server_error' } );
+					},
+				],
+				[
+					'a callback for another client',
+					'client-mismatch',
+					'callback',
+					() => {
+						fake.script.callback = ( params ) => ( {
+							...params,
+							client_id: 'test-issued-client-other',
+						} );
+					},
+				],
+				[
+					'a rejected code',
+					'code-rejected',
+					'callback',
+					() => {
+						fake.script.token = () => ( { status: 400, body: { error: 'invalid_grant' } } );
+					},
+				],
+				[
+					'a failed exchange',
+					'token-exchange-failed',
+					'callback',
+					() => {
+						fake.script.token = () => ( { status: 500, body: { detail: 'test-detail' } } );
+					},
+				],
+				[
+					'an ID token that doesn’t verify',
+					'id-token-invalid',
+					'callback',
+					() => {
+						fake.script.idTokenClaims = ( claims ) => ( { ...claims, nonce: 'test-other-nonce' } );
+					},
+				],
+				[
+					'another account',
+					'identity-mismatch',
+					'callback',
+					() => {
+						fake.account = { subject: 'test-subject-2', email: 'other@example.com' };
+					},
+				],
+				[
+					'no permission to use the plan',
+					'permission-missing',
+					'callback',
+					() => {
+						fake.script.grantedScope = 'openid profile email offline_access resource.invoke';
+					},
+				],
+				[
+					'a sign-out overtaking the save',
+					'save-failed',
+					'callback',
+					() =>
+						startFlow( {
+							credentials: {
+								saveSignIn: async () => {
+									throw new ChatGptConnectionError( 'signed-out' );
+								},
+								readIdTokenHint: ( id ) => broker.readIdTokenHint( id ),
+							},
+						} ),
+				],
+				[
+					'a save failing with an error that quotes a URL and a token',
+					'save-failed',
+					'callback',
+					() =>
+						startFlow( {
+							credentials: {
+								saveSignIn: async () => {
+									throw new Error(
+										`test-save-failure ${ fake.url }/auth/callback?code=test-auth-code-0 test-refresh-token-0`
+									);
+								},
+								readIdTokenHint: ( id ) => broker.readIdTokenHint( id ),
+							},
+						} ),
+				],
+			];
+
+			it.each( endings )(
+				'ends after %s with the typed code %s, holding no URL or token, and restores nothing',
+				async ( _name, code, ending, arrange ) => {
+					const existing = await signInExisting();
+					await broker.signOut( existing.registrationId );
+					const using = arrange() ?? flow;
+
+					const start = await begin( existing.registrationId, { storage: 'session' }, using );
+					const urls = [ start.url ];
+					if ( ending === 'callback' ) {
+						urls.push( await authorize( start.url ) );
+						await deliver( urls[ 1 ] );
+					} else if ( ending === 'cancel' ) {
+						expect( using.cancel( start.attemptId ) ).toBe( true );
+					}
+					const outcome = await using.wait( start.attemptId );
+
+					expect( outcome ).toEqual( {
+						ok: false,
+						code,
+						message: new ChatGptSignInError( code ).message,
+					} );
+					const text = JSON.stringify( outcome );
+					expect( text ).not.toMatch( /https?:|127\.0\.0\.1|auth\/callback/ );
+					for ( const url of urls ) {
+						expect( text ).not.toContain( url );
+					}
+					expectNoSecrets( outcome );
+					// Nothing of the signed-out account came back, in memory or on disk.
+					expect( await readChatGptAccount( existing.registrationId ) ).toMatchObject( {
+						state: 'signed-out',
+						storage: 'vault',
+						logoutGeneration: 1,
+					} );
+					expect( vaultFiles() ).toEqual( [] );
+					expect( broker.getSessionForkEnvironment() ).toEqual( {} );
+					await expect( broker.getAccessToken( existing.registrationId ) ).rejects.toMatchObject( {
+						code: 'signed-out',
+					} );
+				}
+			);
 		} );
 	} );
 

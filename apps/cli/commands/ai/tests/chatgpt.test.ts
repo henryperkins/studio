@@ -248,7 +248,7 @@ describe( 'ChatGPT interactive CLI', () => {
 					'Select saved account',
 					`Work · ${ B }`,
 					'GPT-6 Luna · gpt-6-luna',
-					'High',
+					'Low',
 					'Start new chat',
 				]
 			);
@@ -259,7 +259,7 @@ describe( 'ChatGPT interactive CLI', () => {
 			expect( readChatGptSessionSelection( runs[ 0 ].entries ) ).toEqual( {
 				...INITIAL,
 				connectionId: B,
-				reasoningEffort: 'high',
+				reasoningEffort: 'low',
 			} );
 			expect( JSON.stringify( runs[ 0 ].entries ) ).not.toContain(
 				'Previous private conversation'
@@ -289,7 +289,7 @@ describe( 'ChatGPT interactive CLI', () => {
 		const old = await previousChat();
 		const ui = terminal(
 			[ '/model', 'First request', '/reasoning', 'Second request' ],
-			[ 'GPT-6 Astra · gpt-6-astra', 'High', 'Low' ]
+			[ 'GPT-6 Luna · gpt-6-luna', 'Low', 'Medium' ]
 		);
 		await runCommand( { adapter: ui, resumeSession: resume( old ) } );
 		expect( ui.showError ).not.toHaveBeenCalled();
@@ -299,17 +299,63 @@ describe( 'ChatGPT interactive CLI', () => {
 			old.getSessionId(),
 		] );
 		expect( runs.map( ( run ) => run.config.chatGpt?.reasoningEffort ) ).toEqual( [
-			'high',
 			'low',
+			'medium',
 		] );
-		expect( runs[ 1 ].config.connection?.model.modelId ).toBe( 'gpt-6-astra' );
+		expect( runs[ 1 ].config.connection?.model.modelId ).toBe( 'gpt-6-luna' );
 		const reopened = await openStudioSession( root, old.getSessionFile()! );
 		expect( readChatGptSessionSelection( reopened.getEntries() ) ).toEqual( {
 			...INITIAL,
-			model: 'gpt-6-astra',
-			reasoningEffort: 'low',
+			reasoningEffort: 'medium',
 		} );
 		expect( ui.clearTranscript ).not.toHaveBeenCalled();
+	} );
+
+	it( 'offers only the listed models and efforts the route is qualified for', async () => {
+		const old = await previousChat();
+		const ui = terminal( [ '/model', '/exit' ], [ 'GPT-6 Luna · gpt-6-luna', 'Low' ] );
+		await runCommand( { adapter: ui, resumeSession: resume( old ) } );
+		const offered = vi
+			.mocked( ui.askUser )
+			.mock.calls.map( ( [ questions ] ) =>
+				questions[ 0 ].options.map( ( option: { label: string } ) => option.label )
+			);
+		// The account also lists GPT-6 Astra, which isn't qualified on this route.
+		expect( offered ).toEqual( [ [ 'GPT-6 Luna · gpt-6-luna' ], [ 'Low', 'Medium' ] ] );
+	} );
+
+	it( 'runs a turn with attached images and files on the chat’s pinned connection, model and effort', async () => {
+		const old = await previousChat();
+		const image = {
+			id: 'image-1',
+			name: 'moodboard.png',
+			mimeType: 'image/png' as const,
+			size: 11,
+			dataBase64: 'aW1hZ2UtYnl0ZXM=',
+		};
+		const brief = path.join( root, 'brief.md' );
+		const ui = terminal( [], [] );
+		await runCommand( {
+			adapter: ui,
+			resumeSession: resume( old ),
+			initialMessage: 'Use these',
+			initialImages: [ image ],
+			initialFiles: [ { id: 'file-1', name: 'brief.md', path: brief } ],
+		} );
+		expect( ui.showError ).not.toHaveBeenCalled();
+		expect( runs ).toHaveLength( 1 );
+		const { config } = runs[ 0 ];
+		expect( config.images ).toEqual( [ image ] );
+		expect( config.prompt ).toBe(
+			`Use these\n\nAttached files (read them as needed):\n- ${ brief }`
+		);
+		expect( config.connection ).toEqual( {
+			connectionId: A,
+			revision: 1,
+			model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' },
+		} );
+		expect( config.chatGpt ).toEqual( { reasoningEffort: 'medium' } );
+		expect( config.openAi ).toBeUndefined();
 	} );
 
 	it( 'preserves the account on /clear while dropping the previous conversation', async () => {
@@ -328,7 +374,7 @@ describe( 'ChatGPT interactive CLI', () => {
 		const old = await previousChat();
 		const ui = terminal(
 			[ '/chatgpt', 'Still here' ],
-			[ 'Select saved account', `Work · ${ B }`, 'GPT-6 Luna · gpt-6-luna', 'High', 'Cancel' ]
+			[ 'Select saved account', `Work · ${ B }`, 'GPT-6 Luna · gpt-6-luna', 'Low', 'Cancel' ]
 		);
 		await runCommand( { adapter: ui, resumeSession: resume( old ) } );
 		expect( runs[ 0 ].sessionId ).toBe( old.getSessionId() );
@@ -351,16 +397,28 @@ describe( 'ChatGPT interactive CLI', () => {
 		expect( listChatGptConnections ).not.toHaveBeenCalled();
 	} );
 
-	it( 'does not silently replace an unknown recorded effort', async () => {
+	it.each( [
+		[ 'an unknown recorded effort', { reasoningEffort: 'future-effort' }, 'future-effort' ],
+		[
+			'a recorded effort the route isn’t qualified for',
+			{ reasoningEffort: 'high' },
+			'Studio doesn’t support “High” reasoning for gpt-6-luna with ChatGPT yet',
+		],
+		[
+			'a recorded model the route isn’t qualified for',
+			{ model: 'gpt-6.1-sol' },
+			'Studio doesn’t support the ChatGPT model “gpt-6.1-sol” yet',
+		],
+	] )( 'does not silently replace %s', async ( _name, recorded, explanation ) => {
 		const old = await previousChat();
 		old.appendCustomEntry( 'studio.session_context', {
 			provider: 'chatgpt-oauth',
 			...INITIAL,
-			reasoningEffort: 'future-effort',
+			...recorded,
 		} );
 		const ui = terminal( [ 'New request' ], [] );
 		await runCommand( { adapter: ui, resumeSession: resume( old ) } );
-		expect( ui.showError ).toHaveBeenCalledWith( expect.stringContaining( 'future-effort' ) );
+		expect( ui.showError ).toHaveBeenCalledWith( expect.stringContaining( explanation ) );
 		expect( runs ).toHaveLength( 0 );
 		expect( resolveAiEnvironment ).not.toHaveBeenCalled();
 	} );

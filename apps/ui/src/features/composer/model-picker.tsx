@@ -7,7 +7,7 @@ import {
 import { getStudioCodeAiAccessState } from '@studio/common/lib/studio-assistant-quota';
 import { useQueries } from '@tanstack/react-query';
 import { __, sprintf } from '@wordpress/i18n';
-import { PlugIcon, SparklesIcon } from 'lucide-react';
+import { InfoIcon, PlugIcon, SparklesIcon } from 'lucide-react';
 import { useRef, useState, type RefObject, ComponentType } from 'react';
 import { useConnector } from '@/data/core';
 import { useStudioAssistantQuota } from '@/data/queries/use-assistant-quota';
@@ -16,7 +16,8 @@ import { useUserPreferences } from '@/data/queries/use-user-preferences';
 import { useOpenSettings } from '@/data/use-open-settings';
 import { getCreditsLabel, getModelDescription } from '@/features/composer/model-options';
 import { PlusIcon, ChevronDownIcon, ClaudeIcon, WordPressIcon } from '@/lib/icons';
-import { Button, CommandSheet, Popover, type Command, type CommandGroup } from '@/lib/ui';
+import { Button, CommandList, Popover, type Command, type CommandGroup } from '@/lib/ui';
+import styles from './style.module.css';
 import type { AiModelId } from '@/data/core';
 import type { ModelLockReason } from '@/features/composer/use-model-access';
 import type { ChatGptAccountView } from '@studio/agent/protocol/chatgpt';
@@ -137,6 +138,50 @@ export function ModelPicker( {
 			}
 		}
 	};
+	const chatGptAccountItems = ( account: ChatGptAccountView, index: number ): Command[] =>
+		account.authStatus !== 'connected'
+			? [
+					{
+						value: `disconnected:${ account.connectionId }`,
+						label: __( 'Sign in to this ChatGPT account in Settings' ),
+						disabled: true,
+						icon: PlugIcon,
+					},
+			  ]
+			: chatGptCommands.some( ( command ) => command.account === account )
+			? chatGptCommands
+					.filter( ( command ) => command.account === account )
+					.map( ( command ) => ( {
+						value: command.value,
+						label: command.model.label,
+						description: `${ __( 'ChatGPT plan' ) } · ${ account.email ?? account.label }`,
+						icon: SparklesIcon,
+					} ) )
+			: [
+					{
+						value: `refresh:${ account.connectionId }`,
+						label: catalogs[ index ].isFetching
+							? __( 'Checking ChatGPT models…' )
+							: catalogs[ index ].isError
+							? __( 'Retry ChatGPT models' )
+							: __( 'No supported ChatGPT models. Refresh' ),
+						description: catalogs[ index ].error?.message,
+						disabled: catalogs[ index ].isFetching,
+						icon: SparklesIcon,
+					},
+			  ];
+	// Says an account offers more without naming or offering those models. Kept outside the
+	// option list so it wraps and can't be chosen.
+	const unqualifiedNotes = chatGptAccounts.flatMap( ( account, index ) =>
+		account.authStatus === 'connected' && catalogs[ index ].data?.listsUnqualifiedModels
+			? [
+					{
+						connectionId: account.connectionId,
+						heading: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
+					},
+			  ]
+			: []
+	);
 	const groups: CommandGroup[] = [
 		{
 			label: __( 'Models' ),
@@ -169,38 +214,7 @@ export function ModelPicker( {
 			( account, index ): CommandGroup => ( {
 				label: `ChatGPT · ${ account.label } · ${ account.connectionId }`,
 				heading: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
-				items:
-					account.authStatus !== 'connected'
-						? [
-								{
-									value: `disconnected:${ account.connectionId }`,
-									label: __( 'Sign in to this ChatGPT account in Settings' ),
-									disabled: true,
-									icon: PlugIcon,
-								},
-						  ]
-						: chatGptCommands.some( ( command ) => command.account === account )
-						? chatGptCommands
-								.filter( ( command ) => command.account === account )
-								.map( ( command ) => ( {
-									value: command.value,
-									label: command.model.label,
-									description: `${ __( 'ChatGPT plan' ) } · ${ account.email ?? account.label }`,
-									icon: SparklesIcon,
-								} ) )
-						: [
-								{
-									value: `refresh:${ account.connectionId }`,
-									label: catalogs[ index ].isFetching
-										? __( 'Checking ChatGPT models…' )
-										: catalogs[ index ].isError
-										? __( 'Retry ChatGPT models' )
-										: __( 'No supported ChatGPT models. Refresh' ),
-									description: catalogs[ index ].error?.message,
-									disabled: catalogs[ index ].isFetching,
-									icon: SparklesIcon,
-								},
-						  ],
+				items: chatGptAccountItems( account, index ),
 			} )
 		),
 		{
@@ -260,17 +274,39 @@ export function ModelPicker( {
 				<span>{ modelLabel }</span>
 				<ChevronDownIcon data-icon="inline-end" data-dropdown-indicator />
 			</Popover.Trigger>
-			<CommandSheet
-				label={ __( 'Choose a model' ) }
-				groups={ groups }
-				highlighted={ highlight }
-				onHighlight={ setHighlight }
-				onSelect={ pickCommand }
-				listRef={ listRef }
+			<Popover.Popup
+				variant="commands"
+				side="top"
 				anchor={ anchor }
 				initialFocus={ listRef }
 				finalFocus={ triggerRef }
-			/>
+				aria-label={ __( 'Choose a model' ) }
+			>
+				<CommandList
+					label={ __( 'Choose a model' ) }
+					groups={ groups }
+					highlighted={ highlight }
+					onHighlight={ setHighlight }
+					onSelect={ pickCommand }
+					listRef={ listRef }
+					className={ styles.pickerList }
+				/>
+				{ unqualifiedNotes.length ? (
+					<div className={ styles.pickerNotes }>
+						{ unqualifiedNotes.map( ( { connectionId, heading } ) => (
+							<p key={ connectionId } role="note" className={ styles.pickerNote }>
+								<InfoIcon className={ styles.pickerNoteIcon } aria-hidden="true" />
+								<span>
+									{ unqualifiedNotes.length > 1 ? (
+										<span className={ styles.pickerNoteAccount }>{ heading } </span>
+									) : null }
+									{ __( 'Some models this account offers aren’t supported in Studio yet' ) }
+								</span>
+							</p>
+						) ) }
+					</div>
+				) : null }
+			</Popover.Popup>
 		</Popover.Root>
 	);
 }

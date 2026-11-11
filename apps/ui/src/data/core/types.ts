@@ -17,6 +17,7 @@ import type {
 	CreateClaudeSessionRequest,
 } from '@studio/agent/protocol/claude-code';
 import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
+import type { ImageServiceState } from '@studio/agent/protocol/image-service';
 import type { AiModelId } from '@studio/agent/protocol/models';
 import type {
 	AiProviderId,
@@ -544,6 +545,10 @@ export interface Connector {
 	cancelChatGptSignIn( attemptId: string ): Promise< boolean >;
 	signOutChatGpt( connectionId: string ): Promise< ChatGptSignOutResult >;
 	getChatGptModels( connectionId: string, revision: number ): Promise< ChatGptModelAvailability >;
+
+	// Studio's image service, which generate_images uses whatever the chat's
+	// provider: whether it's available and the account it acts as, or what sets it up.
+	getImageServiceState(): Promise< ImageServiceState >;
 
 	// Apps detected on disk (editors + terminals). Options in the preferences
 	// form are filtered against this so users can't pick something that isn't

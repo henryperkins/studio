@@ -1,5 +1,6 @@
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { getWpcomAiGatewayBaseUrl } from '@studio/agent/node/ai-gateway';
+import type { ImageServiceState, ImageServiceUse } from '@studio/agent/protocol/image-service';
 
 /**
  * AI image generation through the WP.com AI proxy's OpenAI-compatible images
@@ -58,31 +59,59 @@ export type ImageAspectRatioKeyword = keyof typeof IMAGE_SIZE_BY_KEYWORD;
 // prompt; any other failure must not be reported as repairable-by-rewriting.
 const FILTERED_ERROR_CODES = new Set( [ 'moderation_blocked', 'content_policy_violation' ] );
 
-/**
- * Whether the generate_images capability is enabled for this session: an
- * explicit token, or a valid WP.com login (the proxy's `studio-image` slug
- * accepts user OAuth tokens). Sessions with neither — e.g. BYO Anthropic key
- * without a WP.com login — get no tool and no imagery prompt sections.
- */
-export async function isImageGenerationAvailable(): Promise< boolean > {
-	if ( process.env.STUDIO_IMAGE_API_TOKEN?.trim() ) {
-		return true;
-	}
-	return ( await readAuthToken() ) !== null;
+export interface ResolvedImageService {
+	token: string;
+	use: ImageServiceUse;
 }
 
-async function resolveImageAuthToken(): Promise< string > {
+/**
+ * The image service's credential and what it acts as: an explicit token, or
+ * else a valid WP.com login (the proxy's `studio-image` slug accepts user OAuth
+ * tokens). Never a model provider's credential, whichever provider the
+ * conversation runs on. Null when there is neither.
+ */
+export async function resolveImageService(): Promise< ResolvedImageService | null > {
 	const envToken = process.env.STUDIO_IMAGE_API_TOKEN?.trim();
 	if ( envToken ) {
-		return envToken;
+		return {
+			token: envToken,
+			use: { service: 'wordpress-com', credential: 'environment-token', account: null },
+		};
 	}
-	const token = await readAuthToken();
-	if ( ! token?.accessToken ) {
-		throw new Error(
-			'Image generation requires a WordPress.com login (studio auth login) or STUDIO_IMAGE_API_TOKEN.'
-		);
+	const login = await readAuthToken();
+	if ( ! login?.accessToken ) {
+		return null;
 	}
-	return token.accessToken;
+	return {
+		token: login.accessToken,
+		use: {
+			service: 'wordpress-com',
+			credential: 'wordpress-com-login',
+			account: { displayName: login.displayName, email: login.email },
+		},
+	};
+}
+
+/** The image service as the apps show it: available and what it acts as, or what sets it up. */
+export async function readImageServiceState(): Promise< ImageServiceState > {
+	const resolved = await resolveImageService();
+	return resolved
+		? { available: true, ...resolved.use }
+		: {
+				available: false,
+				service: 'wordpress-com',
+				reason: 'signed-out',
+				setup: 'wordpress-com-login',
+		  };
+}
+
+/**
+ * Whether the generate_images capability is enabled for this session. Sessions
+ * without the image service — e.g. BYO Anthropic key without a WP.com login —
+ * get no tool and no imagery guidance in the prompt.
+ */
+export async function isImageGenerationAvailable(): Promise< boolean > {
+	return ( await resolveImageService() ) !== null;
 }
 
 function getImageEndpoint(): string {
@@ -307,16 +336,17 @@ async function generateOne(
 }
 
 /**
- * Generate a batch of images concurrently (bounded pool). Results are keyed by
- * the same index as the requests; a failure never aborts the rest.
+ * Generate a batch of images concurrently (bounded pool) with the image
+ * service's token (`resolveImageService`). Results are keyed by the same index
+ * as the requests; a failure never aborts the rest.
  */
 export async function generateImages(
 	userAgent: string,
+	authToken: string,
 	requests: GenerateImageRequest[],
 	onResult?: ( index: number, result: GenerateImageResult ) => void
 ): Promise< GenerateImageResult[] > {
 	const endpoint = getImageEndpoint();
-	const authToken = await resolveImageAuthToken();
 	const results: GenerateImageResult[] = new Array( requests.length );
 	let next = 0;
 

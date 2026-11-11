@@ -34,4 +34,32 @@ describe( 'tool trace', () => {
 		await user.keyboard( ' ' );
 		expect( trigger ).toHaveAttribute( 'aria-expanded', 'false' );
 	} );
+
+	it( 'names the image service and account that made generated images', async () => {
+		const user = userEvent.setup();
+		render(
+			<ToolUseRow
+				name="generate_images"
+				input={ { images: [ { path: '/sites/a/hero.png', subject: 'A loaf' } ] } }
+				result={ {
+					text: 'Generating 1 image in the background.',
+					isError: false,
+					imageService: {
+						service: 'wordpress-com',
+						credential: 'wordpress-com-login',
+						account: { displayName: 'Someone', email: 'someone@example.test' },
+					},
+				} }
+				isRunning={ false }
+			/>
+		);
+
+		await user.click( screen.getByRole( 'button', { name: /1 image/ } ) );
+
+		expect(
+			screen.getByText(
+				'Made with Studio’s WordPress.com image service, as Someone (someone@example.test).'
+			)
+		).toBeVisible();
+	} );
 } );

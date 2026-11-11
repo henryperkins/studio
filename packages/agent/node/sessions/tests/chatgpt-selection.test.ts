@@ -50,16 +50,11 @@ describe( 'ChatGPT session selection', () => {
 	it( 'persists one provider-qualified model and effort, surviving a reload', async () => {
 		const { id } = await createAiSession( root );
 		await setSessionChatGptSelection( root, id, selection );
-		await setSessionChatGptSelection( root, id, {
-			...selection,
-			model: 'gpt-6-astra',
-			reasoningEffort: 'high',
-		} );
+		await setSessionChatGptSelection( root, id, { ...selection, reasoningEffort: 'low' } );
 		const { entries } = await loadAiSession( root, id );
 		expect( readChatGptSessionSelection( entries ) ).toEqual( {
 			...selection,
-			model: 'gpt-6-astra',
-			reasoningEffort: 'high',
+			reasoningEffort: 'low',
 		} );
 		expect(
 			resolveConnectionSelection( entries, {
@@ -71,10 +66,28 @@ describe( 'ChatGPT session selection', () => {
 			selection: {
 				connectionId: A,
 				revision: 1,
-				model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-astra' },
+				model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' },
 			},
 		} );
 	} );
+
+	it.each( [
+		[ 'a model the route isn’t qualified for', { model: 'gpt-6-astra' }, /“gpt-6-astra” yet/ ],
+		[ 'an effort the model isn’t qualified for', { reasoningEffort: 'high' }, /“High” reasoning/ ],
+	] )(
+		'refuses %s and keeps the saved choice, never a nearby one',
+		async ( _name, change, why ) => {
+			const { id } = await createAiSession( root );
+			await setSessionChatGptSelection( root, id, selection );
+
+			await expect(
+				setSessionChatGptSelection( root, id, { ...selection, ...change } )
+			).rejects.toThrow( why );
+
+			const { entries } = await loadAiSession( root, id );
+			expect( readChatGptSessionSelection( entries ) ).toEqual( selection );
+		}
+	);
 
 	it( 'does not repin API history to ChatGPT, even for the same model slug', async () => {
 		const { id } = await createAiSession( root );

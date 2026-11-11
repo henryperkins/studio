@@ -125,6 +125,30 @@ describe( 'entriesToRenderItems', () => {
 		expect( edit( true ) ).toMatchObject( [ { result: { isError: true, diff: undefined } } ] );
 	} );
 
+	it( 'keeps the image service a result records it was made with', () => {
+		const studioService = {
+			service: 'wordpress-com',
+			credential: 'wordpress-com-login',
+			account: { displayName: 'Someone', email: 'someone@example.test' },
+		};
+		const result = toolResultEntry( 'Generating 1 image in the background.' ) as {
+			message: object;
+		};
+
+		expect(
+			entriesToRenderItems( [
+				assistantToolCallEntry( 'generate_images', { images: [] } ),
+				{ ...result, message: { ...result.message, details: { studioService } } } as SessionEntry,
+			] )
+		).toMatchObject( [ { kind: 'tool-use', result: { imageService: studioService } } ] );
+		expect(
+			entriesToRenderItems( [
+				assistantToolCallEntry( 'generate_images', { images: [] } ),
+				toolResultEntry( 'Generating 1 image in the background.' ),
+			] )
+		).toMatchObject( [ { result: { imageService: undefined } } ] );
+	} );
+
 	it( 'hangs one copy of the whole message off its last text block', () => {
 		expect( entriesToRenderItems( [ assistantTextEntry( 'One', ' ', 'Two' ) ] ) ).toMatchObject( [
 			{ text: 'One', messageText: 'One\n\nTwo', copyText: undefined },

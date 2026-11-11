@@ -18,3 +18,4 @@ Each page shows light and dark side by side, or one scheme from the header. To a
 - `/email-preview.html`: the email log loading skeleton, empty state, multiple selectable sample emails, and loading error. Use `?state=skeleton`, `?state=empty`, `?state=multiple`, or `?state=error` to start in a particular state.
 - `/sidebar-preview.html`: the real app shell with its sidebar held in loading. Use the links to switch to loaded rows or between light and dark mode.
   Add `&rows=30` for a scrolling sidebar or `&chat=long` for a sample conversation.
+- `/image-service-preview.html`: the real app on a ChatGPT chat: the composer's image service line, the generate_images result naming the account that made the image (expand the tool row), and the model picker's note on models Studio doesn't support yet (open Model). Use the links, or `?service=account|token|off`, `?view=settings` for Settings › AI and `?scheme=dark`.

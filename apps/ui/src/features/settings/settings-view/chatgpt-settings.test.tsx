@@ -195,6 +195,108 @@ describe( 'ChatGPT account settings', () => {
 		expect( within( group ).queryByRole( 'combobox', { name: /mode/i } ) ).not.toBeInTheDocument();
 	} );
 
+	it( 'says when the account lists models Studio doesn’t support yet, without naming them', async () => {
+		await openSettings(
+			{ accounts: [ account() ] },
+			{
+				getChatGptModels: async ( connectionId, revision ) => ( {
+					connectionId,
+					revision,
+					checkedAt: '2026-11-10T10:00:00Z',
+					models: [ { id: 'gpt-6-luna', label: 'GPT-6 Luna' } ],
+					listsUnqualifiedModels: true,
+					lastError: null,
+				} ),
+			}
+		);
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+		fireEvent.click( within( group ).getByRole( 'button', { name: 'Refresh models' } ) );
+
+		expect(
+			await within( group ).findByText(
+				'This account lists GPT-6 Luna. Some models this account offers aren’t supported in Studio yet.'
+			)
+		).toBeVisible();
+	} );
+
+	it( 'explains that images use a separate WordPress.com service and logs in to it from here', async () => {
+		const { connector } = await openSettings();
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+
+		expect(
+			await within( group ).findByText(
+				/WordPress\.com image service, separate from your ChatGPT plan\. Log in to WordPress\.com to use it/
+			)
+		).toBeVisible();
+		fireEvent.click( within( group ).getByRole( 'button', { name: 'Log in to WordPress.com' } ) );
+
+		await waitFor( () => expect( connector.authenticate ).toHaveBeenCalledTimes( 1 ) );
+		expect(
+			await within( group ).findByText(
+				/WordPress\.com image service, as Test User \(test@example\.test\)\. It’s separate from your ChatGPT plan/
+			)
+		).toBeVisible();
+		expect(
+			within( group ).queryByRole( 'button', { name: 'Log in to WordPress.com' } )
+		).not.toBeInTheDocument();
+		expect( connector.beginChatGptSignIn ).not.toHaveBeenCalled();
+	} );
+
+	it( 'says a token set for the image service is in use, naming no account', async () => {
+		await openSettings(
+			{},
+			{
+				getImageServiceState: async () => ( {
+					available: true,
+					service: 'wordpress-com',
+					credential: 'environment-token',
+					account: null,
+				} ),
+			}
+		);
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+
+		expect(
+			await within( group ).findByText( /image service, with the token set for it\./ )
+		).toBeVisible();
+	} );
+
+	it( 'offers a retry when the image service can’t be checked', async () => {
+		let fail = true;
+		const { connector } = await openSettings(
+			{},
+			{
+				getImageServiceState: async () => {
+					if ( fail ) throw new Error( 'Offline' );
+					return {
+						available: false,
+						service: 'wordpress-com',
+						reason: 'signed-out',
+						setup: 'wordpress-com-login',
+					};
+				},
+			}
+		);
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+
+		expect( await within( group ).findByText( 'Couldn’t check image generation.' ) ).toBeVisible();
+		fail = false;
+		fireEvent.click( within( group ).getByRole( 'button', { name: 'Retry' } ) );
+		await waitFor( () => expect( connector.getImageServiceState ).toHaveBeenCalledTimes( 2 ) );
+		expect(
+			await within( group ).findByText( /Log in to WordPress\.com to use it/ )
+		).toBeVisible();
+	} );
+
+	it( 'shows no image service row while ChatGPT plans are off', async () => {
+		const { connector } = await openSettings( { enabled: false } );
+
+		await screen.findAllByRole( 'group', { name: 'Providers' } );
+		await waitFor( () => expect( connector.getChatGptSettings ).toHaveBeenCalled() );
+		expect( screen.queryByText( 'Image generation' ) ).not.toBeInTheDocument();
+		expect( connector.getImageServiceState ).not.toHaveBeenCalled();
+	} );
+
 	it( 'cancels an attempt that finishes starting after Settings closes', async () => {
 		const beginning = deferred< { attemptId: string } >();
 		const { connector, unmount } = await openSettings(

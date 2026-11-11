@@ -123,6 +123,42 @@ describe( 'buildSystemPrompt', () => {
 		expect( textOnly ).not.toContain( 'Pair with take_screenshot' );
 	} );
 
+	describe( 'imagery guidance', () => {
+		const IMAGERY_ROUTING =
+			'and you can make images (generate_images, or an image tool of your own), load the `imagery` skill';
+
+		it( 'routes imagery to the imagery skill when generate_images is registered', () => {
+			const prompt = buildSystemPrompt( { tools: toolsFor( { imageGeneration: true } ) } );
+
+			expect( prompt ).toContain( '- generate_images:' );
+			expect( prompt ).toContain( IMAGERY_ROUTING );
+			expect( prompt ).not.toContain( 'cannot make images' );
+		} );
+
+		it( 'gives no image-generation guidance without the image service, only how to do without images', () => {
+			const prompt = buildSystemPrompt( { tools: toolsFor( { imageGeneration: false } ) } );
+
+			expect( prompt ).not.toContain( 'generate_images' );
+			expect( prompt ).not.toContain( '`imagery` skill' );
+			expect( prompt ).toContain( 'You cannot make images in this conversation' );
+			expect( prompt ).toContain( 'never source images from web URLs' );
+		} );
+
+		it( 'routes an external agent with an image tool of its own to the imagery skill, and one without to neither', () => {
+			const ownTool = buildSystemPrompt( { external: true, ownImageTool: true, tools: [] } );
+			const noTool = buildSystemPrompt( { external: true, tools: [] } );
+			const serviceTool = buildSystemPrompt( {
+				external: true,
+				tools: toolsFor( { imageGeneration: true } ),
+			} );
+
+			expect( ownTool ).toContain( IMAGERY_ROUTING );
+			expect( serviceTool ).toContain( IMAGERY_ROUTING );
+			expect( noTool ).not.toContain( '`imagery` skill' );
+			expect( noTool ).toContain( 'You cannot make images in this conversation' );
+		} );
+	} );
+
 	it( 'lists refresh_browser only when a Studio UI is attached', () => {
 		const ui = { showArtifact: () => {}, reloadPreview: () => {} };
 		expect( buildSystemPrompt( { tools: toolsFor( {}, { ...createFakeHost(), ui } ) } ) ).toContain(

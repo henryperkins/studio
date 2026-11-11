@@ -41,7 +41,8 @@ import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections
  * registration and the record's version. Without a keychain the vault
  * refuses; it never falls back to plaintext. A registration may instead keep
  * its tokens in the memory of the app that signed in, for that session only;
- * a turn the app forks asks it for an access token over their IPC channel.
+ * a turn the app forks asks it for an access token over their IPC channel,
+ * and loses what it was handed once the app has gone.
  *
  * A lockfile per registration serializes refreshes across processes, and a
  * sign-out raises the registration's logout generation first, so a refresh
@@ -189,6 +190,12 @@ export interface ChatGptTurnHandle {
 	end(): void;
 }
 
+/**
+ * A forked turn's end of its IPC channel to the app that forked it: `process`
+ * there, whose `connected` turns false once the app's end has closed.
+ */
+export type ChatGptParentChannel = ParentChannel & { readonly connected?: boolean };
+
 export interface ChatGptCredentialBrokerOptions {
 	tokenClient: ChatGptTokenClient;
 	/** The system keychain by default. */
@@ -209,7 +216,7 @@ export interface ChatGptCredentialBroker {
 	getSessionForkEnvironment(): Record< string, string >;
 	answerSessionTokenRequest( message: unknown, reply: ( message: unknown ) => void ): boolean;
 	answerSessionTokenInvalidation( message: unknown ): boolean;
-	acceptSessionTokensFromParent( channel?: ParentChannel, env?: NodeJS.ProcessEnv ): void;
+	acceptSessionTokensFromParent( channel?: ChatGptParentChannel, env?: NodeJS.ProcessEnv ): void;
 }
 
 interface CredentialRecord {
@@ -449,10 +456,12 @@ async function callTokenService< T >(
 	}
 }
 
+// `onChannelClosed` runs when sending fails: the app's end of the channel has gone.
 function requestParentToken(
-	channel: ParentChannel,
+	channel: ChatGptParentChannel,
 	connectionId: string,
-	logoutGeneration: number
+	logoutGeneration: number,
+	onChannelClosed: () => void
 ): Promise< AccessToken | null > {
 	return new Promise( ( resolve ) => {
 		const requestId = randomUUID();
@@ -484,11 +493,13 @@ function requestParentToken(
 				{ type: SESSION_TOKEN_REQUEST, requestId, connectionId, logoutGeneration },
 				( error ) => {
 					if ( error ) {
+						onChannelClosed();
 						finish( null );
 					}
 				}
 			);
 		} catch {
+			onChannelClosed();
 			finish( null );
 		}
 	} );
@@ -523,11 +534,36 @@ export function createChatGptCredentialBroker(
 	let stopWatchingSessions: ( () => void ) | null = null;
 	// In a turn forked by an app holding session-only tokens: how to ask it for them.
 	let parent: {
-		channel: ParentChannel;
+		channel: ChatGptParentChannel;
 		offered: Set< string >;
 		tokens: Map< string, AccessToken >;
+		/** The app's end of the channel has closed: what it offered ended with it. */
+		gone: boolean;
 	} | null = null;
 	const turns = new Set< ActiveTurn >();
+
+	const leaveParent = () => {
+		if ( parent ) {
+			parent.gone = true;
+			parent.tokens.clear();
+		}
+	};
+
+	// The app that forked this turn, while it can still be asked. `connected` is
+	// read rather than listened for: a `disconnect` listener on `process` would
+	// hold the fork open for as long as the app keeps its end of the channel.
+	function reachableParent() {
+		if ( parent && ! parent.gone && parent.channel.connected === false ) {
+			leaveParent();
+		}
+		return parent?.gone ? null : parent;
+	}
+
+	// A session-only sign-in only the app that forked this turn held, and that app has gone.
+	const isLeftByParent = ( registrationId: string ) =>
+		Boolean( parent?.offered.has( registrationId ) ) &&
+		! sessions.has( registrationId ) &&
+		! reachableParent();
 
 	const credentialsDirectory = () => path.join( getConfigDirectory(), CREDENTIALS_DIRECTORY );
 	const recordFile = ( registrationId: string ) => `${ registrationId }.vault`;
@@ -935,19 +971,25 @@ export function createChatGptCredentialBroker(
 		if ( sessions.has( registrationId ) ) {
 			return renewSession( account );
 		}
-		if ( ! parent?.offered.has( registrationId ) ) {
+		const offering = reachableParent();
+		if ( ! offering?.offered.has( registrationId ) ) {
 			throw new ChatGptConnectionError( 'session-unavailable' );
 		}
-		const cached = parent.tokens.get( registrationId );
+		const cached = offering.tokens.get( registrationId );
 		if ( cached && cached.logoutGeneration === logoutGeneration && isFresh( cached.expiresAt ) ) {
 			return cached;
 		}
-		const token = await requestParentToken( parent.channel, registrationId, logoutGeneration );
-		if ( ! token ) {
-			parent.tokens.delete( registrationId );
+		const token = await requestParentToken(
+			offering.channel,
+			registrationId,
+			logoutGeneration,
+			leaveParent
+		);
+		if ( ! token || ! reachableParent() ) {
+			offering.tokens.delete( registrationId );
 			throw new ChatGptConnectionError( 'session-unavailable' );
 		}
-		parent.tokens.set( registrationId, token );
+		offering.tokens.set( registrationId, token );
 		return token;
 	}
 
@@ -977,28 +1019,33 @@ export function createChatGptCredentialBroker(
 		connectionId: string,
 		rejectedAccessToken: string
 	): Promise< void > {
-		const cached = parent?.tokens.get( connectionId );
+		const offering = reachableParent();
+		const cached = offering?.tokens.get( connectionId );
 		const account = await readChatGptAccount( connectionId );
 		if ( ! account || account.state !== 'signed-in' ) {
 			return;
 		}
 		if ( account.storage === 'session' ) {
-			if ( parent && cached?.accessToken === rejectedAccessToken ) {
-				if ( parent.tokens.get( connectionId ) === cached ) {
-					parent.tokens.delete( connectionId );
+			if ( offering && cached?.accessToken === rejectedAccessToken ) {
+				if ( offering.tokens.get( connectionId ) === cached ) {
+					offering.tokens.delete( connectionId );
 				}
 				try {
-					parent.channel.send?.(
+					offering.channel.send?.(
 						{
 							type: SESSION_TOKEN_INVALIDATE,
 							connectionId,
 							tokenGeneration: cached.tokenGeneration,
 							logoutGeneration: cached.logoutGeneration,
 						},
-						() => undefined
+						( error ) => {
+							if ( error ) {
+								leaveParent();
+							}
+						}
 					);
 				} catch {
-					// The app has gone; the next request fails closed anyway.
+					leaveParent();
 				}
 			}
 			await invalidateSessionToken(
@@ -1149,7 +1196,7 @@ export function createChatGptCredentialBroker(
 			settled: new Promise< void >( ( resolve ) => ( settle = resolve ) ),
 		};
 		turns.add( turn );
-		const stop = ( code: 'signed-out' | 'needs-sign-in' | 'changed' ) => {
+		const stop = ( code: 'signed-out' | 'needs-sign-in' | 'changed' | 'session-unavailable' ) => {
 			const error = new ChatGptConnectionError( code );
 			controller.abort( error );
 			return error;
@@ -1165,6 +1212,9 @@ export function createChatGptCredentialBroker(
 			}
 			if ( current.revision !== revision ) {
 				throw stop( 'changed' );
+			}
+			if ( current.storage === 'session' && isLeftByParent( connectionId ) ) {
+				throw stop( 'session-unavailable' );
 			}
 		};
 		const assertActive = async () => {
@@ -1303,7 +1353,7 @@ export function createChatGptCredentialBroker(
 		const held = sessions.get( account.registrationId );
 		return held
 			? held.logoutGeneration === account.logoutGeneration
-			: Boolean( parent?.offered.has( account.registrationId ) );
+			: Boolean( reachableParent()?.offered.has( account.registrationId ) );
 	}
 
 	async function listConnections(): Promise< ConnectionRegistryEntry[] > {
@@ -1389,7 +1439,7 @@ export function createChatGptCredentialBroker(
 	}
 
 	function acceptSessionTokensFromParent(
-		channel: ParentChannel = process as unknown as ParentChannel,
+		channel: ChatGptParentChannel = process as unknown as ChatGptParentChannel,
 		env: NodeJS.ProcessEnv = process.env
 	): void {
 		const offered = ( env[ SESSION_OFFER_ENV ] ?? '' )
@@ -1397,7 +1447,7 @@ export function createChatGptCredentialBroker(
 			.filter( isChatGptRegistrationId );
 		delete env[ SESSION_OFFER_ENV ];
 		if ( offered.length && typeof channel.send === 'function' ) {
-			parent = { channel, offered: new Set( offered ), tokens: new Map() };
+			parent = { channel, offered: new Set( offered ), tokens: new Map(), gone: false };
 		}
 	}
 
@@ -1507,10 +1557,10 @@ export function answerChatGptSessionTokenInvalidation( message: unknown ): boole
 
 /**
  * In a turn forked by a Studio app that holds session-only ChatGPT tokens:
- * lets the turn ask it for access tokens. Call at startup.
+ * lets the turn ask it for access tokens until the app has gone. Call at startup.
  */
 export function acceptChatGptSessionTokensFromParent(
-	channel?: ParentChannel,
+	channel?: ChatGptParentChannel,
 	env?: NodeJS.ProcessEnv
 ): void {
 	getAppBroker().acceptSessionTokensFromParent( channel, env );

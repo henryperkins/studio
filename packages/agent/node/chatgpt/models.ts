@@ -40,7 +40,9 @@ export interface ChatGptCatalogModel extends ProviderModelRef {
 }
 
 export type ChatGptModelListResult =
-	| { ok: true; models: ChatGptCatalogModel[] }
+	// `listsUnqualifiedModels`: the account also lists models Studio hasn't
+	// qualified for the route, which it leaves out without naming them.
+	| { ok: true; models: ChatGptCatalogModel[]; listsUnqualifiedModels?: boolean }
 	| { ok: false; error: ChatGptErrorSummary };
 
 const isRecord = ( value: unknown ): value is Record< string, unknown > =>
@@ -58,15 +60,20 @@ function parseModelEntries( text: string ): unknown[] | null {
 	return Array.isArray( models ) ? models : null;
 }
 
-function toCatalogModels( entries: unknown[] ): ChatGptCatalogModel[] {
+function toCatalogModels( entries: unknown[] ): Extract< ChatGptModelListResult, { ok: true } > {
 	const models: ChatGptCatalogModel[] = [];
+	let listsUnqualifiedModels = false;
 	for ( const entry of entries ) {
 		if ( ! isRecord( entry ) || entry.visibility !== 'list' || typeof entry.slug !== 'string' ) {
 			continue;
 		}
 		const slug = entry.slug;
 		const capabilities = getChatGptModelCapabilities( slug );
-		if ( ! capabilities || models.some( ( model ) => model.modelId === slug ) ) {
+		if ( ! capabilities ) {
+			listsUnqualifiedModels = true;
+			continue;
+		}
+		if ( models.some( ( model ) => model.modelId === slug ) ) {
 			continue;
 		}
 		const label =
@@ -75,7 +82,7 @@ function toCatalogModels( entries: unknown[] ): ChatGptCatalogModel[] {
 				: slug;
 		models.push( { providerId: 'chatgpt-oauth', modelId: slug, label, capabilities } );
 	}
-	return models;
+	return { ok: true, models, ...( listsUnqualifiedModels ? { listsUnqualifiedModels } : {} ) };
 }
 
 /**
@@ -149,7 +156,7 @@ export async function fetchChatGptModels(
 			},
 		};
 	}
-	return { ok: true, models: toCatalogModels( entries ) };
+	return toCatalogModels( entries );
 }
 
 /**
@@ -172,6 +179,7 @@ export function applyChatGptModelList(
 			revision,
 			checkedAt,
 			models: result.models.map( ( model ) => ( { id: model.modelId, label: model.label } ) ),
+			...( result.listsUnqualifiedModels ? { listsUnqualifiedModels: true } : {} ),
 			lastError: null,
 		};
 	}
@@ -181,6 +189,7 @@ export function applyChatGptModelList(
 		revision,
 		checkedAt: same ? previous.checkedAt : null,
 		models: same ? previous.models : null,
+		...( same && previous.listsUnqualifiedModels ? { listsUnqualifiedModels: true } : {} ),
 		lastError: result.error,
 	};
 }

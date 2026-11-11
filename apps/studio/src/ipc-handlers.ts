@@ -253,6 +253,7 @@ export {
 	getChatGptModels,
 	getChatGptSettings,
 	getGlobalAgentInstructions,
+	getImageServiceState,
 	getInstalledAppsAndTerminals,
 	getOnboardingHints,
 	getUserPreferences,

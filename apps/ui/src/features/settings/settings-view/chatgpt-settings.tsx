@@ -10,6 +10,7 @@ import {
 } from '@/data/queries/use-chatgpt-settings';
 import { useOffline } from '@/lib/hooks';
 import { Badge, Button } from '@/lib/ui';
+import { ImageServiceSettingsRow } from './image-service-row';
 import { connectedBadge, SettingsGroup, SettingsRow, SettingsSelect } from './rows';
 import styles from './style.module.css';
 import type { ChatGptCredentialStorage } from '@studio/agent/protocol/chatgpt';
@@ -159,6 +160,33 @@ export function ChatGptSettingsGroup() {
 		( storage === 'session' || settings.data.secureStorage === 'available' );
 	const connected = account?.authStatus === 'connected';
 	const availability = models.data?.models;
+	const listsUnqualified = !! models.data?.listsUnqualifiedModels;
+	const availabilityDescription = () => {
+		if ( ! availability ) {
+			return __( 'Check which supported models this account can use.' );
+		}
+		const names = availability.map( ( model ) => model.label ).join( ', ' );
+		if ( availability.length ) {
+			return listsUnqualified
+				? sprintf(
+						/* translators: %s: comma-separated model names. */
+						__(
+							'This account lists %s. Some models this account offers aren’t supported in Studio yet.'
+						),
+						names
+				  )
+				: sprintf(
+						/* translators: %s: comma-separated model names. */
+						__( 'This account lists %s.' ),
+						names
+				  );
+		}
+		return listsUnqualified
+			? __(
+					'This account lists none of the models Studio supports. Some models this account offers aren’t supported in Studio yet.'
+			  )
+			: __( 'This account lists none of the models Studio supports.' );
+	};
 
 	return (
 		<SettingsGroup
@@ -292,18 +320,7 @@ export function ChatGptSettingsGroup() {
 				<SettingsRow
 					title={ __( 'Available ChatGPT models' ) }
 					error={ models.error?.message }
-					description={
-						availability
-							? availability.length
-								? sprintf(
-										/* translators: %s: comma-separated model names. */ __(
-											'This account lists %s.'
-										),
-										availability.map( ( model ) => model.label ).join( ', ' )
-								  )
-								: __( 'This account lists none of the models Studio supports.' )
-							: __( 'Check which supported models this account can use.' )
-					}
+					description={ availabilityDescription() }
 				>
 					<Button
 						variant="outline"
@@ -316,6 +333,7 @@ export function ChatGptSettingsGroup() {
 					</Button>
 				</SettingsRow>
 			) : null }
+			<ImageServiceSettingsRow subscription={ __( 'ChatGPT plan' ) } />
 		</SettingsGroup>
 	);
 }
