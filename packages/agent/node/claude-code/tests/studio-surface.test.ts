@@ -13,6 +13,7 @@ import {
 	loadAiSession,
 } from '../../sessions/store';
 import { getClaudeConnections } from '../connection';
+import { claudePlatformTarget, currentClaudeHost } from '../platform';
 import { discoverClaudeModels } from '../runtime';
 import {
 	createNativeSessionStore,
@@ -39,6 +40,7 @@ vi.mock( '../runtime', () => ( { discoverClaudeModels: vi.fn() } ) );
 
 const selection = { model: 'claude-model', effort: 'medium' } as const;
 const request = { siteId: 'site-id', connectionId: 'connection', selection };
+const surfaceTarget = !! claudePlatformTarget( currentClaudeHost() );
 const tempDirectories: string[] = [];
 
 afterEach( async () => {
@@ -70,7 +72,7 @@ it( 'does not inspect stored connections when the experiment is disabled', async
 	expect( getClaudeConnections ).not.toHaveBeenCalled();
 } );
 
-it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
+it.runIf( surfaceTarget )(
 	'creates a pinned local Claude conversation before its first turn and fails closed on a stale Send',
 	async () => {
 		const { root, config } = await createFixture();
@@ -97,7 +99,7 @@ it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 	}
 );
 
-it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
+it.runIf( surfaceTarget )(
 	'deletes only the selected Studio journal and rejects deletion while the run lock is held',
 	async () => {
 		const { root } = await createFixture();
@@ -125,7 +127,7 @@ it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 	}
 );
 
-it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
+it.runIf( surfaceTarget )(
 	'refuses unsupported effort and a Claude selection on a Pi session',
 	async () => {
 		const { root } = await createFixture();
@@ -142,7 +144,7 @@ it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 	}
 );
 
-it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
+it.runIf( surfaceTarget )(
 	'creates a global conversation in the dedicated global workspace',
 	async () => {
 		const { root, config } = await createFixture();
@@ -171,7 +173,7 @@ it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 	}
 );
 
-it.runIf( process.platform === 'win32' && process.arch === 'x64' )(
+it.runIf( surfaceTarget )(
 	'holds a Send to a disconnected live target and verifies the target a turn started with',
 	async () => {
 		const { root, config } = await createFixture();

@@ -124,9 +124,14 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 
 		it( 'refuses an installed version older than the qualified pair', async () => {
 			version = '2.1.318 (Claude Code)';
-			await expect( inspectClaudeExecutable( executable ) ).resolves.toEqual( {
+			await expect( inspectClaudeExecutable( executable ) ).resolves.toMatchObject( {
 				ok: false,
 				reason: 'version-unqualified',
+				qualification: {
+					state: 'unqualified',
+					reason: 'version-unqualified',
+					supportedRuntimeVersions: [ '2.1.319' ],
+				},
 			} );
 		} );
 

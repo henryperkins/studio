@@ -19,6 +19,7 @@ import {
 	saveClaudeConnection,
 } from './connection';
 import { inspectClaudeExecutable } from './discovery';
+import { currentClaudeHost, isClaudeRuntimeSurfaceEnabled } from './platform';
 import { getClaudeGlobalWorkspace, getClaudeSessionStoreRoot } from './sessions';
 import type { ClaudeBackendTurnSnapshot } from '@studio/agent/protocol/backend-events';
 import type {
@@ -33,11 +34,7 @@ import type {
 export { getClaudeSessionStoreRoot } from './sessions';
 
 function isClaudeRuntimeEnabled(): boolean {
-	return (
-		process.platform === 'win32' &&
-		process.arch === 'x64' &&
-		process.env.STUDIO_EXPERIMENTAL_CLAUDE_CODE === '1'
-	);
+	return isClaudeRuntimeSurfaceEnabled( currentClaudeHost(), process.env );
 }
 
 function requireClaudeRuntime() {

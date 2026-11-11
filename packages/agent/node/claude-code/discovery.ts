@@ -3,6 +3,14 @@ import { open, realpath } from 'fs/promises';
 import path from 'path';
 import { promisify } from 'util';
 import { buildClaudeEnvironment } from './auth-status';
+import {
+	CLAUDE_AGENT_SDK_VERSION,
+	CLAUDE_QUALIFICATION_MATRIX,
+	claudePlatformTarget,
+	currentClaudeHost,
+	qualifyClaudeRuntime,
+} from './platform';
+import type { ClaudeHost, ClaudeQualificationResult } from './platform';
 
 const execFileAsync = promisify( execFile );
 export const QUALIFIED_CLAUDE_CODE_VERSION = '2.1.319';
@@ -18,13 +26,30 @@ export function trustedPowerShellPath(): string {
 	);
 }
 export type ClaudeExecutableInspection =
-	| { ok: false; reason: string }
+	| { ok: false; reason: string; qualification?: ClaudeQualificationResult }
 	| { ok: true; executablePath: string; version: string; platform: string; architecture: string };
 
 export async function inspectClaudeExecutable(
-	selectedPath: string
+	selectedPath: string,
+	options: { host?: ClaudeHost } = {}
 ): Promise< ClaudeExecutableInspection > {
-	if ( process.platform !== 'win32' ) return { ok: false, reason: 'platform-unqualified' };
+	const host = options.host ?? currentClaudeHost();
+	const target = claudePlatformTarget( host );
+	if ( ! target ) return { ok: false, reason: 'platform-unsupported' };
+	if (
+		! CLAUDE_QUALIFICATION_MATRIX.some(
+			( item ) => item.target === target && item.state === 'qualified'
+		)
+	)
+		return {
+			ok: false,
+			reason: 'platform-unqualified',
+			qualification: qualifyClaudeRuntime( {
+				target,
+				runtimeVersion: undefined,
+				sdkVersion: CLAUDE_AGENT_SDK_VERSION,
+			} ),
+		};
 	if ( ! path.isAbsolute( selectedPath ) || path.extname( selectedPath ).toLowerCase() !== '.exe' )
 		return { ok: false, reason: 'absolute-native-executable-required' };
 	try {
@@ -50,7 +75,7 @@ export async function inspectClaudeExecutable(
 		} finally {
 			await file.close();
 		}
-		if ( machine !== 0x8664 || process.arch !== 'x64' )
+		if ( machine !== ( host.arch === 'arm64' ? 0xaa64 : 0x8664 ) )
 			return { ok: false, reason: 'architecture-unqualified' };
 		const encoded = Buffer.from( executablePath, 'utf8' ).toString( 'base64' );
 		const script = `$ErrorActionPreference='Stop'; Import-Module "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1"; $p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${ encoded }')); $s=Get-AuthenticodeSignature -LiteralPath $p; if($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notmatch '(^|,\\s*)O="?Anthropic, PBC"?(,|$)') { exit 1 }`;
@@ -71,14 +96,23 @@ export async function inspectClaudeExecutable(
 			maxBuffer: 4096,
 		} );
 		const version = /^(\d+\.\d+\.\d+)\s/.exec( stdout.trim() )?.[ 1 ];
-		if ( version !== QUALIFIED_CLAUDE_CODE_VERSION )
-			return { ok: false, reason: 'version-unqualified' };
+		const qualification = qualifyClaudeRuntime( {
+			target,
+			runtimeVersion: version,
+			sdkVersion: CLAUDE_AGENT_SDK_VERSION,
+		} );
+		if ( ! version || qualification.state !== 'qualified' )
+			return {
+				ok: false,
+				reason: qualification.state === 'qualified' ? 'version-unqualified' : qualification.reason,
+				qualification,
+			};
 		return {
 			ok: true,
 			executablePath,
 			version,
-			platform: process.platform,
-			architecture: process.arch,
+			platform: host.platform,
+			architecture: host.arch,
 		};
 	} catch {
 		return { ok: false, reason: 'unavailable-or-untrusted' };
