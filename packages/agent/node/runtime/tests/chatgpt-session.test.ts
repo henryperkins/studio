@@ -13,7 +13,7 @@ import { createFakeHost, fakeSite } from '../../tests/fake-host';
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
 import type { ChatGptTurnHandle } from '@studio/agent/node/chatgpt/credential-broker';
 import type { StudioAgentHost } from '@studio/agent/node/host';
-import type { StudioAgentTurnConfig } from '@studio/agent/node/runtime';
+import type { StudioAgentTurnConfig, StudioAgentTurnHandle } from '@studio/agent/node/runtime';
 import type {
 	ConnectionRegistryEntry,
 	ConnectionSelection,
@@ -442,6 +442,9 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 	let requests: CapturedRequest[];
 	let fetchSpy: ReturnType< typeof vi.spyOn >;
 	let host: StudioAgentHost;
+	let activeHandle: StudioAgentTurnHandle | undefined;
+	// Answers by what each request is, instead of in a scripted order.
+	let respond: ( ( request: CapturedRequest ) => Response ) | undefined;
 	// WordPress.com's image service, which generate_images calls.
 	let imageService: ( init: RequestInit ) => Response | Promise< Response >;
 	let imageRequests: Headers[];
@@ -470,6 +473,8 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			...createFakeHost( sitesRoot ),
 			screenshotsDirectory: async () => path.join( paths.root, 'screenshots' ),
 		};
+		activeHandle = undefined;
+		respond = undefined;
 		seams.order = [];
 		seams.wpcomLogin = null;
 		seams.captureScreenshotBuffer.mockReset().mockImplementation( async () => {
@@ -495,10 +500,14 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			if ( url !== RESPONSES_URL ) {
 				return new Response( null, { status: 404 } );
 			}
-			requests.push( {
+			const request = {
 				headers: new Headers( init?.headers ),
 				body: JSON.parse( String( init?.body ) ) as RequestBody,
-			} );
+			};
+			requests.push( request );
+			if ( respond ) {
+				return respond( request );
+			}
 			const reply = replies.shift();
 			if ( ! reply ) {
 				throw new Error( `No reply scripted for request ${ requests.length }` );
@@ -548,6 +557,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				onEvent?.( event );
 			},
 		} );
+		activeHandle = handle;
 		await handle.result;
 		const end = [ ...events ].reverse().find( ( event ) => event.type === 'agent_end' );
 		const last = end?.type === 'agent_end' ? end.messages.at( -1 ) : undefined;
@@ -1477,6 +1487,344 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				expect(
 					JSON.stringify( requests.map( ( request ) => [ ...request.headers ] ) )
 				).not.toMatch( /test-wpcom-/ );
+			}
+		);
+	} );
+
+	describe( 'compaction, restart and interruption on the ChatGPT route', () => {
+		const LONG_LOG = `Check this log for errors:\n${ 'PHP Notice: nothing to see here.\n'.repeat(
+			3_000
+		) }`;
+
+		// pi's own summarization prompt, pinned in compaction.test.ts.
+		const isSummaryRequest = ( request: CapturedRequest ) =>
+			String( request.body.instructions ?? '' ).startsWith(
+				'You are a context summarization assistant.'
+			);
+
+		const compacted = ( turn: { entries: Array< { type: string } > } ) =>
+			turn.entries.some( ( entry ) => entry.type === 'compaction' );
+
+		const toolRuns = ( turn: { events: AgentSessionEvent[] } ) =>
+			turn.events.filter( ( event ) => event.type === 'tool_execution_start' ).length;
+
+		// A first turn that read a file, so the history holds a tool call.
+		async function readConfigTurn( selection: ConnectionSelection ) {
+			const read = toolCalls( { name: 'Read', args: { path: 'wp-config.php' } } );
+			replies.push( read.reply, () => textReply( 'DB_NAME is studio.' ) );
+			const turn = await runChatGptTurn(
+				newChatGptSession( selection ),
+				'What is the database name?',
+				selection,
+				'medium'
+			);
+			expect( turn.error ).toBeUndefined();
+			requests.length = 0;
+			return { turn, read };
+		}
+
+		it( 'replays an image-heavy history statelessly and summarizes it without its images, on the pinned connection, model and effort', async () => {
+			const selection = selectionFor();
+			const readImage = toolCalls( { name: 'Read', args: { path: 'screenshot.png' } } );
+			replies.push( readImage.reply, () => textReply( 'Three images seen.' ) );
+			const first = await runTurn(
+				newChatGptSession( selection ),
+				'Compare these with the screenshot.',
+				{
+					connection: selection,
+					chatGpt: { reasoningEffort: 'medium' },
+					images: [ attachedImage( 'a' ), attachedImage( 'b' ) ],
+				}
+			);
+			expect( first.error ).toBeUndefined();
+			expect( imageCount( requests[ 1 ].body.input ) ).toBe( 3 );
+			expectPinned( 'medium' );
+
+			// Reopened in a fresh agent, at another effort, near the budget.
+			requests.length = 0;
+			replies.push(
+				() => textReply( 'The log has no errors.', 190_000 ),
+				() => textReply( 'Summary: the user compared three images.' )
+			);
+			const second = await runChatGptTurn(
+				reopen( first.sessionFile ),
+				LONG_LOG,
+				selection,
+				'low'
+			);
+
+			expect( second.error ).toBeUndefined();
+			expect( compacted( second ) ).toBe( true );
+			expect( toolRuns( second ) ).toBe( 0 );
+			expectPinned( 'low' );
+			const [ turnRequest, ...summaryRequests ] = requests;
+			expect( isSummaryRequest( turnRequest ) ).toBe( false );
+			expect( imageCount( turnRequest.body.input ) ).toBe( 3 );
+			expect( summaryRequests.length ).toBeGreaterThan( 0 );
+			for ( const request of summaryRequests ) {
+				expect( isSummaryRequest( request ) ).toBe( true );
+				expect( imageCount( request.body.input ) ).toBe( 0 );
+			}
+
+			// The summary stands in for the images from here on.
+			requests.length = 0;
+			replies.push( () => textReply( 'Anything else?' ) );
+			const third = await runChatGptTurn(
+				reopen( second.sessionFile ),
+				'Thanks.',
+				selection,
+				'low'
+			);
+
+			expect( third.error ).toBeUndefined();
+			expect( requests ).toHaveLength( 1 );
+			expectPinned( 'low' );
+			expect( JSON.stringify( requests[ 0 ].body.input ) ).toContain(
+				'the user compared three images'
+			);
+			expect( imageCount( requests[ 0 ].body.input ) ).toBe( 0 );
+			expect( toolRuns( third ) ).toBe( 0 );
+		} );
+
+		it( 'keeps the history whole when compaction’s summary breaks off, without sending it again or re-running a tool', async () => {
+			const selection = selectionFor();
+			const { turn: first, read } = await readConfigTurn( selection );
+			replies.push( () => textReply( 'The log has no errors.', 190_000 ), PARTIAL_REPLY );
+
+			const second = await runChatGptTurn(
+				reopen( first.sessionFile ),
+				LONG_LOG,
+				selection,
+				'low'
+			);
+
+			expect( second.text ).toBe( 'The log has no errors.' );
+			expect( requests.map( isSummaryRequest ) ).toEqual( [ false, true ] );
+			expectPinned( 'low' );
+			expect( compacted( second ) ).toBe( false );
+			expect( toolRuns( second ) ).toBe( 0 );
+
+			// The next turn still has the whole conversation, and summarizes on
+			// the same connection, model and effort when it does.
+			requests.length = 0;
+			respond = ( request ) =>
+				isSummaryRequest( request )
+					? textReply( 'Summary: the database name is studio.' )
+					: textReply( 'Anything else?' );
+			const third = await runChatGptTurn(
+				reopen( second.sessionFile ),
+				'Thanks.',
+				selection,
+				'low'
+			);
+
+			expect( third.error ).toBeUndefined();
+			expect( third.text ).toBe( 'Anything else?' );
+			expectPinned( 'low' );
+			const turnRequests = requests.filter( ( request ) => ! isSummaryRequest( request ) );
+			expect( turnRequests ).toHaveLength( 1 );
+			expect( toolRuns( third ) ).toBe( 0 );
+			if ( ! compacted( third ) ) {
+				expect( itemsOfType( turnRequests[ 0 ], 'function_call' ) ).toEqual( [
+					expect.objectContaining( { call_id: read.callIds[ 0 ] } ),
+				] );
+			}
+		} );
+
+		it( 'invalidates a token rejected during compaction, keeps the history whole, and goes on with the newer token', async () => {
+			const selection = selectionFor();
+			const { turn: first } = await readConfigTurn( selection );
+			const renewed = 'test-chatgpt-renewed-token';
+			replies.push(
+				() => textReply( 'The log has no errors.', 190_000 ),
+				() => {
+					fakeBroker.token = renewed;
+					return new Response( JSON.stringify( { detail: `Rejected ${ TOKEN }` } ), {
+						status: 401,
+						headers: { 'content-type': 'application/json' },
+					} );
+				}
+			);
+
+			const second = await runChatGptTurn(
+				reopen( first.sessionFile ),
+				LONG_LOG,
+				selection,
+				'low'
+			);
+
+			expect( second.text ).toBe( 'The log has no errors.' );
+			expect( requests.map( isSummaryRequest ) ).toEqual( [ false, true ] );
+			expectPinned( 'low' );
+			expect( fakeBroker.handles.at( -1 )!.invalidations ).toEqual( [ TOKEN ] );
+			expect( compacted( second ) ).toBe( false );
+			expect( JSON.stringify( [ second.events, second.entries ] ) ).not.toContain( TOKEN );
+
+			requests.length = 0;
+			respond = ( request ) =>
+				isSummaryRequest( request )
+					? textReply( 'Summary: the database name is studio.' )
+					: textReply( 'Anything else?' );
+			const third = await runChatGptTurn(
+				reopen( second.sessionFile ),
+				'Thanks.',
+				selection,
+				'low'
+			);
+
+			expect( third.error ).toBeUndefined();
+			expectPinned( 'low', renewed );
+			expect( toolRuns( third ) ).toBe( 0 );
+			expect( JSON.stringify( [ third.events, third.entries ] ) ).not.toContain( renewed );
+		} );
+
+		it( 'reports a partly failed tool batch to the model and, after a mid-stream failure, resumes without running either tool again', async () => {
+			const selection = selectionFor();
+			vi.mocked( host.sites.wpCli )
+				.mockResolvedValueOnce( { exitCode: 0, stdout: 'Success: Created post 5.', stderr: '' } )
+				.mockResolvedValueOnce( {
+					exitCode: 1,
+					stdout: '',
+					stderr: 'Error: Could not find the post with ID 99.',
+				} );
+			const batch = toolCalls(
+				{
+					name: 'wp_cli',
+					args: {
+						nameOrPath: 'My Site',
+						command: 'post create --post_title=Hello --post_status=draft',
+					},
+				},
+				{ name: 'wp_cli', args: { nameOrPath: 'My Site', command: 'post get 99' } }
+			);
+			replies.push( batch.reply, () =>
+				sse( [
+					...PARTIAL_EVENTS,
+					{
+						type: 'response.failed',
+						response: {
+							id: 'resp_partial',
+							status: 'failed',
+							output: [],
+							error: { code: 'server_error', message: 'Upstream exploded.' },
+						},
+					},
+				] )
+			);
+
+			const first = await runChatGptTurn(
+				newChatGptSession( selection ),
+				'Create a draft, then read post 99.',
+				selection,
+				'medium'
+			);
+
+			expect( first.stopReason ).toBe( 'error' );
+			expect( first.error ).toMatch( /^ChatGPT had a server error/ );
+			expect( first.events.some( ( event ) => event.type === 'auto_retry_start' ) ).toBe( false );
+			expect( requests ).toHaveLength( 2 );
+			expectPinned( 'medium' );
+			expect( String( outputFor( requests[ 1 ], batch.callIds[ 0 ] ) ) ).toContain(
+				'Success: Created post 5.'
+			);
+			expect( String( outputFor( requests[ 1 ], batch.callIds[ 1 ] ) ) ).toContain(
+				'Could not find the post with ID 99.'
+			);
+			expect( host.sites.wpCli ).toHaveBeenCalledTimes( 2 );
+
+			requests.length = 0;
+			replies.push( () => textReply( 'Post 5 is a draft; post 99 doesn’t exist.' ) );
+			const second = await runChatGptTurn(
+				reopen( first.sessionFile ),
+				'What happened?',
+				selection,
+				'low'
+			);
+
+			expect( second.error ).toBeUndefined();
+			expect( requests ).toHaveLength( 1 );
+			expectPinned( 'low' );
+			expect( host.sites.wpCli ).toHaveBeenCalledTimes( 2 );
+			expect( toolRuns( second ) ).toBe( 0 );
+			expect(
+				itemsOfType( requests[ 0 ], 'function_call' ).map( ( item ) => item.call_id )
+			).toEqual( batch.callIds );
+			expect( String( outputFor( requests[ 0 ], batch.callIds[ 0 ] ) ) ).toContain(
+				'Success: Created post 5.'
+			);
+			expect( String( outputFor( requests[ 0 ], batch.callIds[ 1 ] ) ) ).toContain(
+				'Could not find the post with ID 99.'
+			);
+			// The reply that failed partway isn't replayed as if it were whole.
+			expect( JSON.stringify( requests[ 0 ].body.input ) ).not.toContain(
+				'Here is the first half of'
+			);
+		} );
+
+		it.each( [
+			[ 'while its command runs', 'during', 1, 'Success: Created post 5.' ],
+			[ 'before its command starts', 'before', 0, 'Operation aborted' ],
+		] as const )(
+			'never runs a tool call again that an interruption cut into %s',
+			async ( _name, when, commandRuns, recorded ) => {
+				const selection = selectionFor();
+				vi.mocked( host.sites.wpCli ).mockImplementationOnce( async () => {
+					if ( when === 'during' ) {
+						void activeHandle!.interrupt();
+					}
+					return { exitCode: 0, stdout: 'Success: Created post 5.', stderr: '' };
+				} );
+				const create = toolCalls( {
+					name: 'wp_cli',
+					args: {
+						nameOrPath: 'My Site',
+						command: 'post create --post_title=Hello --post_status=draft',
+					},
+				} );
+				replies.push( create.reply );
+
+				const first = await runChatGptTurn(
+					newChatGptSession( selection ),
+					'Create a draft.',
+					selection,
+					'medium',
+					{},
+					( event ) => {
+						if (
+							when === 'before' &&
+							event.type === 'tool_execution_start' &&
+							event.toolName === 'wp_cli'
+						) {
+							void activeHandle!.interrupt();
+						}
+					}
+				);
+
+				// pi records an abort that lands while it prepares the next request as
+				// an error, on every provider, not as an interruption.
+				expect( first.stopReason ).toBe( 'error' );
+				expect( first.error ).toBe( 'This operation was aborted' );
+				expect( requests ).toHaveLength( 1 );
+				expect( host.sites.wpCli ).toHaveBeenCalledTimes( commandRuns );
+
+				requests.length = 0;
+				replies.push( () => textReply( 'I’ll check whether the draft exists first.' ) );
+				const second = await runChatGptTurn(
+					reopen( first.sessionFile ),
+					'Did it work?',
+					selection,
+					'low'
+				);
+
+				expect( second.error ).toBeUndefined();
+				expect( requests ).toHaveLength( 1 );
+				expectPinned( 'low' );
+				expect( host.sites.wpCli ).toHaveBeenCalledTimes( commandRuns );
+				expect( toolRuns( second ) ).toBe( 0 );
+				expect(
+					itemsOfType( requests[ 0 ], 'function_call' ).map( ( item ) => item.call_id )
+				).toEqual( create.callIds );
+				expect( outputFor( requests[ 0 ], create.callIds[ 0 ] ) ).toBe( recorded );
 			}
 		);
 	} );
