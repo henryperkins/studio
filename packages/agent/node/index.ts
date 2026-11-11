@@ -16,6 +16,7 @@ export {
 	type ClaudeTranscriptCandidate,
 } from './backends/resume';
 export type {
+	HostOperationOptions,
 	HostSite,
 	ProgressCallback,
 	StudioAgentHost,

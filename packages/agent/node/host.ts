@@ -18,6 +18,15 @@ export interface HostSite {
 	adminPassword?: string;
 }
 
+// Fences the start of a host operation: `beforeSpawn` runs and `signal` is
+// checked immediately before its CLI command starts, so a cancelled or no longer
+// authorized operation never starts. Commands that can stop part-way, such as
+// WP-CLI, also stop when `signal` aborts.
+export interface HostOperationOptions {
+	signal?: AbortSignal;
+	beforeSpawn?: () => Promise< void >;
+}
+
 export interface WpCliOutput {
 	exitCode: number;
 	stdout: string;
@@ -47,34 +56,63 @@ export interface StudioAgentHost {
 		all(): Promise< HostSite[] >;
 		list(): Promise< Omit< SiteListItem, 'adminPassword' >[] >;
 		status( site: HostSite ): Promise< SiteStatus >;
-		create( name: string, sitePath: string, onProgress: ProgressCallback ): Promise< void >;
-		start( site: HostSite, onProgress: ProgressCallback ): Promise< void >;
-		stop( site: HostSite, onProgress: ProgressCallback ): Promise< void >;
-		delete( site: HostSite, deleteFiles: boolean, onProgress: ProgressCallback ): Promise< void >;
+		create(
+			name: string,
+			sitePath: string,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
+		start(
+			site: HostSite,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
+		stop(
+			site: HostSite,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
+		delete(
+			site: HostSite,
+			deleteFiles: boolean,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
 		isRunning( site: HostSite ): Promise< boolean >;
-		import( site: HostSite, file: string, onProgress: ProgressCallback ): Promise< void >;
+		import(
+			site: HostSite,
+			file: string,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
 		export(
 			site: HostSite,
 			file: string,
 			mode: 'full' | 'db',
-			onProgress: ProgressCallback
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
 		): Promise< void >;
-		wpCli(
-			site: HostSite,
-			args: string[],
-			options?: { signal?: AbortSignal; beforeSpawn?: () => Promise< void > }
-		): Promise< WpCliOutput >;
+		wpCli( site: HostSite, args: string[], options?: HostOperationOptions ): Promise< WpCliOutput >;
 	};
 	previews: {
 		list( site: HostSite ): Promise< Snapshot[] >;
-		create( site: HostSite, onProgress: ProgressCallback ): Promise< Snapshot >;
+		create(
+			site: HostSite,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< Snapshot >;
 		update(
 			site: HostSite,
 			hostname: string,
 			overwrite: boolean,
-			onProgress: ProgressCallback
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
 		): Promise< Snapshot >;
-		delete( hostname: string, onProgress: ProgressCallback ): Promise< void >;
+		delete(
+			hostname: string,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
 	};
 	// Push and pull return the WordPress.com site they synced with, or nothing when
 	// the user backed out.
@@ -83,13 +121,15 @@ export interface StudioAgentHost {
 			site: HostSite,
 			options: string,
 			remoteSite: string | undefined,
-			onProgress: ProgressCallback
+			onProgress: ProgressCallback,
+			fence?: HostOperationOptions
 		): Promise< SyncSite | undefined >;
 		pull(
 			site: HostSite,
 			options: string,
 			remoteSite: string | undefined,
-			onProgress: ProgressCallback
+			onProgress: ProgressCallback,
+			fence?: HostOperationOptions
 		): Promise< SyncSite | undefined >;
 	};
 	wpcom: {
