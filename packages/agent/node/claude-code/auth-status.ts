@@ -1,4 +1,6 @@
 import { createHash } from 'crypto';
+import { claudeEnvironmentRules } from './platform';
+
 const conflicts = new Set( [
 	'ANTHROPIC_API_KEY',
 	'ANTHROPIC_AUTH_TOKEN',
@@ -15,24 +17,6 @@ const conflicts = new Set( [
 	'ALL_PROXY',
 	'CLAUDE_CODE_SIMPLE',
 ] );
-const allowed = new Set( [
-	'PATH',
-	'SYSTEMROOT',
-	'WINDIR',
-	'COMSPEC',
-	'PATHEXT',
-	'USERPROFILE',
-	'HOMEDRIVE',
-	'HOMEPATH',
-	'APPDATA',
-	'LOCALAPPDATA',
-	'TEMP',
-	'TMP',
-	'PROGRAMFILES',
-	'PROGRAMFILES(X86)',
-	'PROGRAMDATA',
-	'CLAUDE_CODE_GIT_BASH_PATH',
-] );
 export type ClaudeAuthIdentity = {
 	email?: string;
 	organization?: string;
@@ -41,11 +25,23 @@ export type ClaudeAuthIdentity = {
 	apiKeySource?: string;
 	apiProvider?: string;
 };
-export function buildClaudeEnvironment( input: NodeJS.ProcessEnv ): {
+
+/**
+ * The environment a native Claude process gets: only the platform's allowlist.
+ * Every alternate billing route in the input is reported, under any spelling,
+ * and never passed. Where names ignore case (Windows), spellings of one
+ * variable with different values are ambiguous and reported too.
+ */
+export function buildClaudeEnvironment(
+	input: NodeJS.ProcessEnv,
+	platform: string = process.platform
+): {
 	env: NodeJS.ProcessEnv;
 	conflicts: string[];
 } {
-	const env: NodeJS.ProcessEnv = {};
+	const rules = claudeEnvironmentRules( platform );
+	const allowed = new Set( rules.allowed );
+	const kept = new Map< string, { key: string; value: string } >();
 	const found: string[] = [];
 	for ( const [ key, value ] of Object.entries( input ) ) {
 		const upper = key.toUpperCase();
@@ -59,8 +55,14 @@ export function buildClaudeEnvironment( input: NodeJS.ProcessEnv ): {
 				upper.endsWith( '_PROXY' ) )
 		)
 			found.push( upper );
-		if ( allowed.has( upper ) ) env[ key ] = value;
+		const name = rules.caseInsensitiveNames ? upper : key;
+		if ( value === undefined || ! allowed.has( name ) ) continue;
+		const previous = kept.get( name );
+		if ( ! previous ) kept.set( name, { key, value } );
+		else if ( previous.value !== value ) found.push( name );
 	}
+	const env: NodeJS.ProcessEnv = {};
+	for ( const [ name, { key, value } ] of kept ) if ( ! found.includes( name ) ) env[ key ] = value;
 	return { env, conflicts: [ ...new Set( found ) ].sort() };
 }
 export function assessClaudeAuth( status: Record< string, unknown > ): { qualified: boolean } {

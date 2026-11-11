@@ -306,6 +306,8 @@ export interface ClaudePlatformAdapter {
 	readonly path: PlatformPath;
 	/** Whether the OS has execute permission bits a native executable must carry. */
 	readonly requiresExecutePermission: boolean;
+	/** The only inherited variables a native Claude process receives. */
+	readonly environment: ClaudeEnvironmentRules;
 	/** Whether a selected path can name a native executable at all, before touching the file. */
 	isSelectablePath( selected: string ): boolean;
 	readBinaryHeader( read: ClaudeByteReader ): Promise< ClaudeBinaryHeader | undefined >;
@@ -316,12 +318,26 @@ export interface ClaudePlatformAdapter {
 	): Promise< ClaudeBinaryVerificationResult >;
 }
 
+export interface ClaudeEnvironmentRules {
+	/** Variable names passed through, upper-case where names ignore case. */
+	readonly allowed: readonly string[];
+	/** Whether the OS treats `Path` and `PATH` as one variable. */
+	readonly caseInsensitiveNames: boolean;
+}
+
 export function selectClaudePlatformAdapter( host: ClaudeHost ): ClaudePlatformAdapter | undefined {
 	const target = claudePlatformTarget( host );
 	if ( ! target ) return;
 	if ( target.startsWith( 'windows-' ) ) return windowsAdapter;
 	if ( target.startsWith( 'macos-' ) ) return macosAdapter;
 	return linuxAdapter;
+}
+
+/** The environment rules for an OS; any other Unix gets Linux's, the strictest session set. */
+export function claudeEnvironmentRules( platform: string ): ClaudeEnvironmentRules {
+	if ( platform === 'win32' ) return windowsAdapter.environment;
+	if ( platform === 'darwin' ) return macosAdapter.environment;
+	return linuxAdapter.environment;
 }
 
 function fileStat( value: BigIntStats ): ClaudeFileStat {

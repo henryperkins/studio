@@ -173,7 +173,7 @@ export async function inspectClaudeExecutable(
 		changed: before.changed,
 		sha256,
 	};
-	const env = buildClaudeEnvironment( seams.env ).env;
+	const env = buildClaudeEnvironment( seams.env, seams.host.platform ).env;
 	const verification = await adapter.verifyBinary(
 		{ executablePath, sha256, header, records, env },
 		seams

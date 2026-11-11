@@ -61,6 +61,21 @@ export const macosAdapter: ClaudePlatformAdapter = Object.freeze< ClaudePlatform
 	os: 'macos',
 	path: path.posix,
 	requiresExecutePermission: true,
+	environment: Object.freeze( {
+		allowed: Object.freeze( [
+			'HOME',
+			'USER',
+			'LOGNAME',
+			'SHELL',
+			'PATH',
+			'TMPDIR',
+			'LANG',
+			'LC_ALL',
+			'LC_CTYPE',
+			'__CF_USER_TEXT_ENCODING',
+		] ),
+		caseInsensitiveNames: false,
+	} ),
 	isSelectablePath: ( selected: string ) => path.posix.isAbsolute( selected ),
 	readBinaryHeader: readMachOHeader,
 	async verifyBinary( input, seams ) {

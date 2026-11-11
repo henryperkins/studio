@@ -567,7 +567,7 @@ describe( 'Claude executable inspection on macOS', () => {
 					'=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.O] = "Anthropic PBC"',
 					installed,
 				],
-				env: expect.any( Object ),
+				env: { HOME: '/Users/tester', PATH: '/usr/bin:/bin' },
 			} );
 			expect( calls[ 1 ] ).toMatchObject( { file: installed, args: [ '--version' ] } );
 		}
