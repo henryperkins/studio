@@ -191,6 +191,17 @@ Test accounts and quota:
 - Live-run consent: **pending, to be requested once the acceptance runners exist.** Earlier authorization is not extended by this record.
 - Quota: the repository owner stated in a PR #3 comment that live-account checks are deferred because quota is exhausted. Quota for future runs is unknown.
 
+### P1a record (Claude platform code, November 11, 2026)
+
+Commits `4f824c88e`, `612ba6b86`, `13c5ef36f`, `e577663c3`, `be6c932ef`, `24cf1a7b7` on `add-claude-code-runtime`. This record changes no cell's status. The "Code currently refuses" notes in C8 to C12 now read: the code has a path for the cell, and refuses it as unqualified.
+
+- **Gate.** The `win32` + `x64` checks in discovery and the Studio surface are gone. `CLAUDE_QUALIFICATION_MATRIX` (`packages/agent/node/claude-code/platform.ts`) has one record per target for SDK `0.3.319` / runtime `2.1.319`. Only Windows x64 is qualified. The other five records are `unqualified`, reason `no-native-qualification-run`. With the experiment flag on, the surface appears on all six targets. On the five unqualified ones, inspection returns `platform-unqualified` before any prompt is sent.
+- **Code paths per platform** (`platforms/windows.ts`, `macos.ts`, `linux.ts`), each checked only with simulated filesystems and command runners:
+  - Executable inspection: PE32+ with Authenticode (`Anthropic, PBC`); 64-bit thin or universal Mach-O with a `codesign` Developer ID requirement on `Anthropic PBC`; 64-bit glibc ELF against a signed-manifest SHA-256 copied into the matrix during qualification. No Linux checksum is recorded yet, so a Linux binary is never run.
+  - Shared steps: a re-check of the executable's identity before sign-in and at spawn; filesystem-based path identity; per-OS environment allowlists; documented managed-policy locations; argv-safe sign-in (ShellExecute, AppleScript `quoted form of`, Linux terminals that take a separate argv); shell-sandbox availability recorded as plain data.
+- **Windows x64 only:** the junction, spaces/Unicode and identity-change cases ran on this machine's filesystem with an injected runner. No real Claude executable was run and no sign-in was opened.
+- **Still open:** native runs on Windows ARM64, macOS x64/ARM64 and Linux x64/ARM64 (P4); a GPG-verified manifest checksum for each Linux record; confirmation of the macOS signer requirement and managed-preferences paths. The Settings display is P1b. No live gate is passed by this record.
+
 ## D. Studio tool inventory (counted from code)
 
 Read at `4ae1e38da` in the primary checkout. The registry is identical at `ce4eea5dc`: `git diff 4ae1e38da ce4eea5dc` shows no change to `tools/index.ts` or `runtime/index.ts`; `host.ts` differs only in an added optional `options` argument on `sites.wpCli` (abort signal and pre-spawn check).
