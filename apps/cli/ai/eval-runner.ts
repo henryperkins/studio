@@ -34,6 +34,7 @@ import {
 import { isChatGptEnabled } from '@studio/agent/node/chatgpt/settings';
 import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { writeGlobalInstructions } from '@studio/agent/node/global-instructions';
+import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
 import { DEFAULT_MODEL, isAiModelId, type AiModelId } from '@studio/agent/protocol/models';
 import { findLastAssistant } from '@studio/agent/protocol/session-events';
 import { DEFAULT_PHP_VERSION } from '@studio/common/constants';
@@ -52,6 +53,14 @@ import {
 	readObservedLines,
 	type ObservedRequest,
 } from 'cli/ai/chatgpt-acceptance-observer';
+import {
+	evalHistoryMessages,
+	findEvalFixturesDir,
+	loadEvalAttachments,
+	withMockedRemote,
+	type EvalAttachments,
+	type RemoteCall,
+} from 'cli/ai/eval-harness';
 import { parseEvalRunnerVars, type EvalRunnerVars, type EvalSeed } from 'cli/ai/eval-input';
 import { captureTurnOutcome, fingerprintSites, type TurnOutcome } from 'cli/ai/eval-outcome';
 import {
@@ -83,6 +92,9 @@ import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
 import { STUDIO_SITES_ROOT } from 'cli/lib/site-paths';
 import { Logger } from 'cli/logger';
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
+import type { StudioChatArtifactData } from '@studio/agent/protocol/chat-artifacts';
+import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
+import type { SyncSite } from '@studio/common/types/sync';
 import type { AiProviderId } from 'cli/ai/providers';
 
 interface Inspection {
@@ -148,11 +160,18 @@ const STUDIO_DOWNLOADS = [ 'server-files', 'php-bin', 'import-runtime', 'mu-plug
 // user, so what a case seeds (global instructions, WordPress.com connections)
 // and what its turn changes stay in the case: concurrent cases and the user's
 // own Studio never see them.
-function isolateStudioConfig(): { userDir: string; dir: string } {
+function isolateStudioConfig( { withoutWpcomLogin = false } = {} ): {
+	userDir: string;
+	dir: string;
+} {
 	const userDir = getConfigDirectory();
-	const { version, authToken, aiProvider } = JSON.parse(
-		readFileSync( getSharedConfigPath(), 'utf8' )
-	) as Record< string, unknown >;
+	const shared = JSON.parse( readFileSync( getSharedConfigPath(), 'utf8' ) ) as Record<
+		string,
+		unknown
+	>;
+	const { version, aiProvider } = shared;
+	// Without the login, Studio's image service, which signs with it, is off.
+	const authToken = withoutWpcomLogin ? undefined : shared.authToken;
 	const dir = mkdtempSync( path.join( os.tmpdir(), 'studio-eval-config-' ) );
 	for ( const name of STUDIO_DOWNLOADS ) {
 		if ( existsSync( path.join( userDir, name ) ) ) {
@@ -491,28 +510,72 @@ const liveProviderDeps: EvalProviderDeps = {
 	provider: ( id ) => getAiProviderDefinition( id ),
 };
 
+interface EvalRefusal {
+	code: EvalProviderFailure[ 'code' ] | EvalSetupRefusalCode;
+	message: string;
+}
+
+type EvalSetupRefusalCode =
+	| 'staging-not-designated'
+	| 'staging-needs-active-site'
+	| 'history-needs-provider'
+	| 'fixture-missing'
+	| 'image-service-not-configured'
+	| 'image-service-still-configured';
+
 interface ProviderRouteReport {
 	requested: RequestedRoute | null;
 	executed?: ExecutedRoute;
-	failure?: EvalProviderFailure;
+	failure?: EvalRefusal;
 }
 
-/** A run refused before any site, turn or model request, with its typed code. */
-function refusedRun( failure: EvalProviderFailure, requested: RequestedRoute | null = null ) {
+/**
+ * A run refused before any site, turn or model request, with its typed code:
+ * in `providerRoute` too when a provider was selected or its selection failed.
+ */
+function refusedRun( failure: EvalRefusal, route?: { requested: RequestedRoute | null } ) {
 	return {
 		success: false,
 		error: failure.message,
 		refusal: failure,
-		providerRoute: { requested, failure } satisfies ProviderRouteReport,
+		...( route
+			? { providerRoute: { requested: route.requested, failure } satisfies ProviderRouteReport }
+			: {} ),
 	};
 }
 
+const STAGING_SITE_ID_ENV = 'STUDIO_EVAL_STAGING_SITE_ID';
+const STAGING_SITE_URL_ENV = 'STUDIO_EVAL_STAGING_SITE_URL';
+
+/**
+ * The WordPress.com site a `remote: staging` case may change: one the person
+ * running the eval designated as disposable staging, never one a config names.
+ */
+function designatedStagingSite(): Omit< SyncSite, 'localSiteId' > | null {
+	const id = Number( process.env[ STAGING_SITE_ID_ENV ] );
+	const url = process.env[ STAGING_SITE_URL_ENV ]?.trim();
+	if ( ! Number.isSafeInteger( id ) || id <= 0 || ! url || ! /^https:\/\//.test( url ) ) {
+		return null;
+	}
+	return {
+		id,
+		name: 'Designated staging site',
+		url,
+		isStaging: true,
+		isPressable: false,
+		environmentType: 'staging',
+		syncSupport: 'already-connected',
+		lastPullTimestamp: null,
+		lastPushTimestamp: null,
+	};
+}
+
+interface UiEvents {
+	artifacts: Array< { id: string; widgets: string[] } >;
+	previewReloads: number;
+}
+
 export async function runEval( input: EvalRunnerInput ) {
-	const agent = createAgent( {
-		host: input.ui
-			? { ...cliAgentHost, ui: { showArtifact: () => {}, reloadPreview: () => {} } }
-			: cliAgentHost,
-	} );
 	const evalStartedAt = Date.now();
 	const elapsed = () => Date.now() - evalStartedAt;
 	const phaseTimingsMs: Record< string, number > = {};
@@ -522,12 +585,12 @@ export async function runEval( input: EvalRunnerInput ) {
 	let aiEnvironment: Record< string, string >;
 	if ( input.provider ) {
 		if ( ! input.provider.ok ) {
-			return refusedRun( input.provider.failure );
+			return refusedRun( input.provider.failure, { requested: null } );
 		}
 		const resolved = await resolveEvalProviderPlan( input.provider.request, liveProviderDeps );
 		phaseTimingsMs.resolve_selected_provider_ms = Date.now() - phaseStartedAt;
 		if ( ! resolved.ok ) {
-			return refusedRun( resolved.failure );
+			return refusedRun( resolved.failure, { requested: null } );
 		}
 		plan = resolved.plan;
 		aiEnvironment = plan.env;
@@ -548,6 +611,75 @@ export async function runEval( input: EvalRunnerInput ) {
 	}
 	// Mirrors the fallback in the agent runtime (packages/agent/node/runtime) — keep in sync.
 	const resolvedModel = plan ? plan.requested.model : input.model ?? DEFAULT_MODEL;
+	const providerRefusal = ( failure: EvalRefusal ) =>
+		refusedRun( failure, plan ? { requested: plan.requested } : undefined );
+
+	let seed = input.seed;
+	if ( input.remote === 'staging' ) {
+		const staging = designatedStagingSite();
+		if ( ! staging ) {
+			return providerRefusal( {
+				code: 'staging-not-designated',
+				message: `A remote: staging case changes a real WordPress.com site, so it runs only against a disposable staging site you designate: set ${ STAGING_SITE_ID_ENV } and ${ STAGING_SITE_URL_ENV } (https).`,
+			} );
+		}
+		if ( ! seed?.activeSite ) {
+			return providerRefusal( {
+				code: 'staging-needs-active-site',
+				message: 'A remote: staging case connects the staging site to its seeded active site.',
+			} );
+		}
+		seed = {
+			...seed,
+			activeSite: {
+				...seed.activeSite,
+				connectedWpcomSites: [ ...( seed.activeSite.connectedWpcomSites ?? [] ), staging ],
+			},
+		};
+	}
+	if ( seed?.history?.length && ! plan ) {
+		return providerRefusal( {
+			code: 'history-needs-provider',
+			message:
+				'Seeded history is recorded as replies on the selected route, so it needs STUDIO_EVAL_PROVIDER.',
+		} );
+	}
+	let attachments: EvalAttachments | null = null;
+	if ( input.attachments?.length ) {
+		const fixturesDir = findEvalFixturesDir( import.meta.dirname, process.env );
+		const loaded = fixturesDir
+			? loadEvalAttachments( input.attachments, fixturesDir )
+			: { missing: input.attachments[ 0 ].fixture };
+		if ( 'missing' in loaded ) {
+			return providerRefusal( {
+				code: 'fixture-missing',
+				message: `The attachment fixture ${ loaded.missing } is not in scripts/eval/fixtures (or STUDIO_EVAL_FIXTURES_DIR).`,
+			} );
+		}
+		attachments = loaded;
+	}
+
+	const remoteCalls: RemoteCall[] = [];
+	const uiEvents: UiEvents = { artifacts: [], previewReloads: 0 };
+	const baseHost =
+		input.remote === 'mock' ? withMockedRemote( cliAgentHost, remoteCalls ) : cliAgentHost;
+	const host = input.ui
+		? {
+				...baseHost,
+				ui: {
+					showArtifact: ( artifact: StudioChatArtifactData ) => {
+						uiEvents.artifacts.push( {
+							id: artifact.id,
+							widgets: artifact.widgets.map( ( widget ) => widget.type ),
+						} );
+					},
+					reloadPreview: () => {
+						uiEvents.previewReloads += 1;
+					},
+				},
+		  }
+		: baseHost;
+	let agent = createAgent( { host } );
 
 	const env = {
 		...( process.env as Record< string, string > ),
@@ -555,6 +687,12 @@ export async function runEval( input: EvalRunnerInput ) {
 	};
 	// Allow running inside a Claude Code session
 	delete env.CLAUDECODE;
+	if ( input.imageService === 'off' ) {
+		// The image service's own token; its other credential, the WordPress.com
+		// login, is left out of the case's profile below.
+		delete process.env.STUDIO_IMAGE_API_TOKEN;
+		delete env.STUDIO_IMAGE_API_TOKEN;
+	}
 
 	const toolCalls: ToolCallRecord[] = [];
 	const toolResults: {
@@ -574,7 +712,8 @@ export async function runEval( input: EvalRunnerInput ) {
 		? async ( asked ) =>
 				Object.fromEntries(
 					asked.map( ( { question, options } ) => {
-						const answer = pendingAnswers.shift()?.label ?? 'Cancel';
+						const label = pendingAnswers.shift()?.label;
+						const answer = ( label === '@first' ? options[ 0 ]?.label : label ) ?? 'Cancel';
 						questions.push( {
 							question,
 							options: options.map( ( option ) => option.label ),
@@ -605,7 +744,25 @@ export async function runEval( input: EvalRunnerInput ) {
 	const usage = createTokenUsage();
 
 	await isolateSiteRegistry();
-	const config = isolateStudioConfig();
+	const config = isolateStudioConfig( { withoutWpcomLogin: input.imageService === 'off' } );
+	// As the runtime decides it: whether this run offers generate_images.
+	const imageServiceConfigured = input.imageService
+		? await isImageGenerationAvailable()
+		: undefined;
+	if ( input.imageService === 'off' && imageServiceConfigured ) {
+		return providerRefusal( {
+			code: 'image-service-still-configured',
+			message:
+				'This case needs Studio’s image service off, but it is still configured (a DEV_CONFIG_DIR profile with a WordPress.com login, say).',
+		} );
+	}
+	if ( input.imageService === 'required' && ! imageServiceConfigured ) {
+		return providerRefusal( {
+			code: 'image-service-not-configured',
+			message:
+				'This case needs Studio’s separate WordPress.com image service: log in to WordPress.com or set STUDIO_IMAGE_API_TOKEN.',
+		} );
+	}
 	// A selected ChatGPT connection is the source profile's sign-in, reached from the case's profile.
 	const unlinkChatGpt =
 		plan?.requested.kind === 'chatgpt-oauth'
@@ -617,14 +774,21 @@ export async function runEval( input: EvalRunnerInput ) {
 		: null;
 	const uninstallObserver = observerFile ? installAcceptanceObserver( observerFile ) : null;
 	const replies: Array< { provider?: unknown; model?: unknown } > = [];
-	const bystanderPaths = await createBystanderSites();
 
+	let bystanderPaths: string[];
 	let seeded: SeededFixtures | null = null;
 	let inspections: Inspection[] = [];
 	let outcome: TurnOutcome | { error: string } | null = null;
-	const prompt = input.prompt.trim();
-	if ( input.seed ) {
-		seeded = await seedFixtures( input.seed );
+	const prompt = `${ input.prompt.trim() }${ attachments?.promptBlock ?? '' }`;
+	try {
+		bystanderPaths = await createBystanderSites();
+		if ( seed ) {
+			seeded = await seedFixtures( seed );
+		}
+	} catch ( setupError ) {
+		uninstallObserver?.();
+		unlinkChatGpt?.();
+		throw setupError;
 	}
 
 	phaseStartedAt = Date.now();
@@ -633,7 +797,20 @@ export async function runEval( input: EvalRunnerInput ) {
 	const sessionDir =
 		process.env.STUDIO_EVAL_SESSION_DIR?.trim() || path.join( os.tmpdir(), 'studio-eval-sessions' );
 	mkdirSync( sessionDir, { recursive: true } );
-	const session = SessionManager.create( STUDIO_SITES_ROOT, sessionDir );
+	let session = SessionManager.create( STUDIO_SITES_ROOT, sessionDir );
+	if ( plan && seed?.history?.length ) {
+		for ( const message of evalHistoryMessages( seed.history, plan.reply ) ) {
+			session.appendMessage( message );
+		}
+	}
+	// Where each user message's turn starts in the run's records.
+	const turns: Array< {
+		reopened: boolean;
+		startedAtMs: number;
+		toolCallsStart: number;
+		textSegmentsStart: number;
+		questionsStart: number;
+	} > = [];
 	const queryStartedAt = Date.now();
 	let turnStart = queryStartedAt;
 
@@ -731,13 +908,30 @@ export async function runEval( input: EvalRunnerInput ) {
 		}
 	};
 
-	const runTurn = ( turnPrompt: string ) => {
+	const runTurn = (
+		turnPrompt: string,
+		{ images, reopen = false }: { images?: StudioChatImage[]; reopen?: boolean } = {}
+	) => {
+		const sessionFile = session.getSessionFile();
+		if ( reopen && sessionFile ) {
+			// As a resumed chat: the conversation read back from its file, in a fresh agent.
+			session = SessionManager.open( sessionFile, sessionDir );
+			agent = createAgent( { host } );
+		}
+		turns.push( {
+			reopened: reopen,
+			startedAtMs: elapsed(),
+			toolCallsStart: toolCalls.length,
+			textSegmentsStart: textSegments.length,
+			questionsStart: questions.length,
+		} );
 		// As the CLI does before each turn: the conversation names the connection it runs on.
 		if ( plan?.sessionContext ) {
 			session.appendCustomEntry( 'studio.session_context', plan.sessionContext );
 		}
 		return agent.runTurn( {
 			prompt: turnPrompt,
+			...( images?.length ? { images } : {} ),
 			env,
 			session,
 			activeSite: seeded?.activeSite,
@@ -747,7 +941,7 @@ export async function runEval( input: EvalRunnerInput ) {
 		} );
 	};
 	const sitesBeforeTurn = await fingerprintSites();
-	let query = runTurn( prompt );
+	let query = runTurn( prompt, { images: attachments?.images } );
 	phaseTimingsMs.start_ai_agent_ms = Date.now() - phaseStartedAt;
 
 	const timeout = setTimeout( () => {
@@ -758,10 +952,10 @@ export async function runEval( input: EvalRunnerInput ) {
 	try {
 		await query.result;
 		for ( const followUp of input.followUps ?? [] ) {
-			if ( timedOut || stoppedAt ) {
+			if ( timedOut || ( stoppedAt && ! input.resumeAfterStop ) ) {
 				break;
 			}
-			query = runTurn( followUp.prompt );
+			query = runTurn( followUp.prompt, { reopen: followUp.reopen } );
 			await query.result;
 		}
 	} catch ( caught ) {
@@ -795,6 +989,7 @@ export async function runEval( input: EvalRunnerInput ) {
 						),
 						replies,
 						entries: session.getEntries(),
+						turnStartedAt: turns.map( ( turn ) => evalStartedAt + turn.startedAtMs ),
 					} ),
 			  }
 			: null;
@@ -804,6 +999,12 @@ export async function runEval( input: EvalRunnerInput ) {
 
 	return {
 		...( providerRoute ? { providerRoute } : {} ),
+		...( input.remote ? { remoteCalls } : {} ),
+		...( input.ui ? { uiEvents } : {} ),
+		...( input.imageService ? { imageService: { configured: imageServiceConfigured } } : {} ),
+		...( attachments ? { attachments: attachments.summary } : {} ),
+		turns,
+		compactions: session.getEntries().filter( ( entry ) => entry.type === 'compaction' ).length,
 		success,
 		error,
 		timedOut,

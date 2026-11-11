@@ -718,3 +718,250 @@ export const designSystemReplyLink = check( ( d ) => {
 		? pass( 'final reply includes the design system link within prose' )
 		: fail( `design system link is in a standalone links row: ${ paragraph }` );
 } );
+
+// --- Subscription parity checks ----------------------------------------------
+//
+// For scripts/eval/subscription-parity.config.yaml. Each judges a final state
+// or what the user was shown; `ranOnRequestedRoute` above judges the route.
+
+const inspectionText = ( d ) => ( d.inspections || [] ).map( ( i ) => i.stdout || '' ).join( '\n' );
+const lowered = ( text ) => String( text ).toLowerCase();
+
+// The active theme's file `vars.file` contains `vars.expectedText`.
+export const themeFileIncludes = check( ( d, vars ) => {
+	const s = site( d, vars );
+	const text = ( s.themeFiles || {} )[ vars.file ];
+	if ( typeof text !== 'string' )
+		return fail( `the active theme (${ s.theme?.stylesheet }) has no ${ vars.file }` );
+	return text.includes( vars.expectedText )
+		? pass( `${ vars.file } contains ${ vars.expectedText }` )
+		: fail( `${ vars.file } lacks ${ vars.expectedText }` );
+} );
+
+// What the seed's `inspect` commands printed after the turn contains `vars.expectedText`.
+export const inspectionIncludes = check( ( d, vars ) => {
+	const text = inspectionText( d );
+	if ( ! ( d.inspections || [] ).length ) return fail( 'no inspection ran after the turn' );
+	return text.includes( vars.expectedText )
+		? pass( `the site shows ${ vars.expectedText }` )
+		: fail( `the site does not show ${ vars.expectedText }: ${ text.slice( 0, 300 ) }` );
+} );
+
+// What the seed's `inspect` commands printed after the turn matches the regex `vars.inspectPattern`.
+export const inspectionMatches = check( ( d, vars ) => {
+	if ( ! ( d.inspections || [] ).length ) return fail( 'no inspection ran after the turn' );
+	const text = inspectionText( d );
+	return new RegExp( vars.inspectPattern ).test( text )
+		? pass( `the site matches ${ vars.inspectPattern }` )
+		: fail( `the site does not match ${ vars.inspectPattern }: ${ text.slice( 0, 300 ) }` );
+} );
+
+// The turn reloaded the preview the Studio UI shows (cases with `ui: true`).
+export const previewRefreshed = check( ( d ) => {
+	const reloads = d.uiEvents?.previewReloads ?? 0;
+	return reloads > 0
+		? pass( `the preview was reloaded ${ reloads } time(s)` )
+		: fail( 'the preview the user sees was never reloaded' );
+} );
+
+// The turn showed the user an artifact, with a `vars.widgetType` widget when set.
+export const artifactShown = check( ( d, vars ) => {
+	const artifacts = d.uiEvents?.artifacts || [];
+	const shown = artifacts.filter(
+		( a ) => ! vars.widgetType || ( a.widgets || [] ).includes( vars.widgetType )
+	);
+	return shown.length
+		? pass( `${ shown.length } artifact(s) shown: ${ JSON.stringify( shown ) }` )
+		: fail(
+				`no ${
+					vars.widgetType ? `${ vars.widgetType } ` : ''
+				}artifact was shown: ${ JSON.stringify( artifacts ) }`
+		  );
+} );
+
+// The last reply mentions each of `vars.expectedTexts` (`{ "text": "…" }`), in any case.
+export const finalReplyIncludes = check( ( d, vars ) => {
+	const text = finalReply( d );
+	const missing = ( vars.expectedTexts || [] )
+		.map( ( { text: expected } ) => expected )
+		.filter( ( expected ) => ! lowered( text ).includes( lowered( expected ) ) );
+	return missing.length
+		? fail( `the last reply lacks ${ missing.join( ', ' ) }: ${ text.slice( 0, 300 ) }` )
+		: pass( 'the last reply has everything asked for' );
+} );
+
+const lastTurnCalls = ( d ) =>
+	( d.toolCalls || [] ).slice( ( d.turns || [] ).at( -1 )?.toolCallsStart ?? 0 );
+
+// The last user message was answered without any tool call.
+export const lastTurnUsedNoTools = check( ( d ) => {
+	const calls = lastTurnCalls( d );
+	return calls.length
+		? fail( `the last turn called ${ calls.map( ( c ) => c.name ).join( ', ' ) }` )
+		: pass( 'the last turn answered from the conversation alone' );
+} );
+
+// Every tool call was one of `vars.allowedTools` (`{ "name": "…" }`), and there was one.
+export const usedOnlyTools = check( ( d, vars ) => {
+	const allowed = ( vars.allowedTools || [] ).map( ( t ) => t.name );
+	const calls = d.toolCalls || [];
+	if ( ! calls.length ) return fail( `no tool was called; expected ${ allowed.join( ', ' ) }` );
+	const other = calls.filter( ( c ) => ! allowed.includes( c.name ) ).map( ( c ) => c.name );
+	return other.length
+		? fail( `called ${ [ ...new Set( other ) ].join( ', ' ) } besides ${ allowed.join( ', ' ) }` )
+		: pass( `${ calls.length } call(s), all to ${ allowed.join( ', ' ) }` );
+} );
+
+// An attached image reached the model as image input on the selected route,
+// and with `vars.replayed` a later message's requests still carried it.
+export const attachmentReachedModel = check( ( d, vars ) => {
+	const requests = d.providerRoute?.executed?.requests;
+	if ( ! requests )
+		return fail( 'no provider-qualified route report: run with a selected provider' );
+	const carried = requests.filter( ( r ) => ( r.imageInputs ?? 0 ) > 0 );
+	if ( ! carried.length ) return fail( 'no model request carried the attached image' );
+	if ( vars.replayed && ! carried.some( ( r ) => ( r.turn ?? 0 ) > 0 ) )
+		return fail( 'the attached image was not replayed to a later message’s requests' );
+	return pass(
+		`${ carried.length } request(s) carried the image${
+			vars.replayed ? ', after the first message too' : ''
+		}`
+	);
+} );
+
+const REMOTE_TOOL = {
+	push: 'site_push',
+	pull: 'site_pull',
+	'preview-create': 'preview_create',
+	'preview-update': 'preview_update',
+	'preview-delete': 'preview_delete',
+};
+
+// The remote operation `vars.operation` ran, against `vars.target` when set:
+// recorded by the mock (`remote: mock`), or, on a designated staging site,
+// judged on the tool's own result.
+export const remoteOperationRan = check( ( d, vars ) => {
+	if ( Array.isArray( d.remoteCalls ) ) {
+		const matching = d.remoteCalls.filter(
+			( c ) =>
+				c.operation === vars.operation &&
+				( ! vars.target || ( c.target || '' ).includes( vars.target ) )
+		);
+		return matching.length
+			? pass( `mocked ${ vars.operation } ran: ${ JSON.stringify( matching[ 0 ] ) }` )
+			: fail(
+					`no mocked ${ vars.operation }${
+						vars.target ? ` to ${ vars.target }` : ''
+					}: ${ JSON.stringify( d.remoteCalls ) }`
+			  );
+	}
+	const ran = ( d.toolResults || [] ).filter(
+		( r ) => r.toolName === REMOTE_TOOL[ vars.operation ] && ! r.isError
+	);
+	return ran.length
+		? pass( `${ REMOTE_TOOL[ vars.operation ] } ran: ${ ( ran[ 0 ].text || '' ).slice( 0, 200 ) }` )
+		: fail( `${ REMOTE_TOOL[ vars.operation ] } never succeeded` );
+} );
+
+// Under `remote: mock`, no remote operation was even attempted.
+export const noRemoteOperation = check( ( d ) => {
+	if ( ! Array.isArray( d.remoteCalls ) )
+		return fail( 'the case did not run with remote: mock, so nothing records remote operations' );
+	return d.remoteCalls.length
+		? fail( `remote operations ran: ${ JSON.stringify( d.remoteCalls ) }` )
+		: pass( 'no remote operation was attempted' );
+} );
+
+// With Studio's separate image service configured, generate_images made
+// images, its result names the service that made them, and that service's
+// requests stayed apart from the model's.
+export const imageGenerated = check( ( d ) => {
+	if ( ! d.imageService?.configured )
+		return fail( 'the image service was not configured for this run' );
+	const made = ( d.toolResults || [] ).filter(
+		( r ) => r.toolName === 'generate_images' && ! r.isError
+	);
+	if ( ! made.length ) return fail( 'generate_images never succeeded' );
+	if ( ! made.some( ( r ) => r.details?.studioService ) )
+		return fail( 'the generate_images result does not name the image service' );
+	const route = d.providerRoute?.executed;
+	if ( route && ! route.imageServiceRequests )
+		return fail( 'no request reached the image service' );
+	return pass(
+		`generate_images ran ${ made.length } time(s) on ${ JSON.stringify(
+			made[ 0 ].details.studioService
+		) }`
+	);
+} );
+
+// Without the image service, the agent had no generate_images and told the
+// user images are unavailable and how to turn them on.
+export const imageGenerationUnavailable = check( ( d ) => {
+	if ( d.imageService?.configured !== false )
+		return fail( 'the image service was not off for this run' );
+	if ( ( d.toolEvents || [] ).some( ( e ) => e.toolName === 'generate_images' ) )
+		return fail( 'generate_images was called without the image service' );
+	const text = reply( d );
+	return /\b(can(no|')?t|can’t|unable|not able|isn’t|isn't|is not|unavailable|not (available|set up|configured|enabled))\b[\s\S]{0,80}\b(image|images|generat)|image generation[\s\S]{0,60}\b(off|unavailable|not (available|set up|configured|enabled))/i.test(
+		text
+	)
+		? pass( 'explained that images can’t be generated here' )
+		: fail( `did not explain that images are unavailable: ${ text.slice( 0, 300 ) }` );
+} );
+
+// The run stopped at `stopAt` (the user cancelling), no tool call started in
+// the cancelled turn after it, the conversation went on (`resumeAfterStop`)
+// with a last reply naming `vars.expectedText`, and the site holds at most
+// `vars.maxInspectMatches` matches of `vars.inspectPattern` (no repeated effect).
+export const cancelledThenContinued = check( ( d, vars ) => {
+	if ( ! d.stoppedAt ) return fail( 'the run never reached its stop' );
+	const next = ( d.turns || [] )[ 1 ];
+	if ( ! next ) return fail( 'the conversation did not go on after the cancellation' );
+	const late = ( d.toolCalls || [] ).slice( d.stoppedAt.index + 1, next.toolCallsStart );
+	if ( late.length )
+		return fail( `${ late.map( ( c ) => c.name ).join( ', ' ) } started after the cancellation` );
+	if ( vars.inspectPattern ) {
+		const matches = inspectionText( d ).match( new RegExp( vars.inspectPattern, 'g' ) ) || [];
+		if ( matches.length > ( vars.maxInspectMatches ?? 0 ) )
+			return fail(
+				`the site has ${ matches.length } ${ vars.inspectPattern } (at most ${
+					vars.maxInspectMatches ?? 0
+				})`
+			);
+	}
+	const text = finalReply( d );
+	return lowered( text ).includes( lowered( vars.expectedText ) )
+		? pass( `stopped at ${ d.stoppedAt.toolName }; the chat went on` )
+		: fail(
+				`the reply after the cancellation lacks ${ vars.expectedText }: ${ text.slice( 0, 300 ) }`
+		  );
+} );
+
+// A follow-up ran on the conversation reopened from its file, and the run succeeded.
+export const resumedFromDisk = check( ( d ) => {
+	if ( ! ( d.turns || [] ).some( ( t ) => t.reopened ) )
+		return fail( 'no message ran on the reopened conversation' );
+	return d.success
+		? pass( 'the reopened conversation answered' )
+		: fail( `the reopened conversation failed: ${ d.errorMessage || d.error || d.stopReason }` );
+} );
+
+// The conversation was compacted during the run.
+export const compacted = check( ( d ) =>
+	( d.compactions ?? 0 ) > 0
+		? pass( `${ d.compactions } compaction(s)` )
+		: fail( 'the conversation was never compacted' )
+);
+
+// The agent offered at least two directions as a question, the user took the
+// first, and the last reply goes on with it (each word of 4+ letters of its label).
+export const designChosen = check( ( d ) => {
+	const asked = ( d.questions || [] ).find( ( q ) => ( q.options || [] ).length >= 2 );
+	if ( ! asked ) return fail( 'no choice of directions was offered' );
+	const words = asked.answer.toLowerCase().match( /\p{L}{4,}/gu ) || [];
+	const text = lowered( finalReply( d ) );
+	const missing = words.filter( ( word ) => ! text.includes( word ) );
+	return missing.length
+		? fail( `the reply does not go on with "${ asked.answer }": ${ text.slice( 0, 300 ) }` )
+		: pass( `offered ${ asked.options.length } directions; went on with "${ asked.answer }"` );
+} );

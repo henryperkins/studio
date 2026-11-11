@@ -6,12 +6,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { evalConnectionRef } from 'cli/ai/eval-provider';
 import { readEvalRunnerInput, runEval as runEvalUntyped } from 'cli/ai/eval-runner';
 import type { AgentSessionEvent, SessionManager } from '@earendil-works/pi-coding-agent';
+import type { StudioAgentHost } from '@studio/agent/node/host';
 import type { StudioAgentTurnConfig } from '@studio/agent/node/runtime';
 import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections';
 
 // Test values only; nothing here reaches a model provider or a site.
 const CONNECTION_ID = '7c1e8a41-6d3b-4c55-9b8e-3f2d7c1eb2f0';
 const API_KEY = 'sk-proj-TESTONLY_eval_runner_bbbbbbbbbbbbbbbbbbbbbb';
+const WPCOM_LOGIN = { accessToken: 'test-wpcom-token', id: 1, displayName: 'Test', email: '' };
 
 const paths = vi.hoisted( () => ( { root: '' } ) );
 
@@ -56,10 +58,23 @@ vi.mock( 'cli/ai/eval-outcome', () => ( {
 		otherSitesRemoved: [],
 	} ),
 } ) );
+const imageService = vi.hoisted( () => ( { configured: false } ) );
 vi.mock( '@studio/agent/node/image-generation', async ( importOriginal ) => ( {
 	...( await importOriginal< typeof import('@studio/agent/node/image-generation') >() ),
-	isImageGenerationAvailable: async () => false,
+	isImageGenerationAvailable: async () => imageService.configured,
 } ) );
+
+// The real host's remote operations must never run under `remote: mock`.
+vi.mock( 'cli/ai/host', async () => {
+	const { createFakeHost } = await import( '@studio/agent/node/tests/fake-host' );
+	const host = createFakeHost();
+	for ( const operation of [ 'push', 'pull' ] as const ) {
+		host.sync[ operation ] = vi.fn( async () => {
+			throw new Error( 'reached the real remote' );
+		} );
+	}
+	return { cliAgentHost: host };
+} );
 
 const broker = vi.hoisted( () => ( {
 	connections: [] as ConnectionRegistryEntry[],
@@ -76,23 +91,32 @@ vi.mock( '@studio/agent/node/chatgpt/credential-broker', async ( importOriginal 
 interface FakeTurnBehavior {
 	request?: { url: string; authorization: string; body: Record< string, unknown > };
 	replyProvider: string;
+	// What the turn does with its host and config before it replies.
+	act?: ( turn: { config: StudioAgentTurnConfig; host: StudioAgentHost } ) => Promise< void >;
+	// Tool calls the reply asks for, on the first turn only.
+	toolCalls?: Array< { name: string; arguments: Record< string, unknown > } >;
 }
 const agent = vi.hoisted( () => ( {
-	turns: [] as Array< StudioAgentTurnConfig & { entriesAtStart: unknown[] } >,
+	turns: [] as Array< StudioAgentTurnConfig & { entriesAtStart: unknown[]; host: unknown } >,
 	behavior: null as FakeTurnBehavior | null,
+	created: 0,
 } ) );
 vi.mock( '@studio/agent/node', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('@studio/agent/node') >();
 	return {
 		...actual,
-		createAgent: () => ( {
+		createAgent: ( { host }: { host: StudioAgentHost } ) => ( {
+			created: ++agent.created,
 			runTurn: ( config: StudioAgentTurnConfig ) => {
 				agent.turns.push( {
 					...config,
 					entriesAtStart: ( config.session as SessionManager ).getEntries(),
+					host,
 				} );
+				const first = agent.turns.length === 1;
 				const result = ( async () => {
 					const behavior = agent.behavior;
+					await behavior?.act?.( { config, host } );
 					if ( behavior?.request ) {
 						await fetch( behavior.request.url, {
 							method: 'POST',
@@ -102,7 +126,17 @@ vi.mock( '@studio/agent/node', async ( importOriginal ) => {
 					}
 					const message = {
 						role: 'assistant',
-						content: [ { type: 'text', text: 'READY' } ],
+						content: [
+							{ type: 'text', text: 'READY' },
+							...( first
+								? ( behavior?.toolCalls ?? [] ).map( ( call, index ) => ( {
+										type: 'toolCall',
+										id: `call-${ index }`,
+										name: call.name,
+										arguments: call.arguments,
+								  } ) )
+								: [] ),
+						],
 						api: 'openai-responses',
 						provider: behavior?.replyProvider ?? 'studio-wpcom',
 						model: 'gpt-6-luna',
@@ -140,6 +174,14 @@ interface RunReport {
 		executed?: Record< string, unknown >;
 		failure?: { code: string };
 	};
+	stoppedAt?: unknown;
+	remoteCalls?: unknown[];
+	imageService?: { configured: boolean };
+	attachments?: unknown[];
+	turns?: Array< Record< string, unknown > >;
+	questions?: Array< { answer: string } >;
+	uiEvents?: { artifacts: unknown[]; previewReloads: number };
+	compactions?: number;
 }
 const runEval = async ( ...args: Parameters< typeof runEvalUntyped > ) =>
 	( await runEvalUntyped( ...args ) ) as RunReport;
@@ -160,7 +202,7 @@ describe( 'eval runner provider selection', () => {
 		fs.mkdirSync( path.join( profile, 'chatgpt-credentials' ), { recursive: true } );
 		fs.writeFileSync(
 			path.join( profile, 'shared.json' ),
-			JSON.stringify( { version: 1, aiProvider: 'openai-api-key' } )
+			JSON.stringify( { version: 1, aiProvider: 'openai-api-key', authToken: WPCOM_LOGIN } )
 		);
 		fs.writeFileSync( path.join( profile, 'chatgpt-accounts.json' ), '{}' );
 		for ( const name of [
@@ -185,6 +227,8 @@ describe( 'eval runner provider selection', () => {
 		];
 		agent.turns = [];
 		agent.behavior = null;
+		agent.created = 0;
+		imageService.configured = false;
 		// The global provider is OpenAI with a saved key.
 		legacy.resolveInitialAiProvider.mockResolvedValue( 'openai-api-key' );
 		legacy.resolveUnavailableAiProvider.mockResolvedValue( undefined );
@@ -343,5 +387,212 @@ describe( 'eval runner provider selection', () => {
 		expect( result ).toMatchObject( { success: false, refusal: { code: 'provider-required' } } );
 		expect( agent.turns ).toEqual( [] );
 		expect( legacy.resolveInitialAiProvider ).not.toHaveBeenCalled();
+	} );
+
+	describe( 'what a parity case sets up and captures', () => {
+		const chatGptEnv = {
+			STUDIO_EVAL_PROVIDER: 'chatgpt-oauth',
+			STUDIO_EVAL_CONNECTION: CONNECTION_ID,
+			STUDIO_EVAL_MODEL: 'gpt-6-luna',
+		};
+
+		it( 'records every remote operation under remote: mock, never reaching the real host', async () => {
+			agent.behavior = {
+				replyProvider: 'studio-wpcom',
+				act: async ( { host } ) => {
+					const site = {
+						id: 'site-1',
+						name: 'Parity Site',
+						path: '/sites/parity',
+						url: 'http://localhost:8881',
+						phpVersion: '8.3',
+					};
+					await host.sync.push( site, 'all', 'https://myprod.wordpress.com', () => undefined );
+					await host.previews.create( site, () => undefined );
+				},
+			};
+			const result = await runEval( input( { remote: 'mock' } ) );
+			expect( result.success ).toBe( true );
+			expect( result.remoteCalls ).toEqual( [
+				{
+					operation: 'push',
+					site: 'Parity Site',
+					target: 'https://myprod.wordpress.com',
+					options: 'all',
+				},
+				{ operation: 'preview-create', site: 'Parity Site' },
+			] );
+		} );
+
+		it( 'refuses remote: staging without a designated staging site, before any site or turn', async () => {
+			const result = await runEval( input( { remote: 'staging' } ) );
+			expect( result ).toMatchObject( {
+				success: false,
+				refusal: { code: 'staging-not-designated' },
+			} );
+			expect( agent.turns ).toEqual( [] );
+			expect( sites.create ).not.toHaveBeenCalled();
+		} );
+
+		it( 'refuses imageService: required while the image service is off', async () => {
+			const result = await runEval( input( { imageService: 'required' } ) );
+			expect( result ).toMatchObject( {
+				success: false,
+				refusal: { code: 'image-service-not-configured' },
+			} );
+			expect( agent.turns ).toEqual( [] );
+		} );
+
+		it( 'runs imageService: off without the WordPress.com login, and refuses when the service stays on', async () => {
+			const result = await runEval( input( { imageService: 'off' } ) );
+			expect( result.imageService ).toEqual( { configured: false } );
+			const caseShared = JSON.parse(
+				fs.readFileSync(
+					path.join( process.env.E2E_SHARED_CONFIG_PATH ?? '', 'shared.json' ),
+					'utf8'
+				)
+			);
+			expect( caseShared ).not.toHaveProperty( 'authToken' );
+
+			agent.turns = [];
+			imageService.configured = true;
+			expect( await runEval( input( { imageService: 'off' } ) ) ).toMatchObject( {
+				refusal: { code: 'image-service-still-configured' },
+			} );
+			expect( agent.turns ).toEqual( [] );
+		} );
+
+		it( 'attaches fixture images and documents to the first message only', async () => {
+			const result = await runEval(
+				input( {
+					attachments: [ { fixture: 'red-swatch.png' }, { fixture: 'project-brief.md' } ],
+					followUps: [ { prompt: 'And now?' } ],
+				} )
+			);
+			const [ first, second ] = agent.turns;
+			expect( first.images ).toEqual( [
+				expect.objectContaining( { name: 'red-swatch.png', mimeType: 'image/png' } ),
+			] );
+			expect( first.prompt ).toMatch( /Attached files[\s\S]*project-brief\.md/ );
+			expect( second.images ).toBeUndefined();
+			expect( second.prompt ).toBe( 'And now?' );
+			expect( result.attachments ).toEqual( [
+				{ fixture: 'red-swatch.png', kind: 'image' },
+				{ fixture: 'project-brief.md', kind: 'file' },
+			] );
+			expect(
+				await runEval( input( { attachments: [ { fixture: 'missing.png' } ] } ) )
+			).toMatchObject( { refusal: { code: 'fixture-missing' } } );
+		} );
+
+		it( 'reopens the conversation from its file for a follow-up marked reopen', async () => {
+			agent.behavior = { replyProvider: 'studio-chatgpt' };
+			const result = await runEval(
+				input( { followUps: [ { prompt: 'What was it?', reopen: true } ] }, chatGptEnv )
+			);
+			const [ first, second ] = agent.turns;
+			expect( second.session ).not.toBe( first.session );
+			expect( ( second.session as SessionManager ).getSessionFile() ).toBe(
+				( first.session as SessionManager ).getSessionFile()
+			);
+			expect( agent.created ).toBe( 2 );
+			expect( result.turns?.map( ( turn ) => turn.reopened ) ).toEqual( [ false, true ] );
+			// The reopened conversation still names its connection before the turn.
+			expect( JSON.stringify( second.entriesAtStart ) ).toContain( 'studio.session_context' );
+		} );
+
+		it( 'goes on after a stop only with resumeAfterStop', async () => {
+			const stopAt = [ { tool: 'wp_cli', input: { command: '^post create' } } ];
+			agent.behavior = {
+				replyProvider: 'studio-wpcom',
+				toolCalls: [ { name: 'wp_cli', arguments: { command: 'post create --post_title=A' } } ],
+			};
+			const stopped = await runEval(
+				input( { stopAt, followUps: [ { prompt: 'Never mind. Reply STOPPED.' } ] } )
+			);
+			expect( stopped.stoppedAt ).toMatchObject( { toolName: 'wp_cli', index: 0 } );
+			expect( agent.turns ).toHaveLength( 1 );
+
+			agent.turns = [];
+			const resumed = await runEval(
+				input( {
+					stopAt,
+					resumeAfterStop: true,
+					followUps: [ { prompt: 'Never mind. Reply STOPPED.' } ],
+				} )
+			);
+			expect( resumed.stoppedAt ).toMatchObject( { toolName: 'wp_cli' } );
+			expect( agent.turns ).toHaveLength( 2 );
+			expect( resumed.turns?.[ 1 ] ).toMatchObject( { toolCallsStart: 1 } );
+		} );
+
+		it( 'answers @first with the first option of the question', async () => {
+			agent.behavior = {
+				replyProvider: 'studio-wpcom',
+				act: async ( { config } ) => {
+					await config.onAskUser?.( [
+						{
+							question: 'Which direction?',
+							options: [
+								{ label: 'Warm and rustic', description: '' },
+								{ label: 'Cool and minimal', description: '' },
+							],
+						},
+					] );
+				},
+			};
+			const result = await runEval( input( { answers: [ { label: '@first' } ] } ) );
+			expect( result.questions ).toEqual( [
+				expect.objectContaining( { answer: 'Warm and rustic' } ),
+			] );
+		} );
+
+		it( 'seeds history as replies on the selected route, and refuses it without a selection', async () => {
+			const history = [
+				{ role: 'user', text: 'The codename is AURORA-7.' },
+				{ role: 'assistant', text: 'Noted.', contextTokens: 190000 },
+			];
+			agent.behavior = { replyProvider: 'studio-chatgpt' };
+			await runEval( input( { seed: { history } }, chatGptEnv ) );
+			const entries = JSON.stringify( agent.turns[ 0 ].entriesAtStart );
+			expect( entries ).toContain( 'AURORA-7' );
+			expect( entries ).toContain( '"provider":"studio-chatgpt"' );
+			expect( entries ).toContain( '"input":190000' );
+
+			agent.turns = [];
+			expect( await runEval( input( { seed: { history } } ) ) ).toMatchObject( {
+				refusal: { code: 'history-needs-provider' },
+			} );
+			expect( agent.turns ).toEqual( [] );
+		} );
+
+		it( 'records what the turn showed the Studio UI, its turns and its compactions', async () => {
+			agent.behavior = {
+				replyProvider: 'studio-wpcom',
+				act: async ( { config, host } ) => {
+					await host.ui?.showArtifact( {
+						version: 1,
+						id: 'artifact-1',
+						widgets: [ { type: 'media', widgetProps: { src: 'x' } } ],
+					} );
+					host.ui?.reloadPreview();
+					( config.session as SessionManager ).appendCompaction( 'Summary.', null, 190000 );
+				},
+			};
+			const result = await runEval( input( { ui: true } ) );
+			expect( result.uiEvents ).toEqual( {
+				artifacts: [ { id: 'artifact-1', widgets: [ 'media' ] } ],
+				previewReloads: 1,
+			} );
+			expect( result.compactions ).toBe( 1 );
+			expect( result.turns ).toEqual( [
+				expect.objectContaining( {
+					reopened: false,
+					toolCallsStart: 0,
+					textSegmentsStart: 0,
+					questionsStart: 0,
+				} ),
+			] );
+		} );
 	} );
 } );

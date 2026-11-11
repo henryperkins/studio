@@ -537,6 +537,24 @@ describe( 'eval provider selection', () => {
 			expect( evalConnectionRef( CONNECTION_ID ) ).toMatch( /^conn-[0-9a-f]{12}$/ );
 		} );
 
+		it( 'tells which user message each request belongs to', () => {
+			const executed = summarizeExecutedRoute( {
+				requests: [
+					request( { id: 1, startedAt: 1_000, imageInputs: 1 } ),
+					request( { id: 2, startedAt: 2_500, imageInputs: 1 } ),
+					request( { id: 3, startedAt: 3_000 } ),
+				],
+				replies: [],
+				entries: [],
+				turnStartedAt: [ 900, 2_400 ],
+			} );
+			expect( executed.requests.map( ( item ) => [ item.turn, item.imageInputs ] ) ).toEqual( [
+				[ 0, 1 ],
+				[ 1, 1 ],
+				[ 1, undefined ],
+			] );
+		} );
+
 		it( 'reports a mix, no request at all, and keeps the image service apart from inference', () => {
 			expect(
 				summarizeExecutedRoute( {

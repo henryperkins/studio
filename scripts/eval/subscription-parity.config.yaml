@@ -1,0 +1,614 @@
+# Subscription provider parity evaluation
+# Run: see "Provider-qualified parity runs" in README.md. In short:
+#   STUDIO_EXPERIMENTAL_CHATGPT=1 STUDIO_EVAL_PROVIDER=chatgpt-oauth \
+#   STUDIO_EVAL_CONNECTION=<registration id> STUDIO_EVAL_MODEL=gpt-6-luna STUDIO_EVAL_EFFORT=medium \
+#   npm run eval:parity
+#
+# The same Studio workflows as promptfoo.config.yaml, on one explicitly
+# selected provider and connection. No case runs on the global provider:
+# `requireProvider` refuses a run that selects none, and every case asserts
+# `ranOnRequestedRoute`, which reads the route the run actually took (the
+# model requests it made, the providers the runtime stamped on its replies
+# and the connection the conversation records). The config names no provider,
+# so another subscription provider runs it with its own selection.
+#
+# Every case is judged on a deterministic final state or on what the user was
+# shown (outcome.mjs). Remote operations (push, pull, preview create, update,
+# delete) are recorded by a mocked host (`remote: mock`) and never reach
+# WordPress.com, except in the `staging:` cases at the end, which change only
+# the disposable staging site the runner is told about and are refused
+# without it. Cases marked `[image service]` need Studio's separate
+# WordPress.com image service and are refused without it; the
+# `[fixture-forced compaction]` case starts from a seeded history whose last
+# reply reports a context at the compaction threshold.
+
+description: Studio Code subscription provider parity
+
+# One connection, its rate limits and a staging site are shared: one case at a time.
+evaluateOptions:
+  maxConcurrency: 1
+
+providers:
+  - id: exec:node ../../apps/cli/dist/cli/eval-runner.mjs
+    label: studio-agent-parity
+
+defaultTest:
+  vars:
+    requireProvider: true
+    remote: mock
+  assert:
+    - type: javascript
+      value: file://outcome.mjs:ranOnRequestedRoute
+
+tests:
+  # --- Guidance: identity, instructions and skills ---------------------------
+
+  - description: "parity: identifies as WordPress Studio"
+    vars:
+      caseId: parity-identity
+      timeoutMs: 60000
+      prompt: In one short sentence, tell me who you are. Do not call any tools.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:identifiesAsStudio
+
+  - description: "parity: follows the user's global instructions"
+    vars:
+      caseId: parity-global-instructions
+      expectedText: STUDIO-EVAL-TOKEN-7319
+      timeoutMs: 60000
+      prompt: In one short sentence, say hello. Do not call any tools.
+      seed:
+        globalInstructions: |
+          Always end every reply with the exact token STUDIO-EVAL-TOKEN-7319.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:replyIncludes
+
+  - description: "parity: a contact form loads plugin-recommendations before the work"
+    vars:
+      caseId: parity-skill-routing
+      timeoutMs: 300000
+      skills: [{ name: plugin-recommendations }]
+      stopAt:
+        - tool: Write
+        - tool: Edit
+        - tool: generate_images
+        - tool: wp_cli
+          input:
+            command: '\b(post|plugin|theme|option|menu|media|term|widget)\s+(create|update|install|activate|import|add|set)\b'
+      seed:
+        activeSite:
+          name: Parity Routing Site
+      prompt: Add a contact form to the homepage.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:skillsLoadedFirst
+
+  # --- Sites: creation and target selection ----------------------------------
+
+  - description: "parity: asking for a site leaves a working new site"
+    vars:
+      caseId: parity-site-creation
+      siteName: "Parity Site"
+      timeoutMs: 180000
+      prompt: |
+        Create a new site named "Parity Site".
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:siteWorks
+      - type: javascript
+        value: file://outcome.mjs:otherSitesUntouched
+
+  - description: "parity: a different site name asks before using or replacing the active site"
+    vars:
+      caseId: parity-target-selection
+      timeoutMs: 180000
+      seed:
+        activeSite:
+          name: Eval Active Site Two
+      prompt: |
+        Build a one-page site named "Joe's Bakery".
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:asksCurrentOrNew
+      - type: javascript
+        value: file://outcome.mjs:otherSitesUntouched
+
+  # --- File and theme work ---------------------------------------------------
+
+  - description: "parity: edits the active theme's file with the file tools and leaves the site working"
+    vars:
+      caseId: parity-theme-file
+      file: style.css
+      expectedText: "parity-marker: PARITY-THEME-5521"
+      timeoutMs: 240000
+      seed:
+        activeSite:
+          name: Parity Theme Site
+          files:
+            wp-content/themes/parity-theme/style.css: |
+              /*
+              Theme Name: Parity Theme
+              Template: twentytwentyfive
+              */
+            wp-content/themes/parity-theme/theme.json: |
+              { "version": 3 }
+          wpCli:
+            - [ "theme", "activate", "parity-theme" ]
+      prompt: |
+        Append the exact line `/* parity-marker: PARITY-THEME-5521 */` at the end of the active theme's style.css, then read the file back to confirm it is there. Change nothing else.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:themeFileIncludes
+      - type: javascript
+        value: file://outcome.mjs:siteWorks
+      - type: javascript
+        value: file://outcome.mjs:otherSitesUntouched
+
+  - description: "parity: exports the site, changes it, and imports the export back"
+    vars:
+      caseId: parity-import-export
+      expectedText: Parity Original Title
+      timeoutMs: 420000
+      seed:
+        activeSite:
+          name: Parity Roundtrip Site
+          wpCli:
+            - [ "option", "update", "blogname", "Parity Original Title" ]
+          inspect:
+            - [ "option", "get", "blogname" ]
+      prompt: |
+        On the active site, in this order: export only its database to a file named parity-roundtrip.sql in the site's own folder; then change the site title to "Parity Changed Title" with WP-CLI; then import parity-roundtrip.sql back into the same site. Finally tell me the site title.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:inspectionIncludes
+      - type: javascript
+        value: file://outcome.mjs:otherSitesUntouched
+
+  # --- Questions and choices -------------------------------------------------
+
+  - description: "parity: the question tool takes a selection and a skipped question"
+    vars:
+      caseId: parity-question
+      timeoutMs: 90000
+      answers:
+        - label: Gallery
+        - label: The user skipped this question.
+      prompt: |
+        Ask me two multiple-choice questions together: which page to add (Gallery or Contact),
+        and which layout to use (Grid or Masonry). Do not create or change anything.
+        After my answers, summarize the chosen page and say if the layout is undecided.
+        Do not ask again if I skip a question.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:questionnaireSkip
+
+  - description: "parity: offers design directions as a choice and goes on with the one picked"
+    vars:
+      caseId: parity-design-choice
+      ui: true
+      timeoutMs: 300000
+      answers:
+        - label: "@first"
+      prompt: |
+        Before building anything, offer me two or three distinct visual directions for a small bakery's homepage as a choice, let me pick one, then describe in two sentences how the homepage will look in the direction I picked. Do not create or change any site.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:designChosen
+      - type: javascript
+        value: file://outcome.mjs:noSiteCreated
+
+  # --- Preview and screenshots -----------------------------------------------
+
+  - description: "parity: screenshots show the model the home page at desktop and mobile width"
+    vars:
+      caseId: parity-screenshot-desktop-mobile
+      timeoutMs: 240000
+      seed:
+        activeSite:
+          name: Parity Screenshot Site
+      prompt: |
+        Take screenshots of the active site's home page at desktop width and at mobile width, then briefly say whether both were captured. Do not change the site.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:sawDesktopAndMobile
+      - type: javascript
+        value: file://outcome.mjs:otherSitesUntouched
+
+  - description: "parity: reads the site title from a screenshot alone"
+    vars:
+      caseId: parity-screenshot-interpretation
+      expectedText: PARITY VISION 4402
+      allowedTools: [{ name: take_screenshot }, { name: Skill }]
+      timeoutMs: 240000
+      seed:
+        activeSite:
+          name: Parity Vision Site
+          wpCli:
+            - [ "option", "update", "blogname", "PARITY VISION 4402" ]
+      prompt: |
+        Use only take_screenshot to look at the active site's home page, then reply with the site title exactly as it appears in the screenshot.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:replyIncludes
+      - type: javascript
+        value: file://outcome.mjs:usedOnlyTools
+
+  - description: "parity: refreshes the preview the user sees after a change"
+    vars:
+      caseId: parity-preview-refresh
+      ui: true
+      expectedText: Parity Preview 3318
+      timeoutMs: 240000
+      seed:
+        activeSite:
+          name: Parity Preview Site
+          inspect:
+            - [ "option", "get", "blogname" ]
+      prompt: |
+        Change the active site's title to "Parity Preview 3318" with WP-CLI, then refresh the preview so I can see it.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:previewRefreshed
+      - type: javascript
+        value: file://outcome.mjs:inspectionIncludes
+
+  - description: "parity: creates a preview site (mocked remote)"
+    vars:
+      caseId: parity-preview-create
+      operation: preview-create
+      timeoutMs: 240000
+      seed:
+        activeSite:
+          name: Parity Preview Create Site
+      prompt: |
+        Create a shareable preview site of the active site.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:remoteOperationRan
+
+  # --- Annotations and artifacts ---------------------------------------------
+
+  - description: "parity: a design system annotation reaches DESIGN.md and the theme palette"
+    vars:
+      caseId: parity-annotation
+      ui: true
+      token: primary
+      originalValue: "#2F6BFF"
+      timeoutMs: 420000
+      seed:
+        activeSite:
+          name: Parity Design Annotation
+          files:
+            DESIGN.md: |
+              ---
+              name: "Parity Design Annotation"
+              colors:
+                primary: "#2F6BFF"
+                background: "#FFFFFF"
+                text: "#111111"
+              typography:
+                body:
+                  fontFamily: "Inter"
+                  fontSize: "1rem"
+                  fontWeight: 400
+              ---
+
+              # Overview
+              A calm, minimal site.
+            wp-content/themes/eval-design-system/style.css: |
+              /*
+              Theme Name: Eval Design System
+              Template: twentytwentyfive
+              */
+            wp-content/themes/eval-design-system/theme.json: |
+              {
+                "version": 3,
+                "settings": {
+                  "color": {
+                    "palette": [
+                      { "slug": "primary", "name": "Primary", "color": "#2F6BFF" },
+                      { "slug": "background", "name": "Background", "color": "#FFFFFF" },
+                      { "slug": "text", "name": "Text", "color": "#111111" }
+                    ]
+                  }
+                },
+                "styles": {
+                  "color": { "background": "var:preset|color|background", "text": "var:preset|color|text" },
+                  "elements": { "link": { "color": { "text": "var:preset|color|primary" } } }
+                }
+              }
+          wpCli:
+            - [ "theme", "activate", "eval-design-system" ]
+      prompt: |
+        The user submitted 1 visual annotation from the site preview.
+
+        Make the requested changes. When there are several annotations, address them in the order they were submitted.
+
+        When you reference an annotation for the user, identify the element by what is visible on the page rather than by selector. Use selectors and raw annotation data only for implementation.
+
+        Annotations from the Design system page are about the site's DESIGN.md: make the change there, then update the matching presets in the active theme's theme.json so the site follows it.
+
+        ## Submitted Annotations
+
+        ### 1. design token `colors.primary` - "primary: #2F6BFF"
+        - Page: Design system (DESIGN.md)
+        - Comment: Make the primary color a warm terracotta instead of this blue.
+
+        ```json
+        {
+          "id": "a_1",
+          "comment": "Make the primary color a warm terracotta instead of this blue.",
+          "nearbyText": "primary: #2F6BFF",
+          "designToken": "colors.primary",
+          "path": "DESIGN.md",
+          "timestamp": 1790000000000
+        }
+        ```
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:designTokenReachedTheme
+      - type: javascript
+        value: file://outcome.mjs:designSystemReplyLink
+      - type: javascript
+        value: file://outcome.mjs:otherSitesUntouched
+
+  - description: "parity: a screenshot is shown to the user as an artifact"
+    vars:
+      caseId: parity-artifact
+      ui: true
+      widgetType: media
+      timeoutMs: 240000
+      seed:
+        activeSite:
+          name: Parity Artifact Site
+      prompt: |
+        Take one desktop screenshot of the active site's home page and show it to me here.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:artifactShown
+
+  # --- Attachments -----------------------------------------------------------
+
+  - description: "parity: an attached image and document are still known to a later message"
+    vars:
+      caseId: parity-attachment-replay
+      timeoutMs: 180000
+      attachments:
+        - fixture: red-swatch.png
+        - fixture: project-brief.md
+      expectedTexts:
+        - text: red
+        - text: PARITY-BRIEF-2207
+      replayed: true
+      prompt: |
+        I attached an image and a document. Read the document now, then reply with only the word OK.
+      followUps:
+        - prompt: Without using any tools, tell me the main color of the image I attached and the project code in the document.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:finalReplyIncludes
+      - type: javascript
+        value: file://outcome.mjs:lastTurnUsedNoTools
+      - type: javascript
+        value: file://outcome.mjs:attachmentReachedModel
+
+  # --- Approvals (remote side mocked) ----------------------------------------
+
+  - description: "parity: a push asks first, and nothing is pushed when the user declines (mocked remote)"
+    vars:
+      caseId: parity-push-declined
+      timeoutMs: 180000
+      answers:
+        - label: Cancel
+      seed:
+        localSite:
+          id: parity-site-push
+          name: Eval Site Push
+          path: /tmp/parity-site-push
+          port: 8882
+        connectedWpcomSites:
+          - id: 112
+            localSiteId: parity-site-push
+            name: My Production Site
+            url: https://myprod.wordpress.com
+            isStaging: false
+            isPressable: false
+            environmentType: production
+            syncSupport: already-connected
+            lastPullTimestamp: null
+            lastPushTimestamp: null
+      prompt: |
+        Push my local site "Eval Site Push" to WordPress.com.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:pushNotRunAndAsks
+      - type: javascript
+        value: file://outcome.mjs:noRemoteOperation
+
+  - description: "parity: a confirmed push runs once against the confirmed site (mocked remote)"
+    vars:
+      caseId: parity-push-approved
+      operation: push
+      timeoutMs: 180000
+      answers:
+        - label: "Yes"
+      seed:
+        localSite:
+          id: parity-site-push-approved
+          name: Eval Site Push Approved
+          path: /tmp/parity-site-push-approved
+          port: 8883
+        connectedWpcomSites:
+          - id: 113
+            localSiteId: parity-site-push-approved
+            name: My Production Site
+            url: https://myprod.wordpress.com
+            isStaging: false
+            isPressable: false
+            environmentType: production
+            syncSupport: already-connected
+            lastPullTimestamp: null
+            lastPushTimestamp: null
+      prompt: |
+        Push my local site "Eval Site Push Approved" to its connected WordPress.com site.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:remoteOperationRan
+
+  # --- Cancellation and resumed conversations --------------------------------
+
+  - description: "parity: a cancelled turn stops its work, and the chat goes on"
+    vars:
+      caseId: parity-cancellation
+      expectedText: STOPPED
+      inspectPattern: 'Parity [ABC]'
+      maxInspectMatches: 1
+      resumeAfterStop: true
+      timeoutMs: 240000
+      stopAt:
+        - tool: wp_cli
+          input:
+            command: '\bpost\s+create\b'
+      seed:
+        activeSite:
+          name: Parity Cancel Site
+          inspect:
+            - [ "post", "list", "--post_type=post", "--post_status=any", "--fields=post_title", "--format=json" ]
+      prompt: |
+        Using WP-CLI on the active site, create three draft posts titled "Parity A", "Parity B" and "Parity C", one at a time.
+      followUps:
+        - prompt: Stop, I changed my mind. Don't create or change anything else. Reply with the single word STOPPED.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:cancelledThenContinued
+
+  - description: "parity: a conversation reopened from its file goes on with what it knew"
+    vars:
+      caseId: parity-resume
+      expectedTexts:
+        - text: PARITY-RESUME-8841
+      timeoutMs: 120000
+      prompt: Remember the code word PARITY-RESUME-8841 for later in this conversation. Reply with only OK.
+      followUps:
+        - prompt: What was the code word I gave you? Reply with only the code word.
+          reopen: true
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:finalReplyIncludes
+      - type: javascript
+        value: file://outcome.mjs:resumedFromDisk
+      - type: javascript
+        value: file://outcome.mjs:lastTurnUsedNoTools
+
+  - description: "parity [fixture-forced compaction]: a conversation at its context limit compacts on the route and resumes"
+    vars:
+      caseId: parity-compaction-fixture
+      expectedTexts:
+        - text: AURORA-7
+        - text: Lisbon
+      timeoutMs: 240000
+      seed:
+        history:
+          - role: user
+            text: For this project, the codename is AURORA-7. Remember it.
+          - role: assistant
+            text: "Noted: the codename is AURORA-7."
+          - role: user
+            text: Also note that the launch city is Lisbon.
+          - role: assistant
+            text: "Noted: the launch city is Lisbon."
+            contextTokens: 190000
+      prompt: What is the project codename? Reply with only the codename.
+      followUps:
+        - prompt: Now give me the codename and the launch city, separated by a comma.
+          reopen: true
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:compacted
+      - type: javascript
+        value: file://outcome.mjs:finalReplyIncludes
+      - type: javascript
+        value: file://outcome.mjs:resumedFromDisk
+
+  # --- Image generation, with and without Studio's separate image service ----
+
+  - description: "parity [image service]: generate_images makes an image through Studio's separate image service"
+    vars:
+      caseId: parity-image-generation
+      imageService: required
+      inspectPattern: 'UPLOADED_IMAGES=[1-9]'
+      timeoutMs: 300000
+      seed:
+        activeSite:
+          name: Parity Image Site
+          inspect: &countUploadedImages
+            - - eval
+              - |
+                $dir = wp_upload_dir()['basedir']; $n = 0;
+                if ( is_dir( $dir ) ) { foreach ( new RecursiveIteratorIterator( new RecursiveDirectoryIterator( $dir, FilesystemIterator::SKIP_DOTS ) ) as $file ) { if ( preg_match( '/\.(png|jpe?g|webp)$/i', $file->getFilename() ) ) { $n++; } } }
+                echo 'UPLOADED_IMAGES=' . $n . "\n";
+      prompt: |
+        Use generate_images to make one small square image of a plain blue circle and save it in the active site's wp-content/uploads folder. Then reply DONE.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:imageGenerated
+      - type: javascript
+        value: file://outcome.mjs:inspectionMatches
+
+  - description: "parity [image service]: background image generation settles before a screenshot and the turn's end"
+    vars:
+      caseId: parity-pending-work
+      imageService: required
+      inspectPattern: 'UPLOADED_IMAGES=[1-9]'
+      timeoutMs: 360000
+      seed:
+        activeSite:
+          name: Parity Pending Site
+          inspect: *countUploadedImages
+      prompt: |
+        Use generate_images to make a small hero image of a sunlit bakery counter in the active site's wp-content/uploads folder, then take one desktop screenshot of the active site's home page, and reply DONE.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:imageGenerated
+      - type: javascript
+        value: file://outcome.mjs:inspectionMatches
+
+  - description: "parity: without the image service, an image request is explained, never attempted"
+    vars:
+      caseId: parity-image-generation-absent
+      imageService: "off"
+      timeoutMs: 120000
+      seed:
+        activeSite:
+          name: Parity No Images Site
+      prompt: Generate an image of a red apple for my homepage.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:imageGenerationUnavailable
+      - type: javascript
+        value: file://outcome.mjs:noSiteCreated
+
+  # --- staging: a designated disposable staging site only --------------------
+  # Refused (staging-not-designated) unless STUDIO_EVAL_STAGING_SITE_ID and
+  # STUDIO_EVAL_STAGING_SITE_URL name a WordPress.com staging site you have set
+  # aside to be overwritten. Leave these out of automatic runs:
+  #   npm run eval:parity -- --filter-pattern "^parity"
+
+  - description: "staging: pushes the active site to the designated disposable staging site"
+    vars:
+      caseId: staging-push
+      remote: staging
+      operation: push
+      timeoutMs: 900000
+      answers:
+        - label: "Yes"
+      seed:
+        activeSite:
+          name: Parity Staging Source
+      prompt: |
+        Push the active site to its connected WordPress.com staging site.
+    assert:
+      - type: javascript
+        value: file://outcome.mjs:remoteOperationRan

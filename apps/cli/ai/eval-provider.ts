@@ -421,6 +421,8 @@ interface ExecutedRequest {
 	imageInputs?: number;
 	imageToolOutputs?: number;
 	reasoningItems?: number;
+	/** The user message (0 for the first) whose turn made the request. */
+	turn?: number;
 }
 
 /** The route a run's model requests actually took. */
@@ -475,11 +477,18 @@ export function summarizeExecutedRoute( {
 	requests,
 	replies,
 	entries,
+	turnStartedAt = [],
 }: {
 	requests: readonly ObservedRequest[];
 	replies: ReadonlyArray< { provider?: unknown; model?: unknown } >;
 	entries: SessionEntry[];
+	/** When each user message's turn started (epoch ms), in order. */
+	turnStartedAt?: readonly number[];
 } ): ExecutedRoute {
+	const turnOf = ( startedAt: number ) => {
+		const index = turnStartedAt.filter( ( start ) => start <= startedAt ).length - 1;
+		return index >= 0 ? index : undefined;
+	};
 	const imageService = requests.filter(
 		( request ) => request.host === 'wpcom-ai-proxy' && request.endpoint === 'images'
 	);
@@ -525,6 +534,7 @@ export function summarizeExecutedRoute( {
 				imageInputs: request.imageInputs,
 				imageToolOutputs: request.imageToolOutputs,
 				reasoningItems: request.reasoningItems,
+				turn: turnOf( request.startedAt ),
 			} ) ),
 	};
 }

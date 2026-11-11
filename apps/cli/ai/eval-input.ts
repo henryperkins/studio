@@ -24,6 +24,20 @@ const evalSeedSchema = z.object( {
 	connectedWpcomSites: z.array( syncSiteSchema ).optional(),
 	snapshots: z.array( snapshotSchema ).optional(),
 	globalInstructions: z.string().optional(),
+	// Messages the conversation already holds before the first turn, the
+	// assistant's recorded as a reply on the run's selected route (so only with
+	// a provider selection). `contextTokens` is the context size that reply
+	// reported: a fixture reaches a limit, such as the compaction threshold,
+	// without sending a request that size.
+	history: z
+		.array(
+			z.object( {
+				role: z.enum( [ 'user', 'assistant' ] ),
+				text: z.string(),
+				contextTokens: z.number().int().nonnegative().optional(),
+			} )
+		)
+		.optional(),
 	// A real (stopped) site under STUDIO_SITES_ROOT, active for the turn, with
 	// `files` written relative to its root, then each `wpCli` argv run in order
 	// (e.g. to activate a theme or seed database rows). Each `inspect` argv runs
@@ -54,25 +68,62 @@ export type EvalSeed = z.infer< typeof evalSeedSchema >;
 
 // Objects rather than strings: promptfoo expands an array of strings into one
 // test case per element.
-const followUpsSchema = z.array( z.object( { prompt: z.string() } ) );
+const followUpsSchema = z.array(
+	z.object( { prompt: z.string(), reopen: z.boolean().optional() } )
+);
 const answersSchema = z.array( z.object( { label: z.string() } ) );
+const attachmentsSchema = z.array( z.object( { fixture: z.string() } ) );
+
+/** Every var the runner itself reads; the rest are the outcome checks' parameters. */
+export const EVAL_RUNNER_VARS = [
+	'prompt',
+	'ui',
+	'followUps',
+	'answers',
+	'timeoutMs',
+	'stopAt',
+	'seed',
+	'model',
+	'provider',
+	'effort',
+	'requireProvider',
+	'remote',
+	'imageService',
+	'attachments',
+	'resumeAfterStop',
+] as const;
 
 export interface EvalRunnerVars {
 	ui: boolean;
 	prompt?: string;
 	// Sent in order, each as a new user message in the same session once the
 	// previous one finishes, so a case can measure a multi-message conversation.
-	followUps?: Array< { prompt: string } >;
+	// `reopen` first reopens the conversation from its file in a fresh agent,
+	// as a resumed chat is.
+	followUps?: Array< { prompt: string; reopen?: boolean } >;
 	// Scripted replies for the questions the agent asks the user, in order:
-	// each question takes the next label. With answers set, the turn runs with
-	// Studio chat's ask-the-user handler, so AskUserQuestion and tools that
-	// confirm with the user work; once they run out, the user cancels.
+	// each question takes the next label, and `@first` takes its first option.
+	// With answers set, the turn runs with Studio chat's ask-the-user handler,
+	// so AskUserQuestion and tools that confirm with the user work; once they
+	// run out, the user cancels.
 	answers?: Array< { label: string } >;
 	timeoutMs?: number;
 	seed?: EvalSeed;
 	// Ends the run at the first tool call matching one of these rules, before
-	// any follow-ups; the result's `stoppedAt` names it.
+	// any follow-ups unless `resumeAfterStop`; the result's `stoppedAt` names it.
 	stopAt?: StopRule[];
+	// The follow-ups still run after a `stopAt` interrupt, as a user who
+	// cancelled a turn and went on in the same chat.
+	resumeAfterStop: boolean;
+	// `mock`: every push, pull and preview change is recorded and answered with
+	// a fixture, never run. `staging`: they run for real, only against the
+	// disposable staging site the environment designates.
+	remote?: 'mock' | 'staging';
+	// `off`: the run has no image service. `required`: it is refused unless
+	// Studio's separate WordPress.com image service is configured.
+	imageService?: 'off' | 'required';
+	// Files from scripts/eval/fixtures attached to the first message.
+	attachments?: Array< { fixture: string } >;
 }
 
 /** Parses the vars the runner reads; zod errors name a malformed one. */
@@ -85,5 +136,13 @@ export function parseEvalRunnerVars( vars: Record< string, unknown > ): EvalRunn
 		timeoutMs: typeof vars.timeoutMs === 'number' ? vars.timeoutMs : undefined,
 		stopAt: vars.stopAt ? z.array( stopRuleSchema ).parse( vars.stopAt ) : undefined,
 		seed: vars.seed ? evalSeedSchema.parse( vars.seed ) : undefined,
+		resumeAfterStop: vars.resumeAfterStop === true,
+		remote:
+			vars.remote !== undefined ? z.enum( [ 'mock', 'staging' ] ).parse( vars.remote ) : undefined,
+		imageService:
+			vars.imageService !== undefined
+				? z.enum( [ 'off', 'required' ] ).parse( vars.imageService )
+				: undefined,
+		attachments: vars.attachments ? attachmentsSchema.parse( vars.attachments ) : undefined,
 	};
 }
