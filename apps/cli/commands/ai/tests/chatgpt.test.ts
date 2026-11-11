@@ -397,16 +397,28 @@ describe( 'ChatGPT interactive CLI', () => {
 		expect( listChatGptConnections ).not.toHaveBeenCalled();
 	} );
 
-	it( 'does not silently replace an unknown recorded effort', async () => {
+	it.each( [
+		[ 'an unknown recorded effort', { reasoningEffort: 'future-effort' }, 'future-effort' ],
+		[
+			'a recorded effort the route isn’t qualified for',
+			{ reasoningEffort: 'high' },
+			'Studio doesn’t support “High” reasoning for gpt-6-luna with ChatGPT yet',
+		],
+		[
+			'a recorded model the route isn’t qualified for',
+			{ model: 'gpt-6.1-sol' },
+			'Studio doesn’t support the ChatGPT model “gpt-6.1-sol” yet',
+		],
+	] )( 'does not silently replace %s', async ( _name, recorded, explanation ) => {
 		const old = await previousChat();
 		old.appendCustomEntry( 'studio.session_context', {
 			provider: 'chatgpt-oauth',
 			...INITIAL,
-			reasoningEffort: 'future-effort',
+			...recorded,
 		} );
 		const ui = terminal( [ 'New request' ], [] );
 		await runCommand( { adapter: ui, resumeSession: resume( old ) } );
-		expect( ui.showError ).toHaveBeenCalledWith( expect.stringContaining( 'future-effort' ) );
+		expect( ui.showError ).toHaveBeenCalledWith( expect.stringContaining( explanation ) );
 		expect( runs ).toHaveLength( 0 );
 		expect( resolveAiEnvironment ).not.toHaveBeenCalled();
 	} );
