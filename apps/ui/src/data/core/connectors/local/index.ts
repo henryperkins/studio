@@ -41,6 +41,7 @@ import type {
 	ChatGptSignOutResult,
 } from '@studio/agent/protocol/chatgpt';
 import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
+import type { ImageServiceState } from '@studio/agent/protocol/image-service';
 import type { AiSettings } from '@studio/agent/protocol/providers';
 import type { AuthAnalytics, OnboardingAnalytics } from '@studio/common/lib/auth-tracks';
 import type { SiteEvent, SiteListItem, SnapshotEvent } from '@studio/common/lib/cli-events';
@@ -903,6 +904,9 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 				method: 'POST',
 				body: JSON.stringify( { connectionId, revision } ),
 			} );
+		},
+		async getImageServiceState() {
+			return api< ImageServiceState >( '/image-service' );
 		},
 		async saveAnthropicApiKey( key: string | null ): Promise< AiSettings > {
 			return api< AiSettings >( '/ai-settings', {

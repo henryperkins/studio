@@ -11,6 +11,7 @@ import {
 	readGlobalInstructionsFile,
 	writeGlobalInstructions,
 } from '@studio/agent/node/global-instructions';
+import { readImageServiceState } from '@studio/agent/node/image-generation';
 import {
 	readAiSettings,
 	refreshOpenAiModels as refreshOpenAiModelsInConfig,
@@ -145,6 +146,10 @@ export async function getAiSettings() {
 
 export async function getChatGptSettings() {
 	return readChatGptSettings();
+}
+
+export async function getImageServiceState() {
+	return readImageServiceState();
 }
 
 export async function beginChatGptSignIn(

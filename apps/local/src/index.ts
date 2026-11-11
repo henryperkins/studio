@@ -19,6 +19,7 @@ import {
 	setGlobalInstructionsEnabled,
 	writeGlobalInstructions,
 } from '@studio/agent/node/global-instructions';
+import { readImageServiceState } from '@studio/agent/node/image-generation';
 import { resolveLocalMediaFile } from '@studio/agent/node/local-media';
 import { createAgentRunManager } from '@studio/agent/node/run-manager';
 import { setSessionChatGptSelection } from '@studio/agent/node/sessions/chatgpt-selection';
@@ -638,6 +639,13 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 		'/chatgpt/models',
 		asyncHandler( async ( req: Request, res: Response ) => {
 			res.json( await readChatGptModels( req.body?.connectionId, req.body?.revision ) );
+		} )
+	);
+
+	api.get(
+		'/image-service',
+		asyncHandler( async ( _req: Request, res: Response ) => {
+			res.json( await readImageServiceState() );
 		} )
 	);
 

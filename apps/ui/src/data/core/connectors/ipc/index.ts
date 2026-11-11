@@ -727,6 +727,9 @@ export function createIpcConnector(): Connector {
 		async getChatGptModels( connectionId, revision ) {
 			return unwrapIpcError( ipcApi.getChatGptModels( connectionId, revision ) );
 		},
+		async getImageServiceState() {
+			return unwrapIpcError( ipcApi.getImageServiceState() );
+		},
 
 		async getInstalledApps(): Promise< InstalledApps > {
 			return ( await ipcApi.getInstalledAppsAndTerminals() ) as InstalledApps;

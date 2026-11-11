@@ -24,6 +24,7 @@ import type {
 	UserPreferences,
 } from '@/data/core';
 import type { ChatGptSettings } from '@studio/agent/protocol/chatgpt';
+import type { ImageServiceState } from '@studio/agent/protocol/image-service';
 import type { AiSettings } from '@studio/agent/protocol/providers';
 
 type Methods = {
@@ -52,6 +53,8 @@ export interface FakeConnectorState {
 	// Each site's email, newest first.
 	emails: Record< string, SiteEmail[] >;
 	chatGpt: ChatGptSettings;
+	// Studio's image service. Unset, it follows `user`, as it does without a token.
+	imageService?: ImageServiceState;
 }
 
 export type FakeConnectorInitialState = Partial< Omit< FakeConnectorState, 'preferences' > > & {
@@ -372,6 +375,21 @@ export function createInMemoryConnector(
 			models: [ { id: 'gpt-6-luna', label: 'GPT-6 Luna' } ],
 			lastError: null,
 		} ),
+		getImageServiceState: async () =>
+			state.imageService ??
+			( state.user
+				? {
+						available: true,
+						service: 'wordpress-com',
+						credential: 'wordpress-com-login',
+						account: { displayName: state.user.displayName, email: state.user.email },
+				  }
+				: {
+						available: false,
+						service: 'wordpress-com',
+						reason: 'signed-out',
+						setup: 'wordpress-com-login',
+				  } ),
 		saveAnthropicApiKey: async ( key ) => ( {
 			provider: 'wpcom',
 			hasAnthropicApiKey: !! key,
