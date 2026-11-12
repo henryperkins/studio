@@ -42,6 +42,7 @@ export {
 	type ToolResult,
 } from './tools/define-tool';
 export type { StudioToolsOptions } from './tools';
+export { describeToolError, runStudioTool } from './tools/execution';
 export { createPresentDesignOptionsTool } from './tools/present-design-options';
 export { renderSkill } from './tools/skill';
 export { textResult } from './tools/utils';

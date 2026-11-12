@@ -42,9 +42,10 @@ import { isImageGenerationAvailable } from '@studio/agent/node/image-generation'
 import { OPENAI_API_BASE_URL } from '@studio/agent/node/openai-model-list';
 import { createResultNotes } from '@studio/agent/node/result-notes';
 import { buildSystemPrompt, type ToolPromptContribution } from '@studio/agent/node/system-prompt';
-import { resolveStudioTools } from '@studio/agent/node/tools';
+import { resolveStudioTools, toPiTool } from '@studio/agent/node/tools';
 import { createAskUserQuestionTool } from '@studio/agent/node/tools/ask-user-question';
 import { bindTool } from '@studio/agent/node/tools/define-tool';
+import { completeToolResult, settlePendingWorkFor } from '@studio/agent/node/tools/execution';
 import { createPresentDesignOptionsTool } from '@studio/agent/node/tools/present-design-options';
 import { createSkillTool } from '@studio/agent/node/tools/skill';
 import {
@@ -1044,24 +1045,20 @@ function toToolDefinition(
 			if ( fileWriteRefusal ) {
 				throw new Error( fileWriteRefusal );
 			}
-			if ( ( tool as { settlesPendingWork?: boolean } ).settlesPendingWork ) {
-				await pendingWork.settle();
-			}
+			await settlePendingWorkFor( tool as { settlesPendingWork?: boolean }, pendingWork );
 			const result = await tool.execute( toolCallId, params, signal, onUpdate );
 			const details = result.details as StudioToolResultDetails | undefined;
-			if ( details?.pending ) {
-				pendingWork.add( details.pending );
+			const pending = details?.pending;
+			if ( details && pending ) {
 				delete details.pending;
 			}
-			const resultText = result.content
-				.map( ( part ) => ( part.type === 'text' ? part.text : '' ) )
-				.join( '\n' );
-			const notes = [ await resultNotes?.( resultText ), pendingWork.takeReports() ]
-				.filter( Boolean )
-				.join( '\n' );
-			return notes
-				? { ...result, content: [ ...result.content, { type: 'text', text: notes } ] }
-				: result;
+			// Every tool's result, pi's file tools' included, carries the notes and
+			// what work left running reports.
+			const content = await completeToolResult( result.content, pending, {
+				pendingWork,
+				notes: resultNotes,
+			} );
+			return content === result.content ? result : { ...result, content };
 		},
 	};
 }
@@ -1073,21 +1070,26 @@ function buildAgentTools(
 ): AgentToolAny[] {
 	const { host } = config;
 	const askUserTool: AgentToolAny[] = config.onAskUser
-		? [ bindTool( createAskUserQuestionTool( config.onAskUser ), host ) ]
+		? [ toPiTool( bindTool( createAskUserQuestionTool( config.onAskUser ), host ), host.ui ) ]
 		: [];
 	const tracks = getAiTracksIdentity( config.session.getSessionId() );
 	const designOptionsTool: AgentToolAny[] =
 		config.onAskUser && host.ui
 			? [
-					bindTool(
-						createPresentDesignOptionsTool( { onAskUser: config.onAskUser, tracks } ),
-						host
+					toPiTool(
+						bindTool(
+							createPresentDesignOptionsTool( { onAskUser: config.onAskUser, tracks } ),
+							host
+						),
+						host.ui
 					) as unknown as AgentToolAny,
 			  ]
 			: [];
 
 	const skillToolDef = createSkillTool();
-	const skillTool: AgentToolAny[] = skillToolDef ? [ bindTool( skillToolDef, host ) ] : [];
+	const skillTool: AgentToolAny[] = skillToolDef
+		? [ toPiTool( bindTool( skillToolDef, host ), host.ui ) ]
+		: [];
 
 	// pi's tools are registered under Studio's names; the prompt text for them
 	// is Studio's too (file-tool-prompts.ts), so nothing of pi's wording leaks.

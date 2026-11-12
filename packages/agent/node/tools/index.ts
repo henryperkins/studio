@@ -1,9 +1,9 @@
-import { emitChatArtifactWidgets } from '@studio/agent/node/chat-artifacts';
 import { createPreviewTool } from './create-preview';
 import { createSiteTool } from './create-site';
 import { bindTool } from './define-tool';
 import { deletePreviewTool } from './delete-preview';
 import { deleteSiteTool } from './delete-site';
+import { runStudioTool, showToolArtifacts } from './execution';
 import { exportSiteTool } from './export-site';
 import { generateImagesTool } from './generate-images';
 import { importSiteTool } from './import-site';
@@ -36,6 +36,7 @@ import type {
 } from './define-tool';
 import type { DesignTracksContext } from '@studio/agent/node/design-tracks';
 import type { StudioAgentHost, StudioAgentUi } from '@studio/agent/node/host';
+import type { StudioToolProgressUpdate } from '@studio/agent/protocol/tool-progress';
 
 export const studioToolDefinitions: StudioToolDefinition[] = [
 	createSiteTool,
@@ -88,12 +89,13 @@ export interface StudioToolsOptions {
 	imageLink?: ( file: string ) => string;
 }
 
-// The Studio tools, bound to `host`. Visual results show in the conversation
-// only when the host has a UI; otherwise they would leak into terminal transcripts.
-export function resolveStudioTools(
+// The Studio tools a host can run, as definitions: the registry less the tools
+// the host's capabilities leave out, with the factory-built variants those
+// capabilities call for. Every runtime builds its tools from this list.
+export function resolveStudioToolDefinitions(
 	host: StudioAgentHost,
 	options: StudioToolsOptions = {}
-): AnyStudioAgentTool[] {
+): StudioToolDefinition[] {
 	return studioToolDefinitions.flatMap( ( candidate ) => {
 		if ( candidate.name === generateImagesTool.name && ! options.imageGeneration ) {
 			return [];
@@ -122,10 +124,63 @@ export function resolveStudioTools(
 				tracks: options.tracks,
 			} );
 		}
-		return [ withChatArtifactEmission( bindTool( tool, host ), host.ui ) ];
+		return [ tool ];
 	} );
 }
 
+// The Studio tools, bound to `host`, in the Pi route's form. Visual results show
+// in the conversation only when the host has a UI; otherwise they would leak
+// into terminal transcripts.
+export function resolveStudioTools(
+	host: StudioAgentHost,
+	options: StudioToolsOptions = {}
+): AnyStudioAgentTool[] {
+	return resolveStudioToolDefinitions( host, options ).map( ( tool ) =>
+		toPiTool( bindTool( tool, host ), host.ui )
+	);
+}
+
+/**
+ * A bound Studio tool in the Pi route's form, run through the shared execution
+ * semantics (`execution.ts`). Pi validates a call against the tool's schema,
+ * coercing what models commonly send, before it calls `execute`, so the call is
+ * not validated again here. Progress is a tool update carrying only its message,
+ * a failure is thrown for pi to report by its message, and what the result
+ * leaves for Studio (artifacts, pending work, the service it used) goes in
+ * `details`, which the model never sees.
+ */
+export function toPiTool< TTool extends AnyStudioAgentTool >(
+	tool: TTool,
+	ui: StudioAgentUi | undefined
+): TTool {
+	return {
+		...tool,
+		execute: async ( _toolCallId, params, _signal, onUpdate ) => {
+			const run = await runStudioTool( tool, params, {
+				validate: false,
+				ui,
+				onProgress: ( message, update ) => {
+					const details: StudioToolProgressUpdate = { studioProgress: { message, update } };
+					onUpdate?.( { content: [], details } );
+				},
+			} );
+			if ( run.status === 'failed' ) {
+				throw run.error;
+			}
+			if ( run.status !== 'completed' ) {
+				throw new Error( `Not run: ${ tool.name }` );
+			}
+			const { content, studioArtifacts, pending, studioService } = run.result;
+			const details: StudioToolResultDetails | undefined =
+				studioArtifacts?.length || pending || studioService
+					? { studioArtifacts, pending, ...( studioService ? { studioService } : {} ) }
+					: undefined;
+			return { content, details };
+		},
+	};
+}
+
+// Shows the artifacts of a tool already in the Pi route's form once it succeeds.
 export function withChatArtifactEmission< TTool extends AnyStudioAgentTool >(
 	tool: TTool,
 	ui: StudioAgentUi | undefined
@@ -138,13 +193,7 @@ export function withChatArtifactEmission< TTool extends AnyStudioAgentTool >(
 		execute: async ( toolCallId, params, signal, onUpdate ) => {
 			const result = await tool.execute( toolCallId, params, signal, onUpdate );
 			const details = result.details as StudioToolResultDetails | undefined;
-			try {
-				await emitChatArtifactWidgets( ui, details?.studioArtifacts );
-			} catch ( error ) {
-				// Artifacts are presentation-only; a failed emit (e.g. session file
-				// unwritable) must never turn a successful tool result into an error.
-				console.warn( `[chat-artifacts] failed to emit artifact for ${ tool.name }:`, error );
-			}
+			await showToolArtifacts( ui, tool.name, details?.studioArtifacts );
 			return result;
 		},
 	};

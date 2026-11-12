@@ -148,3 +148,27 @@ it( 'never hands an MCP client the image service account a result was made with'
 
 	expect( JSON.stringify( served ) ).not.toMatch( /Someone|someone@example|wordpress-com/ );
 } );
+
+it( 'refuses arguments the tool’s schema refuses, naming at most three problems, before the tool runs', async () => {
+	const handler = vi.fn( async () => ( { content: [ { type: 'text' as const, text: 'Ran.' } ] } ) );
+	const tool = defineTool(
+		'show_site',
+		'Shows a site.',
+		{ nameOrPath: Type.String(), a: Type.String(), b: Type.String(), c: Type.String() },
+		handler,
+		{ annotations: READ_ONLY }
+	);
+	const serve = ( args: Record< string, unknown > ) =>
+		runServedTool( cliAgentHost, bindTool( tool, cliAgentHost ), args, createResultNotes() );
+
+	expect( await serve( { nameOrPath: 7, a: 'x', b: 'x', c: 'x' } ) ).toEqual( {
+		content: [
+			{ type: 'text', text: 'Invalid arguments for show_site: /nameOrPath must be string.' },
+		],
+		isError: true,
+	} );
+	const many = await serve( { nameOrPath: 1, a: 2, b: 3, c: 4 } );
+	expect( many.isError ).toBe( true );
+	expect( ( many.content[ 0 ] as { text: string } ).text.split( '; ' ) ).toHaveLength( 3 );
+	expect( handler ).not.toHaveBeenCalled();
+} );
