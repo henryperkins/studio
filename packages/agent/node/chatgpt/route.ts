@@ -64,8 +64,9 @@ export function summarizeChatGptTokenFailure(
 	if ( error instanceof ChatGptConnectionError ) {
 		return { kind: 'credentials', code: error.code, detail: redact( error.message ) };
 	}
-	const message = ( error instanceof Error ? error.message : String( error ) ).trim();
-	return { kind: 'credentials', ...( message ? { detail: redact( message ) } : {} ) };
+	// A lock or a file the broker couldn't use: its own message can name a
+	// path in the user's home, so the transcript gets the fixed one instead.
+	return { kind: 'credentials' };
 }
 
 function describeNetworkFailure( error: unknown ): string {

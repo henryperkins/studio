@@ -10,6 +10,7 @@ import {
 	type ChatGptModelListResult,
 } from '@studio/agent/node/chatgpt/models';
 import { CHATGPT_UNAVAILABLE_RETRY_DELAYS_MS } from '@studio/agent/node/chatgpt/route';
+import { describeChatGptError } from '@studio/agent/protocol/chatgpt-errors';
 import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
 import type { OpenAiModelCapabilities, OpenAiModelId } from '@studio/agent/protocol/openai-models';
 
@@ -352,6 +353,24 @@ describe( 'fetchChatGptModels', () => {
 
 		expect( error ).toMatchObject( { kind: 'credentials', code: 'needs-sign-in' } );
 		expect( error.detail ).toBe( new ChatGptConnectionError( 'needs-sign-in' ).message );
+		expect( http.spy ).not.toHaveBeenCalled();
+	} );
+
+	it( 'reports a lock or file the broker couldn’t use with a fixed message, never its path', async () => {
+		const home = [ '', 'home', 'someone', '.studio', 'chatgpt-credentials', 'x.lock' ].join( '/' );
+		broker.failure = Object.assign(
+			new Error( `EPERM: operation not permitted, open '${ home }'` ),
+			{ code: 'EPERM', path: home }
+		);
+		const http = captureFetch( () => json( { models: [] } ) );
+
+		const error = failureOf( await fetchChatGptModels( ACCOUNT_A ) );
+
+		expect( error ).toEqual( { kind: 'credentials' } );
+		expect( describeChatGptError( error ) ).toBe(
+			'Studio couldn’t use your ChatGPT sign-in for this request.'
+		);
+		expect( JSON.stringify( error ) ).not.toMatch( /someone|EPERM|lock/ );
 		expect( http.spy ).not.toHaveBeenCalled();
 	} );
 
