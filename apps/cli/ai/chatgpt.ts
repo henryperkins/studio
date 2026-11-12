@@ -4,6 +4,7 @@ import {
 	finishChatGptSignIn,
 	readChatGptModels,
 	readChatGptSettings,
+	readSavedChatGptSignIns,
 	startChatGptSignIn,
 	stopChatGptSignIn,
 	validateChatGptSelection,
@@ -180,16 +181,56 @@ async function configure(
 	);
 }
 
+async function signOut( ctx: SlashCommandContext, connectionId: string ) {
+	const result = await disconnectChatGpt( connectionId );
+	ctx.ui.showInfo(
+		! result.localCleared
+			? __( 'Couldn’t clear this sign-in. Try again.' )
+			: result.remoteRevocationConfirmed
+			? __( 'Signed out locally. Remote revocation confirmed.' )
+			: __(
+					'Signed out locally. Remote revocation wasn’t confirmed; remove Studio in ChatGPT account settings if needed.'
+			  )
+	);
+}
+
+// With ChatGPT off, saved sign-ins can still be signed out, and nothing else.
+async function signOutWhileDisabled(
+	ctx: SlashCommandContext,
+	selectionOnly?: 'model' | 'reasoning'
+) {
+	const notEnabled = __( 'ChatGPT plan connections are not enabled in this app.' );
+	const saved = selectionOnly ? [] : await readSavedChatGptSignIns();
+	if ( ! saved.length ) {
+		throw new ChatGptSettingsError( notEnabled );
+	}
+	ctx.ui.showInfo( notEnabled );
+	const action = await choose( ctx, __( 'ChatGPT plan' ), [
+		{ label: __( 'Sign out' ), value: 'sign-out' },
+	] );
+	if ( action !== 'sign-out' ) return;
+	const account = await choose(
+		ctx,
+		__( 'Saved ChatGPT account' ),
+		saved.map( ( item ) => ( {
+			label: `${ item.label } · ${ item.connectionId }`,
+			value: item,
+			description: item.email ?? '',
+		} ) )
+	);
+	if ( account ) await signOut( ctx, account.connectionId );
+}
+
 export async function runChatGptCommand(
 	ctx: SlashCommandContext,
 	selectionOnly?: 'model' | 'reasoning'
 ): Promise< 'continue' > {
 	try {
 		const settings = await readChatGptSettings();
-		if ( ! settings.enabled )
-			throw new ChatGptSettingsError(
-				__( 'ChatGPT plan connections are not enabled in this app.' )
-			);
+		if ( ! settings.enabled ) {
+			await signOutWhileDisabled( ctx, selectionOnly );
+			return 'continue';
+		}
 		if ( selectionOnly ) {
 			const current = readChatGptSessionSelection( await ctx.getSessionEntries() );
 			const account = settings.accounts.find(
@@ -228,18 +269,7 @@ export async function runChatGptCommand(
 						__( 'No supported models listed.' )
 				);
 			}
-			if ( action === 'sign-out' ) {
-				const result = await disconnectChatGpt( account.connectionId );
-				ctx.ui.showInfo(
-					! result.localCleared
-						? __( 'Couldn’t clear this sign-in. Try again.' )
-						: result.remoteRevocationConfirmed
-						? __( 'Signed out locally. Remote revocation confirmed.' )
-						: __(
-								'Signed out locally. Remote revocation wasn’t confirmed; remove Studio in ChatGPT account settings if needed.'
-						  )
-				);
-			}
+			if ( action === 'sign-out' ) await signOut( ctx, account.connectionId );
 		}
 	} catch ( error ) {
 		ctx.ui.showError(

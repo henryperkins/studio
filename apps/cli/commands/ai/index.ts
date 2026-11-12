@@ -85,7 +85,7 @@ import {
 	type AiProviderId,
 } from 'cli/ai/providers';
 import { replaySessionHistory } from 'cli/ai/sessions/replay';
-import { getActiveSlashCommands, type SlashCommandContext } from 'cli/ai/slash-commands';
+import { findSlashCommand, type SlashCommandContext } from 'cli/ai/slash-commands';
 import { AiChatUI } from 'cli/ai/ui';
 import { runCommand as runLoginCommand } from 'cli/commands/auth/login';
 import { findSiteByFolder, findSiteById } from 'cli/lib/cli-config/sites';
@@ -1184,9 +1184,7 @@ export async function runCommand( options: {
 
 			// Match the exact prompt: `/clear foo` falls through to the AI agent
 			// rather than running `/clear`.
-			const cmd = trimmedPrompt.startsWith( '/' )
-				? getActiveSlashCommands().find( ( c ) => `/${ c.name }` === trimmedPrompt )
-				: undefined;
+			const cmd = trimmedPrompt.startsWith( '/' ) ? findSlashCommand( trimmedPrompt ) : undefined;
 			if ( cmd ) {
 				if ( cmd.handler ) {
 					const result = await cmd.handler( prompt, slashCommandContext );

@@ -150,11 +150,14 @@ function describeChatGptConnectionError(
 /** Why a ChatGPT account can't be used or changed. The message is for the user and never holds a secret. */
 export class ChatGptConnectionError extends Error {
 	readonly code: ChatGptConnectionErrorCode;
+	/** Why, where the code takes one: what the system keychain answered, say. */
+	readonly detail?: string;
 
 	constructor( code: ChatGptConnectionErrorCode, detail?: string ) {
 		super( describeChatGptConnectionError( code, detail ) );
 		this.name = 'ChatGptConnectionError';
 		this.code = code;
+		this.detail = detail;
 	}
 }
 

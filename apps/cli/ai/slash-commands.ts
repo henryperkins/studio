@@ -93,6 +93,15 @@ export function getActiveSlashCommands(): SlashCommandDef[] {
 	).sort( ( a, b ) => a.name.localeCompare( b.name ) );
 }
 
+/**
+ * The command a prompt that is exactly `/<name>` runs. `/chatgpt` runs with
+ * ChatGPT off too, though it isn't listed then: it only signs saved accounts
+ * out, since removing Studio's access never depends on the flag.
+ */
+export function findSlashCommand( prompt: string ): SlashCommandDef | undefined {
+	return AI_CHAT_SLASH_COMMANDS.find( ( command ) => `/${ command.name }` === prompt );
+}
+
 function isPromptAbortError( error: unknown ): boolean {
 	return (
 		error instanceof Error &&

@@ -20,6 +20,7 @@ import {
 	finishChatGptSignIn,
 	readChatGptModels,
 	readChatGptSettings,
+	readSavedChatGptSignIns,
 	startChatGptSignIn,
 	stopChatGptSignIn,
 	validateChatGptSelection,
@@ -207,6 +208,42 @@ describe( 'ChatGPT application settings facade', () => {
 			remoteRevocationConfirmed: false,
 		} );
 		expect( signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( ID );
+	} );
+
+	it( 'signs out with ChatGPT turned off, and lists only the saved sign-ins there are to sign out of', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+		vi.mocked( readChatGptAccounts ).mockResolvedValue( [
+			ACCOUNT,
+			{ ...ACCOUNT, registrationId: ATTEMPT, label: 'Gone', state: 'signed-out' },
+		] );
+		vi.mocked( signOutChatGpt ).mockResolvedValue( {
+			localCleared: true,
+			remoteRevocationConfirmed: true,
+		} );
+
+		await expect( readSavedChatGptSignIns() ).resolves.toEqual( [
+			{ connectionId: ID, label: ACCOUNT.label, email: ACCOUNT.email },
+		] );
+		await expect( disconnectChatGpt( ID ) ).resolves.toEqual( {
+			localCleared: true,
+			remoteRevocationConfirmed: true,
+		} );
+		expect( signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( ID );
+		await expect( readChatGptSettings() ).resolves.toMatchObject( {
+			enabled: false,
+			accounts: [],
+		} );
+	} );
+
+	it( 'keeps why the keychain couldn’t be reached in the message it passes on', async () => {
+		vi.mocked( signOutChatGpt ).mockRejectedValueOnce(
+			new ChatGptConnectionError( 'vault-unavailable', 'its tool didn’t answer in time' )
+		);
+
+		const failed = await disconnectChatGpt( ID ).catch( ( error: unknown ) => error );
+
+		expect( ( failed as Error ).message ).toContain( '(its tool didn’t answer in time)' );
+		expect( ( failed as Error ).message ).not.toContain( 'unknown error' );
 	} );
 
 	it( 'validates cancellation and sanitizes unexpected cancellation errors', async () => {

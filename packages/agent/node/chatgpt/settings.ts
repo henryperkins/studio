@@ -19,6 +19,7 @@ import {
 	waitForChatGptSignIn,
 } from './oauth';
 import type {
+	ChatGptAccountView,
 	ChatGptSessionSelection,
 	ChatGptSettings,
 	ChatGptSignInOptions,
@@ -57,7 +58,9 @@ export async function chatGptSettingsAction< T >( action: () => Promise< T > ): 
 			throw new ChatGptSettingsError( new ChatGptSignInError( error.code ).message );
 		}
 		if ( error instanceof ChatGptConnectionError ) {
-			throw new ChatGptSettingsError( new ChatGptConnectionError( error.code ).message );
+			throw new ChatGptSettingsError(
+				new ChatGptConnectionError( error.code, error.detail ).message
+			);
 		}
 		throw new ChatGptSettingsError(
 			__( 'Studio couldn’t complete the ChatGPT action. Try again.' )
@@ -177,9 +180,27 @@ export function stopChatGptSignIn( attemptId: unknown ): Promise< boolean > {
 	} );
 }
 
+/**
+ * The saved sign-ins there are to sign out of, whether or not ChatGPT is
+ * turned on: removing Studio's access never depends on an experimental flag.
+ */
+export function readSavedChatGptSignIns(): Promise<
+	Array< Pick< ChatGptAccountView, 'connectionId' | 'label' | 'email' > >
+> {
+	return chatGptSettingsAction( async () =>
+		( await readChatGptAccounts() )
+			.filter( ( account ) => account.state === 'signed-in' )
+			.map( ( account ) => ( {
+				connectionId: account.registrationId,
+				label: account.label,
+				email: account.email,
+			} ) )
+	);
+}
+
+// Not behind the flag: removing Studio's access never depends on it.
 export function disconnectChatGpt( connectionId: unknown ): Promise< ChatGptSignOutResult > {
 	return chatGptSettingsAction( async () => {
-		assertChatGptEnabled();
 		requireRegistration( connectionId );
 		const { localCleared, remoteRevocationConfirmed } = await signOutChatGpt( connectionId );
 		return { localCleared, remoteRevocationConfirmed };

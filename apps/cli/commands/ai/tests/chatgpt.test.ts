@@ -397,6 +397,49 @@ describe( 'ChatGPT interactive CLI', () => {
 		expect( listChatGptConnections ).not.toHaveBeenCalled();
 	} );
 
+	it( 'with ChatGPT off, says so at /chatgpt and offers only signing out of the saved sign-ins', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+		vi.mocked( signOutChatGpt ).mockResolvedValueOnce( {
+			localCleared: true,
+			remoteRevocationConfirmed: true,
+		} );
+		const ui = terminal( [ '/chatgpt' ], [ 'Sign out', `Personal · ${ A }` ] );
+
+		await runCommand( { adapter: ui } );
+
+		expect( ui.showInfo ).toHaveBeenCalledWith(
+			'ChatGPT plan connections are not enabled in this app.'
+		);
+		expect(
+			vi.mocked( ui.askUser ).mock.calls[ 0 ][ 0 ][ 0 ].options.map( ( option ) => option.label )
+		).toEqual( [ 'Sign out' ] );
+		expect( signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( A );
+		expect( ui.showInfo ).toHaveBeenCalledWith(
+			'Signed out locally. Remote revocation confirmed.'
+		);
+		expect( beginChatGptSignIn ).not.toHaveBeenCalled();
+		expect( listChatGptConnections ).not.toHaveBeenCalled();
+		expect( runs ).toHaveLength( 0 );
+		// It stays out of the command list while ChatGPT is off.
+		expect( getActiveSlashCommands().some( ( command ) => command.name === 'chatgpt' ) ).toBe(
+			false
+		);
+	} );
+
+	it( 'with ChatGPT off and no saved sign-in, only says ChatGPT isn’t enabled at /chatgpt', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+		vi.mocked( readChatGptAccounts ).mockResolvedValue( [] );
+		const ui = terminal( [ '/chatgpt' ], [] );
+
+		await runCommand( { adapter: ui } );
+
+		expect( ui.showError ).toHaveBeenCalledWith(
+			'ChatGPT plan connections are not enabled in this app.'
+		);
+		expect( ui.askUser ).not.toHaveBeenCalled();
+		expect( runs ).toHaveLength( 0 );
+	} );
+
 	it.each( [
 		[ 'an unknown recorded effort', { reasoningEffort: 'future-effort' }, 'future-effort' ],
 		[
