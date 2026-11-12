@@ -3,9 +3,13 @@ import {
 	createClaudeSession,
 	getClaudeModelCatalog,
 	getClaudeRuntimeState,
+	recoverClaudeSession,
 	setClaudeSessionSelection,
 } from '@studio/agent/node/claude-code/studio-surface';
-import { parseClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
+import {
+	getClaudeRecoveryBlockedMessage,
+	parseClaudeSessionSelection,
+} from '@studio/agent/protocol/claude-code';
 import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { __ } from '@wordpress/i18n';
 import type { StudioArgv } from 'cli/types';
@@ -26,6 +30,7 @@ export const registerCommand = ( yargs: StudioArgv ) =>
 						'models',
 						'new',
 						'select',
+						'recover',
 					] as const,
 					demandOption: true,
 				} )
@@ -85,6 +90,19 @@ export const registerCommand = ( yargs: StudioArgv ) =>
 					);
 					result = { ok: true };
 					break;
+				case 'recover': {
+					const recovery = await recoverClaudeSession( requireValue( argv.session, 'session' ) );
+					if ( recovery.status === 'blocked' ) {
+						process.stderr.write(
+							`${ __( 'Studio did not recover this chat:' ) } ${ getClaudeRecoveryBlockedMessage(
+								recovery.reason
+							) }\n`
+						);
+						process.exitCode = 1;
+					}
+					result = recovery;
+					break;
+				}
 			}
 			process.stdout.write( JSON.stringify( result, null, 2 ) + '\n' );
 		},
