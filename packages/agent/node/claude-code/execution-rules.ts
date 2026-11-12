@@ -60,6 +60,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		importSiteTool.name,
 		exportSiteTool.name,
 		installTaxonomyScriptsTool.name,
+		refreshBrowserTool.name,
 	] ),
 } );
 
@@ -830,7 +831,17 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		openAnnotationBrowserTool.name,
 		unqualified( studioRule( 'local-change', { urls: pageUrls, navigates: true } ) ),
 	],
-	[ refreshBrowserTool.name, unqualified( studioRule( 'read' ) ) ],
+	[
+		refreshBrowserTool.name,
+		// It asks the app that shows the conversation to reload its preview,
+		// through the guarded host, whose `ui` does nothing once the call has
+		// ended. The registry offers it only to a host with that app. Its module
+		// links `tools/utils.ts`, whose `runWpCli` runs only through the host.
+		qualified(
+			studioRule( 'read' ),
+			using( { runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] } )
+		),
+	],
 	[ sendFeedbackTool.name, unqualified( studioRule( 'external-message' ) ) ],
 	// Tools built by factories for the host's capabilities.
 	[ 'AskUserQuestion', unqualified( studioRule( 'read' ) ) ],

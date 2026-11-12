@@ -371,6 +371,47 @@ describe( 'install_taxonomy_scripts on the Claude route', () => {
 	} );
 } );
 
+describe( 'refresh_browser on the Claude route', () => {
+	it( 'reloads the preview of the app that shows the conversation, unprompted and unjournaled, only while the call lives', async () => {
+		const fixture = await createPolicyFixture();
+		cleanups.push( fixture.cleanup );
+		const ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
+		fixture.host.ui = ui;
+		let kept: ( () => void ) | undefined;
+		const guardHost = fixture.policy.guardHost;
+		const bridge = createStudioClaudeToolBridge(
+			fixture.host,
+			{
+				runId: 'run',
+				turnId: 'turn',
+				policy: {
+					...fixture.policy,
+					guardHost: ( ...args ) => {
+						const guarded = guardHost( ...args );
+						kept = () => guarded.ui!.reloadPreview();
+						return guarded;
+					},
+				},
+			},
+			() => {}
+		);
+		cleanups.push( () => bridge.dispose() );
+		expect( bridge.tools ).toContain( 'refresh_browser' );
+		expect( ( await bridge.invoke( 'refresh_browser', {} ) ).isError ).toBe( false );
+		expect( ui.reloadPreview ).toHaveBeenCalledOnce();
+		expect( fixture.context.approve ).not.toHaveBeenCalled();
+		expect( fixture.journal ).toEqual( [] );
+		kept!();
+		expect( ui.reloadPreview ).toHaveBeenCalledOnce();
+	} );
+
+	it( 'is not offered to a host without an app that shows the conversation', async () => {
+		const { bridge } = await setup();
+		expect( bridge.tools ).not.toContain( 'refresh_browser' );
+		expect( ( await bridge.invoke( 'refresh_browser', {} ) ).isError ).toBe( true );
+	} );
+} );
+
 describe( 'the folders Studio ships its read-only files in', () => {
 	it( 'are Studio’s own bundled skills, outside every folder a conversation reaches', async () => {
 		const scripts = getSkillPath( 'taxonomist', 'scripts' );

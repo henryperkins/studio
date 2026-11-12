@@ -67,11 +67,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_export: { status: 'bridged' },
 	scaffold_theme: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
 	install_taxonomy_scripts: { status: 'bridged' },
-	refresh_browser: {
-		status: 'unqualified',
-		step: 'C2a-2',
-		reason: `${ LOCAL }; it reloads the app's preview, which the guarded host fences`,
-	},
+	refresh_browser: { status: 'absent', capability: 'ui' },
 	site_list: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
 	site_connected_remote_sites: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
 	wpcom_request: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },

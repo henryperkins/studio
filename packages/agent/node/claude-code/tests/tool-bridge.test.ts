@@ -434,6 +434,19 @@ describe( 'the Claude bridge built from the Studio registry', () => {
 			server: discovery.server,
 		} as ReturnType< typeof createStudioClaudeToolBridge > );
 		expect( listed.map( ( item ) => item.name ) ).toEqual( discovery.tools );
+		// A turn on a host with an app that shows the conversation lists more: the
+		// tools that capability gates, which discovery leaves out.
+		fixture.host.ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
+		const withApp = createStudioClaudeToolBridge(
+			fixture.host,
+			{ runId: 'run', turnId: 'turn', policy: fixture.policy },
+			() => {}
+		);
+		expect( withApp.tools ).toEqual( expect.arrayContaining( [ ...discovery.tools ] ) );
+		expect( withApp.tools.filter( ( name ) => ! discovery.tools.includes( name ) ) ).toEqual( [
+			'refresh_browser',
+		] );
+		await withApp.dispose();
 		await turn.dispose();
 		await discovery.server.instance.close();
 	} );
