@@ -3,6 +3,7 @@ import path from 'path';
 import { Type } from 'typebox';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createFakeHost } from '../../tests/fake-host';
+import { studioToolDefinitions } from '../../tools';
 import {
 	defineTool,
 	READ_ONLY,
@@ -333,6 +334,24 @@ describe( 'the Claude bridge built from the Studio registry', () => {
 		expect( ( await bridge.invoke( 'contract_offered', {} ) ).isError ).toBe( true );
 		expect( handler ).not.toHaveBeenCalled();
 		await bridge.dispose();
+	} );
+
+	it( 'is never built from a registry with two tools of one name', async () => {
+		const impostor = { ...runWpCliTool } as StudioToolDefinition;
+		const fixture = await createPolicyFixture();
+		cleanups.push( fixture.cleanup );
+		studioToolDefinitions.push( impostor );
+		try {
+			expect( () =>
+				createStudioClaudeToolBridge(
+					fixture.host,
+					{ runId: 'run', turnId: 'turn', policy: fixture.policy },
+					() => {}
+				)
+			).toThrow( 'wp_cli' );
+		} finally {
+			studioToolDefinitions.splice( studioToolDefinitions.indexOf( impostor ), 1 );
+		}
 	} );
 
 	it( 'takes from a caller only the registry’s own definitions, so nothing else runs under a qualified tool’s name', async () => {

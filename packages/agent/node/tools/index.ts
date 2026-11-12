@@ -38,7 +38,21 @@ import type { DesignTracksContext } from '@studio/agent/node/design-tracks';
 import type { StudioAgentHost, StudioAgentUi } from '@studio/agent/node/host';
 import type { StudioToolProgressUpdate } from '@studio/agent/protocol/tool-progress';
 
-export const studioToolDefinitions: StudioToolDefinition[] = [
+/**
+ * The registry as a process runs it. Every runtime builds its tools from it,
+ * and the Claude route trusts its entries by identity, so outside the test
+ * runner it is frozen: nothing can add, replace or remove a tool once the
+ * process runs. Under the test runner it stays open, so a test can add a tool
+ * of its own and take it out again.
+ */
+export function studioToolRegistry(
+	definitions: StudioToolDefinition[],
+	extendable = process.env.VITEST === 'true'
+): StudioToolDefinition[] {
+	return extendable ? definitions : ( Object.freeze( definitions ) as StudioToolDefinition[] );
+}
+
+export const studioToolDefinitions: StudioToolDefinition[] = studioToolRegistry( [
 	createSiteTool,
 	listSitesTool,
 	getSiteInfoTool,
@@ -68,7 +82,7 @@ export const studioToolDefinitions: StudioToolDefinition[] = [
 	openAnnotationBrowserTool,
 	refreshBrowserTool,
 	sendFeedbackTool,
-];
+] );
 
 export interface StudioToolsOptions {
 	// Enable generate_images. Callers resolve isImageGenerationAvailable()
@@ -91,11 +105,20 @@ export interface StudioToolsOptions {
 
 // The Studio tools a host can run, as definitions: the registry less the tools
 // the host's capabilities leave out, with the factory-built variants those
-// capabilities call for. Every runtime builds its tools from this list.
+// capabilities call for. Every runtime builds its tools from this list, and
+// finds a tool in it by name, so a registry with two tools of one name is
+// refused.
 export function resolveStudioToolDefinitions(
 	host: StudioAgentHost,
 	options: StudioToolsOptions = {}
 ): StudioToolDefinition[] {
+	const names = new Set< string >();
+	for ( const { name } of studioToolDefinitions ) {
+		if ( names.has( name ) ) {
+			throw new Error( `The Studio tool registry has two tools named ${ name }.` );
+		}
+		names.add( name );
+	}
 	return studioToolDefinitions.flatMap( ( candidate ) => {
 		if ( candidate.name === generateImagesTool.name && ! options.imageGeneration ) {
 			return [];
