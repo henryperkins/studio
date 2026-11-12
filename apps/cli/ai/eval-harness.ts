@@ -134,7 +134,7 @@ const READ_METHODS = new Set( [ 'GET', 'HEAD' ] );
 const KNOWN_METHODS = new Set( [ 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS' ] );
 
 /** A request a guarded case tried to send to WordPress.com that could change something there. */
-export interface WpcomWriteAttempt {
+interface WpcomWriteAttempt {
 	code: typeof WPCOM_WRITE_CODE;
 	method: string;
 	host: 'wpcom' | 'wpcom-ai-proxy';
