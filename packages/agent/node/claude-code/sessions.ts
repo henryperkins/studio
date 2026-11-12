@@ -230,6 +230,15 @@ function ownershipChanged(): Error {
 	return new Error( 'Run lock ownership changed' );
 }
 
+/** A run lock's holder asked to move or release it after it had released it. */
+export class ClaudeRunLockReleasedError extends Error {
+	readonly code = 'ERR_CLAUDE_RUN_LOCK_RELEASED';
+	constructor() {
+		super( 'Run lock already released' );
+		this.name = 'ClaudeRunLockReleasedError';
+	}
+}
+
 // An approval journaled before requests named their operation is kept for
 // display only, under its own type, so it can never be taken for a live request.
 function readJournalEvent( line: string ): ClaudeJournalEvent {
@@ -550,8 +559,12 @@ export function createNativeSessionStore( root: string ) {
 		},
 		/**
 		 * Takes the conversation's run lock for a turn, complete with its owner,
-		 * or fails with EEXIST. Only its holder moves it through its stages, each
-		 * written whole in place; release removes it only while it is still its own.
+		 * or fails with EEXIST. The lock path is only ever created by exclusive
+		 * create. After that, only its holder writes it: each stage whole, by
+		 * atomic rename over a lock it has just read as its own. Its updates and
+		 * its release run one at a time, in order, and once it is released every
+		 * later update or release is refused with `ClaudeRunLockReleasedError`, so
+		 * no rename can land after the removal.
 		 */
 		async lockRun( conversationId: string, input: ClaudeRunLockInput ) {
 			await mkdir( root, { recursive: true } );
@@ -586,22 +599,30 @@ export function createNativeSessionStore( root: string ) {
 					throw ownershipChanged();
 			};
 			let pending = Promise.resolve();
+			let released = false;
+			const serialized = ( work: () => Promise< void > ): Promise< void > => {
+				const result = pending.then( work );
+				pending = result.catch( () => {} );
+				return result;
+			};
 			return {
 				update( next: ClaudeRunLockStage ): Promise< void > {
-					const work = pending.then( async () => {
+					return serialized( async () => {
+						if ( released ) throw new ClaudeRunLockReleasedError();
 						const updated = { ...record, ...next };
 						if ( ! runLockOf( { ...updated } ) ) throw new Error( 'Invalid run lock' );
 						await own();
 						await atomicWriteFile( lock, JSON.stringify( updated ), { mode: 0o600 } );
 						record = updated;
 					} );
-					pending = work.catch( () => {} );
-					return work;
 				},
-				async release(): Promise< void > {
-					await pending;
-					await own();
-					await unlink( lock );
+				release(): Promise< void > {
+					return serialized( async () => {
+						if ( released ) throw new ClaudeRunLockReleasedError();
+						released = true;
+						await own();
+						await unlink( lock );
+					} );
 				},
 			};
 		},

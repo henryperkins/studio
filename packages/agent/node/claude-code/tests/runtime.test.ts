@@ -72,6 +72,9 @@ function fakeProcessOwner(
 		clean?: boolean;
 		failure?: OwnershipFailure;
 		unidentified?: boolean;
+		/** Reads the helper that guards the tree; undefined when it cannot be read. */
+		guardian?: () => Promise< { pid: number; start: string } | undefined >;
+		onShutdown?: () => void;
 	} = {},
 	order: string[] = []
 ) {
@@ -92,13 +95,14 @@ function fakeProcessOwner(
 			},
 			failure: () => owned.failure,
 			identity: () => ( owned.unidentified ? undefined : { pid: 4321, start: '1' } ),
-			guardian: async () => ( { pid: 4322, start: '2' } ),
+			guardian: owned.guardian ?? ( async () => ( { pid: 4322, start: '2' } ) ),
 			inspect: async () => ( { live: [], uncertain: false } ),
 			requestShutdown: async () => {},
 			waitForExit: async () => true,
 			terminate: async () => owned.clean ?? true,
 			shutdown: async () => {
 				order.push( 'owned-shutdown' );
+				owned.onShutdown?.();
 				return owned.clean ?? true;
 			},
 		};
@@ -2257,6 +2261,77 @@ describe( 'the run lock a turn records (mock SDK)', () => {
 				outcome: { status: 'error' },
 			} );
 			expect( stage ).toBe( 'starting' );
+			await expect(
+				createNativeSessionStore( fixture.storeRoot ).inspectLock( 'chat' )
+			).resolves.toEqual( { state: 'none' } );
+		} finally {
+			await fixture.cleanup();
+		}
+	} );
+
+	it( 'releases the lock only once the ownership it is recording has settled, and never recreates it', async () => {
+		const { runClaudeTurn } = await import( '../runtime' );
+		const { createNativeSessionStore } = await import( '../sessions' );
+		const { existsSync } = await import( 'fs' );
+		const path = await import( 'path' );
+		let settleGuardian!: ( identity: { pid: number; start: string } ) => void;
+		const guardianRead = new Promise< { pid: number; start: string } >( ( resolve ) => {
+			settleGuardian = resolve;
+		} );
+		let shutDown!: () => void;
+		const shutdownCalled = new Promise< void >( ( resolve ) => {
+			shutDown = resolve;
+		} );
+		const fixture = await ownedNativeFixture( 'claude-lock-settled-', {
+			guardian: () => guardianRead,
+			onShutdown: () => shutDown(),
+		} );
+		try {
+			const file = path.join(
+				fixture.storeRoot,
+				`${ createHash( 'sha256' ).update( 'chat' ).digest( 'hex' ) }.json.lock`
+			);
+			const inner = spawningNativeTurn( fixture.root, async () => 'result' );
+			// Startup fails while the guardian is still being read, so the turn ends first.
+			const query = vi.fn( ( input: Parameters< typeof inner >[ 0 ] ) =>
+				Object.assign( inner( input ), {
+					initializationResult: async () => ( {
+						hooks_applied: false,
+						hook_on_failure_supported: true,
+					} ),
+				} )
+			);
+			const events: Array< { type: string; outcome?: { status: string } } > = [];
+			const turn = runClaudeTurn(
+				turnSnapshot( fixture.root, fixture.config, 'turn' ),
+				fixture.host,
+				{
+					prompt: 'hello',
+					signal: new AbortController().signal,
+					onEvent: ( event ) => events.push( event ),
+				},
+				{
+					storeRoot: fixture.storeRoot,
+					approve: async () => 'deny',
+					verifyTarget: async () => true,
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					prepareOwner: fixture.prepareOwner,
+					ownerIdentity: async () => owner,
+					connection: fixture.connection,
+					prepare: fixture.prepare,
+					account: fixture.account,
+				}
+			);
+			await shutdownCalled;
+			await new Promise( ( resolve ) => setTimeout( resolve, 100 ) );
+			const heldWhileReading = existsSync( file );
+			settleGuardian( { pid: 4322, start: '2' } );
+			await turn;
+			expect( heldWhileReading ).toBe( true );
+			expect( events.at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'error' },
+			} );
 			await expect(
 				createNativeSessionStore( fixture.storeRoot ).inspectLock( 'chat' )
 			).resolves.toEqual( { state: 'none' } );

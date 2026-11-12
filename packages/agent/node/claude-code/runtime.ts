@@ -1067,6 +1067,9 @@ export async function runClaudeTurn(
 		} catch {
 			failIfSuccessful();
 		}
+		// A lock update still recording ownership settles first: the release
+		// follows it on the lock, never the other way round.
+		await ownership;
 		if ( stopped )
 			try {
 				await release?.();
