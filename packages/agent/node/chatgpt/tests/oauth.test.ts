@@ -141,6 +141,7 @@ describe( 'Signing in to ChatGPT', () => {
 					return broker.saveSignIn( signIn );
 				},
 				readIdTokenHint: ( registrationId ) => broker.readIdTokenHint( registrationId ),
+				checkVaultKey: () => broker.checkVaultKey(),
 			},
 			openBrowser,
 			...options,
@@ -937,6 +938,7 @@ describe( 'Signing in to ChatGPT', () => {
 									throw new ChatGptConnectionError( 'signed-out' );
 								},
 								readIdTokenHint: ( id ) => broker.readIdTokenHint( id ),
+								checkVaultKey: () => broker.checkVaultKey(),
 							},
 						} ),
 				],
@@ -953,6 +955,7 @@ describe( 'Signing in to ChatGPT', () => {
 									);
 								},
 								readIdTokenHint: ( id ) => broker.readIdTokenHint( id ),
+								checkVaultKey: () => broker.checkVaultKey(),
 							},
 						} ),
 				],
@@ -1785,6 +1788,101 @@ describe( 'Signing in to ChatGPT', () => {
 					expect( owner ).not.toHaveBeenCalled();
 				}
 			);
+		} );
+	} );
+
+	// Saved sign-ins whose key the keychain says it doesn't have: the user hears
+	// so before the browser opens, not after finishing ChatGPT's page.
+	describe( 'a sign-in to keep in secure storage while the saved sign-ins’ key can’t be read', () => {
+		async function savedUnderUnreadableKey() {
+			const existing = await signInExisting();
+			keychain.items.clear();
+			return existing;
+		}
+
+		async function expectRefusedBeforeTheBrowser( starting: () => Promise< unknown > ) {
+			const listen = vi.spyOn( http.Server.prototype, 'listen' );
+			const openedBefore = opened.length;
+			const discoveries = fake.counts.discovery;
+
+			const error = await starting().then(
+				() => null,
+				( failure: unknown ) => failure
+			);
+
+			expect( error ).toBeInstanceOf( ChatGptSignInError );
+			expect( error ).toMatchObject( {
+				code: 'vault-key-unreadable',
+				message: new ChatGptSignInError( 'vault-key-unreadable' ).message,
+			} );
+			expect( listen ).not.toHaveBeenCalled();
+			expect( opened ).toHaveLength( openedBefore );
+			expect( fake.counts.discovery ).toBe( discoveries );
+			expect( keychain.items.size ).toBe( 0 );
+			listen.mockRestore();
+		}
+
+		it.each< [ string, 'new' | 'saved' | 'saved, kept where it was' ] >( [
+			[ 'a new registration', 'new' ],
+			[ 'a saved registration', 'saved' ],
+			[ 'a saved registration with no storage chosen', 'saved, kept where it was' ],
+		] )( 'is refused for %s before any listener, discovery or browser', async ( _name, kind ) => {
+			const existing = await savedUnderUnreadableKey();
+			const registrationId = kind === 'new' ? undefined : existing.registrationId;
+			const options: ChatGptSignInOptions =
+				kind === 'saved, kept where it was' ? {} : { storage: 'vault' };
+
+			await expectRefusedBeforeTheBrowser( () => flow.begin( registrationId, options ) );
+
+			expect( saves ).toHaveLength( existing.saved );
+			expect( await snapshot() ).toEqual( existing.before );
+		} );
+
+		it( 'is refused by the app’s own sign-in, which the CLI and the Desktop app both start', async () => {
+			await savedUnderUnreadableKey();
+			vi.resetModules();
+			const app = await import( '@studio/agent/node/chatgpt/oauth' );
+			const appFlow = app.createChatGptSignInFlow( {
+				discoveryUrl: fake.discoveryUrl,
+				openBrowser,
+			} );
+			flows.push( appFlow );
+
+			const listen = vi.spyOn( http.Server.prototype, 'listen' );
+			const error = await appFlow.begin( undefined, { storage: 'vault' } ).catch( ( e ) => e );
+
+			expect( error ).toBeInstanceOf( app.ChatGptSignInError );
+			expect( error.code ).toBe( 'vault-key-unreadable' );
+			expect( listen ).not.toHaveBeenCalled();
+		} );
+
+		it( 'goes on as before when the key can be read, or no saved sign-in needs one', async () => {
+			// No saved sign-in: the first makes the key.
+			expect( ( await signIn( undefined, { storage: 'vault' } ) ).outcome.ok ).toBe( true );
+			// Saved sign-ins, and their key there.
+			expect( ( await signIn( undefined, { storage: 'vault' } ) ).outcome.ok ).toBe( true );
+			expect( keychain.items.size ).toBe( 1 );
+		} );
+
+		it( 'leaves a sign-in for this app session only to go on', async () => {
+			await savedUnderUnreadableKey();
+
+			const { outcome } = await signIn( undefined, { storage: 'session' } );
+
+			expect( outcome.ok ).toBe( true );
+			expect( keychain.items.size ).toBe( 0 );
+		} );
+
+		it( 'is still refused when saving, if the key becomes unreadable after the attempt began', async () => {
+			const existing = await signInExisting();
+			const start = await begin( undefined, { storage: 'vault' } );
+			keychain.items.clear();
+
+			await deliver( await authorize( start.url ) );
+
+			expect( await flow.wait( start.attemptId ) ).toEqual( failed( 'vault-key-unreadable' ) );
+			expect( await snapshot() ).toEqual( existing.before );
+			expect( keychain.items.size ).toBe( 0 );
 		} );
 	} );
 

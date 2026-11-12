@@ -207,6 +207,12 @@ export interface ChatGptCredentialBrokerOptions {
 }
 
 export interface ChatGptCredentialBroker {
+	/**
+	 * Before a sign-in that will be kept in the vault: refuses with
+	 * `vault-key-unreadable` when saving it would, because saved records exist
+	 * and the keychain says it has no key for them. Writes nothing.
+	 */
+	checkVaultKey(): Promise< void >;
 	saveSignIn( signIn: ChatGptSignIn ): Promise< ChatGptAccount >;
 	getAccessToken( connectionId: string ): Promise< string >;
 	/** Drops only the rejected access token, preserving any newer token. */
@@ -657,6 +663,13 @@ export function createChatGptCredentialBroker(
 			}
 		);
 		return cacheWrappingKey( text );
+	}
+
+	// The check `getSealingKey` makes before it would make a key, without making one.
+	async function checkVaultKey(): Promise< void > {
+		if ( ! ( await readWrappingKeyText() ) && ( await hasSealedRecords() ) ) {
+			throw new ChatGptConnectionError( 'vault-key-unreadable' );
+		}
 	}
 
 	async function lockRefresh( registrationId: string ): Promise< () => Promise< void > > {
@@ -1488,6 +1501,7 @@ export function createChatGptCredentialBroker(
 	}
 
 	return {
+		checkVaultKey,
 		saveSignIn,
 		getAccessToken,
 		invalidateAccessToken,
@@ -1524,6 +1538,11 @@ function getAppBroker(): ChatGptCredentialBroker {
 		},
 	} );
 	return appBroker;
+}
+
+/** Refuses, before a sign-in to keep in the vault, when saving it would for an unreadable key. */
+export function checkChatGptVaultKey(): Promise< void > {
+	return getAppBroker().checkVaultKey();
 }
 
 /** Saves a completed, validated sign-in as a new registration or to the one it names. */

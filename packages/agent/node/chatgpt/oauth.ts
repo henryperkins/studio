@@ -17,6 +17,7 @@ import {
 } from '@studio/agent/node/chatgpt/account-store';
 import {
 	CHATGPT_DIRECT_USE_SCOPE,
+	checkChatGptVaultKey,
 	readChatGptIdTokenHint,
 	saveChatGptSignIn,
 	type ChatGptCredentialBroker,
@@ -111,7 +112,7 @@ export interface ChatGptSignInFlowOptions {
 	/** Replaced only by tests: how long an attempt waits for its callback. */
 	timeoutMs?: number;
 	/** The broker sign-ins are saved through: the app's by default. */
-	credentials?: Pick< ChatGptCredentialBroker, 'saveSignIn' | 'readIdTokenHint' >;
+	credentials?: Pick< ChatGptCredentialBroker, 'checkVaultKey' | 'saveSignIn' | 'readIdTokenHint' >;
 	/** The system browser: the opener installed with `setChatGptBrowserOpener` by default. */
 	openBrowser?: ChatGptBrowserOpener;
 	/** Replaced only by tests: the platform whose rules the listener follows. */
@@ -188,7 +189,7 @@ function describeSignInFailure( code: ChatGptSignInFailureCode ): string {
 			);
 		case 'vault-key-unreadable':
 			return __(
-				'Studio couldn’t read the key in the system keychain that protects your saved ChatGPT sign-ins, so it didn’t save this one. Unlock the keychain and try again, or keep this sign-in for this app session only. If the key is gone, sign out of every saved ChatGPT account first: the next sign-in kept in secure storage then makes a new key.'
+				'Studio couldn’t read the key in the system keychain that protects your saved ChatGPT sign-ins, so it can’t keep this sign-in in secure storage, and nothing was saved. Unlock the keychain and try again, or keep this sign-in for this app session only. If the key is gone, sign out of every saved ChatGPT account first: the next sign-in kept in secure storage then makes a new key.'
 			);
 		case 'save-failed':
 			return __( 'Studio couldn’t save your ChatGPT sign-in. Try again.' );
@@ -386,6 +387,7 @@ export function createChatGptSignInFlow(
 ): ChatGptSignInFlow {
 	const timeoutMs = options.timeoutMs ?? CHATGPT_SIGN_IN_TIMEOUT_MS;
 	const credentials = options.credentials ?? {
+		checkVaultKey: checkChatGptVaultKey,
 		saveSignIn: saveChatGptSignIn,
 		readIdTokenHint: readChatGptIdTokenHint,
 	};
@@ -760,6 +762,21 @@ export function createChatGptSignInFlow(
 			throw new ChatGptSignInError( 'browser-unavailable' );
 		}
 		const account = registrationId === undefined ? null : await findRegistration( registrationId );
+		const storage = isCredentialStorage( signInOptions.storage )
+			? signInOptions.storage
+			: account?.storage ?? 'vault';
+		// Saving would refuse for an unreadable key: say so before the browser
+		// opens. Saving checks again, as the keychain may lock in between; any
+		// other answer here is left for it to report.
+		if ( storage === 'vault' ) {
+			const refusal = await credentials.checkVaultKey().then(
+				() => null,
+				( error: unknown ) => error
+			);
+			if ( refusal instanceof ChatGptConnectionError && refusal.code === 'vault-key-unreadable' ) {
+				throw new ChatGptSignInError( 'vault-key-unreadable' );
+			}
+		}
 		let hostId: string;
 		try {
 			hostId = await getChatGptHostId();
@@ -800,9 +817,7 @@ export function createChatGptSignInFlow(
 				  }
 				: null,
 			retainedClientId,
-			storage: isCredentialStorage( signInOptions.storage )
-				? signInOptions.storage
-				: account?.storage ?? 'vault',
+			storage,
 			authServer,
 			redirectUri: `http://${ CALLBACK_HOST }:${ port }${ CALLBACK_PATH }`,
 			state: randomValue(),
