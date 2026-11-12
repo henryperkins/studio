@@ -139,6 +139,12 @@ const config: ForgeConfig = {
 				// ca-certificates: ships `update-ca-certificates` and the system trust bundle.
 				// libnss3-tools: ships `certutil`, used to import the CA into per-user NSS DBs.
 				depends: [ 'libcap2-bin', 'pkexec | policykit-1', 'ca-certificates', 'libnss3-tools' ],
+				// libsecret-tools: ships `secret-tool`, which keeps the key to saved ChatGPT
+				// sign-ins in the Secret Service. Recommended rather than required: it only
+				// works with an unlocked Secret Service on a session bus, and without it
+				// Studio reports persistent storage unavailable and can still keep a sign-in
+				// for the app session, which headless and minimal installs rely on.
+				recommends: [ 'libsecret-tools' ],
 				scripts: {
 					postinst: path.join( __dirname, 'installers', 'linux', 'postinst.sh' ),
 					postrm: path.join( __dirname, 'installers', 'linux', 'postrm.sh' ),
