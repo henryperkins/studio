@@ -1716,7 +1716,12 @@ it( 'keeps a conversation on the Claude account it started with, adopting it for
 // and an owned process that records what the runtime asks of it.
 async function ownedNativeFixture(
 	prefix: string,
-	owned: { ready?: boolean; clean?: boolean } = {}
+	owned: {
+		prepared?: boolean;
+		ready?: boolean;
+		clean?: boolean;
+		failure?: import('@studio/common/lib/owned-process').OwnershipFailure;
+	} = {}
 ) {
 	const { EventEmitter } = await import( 'events' );
 	const { PassThrough } = await import( 'stream' );
@@ -1740,6 +1745,7 @@ async function ownedNativeFixture(
 				order.push( 'owned-ready' );
 				return owned.ready ?? true;
 			},
+			failure: () => owned.failure,
 			identity: () => ( { pid: 4321, start: '1' } ),
 			inspect: async () => ( { live: [], uncertain: false } ),
 			requestShutdown: async () => {},
@@ -1754,8 +1760,19 @@ async function ownedNativeFixture(
 	return {
 		...fixture,
 		order,
-		spawnOwned:
-			spawnOwned as unknown as typeof import('@studio/common/lib/owned-process').spawnOwnedProcess,
+		spawnOwned,
+		prepareOwner: () =>
+			( {
+				prepared: async () => {
+					order.push( 'owner-prepared' );
+					return owned.prepared ?? true;
+				},
+				failure: () => owned.failure,
+				spawn: spawnOwned,
+				dispose: async () => {
+					order.push( 'owner-disposed' );
+				},
+			} ) as unknown as import('@studio/common/lib/owned-process').ProcessOwner,
 		connection: async () => ( { id: 'native', executablePath: executable } ),
 		prepare: async () => ( {
 			ok: true as const,
@@ -1905,13 +1922,14 @@ it( 'on cancel ends the pending approval before the native process hears of it, 
 				},
 				verifyTarget: async () => true,
 				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-				spawnOwned: fixture.spawnOwned,
+				prepareOwner: fixture.prepareOwner,
 				connection: fixture.connection,
 				prepare: fixture.prepare,
 				account: fixture.account,
 			}
 		);
 		expect( fixture.order ).toEqual( [
+			'owner-prepared',
 			'owned-ready',
 			'approval-requested',
 			'approval-cancelled',
@@ -1953,13 +1971,13 @@ it( 'reports no success and keeps the run lock when the owned tree cannot be con
 					fixture.root,
 					async () => 'result'
 				) as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-				spawnOwned: fixture.spawnOwned,
+				prepareOwner: fixture.prepareOwner,
 				connection: fixture.connection,
 				prepare: fixture.prepare,
 				account: fixture.account,
 			}
 		);
-		expect( fixture.order ).toEqual( [ 'owned-ready', 'owned-shutdown' ] );
+		expect( fixture.order ).toEqual( [ 'owner-prepared', 'owned-ready', 'owned-shutdown' ] );
 		expect( events.filter( ( event ) => event.type === 'turn.terminal' ) ).toEqual( [
 			expect.objectContaining( { outcome: expect.objectContaining( { status: 'error' } ) } ),
 		] );
@@ -1971,9 +1989,12 @@ it( 'reports no success and keeps the run lock when the owned tree cannot be con
 	}
 } );
 
-it( 'sends no prompt to a native process whose tree could not be owned (mock SDK)', async () => {
+it( 'sends no prompt to a native process it could not put in the job, and says why (mock SDK)', async () => {
 	const { runClaudeTurn } = await import( '../runtime' );
-	const fixture = await ownedNativeFixture( 'claude-unowned-', { ready: false } );
+	const fixture = await ownedNativeFixture( 'claude-unowned-', {
+		ready: false,
+		failure: 'job-assignment-denied',
+	} );
 	try {
 		const onTurn = vi.fn( async () => 'result' as const );
 		const events: Array< { type: string; outcome?: { status: string } } > = [];
@@ -1993,20 +2014,74 @@ it( 'sends no prompt to a native process whose tree could not be owned (mock SDK
 					fixture.root,
 					onTurn
 				) as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-				spawnOwned: fixture.spawnOwned,
+				prepareOwner: fixture.prepareOwner,
 				connection: fixture.connection,
 				prepare: fixture.prepare,
 				account: fixture.account,
 			}
 		);
 		expect( onTurn ).not.toHaveBeenCalled();
-		expect( fixture.order ).toEqual( [ 'owned-ready', 'owned-shutdown' ] );
+		expect( fixture.order ).toEqual( [ 'owner-prepared', 'owned-ready', 'owned-shutdown' ] );
 		expect( events ).toEqual( [
 			expect.objectContaining( {
 				type: 'turn.terminal',
-				outcome: expect.objectContaining( { status: 'error' } ),
+				outcome: expect.objectContaining( {
+					status: 'error',
+					code: 'process_unowned',
+					message: expect.stringContaining( 'job object' ),
+				} ),
 			} ),
 		] );
+	} finally {
+		await fixture.cleanup();
+	}
+} );
+
+it( 'starts no native process when the job cannot be prepared, and says why (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createNativeSessionStore } = await import( '../sessions' );
+	const fixture = await ownedNativeFixture( 'claude-unprepared-', {
+		prepared: false,
+		failure: 'keeper-unavailable',
+	} );
+	try {
+		const query = spawningNativeTurn( fixture.root, async () => 'result' );
+		const events: Array< { type: string; outcome?: { status: string } } > = [];
+		await runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'turn' ),
+			fixture.host,
+			{
+				prompt: 'hello',
+				signal: new AbortController().signal,
+				onEvent: ( event ) => events.push( event ),
+			},
+			{
+				storeRoot: fixture.storeRoot,
+				approve: async () => 'deny',
+				verifyTarget: async () => true,
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				prepareOwner: fixture.prepareOwner,
+				connection: fixture.connection,
+				prepare: fixture.prepare,
+				account: fixture.account,
+			}
+		);
+		expect( query ).not.toHaveBeenCalled();
+		expect( fixture.spawnOwned ).not.toHaveBeenCalled();
+		expect( fixture.order ).toEqual( [ 'owner-prepared', 'owner-disposed' ] );
+		expect( events ).toEqual( [
+			expect.objectContaining( {
+				type: 'turn.terminal',
+				outcome: expect.objectContaining( {
+					status: 'error',
+					code: 'process_unowned',
+					message: expect.stringContaining( 'Full Language mode' ),
+				} ),
+			} ),
+		] );
+		await (
+			await createNativeSessionStore( fixture.storeRoot ).lockTurn( 'chat' )
+		)();
 	} finally {
 		await fixture.cleanup();
 	}

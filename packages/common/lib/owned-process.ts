@@ -153,13 +153,35 @@ export async function checkProcessIdentity(
 	return found.state === 'running' && found.start === identity.start ? 'alive' : 'gone';
 }
 
+/** Why Studio could not take ownership of a process tree. */
+export type OwnershipFailure =
+	/** The Windows keeper did not start: PowerShell or Add-Type failed or was blocked. */
+	| 'keeper-unavailable'
+	/** Windows could not create the job object. */
+	| 'job-unavailable'
+	/** The keeper could not open the process. */
+	| 'process-unavailable'
+	/** The process exited before its ownership was confirmed. */
+	| 'process-exited'
+	/** Windows refused to put the process in the job (access denied). */
+	| 'job-assignment-denied'
+	| 'job-assignment-failed'
+	/** The job could not be limited, or the process is not shown in it. */
+	| 'job-unverified'
+	/** The process already had a child outside the job when it was assigned. */
+	| 'job-incomplete'
+	/** POSIX: the process's start identity could not be read. */
+	| 'identity-unavailable'
+	/** POSIX: the supervisor or its keeper did not start. */
+	| 'supervisor-unavailable';
+
 export interface OwnedProcessOptions {
 	cwd?: string;
 	env: NodeJS.ProcessEnv;
 	/**
-	 * Runs the keeper under a detached supervisor, which ends the owned tree if
-	 * this process dies before shutting it down. The supervisor runs on
-	 * `nodePath`. Without it, the tree is ended only by `shutdown`.
+	 * POSIX: runs a detached supervisor, on `nodePath`, that ends the group if
+	 * this process dies before shutting it down. Windows needs none: the job
+	 * ends with this process.
 	 */
 	supervise?: boolean;
 }
@@ -167,33 +189,49 @@ export interface OwnedProcessOptions {
 export interface OwnedProcess {
 	readonly child: ChildProcessWithoutNullStreams;
 	/**
-	 * Resolves true once the child's identity is verified and its keeper or
-	 * supervisor runs; false when any of them could not be established.
+	 * Resolves true once the child's identity is verified and the child is
+	 * owned (in the job on Windows; supervised on POSIX when asked for);
+	 * false when that could not be established, with `failure` saying why.
 	 */
 	ready(): Promise< boolean >;
+	failure(): OwnershipFailure | undefined;
 	/** The child's verified identity. */
 	identity(): ProcessIdentity | undefined;
 	/** The owned processes alive now, and whether any could not be decided. */
 	inspect(): Promise< { live: ProcessIdentity[]; uncertain: boolean } >;
 	/** Ends the child's input and, on POSIX, sends SIGTERM to its group. */
 	requestShutdown(): Promise< void >;
-	/** Whether the child (and on POSIX its whole group) exited within the bound. */
+	/** Whether the child and everything owned with it exited within the bound. */
 	waitForExit( timeoutMs: number ): Promise< boolean >;
 	/** Kills whatever remains of the owned tree; true only when nothing owned is left. */
 	terminate( timeoutMs?: number ): Promise< boolean >;
 	/**
 	 * `requestShutdown`, `waitForExit( graceMs )`, then `terminate`. Lets the
-	 * keeper and supervisor go only when the tree is gone, so they still act if not.
+	 * keeper or supervisor go only when the tree is gone, so it still acts if not.
 	 */
 	shutdown( options?: { graceMs?: number; timeoutMs?: number } ): Promise< boolean >;
 }
 
+/**
+ * Ownership made ready before the process exists. On Windows its keeper
+ * creates the job first, so the process is assigned within moments of its
+ * creation; on POSIX there is nothing to prepare.
+ */
+export interface ProcessOwner {
+	prepared(): Promise< boolean >;
+	failure(): OwnershipFailure | undefined;
+	/** Spawns the one process this owner owns. */
+	spawn( command: string, args: readonly string[], options: OwnedProcessOptions ): OwnedProcess;
+	/** Ends the keeper of an owner that never spawned. */
+	dispose(): Promise< void >;
+}
+
 const SUPERVISOR_LABEL = 'studio-owned-process-supervisor';
 
-// The supervisor reads one line naming its keeper, starts it and relays lines
-// both ways. A `release` line lets both end quietly. The end of its input,
-// which the OS delivers whenever Studio's process exits, tells the keeper
-// `gone`, so it ends the tree first.
+// The POSIX supervisor reads one line naming its keeper, starts it and relays
+// lines both ways. A `release` line lets both end quietly. The end of its
+// input, which the OS delivers whenever Studio's process exits, tells the
+// keeper `gone`, so it ends the group first.
 const SUPERVISOR_SOURCE = [
 	"'use strict';",
 	"const { spawn } = require( 'child_process' );",
@@ -231,13 +269,8 @@ const SUPERVISOR_SOURCE = [
 	"process.stdin.on( 'error', () => end( true ) );",
 ].join( '\n' );
 
-function supervisorEnvironment( seams: OwnedProcessSeams ): NodeJS.ProcessEnv {
-	const env: NodeJS.ProcessEnv =
-		seams.platform === 'win32'
-			? Object.fromEntries(
-					Object.entries( seams.env ).filter( ( [ name ] ) => name.toUpperCase() === 'SYSTEMROOT' )
-			  )
-			: { PATH: '/usr/bin:/bin' };
+function supervisorEnvironment(): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = { PATH: '/usr/bin:/bin' };
 	if ( process.versions.electron ) env.ELECTRON_RUN_AS_NODE = '1';
 	return env;
 }
@@ -307,7 +340,8 @@ function converse( helper: ChildProcessByStdio< Writable, Readable, null > ) {
 	}
 
 	return {
-		helper,
+		/** Whether the helper has exited. */
+		ended: () => ended,
 		send( line: string ) {
 			try {
 				helper.stdin.write( line + '\n' );
@@ -330,13 +364,13 @@ function converse( helper: ChildProcessByStdio< Writable, Readable, null > ) {
 			turn = asked.then( () => undefined );
 			return asked;
 		},
-		/** Stops the keeper (and supervisor) from keeping this process alive. */
+		/** Stops the helper from keeping this process alive. */
 		detach() {
 			helper.unref();
 			( helper.stdin as unknown as Unreferenced ).unref?.();
 			( helper.stdout as unknown as Unreferenced ).unref?.();
 		},
-		/** Lets the keeper end without touching the tree. */
+		/** Ends the helper, which closes whatever it holds. */
 		async release() {
 			if ( helper.exitCode !== null || helper.signalCode !== null ) return;
 			const gone = exitedWithin( helper, 5_000 );
@@ -352,19 +386,71 @@ function converse( helper: ChildProcessByStdio< Writable, Readable, null > ) {
 	};
 }
 
+type Conversation = ReturnType< typeof converse >;
+
+const WINDOWS_FAILURES: ReadonlyArray< [ RegExp, OwnershipFailure ] > = [
+	[ /^failed open /, 'process-unavailable' ],
+	[ /^failed assign 5 /, 'job-assignment-denied' ],
+	[ /^failed assign /, 'job-assignment-failed' ],
+	[ /^failed (limit|verify) /, 'job-unverified' ],
+	[ /^failed outside /, 'job-incomplete' ],
+];
+
 /**
- * Spawns `command` as an owned process. On POSIX it leads a new session and
- * process group. On Windows it stays in the job object Node puts its children
- * in, so the OS ends it with this process, and a keeper tracks its
- * descendants (see owned-process-windows).
+ * Prepares ownership for one process. On Windows this starts the keeper, which
+ * creates the job; `prepared` resolves once it exists.
  */
-export function spawnOwnedProcess(
+export function prepareProcessOwner( overrides: Partial< OwnedProcessSeams > = {} ): ProcessOwner {
+	const seams = seamsWith( overrides );
+	let keeper: Conversation | undefined;
+	let failure: OwnershipFailure | undefined;
+	let prepared: Promise< boolean > = Promise.resolve( true );
+	if ( seams.platform === 'win32' ) {
+		try {
+			const helper = windowsKeeperCommand( seams );
+			keeper = converse(
+				seams.spawn( helper.command, helper.args, {
+					env: helper.env,
+					stdio: [ 'pipe', 'pipe', 'ignore' ],
+					windowsHide: true,
+				} )
+			);
+			keeper.detach();
+			prepared = keeper.ask( undefined, /^(prepared|failed .*)$/, 60_000 ).then( ( replies ) => {
+				const last = replies?.at( -1 );
+				if ( last === 'prepared' ) return true;
+				failure = last?.startsWith( 'failed job ' ) ? 'job-unavailable' : 'keeper-unavailable';
+				return false;
+			} );
+		} catch {
+			failure = 'keeper-unavailable';
+			prepared = Promise.resolve( false );
+		}
+	}
+	let used = false;
+	return {
+		prepared: () => prepared,
+		failure: () => failure,
+		spawn( command, args, options ) {
+			if ( used ) throw new Error( 'An owner owns one process' );
+			used = true;
+			return ownProcess( command, args, options, seams, keeper, prepared, () => failure );
+		},
+		async dispose() {
+			if ( ! used ) await keeper?.release();
+		},
+	};
+}
+
+function ownProcess(
 	command: string,
 	args: readonly string[],
 	options: OwnedProcessOptions,
-	overrides: Partial< OwnedProcessSeams > = {}
+	seams: OwnedProcessSeams,
+	jobKeeper: Conversation | undefined,
+	prepared: Promise< boolean >,
+	preparationFailure: () => OwnershipFailure | undefined
 ): OwnedProcess {
-	const seams = seamsWith( overrides );
 	const windows = seams.platform === 'win32';
 	const child = seams.spawn( command, [ ...args ], {
 		cwd: options.cwd,
@@ -377,63 +463,101 @@ export function spawnOwnedProcess(
 	child.once( 'error', () => {} );
 	// Until this process reaps the child, its PID cannot name any other process.
 	const unreaped = () => ! failed && child.exitCode === null && child.signalCode === null;
+	// The keeper reads this once its job exists, and assigns at once.
+	if ( jobKeeper && child.pid ) jobKeeper.send( `own ${ child.pid }` );
 
 	let identity: ProcessIdentity | undefined;
-	let keeper: ReturnType< typeof converse > | undefined;
+	let failure: OwnershipFailure | undefined;
+	let keeper: Conversation | undefined = jobKeeper;
+	// Windows: whether the keeper holds a handle to the child, and whether it
+	// put the child in the job after Studio confirmed it was its own.
+	let opened = false;
+	let confirmed = false;
 
-	function startKeeper( helper: {
-		command: string;
-		args: string[];
-		env: NodeJS.ProcessEnv;
-		timeout: number;
-	} ) {
-		if ( ! options.supervise )
-			return converse(
-				seams.spawn( helper.command, helper.args, {
-					env: helper.env,
+	async function establishWindows( pid: number ): Promise< boolean > {
+		if ( ! keeper || ! ( await prepared ) ) {
+			failure = preparationFailure() ?? 'keeper-unavailable';
+			return false;
+		}
+		const assigned = (
+			await keeper.ask( undefined, /^(assigned \d{1,19}|failed .*)$/, 30_000 )
+		)?.at( -1 );
+		const start = /^assigned (\d{1,19})$/.exec( assigned ?? '' )?.[ 1 ];
+		opened = !! start || /^failed assign \d+ \d+$/.test( assigned ?? '' );
+		if ( ! start ) {
+			failure =
+				WINDOWS_FAILURES.find( ( [ pattern ] ) => pattern.test( assigned ?? '' ) )?.[ 1 ] ??
+				'keeper-unavailable';
+			return false;
+		}
+		// The keeper opened the PID while this process had not reaped the child,
+		// so the handle is the child's. Otherwise nothing proves it: the keeper
+		// ends without having set kill-on-close, so it kills nothing.
+		if ( ! unreaped() ) {
+			failure = 'process-exited';
+			opened = false;
+			await keeper.release();
+			keeper = undefined;
+			return false;
+		}
+		const ready = (
+			await keeper.ask( 'confirm', /^(ready \d{1,19} in-job|failed .*)$/, 30_000 )
+		)?.at( -1 );
+		// Kill-on-close is set unless the keeper said otherwise or went quiet.
+		confirmed = !! ready && ! ready.startsWith( 'failed limit ' );
+		if ( ready !== `ready ${ start } in-job` ) {
+			failure =
+				WINDOWS_FAILURES.find( ( [ pattern ] ) => pattern.test( ready ?? '' ) )?.[ 1 ] ??
+				'keeper-unavailable';
+			return false;
+		}
+		identity = { pid, start };
+		return true;
+	}
+
+	async function establishPosix( pid: number ): Promise< boolean > {
+		const found = await probe( pid, seams );
+		if ( found.state !== 'running' || ! unreaped() ) {
+			failure = found.state === 'running' ? 'process-exited' : 'identity-unavailable';
+			return false;
+		}
+		if ( options.supervise ) {
+			const supervisor = converse(
+				seams.spawn( seams.nodePath, [ '-e', SUPERVISOR_SOURCE, SUPERVISOR_LABEL ], {
+					detached: true,
 					stdio: [ 'pipe', 'pipe', 'ignore' ],
 					windowsHide: true,
+					env: supervisorEnvironment(),
 				} )
 			);
-		const supervisor = converse(
-			seams.spawn( seams.nodePath, [ '-e', SUPERVISOR_SOURCE, SUPERVISOR_LABEL ], {
-				detached: true,
-				stdio: [ 'pipe', 'pipe', 'ignore' ],
-				windowsHide: true,
-				env: supervisorEnvironment( seams ),
-			} )
-		);
-		supervisor.send( JSON.stringify( helper ) );
-		return supervisor;
+			keeper = supervisor;
+			supervisor.send( JSON.stringify( posixKeeperCommand( pid, found.start ) ) );
+			if (
+				( await supervisor.ask( undefined, /^(ready|failed)$/, 30_000 ) )?.at( -1 ) !== 'ready'
+			) {
+				failure = 'supervisor-unavailable';
+				await supervisor.release();
+				keeper = undefined;
+				return false;
+			}
+			supervisor.detach();
+		}
+		if ( ! unreaped() ) {
+			failure = 'process-exited';
+			return false;
+		}
+		identity = { pid, start: found.start };
+		return true;
 	}
 
 	const established = ( async () => {
 		const pid = child.pid;
-		if ( ! pid || ! unreaped() ) return false;
-		let start: string | undefined;
-		if ( windows ) {
-			keeper = startKeeper( windowsKeeperCommand( pid, seams ) );
-			const replies = await keeper.ask( undefined, /^(ready \d{1,19}|failed)$/, 30_000 );
-			start = /^ready (\d{1,19})$/.exec( replies?.at( -1 ) ?? '' )?.[ 1 ];
-		} else {
-			const found = await probe( pid, seams );
-			if ( found.state === 'running' ) start = found.start;
-			if ( start && unreaped() && options.supervise ) {
-				keeper = startKeeper( posixKeeperCommand( pid, start ) );
-				if ( ( await keeper.ask( undefined, /^(ready|failed)$/, 30_000 ) )?.at( -1 ) !== 'ready' )
-					start = undefined;
-			}
-		}
-		// Read while this process had not reaped the child, so the PID could not name another process.
-		if ( ! start || ! unreaped() ) {
-			await keeper?.release();
-			keeper = undefined;
-			return false;
-		}
-		identity = { pid, start };
-		keeper?.detach();
-		return true;
-	} )().catch( () => false );
+		if ( ! pid ) return false;
+		return windows ? establishWindows( pid ) : establishPosix( pid );
+	} )().catch( () => {
+		failure ??= windows ? 'keeper-unavailable' : 'identity-unavailable';
+		return false;
+	} );
 
 	// POSIX: signals the child's group, if it is still the child's. 'empty'
 	// when the group no longer exists, 'unknown' when that cannot be told.
@@ -469,7 +593,15 @@ export function spawnOwnedProcess(
 	async function waitForExit( timeoutMs: number ): Promise< boolean > {
 		const deadline = seams.now() + timeoutMs;
 		if ( ! failed && ! ( await exitedWithin( child, timeoutMs ) ) ) return false;
-		if ( windows ) return true;
+		if ( windows ) {
+			if ( ! keeper || ! identity ) return true;
+			while ( true ) {
+				const count = ( await keeper.ask( 'active', /^active -?\d+$/, 10_000 ) )?.at( -1 );
+				if ( count === 'active 0' ) return true;
+				if ( ! count || seams.now() >= deadline ) return false;
+				await seams.delay( 50 );
+			}
+		}
 		let state = await signalGroup( 0 );
 		while ( state === 'sent' && seams.now() < deadline ) {
 			await seams.delay( 50 );
@@ -478,21 +610,41 @@ export function spawnOwnedProcess(
 		return state === 'empty';
 	}
 
+	// Windows: whether the child's live children, in the job or not, are none.
+	async function noChildren(): Promise< boolean > {
+		if ( ! keeper || ! opened ) return false;
+		return (
+			( await keeper.ask( 'children', /^children -?\d+$/, 20_000 ) )?.at( -1 ) === 'children 0'
+		);
+	}
+
+	async function terminateWindows( timeoutMs: number ): Promise< boolean > {
+		if ( confirmed && keeper ) {
+			const reaped = (
+				await keeper.ask(
+					`reap ${ Math.max( 0, Math.round( timeoutMs ) ) }`,
+					/^reaped (clean|dirty)$/,
+					timeoutMs + 30_000
+				)
+			)?.at( -1 );
+			// A keeper that has ended closed the job, and kill-on-close ended
+			// everything in it; what is left to see is the child itself.
+			if ( ! reaped && keeper.ended() ) return !! identity && exitedWithin( child, 5_000 );
+			if ( reaped !== 'reaped clean' ) return false;
+			if ( identity ) return true;
+		}
+		// The child is not, or not provably, in a kill-on-close job: only the
+		// child itself can be ended, through this process's own handle, and
+		// then its children must be none.
+		if ( unreaped() ) child.kill( 'SIGKILL' );
+		await exitedWithin( child, 5_000 );
+		return noChildren();
+	}
+
 	async function terminate( timeoutMs = 10_000 ): Promise< boolean > {
 		if ( failed ) return true;
 		await established;
-		if ( windows ) {
-			if ( ! identity || ! keeper ) {
-				if ( unreaped() ) child.kill( 'SIGKILL' );
-				return false;
-			}
-			const replies = await keeper.ask(
-				`reap ${ Math.max( 0, Math.round( timeoutMs ) ) }`,
-				/^reaped (clean|dirty)$/,
-				timeoutMs + 30_000
-			);
-			return replies?.at( -1 ) === 'reaped clean';
-		}
+		if ( windows ) return terminateWindows( timeoutMs );
 		const deadline = seams.now() + timeoutMs;
 		let state = await signalGroup( 'SIGKILL' );
 		while ( state === 'sent' && seams.now() < deadline ) {
@@ -515,7 +667,7 @@ export function spawnOwnedProcess(
 				const found = /^live (\d+) (\d{1,19})$/.exec( line );
 				if ( found ) live.push( { pid: Number( found[ 1 ] ), start: found[ 2 ] } );
 			}
-			return { live, uncertain: replies.some( ( line ) => line.startsWith( 'uncertain ' ) ) };
+			return { live, uncertain: replies.includes( 'uncertain' ) };
 		}
 		const state = await signalGroup( 0 );
 		if ( state !== 'sent' ) return { live: [], uncertain: state === 'unknown' };
@@ -533,6 +685,7 @@ export function spawnOwnedProcess(
 	return {
 		child,
 		ready: () => established,
+		failure: () => failure,
 		identity: () => identity,
 		inspect,
 		requestShutdown,
@@ -542,7 +695,10 @@ export function spawnOwnedProcess(
 			await requestShutdown();
 			await waitForExit( graceMs );
 			const clean = await terminate( timeoutMs );
-			if ( clean ) {
+			// Releasing the Windows keeper closes the job, which ends anything
+			// still in it once kill-on-close is set; a POSIX supervisor is kept
+			// to try again when this process exits.
+			if ( clean || windows ) {
 				await keeper?.release();
 				keeper = undefined;
 			}

@@ -62,9 +62,11 @@ export interface BackendTurnOutcome {
 	/**
 	 * Why the turn stopped, for an app to explain in its own words:
 	 * `account_changed` when the native sign-in became another account or none,
-	 * `account_unverified` when it could not be read.
+	 * `account_unverified` when it could not be read, `process_unowned` when
+	 * Studio could not take ownership of the native process tree, so nothing
+	 * was sent.
 	 */
-	code?: 'rebind_required' | 'account_changed' | 'account_unverified';
+	code?: 'rebind_required' | 'account_changed' | 'account_unverified' | 'process_unowned';
 }
 
 interface ContentBlock {

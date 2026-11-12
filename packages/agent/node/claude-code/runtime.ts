@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
-import { spawnOwnedProcess } from '@studio/common/lib/owned-process';
+import { prepareProcessOwner } from '@studio/common/lib/owned-process';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
 import {
 	isClaudeEffort,
@@ -43,7 +43,11 @@ import type {
 } from '@studio/agent/protocol/backend-events';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type { ClaudeModelOption, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
-import type { OwnedProcess } from '@studio/common/lib/owned-process';
+import type {
+	OwnedProcess,
+	OwnershipFailure,
+	ProcessOwner,
+} from '@studio/common/lib/owned-process';
 
 interface StartupControl {
 	initializationResult(): Promise< {
@@ -200,8 +204,8 @@ interface RuntimeDependencies {
 	/** The native sign-in now, read with the prepared binary from the runtime's own status. */
 	account?: ( request: ClaudeAccountStatusRequest ) => Promise< ClaudeAccountStatus >;
 	clock?: () => number;
-	/** Starts the native process as an owned process tree. */
-	spawnOwned?: typeof spawnOwnedProcess;
+	/** Prepares the ownership the native process is started under. */
+	prepareOwner?: () => ProcessOwner;
 }
 
 interface RuntimeOptions extends RuntimeDependencies {
@@ -224,7 +228,7 @@ async function findSavedConnection( id: string ) {
 function nativeLaunchOptions(
 	prepared: Extract< Prepared, { ok: true } >,
 	controller: AbortController,
-	launch: { spawnOwned?: typeof spawnOwnedProcess; supervise: boolean },
+	launch: { owner: ProcessOwner; supervise: boolean },
 	onOwned: ( owned: OwnedProcess ) => void
 ): Options {
 	const env = { ...prepared.env, CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1' };
@@ -243,15 +247,11 @@ function nativeLaunchOptions(
 				! isClaudeExecutableUnchanged( prepared.executableIdentity )
 			)
 				throw new Error( 'Unexpected native process invocation' );
-			const owned = ( launch.spawnOwned ?? spawnOwnedProcess )(
-				invocation.command,
-				invocation.args,
-				{
-					cwd: invocation.cwd,
-					env: invocation.env,
-					supervise: launch.supervise,
-				}
-			);
+			const owned = launch.owner.spawn( invocation.command, invocation.args, {
+				cwd: invocation.cwd,
+				env: invocation.env,
+				supervise: launch.supervise,
+			} );
 			onOwned( owned );
 			// The SDK aborts this once it stops waiting for the process to exit;
 			// escalation stays with the owned shutdown, within the owned tree.
@@ -313,6 +313,16 @@ async function qualifyWithinDeadline(
 	}
 }
 
+function unownedMessage( failure: OwnershipFailure | undefined ): string {
+	const reason =
+		failure === 'keeper-unavailable'
+			? ' Windows PowerShell could not run its process keeper, which needs Full Language mode.'
+			: failure?.startsWith( 'job-' )
+			? ' Windows did not let Studio put Claude Code in a job object it controls.'
+			: '';
+	return `Studio could not take ownership of the Claude Code process, so nothing was sent.${ reason }`;
+}
+
 export async function discoverClaudeModels(
 	connectionId: string,
 	workingDirectory: string,
@@ -320,6 +330,7 @@ export async function discoverClaudeModels(
 ) {
 	const failed = { ok: false as const, blockers: [ 'native-runtime-unqualified' ] };
 	const controller = new AbortController();
+	let owner: ProcessOwner | undefined;
 	let owned: OwnedProcess | undefined;
 	let sdk: ReturnType< typeof sdkQuery > | undefined;
 	let server: ReturnType< typeof createStudioClaudeMcpServer > | undefined;
@@ -347,21 +358,18 @@ export async function discoverClaudeModels(
 		);
 		if ( ! prepared.ok )
 			return { ok: false as const, blockers: prepared.blockers ?? failed.blockers };
+		owner = ( dependencies.prepareOwner ?? prepareProcessOwner )();
+		if ( ! ( await owner.prepared() ) ) return failed;
 		server = createStudioClaudeMcpServer( async () => ( { content: [], isError: true } ) );
 		sdk = ( dependencies.query ?? sdkQuery )( {
 			prompt: { [ Symbol.asyncIterator ]: () => ( { next: () => done } ) },
 			options: {
 				// Discovery sends no prompt, so nothing it starts can run a tool; it
 				// also runs in the Desktop's main process, which is not a Node binary
-				// a supervisor could run on.
-				...nativeLaunchOptions(
-					prepared,
-					controller,
-					{ spawnOwned: dependencies.spawnOwned, supervise: false },
-					( started ) => {
-						owned = started;
-					}
-				),
+				// a POSIX supervisor could run on.
+				...nativeLaunchOptions( prepared, controller, { owner, supervise: false }, ( started ) => {
+					owned = started;
+				} ),
 				persistSession: false,
 				mcpServers: { studio: server },
 				hooks: {
@@ -393,7 +401,9 @@ export async function discoverClaudeModels(
 			result = failed;
 		}
 		try {
-			if ( owned && ! ( await owned.shutdown() ) ) result = failed;
+			if ( owned ) {
+				if ( ! ( await owned.shutdown() ) ) result = failed;
+			} else await owner?.dispose();
 			await server?.instance.close();
 		} catch {
 			result = failed;
@@ -430,6 +440,16 @@ export async function runClaudeTurn(
 			message,
 		},
 	} );
+	const unowned = ( failure: OwnershipFailure | undefined ): TerminalEvent => ( {
+		type: 'turn.terminal',
+		runId,
+		turnId,
+		outcome: {
+			status: 'error',
+			code: 'process_unowned',
+			message: unownedMessage( failure ),
+		},
+	} );
 	const controller = new AbortController();
 	let policy: ReturnType< typeof createClaudeExecutionPolicy > | undefined;
 	// Stopping first makes the policy refuse every new operation and end every
@@ -442,6 +462,7 @@ export async function runClaudeTurn(
 	const timer = setTimeout( cancel, 30 * 60 * 1000 );
 	let release: ( () => Promise< void > ) | undefined;
 	let native: ReturnType< typeof sdkQuery > | undefined;
+	let owner: ProcessOwner | undefined;
 	let owned: OwnedProcess | undefined;
 	let bridge: ReturnType< typeof createStudioClaudeToolBridge > | undefined;
 	let openGate: ( allow: boolean ) => void = () => {};
@@ -536,6 +557,8 @@ export async function runClaudeTurn(
 			}
 			targetSite = { id: target.siteId, path: sitePath, url: site.url };
 		}
+		// Prepared now, so the job exists by the time the native process starts.
+		owner = ( options.prepareOwner ?? prepareProcessOwner )();
 		const clock = options.clock ?? Date.now;
 		const accountVerifiedAt = clock();
 		const prepared = await ( options.prepare ?? prepareClaudeInvocation )(
@@ -714,13 +737,18 @@ export async function runClaudeTurn(
 		};
 		const effort = snapshot.effort;
 		if ( ! isClaudeEffort( effort ) ) throw new Error();
+		if ( ! ( await owner.prepared() ) ) {
+			terminal = unowned( owner.failure() );
+			return;
+		}
+		const processOwner = owner;
 		native = ( options.query ?? sdkQuery )( {
 			prompt: nativeInput(),
 			options: {
 				...nativeLaunchOptions(
 					prepared,
 					controller,
-					{ spawnOwned: options.spawnOwned, supervise: true },
+					{ owner: processOwner, supervise: true },
 					( started ) => {
 						owned = started;
 					}
@@ -785,7 +813,10 @@ export async function runClaudeTurn(
 		if ( ! qualification.ok || controller.signal.aborted || ! ( await stillConnected() ) )
 			throw new Error();
 		// No prompt reaches a native process whose tree Studio could not take ownership of.
-		if ( owned && ! ( await owned.ready() ) ) throw new Error();
+		if ( owned && ! ( await owned.ready() ) ) {
+			terminal = unowned( owned.failure() );
+			return;
+		}
 		if ( ! accountKey ) throw new Error();
 		if ( ! existing ) await store.create( session );
 		else if ( ! existing.accountKey )
@@ -861,6 +892,7 @@ export async function runClaudeTurn(
 		let stopped = true;
 		try {
 			if ( owned ) stopped = await owned.shutdown();
+			else await owner?.dispose();
 		} catch {
 			stopped = false;
 		}
