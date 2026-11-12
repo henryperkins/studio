@@ -202,7 +202,7 @@ Required evidence per cell, from the spec: native account lifecycle; authenticat
 
 | # | Provider | Platform cell | Runner | Owner | Status | Test/eval | Evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| C1 | ChatGPT | Windows x64 | This machine (Windows 11 x64) | G3, P3, P4 | partial. Saved-account live run `live-passed`; session-only live `failed`; packaging claimed at an earlier SHA, not re-verified. Native Credential Manager qualification not recorded for `4ae1e38da`. | none yet beyond A-section tests | Section 2 |
+| C1 | ChatGPT | Windows x64 | This machine (Windows 11 x64) | G3, P3, P4 | partial. Saved-account live run `live-passed`; session-only live `failed`; packaging claimed at an earlier SHA, not re-verified. Native Credential Manager qualification not recorded for `4ae1e38da`. P4a (`4cd82cec9`): credential-free build, static inspection and standalone `--version`/`--help` probe done; unsigned; install, launch, authenticated runs and Desktop e2e open. | none yet beyond A-section tests | Section 2; P4a record below |
 | C2 | ChatGPT | Windows ARM64 | no runner assigned: scheduling blocker | P1, P3, P4 | blocked | none yet | none yet |
 | C3 | ChatGPT | macOS x64 | no runner assigned: scheduling blocker | P3, P4 | blocked | none yet | none yet |
 | C4 | ChatGPT | macOS ARM64 | no runner assigned: scheduling blocker | P3, P4 | blocked | none yet | none yet |
@@ -270,6 +270,71 @@ ChatGPT native storage and browser sign-in, offline part. Commits `ffef17540`, `
   - **R2, "nothing saved" is not trusted while saved sign-ins exist** (`packages/agent/node/chatgpt/credential-broker.ts`, every platform). A keychain that has no key for records it should open gives `vault-key-unreadable`: the record and the signed-in state are kept, a new "Secure storage" save is refused without writing a key, "This app session" still works when chosen, the kept record opens again once the keychain answers, and a new key is made only after every saved registration (one Studio lists) is signed out. A record that fails to open with a readable key is still cleared. Pinned through the real store and its process seam on darwin, linux and win32 in `node/chatgpt/tests/credential-store-failures.test.ts`, after a characterization run showed the old behavior: record cleared, registration flipped to `needs-sign-in`, and the next secure save replacing the key so the other saved registration was lost too.
   - Also: a timed-out keychain tool is reported as such (`SecureStorageError.timedOut`), the acceptance runner takes the keychain kind from the store, `/chatgpt` tells Linux users what keeping a sign-in needs, the README's Windows cleanup names the run's own service, and its manual Linux check records what a dismissed unlock prompt returns and that nothing is cleared or overwritten.
 - **Remaining live, per platform (C1-C6):** the two native test files (the vault file's lost-key test now expects `vault-key-unreadable`, a kept record and a new key only after sign-out); the manual Linux lock check, now also confirming R2 and R4; on Linux, the listener's owner check (a same-user browser, Snap or Flatpak included, accepted; a second local account refused, and its eight held connections neither served past the cap nor using the address up; the tables kept open and re-read, and `Max open files` recorded for the Desktop main process, the CLI and the `studio ui` server; WSL2 in NAT and in mirrored networking mode; `wc -c /proc/net/tcp /proc/net/tcp6` on a typical and a busy machine, and a sign-in on one whose table is larger than one page; WSL1 and gVisor, whose `/proc` is emulated; a reload after a "couldn't check" page completing the sign-in), per the README; a real browser following the local `302` with ChatGPT's page loading without a `Referer`; on macOS, a secure sign-in whose preflight keychain read is cancelled at its prompt (saved records present); G3's `saved` and `session` scenarios with that platform's keychain, GUI and headless separately; browser sign-in on the platform, now through the start address (a real browser following the local redirect, on each OS). Status `offline-tested`. **No platform cell is qualified and no live gate is passed by this record.**
+
+### P4a record: Windows x64, ChatGPT provider, credential-free (November 12, 2026)
+
+**Evidence level reached: credential-free build and static-inspection evidence, plus a lower-level probe (`--version`, `--help`) of the standalone CLI. This is NOT qualification.** Not done, each open: any authenticated run (native Credential Manager storage, sign-in, read/draft/readback/resume, cancel/recovery), installing or updating the app, launching the packaged Desktop app, uninstall behavior, the Desktop and browser end-to-end tests in light and dark, and the other five platform targets. Those need the account owner's consent and a disposable profile or machine; this machine also has the upstream Studio installed, and running the installer or the packaged app would collide with it (same Squirrel id, single-instance lock, `%APPDATA%\Studio`, `wp-studio://` handler). Any later code change invalidates the build evidence below; rebuild and rerun the affected steps.
+
+| Field | Value |
+| --- | --- |
+| Provider | ChatGPT plan (`chatgpt-oauth`), experimental flag `STUDIO_EXPERIMENTAL_CHATGPT` |
+| Source SHA | `4cd82cec9fead10a316f60730415a307909092cb` (branch `add-chatgpt-plan-provider`; base `trunk` `8672a64e7`). The working tree had uncommitted documentation edits only (`docs/design-docs/chatgpt-provider.md`, `docs/superpowers/**`); no source file differed from the SHA. |
+| OS, architecture | Windows 11 Pro, 10.0.26320, x64 (`process.arch` `x64`, `PROCESSOR_ARCHITECTURE` `AMD64`), native (not emulated) |
+| Node / npm | 24.22.1 (`.nvmrc` 24.22.1) / 11.13.0 (the repository's pinned version); the Node binary bundled in both artifacts is also v24.22.1 |
+| SDK/runtime pair | Not applicable to this provider (no vendor runtime binary). The agent runtime is `@earendil-works/pi-ai`, `pi-coding-agent`, `pi-tui` 1.5.0 (same range in `apps/cli/package.json`); present in the bundled CLI `node_modules` of both artifacts. |
+| Environment | `DEV_CONFIG_DIR` and `STUDIO_PROCESS_MANAGER_HOME` pointing at an isolated folder under `%LOCALAPPDATA%` for every step; `OPENAI_API_KEY` unset; no `STUDIO_EXPERIMENTAL_*` variable in the main test run |
+
+**What ran (command, result, duration):**
+
+| Step | Command | Result |
+| --- | --- | --- |
+| Typecheck | `npm run typecheck` | exit 0, 1 m 08 s |
+| Knip | `npm run knip` | exit 0, 7 s (prints only configuration hints: seven redundant entry patterns in `apps/cli`'s `knip.json`; no unused files, exports or dependencies) |
+| ESLint | the files changed against `trunk` (151 `*.ts/tsx/js/jsx/mjs/cjs`, the workflow's `git diff --diff-filter=ACMR` list), `NODE_OPTIONS=--max-old-space-size=8192` | exit 0, 1 m 32 s, no findings |
+| Dependency ranges | `npx vitest run --config scripts/vitest.config.ts scripts/dependency-ranges.test.mjs --maxWorkers=2` | 1 passed, exit 0 |
+| Full tests | `npm test -- --maxWorkers=2 --tagsFilter='!e2e'` with `DEV_CONFIG_DIR` set | **12 failed, 6377 passed, 81 skipped** (6470 tests; 2 files failed, 519 passed, 12 skipped, 533 files), exit 1, 21 m 03 s. Both failing files are environment artifacts of `DEV_CONFIG_DIR` being set, see below. |
+| Flag-on routing | the workflow's seven `ROUTING_TESTS` files with `STUDIO_EXPERIMENTAL_CHATGPT=1`, `--tagsFilter='!e2e'` | 7 files, 144 tests passed, 14 s. Used a scratch config folder instead of the isolated one. |
+| Browser UI | `STUDIO_TARGET=local npm -w @studio/ui run build` | exit 0, 11 s |
+| CLI | `npm run cli:build` | exit 0, 21 s |
+| App package | `STUDIO_PACKAGE_FRESH=1 npm run make:windows-x64` | exit 0, 45 m 26 s; built in a temporary copy of the checkout (`package-in-isolation.ts`), artifacts moved back to `apps/studio/out`, temp copy removed. Disk free 105 GB before, 104 GB after. |
+| Standalone CLI | `node --experimental-strip-types scripts/create-standalone-bundle.ts win32 x64` | exit 0, 12 m 09 s |
+
+Deviation: `npm run cli:build:ui` failed at once under `cmd.exe` (npm runs scripts through `cmd.exe` even from Git Bash; `STUDIO_TARGET=local vite build` is not recognized). It was replaced, as the platform plan allows, by `STUDIO_TARGET=local npm -w @studio/ui run build` followed by `npm run cli:build`. The build `build:local` produces is therefore the same one; the `cli:build:ui` script itself was not run to completion.
+
+**Test failures and their classification (the run set `DEV_CONFIG_DIR`, as the dispatch directed):**
+
+- `packages/common/lib/tests/shared-config.test.ts`, 5 tests: the known failures that occur only with `DEV_CONFIG_DIR` set (that file mocks its paths). Re-run alone with `DEV_CONFIG_DIR` unset: 29 passed. Environment artifact.
+- `apps/cli/commands/tests/pull.test.ts`, 7 tests (`--path` pull, delta re-pull, essential-files pull, three "uncoded failure" step records, first-pull selective sync): all fail with "The specified directory is not added to Studio." Cause: the tests redirect `os.homedir()` to a fake home and seed `~/.studio/cli.json` there, but `getConfigDirectory()` (`packages/common/lib/well-known-paths.ts`) returns `DEV_CONFIG_DIR` first, so the seeded site record is never read. Failed again alone with `DEV_CONFIG_DIR` set; with it unset (and `USERPROFILE`/`HOME` pointed at an empty scratch folder so nothing could reach the real `~/.studio`) all 21 tests pass. Environment artifact, same class as the first; not a branch defect. Not an unchanged-base comparison (no other commit was checked out); it rests on reading the test and the path code. CI runs `npm test` with `DEV_CONFIG_DIR` unset, so this does not occur there.
+- No branch defect found. No source change was made.
+
+**Artifacts** (built from the SHA above; all paths relative to the checkout, all git-ignored):
+
+| Artifact | Size (bytes) | SHA-256 | Authenticode |
+| --- | --- | --- | --- |
+| `apps/studio/out/make/squirrel.windows/x64/studio-setup.exe` | 387,685,376 | `687b4b8bd8193ecf93224f097625b6ad9c2d10ebd82875cbd68c11a6634a3f9e` | NotSigned |
+| `apps/studio/out/make/squirrel.windows/x64/studio_app-2.1.1-full.nupkg` | 397,947,333 | `4843fe404fe611854cd600c72a4a4724c241d7d3339189355120a393bc70dc8b` | not applicable |
+| `apps/studio/out/make/squirrel.windows/x64/RELEASES` | 81 | `fb1d00d8e465e6bcaf8a3fa700958d7fdf45ea1ba54832a92bb39b9c4c5cb77d` | not applicable |
+| `apps/studio/out/Studio-win32-x64/Studio.exe` | 246,633,472 | `36d316d4a6727becae3a6e5ddfef8e9e799590aee3486515c388c1941e65c4d6` | NotSigned |
+| `.../Studio-win32-x64/resources/app.asar` | 66,396,159 | `8dc6367ae4b4e6ee2ada894e24ae09374f11b7571562e75482929cb3476bca17` | not applicable |
+| `.../resources/bin/studio-cli.exe` (launcher) | 57,529,683 | `5cacd9417825d49506c63bd551eed98d79926e8b48b1d4856d22036a3400a35b` | NotSigned |
+| `.../resources/bin/node.exe` (bundled Node 24.22.1) | 93,915,464 | `d702daa815eabbff763c7d3808e235cf031cf2ca70211b56847bc72f51e240e5` | Valid (Node.js publisher's own signature) |
+| `standalone-bundles/studio-cli-win32-x64.tgz` | 131,152,269 | `2c85c2b0e31f61c81f4ea3582862c4d7c315855cfdcf55a9dde4a31e1bf6110c` (matches the `.sha256` file the script wrote) | not applicable |
+
+Every Studio-built executable is **unsigned**. Nothing here is release-ready, and signing is recorded separately from functional readiness.
+
+**Statically inspected (extracted to a scratch folder or listed; nothing launched, installed or registered):**
+
+- The packaged CLI (`resources/cli`, 149 entries) and the standalone bundle's `cli/` contain the ChatGPT provider as bundled modules (`chatgpt-oauth` appears in 7 modules; `credential-broker`, `settings-store` among them) and the pi 1.5.0 agent packages plus `playwright`/`playwright-core` in `node_modules`. The app's main bundle (`dist/main/index.js` in `app.asar`, 7,172 files) holds the provider's Desktop side (`chatgpt-oauth`, `chatgpt-accounts`, `chatgpt-credentials`, `chatgpt-vault-key`).
+- Windows credential storage selects the `password-vault` adapter in the main bundle; the bundle contains no native keychain module, and none is expected on Windows. The Linux `secret-tool`/`libsecret-tools` code path exists but is only a Debian `recommends` (`apps/studio/forge.config.ts`); no `libsecret` or keychain helper binary is packaged, as expected on Windows. No `koffi` copy was left in the CLI bundle.
+- The experimental flag is read only from the environment (`process.env.STUDIO_EXPERIMENTAL_CHATGPT === "1"`) in both the CLI module and the main bundle, so it is **off by default** in both artifacts. There is no packaged configuration file that turns it on.
+- No credential, token, test profile, `.env*`, evidence file, `*.ndjson`, `shared.json`/`cli.json`/`app.json` or `.superpowers` content in the packaged tree, the asar listing or the standalone bundle (searched by name; asar entries matching "token" or "credential" are third-party library files only, such as `js-tokens` and a caniuse data file). Contents were not scanned for secret-shaped strings.
+- The package build is `rm`-then-`install:bundle` inside a temporary copy; it ran no installer, did not register a protocol handler and did not touch the installed upstream app. `packagerConfig.protocols` only writes macOS metadata.
+
+**Probed (lower evidence level), standalone CLI extracted to a scratch folder and run with its own `bin/node.exe cli/main.mjs`, isolated `DEV_CONFIG_DIR` (the built CLI honours it: `getConfigDirectory()` is the same code) and no sign-in:** `--version` printed `2.1.1` (exit 0, about 6 s); `--help` and `code --help` listed the commands, exit 0. With the flag off, `studio code --help` shows no ChatGPT surface, as designed. These commands also make the CLI's own update check over the network (it reported a newer upstream release); that is not a provider call. **No read-only ChatGPT connection-status command exists in the CLI** (the connection surface is `/chatgpt` inside the interactive chat and the acceptance runner, which needs `--live`), so no provider status probe was run. Before and after, the real `~/.studio` top-level listing and modification times were unchanged and no entry down to depth 3 was modified during the run; `~/Studio` was unchanged. (The depth-3 "before" snapshot file was overwritten by a name collision on this case-insensitive filesystem, so the comparison for depth 2-3 rests on the latest modification time in the "after" listing preceding the session start.)
+
+**Side effects on the checkout:** the standalone script deletes and reinstalls `apps/cli/node_modules` in place; it was backed up first and restored afterwards (identical to the backup). Built outputs (`apps/cli/dist`, `apps/studio/out`, `apps/studio/dist`, `apps/ui/dist`, `standalone-bundles`) are git-ignored and untracked files were not added.
+
+**Windows x64 ChatGPT cell (C1): P4a reached "credential-free build and static inspection; standalone CLI `--version`/`--help` probe". Not qualified.** The other five ChatGPT cells (C2-C6) stay open: no runner assigned (Windows ARM64 also needs its x64 PHP emulation exercised; Linux needs a Debian/Ubuntu glibc host; macOS needs native runners). Claude cells are out of scope for this record.
 
 ## D. Studio tool inventory (counted from code)
 
