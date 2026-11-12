@@ -1,7 +1,8 @@
-import { mkdtemp, realpath, rm } from 'fs/promises';
+import { createHash, randomUUID } from 'crypto';
+import { mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { createNativeSessionStore } from '../sessions';
 
 const dirs: string[] = [];
@@ -307,6 +308,126 @@ it( 'retains the run lock when its owner process exits without proving the nativ
 	await expect( createNativeSessionStore( dir ).lockTurn( 'chat' ) ).rejects.toThrow();
 	const files = await fs.readdir( dir );
 	expect( files.some( ( name ) => name.endsWith( '.json.lock' ) ) ).toBe( true );
+} );
+
+describe( 'the versioned run lock', () => {
+	const owner = { pid: 4321, start: '134389060548247995' };
+	const nativeSessionId = 'd8f40437-482c-4e07-8cac-2371e78bcaef';
+	const hash = ( value: string ) => createHash( 'sha256' ).update( value ).digest( 'hex' );
+	async function lockFixture() {
+		const dir = await realpath( await mkdtemp( path.join( os.tmpdir(), 'claude-run-lock-' ) ) );
+		dirs.push( dir );
+		return {
+			dir,
+			file: path.join( dir, `${ hash( 'chat' ) }.json.lock` ),
+			store: createNativeSessionStore( dir ),
+			run: {
+				owner,
+				runId: 'run',
+				turnId: 'turn',
+				connection: { id: 'connection', revision: 3 },
+				workspace: { siteId: 'site', workingDirectory: dir, configDirectory: dir },
+			},
+		};
+	}
+
+	it( 'names its owner, run, connection and binding from the start, and moves through its stages atomically', async () => {
+		const { dir, file, store, run } = await lockFixture();
+		const lock = await store.lockRun( 'chat', run );
+		const first = JSON.parse( await readFile( file, 'utf8' ) );
+		expect( first ).toEqual( {
+			version: 2,
+			purpose: 'run',
+			token: expect.stringMatching( /^[0-9a-f-]{36}$/ ),
+			conversationId: 'chat',
+			platform: process.platform,
+			owner,
+			createdAt: expect.any( String ),
+			runId: 'run',
+			turnId: 'turn',
+			connection: { id: 'connection', revision: 3 },
+			workspace: { siteId: 'site', workingDirectory: dir, configDirectory: dir },
+			stage: 'locked',
+		} );
+		await expect( store.lockRun( 'chat', run ) ).rejects.toMatchObject( { code: 'EEXIST' } );
+		await expect( store.lockTurn( 'chat' ) ).rejects.toMatchObject( { code: 'EEXIST' } );
+		const session = { nativeSessionId, resume: false };
+		await lock.update( { stage: 'starting', session } );
+		expect( JSON.parse( await readFile( file, 'utf8' ) ) ).toEqual( {
+			...first,
+			stage: 'starting',
+			session,
+		} );
+		const processes = {
+			native: { pid: 77, start: '134389060548248000' },
+			guardian: { pid: 78, start: '134389060541000000' },
+		};
+		await lock.update( { stage: 'owned', processes } );
+		const owned = { ...first, stage: 'owned', session, processes };
+		expect( JSON.parse( await readFile( file, 'utf8' ) ) ).toEqual( owned );
+		expect( await store.inspectLock( 'chat' ) ).toEqual( {
+			state: 'run',
+			record: owned,
+			raw: await readFile( file, 'utf8' ),
+		} );
+		expect( ( await readdir( dir ) ).filter( ( name ) => name !== path.basename( file ) ) ).toEqual(
+			[]
+		);
+		await lock.release();
+		expect( await store.inspectLock( 'chat' ) ).toEqual( { state: 'none' } );
+	} );
+
+	it( 'refuses to move or release a lock that is no longer its own, and leaves that lock as it is', async () => {
+		const { file, store, run } = await lockFixture();
+		const lock = await store.lockRun( 'chat', run );
+		await writeFile( file, 'different-owner' );
+		await expect(
+			lock.update( { stage: 'starting', session: { nativeSessionId, resume: true } } )
+		).rejects.toThrow( 'Run lock ownership changed' );
+		await expect( lock.release() ).rejects.toThrow( 'Run lock ownership changed' );
+		expect( await readFile( file, 'utf8' ) ).toBe( 'different-owner' );
+	} );
+
+	it( 'takes no lock from a creation that never completed, and leaves its file alone', async () => {
+		const { dir, file, store, run } = await lockFixture();
+		const partial = `${ file }.${ randomUUID() }.tmp`;
+		await writeFile( partial, '{"version":2,"purp' );
+		expect( await store.inspectLock( 'chat' ) ).toEqual( { state: 'none' } );
+		const lock = await store.lockRun( 'chat', run );
+		await lock.release();
+		expect( await readdir( dir ) ).toEqual( [ path.basename( partial ) ] );
+	} );
+
+	it( 'reads a lock written before locks named their owner as legacy, a deletion as held, and anything else as unreadable', async () => {
+		const { file, store, run } = await lockFixture();
+		await writeFile( file, randomUUID() );
+		expect( await store.inspectLock( 'chat' ) ).toEqual( { state: 'legacy' } );
+		await rm( file );
+		const lock = await store.lockRun( 'chat', run );
+		await lock.update( { stage: 'starting', session: { nativeSessionId, resume: false } } );
+		const record = JSON.parse( await readFile( file, 'utf8' ) );
+		for ( const content of [
+			'',
+			'{broken',
+			'different-owner',
+			JSON.stringify( { ...record, version: 3 } ),
+			JSON.stringify( { ...record, purpose: 'other' } ),
+			JSON.stringify( { ...record, owner: { pid: 0, start: 'x' } } ),
+			JSON.stringify( { ...record, owner: { pid: 4321, start: '' } } ),
+			JSON.stringify( { ...record, connection: { id: 'connection', revision: '3' } } ),
+			JSON.stringify( { ...record, workspace: { ...record.workspace, workingDirectory: 'site' } } ),
+			JSON.stringify( { ...record, stage: 'owned' } ),
+			JSON.stringify( { ...record, stage: 'locked' } ),
+			JSON.stringify( { ...record, session: { nativeSessionId: 'not-a-uuid', resume: false } } ),
+		] ) {
+			await writeFile( file, content );
+			expect( await store.inspectLock( 'chat' ) ).toEqual( { state: 'unreadable' } );
+		}
+		await rm( file );
+		const release = await store.lockTurn( 'chat' );
+		expect( await store.inspectLock( 'chat' ) ).toEqual( { state: 'held' } );
+		await release();
+	} );
 } );
 
 it( 'reads approvals journaled before they named their operation as display-only legacy events', async () => {

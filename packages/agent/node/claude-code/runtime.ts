@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
-import { prepareProcessOwner } from '@studio/common/lib/owned-process';
+import { prepareProcessOwner, readProcessIdentity } from '@studio/common/lib/owned-process';
 import { __ } from '@wordpress/i18n';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
 import {
@@ -47,6 +47,7 @@ import type { ClaudeModelOption, ClaudeStudioTarget } from '@studio/agent/protoc
 import type {
 	OwnedProcess,
 	OwnershipFailure,
+	ProcessIdentity,
 	ProcessOwner,
 } from '@studio/common/lib/owned-process';
 
@@ -207,6 +208,19 @@ interface RuntimeDependencies {
 	clock?: () => number;
 	/** Prepares the ownership the native process is started under. */
 	prepareOwner?: () => ProcessOwner;
+	/** This process's identity, which the run lock records as its owner. */
+	ownerIdentity?: () => Promise< ProcessIdentity | undefined >;
+}
+
+let ownIdentity: Promise< ProcessIdentity | undefined > | undefined;
+
+// Read once per process: a process's start never changes.
+function readOwnIdentity(): Promise< ProcessIdentity | undefined > {
+	ownIdentity ??= readProcessIdentity( process.pid ).then( ( found ) => {
+		if ( ! found ) ownIdentity = undefined;
+		return found;
+	} );
+	return ownIdentity;
 }
 
 interface RuntimeOptions extends RuntimeDependencies {
@@ -529,6 +543,9 @@ export async function runClaudeTurn(
 	let native: ReturnType< typeof sdkQuery > | undefined;
 	let owner: ProcessOwner | undefined;
 	let owned: OwnedProcess | undefined;
+	// Settles once the owned process is confirmed and recorded in the run lock,
+	// or found not to be.
+	let ownership: Promise< 'recorded' | 'unowned' | 'unrecorded' > | undefined;
 	// Whether the SDK asked Studio's spawn hook for its process; one that never
 	// did may have started a process Studio knows nothing of.
 	let spawnRequested = false;
@@ -554,8 +571,23 @@ export async function runClaudeTurn(
 	try {
 		if ( input.signal.aborted ) throw new Error();
 		const store = createNativeSessionStore( options.storeRoot );
+		// A lock that cannot name its owner could never be recovered, so no turn starts without one.
+		const ownerIdentity = await ( options.ownerIdentity ?? readOwnIdentity )();
+		if ( ! ownerIdentity ) throw new Error();
+		let lock: Awaited< ReturnType< typeof store.lockRun > >;
 		try {
-			release = await store.lockTurn( workspace.conversationId );
+			lock = await store.lockRun( workspace.conversationId, {
+				owner: ownerIdentity,
+				runId,
+				turnId,
+				connection: { id: selection.connectionId, revision: selection.revision },
+				workspace: {
+					siteId: workspace.siteId,
+					workingDirectory: workspace.workingDirectory,
+					configDirectory: workspace.configDirectory,
+				},
+			} );
+			release = () => lock.release();
 		} catch ( error ) {
 			if ( ( error as NodeJS.ErrnoException ).code !== 'EEXIST' ) throw error;
 			terminal = rebind(
@@ -690,7 +722,9 @@ export async function runClaudeTurn(
 				! existing &&
 				( await store.readJournals( workspace.conversationId ) ).some( ( events ) =>
 					events.some(
-						( event ) => event.type !== 'turn.terminal' || event.outcome.status === 'success'
+						( event ) =>
+							event.type !== 'turn.recovered' &&
+							( event.type !== 'turn.terminal' || event.outcome.status === 'success' )
 					)
 				)
 			) {
@@ -813,6 +847,12 @@ export async function runClaudeTurn(
 			terminal = unowned( owner.failure() );
 			return;
 		}
+		// The SDK starts its process inside `query`, so the lock says so first.
+		await lock.update( {
+			stage: 'starting',
+			session: { nativeSessionId: session.nativeSessionId, resume: !! existing },
+		} );
+		if ( controller.signal.aborted ) throw new Error();
 		const processOwner = owner;
 		native = ( options.query ?? sdkQuery )( {
 			prompt: nativeInput(),
@@ -825,6 +865,21 @@ export async function runClaudeTurn(
 					},
 					onOwned: ( started ) => {
 						owned = started;
+						ownership = started.ready().then(
+							async ( ready ) => {
+								const identity = started.identity();
+								if ( ! ready ) return 'unowned';
+								if ( ! identity ) return 'unrecorded';
+								const guardian = await started.guardian();
+								await lock.update( {
+									stage: 'owned',
+									processes: { native: identity, ...( guardian ? { guardian } : {} ) },
+								} );
+								return 'recorded';
+							},
+							() => 'unowned' as const
+						);
+						ownership = ownership.catch( () => 'unrecorded' as const );
 					},
 				} ),
 				...( existing
@@ -887,11 +942,14 @@ export async function runClaudeTurn(
 		if ( ! qualification.ok || controller.signal.aborted || ! ( await stillConnected() ) )
 			throw new Error();
 		// No prompt reaches a native process whose tree Studio could not take
-		// ownership of, nor one the SDK started without Studio's spawn hook.
-		if ( ! owned || ! ( await owned.ready() ) ) {
+		// ownership of, nor one the SDK started without Studio's spawn hook,
+		// nor one the run lock does not name for a later recovery.
+		const owning = ownership ? await ownership : 'unowned';
+		if ( ! owned || owning === 'unowned' ) {
 			terminal = unowned( owned?.failure() );
 			return;
 		}
+		if ( owning !== 'recorded' ) throw new Error();
 		if ( ! accountKey ) throw new Error();
 		if ( ! existing ) await store.create( session );
 		else if ( ! existing.accountKey )

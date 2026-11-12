@@ -1,5 +1,9 @@
 import type { StudioChatArtifactData } from './chat-artifacts';
-import type { ClaudeOperationClass, ClaudeStudioTarget } from './claude-code';
+import type {
+	ClaudeOperationClass,
+	ClaudeStudioTarget,
+	ClaudeUncertainOperation,
+} from './claude-code';
 import type { ConnectionBackend, ConnectionSelection } from './connections';
 import type { AiProviderId } from './providers';
 
@@ -66,14 +70,17 @@ export interface BackendTurnOutcome {
 	 * Studio could not take ownership of the native process tree, so nothing
 	 * was sent, and `process_unconfirmed` when Studio could not confirm that
 	 * every process of the turn ended, so the conversation stays locked until
-	 * it is recovered.
+	 * it is recovered, and `recovered` when the turn's process ended without
+	 * finishing it and Studio recorded this outcome when it recovered the
+	 * conversation.
 	 */
 	code?:
 		| 'rebind_required'
 		| 'account_changed'
 		| 'account_unverified'
 		| 'process_unowned'
-		| 'process_unconfirmed';
+		| 'process_unconfirmed'
+		| 'recovered';
 }
 
 interface ContentBlock {
@@ -143,5 +150,20 @@ export interface LegacyApprovalRequestedEvent extends BackendTurnIds, ToolCall {
 	draft?: { siteName: string; title: string; content?: string };
 }
 
+/**
+ * Recorded once when Studio recovers a turn whose process ended without
+ * finishing it. Display-only: nothing is replayed or answered from it.
+ */
+export interface ClaudeRecoveryJournalEvent extends BackendTurnIds {
+	type: 'turn.recovered';
+	/** Identifies the run lock the recovery released: a hash of its token. */
+	lock: string;
+	invalidatedApprovals: string[];
+	uncertainOperations: ClaudeUncertainOperation[];
+}
+
 /** What a Claude conversation's display journal holds once read back. */
-export type ClaudeJournalEvent = BackendTurnEvent | LegacyApprovalRequestedEvent;
+export type ClaudeJournalEvent =
+	| BackendTurnEvent
+	| LegacyApprovalRequestedEvent
+	| ClaudeRecoveryJournalEvent;
