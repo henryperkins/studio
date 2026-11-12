@@ -1,7 +1,9 @@
 // @vitest-environment node
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
+import { once } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { base64url, SignJWT, type JWTPayload } from 'jose';
@@ -20,6 +22,7 @@ import {
 	type ChatGptSignIn,
 	type ChatGptTokenRequest,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { openLoopbackPeerLookup } from '@studio/agent/node/chatgpt/loopback-peer';
 import {
 	CHATGPT_SIGN_IN_TIMEOUT_MS,
 	ChatGptSignInError,
@@ -44,6 +47,30 @@ import {
 	type FakeAuthorizationServerScript,
 	type SigningKey,
 } from './fixtures/fake-authorization-server';
+import {
+	INITIAL_UID_MAP,
+	OTHER_UID,
+	OVERFLOW_UID_FILE,
+	OWN_UID,
+	TCP6_FILE,
+	TCP_FILE,
+	UID_MAP_FILE,
+	at,
+	createFakeProc,
+	hex4,
+	mapped,
+	systemError,
+	tcp6Row,
+	tcp6Table,
+	tcpRow,
+	tcpTable,
+	v4,
+	type FakeProc,
+} from './fixtures/proc-net-tcp';
+import type {
+	LoopbackConnection,
+	LoopbackPeerOwner,
+} from '@studio/agent/node/chatgpt/loopback-peer';
 import type { AddressInfo } from 'node:net';
 
 const systemKeychain = vi.hoisted( () => ( { current: null as FakeCredentialStore | null } ) );
@@ -61,6 +88,8 @@ const REQUESTED_SCOPE =
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RANDOM = /^[\w-]{43,128}$/;
 const CALLBACK = /^http:\/\/127\.0\.0\.1:(\d+)\/auth\/callback$/;
+// What the browser opener is given: the attempt's listener and a one-time path, nothing else.
+const START = /^http:\/\/127\.0\.0\.1:(\d+)\/([\w-]{43})$/;
 
 const sleep = ( ms: number ) => new Promise( ( resolve ) => setTimeout( resolve, ms ) );
 const nextTurn = () => new Promise( ( resolve ) => setImmediate( resolve ) );
@@ -82,6 +111,35 @@ async function closedPort(): Promise< number > {
 	const { port } = server.address() as AddressInfo;
 	await new Promise( ( resolve ) => server.close( resolve ) );
 	return port;
+}
+
+/**
+ * A GET from a socket of its own, so a test knows the port it comes from
+ * before it is sent; status 0 when the connection is dropped unanswered.
+ */
+async function requestFrom(
+	url: string,
+	beforeSending: ( localPort: number ) => void = () => undefined
+): Promise< { status: number; location?: string; page: string } > {
+	const target = new URL( url );
+	const socket = net.connect( Number( target.port ), target.hostname );
+	let text = '';
+	socket.setEncoding( 'utf8' );
+	socket.on( 'data', ( chunk: string ) => ( text += chunk ) );
+	socket.on( 'error', () => undefined );
+	const closed = new Promise( ( resolve ) => socket.on( 'close', resolve ) );
+	await once( socket, 'connect' );
+	beforeSending( socket.localPort! );
+	socket.write(
+		`GET ${ target.pathname }${ target.search } HTTP/1.1\r\nHost: ${ target.host }\r\n\r\n`
+	);
+	await closed;
+	const [ head, ...body ] = text.split( '\r\n\r\n' );
+	return {
+		status: Number( /^HTTP\/1\.1 (\d{3}) /.exec( head )?.[ 1 ] ?? 0 ),
+		location: /\r\nlocation: ([^\r\n]*)/i.exec( head )?.[ 1 ],
+		page: body.join( '\r\n\r\n' ),
+	};
 }
 
 const failed = ( code: string ) => ( { ok: false, code, message: expect.any( String ) } );
@@ -126,6 +184,9 @@ describe( 'Signing in to ChatGPT', () => {
 		} );
 	}
 
+	// Every flow here follows Linux's rules, the strictest, whatever machine runs
+	// the tests, with a socket-table lookup that finds each request this user's;
+	// a test that needs another platform or answer says so.
 	function startFlow( options: ChatGptSignInFlowOptions = {} ) {
 		const created = createChatGptSignInFlow( {
 			discoveryUrl: fake.discoveryUrl,
@@ -135,12 +196,25 @@ describe( 'Signing in to ChatGPT', () => {
 					return broker.saveSignIn( signIn );
 				},
 				readIdTokenHint: ( registrationId ) => broker.readIdTokenHint( registrationId ),
+				checkVaultKey: () => broker.checkVaultKey(),
 			},
 			openBrowser,
+			platform: 'linux',
+			loopbackPeers: () => ( {
+				ownerOf: async () => 'same-user',
+				close: async () => undefined,
+			} ),
 			...options,
 		} );
 		flows.push( created );
 		return created;
+	}
+
+	// The browser at the start address it was given: Studio sends it on to the authorize page.
+	async function follow( startUrl: string ): Promise< string > {
+		const response = await fetch( startUrl, { redirect: 'manual' } );
+		expect( response.status ).toBe( 302 );
+		return response.headers.get( 'location' )!;
 	}
 
 	async function begin(
@@ -151,10 +225,12 @@ describe( 'Signing in to ChatGPT', () => {
 		const before = opened.length;
 		const started = await using.begin( registrationId, options );
 		begun.push( started.attemptId );
-		// The caller gets the attempt id alone; the URL went to the browser.
+		// The caller gets the attempt id alone; the start address went to the browser.
 		expect( started ).toEqual( { attemptId: expect.stringMatching( UUID ) } );
 		expect( opened ).toHaveLength( before + 1 );
-		return { attemptId: started.attemptId, url: opened[ before ] };
+		const startUrl = opened[ before ];
+		expect( startUrl ).toMatch( START );
+		return { attemptId: started.attemptId, startUrl, url: await follow( startUrl ) };
 	}
 
 	// The browser at the authorize page: ChatGPT sends it back to the callback.
@@ -922,6 +998,7 @@ describe( 'Signing in to ChatGPT', () => {
 									throw new ChatGptConnectionError( 'signed-out' );
 								},
 								readIdTokenHint: ( id ) => broker.readIdTokenHint( id ),
+								checkVaultKey: () => broker.checkVaultKey(),
 							},
 						} ),
 				],
@@ -938,6 +1015,7 @@ describe( 'Signing in to ChatGPT', () => {
 									);
 								},
 								readIdTokenHint: ( id ) => broker.readIdTokenHint( id ),
+								checkVaultKey: () => broker.checkVaultKey(),
 							},
 						} ),
 				],
@@ -951,10 +1029,11 @@ describe( 'Signing in to ChatGPT', () => {
 					const using = arrange() ?? flow;
 
 					const start = await begin( existing.registrationId, { storage: 'session' }, using );
-					const urls = [ start.url ];
+					const urls = [ start.startUrl, start.url ];
 					if ( ending === 'callback' ) {
-						urls.push( await authorize( start.url ) );
-						await deliver( urls[ 1 ] );
+						const callbackUrl = await authorize( start.url );
+						urls.push( callbackUrl );
+						await deliver( callbackUrl );
 					} else if ( ending === 'cancel' ) {
 						expect( using.cancel( start.attemptId ) ).toBe( true );
 					}
@@ -1158,6 +1237,79 @@ describe( 'Signing in to ChatGPT', () => {
 			expect( await flow.wait( 'test-unknown-attempt' ) ).toEqual( failed( 'unknown-attempt' ) );
 			expect( flow.cancel( 'test-unknown-attempt' ) ).toBe( false );
 		} );
+
+		it( 'keeps a second sign-in apart from one still pending: neither’s callback completes the other, and cancelling one leaves the other', async () => {
+			const existing = await signInExisting();
+			const first = await begin( existing.registrationId );
+			const second = await begin( existing.registrationId );
+			const firstCallback = new URL( await authorize( first.url ) );
+			const secondCallback = new URL( await authorize( second.url ) );
+			expect( firstCallback.port ).not.toBe( secondCallback.port );
+
+			// Each listener refuses the other attempt's answer, and both go on waiting.
+			for ( const [ answer, port ] of [
+				[ firstCallback, secondCallback.port ],
+				[ secondCallback, firstCallback.port ],
+			] as const ) {
+				const misdelivered = new URL( answer );
+				misdelivered.port = port;
+				const delivery = await deliver( misdelivered.toString() );
+				expect( delivery.status ).toBe( 400 );
+				expectNoSecrets( delivery.page );
+			}
+			expect( fake.tokenRequests ).toHaveLength( 1 );
+
+			expect( flow.cancel( first.attemptId ) ).toBe( true );
+			expect( await flow.wait( first.attemptId ) ).toEqual( failed( 'cancelled' ) );
+			expect( await deliver( firstCallback.toString() ) ).toEqual( { status: 0, page: '' } );
+			await expectUntouched( existing );
+
+			expect( ( await deliver( secondCallback.toString() ) ).status ).toBe( 200 );
+			expect( await flow.wait( second.attemptId ) ).toMatchObject( {
+				ok: true,
+				registrationId: existing.registrationId,
+			} );
+			expect( fake.tokenRequests ).toHaveLength( 2 );
+			await expect( broker.getAccessToken( existing.registrationId ) ).resolves.toBe(
+				fake.issued[ 1 ].accessToken
+			);
+		} );
+
+		it( 'names only its own 127.0.0.1 listener as the callback, whatever is chosen or set in the environment', async () => {
+			const previousHost = process.env.HOST;
+			process.env.HOST = '0.0.0.0';
+			try {
+				const registrationId = registrationOf( ( await signIn() ).outcome );
+				await signIn( undefined, { storage: 'session' } );
+				await signIn( registrationId, { storage: 'session' } );
+				await signIn( registrationId, { storage: 'vault', reconsent: true } );
+				await broker.signOut( registrationId );
+				await signIn( registrationId );
+			} finally {
+				if ( previousHost === undefined ) {
+					delete process.env.HOST;
+				} else {
+					process.env.HOST = previousHost;
+				}
+			}
+
+			expect( fake.authorizeRequests ).toHaveLength( 5 );
+			const advertised = fake.authorizeRequests.map(
+				( query ) => query.get( 'redirect_uri' ) ?? ''
+			);
+			for ( const redirectUri of advertised ) {
+				expect( redirectUri ).toMatch( CALLBACK );
+			}
+			// The token exchange names the same callback the browser was sent to.
+			expect( fake.tokenRequests.map( ( form ) => form.get( 'redirect_uri' ) ) ).toEqual(
+				advertised
+			);
+			// Each was a listener of its own, closed with its attempt.
+			expect( new Set( advertised ).size ).toBe( advertised.length );
+			for ( const redirectUri of advertised ) {
+				expect( await deliver( redirectUri ) ).toEqual( { status: 0, page: '' } );
+			}
+		} );
 	} );
 
 	describe( 'the tokens a failed sign-in was issued', () => {
@@ -1284,7 +1436,7 @@ describe( 'Signing in to ChatGPT', () => {
 	} );
 
 	describe( 'the system browser', () => {
-		it( 'is sent the URL, which, with the ID token it carries, reaches nothing returned, thrown or shown', async () => {
+		it( 'is sent only the start address, and the URL it leads to, with the ID token it carries, reaches nothing returned, thrown or shown', async () => {
 			const existing = await signInExisting();
 
 			const signedIn = await signIn( existing.registrationId );
@@ -1298,12 +1450,15 @@ describe( 'Signing in to ChatGPT', () => {
 			} );
 			const error = await refusing.begin( existing.registrationId ).catch( ( e ) => e );
 
-			const urls = opened.slice( -3 );
-			expect( urls.map( ( url ) => new URL( url ).searchParams.get( 'id_token_hint' ) ) ).toEqual( [
-				fake.issued[ 0 ].idToken,
-				fake.issued[ 1 ].idToken,
-				fake.issued[ 1 ].idToken,
-			] );
+			const sent = opened.slice( -3 );
+			for ( const url of sent ) {
+				expect( url ).toMatch( START );
+			}
+			// The ID token reached the authorization endpoint alone, by way of the start address.
+			expect(
+				fake.authorizeRequests.slice( -2 ).map( ( query ) => query.get( 'id_token_hint' ) )
+			).toEqual( [ fake.issued[ 0 ].idToken, fake.issued[ 1 ].idToken ] );
+			const urls = [ ...sent, signedIn.start.url, denied.start.url ];
 			expect( error ).toBeInstanceOf( ChatGptSignInError );
 			expect( error.code ).toBe( 'browser-unavailable' );
 			const caught = [
@@ -1339,7 +1494,8 @@ describe( 'Signing in to ChatGPT', () => {
 
 			expect( error ).toBeInstanceOf( ChatGptSignInError );
 			expect( error.code ).toBe( 'browser-unavailable' );
-			expect( await deliver( await authorize( sentTo ) ) ).toEqual( { status: 0, page: '' } );
+			expect( sentTo ).toMatch( START );
+			expect( await deliver( sentTo ) ).toEqual( { status: 0, page: '' } );
 			expect( fake.tokenRequests ).toHaveLength( 1 );
 			await expectUntouched( existing );
 		} );
@@ -1352,6 +1508,9 @@ describe( 'Signing in to ChatGPT', () => {
 			const appFlow = app.createChatGptSignInFlow( {
 				discoveryUrl: fake.discoveryUrl,
 				credentials: broker,
+				// As every flow here: never this machine's own platform or socket tables.
+				platform: 'linux',
+				loopbackPeers: () => ( { ownerOf: async () => 'same-user', close: async () => undefined } ),
 			} );
 			flows.push( appFlow );
 
@@ -1369,7 +1528,8 @@ describe( 'Signing in to ChatGPT', () => {
 			const { attemptId } = await appFlow.begin();
 			begun.push( attemptId );
 			expect( installed ).toHaveLength( 1 );
-			await deliver( await authorize( installed[ 0 ] ) );
+			expect( installed[ 0 ] ).toMatch( START );
+			await deliver( await authorize( await follow( installed[ 0 ] ) ) );
 			expect( ( await appFlow.wait( attemptId ) ).ok ).toBe( true );
 		} );
 
@@ -1377,7 +1537,7 @@ describe( 'Signing in to ChatGPT', () => {
 			fake.script.tokenDelayMs = 200;
 			const late = startFlow( {
 				openBrowser: async ( url ) => {
-					void deliver( await authorize( url ) );
+					void deliver( await authorize( await follow( url ) ) );
 					await until( () => fake.tokenRequests.length === 1 );
 					throw new Error( 'test-late-opener-failure' );
 				},
@@ -1400,6 +1560,809 @@ describe( 'Signing in to ChatGPT', () => {
 
 			expect( started ).toEqual( { attemptId: expect.stringMatching( UUID ) } );
 			expect( await hanging.wait( started.attemptId ) ).toEqual( failed( 'timed-out' ) );
+		} );
+	} );
+
+	// A process's command line can be read by others on the machine, so the
+	// browser opener is given an address on the attempt's own listener, which
+	// sends the browser on to the authorization URL once.
+	describe( 'the start address', () => {
+		// Begins an attempt, leaving the start address unused.
+		async function beginUnfollowed(
+			registrationId?: string,
+			options?: ChatGptSignInOptions,
+			using: ChatGptSignInFlow = flow
+		) {
+			const before = opened.length;
+			const { attemptId } = await using.begin( registrationId, options );
+			begun.push( attemptId );
+			expect( opened ).toHaveLength( before + 1 );
+			return { attemptId, startUrl: opened[ before ] };
+		}
+
+		// A raw request, so its Host header can be any.
+		function request( url: string, init: { method?: string; host?: string } = {} ) {
+			return new Promise< { status: number; location?: string; page: string } >(
+				( resolve, reject ) => {
+					const sent = http.request(
+						url,
+						{
+							method: init.method ?? 'GET',
+							...( init.host ? { headers: { host: init.host } } : {} ),
+						},
+						( response ) => {
+							let page = '';
+							response.setEncoding( 'utf8' );
+							response.on( 'data', ( chunk: string ) => ( page += chunk ) );
+							response.on( 'end', () =>
+								resolve( {
+									status: response.statusCode ?? 0,
+									location: response.headers.location,
+									page,
+								} )
+							);
+						}
+					);
+					sent.on( 'error', reject );
+					sent.end();
+				}
+			);
+		}
+
+		it.each< [ string, 'vault' | 'session', 'new' | 'id-token' | 'email' ] >( [
+			[ 'a new registration', 'vault', 'new' ],
+			[ 'a new registration', 'session', 'new' ],
+			[ 'a registration signed in again with its ID token as the hint', 'vault', 'id-token' ],
+			[ 'a registration signed in again with its ID token as the hint', 'session', 'id-token' ],
+			[ 'a signed-out registration signed in again with its email as the hint', 'vault', 'email' ],
+			[
+				'a signed-out registration signed in again with its email as the hint',
+				'session',
+				'email',
+			],
+		] )(
+			'is all the browser opener gets for %s, kept in %s, and leads to the same authorization request',
+			async ( _name, storage, kind ) => {
+				let registrationId: string | undefined;
+				if ( kind !== 'new' ) {
+					registrationId = registrationOf( ( await signIn() ).outcome );
+					if ( kind === 'email' ) {
+						await broker.signOut( registrationId );
+					}
+				}
+				const asked = fake.authorizeRequests.length;
+
+				const { attemptId, startUrl } = await beginUnfollowed( registrationId, { storage } );
+				const authorizationUrl = await follow( startUrl );
+				const callbackUrl = await authorize( authorizationUrl );
+
+				const sent = Object.fromEntries( fake.authorizeRequests[ asked ] );
+				expect( sent ).toMatchObject( {
+					redirect_uri: expect.stringMatching( CALLBACK ),
+					state: expect.stringMatching( RANDOM ),
+					nonce: expect.stringMatching( RANDOM ),
+					code_challenge: expect.stringMatching( /^[\w-]{43}$/ ),
+					ext_agent_host_id: await getChatGptHostId(),
+				} );
+				if ( kind === 'new' ) {
+					expect( sent.client_id ).toBe( 'dynamic_agent_client' );
+				} else {
+					expect( sent.client_id ).toBe( 'test-issued-client-1' );
+				}
+				if ( kind === 'id-token' ) {
+					expect( sent.id_token_hint ).toBe( fake.issued[ 0 ].idToken );
+				}
+				if ( kind === 'email' ) {
+					expect( sent.login_hint ).toBe( 'someone@example.com' );
+				}
+				// The same listener, at a path only Studio chose, and nothing of the request.
+				const [ , port ] = START.exec( startUrl )!;
+				expect( new URL( sent.redirect_uri ).port ).toBe( port );
+				for ( const name of [
+					'state',
+					'nonce',
+					'code_challenge',
+					'id_token_hint',
+					'login_hint',
+					'client_id',
+					'ext_agent_host_id',
+					'redirect_uri',
+				] ) {
+					if ( sent[ name ] ) {
+						expect( startUrl ).not.toContain( sent[ name ] );
+					}
+				}
+				const authorization = new URL( authorizationUrl );
+				expect( startUrl ).not.toContain( authorization.pathname );
+				expect( startUrl ).not.toContain( authorization.search.slice( 1 ) );
+				expect( startUrl ).not.toContain( 'authorize' );
+
+				await deliver( callbackUrl );
+				expect( ( await flow.wait( attemptId ) ).ok ).toBe( true );
+			}
+		);
+
+		it( 'sends the browser on once, uncached and without a referrer, and refuses anything else without the URL', async () => {
+			const { attemptId, startUrl } = await beginUnfollowed();
+			const start = new URL( startUrl );
+			const at = ( pathname: string ) => `${ start.origin }${ pathname }`;
+			const guessed = randomBytes( 32 ).toString( 'base64url' );
+
+			// None of these uses the address up.
+			const refusals = [
+				[ 400, await request( startUrl, { host: `attacker.example:${ start.port }` } ) ],
+				[ 400, await request( startUrl, { host: `localhost:${ start.port }` } ) ],
+				[ 405, await request( startUrl, { method: 'POST' } ) ],
+				[ 405, await request( startUrl, { method: 'HEAD' } ) ],
+				[ 404, await request( at( `/${ guessed }` ) ) ],
+				[ 404, await request( at( `${ start.pathname }/` ) ) ],
+				[ 404, await request( at( `${ start.pathname }x` ) ) ],
+				[ 404, await request( at( start.pathname.toUpperCase() ) ) ],
+				[ 404, await request( at( '/' ) ) ],
+			] as const;
+			const response = await fetch( startUrl, { redirect: 'manual' } );
+			const location = response.headers.get( 'location' )!;
+			const again = await request( startUrl );
+
+			expect( response.status ).toBe( 302 );
+			expect( response.headers.get( 'cache-control' ) ).toBe( 'no-store' );
+			expect( response.headers.get( 'referrer-policy' ) ).toBe( 'no-referrer' );
+			expect( await response.text() ).toBe( '' );
+			expect( location.startsWith( `${ fake.url }/api/accounts/authorize?` ) ).toBe( true );
+			expect( fake.authorizeRequests ).toHaveLength( 0 );
+			const query = new URL( location ).searchParams;
+			const values = [
+				'state',
+				'nonce',
+				'code_challenge',
+				'client_id',
+				'ext_agent_host_id',
+				'redirect_uri',
+			].map( ( name ) => query.get( name )! );
+			for ( const [ status, refused ] of [ ...refusals, [ 400, again ] as const ] ) {
+				expect( refused.status ).toBe( status );
+				expect( refused.location ).toBeUndefined();
+				expect( refused.page ).not.toMatch( /authorize|https?:/ );
+				for ( const value of values ) {
+					expect( refused.page ).not.toContain( value );
+				}
+			}
+
+			// The attempt goes on, and its address goes with it.
+			await deliver( await authorize( location ) );
+			expect( ( await flow.wait( attemptId ) ).ok ).toBe( true );
+			expect( await deliver( startUrl ) ).toEqual( { status: 0, page: '' } );
+		} );
+
+		it( 'ends with its attempt, cancelled or timed out, before it was used', async () => {
+			const cancelled = await beginUnfollowed();
+			expect( flow.cancel( cancelled.attemptId ) ).toBe( true );
+			const quick = startFlow( { timeoutMs: 100 } );
+			const timedOut = await beginUnfollowed( undefined, undefined, quick );
+			expect( await quick.wait( timedOut.attemptId ) ).toEqual( failed( 'timed-out' ) );
+
+			for ( const { startUrl } of [ cancelled, timedOut ] ) {
+				expect( await deliver( startUrl ) ).toEqual( { status: 0, page: '' } );
+			}
+			expect( fake.authorizeRequests ).toHaveLength( 0 );
+		} );
+
+		it.each< NodeJS.Platform >( [ 'linux', 'darwin', 'win32' ] )(
+			'on %s, is served on 8 connections at most, each closed when it sends no request within 10 seconds, and one beyond doesn’t use it up',
+			async ( platform ) => {
+				const createServer = vi.spyOn( http, 'createServer' );
+				const capped = startFlow( { platform } );
+				const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, capped );
+				const server = createServer.mock.results.at( -1 )!.value as http.Server & {
+					connectionsCheckingInterval: number;
+				};
+				let connected = 0;
+				server.on( 'connection', ( socket: net.Socket ) => {
+					connected++;
+					socket.on( 'close', () => connected-- );
+				} );
+				const start = new URL( startUrl );
+
+				const idle = await Promise.all(
+					Array.from( { length: 8 }, async () => {
+						const socket = net.connect( Number( start.port ), start.hostname );
+						socket.on( 'error', () => undefined );
+						await once( socket, 'connect' );
+						return socket;
+					} )
+				);
+				await until( () => connected === 8 );
+				const beyond = await requestFrom( startUrl );
+				for ( const socket of idle ) {
+					socket.destroy();
+				}
+				await until( () => connected === 0 );
+
+				expect( server.maxConnections ).toBe( 8 );
+				// Checked every second, from the moment a connection is accepted.
+				expect( server.headersTimeout ).toBe( 10_000 );
+				expect( server.requestTimeout ).toBe( 10_000 );
+				expect( server.connectionsCheckingInterval ).toBe( 1_000 );
+				expect( beyond ).toEqual( { status: 0, location: undefined, page: '' } );
+				await deliver( await authorize( await follow( startUrl ) ) );
+				expect( ( await capped.wait( attemptId ) ).ok ).toBe( true );
+			}
+		);
+
+		// Another user on a Linux machine can read the start address from the
+		// opener's command line: the listener answers only its own user.
+		describe( 'on Linux', () => {
+			// A flow whose socket-table lookup gives these answers, in order.
+			function linuxFlow(
+				answers: Array< LoopbackPeerOwner | Error | Promise< LoopbackPeerOwner > >
+			) {
+				const queue = [ ...answers ];
+				const owner = vi.fn( async ( _connection: LoopbackConnection ) => {
+					const next = queue.shift();
+					if ( next === undefined ) {
+						throw new Error( 'test-unexpected-owner-lookup' );
+					}
+					if ( next instanceof Error ) {
+						throw next;
+					}
+					return next;
+				} );
+				const close = vi.fn( async () => undefined );
+				const linux = startFlow( {
+					platform: 'linux',
+					loopbackPeers: () => ( { ownerOf: owner, close } ),
+				} );
+				return { flow: linux, owner, close };
+			}
+
+			// Another user's request is told the link isn't valid; one that couldn't
+			// be checked, to reload the page, which works.
+			const PAGES = {
+				invalid: /This sign-in link isn’t valid\./,
+				reload: /Reload this page to try again\./,
+			};
+
+			function expectNothingDisclosed(
+				refused: { status: number; location?: string | null; page: string },
+				location: string,
+				page: keyof typeof PAGES
+			) {
+				expect( refused.status ).toBe( 400 );
+				expect( refused.location ?? undefined ).toBeUndefined();
+				expect( refused.page ).not.toMatch( /authorize|https?:|code=|state=/ );
+				const query = new URL( location ).searchParams;
+				for ( const name of [ 'state', 'nonce', 'code_challenge', 'client_id', 'redirect_uri' ] ) {
+					expect( refused.page ).not.toContain( query.get( name )! );
+				}
+				expect( refused.page ).toMatch( PAGES[ page ] );
+				expect( refused.page ).not.toMatch( PAGES[ page === 'invalid' ? 'reload' : 'invalid' ] );
+			}
+
+			it.each< [ string, LoopbackPeerOwner | Error, keyof typeof PAGES ] >( [
+				[ 'another user', 'other-user', 'invalid' ],
+				[ 'an owner whose socket tables can’t be read', 'unreadable', 'reload' ],
+				[ 'an owner the lookup failed to find', new Error( 'test-lookup-failure' ), 'reload' ],
+			] )(
+				'refuses a request from %s without disclosing anything, leaving the address and the attempt to the browser',
+				async ( _name, refusal, page ) => {
+					const { flow: linux, owner } = linuxFlow( [
+						refusal,
+						'same-user',
+						refusal,
+						'same-user',
+					] );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const listenerPort = Number( new URL( startUrl ).port );
+
+					const intruded = await request( startUrl );
+					const response = await fetch( startUrl, { redirect: 'manual' } );
+					const location = response.headers.get( 'location' )!;
+					const callbackUrl = await authorize( location );
+					const intrudedCallback = await deliver( callbackUrl );
+					const exchangedBefore = fake.tokenRequests.length;
+					const delivered = await deliver( callbackUrl );
+
+					expectNothingDisclosed( intruded, location, page );
+					expect( response.status ).toBe( 302 );
+					expect( location.startsWith( `${ fake.url }/api/accounts/authorize?` ) ).toBe( true );
+					expectNothingDisclosed( intrudedCallback, location, page );
+					expect( exchangedBefore ).toBe( 0 );
+					expect( delivered.status ).toBe( 200 );
+					expect( ( await linux.wait( attemptId ) ).ok ).toBe( true );
+					expect( owner ).toHaveBeenCalledTimes( 4 );
+					for ( const [ connection ] of owner.mock.calls ) {
+						expect( connection ).toEqual( {
+							remoteAddress: '127.0.0.1',
+							remotePort: expect.any( Number ),
+							localAddress: '127.0.0.1',
+							localPort: listenerPort,
+						} );
+					}
+				}
+			);
+
+			it.each< LoopbackPeerOwner >( [ 'same-user', 'root', 'unknown' ] )(
+				'lets a request whose owner is %s through, as before, and closes the tables with the attempt',
+				async ( answer ) => {
+					const { flow: linux, owner, close } = linuxFlow( [ answer, answer ] );
+
+					const { outcome } = await signIn( undefined, undefined, linux );
+
+					expect( outcome.ok ).toBe( true );
+					expect( owner ).toHaveBeenCalledTimes( 2 );
+					expect( close ).toHaveBeenCalledTimes( 1 );
+				}
+			);
+
+			it( 'closes the tables with an attempt that ends before any request', async () => {
+				const cancelled = linuxFlow( [] );
+				const { attemptId } = await beginUnfollowed( undefined, undefined, cancelled.flow );
+				expect( cancelled.close ).not.toHaveBeenCalled();
+				expect( cancelled.flow.cancel( attemptId ) ).toBe( true );
+				const timedOut = linuxFlow( [] );
+				const quick = startFlow( {
+					timeoutMs: 100,
+					platform: 'linux',
+					loopbackPeers: () => ( { ownerOf: timedOut.owner, close: timedOut.close } ),
+				} );
+				const late = await beginUnfollowed( undefined, undefined, quick );
+
+				expect( await quick.wait( late.attemptId ) ).toEqual( failed( 'timed-out' ) );
+				expect( cancelled.close ).toHaveBeenCalledTimes( 1 );
+				expect( timedOut.close ).toHaveBeenCalledTimes( 1 );
+			} );
+
+			it.each< NodeJS.Platform >( [ 'darwin', 'win32' ] )(
+				'opens no socket table and asks nothing on %s, which keeps other users from reading the opener’s arguments',
+				async ( platform ) => {
+					const owner = vi.fn( async () => 'other-user' as const );
+					const peers = vi.fn( () => ( { ownerOf: owner, close: async () => undefined } ) );
+					const other = startFlow( { platform, loopbackPeers: peers } );
+
+					const { outcome } = await signIn( undefined, undefined, other );
+
+					expect( outcome.ok ).toBe( true );
+					expect( peers ).not.toHaveBeenCalled();
+					expect( owner ).not.toHaveBeenCalled();
+				}
+			);
+
+			it.each( [ 'closes', 'resets' ] )(
+				'leaves the address to the browser when a client %s its connection before its lookup settles',
+				async ( how ) => {
+					let settle: ( owner: LoopbackPeerOwner ) => void = () => undefined;
+					const unsettled = new Promise< LoopbackPeerOwner >( ( resolve ) => ( settle = resolve ) );
+					const { flow: linux, owner } = linuxFlow( [ unsettled, 'same-user', 'same-user' ] );
+					const createServer = vi.spyOn( http, 'createServer' );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const server = createServer.mock.results.at( -1 )!.value as http.Server;
+					const accepted: net.Socket[] = [];
+					server.on( 'connection', ( socket: net.Socket ) => accepted.push( socket ) );
+					const start = new URL( startUrl );
+					const client = net.connect( Number( start.port ), start.hostname );
+					client.on( 'error', () => undefined );
+					await once( client, 'connect' );
+
+					client.write( `GET ${ start.pathname } HTTP/1.1\r\nHost: ${ start.host }\r\n\r\n` );
+					await until( () => owner.mock.calls.length === 1 );
+					if ( how === 'closes' ) {
+						client.destroy();
+					} else {
+						client.resetAndDestroy();
+					}
+					await until( () => accepted.length === 1 && ! accepted[ 0 ].writable );
+					settle( 'same-user' );
+					await nextTurn();
+
+					const location = await follow( startUrl );
+					await deliver( await authorize( location ) );
+					expect( ( await linux.wait( attemptId ) ).ok ).toBe( true );
+					expect( owner ).toHaveBeenCalledTimes( 3 );
+				}
+			);
+
+			// Through the reader itself, over stand-in /proc files the test scripts.
+			describe( 'reading the socket tables', () => {
+				const CONTAINER_UID_MAP = '         0     100000      65536\n';
+				const busy = new Map< string, string >();
+
+				function linuxProc( files: Record< string, string > = {} ) {
+					return createFakeProc( {
+						[ TCP_FILE ]: tcpTable(),
+						[ TCP6_FILE ]: tcp6Table(),
+						[ OVERFLOW_UID_FILE ]: '65534\n',
+						[ UID_MAP_FILE ]: INITIAL_UID_MAP,
+						...files,
+					} );
+				}
+
+				function procFlow(
+					proc: FakeProc,
+					{
+						lookupTimeoutMs,
+						...options
+					}: ChatGptSignInFlowOptions & { lookupTimeoutMs?: number } = {}
+				) {
+					return startFlow( {
+						platform: 'linux',
+						loopbackPeers: () =>
+							openLoopbackPeerLookup( {
+								open: proc.open,
+								uid: OWN_UID,
+								littleEndian: true,
+								...( lookupTimeoutMs ? { timeoutMs: lookupTimeoutMs } : {} ),
+							} ),
+						...options,
+					} );
+				}
+
+				// Lists the socket a request is about to come from as `uid`'s, in one table.
+				const listedAs =
+					( proc: FakeProc, startUrl: string, uid: number, file = TCP_FILE ) =>
+					( localPort: number ) => {
+						const listener = Number( new URL( startUrl ).port );
+						proc.content.set(
+							TCP_FILE,
+							file === TCP_FILE
+								? tcpTable( tcpRow( 1, at( localPort ), at( listener ), { uid } ) )
+								: tcpTable()
+						);
+						proc.content.set(
+							TCP6_FILE,
+							file === TCP6_FILE
+								? tcp6Table(
+										tcp6Row(
+											1,
+											`${ mapped( 1 ) }:${ hex4( localPort ) }`,
+											`${ mapped( 1 ) }:${ hex4( listener ) }`,
+											uid
+										)
+								  )
+								: tcp6Table()
+						);
+					};
+
+				// Lists the request's socket as `uid`'s at the very end of a busy host's
+				// table, over the 4 MiB an earlier bound refused.
+				const listedLastAs =
+					( proc: FakeProc, startUrl: string, uid: number, file = TCP_FILE ) =>
+					( localPort: number ) => {
+						const listener = Number( new URL( startUrl ).port );
+						let others = busy.get( file );
+						if ( ! others ) {
+							const rows = Array.from( { length: 40_000 }, ( _, slot ) =>
+								file === TCP_FILE
+									? tcpRow( slot + 10, at( 20_000 + slot, v4( 9 ) ), at( 443, 'C0A80001' ), {
+											uid: OTHER_UID,
+									  } )
+									: tcp6Row(
+											slot + 10,
+											`${ mapped( 9 ) }:${ hex4( 20_000 + slot ) }`,
+											`${ mapped( 9 ) }:01BB`,
+											OTHER_UID
+									  )
+							);
+							others = file === TCP_FILE ? tcpTable( ...rows ) : tcp6Table( ...rows );
+							busy.set( file, others );
+						}
+						const row =
+							file === TCP_FILE
+								? tcpRow( 1, at( localPort ), at( listener ), { uid } )
+								: tcp6Row(
+										1,
+										`${ mapped( 1 ) }:${ hex4( localPort ) }`,
+										`${ mapped( 1 ) }:${ hex4( listener ) }`,
+										uid
+								  );
+						proc.content.set( TCP_FILE, tcpTable() );
+						proc.content.set( TCP6_FILE, tcp6Table() );
+						proc.content.set( file, `${ others }${ row }\n` );
+						expect( Buffer.byteLength( proc.content.get( file )! ) ).toBeGreaterThan(
+							5 * 1024 * 1024
+						);
+					};
+
+				it( 'opens the tables as its listener starts, before the browser, reads them again for each request, and closes them with the attempt', async () => {
+					const proc = linuxProc();
+					const openWhenBrowsing: string[][] = [];
+					const linux = procFlow( proc, {
+						openBrowser: async ( url ) => {
+							openWhenBrowsing.push( [ ...proc.opens ] );
+							opened.push( url );
+						},
+					} );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const mine = listedAs( proc, startUrl, OWN_UID );
+
+					const intruded = await requestFrom( startUrl, listedAs( proc, startUrl, OTHER_UID ) );
+					const location = ( await requestFrom( startUrl, mine ) ).location!;
+					const delivered = await requestFrom( await authorize( location ), mine );
+
+					expect( openWhenBrowsing ).toEqual( [
+						expect.arrayContaining( [ TCP_FILE, TCP6_FILE ] ),
+					] );
+					expectNothingDisclosed( intruded, location, 'invalid' );
+					expect( delivered.status ).toBe( 200 );
+					expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+					for ( const file of [ TCP_FILE, TCP6_FILE ] ) {
+						expect( proc.opens.filter( ( opened ) => opened === file ) ).toHaveLength( 1 );
+						expect(
+							proc.reads.filter( ( read ) => read.file === file && read.position === 0 )
+						).toHaveLength( 3 );
+					}
+					await until(
+						() => proc.closes.includes( TCP_FILE ) && proc.closes.includes( TCP6_FILE )
+					);
+				} );
+
+				const FAILURES: Array< {
+					name: string;
+					fail: ( proc: FakeProc, file: string ) => void;
+					lookupTimeoutMs?: number;
+					recoverMs?: number;
+				} > = [
+					...[ 'EMFILE', 'ENFILE', 'ENOMEM', 'EIO' ].map( ( code ) => ( {
+						name: `a read failing with ${ code }`,
+						fail: ( proc: FakeProc, file: string ) =>
+							proc.failNextRead( file, systemError( code ) ),
+					} ) ),
+					{
+						name: 'a read slower than a lookup may take',
+						fail: ( proc, file ) => proc.failNextRead( file, { stallMs: 300 } ),
+						lookupTimeoutMs: 100,
+						recoverMs: 300,
+					},
+					{
+						name: 'a read failing in a way it doesn’t expect',
+						fail: ( proc, file ) =>
+							proc.failNextRead( file, new TypeError( 'test-unexpected-read' ) ),
+					},
+					{
+						name: 'a read failing partway through the table',
+						fail: ( proc, file ) =>
+							proc.failNextRead( file, { failAfter: 1, error: systemError( 'EIO' ) } ),
+					},
+					{
+						name: 'a table in a layout it doesn’t know',
+						fail: ( proc, file ) => proc.failNextRead( file, { text: 'not a socket table\n' } ),
+					},
+				];
+				const CASES = FAILURES.flatMap( ( failure ) =>
+					[ TCP_FILE, TCP6_FILE ].flatMap( ( file ) =>
+						( [ 'start address', 'callback' ] as const ).map( ( kind ) => ( {
+							...failure,
+							file,
+							kind,
+						} ) )
+					)
+				);
+
+				it.each( CASES )(
+					'refuses the $kind for $name in $file, though its owner is this user, leaving the address and the attempt to the browser',
+					async ( { fail, file, kind, lookupTimeoutMs, recoverMs } ) => {
+						const proc = linuxProc();
+						const linux = procFlow( proc, { lookupTimeoutMs } );
+						const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+						const mine = listedAs( proc, startUrl, OWN_UID );
+						let target = startUrl;
+						let location: string | undefined;
+						if ( kind === 'callback' ) {
+							location = ( await requestFrom( startUrl, mine ) ).location!;
+							target = await authorize( location );
+						}
+
+						fail( proc, file );
+						const refused = await requestFrom( target, mine );
+						await sleep( recoverMs ?? 0 );
+						const exchangedBefore = fake.tokenRequests.length;
+						const answered = await requestFrom( target, mine );
+						if ( kind === 'start address' ) {
+							location = answered.location!;
+							expect( ( await requestFrom( await authorize( location ), mine ) ).status ).toBe(
+								200
+							);
+						}
+
+						expect( answered.status ).toBe( kind === 'start address' ? 302 : 200 );
+						// Told to reload, which, as `answered` shows, works.
+						expectNothingDisclosed( refused, location!, 'reload' );
+						expect( exchangedBefore ).toBe( 0 );
+						expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+					}
+				);
+
+				it.each( [ 'ENOENT', 'EACCES' ] )(
+					'decides from the other table when the kernel hides one with %s',
+					async ( code ) => {
+						const proc = linuxProc();
+						proc.failNextOpen( TCP_FILE, systemError( code ) );
+						const linux = procFlow( proc );
+						const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+
+						// Listed in the table it can read: another user is refused, this one let through.
+						const intruded = await requestFrom(
+							startUrl,
+							listedAs( proc, startUrl, OTHER_UID, TCP6_FILE )
+						);
+						const response = await requestFrom(
+							startUrl,
+							listedAs( proc, startUrl, OWN_UID, TCP6_FILE )
+						);
+						// Listed only where the kernel hides it, with the other table hidden too: let through.
+						proc.failNextRead( TCP6_FILE, systemError( code ) );
+						const delivered = await requestFrom(
+							await authorize( response.location! ),
+							listedAs( proc, startUrl, OTHER_UID, TCP_FILE )
+						);
+
+						expectNothingDisclosed( intruded, response.location!, 'invalid' );
+						expect( response.status ).toBe( 302 );
+						expect( delivered.status ).toBe( 200 );
+						expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+					}
+				);
+
+				it.each( [ TCP_FILE, TCP6_FILE ] )(
+					'finds the request’s row at the end of a busy host’s %s, over 4 MiB: another user refused, this user let through',
+					async ( file ) => {
+						const proc = linuxProc();
+						const linux = procFlow( proc );
+						const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+						const mine = listedLastAs( proc, startUrl, OWN_UID, file );
+
+						const intruded = await requestFrom(
+							startUrl,
+							listedLastAs( proc, startUrl, OTHER_UID, file )
+						);
+						const response = await requestFrom( startUrl, mine );
+						const delivered = await requestFrom( await authorize( response.location! ), mine );
+
+						expectNothingDisclosed( intruded, response.location!, 'invalid' );
+						expect( response.status ).toBe( 302 );
+						expect( delivered.status ).toBe( 200 );
+						expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+					}
+				);
+
+				it( 'refuses a request listed as the overflow uid where every uid is mapped, the initial user namespace', async () => {
+					const proc = linuxProc();
+					const linux = procFlow( proc );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const mine = listedAs( proc, startUrl, OWN_UID );
+
+					const nobody = await requestFrom( startUrl, listedAs( proc, startUrl, 65534 ) );
+					const location = ( await requestFrom( startUrl, mine ) ).location!;
+					await requestFrom( await authorize( location ), mine );
+
+					expectNothingDisclosed( nobody, location, 'invalid' );
+					expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+				} );
+
+				it( 'lets a request listed as the overflow uid through under another uid map, where it proves no owner', async () => {
+					const proc = linuxProc( { [ UID_MAP_FILE ]: CONTAINER_UID_MAP } );
+					const linux = procFlow( proc );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const nobody = listedAs( proc, startUrl, 65534 );
+
+					const response = await requestFrom( startUrl, nobody );
+					const delivered = await requestFrom( await authorize( response.location! ), nobody );
+
+					expect( response.status ).toBe( 302 );
+					expect( delivered.status ).toBe( 200 );
+					expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+				} );
+			} );
+		} );
+	} );
+
+	// Saved sign-ins whose key the keychain says it doesn't have: the user hears
+	// so before the browser opens, not after finishing ChatGPT's page.
+	describe( 'a sign-in to keep in secure storage while the saved sign-ins’ key can’t be read', () => {
+		async function savedUnderUnreadableKey() {
+			const existing = await signInExisting();
+			keychain.items.clear();
+			return existing;
+		}
+
+		async function expectRefusedBeforeTheBrowser( starting: () => Promise< unknown > ) {
+			const listen = vi.spyOn( http.Server.prototype, 'listen' );
+			const openedBefore = opened.length;
+			const discoveries = fake.counts.discovery;
+
+			const error = await starting().then(
+				() => null,
+				( failure: unknown ) => failure
+			);
+
+			expect( error ).toBeInstanceOf( ChatGptSignInError );
+			expect( error ).toMatchObject( {
+				code: 'vault-key-unreadable',
+				message: new ChatGptSignInError( 'vault-key-unreadable' ).message,
+			} );
+			expect( listen ).not.toHaveBeenCalled();
+			expect( opened ).toHaveLength( openedBefore );
+			expect( fake.counts.discovery ).toBe( discoveries );
+			expect( keychain.items.size ).toBe( 0 );
+			listen.mockRestore();
+		}
+
+		it.each< [ string, 'new' | 'saved' | 'saved, kept where it was' ] >( [
+			[ 'a new registration', 'new' ],
+			[ 'a saved registration', 'saved' ],
+			[ 'a saved registration with no storage chosen', 'saved, kept where it was' ],
+		] )( 'is refused for %s before any listener, discovery or browser', async ( _name, kind ) => {
+			const existing = await savedUnderUnreadableKey();
+			const registrationId = kind === 'new' ? undefined : existing.registrationId;
+			const options: ChatGptSignInOptions =
+				kind === 'saved, kept where it was' ? {} : { storage: 'vault' };
+
+			await expectRefusedBeforeTheBrowser( () => flow.begin( registrationId, options ) );
+
+			expect( saves ).toHaveLength( existing.saved );
+			expect( await snapshot() ).toEqual( existing.before );
+		} );
+
+		it( 'is refused by the app’s own sign-in, which the CLI and the Desktop app both start', async () => {
+			await savedUnderUnreadableKey();
+			vi.resetModules();
+			const app = await import( '@studio/agent/node/chatgpt/oauth' );
+			const appFlow = app.createChatGptSignInFlow( {
+				discoveryUrl: fake.discoveryUrl,
+				openBrowser,
+			} );
+			flows.push( appFlow );
+
+			const listen = vi.spyOn( http.Server.prototype, 'listen' );
+			const error = await appFlow.begin( undefined, { storage: 'vault' } ).catch( ( e ) => e );
+
+			expect( error ).toBeInstanceOf( app.ChatGptSignInError );
+			expect( error.code ).toBe( 'vault-key-unreadable' );
+			expect( listen ).not.toHaveBeenCalled();
+		} );
+
+		it( 'goes on as before when the key can be read, or no saved sign-in needs one', async () => {
+			// No saved sign-in: the first makes the key.
+			expect( ( await signIn( undefined, { storage: 'vault' } ) ).outcome.ok ).toBe( true );
+			// Saved sign-ins, and their key there.
+			expect( ( await signIn( undefined, { storage: 'vault' } ) ).outcome.ok ).toBe( true );
+			expect( keychain.items.size ).toBe( 1 );
+		} );
+
+		it( 'asks the keychain nothing before the browser for a first sign-in, while no sign-in is saved', async () => {
+			const get = vi.spyOn( keychain.store, 'get' );
+			const listen = vi.spyOn( http.Server.prototype, 'listen' );
+
+			const { attemptId, url } = await begin( undefined, { storage: 'vault' } );
+
+			expect( get ).not.toHaveBeenCalled();
+			expect( listen ).toHaveBeenCalledTimes( 1 );
+			expect( opened ).toHaveLength( 1 );
+			await deliver( await authorize( url ) );
+			expect( ( await flow.wait( attemptId ) ).ok ).toBe( true );
+			// The save, after the browser, made the key.
+			expect( get ).toHaveBeenCalled();
+			expect( keychain.items.size ).toBe( 1 );
+		} );
+
+		it( 'leaves a sign-in for this app session only to go on', async () => {
+			await savedUnderUnreadableKey();
+
+			const { outcome } = await signIn( undefined, { storage: 'session' } );
+
+			expect( outcome.ok ).toBe( true );
+			expect( keychain.items.size ).toBe( 0 );
+		} );
+
+		it( 'is still refused when saving, if the key becomes unreadable after the attempt began', async () => {
+			const existing = await signInExisting();
+			const start = await begin( undefined, { storage: 'vault' } );
+			keychain.items.clear();
+
+			await deliver( await authorize( start.url ) );
+
+			expect( await flow.wait( start.attemptId ) ).toEqual( failed( 'vault-key-unreadable' ) );
+			expect( await snapshot() ).toEqual( existing.before );
+			expect( keychain.items.size ).toBe( 0 );
 		} );
 	} );
 

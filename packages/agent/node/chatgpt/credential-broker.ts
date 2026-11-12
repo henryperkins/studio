@@ -6,7 +6,6 @@ import {
 	createOsCredentialStore,
 	type OsCredentialStore,
 } from '@studio/common/lib/os-credential-store';
-import { getConfigDirectory } from '@studio/common/lib/well-known-paths';
 import { __ } from '@wordpress/i18n';
 import { readFile } from 'atomically';
 import {
@@ -28,6 +27,7 @@ import {
 	type ChatGptAccount,
 	type ChatGptAccountSignIn,
 } from '@studio/agent/node/chatgpt/account-store';
+import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
 import type { ParentChannel } from '@studio/agent/node/openai-credentials';
 import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections';
 
@@ -39,7 +39,10 @@ import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections
  * A registration's tokens are one record in a vault file, sealed with
  * AES-256-GCM under a random key kept in the system keychain and bound to the
  * registration and the record's version. Without a keychain the vault
- * refuses; it never falls back to plaintext. A registration may instead keep
+ * refuses; it never falls back to plaintext. A keychain that says it has no
+ * key while saved records exist may only be locked, so the key reads as
+ * unreadable, never lost: no record is cleared and no new key made until the
+ * last saved registration is signed out. A registration may instead keep
  * its tokens in the memory of the app that signed in, for that session only;
  * a turn the app forks asks it for an access token over their IPC channel,
  * and loses what it was handed once the app has gone.
@@ -204,6 +207,12 @@ export interface ChatGptCredentialBrokerOptions {
 }
 
 export interface ChatGptCredentialBroker {
+	/**
+	 * Before a sign-in that will be kept in the vault: refuses with
+	 * `vault-key-unreadable` when saving it would, because saved records exist
+	 * and the keychain says it has no key for them. Writes nothing.
+	 */
+	checkVaultKey(): Promise< void >;
 	saveSignIn( signIn: ChatGptSignIn ): Promise< ChatGptAccount >;
 	getAccessToken( connectionId: string ): Promise< string >;
 	/** Drops only the rejected access token, preserving any newer token. */
@@ -565,7 +574,7 @@ export function createChatGptCredentialBroker(
 		! sessions.has( registrationId ) &&
 		! reachableParent();
 
-	const credentialsDirectory = () => path.join( getConfigDirectory(), CREDENTIALS_DIRECTORY );
+	const credentialsDirectory = () => path.join( getChatGptStateDirectory(), CREDENTIALS_DIRECTORY );
 	const recordFile = ( registrationId: string ) => `${ registrationId }.vault`;
 
 	function vaultUnavailable( error: unknown, secret?: string ): ChatGptConnectionError {
@@ -604,10 +613,33 @@ export function createChatGptCredentialBroker(
 		return text ? cacheWrappingKey( text ) : null;
 	}
 
+	// Whether a registration Studio lists keeps a sealed record. One no
+	// registration owns can't be signed out, so it doesn't count.
+	async function hasSealedRecords(): Promise< boolean > {
+		let names: string[];
+		try {
+			names = await fs.readdir( credentialsDirectory() );
+		} catch ( error ) {
+			if ( isErrnoException( error ) && error.code === 'ENOENT' ) {
+				return false;
+			}
+			throw error;
+		}
+		const sealed = new Set(
+			names.filter( ( name ) => name.endsWith( '.vault' ) ).map( ( name ) => name.slice( 0, -6 ) )
+		);
+		return (
+			sealed.size > 0 &&
+			( await readChatGptAccounts() ).some( ( account ) => sealed.has( account.registrationId ) )
+		);
+	}
+
 	/**
 	 * The key a record is sealed with: the one the keychain holds now, which
 	 * another process may have put there since this one last read it. Created
-	 * there, under the key's lock, only when there is none.
+	 * there, under the key's lock, only when there is none and no saved record
+	 * needs one: a keychain may say it has none when it is only locked, and a
+	 * new key would replace the one those records were sealed with.
 	 */
 	async function getSealingKey(): Promise< Buffer > {
 		const text = await withLock(
@@ -617,6 +649,9 @@ export function createChatGptCredentialBroker(
 				const existing = await readWrappingKeyText();
 				if ( existing ) {
 					return existing;
+				}
+				if ( await hasSealedRecords() ) {
+					throw new ChatGptConnectionError( 'vault-key-unreadable' );
 				}
 				const created = randomBytes( WRAPPING_KEY_BYTES ).toString( 'base64url' );
 				try {
@@ -628,6 +663,15 @@ export function createChatGptCredentialBroker(
 			}
 		);
 		return cacheWrappingKey( text );
+	}
+
+	// The check `getSealingKey` makes before it would make a key, without making
+	// one. The keychain, and any prompt it shows, is asked only when a saved
+	// sign-in needs the key.
+	async function checkVaultKey(): Promise< void > {
+		if ( ( await hasSealedRecords() ) && ! ( await readWrappingKeyText() ) ) {
+			throw new ChatGptConnectionError( 'vault-key-unreadable' );
+		}
 	}
 
 	async function lockRefresh( registrationId: string ): Promise< () => Promise< void > > {
@@ -802,6 +846,10 @@ export function createChatGptCredentialBroker(
 			if ( read.status === 'newer' ) {
 				throw new ChatGptConnectionError( 'newer-format' );
 			}
+			// A keychain that says it has no key may only be locked: the record stays.
+			if ( read.status === 'unusable' && ! key ) {
+				throw new ChatGptConnectionError( 'vault-key-unreadable' );
+			}
 			if ( read.status !== 'ok' || ! key ) {
 				await clearUnusable( current );
 				throw new ChatGptConnectionError( 'needs-sign-in' );
@@ -837,6 +885,9 @@ export function createChatGptCredentialBroker(
 		}
 		if ( read.status === 'ok' && isFresh( read.record.expiresAt ) ) {
 			return read.record.accessToken;
+		}
+		if ( read.status === 'unusable' && ! key ) {
+			throw new ChatGptConnectionError( 'vault-key-unreadable' );
 		}
 		return renewVaultRecord( account, key );
 	}
@@ -1452,6 +1503,7 @@ export function createChatGptCredentialBroker(
 	}
 
 	return {
+		checkVaultKey,
 		saveSignIn,
 		getAccessToken,
 		invalidateAccessToken,
@@ -1488,6 +1540,11 @@ function getAppBroker(): ChatGptCredentialBroker {
 		},
 	} );
 	return appBroker;
+}
+
+/** Refuses, before a sign-in to keep in the vault, when saving it would for an unreadable key. */
+export function checkChatGptVaultKey(): Promise< void > {
+	return getAppBroker().checkVaultKey();
 }
 
 /** Saves a completed, validated sign-in as a new registration or to the one it names. */

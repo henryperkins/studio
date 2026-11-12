@@ -17,10 +17,16 @@ import {
 } from '@studio/agent/node/chatgpt/account-store';
 import {
 	CHATGPT_DIRECT_USE_SCOPE,
+	checkChatGptVaultKey,
 	readChatGptIdTokenHint,
 	saveChatGptSignIn,
 	type ChatGptCredentialBroker,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import {
+	openLoopbackPeerLookup,
+	type LoopbackPeerLookup,
+	type LoopbackPeerOwner,
+} from '@studio/agent/node/chatgpt/loopback-peer';
 import {
 	CHATGPT_RESOURCE,
 	createChatGptTokenClient,
@@ -54,8 +60,10 @@ export type {
  *
  * The backend opens the authorization page in the system browser itself: its
  * URL can carry the account's ID token, so no caller, renderer or log ever
- * sees it. Callers get the attempt's id and wait for its outcome, which never
- * carries a secret.
+ * sees it. Nor does the browser opener's command line, which other processes
+ * can read: the opener gets a one-time address on the attempt's own loopback
+ * listener, which sends the browser on to the authorization URL. Callers get
+ * the attempt's id and wait for its outcome, which never carries a secret.
  */
 
 /** How long a sign-in waits for ChatGPT to send the browser back. */
@@ -94,6 +102,15 @@ const REVOKE_TIMEOUT_MS = 10_000;
 const OUTCOME_RETENTION_MS = 10 * 60_000;
 // Port 0 can't collide; should listening still fail that way, the system picks again.
 const LISTEN_ATTEMPTS = 3;
+// A browser opens at most six connections to one host at a time; two more
+// leave room for it to retry. Beyond these the listener drops a connection
+// unread, so no one can hold the process's open files through it.
+const MAX_CALLBACK_CONNECTIONS = 8;
+// A connection that hasn't sent its whole request this long after it was
+// accepted is closed, checked each second, so none can be parked there. Once
+// a request is in, answering it isn't timed.
+const CALLBACK_REQUEST_TIMEOUT_MS = 10_000;
+const CALLBACK_CONNECTIONS_CHECK_MS = 1_000;
 
 /** Opens a URL in the system browser; rejects when it can't. */
 export type ChatGptBrowserOpener = ( url: string ) => Promise< void >;
@@ -104,9 +121,13 @@ export interface ChatGptSignInFlowOptions {
 	/** Replaced only by tests: how long an attempt waits for its callback. */
 	timeoutMs?: number;
 	/** The broker sign-ins are saved through: the app's by default. */
-	credentials?: Pick< ChatGptCredentialBroker, 'saveSignIn' | 'readIdTokenHint' >;
+	credentials?: Pick< ChatGptCredentialBroker, 'checkVaultKey' | 'saveSignIn' | 'readIdTokenHint' >;
 	/** The system browser: the opener installed with `setChatGptBrowserOpener` by default. */
 	openBrowser?: ChatGptBrowserOpener;
+	/** Replaced only by tests: the platform whose rules the listener follows. */
+	platform?: NodeJS.Platform;
+	/** Replaced only by tests: on Linux, what a listener asks whose socket a request comes from. */
+	loopbackPeers?: () => LoopbackPeerLookup;
 }
 
 export interface ChatGptSignInFlow {
@@ -175,6 +196,10 @@ function describeSignInFailure( code: ChatGptSignInFailureCode ): string {
 			return __(
 				'Studio couldn’t reach the system keychain to save your ChatGPT sign-in, so nothing was saved. Unlock it and try again.'
 			);
+		case 'vault-key-unreadable':
+			return __(
+				'Studio couldn’t read the key in the system keychain that protects your saved ChatGPT sign-ins, so it can’t keep this sign-in in secure storage, and nothing was saved. Unlock the keychain and try again, or keep this sign-in for this app session only. If the key is gone, sign out of every saved ChatGPT account first: the next sign-in kept in secure storage then makes a new key.'
+			);
 		case 'save-failed':
 			return __( 'Studio couldn’t save your ChatGPT sign-in. Try again.' );
 	}
@@ -208,6 +233,10 @@ interface PendingAttempt {
 	state: string;
 	nonce: string;
 	codeVerifier: string;
+	/** The one-time path the browser opener is given: a random segment and nothing else. */
+	startPath: string;
+	/** Where the start address sends the browser; null once it has. */
+	authorizationUrl: string | null;
 }
 
 /** The account a verified ID token names. */
@@ -225,6 +254,8 @@ interface Attempt {
 	/** The `Host` a browser sends to the callback. */
 	callbackHost: string;
 	server: http.Server;
+	/** On Linux, whose socket a request to the listener comes from; null elsewhere. */
+	peers: LoopbackPeerLookup | null;
 	timer: ReturnType< typeof setTimeout >;
 	/** Aborts the attempt's requests when it is cancelled or times out. */
 	controller: AbortController;
@@ -252,6 +283,7 @@ function commitFailureCode( error: unknown ): ChatGptSignInFailureCode {
 	if ( error instanceof ChatGptConnectionError ) {
 		switch ( error.code ) {
 			case 'vault-unavailable':
+			case 'vault-key-unreadable':
 			case 'identity-mismatch':
 			case 'not-found':
 			case 'accounts-unreadable':
@@ -290,8 +322,30 @@ function respond( response: http.ServerResponse, status: number, message: string
 	}
 }
 
+// Sends the browser on from the start address: the URL goes in the Location
+// header only, never cached and never passed on as a referrer.
+function redirect( response: http.ServerResponse, location: string ): void {
+	try {
+		response.writeHead( 302, {
+			'Cache-Control': 'no-store',
+			Connection: 'close',
+			'Content-Length': '0',
+			Location: location,
+			'Referrer-Policy': 'no-referrer',
+			'X-Content-Type-Options': 'nosniff',
+		} );
+		response.end();
+	} catch {
+		// The browser has gone.
+	}
+}
+
 const rejectedPage = () =>
 	__( 'This sign-in link isn’t valid. Go back to WordPress Studio to sign in again.' );
+
+// For a request whose owner couldn't be checked just now: the link still works.
+const retryPage = () =>
+	__( 'WordPress Studio couldn’t check this sign-in just now. Reload this page to try again.' );
 
 const finishedPage = ( outcome: ChatGptSignInOutcome ) =>
 	outcome.ok
@@ -307,7 +361,15 @@ async function openCallbackListener(
 	answer: http.RequestListener
 ): Promise< { server: http.Server; port: number } > {
 	for ( let tries = 1; ; tries++ ) {
-		const server = http.createServer( answer );
+		const server = http.createServer(
+			{
+				connectionsCheckingInterval: CALLBACK_CONNECTIONS_CHECK_MS,
+				headersTimeout: CALLBACK_REQUEST_TIMEOUT_MS,
+				requestTimeout: CALLBACK_REQUEST_TIMEOUT_MS,
+			},
+			answer
+		);
+		server.maxConnections = MAX_CALLBACK_CONNECTIONS;
 		try {
 			await new Promise< void >( ( resolve, reject ) => {
 				server.once( 'error', reject );
@@ -348,9 +410,12 @@ export function createChatGptSignInFlow(
 ): ChatGptSignInFlow {
 	const timeoutMs = options.timeoutMs ?? CHATGPT_SIGN_IN_TIMEOUT_MS;
 	const credentials = options.credentials ?? {
+		checkVaultKey: checkChatGptVaultKey,
 		saveSignIn: saveChatGptSignIn,
 		readIdTokenHint: readChatGptIdTokenHint,
 	};
+	const platform = options.platform ?? process.platform;
+	const openLoopbackPeers = options.loopbackPeers ?? ( () => openLoopbackPeerLookup() );
 	const attempts = new Map< string, Attempt >();
 	const keySets = new Map< string, ReturnType< typeof createRemoteJWKSet > >();
 	const tokenClient = createChatGptTokenClient( { discoveryUrl: options.discoveryUrl } );
@@ -467,6 +532,7 @@ export function createChatGptSignInFlow(
 		clearTimeout( attempt.timer );
 		attempt.controller.abort();
 		attempt.server.close();
+		void attempt.peers?.close().catch( () => undefined );
 		attempt.resolve( outcome );
 		const forget = setTimeout( () => attempts.delete( attempt.attemptId ), OUTCOME_RETENTION_MS );
 		forget.unref?.();
@@ -615,7 +681,9 @@ export function createChatGptSignInFlow(
 			respond( response, 400, rejectedPage() );
 			return;
 		}
-		if ( url.pathname !== CALLBACK_PATH ) {
+		const pending = attempt?.pending;
+		const isStart = Boolean( pending && isSameText( url.pathname, pending.startPath ) );
+		if ( url.pathname !== CALLBACK_PATH && ! isStart ) {
 			respond( response, 404, rejectedPage() );
 			return;
 		}
@@ -623,15 +691,101 @@ export function createChatGptSignInFlow(
 			respond( response, 405, rejectedPage() );
 			return;
 		}
-		const pending = attempt?.pending;
 		// Another host name is another site reaching the port, not ChatGPT's redirect.
 		if ( ! attempt || ! pending || request.headers.host !== attempt.callbackHost ) {
 			respond( response, 400, rejectedPage() );
 			return;
 		}
-		// An unknown, missing or replayed state is refused, and the attempt goes on waiting.
-		const states = url.searchParams.getAll( 'state' );
+		void peerRefusal( attempt, request ).then( ( refusal ) => {
+			if ( refusal ) {
+				respond( response, 400, refusal === 'unchecked' ? retryPage() : rejectedPage() );
+			} else if ( isStart ) {
+				answerStart( attempt, request, response );
+			} else {
+				answerReturn( attempt, url.searchParams, response );
+			}
+		} );
+	}
+
+	/**
+	 * Why the request is refused for whose socket it comes from, if it is:
+	 * `another-user`, told the link isn't valid, or `unchecked`, told to
+	 * reload, as the start address and the attempt are left as they were.
+	 *
+	 * Only on Linux, where any local user can read the browser opener's
+	 * command line, start address and all, from /proc; macOS and Windows show
+	 * a process's arguments only to its own user and administrators.
+	 *
+	 * The request goes on only when the kernel's socket tables show it comes
+	 * from this process's user or root, when a table that could be read has no
+	 * row proving its owner, or when the kernel hides a table from this
+	 * process (absent or forbidden). Refusing those would break signing in
+	 * where the tables are hidden or the connection is relayed (a hardened
+	 * kernel, WSL's localhost forwarding); an unprivileged user in the same
+	 * network namespace can't keep their socket out of a table the kernel shows
+	 * while still reading the answer, and root may read everything anyway.
+	 * Any other failure to read or parse a table, or to look the socket up, is
+	 * refused: another user can bring one about, by holding the process at its
+	 * limit of open files, say.
+	 */
+	async function peerRefusal(
+		attempt: Attempt,
+		request: http.IncomingMessage
+	): Promise< 'another-user' | 'unchecked' | null > {
+		if ( ! attempt.peers ) {
+			return null;
+		}
+		const { remoteAddress, remotePort, localAddress, localPort } = request.socket;
+		if ( ! remoteAddress || ! remotePort || ! localAddress || ! localPort ) {
+			return 'unchecked';
+		}
+		let owner: LoopbackPeerOwner;
+		try {
+			owner = await attempt.peers.ownerOf( {
+				remoteAddress,
+				remotePort,
+				localAddress,
+				localPort,
+			} );
+		} catch {
+			return 'unchecked';
+		}
+		if ( owner === 'other-user' ) {
+			return 'another-user';
+		}
+		return owner === 'unreadable' ? 'unchecked' : null;
+	}
+
+	// Once only, and only while the attempt waits for its callback.
+	function answerStart(
+		attempt: Attempt,
+		request: http.IncomingMessage,
+		response: http.ServerResponse
+	): void {
+		const authorizationUrl = attempt.pending?.authorizationUrl;
+		if ( attempt.status !== 'waiting' || ! attempt.pending || ! authorizationUrl ) {
+			respond( response, 400, rejectedPage() );
+			return;
+		}
+		// A client gone while its owner was looked up can't be sent on: the
+		// address stays for the browser.
+		if ( request.destroyed || ! request.socket?.writable ) {
+			return;
+		}
+		attempt.pending.authorizationUrl = null;
+		redirect( response, authorizationUrl );
+	}
+
+	// An unknown, missing or replayed state is refused, and the attempt goes on waiting.
+	function answerReturn(
+		attempt: Attempt,
+		params: URLSearchParams,
+		response: http.ServerResponse
+	): void {
+		const { pending } = attempt;
+		const states = params.getAll( 'state' );
 		if (
+			! pending ||
 			attempt.status !== 'waiting' ||
 			states.length !== 1 ||
 			! isSameText( states[ 0 ], pending.state )
@@ -640,7 +794,7 @@ export function createChatGptSignInFlow(
 			return;
 		}
 		attempt.status = 'completing';
-		void settle( attempt, pending, url.searchParams ).then( ( outcome ) =>
+		void settle( attempt, pending, params ).then( ( outcome ) =>
 			respond( response, 200, finishedPage( outcome ) )
 		);
 	}
@@ -654,6 +808,21 @@ export function createChatGptSignInFlow(
 			throw new ChatGptSignInError( 'browser-unavailable' );
 		}
 		const account = registrationId === undefined ? null : await findRegistration( registrationId );
+		const storage = isCredentialStorage( signInOptions.storage )
+			? signInOptions.storage
+			: account?.storage ?? 'vault';
+		// Saving would refuse for an unreadable key: say so before the browser
+		// opens. Saving checks again, as the keychain may lock in between; any
+		// other answer here is left for it to report.
+		if ( storage === 'vault' ) {
+			const refusal = await credentials.checkVaultKey().then(
+				() => null,
+				( error: unknown ) => error
+			);
+			if ( refusal instanceof ChatGptConnectionError && refusal.code === 'vault-key-unreadable' ) {
+				throw new ChatGptSignInError( 'vault-key-unreadable' );
+			}
+		}
 		let hostId: string;
 		try {
 			hostId = await getChatGptHostId();
@@ -682,6 +851,14 @@ export function createChatGptSignInFlow(
 		const { server, port } = await openCallbackListener( ( request, response ) =>
 			answerCallback( attempts.get( attemptId ), request, response )
 		);
+		// Opened with the listener, before the opener is given its port.
+		let peers: LoopbackPeerLookup | null = null;
+		try {
+			peers = platform === 'linux' ? openLoopbackPeers() : null;
+		} catch {
+			server.close();
+			throw new ChatGptSignInError( 'callback-unavailable' );
+		}
 		const pending: PendingAttempt = {
 			version: PENDING_ATTEMPT_VERSION,
 			attemptId,
@@ -694,14 +871,14 @@ export function createChatGptSignInFlow(
 				  }
 				: null,
 			retainedClientId,
-			storage: isCredentialStorage( signInOptions.storage )
-				? signInOptions.storage
-				: account?.storage ?? 'vault',
+			storage,
 			authServer,
 			redirectUri: `http://${ CALLBACK_HOST }:${ port }${ CALLBACK_PATH }`,
 			state: randomValue(),
 			nonce: randomValue(),
 			codeVerifier: randomValue(),
+			startPath: `/${ randomValue() }`,
+			authorizationUrl: null,
 		};
 
 		const params: Record< string, string > = {
@@ -730,6 +907,7 @@ export function createChatGptSignInFlow(
 		for ( const [ name, value ] of Object.entries( params ) ) {
 			authorizationUrl.searchParams.set( name, value );
 		}
+		pending.authorizationUrl = authorizationUrl.toString();
 
 		let resolve: ( outcome: ChatGptSignInOutcome ) => void = () => undefined;
 		const outcome = new Promise< ChatGptSignInOutcome >( ( settled ) => ( resolve = settled ) );
@@ -739,6 +917,7 @@ export function createChatGptSignInFlow(
 			status: 'waiting',
 			callbackHost: `${ CALLBACK_HOST }:${ port }`,
 			server,
+			peers,
 			controller: new AbortController(),
 			outcome,
 			resolve,
@@ -750,9 +929,10 @@ export function createChatGptSignInFlow(
 		};
 		attempts.set( attemptId, started );
 
-		// The URL goes to the browser alone, and the opener's error, which may quote it, nowhere.
+		// The opener gets the start address alone, and its error, which may quote it, goes nowhere.
+		const startUrl = `http://${ started.callbackHost }${ pending.startPath }`;
 		const opening = Promise.resolve()
-			.then( () => openBrowser( authorizationUrl.toString() ) )
+			.then( () => openBrowser( startUrl ) )
 			.then(
 				() => true,
 				() => false

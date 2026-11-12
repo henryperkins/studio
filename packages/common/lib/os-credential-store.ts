@@ -36,9 +36,13 @@ export interface OsCredentialStore {
 
 /** The keychain can't be used, or refused an operation. */
 export class SecureStorageError extends Error {
-	constructor( message: string ) {
+	/** Its tool didn't answer in time, and was stopped. */
+	readonly timedOut: boolean;
+
+	constructor( message: string, { timedOut = false }: { timedOut?: boolean } = {} ) {
 		super( message );
 		this.name = 'SecureStorageError';
+		this.timedOut = timedOut;
 	}
 }
 
@@ -49,6 +53,25 @@ export interface CommandResult {
 	stderr: string;
 	/** Set when the command couldn't be started (e.g. `ENOENT`). */
 	spawnError?: NodeJS.ErrnoException;
+	/** Set when the command ran past its time and was killed. */
+	timedOut?: true;
+}
+
+/** The system keychain Studio uses on a platform. */
+export type CredentialStoreKind = 'password-vault' | 'keychain' | 'secret-service';
+
+/** The system keychain `createOsCredentialStore` uses on a platform, or null where it has none. */
+export function credentialStoreKindFor( platform: NodeJS.Platform ): CredentialStoreKind | null {
+	switch ( platform ) {
+		case 'win32':
+			return 'password-vault';
+		case 'darwin':
+			return 'keychain';
+		case 'linux':
+			return 'secret-service';
+		default:
+			return null;
+	}
 }
 
 export type CommandRunner = (
@@ -66,17 +89,22 @@ export const runCommand: CommandRunner = ( command, args, { input, timeoutMs } )
 		let stdout = '';
 		let stderr = '';
 		let settled = false;
-		const finish = ( result: CommandResult ) => {
-			if ( ! settled ) {
-				settled = true;
-				resolve( result );
-			}
-		};
 		const child = spawn( command, [ ...args ], {
 			stdio: [ 'pipe', 'pipe', 'pipe' ],
 			windowsHide: true,
-			timeout: timeoutMs,
 		} );
+		const finish = ( result: CommandResult ) => {
+			if ( ! settled ) {
+				settled = true;
+				clearTimeout( timer );
+				resolve( result );
+			}
+		};
+		// Settles at once, rather than wait for a killed tool's output to close.
+		const timer = setTimeout( () => {
+			child.kill();
+			finish( { code: null, stdout, stderr, timedOut: true } );
+		}, timeoutMs );
 		child.stdout.setEncoding( 'utf8' );
 		child.stderr.setEncoding( 'utf8' );
 		child.stdout.on( 'data', ( chunk: string ) => ( stdout += chunk ) );
@@ -100,6 +128,14 @@ function assertItemName( value: string ): void {
 // Error text from a tool must never echo a secret back; tools that read the
 // secret from stdin don't, but strip it anyway.
 function toolError( action: string, result: CommandResult, secret?: string ): SecureStorageError {
+	if ( result.timedOut ) {
+		return new SecureStorageError(
+			`Couldn't ${ action } the system keychain: its tool didn't answer within ${
+				COMMAND_TIMEOUT_MS / 1000
+			} seconds.`,
+			{ timedOut: true }
+		);
+	}
 	const raw = ( result.spawnError?.message ?? result.stderr ).trim();
 	const text = secret ? raw.split( secret ).join( '[redacted]' ) : raw;
 	return new SecureStorageError(
@@ -114,6 +150,8 @@ interface PlatformAdapter {
 	get( account: string ): Promise< string | null >;
 	set( account: string, secret: string ): Promise< void >;
 	delete( account: string ): Promise< void >;
+	/** Whether the tool takes the secret whole; it would keep part of a longer one. */
+	takesWhole( account: string, secret: string ): boolean;
 }
 
 // macOS: /usr/bin/security. `add-generic-password` only takes the password as
@@ -123,7 +161,14 @@ function createMacAdapter( run: CommandRunner, service: string ): PlatformAdapte
 	const SECURITY = '/usr/bin/security';
 	// errSecItemNotFound.
 	const NOT_FOUND = 44;
+	// `security -i` reads at most this much of a line and runs the rest as the
+	// next command: a longer secret would be saved cut short and its tail echoed
+	// back in an error.
+	const MAX_LINE = 4095;
+	const addCommand = ( account: string, secret: string ) =>
+		`add-generic-password -U -s ${ service } -a ${ account } -w ${ secret }`;
 	return {
+		takesWhole: ( account, secret ) => addCommand( account, secret ).length <= MAX_LINE,
 		async check() {
 			const result = await run( SECURITY, [ 'default-keychain', '-d', 'user' ], {
 				timeoutMs: COMMAND_TIMEOUT_MS,
@@ -148,7 +193,7 @@ function createMacAdapter( run: CommandRunner, service: string ): PlatformAdapte
 		},
 		async set( account, secret ) {
 			const result = await run( SECURITY, [ '-i' ], {
-				input: `add-generic-password -U -s ${ service } -a ${ account } -w ${ secret }\n`,
+				input: `${ addCommand( account, secret ) }\n`,
 				timeoutMs: COMMAND_TIMEOUT_MS,
 			} );
 			// `security -i` can exit 0 after a failed command, so the caller
@@ -176,8 +221,11 @@ function createMacAdapter( run: CommandRunner, service: string ): PlatformAdapte
 // writes to stderr.
 function createLinuxAdapter( run: CommandRunner, service: string ): PlatformAdapter {
 	const SECRET_TOOL = 'secret-tool';
+	// `secret-tool store` keeps this much of stdin, drops the rest and still exits 0.
+	const MAX_SECRET_BYTES = 8192;
 	const attributes = ( account: string ) => [ 'service', service, 'account', account ];
 	return {
+		takesWhole: ( _account, secret ) => Buffer.byteLength( secret ) <= MAX_SECRET_BYTES,
 		async check() {
 			const result = await run(
 				SECRET_TOOL,
@@ -261,6 +309,8 @@ $vault = New-Object Windows.Security.Credentials.PasswordVault`;
 			{ input, timeoutMs: COMMAND_TIMEOUT_MS }
 		);
 	return {
+		// No known limit; an add PasswordVault refuses puts the previous credential back.
+		takesWhole: () => true,
 		async check() {
 			const result = await runScript( 'exit 0' );
 			return result.code === 0
@@ -328,6 +378,7 @@ function createUnsupportedAdapter( platform: string ): PlatformAdapter {
 		get: fail,
 		set: fail,
 		delete: fail,
+		takesWhole: () => true,
 	};
 }
 
@@ -341,12 +392,13 @@ export function createOsCredentialStore( {
 	run?: CommandRunner;
 } = {} ): OsCredentialStore {
 	assertItemName( service );
+	const kind = credentialStoreKindFor( platform );
 	const adapter =
-		platform === 'darwin'
+		kind === 'keychain'
 			? createMacAdapter( run, service )
-			: platform === 'linux'
+			: kind === 'secret-service'
 			? createLinuxAdapter( run, service )
-			: platform === 'win32'
+			: kind === 'password-vault'
 			? createWindowsAdapter( run, service )
 			: createUnsupportedAdapter( platform );
 
@@ -362,6 +414,9 @@ export function createOsCredentialStore( {
 			// would need anything else escaped, and `security -i` reads a command line.
 			if ( ! /^[\x21-\x7e]+$/.test( secret ) || /["'\\]/.test( secret ) ) {
 				throw new SecureStorageError( 'This secret contains characters the keychain can’t store.' );
+			}
+			if ( ! adapter.takesWhole( account, secret ) ) {
+				throw new SecureStorageError( 'This secret is too long for the system keychain.' );
 			}
 			await adapter.set( account, secret );
 			if ( ( await adapter.get( account ) ) !== secret ) {

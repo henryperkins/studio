@@ -26,6 +26,8 @@
 				"proxy-daemon.ts",
 				"logger.ts",
 				"ai/eval-runner-entry.ts",
+				"ai/chatgpt-acceptance-entry.ts",
+				"ai/chatgpt-acceptance-observer.ts",
 				"commands/**/*.ts",
 				"vite.config.*.ts"
 			],

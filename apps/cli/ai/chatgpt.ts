@@ -56,6 +56,13 @@ async function signIn(
 	settings: ChatGptSettings,
 	account?: ChatGptAccountView
 ) {
+	if ( settings.secureStorage !== 'available' && process.platform === 'linux' ) {
+		ctx.ui.showInfo(
+			__(
+				'Secure storage is unavailable, so a sign-in can be kept for this session only. On Linux, keeping one needs secret-tool (the libsecret-tools package) and a Secret Service keyring, such as GNOME Keyring or KWallet, that is running and unlocked in your desktop session.'
+			)
+		);
+	}
 	const storage = await choose< ChatGptCredentialStorage >( ctx, __( 'Keep ChatGPT sign-in' ), [
 		...( settings.secureStorage === 'available'
 			? [ { value: 'vault' as const, label: __( 'Secure storage' ) } ]

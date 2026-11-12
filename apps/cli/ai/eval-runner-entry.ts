@@ -15,5 +15,6 @@ process.env.E2E_SITES_ROOT = realpathSync(
 // user picked stays theirs.
 void ( async () => {
 	process.env.STUDIO_BASE_PORT ??= String( await claimPortRange() );
-	await import( './eval-runner' );
+	const { main } = await import( './eval-runner' );
+	await main();
 } )();

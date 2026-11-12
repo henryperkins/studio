@@ -1,0 +1,182 @@
+# Credential-free checks for the subscription-provider branches (ChatGPT plan, Claude runtime).
+#
+# Runs on pull requests and by hand. It uses no secrets and no vendor account, and runs
+# pull-request code with a read-only token. A green run is credential-free evidence only: it
+# does not qualify any platform for authenticated use.
+#
+# This workflow must never run, directly or by an environment variable that opts them in:
+#   - account-backed evals (`npm run eval`, `npm run eval:parity`);
+#   - the acceptance runners with `--live` (ChatGPT, and Claude when that branch adds one);
+#   - native keychain or credential-store tests against the real store;
+#   - any vendor sign-in, and the opt-in native Claude lifecycle tests.
+# Those need an account owner's consent, a dedicated test profile and quota, and they write
+# real state. They run only as controlled opt-in runs on a machine the owner controls, with
+# sanitized evidence. Do not add STUDIO_EVAL_*, *_API_KEY or STUDIO_NATIVE_* variables here.
+# Never run `*.e2e.test.ts` files here: they start a real process manager and site servers.
+
+name: Subscription provider checks
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subscription-provider-checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NPM_CONFIG_UPDATE_NOTIFIER: 'false'
+  NPM_CONFIG_FUND: 'false'
+  NPM_CONFIG_AUDIT: 'false'
+
+jobs:
+  checks:
+    name: Checks (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `primary` cells also run the platform-independent checks (lint, knip).
+          - { name: linux-x64, runner: ubuntu-24.04, primary: true }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm, primary: false }
+          - { name: macos-arm64, runner: macos-15, primary: false }
+          - { name: macos-x64, runner: macos-15-intel, primary: false }
+          - { name: windows-x64, runner: windows-2025, primary: false }
+          - { name: windows-arm64, runner: windows-11-arm, primary: false }
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node from .nvmrc
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install the npm version the repository pins
+        run: |
+          PM=$(node -p "require('./package.json').packageManager.split('@')[1]")
+          npm install -g "npm@$PM"
+          test "$(npm --version)" = "$PM"
+
+      - name: Show the platform this job ran on
+        run: |
+          node -p "process.platform + ' ' + process.arch"
+          node --version
+          npm --version
+          if [ "$RUNNER_OS" = "Windows" ]; then cmd //c ver; else uname -a; fi
+
+      # postinstall downloads a PHP runtime into the Studio config directory. Point that at
+      # the job's temp folder so nothing outside the workspace and temp is touched. Only this
+      # step sets it: packages/common/lib/tests/shared-config.test.ts fails when DEV_CONFIG_DIR
+      # is set for the test run.
+      - name: Install dependencies
+        env:
+          DEV_CONFIG_DIR: ${{ runner.temp }}/studio-install-config
+        run: npm ci
+
+      - name: Lint the files this pull request changed
+        if: matrix.primary && github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # Type-aware linting of a branch-sized file list exhausts Node's default heap.
+          NODE_OPTIONS: --max-old-space-size=8192
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          # Added, copied, modified and renamed files only; deleted files are not linted.
+          git diff --name-only --diff-filter=ACMR -z "$BASE_SHA" HEAD -- '*.ts' '*.tsx' '*.js' '*.jsx' '*.mjs' '*.cjs' > "$RUNNER_TEMP/changed-files.txt"
+          if [ ! -s "$RUNNER_TEMP/changed-files.txt" ]; then
+            echo "No changed JavaScript or TypeScript files to lint."
+            exit 0
+          fi
+          tr '\0' '\n' < "$RUNNER_TEMP/changed-files.txt"
+          xargs -0 -r npx eslint --no-warn-ignored < "$RUNNER_TEMP/changed-files.txt"
+
+      - name: Lint (skipped on manual runs)
+        if: matrix.primary && github.event_name != 'pull_request'
+        run: echo "::notice::Changed-file lint runs for pull requests only; a manual run has no base to diff against."
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Knip
+        if: matrix.primary
+        run: npm run knip
+
+      # The same test also runs inside `npm test`; it is its own step so a failure is attributable.
+      - name: Dependency ranges
+        run: npx vitest run --config scripts/vitest.config.ts scripts/dependency-ranges.test.mjs --maxWorkers=2
+
+      # STUDIO_EXPERIMENTAL_CLAUDE_CODE is the stacked Claude branch's flag; listed so this covers it once that branch merges this workflow.
+      - name: Assert the experimental flags are off for the main test run
+        run: |
+          status=0
+          for name in STUDIO_EXPERIMENTAL_CHATGPT STUDIO_EXPERIMENTAL_CLAUDE_CODE DEV_CONFIG_DIR STUDIO_EVAL_PROVIDER; do
+            if [ -n "${!name:-}" ]; then
+              echo "::error::$name must be unset for the main test run"
+              status=1
+            fi
+          done
+          exit $status
+
+      # Every test in a `*.e2e.test.ts` file carries the `e2e` tag (registered in vitest.shared.ts),
+      # and `--tagsFilter='!e2e'` drops them: `vitest list` shows 5 such tests unfiltered and 0
+      # filtered. A CLI `--exclude` does not reach the per-project configs, so it is not used.
+      # Tests run before any build because those suites also enable themselves once a CLI build exists.
+      - name: Unit and integration tests (flags off)
+        run: npm test -- --maxWorkers=2 --tagsFilter='!e2e'
+
+      # Add the Claude flag as one more `STUDIO_EXPERIMENTAL_CLAUDE_CODE: '1'` line and its test
+      # files as lines in ROUTING_TESTS. A listed file that does not exist on the branch under
+      # test is skipped, so the same step works before and after the Claude branch is merged.
+      - name: Routing tests with the experimental flags on
+        env:
+          STUDIO_EXPERIMENTAL_CHATGPT: '1'
+          DEV_CONFIG_DIR: ${{ runner.temp }}/studio-routing-config
+          STUDIO_PROCESS_MANAGER_HOME: ${{ runner.temp }}/studio-routing-config/daemon
+          ROUTING_TESTS: |
+            packages/agent/node/chatgpt/tests/settings.test.ts
+            packages/agent/node/sessions/tests/chatgpt-selection.test.ts
+            packages/agent/node/tests/settings-store.test.ts
+            apps/cli/ai/tests/eval-provider.test.ts
+            apps/cli/ai/tests/eval-runner.test.ts
+            apps/cli/commands/ai/tests/chatgpt.test.ts
+            apps/local/src/tests/chatgpt.test.ts
+        run: |
+          mkdir -p "$DEV_CONFIG_DIR"
+          files=()
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            if [ -f "$file" ]; then
+              files+=("$file")
+            else
+              echo "::notice::Skipping $file (not on this branch)"
+            fi
+          done <<< "$ROUTING_TESTS"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::notice::No routing test files exist on this branch."
+            exit 0
+          fi
+          npx vitest run --maxWorkers=2 --tagsFilter='!e2e' "${files[@]}"
+
+      - name: Build the browser UI
+        env:
+          STUDIO_TARGET: local
+        run: npm -w @studio/ui run build
+
+      - name: Build the CLI
+        env:
+          STUDIO_TARGET: local
+        run: npm run cli:build

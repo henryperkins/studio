@@ -4,6 +4,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { MakerDeb } from '@electron-forge/maker-deb';
 import forgeConfig from '../../forge.config';
 import packageJson from '../../package.json';
 
@@ -35,5 +36,17 @@ describe( 'forge config', () => {
 			).toBe( 'CFBundleDisplayName = "WordPress Studio";\nCFBundleName = "WordPress Studio";\n' );
 		}
 		fs.rmSync( buildPath, { recursive: true, force: true } );
+	} );
+
+	// Without it Studio says persistent sign-in storage is unavailable and offers
+	// session-only storage, so a minimal or headless install may leave it out.
+	it( 'recommends the Secret Service tool for the Linux package, without requiring it', async () => {
+		const deb = forgeConfig.makers?.find( ( maker ) => maker instanceof MakerDeb );
+		expect( deb ).toBeInstanceOf( MakerDeb );
+		await ( deb as MakerDeb ).prepareConfig( 'x64' );
+		const options = ( deb as MakerDeb ).config.options;
+
+		expect( options?.recommends ).toContain( 'libsecret-tools' );
+		expect( options?.depends ).not.toContain( 'libsecret-tools' );
 	} );
 } );

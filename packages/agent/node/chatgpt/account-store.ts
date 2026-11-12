@@ -5,9 +5,9 @@ import path from 'node:path';
 import { LOCKFILE_STALE_TIME, LOCKFILE_WAIT_TIME } from '@studio/common/constants';
 import { isErrnoException } from '@studio/common/lib/is-errno-exception';
 import { lockFileAsync, unlockFileAsync } from '@studio/common/lib/lockfile';
-import { getConfigDirectory } from '@studio/common/lib/well-known-paths';
 import { __, sprintf } from '@wordpress/i18n';
 import { readFile, writeFile } from 'atomically';
+import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
 import type { ChatGptAccountState, ChatGptCredentialStorage } from '@studio/agent/protocol/chatgpt';
 
 export type { ChatGptAccountState, ChatGptCredentialStorage } from '@studio/agent/protocol/chatgpt';
@@ -86,6 +86,7 @@ export type ChatGptConnectionErrorCode =
 	| 'session-unavailable'
 	| 'changed'
 	| 'vault-unavailable'
+	| 'vault-key-unreadable'
 	| 'refresh-failed'
 	| 'identity-mismatch'
 	| 'invalid-sign-in'
@@ -118,6 +119,10 @@ function describeChatGptConnectionError(
 					'Studio couldn’t reach the system keychain that protects your ChatGPT sign-in (%s). Unlock it and try again.'
 				),
 				detail ?? __( 'unknown error' )
+			);
+		case 'vault-key-unreadable':
+			return __(
+				'Studio couldn’t read the key in the system keychain that protects your saved ChatGPT sign-ins, so it kept them as they are. Unlock the keychain and try again. If the key is gone, sign out of every saved ChatGPT account: the next sign-in kept in secure storage then makes a new key.'
 			);
 		case 'refresh-failed':
 			return __(
@@ -242,7 +247,7 @@ function toAccount( account: ChatGptAccount ): ChatGptAccount {
 	};
 }
 
-const getAccountsPath = () => path.join( getConfigDirectory(), ACCOUNTS_FILE );
+const getAccountsPath = () => path.join( getChatGptStateDirectory(), ACCOUNTS_FILE );
 
 async function readIndex(): Promise< AccountIndex > {
 	let text: string;
@@ -341,7 +346,7 @@ export async function lockChatGptFile(
 }
 
 async function updateIndex< T >( update: ( index: AccountIndex ) => T ): Promise< T > {
-	const directory = getConfigDirectory();
+	const directory = getChatGptStateDirectory();
 	await fs.mkdir( directory, { recursive: true } );
 	const release = await lockChatGptFile( path.join( directory, `${ ACCOUNTS_FILE }.lock` ), {
 		wait: LOCKFILE_WAIT_TIME,
@@ -385,7 +390,7 @@ function distinctLabel( accounts: ChatGptAccount[], base: string ): string {
  * overlap; a failed one is left for the next.
  */
 export function watchChatGptAccounts( check: () => Promise< void >, pollMs: number ): () => void {
-	const directory = getConfigDirectory();
+	const directory = getChatGptStateDirectory();
 	let stopped = false;
 	let checking = false;
 	let again = false;
@@ -398,9 +403,9 @@ export function watchChatGptAccounts( check: () => Promise< void >, pollMs: numb
 		watcher?.close();
 	};
 	const run = () => {
-		// A check reads the current config directory; once that isn't the one
-		// watched, its reads would go elsewhere.
-		if ( stopped || getConfigDirectory() !== directory ) {
+		// A check reads the current ChatGPT state directory; once that isn't the
+		// one watched, its reads would go elsewhere.
+		if ( stopped || getChatGptStateDirectory() !== directory ) {
 			stop();
 			return;
 		}

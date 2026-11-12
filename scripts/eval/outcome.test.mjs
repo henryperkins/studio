@@ -1,13 +1,14 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, test } from 'vitest';
+import { afterAll, describe, expect, test } from 'vitest';
 import { parse } from 'yaml';
 import * as checks from './outcome.mjs';
 
 // Each check reads the runner's result file named on stdout, as promptfoo
 // hands it over. These results carry only the fields a check reads.
 const dir = mkdtempSync( path.join( tmpdir(), 'studio-eval-outcome-test-' ) );
+afterAll( () => rmSync( dir, { recursive: true, force: true } ) );
 let count = 0;
 function run( check, result, vars = {} ) {
 	const file = path.join( dir, `result-${ count++ }.json` );
@@ -692,4 +693,522 @@ test( 'list vars in the config are lists of objects', () => {
 			.map( ( [ name ] ) => `${ vars.caseId }.${ name }` )
 	);
 	expect( scalarLists ).toEqual( [] );
+} );
+
+describe( 'provider route checks', () => {
+	const ref = 'conn-0123456789ab';
+	const requested = {
+		kind: 'chatgpt-oauth',
+		backend: 'chatgpt-route',
+		subscription: true,
+		connectionRef: ref,
+		model: 'gpt-6-luna',
+		wireModel: 'gpt-6-luna',
+		effort: 'low',
+	};
+	const executed = ( overrides = {} ) => ( {
+		kind: 'chatgpt-oauth',
+		backend: 'chatgpt-route',
+		modelRequests: 3,
+		apiKeyBearers: 0,
+		imageServiceRequests: 0,
+		models: [ 'gpt-6-luna' ],
+		efforts: [ 'low' ],
+		replyKinds: [ 'chatgpt-oauth' ],
+		replyModels: [ 'gpt-6-luna' ],
+		connectionRef: ref,
+		connectionMatchesBearer: true,
+		requests: [],
+		...overrides,
+	} );
+	const routed = ( overrides = {}, route = {} ) => ( {
+		providerRoute: { requested, executed: executed( overrides ), ...route },
+	} );
+
+	test( 'ranOnRequestedRoute passes only on the selected route, connection, model and effort', () => {
+		const ok = run( checks.ranOnRequestedRoute, routed() );
+		expect( ok.pass ).toBe( true );
+		expect( ok.reason ).toMatch( /3 model request/ );
+		// The separate image service is not inference and doesn't count against the route.
+		expect( run( checks.ranOnRequestedRoute, routed( { imageServiceRequests: 2 } ) ).pass ).toBe(
+			true
+		);
+	} );
+
+	test.each( [
+		[ 'a run on the default provider', { textSegments: [ 'Hi' ] }, /regression evidence only/ ],
+		[
+			'a refused run',
+			{
+				providerRoute: {
+					requested: null,
+					failure: { code: 'connection-signed-out', message: 'Not signed in.' },
+				},
+			},
+			/connection-signed-out/,
+		],
+		[
+			'no model request',
+			routed( { modelRequests: 0, kind: 'none', backend: 'none' } ),
+			/no model request/,
+		],
+		[
+			'the API route',
+			routed( {
+				kind: 'openai-api-key',
+				backend: 'openai-api',
+				apiKeyBearers: 3,
+				replyKinds: [ 'openai-api-key' ],
+				connectionRef: 'openai-api-key',
+			} ),
+			/openai-api-key/,
+		],
+		[
+			'a mix of routes',
+			routed( { kind: 'mixed', backend: 'mixed', connectionRef: null } ),
+			/mixed/,
+		],
+		[ 'another connection', routed( { connectionRef: 'conn-ffffffffffff' } ), /connection/ ],
+		[
+			'a bearer for another identity than the selected connection',
+			routed( { connectionMatchesBearer: false } ),
+			/^connection-mismatch:/,
+		],
+		[
+			'a bearer whose identity could not be compared',
+			routed( { connectionMatchesBearer: 'unverified' } ),
+			/^connection-unverified:/,
+		],
+		[
+			'a report without the comparison',
+			routed( { connectionMatchesBearer: undefined } ),
+			/^connection-unverified:/,
+		],
+		[ 'an API-key bearer', routed( { apiKeyBearers: 1 } ), /API-key/ ],
+		[ 'another model', routed( { models: [ 'gpt-6-luna', 'gpt-6.1-sol' ] } ), /gpt-6\.1-sol/ ],
+		[ 'another effort', routed( { efforts: [ 'low', 'medium' ] } ), /medium/ ],
+		[
+			'replies another runtime recorded',
+			routed( { replyKinds: [ 'chatgpt-oauth', 'unknown' ] } ),
+			/unknown/,
+		],
+	] )( 'ranOnRequestedRoute fails %s', ( _name, result, reason ) => {
+		const verdict = run( checks.ranOnRequestedRoute, result );
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( reason );
+	} );
+} );
+
+describe( 'WordPress.com writes under remote: mock', () => {
+	const guarded = ( blocked = [] ) => ( {
+		remoteGuard: { code: blocked.length ? 'wpcom-write-under-mock' : null, blocked },
+	} );
+
+	test( 'noWordPressComWrites passes when the guard refused nothing', () => {
+		expect( run( checks.noWordPressComWrites, guarded(), { remote: 'mock' } ).pass ).toBe( true );
+	} );
+
+	test( 'noWordPressComWrites fails with its code on a refused write', () => {
+		const verdict = run(
+			checks.noWordPressComWrites,
+			guarded( [ { method: 'POST', host: 'wpcom', endpoint: 'other', via: 'http' } ] ),
+			{ remote: 'mock' }
+		);
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( /^wpcom-write-under-mock:.*POST/ );
+	} );
+
+	test( 'noWordPressComWrites fails a mocked case that ran without the guard', () => {
+		const verdict = run( checks.noWordPressComWrites, { textSegments: [] }, { remote: 'mock' } );
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( /^remote-guard-missing:/ );
+	} );
+
+	test( 'noWordPressComWrites leaves a staging case to its own checks', () => {
+		expect( run( checks.noWordPressComWrites, {}, { remote: 'staging' } ).pass ).toBe( true );
+	} );
+} );
+
+describe( 'parity checks', () => {
+	const site = ( extra = {} ) => outcome( { ...workingSite, ...extra } );
+	const turns = ( ...starts ) =>
+		starts.map( ( toolCallsStart, index ) => ( {
+			reopened: false,
+			toolCallsStart,
+			textSegmentsStart: index,
+			questionsStart: 0,
+		} ) );
+
+	test( 'themeFileIncludes', () => {
+		const vars = { file: 'style.css', expectedText: 'PARITY-THEME-5521' };
+		expect(
+			run(
+				checks.themeFileIncludes,
+				site( { themeFiles: { 'style.css': '/* parity-marker: PARITY-THEME-5521 */' } } ),
+				vars
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.themeFileIncludes, site( { themeFiles: { 'style.css': 'body{}' } } ), vars ).pass
+		).toBe( false );
+		expect( run( checks.themeFileIncludes, site( { themeFiles: {} } ), vars ).pass ).toBe( false );
+	} );
+
+	test( 'inspectionIncludes', () => {
+		const vars = { expectedText: 'Parity Preview 3318' };
+		const inspected = ( stdout ) => ( { inspections: [ { args: [], exitCode: 0, stdout } ] } );
+		expect(
+			run( checks.inspectionIncludes, inspected( 'Parity Preview 3318\n' ), vars ).pass
+		).toBe( true );
+		expect( run( checks.inspectionIncludes, inspected( 'My WordPress' ), vars ).pass ).toBe(
+			false
+		);
+		expect( run( checks.inspectionIncludes, { inspections: [] }, vars ).pass ).toBe( false );
+	} );
+
+	test( 'previewRefreshed and artifactShown', () => {
+		const ui = ( artifacts, previewReloads ) => ( { uiEvents: { artifacts, previewReloads } } );
+		expect( run( checks.previewRefreshed, ui( [], 1 ) ).pass ).toBe( true );
+		expect( run( checks.previewRefreshed, ui( [], 0 ) ).pass ).toBe( false );
+		expect( run( checks.previewRefreshed, {} ).pass ).toBe( false );
+		const media = [ { id: 'a', widgets: [ 'media' ] } ];
+		expect( run( checks.artifactShown, ui( media, 0 ), { widgetType: 'media' } ).pass ).toBe(
+			true
+		);
+		expect(
+			run( checks.artifactShown, ui( [ { id: 'b', widgets: [ 'site-preview' ] } ], 0 ), {
+				widgetType: 'media',
+			} ).pass
+		).toBe( false );
+		expect( run( checks.artifactShown, ui( [], 0 ) ).pass ).toBe( false );
+	} );
+
+	test( 'finalReplyIncludes', () => {
+		const vars = { expectedTexts: [ { text: 'red' }, { text: 'PARITY-BRIEF-2207' } ] };
+		expect(
+			run(
+				checks.finalReplyIncludes,
+				reply( 'Reading it.', 'The image is Red; the code is PARITY-BRIEF-2207.' ),
+				vars
+			).pass
+		).toBe( true );
+		// Only the last reply counts: what the first turn said is not recalled.
+		expect(
+			run(
+				checks.finalReplyIncludes,
+				reply( 'Red, PARITY-BRIEF-2207.', 'I do not remember.' ),
+				vars
+			).pass
+		).toBe( false );
+	} );
+
+	test( 'lastTurnUsedNoTools and usedOnlyTools', () => {
+		const calls = ( ...names ) => names.map( ( name ) => ( { name, input: {} } ) );
+		expect(
+			run( checks.lastTurnUsedNoTools, { toolCalls: calls( 'Read' ), turns: turns( 0, 1 ) } ).pass
+		).toBe( true );
+		expect(
+			run( checks.lastTurnUsedNoTools, {
+				toolCalls: calls( 'Read', 'Read' ),
+				turns: turns( 0, 1 ),
+			} ).pass
+		).toBe( false );
+		const vars = { allowedTools: [ { name: 'take_screenshot' } ] };
+		expect(
+			run( checks.usedOnlyTools, { toolCalls: calls( 'take_screenshot' ) }, vars ).pass
+		).toBe( true );
+		expect(
+			run( checks.usedOnlyTools, { toolCalls: calls( 'take_screenshot', 'wp_cli' ) }, vars ).pass
+		).toBe( false );
+		expect( run( checks.usedOnlyTools, { toolCalls: [] }, vars ).pass ).toBe( false );
+	} );
+
+	test( 'attachmentReachedModel', () => {
+		const routed = ( requests ) => ( {
+			attachments: [ { fixture: 'red-swatch.png', kind: 'image' } ],
+			providerRoute: { requested: {}, executed: { requests } },
+		} );
+		expect(
+			run( checks.attachmentReachedModel, routed( [ { imageInputs: 1, turn: 0 } ] ) ).pass
+		).toBe( true );
+		expect(
+			run( checks.attachmentReachedModel, routed( [ { imageInputs: 0, turn: 0 } ] ) ).pass
+		).toBe( false );
+		// Replayed: a later turn's request still carries the image.
+		const replayed = { replayed: true };
+		expect(
+			run(
+				checks.attachmentReachedModel,
+				routed( [
+					{ imageInputs: 1, turn: 0 },
+					{ imageInputs: 1, turn: 1 },
+				] ),
+				replayed
+			).pass
+		).toBe( true );
+		expect(
+			run(
+				checks.attachmentReachedModel,
+				routed( [
+					{ imageInputs: 1, turn: 0 },
+					{ imageInputs: 0, turn: 1 },
+				] ),
+				replayed
+			).pass
+		).toBe( false );
+		expect( run( checks.attachmentReachedModel, { providerRoute: null } ).pass ).toBe( false );
+	} );
+
+	test( 'remoteOperationRan and noRemoteOperation', () => {
+		const push = {
+			operation: 'push',
+			site: 'Eval Site Push',
+			target: 'https://myprod.wordpress.com',
+		};
+		const mock = { remote: 'mock', operation: 'push', target: 'myprod.wordpress.com' };
+		expect( run( checks.remoteOperationRan, { remoteCalls: [ push ] }, mock ).pass ).toBe( true );
+		expect(
+			run(
+				checks.remoteOperationRan,
+				{ remoteCalls: [ { ...push, target: 'https://other.wordpress.com' } ] },
+				mock
+			).pass
+		).toBe( false );
+		expect( run( checks.remoteOperationRan, { remoteCalls: [] }, mock ).pass ).toBe( false );
+		// On a designated staging site the push really ran: judged on its result,
+		// whatever else the result holds (an empty list of mocked calls included).
+		const staging = { remote: 'staging', operation: 'push' };
+		const staged = ( isError, text, extra = {} ) => ( {
+			toolResults: [ { toolName: 'site_push', isError, text } ],
+			...extra,
+		} );
+		expect(
+			run( checks.remoteOperationRan, staged( false, 'Pushed "A" to Staging (url).' ), staging )
+				.pass
+		).toBe( true );
+		expect(
+			run(
+				checks.remoteOperationRan,
+				staged( false, 'Pushed "A" to Staging (url).', { remoteCalls: [] } ),
+				staging
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.remoteOperationRan, staged( true, 'Failed to push site' ), staging ).pass
+		).toBe( false );
+		// A mocked case is never judged on a real tool result, and a case must declare its mode.
+		expect(
+			run( checks.remoteOperationRan, staged( false, 'Pushed "A".', { remoteCalls: [] } ), mock )
+				.pass
+		).toBe( false );
+		const undeclared = run(
+			checks.remoteOperationRan,
+			{ remoteCalls: [ push ] },
+			{
+				operation: 'push',
+			}
+		);
+		expect( undeclared.pass ).toBe( false );
+		expect( undeclared.reason ).toMatch( /remote: mock or remote: staging/ );
+
+		expect( run( checks.noRemoteOperation, { remoteCalls: [] }, { remote: 'mock' } ).pass ).toBe(
+			true
+		);
+		expect(
+			run( checks.noRemoteOperation, { remoteCalls: [ push ] }, { remote: 'mock' } ).pass
+		).toBe( false );
+		// Without the mock nothing says no remote operation ran.
+		expect( run( checks.noRemoteOperation, { remoteCalls: [] }, {} ).pass ).toBe( false );
+		expect( run( checks.noRemoteOperation, {}, { remote: 'mock' } ).pass ).toBe( false );
+	} );
+
+	test( 'toolsInOrder', () => {
+		const order = { toolOrder: [ { name: 'generate_images' }, { name: 'take_screenshot' } ] };
+		const ran = ( ...calls ) => ( {
+			toolCalls: calls.map( ( [ name ], index ) => ( { id: `c${ index }`, name } ) ),
+			toolResults: calls.map( ( [ name, isError ], index ) => ( {
+				toolUseId: `c${ index }`,
+				toolName: name,
+				isError: Boolean( isError ),
+			} ) ),
+		} );
+		expect(
+			run(
+				checks.toolsInOrder,
+				ran( [ 'generate_images' ], [ 'Read' ], [ 'take_screenshot' ] ),
+				order
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.toolsInOrder, ran( [ 'take_screenshot' ], [ 'generate_images' ] ), order ).pass
+		).toBe( false );
+		expect(
+			run( checks.toolsInOrder, ran( [ 'generate_images', true ], [ 'take_screenshot' ] ), order )
+				.pass
+		).toBe( false );
+		expect( run( checks.toolsInOrder, ran( [ 'generate_images' ] ), order ).reason ).toMatch(
+			/take_screenshot/
+		);
+	} );
+
+	test( 'imageGenerated and imageGenerationUnavailable', () => {
+		const generated = {
+			imageService: { configured: true },
+			toolResults: [
+				{
+					toolName: 'generate_images',
+					isError: false,
+					details: { studioService: { service: 'images' } },
+				},
+			],
+			providerRoute: { executed: { imageServiceRequests: 1 } },
+		};
+		expect( run( checks.imageGenerated, generated ).pass ).toBe( true );
+		expect(
+			run( checks.imageGenerated, { ...generated, imageService: { configured: false } } ).pass
+		).toBe( false );
+		expect(
+			run( checks.imageGenerated, {
+				...generated,
+				toolResults: [ { toolName: 'generate_images', isError: false, details: {} } ],
+			} ).pass
+		).toBe( false );
+		expect(
+			run( checks.imageGenerated, {
+				...generated,
+				providerRoute: { executed: { imageServiceRequests: 0 } },
+			} ).pass
+		).toBe( false );
+
+		const unavailable = ( text, extra = {} ) => ( {
+			imageService: { configured: false },
+			toolEvents: [],
+			textSegments: [ text ],
+			...extra,
+		} );
+		expect(
+			run(
+				checks.imageGenerationUnavailable,
+				unavailable(
+					'I can’t generate images here: image generation isn’t set up. Log in to WordPress.com to turn it on.'
+				)
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.imageGenerationUnavailable, unavailable( 'Here is your apple.' ) ).pass
+		).toBe( false );
+		expect(
+			run(
+				checks.imageGenerationUnavailable,
+				unavailable( 'I can’t generate images.', {
+					toolEvents: [ { toolName: 'generate_images' } ],
+				} )
+			).pass
+		).toBe( false );
+		expect(
+			run(
+				checks.imageGenerationUnavailable,
+				unavailable( 'I can’t generate images.', { imageService: { configured: true } } )
+			).pass
+		).toBe( false );
+	} );
+
+	test( 'cancelledThenContinued', () => {
+		const vars = {
+			expectedText: 'STOPPED',
+			inspectPattern: 'Parity [ABC]',
+			maxInspectMatches: 1,
+		};
+		const base = {
+			stoppedAt: { toolName: 'wp_cli', index: 0 },
+			toolCalls: [ { name: 'wp_cli', input: {} } ],
+			turns: turns( 0, 1 ),
+			textSegments: [ 'Creating…', 'STOPPED' ],
+			inspections: [ { stdout: '[{"post_title":"Parity A"}]' } ],
+		};
+		expect( run( checks.cancelledThenContinued, base, vars ).pass ).toBe( true );
+		expect( run( checks.cancelledThenContinued, { ...base, stoppedAt: null }, vars ).pass ).toBe(
+			false
+		);
+		// A tool call that started after the stop, still in the cancelled turn.
+		expect(
+			run(
+				checks.cancelledThenContinued,
+				{
+					...base,
+					toolCalls: [ ...base.toolCalls, { name: 'wp_cli', input: {} } ],
+					turns: turns( 0, 2 ),
+				},
+				vars
+			).pass
+		).toBe( false );
+		expect(
+			run(
+				checks.cancelledThenContinued,
+				{
+					...base,
+					inspections: [ { stdout: '[{"post_title":"Parity A"},{"post_title":"Parity B"}]' } ],
+				},
+				vars
+			).pass
+		).toBe( false );
+		expect(
+			run(
+				checks.cancelledThenContinued,
+				{ ...base, textSegments: [ 'Creating…', 'Done.' ] },
+				vars
+			).pass
+		).toBe( false );
+	} );
+
+	test( 'resumedFromDisk and compacted', () => {
+		const reopened = [
+			{ reopened: false, toolCallsStart: 0 },
+			{ reopened: true, toolCallsStart: 0 },
+		];
+		expect( run( checks.resumedFromDisk, { turns: reopened, success: true } ).pass ).toBe( true );
+		expect( run( checks.resumedFromDisk, { turns: turns( 0, 0 ), success: true } ).pass ).toBe(
+			false
+		);
+		expect( run( checks.resumedFromDisk, { turns: reopened, success: false } ).pass ).toBe( false );
+		expect( run( checks.compacted, { compactions: 1 } ).pass ).toBe( true );
+		expect( run( checks.compacted, { compactions: 0 } ).pass ).toBe( false );
+	} );
+
+	test( 'designChosen', () => {
+		const asked = ( answer, finalText ) => ( {
+			questions: [
+				{
+					question: 'Which direction?',
+					options: [ 'Warm rustic bakery', 'Cool minimal studio' ],
+					answer,
+				},
+			],
+			textSegments: [ finalText ],
+		} );
+		expect(
+			run(
+				checks.designChosen,
+				asked( 'Warm rustic bakery', 'Going with the warm, rustic bakery direction.' )
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.designChosen, asked( 'Warm rustic bakery', 'Going with the minimal look.' ) ).pass
+		).toBe( false );
+		expect( run( checks.designChosen, { questions: [], textSegments: [ 'Hi' ] } ).pass ).toBe(
+			false
+		);
+	} );
+} );
+
+test( 'inspectionMatches', () => {
+	const vars = { inspectPattern: 'UPLOADED_IMAGES=[1-9]' };
+	const inspected = ( stdout ) => ( { inspections: [ { args: [], exitCode: 0, stdout } ] } );
+	expect( run( checks.inspectionMatches, inspected( 'UPLOADED_IMAGES=2\n' ), vars ).pass ).toBe(
+		true
+	);
+	expect( run( checks.inspectionMatches, inspected( 'UPLOADED_IMAGES=0\n' ), vars ).pass ).toBe(
+		false
+	);
+	expect( run( checks.inspectionMatches, { inspections: [] }, vars ).pass ).toBe( false );
 } );

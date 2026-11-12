@@ -160,6 +160,12 @@ git commit --allow-empty -m "Trigger CI"
 git push
 ```
 
+### CI: Subscription provider checks (GitHub Actions)
+
+[`.github/workflows/subscription-provider-checks.yml`](../.github/workflows/subscription-provider-checks.yml) runs on pull requests and by hand, with no secrets and a read-only token. On each of six GitHub-hosted native targets (Linux, macOS and Windows, each x64 and ARM64) it installs with `npm ci` and runs typecheck, the dependency-range test, the unit and integration tests (`*.e2e.test.ts` tests excluded by the `e2e` tag) and the browser-UI and CLI builds; on Linux x64 it also lints the files the pull request changed (no `--fix`) and runs Knip. A second, small test run sets `STUDIO_EXPERIMENTAL_CHATGPT=1` with an isolated config folder to exercise the enabled routing path.
+
+It deliberately does not run account-backed evals, the acceptance runners with `--live`, real keychain or credential-store tests, vendor sign-in or the opt-in native Claude tests. A green run is credential-free evidence; it does not qualify a platform for authenticated use.
+
 ## Debugging
 
 The renderer process can be debugged using the Chromium developer tools. To open the developer tools, press <kbd>Cmd</kbd>+<kbd>Option</kbd>+<kbd>I</kbd> on Mac or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd> on Windows. You can also use the [React Developer Tools](https://chromewebstore.google.com/detail/react-developer-tools/fmkadmapgofadopljbjfkapdkoienihi) to debug the renderer process.

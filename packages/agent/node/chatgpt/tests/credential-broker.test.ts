@@ -626,9 +626,10 @@ describe( 'ChatGPT credential broker', () => {
 		it( 'seals a sign-in under the key the keychain holds now, even one another process made since', async () => {
 			const app = startBroker();
 			const { registrationId } = await app.saveSignIn( signIn() );
-			// The keychain item went, and another process made a new key.
+			// The keychain item went; once no saved record needed it, another process made a new key.
 			keychain.items.clear();
 			const other = startBroker();
+			await other.signOut( registrationId );
 			await other.saveSignIn(
 				signIn( {
 					subject: 'test-subject-2',
@@ -665,12 +666,19 @@ describe( 'ChatGPT credential broker', () => {
 			);
 		} );
 
+		// The keychain item went, and another process signed the account out and in
+		// again, under the new key its sign-in made once no saved record needed the old one.
+		async function signInAgainUnderNewKey( registrationId: string ) {
+			keychain.items.clear();
+			const other = startBroker();
+			await other.signOut( registrationId );
+			await other.saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) );
+		}
+
 		it( 'reads the keychain again before giving up on a record its key can’t open', async () => {
 			const app = startBroker();
 			const { registrationId } = await app.saveSignIn( signIn() );
-			// The keychain item went, and another process signed in again under a new key.
-			keychain.items.clear();
-			await startBroker().saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) );
+			await signInAgainUnderNewKey( registrationId );
 
 			await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-2' );
 			expect( await readChatGptAccount( registrationId ) ).toMatchObject( { state: 'signed-in' } );
@@ -679,8 +687,7 @@ describe( 'ChatGPT credential broker', () => {
 		it( 'reads the keychain again before giving up on the ID token it keeps for a sign-in again', async () => {
 			const app = startBroker();
 			const { registrationId } = await app.saveSignIn( signIn() );
-			keychain.items.clear();
-			await startBroker().saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) );
+			await signInAgainUnderNewKey( registrationId );
 
 			await expect( app.readIdTokenHint( registrationId ) ).resolves.toBe( 'test-id-token-2' );
 		} );
@@ -688,8 +695,7 @@ describe( 'ChatGPT credential broker', () => {
 		it( 'reads the keychain again before giving up on the record a sign-out revokes', async () => {
 			const app = startBroker();
 			const { registrationId } = await app.saveSignIn( signIn() );
-			keychain.items.clear();
-			await startBroker().saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) );
+			await signInAgainUnderNewKey( registrationId );
 
 			await expect( app.signOut( registrationId ) ).resolves.toEqual( {
 				localCleared: true,
