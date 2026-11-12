@@ -178,6 +178,12 @@ export function bindTool< TProps extends TProperties >(
 		...tool,
 		rawHandler: ( args, context ) =>
 			handler( args, { host, onProgress: context?.onProgress ?? ( () => {} ) } ),
+		// Unused by every runtime: the Pi route registers `toPiTool` over a bound
+		// tool, which runs each call through the shared execution (`execution.ts`),
+		// and `studio mcp` and the Claude route call `rawHandler`. It stays only
+		// because pi's `AgentTool`, and so the tool types this package exports,
+		// require an `execute`, and older tests call it. A tool registered with it
+		// would skip the shared execution; the tool parity contract test fails then.
 		execute: async ( _toolCallId, params, _signal, onUpdate ) => {
 			const context: ToolContext = {
 				host,

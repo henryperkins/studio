@@ -3,7 +3,7 @@ import { createSiteTool } from './create-site';
 import { bindTool } from './define-tool';
 import { deletePreviewTool } from './delete-preview';
 import { deleteSiteTool } from './delete-site';
-import { runStudioTool, showToolArtifacts } from './execution';
+import { runStudioTool } from './execution';
 import { exportSiteTool } from './export-site';
 import { generateImagesTool } from './generate-images';
 import { importSiteTool } from './import-site';
@@ -176,25 +176,6 @@ export function toPiTool< TTool extends AnyStudioAgentTool >(
 					? { studioArtifacts, pending, ...( studioService ? { studioService } : {} ) }
 					: undefined;
 			return { content, details };
-		},
-	};
-}
-
-// Shows the artifacts of a tool already in the Pi route's form once it succeeds.
-export function withChatArtifactEmission< TTool extends AnyStudioAgentTool >(
-	tool: TTool,
-	ui: StudioAgentUi | undefined
-): TTool {
-	if ( ! ui ) {
-		return tool;
-	}
-	return {
-		...tool,
-		execute: async ( toolCallId, params, signal, onUpdate ) => {
-			const result = await tool.execute( toolCallId, params, signal, onUpdate );
-			const details = result.details as StudioToolResultDetails | undefined;
-			await showToolArtifacts( ui, tool.name, details?.studioArtifacts );
-			return result;
 		},
 	};
 }

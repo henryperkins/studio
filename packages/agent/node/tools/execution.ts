@@ -85,7 +85,7 @@ export function describeToolError( error: unknown ): string {
  * Shows a result's artifacts in the conversation. They are presentation only:
  * a failure to show them is logged and never fails the call.
  */
-export async function showToolArtifacts(
+async function showToolArtifacts(
 	ui: StudioAgentUi | undefined,
 	toolName: string,
 	widgets: readonly StudioChatArtifactWidgetDraft[] | undefined
@@ -133,9 +133,14 @@ export async function completeToolResult(
 /**
  * Runs one call of a bound Studio tool: its arguments are checked against the
  * canonical schema, the runtime's gate decides, a cancelled call never starts,
- * progress goes to `onProgress`, a successful result's artifacts are shown, and
- * the result is completed with notes and pending work. Never throws: anything
- * that goes wrong is the outcome, and nothing a failed call produced is shown.
+ * progress goes to `onProgress`, the result is completed with notes and pending
+ * work, and a successful result's artifacts are shown. With `completion` they
+ * are shown only once the result is complete, so nothing of a call whose
+ * pending work or notes fail is shown. Without it they are shown as soon as the
+ * tool returns, and its pending work is the runtime's (Pi reports it with a
+ * later result). From the gate on, anything that goes wrong is the outcome; only
+ * the argument check runs before that, and throws as `studio mcp`'s own check
+ * always could, for a schema or arguments it cannot read.
  */
 export async function runStudioTool(
 	tool: AnyStudioAgentTool,
@@ -162,18 +167,14 @@ export async function runStudioTool(
 		}
 		const { onProgress } = options;
 		const result = await tool.rawHandler( args as never, onProgress ? { onProgress } : undefined );
-		await showToolArtifacts( options.ui, tool.name, result.studioArtifacts );
 		if ( ! completion ) {
+			await showToolArtifacts( options.ui, tool.name, result.studioArtifacts );
 			return { status: 'completed', result };
 		}
 		const { pending, ...completed } = result;
-		return {
-			status: 'completed',
-			result: {
-				...completed,
-				content: await completeToolResult( result.content, pending, completion ),
-			},
-		};
+		const content = await completeToolResult( result.content, pending, completion );
+		await showToolArtifacts( options.ui, tool.name, result.studioArtifacts );
+		return { status: 'completed', result: { ...completed, content } };
 	} catch ( error ) {
 		return { status: 'failed', error };
 	}

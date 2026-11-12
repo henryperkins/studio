@@ -283,6 +283,46 @@ describe( 'runStudioTool', () => {
 		).toEqual( { status: 'failed', error: failure } );
 	} );
 
+	it( 'with completion, shows the artifacts only once the result is complete, and nothing when its work left running fails', async () => {
+		let finish!: ( report: string ) => void;
+		const pending = new Promise< string | undefined >( ( resolve ) => {
+			finish = resolve;
+		} );
+		const handler = vi.fn( () => ( { ...ok(), studioArtifacts: [ widget ], pending } ) );
+		const shown = ui();
+		const running = runStudioTool( tool( handler ), { label: 'a' }, { ui: shown, completion: {} } );
+		await vi.waitFor( () => expect( handler ).toHaveBeenCalled() );
+		await new Promise( ( resolve ) => setTimeout( resolve, 0 ) );
+		expect( shown.showArtifact ).not.toHaveBeenCalled();
+		finish( 'later' );
+		expect( ( await running ).status ).toBe( 'completed' );
+		expect( shown.showArtifact ).toHaveBeenCalledOnce();
+
+		const failure = new Error( 'Generation failed.' );
+		for ( const completion of [
+			{},
+			{
+				notes: () => {
+					throw failure;
+				},
+			},
+		] ) {
+			const failed = ui();
+			expect(
+				await runStudioTool(
+					tool( () => ( {
+						...ok(),
+						studioArtifacts: [ widget ],
+						pending: 'notes' in completion ? undefined : Promise.reject( failure ),
+					} ) ),
+					{ label: 'a' },
+					{ ui: failed, completion }
+				)
+			).toEqual( { status: 'failed', error: failure } );
+			expect( failed.showArtifact ).not.toHaveBeenCalled();
+		}
+	} );
+
 	it( 'with a tracker, keeps the work for later results and settles it before a tool that renders the site', async () => {
 		const tracker: PendingWorkTracker & { added: unknown[] } = {
 			added: [],

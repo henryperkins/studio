@@ -11,10 +11,8 @@ import { generateImages, resolveImageService } from '@studio/agent/node/image-ge
 import {
 	resolveStudioTools,
 	studioToolDefinitions,
-	withChatArtifactEmission,
 	type StudioToolsOptions,
 } from '@studio/agent/node/tools';
-import { createSiteTool } from '@studio/agent/node/tools/create-site';
 import {
 	bindTool,
 	LOCAL_CHANGE,
@@ -494,70 +492,6 @@ describe( 'Studio AI MCP tools', () => {
 		);
 		expect( getTextContent( result ) ).toContain( '"id": "site-123"' );
 		expect( getTextContent( result ) ).toContain( '"name": "My Site"' );
-	} );
-
-	describe( 'withChatArtifactEmission', () => {
-		const widget = { type: 'media', widgetProps: { mediaKind: 'image' } };
-		const makeFakeTool = () => {
-			const execute = vi.fn().mockResolvedValue( {
-				content: [ { type: 'text', text: 'ok' } ],
-				details: { studioArtifacts: [ widget ] },
-			} );
-			return {
-				tool: { name: 'fake_tool', execute } as unknown as AnyStudioAgentTool,
-				execute,
-			};
-		};
-
-		it( 'returns the tool unchanged without a UI', () => {
-			const { tool } = makeFakeTool();
-			expect( withChatArtifactEmission( tool, undefined ) ).toBe( tool );
-		} );
-
-		it( 'does not fail the tool result when artifact emission throws', async () => {
-			const { tool } = makeFakeTool();
-			const warnSpy = vi.spyOn( console, 'warn' ).mockImplementation( () => {} );
-			const ui = withUi();
-			ui.showArtifact.mockImplementation( () => {
-				throw new Error( 'disk full' );
-			} );
-
-			try {
-				const wrapped = withChatArtifactEmission( tool, ui );
-				const result = await wrapped.execute(
-					'tool-call-9',
-					{} as never,
-					new AbortController().signal,
-					() => {}
-				);
-
-				expect( result.content ).toEqual( [ { type: 'text', text: 'ok' } ] );
-				expect( warnSpy ).toHaveBeenCalledWith(
-					expect.stringContaining( '[chat-artifacts] failed to emit artifact for fake_tool' ),
-					expect.any( Error )
-				);
-			} finally {
-				warnSpy.mockRestore();
-			}
-		} );
-
-		it( 'emits site_create artifacts when wrapped directly (remote tool list)', async () => {
-			const ui = withUi();
-			const wrapped = withChatArtifactEmission( bindTool( createSiteTool, host ), ui );
-
-			await executeTool( wrapped, { name: 'My Site' } );
-
-			expect( ui.showArtifact ).toHaveBeenCalledWith(
-				expect.objectContaining( {
-					widgets: [
-						expect.objectContaining( {
-							type: 'site-preview',
-							widgetProps: expect.objectContaining( { siteId: 'site-123' } ),
-						} ),
-					],
-				} )
-			);
-		} );
 	} );
 
 	it( 'makes the created site the conversation site', async () => {
