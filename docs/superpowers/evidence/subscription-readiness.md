@@ -221,6 +221,23 @@ Test accounts and quota:
 - Live-run consent: **pending, to be requested once the acceptance runners exist.** Earlier authorization is not extended by this record.
 - Quota: the repository owner stated in a PR #3 comment that live-account checks are deferred because quota is exhausted. Quota for future runs is unknown.
 
+### M2a record (November 11, 2026)
+
+Credential-free CI workflow: `.github/workflows/subscription-provider-checks.yml` (pull requests and manual runs; read-only token, no secrets; actions pinned to commit SHAs). Cells, one job each with `fail-fast: false`; each job prints `process.platform`/`process.arch` and `uname -a`/`ver`:
+
+| Cell | Runner label |
+| --- | --- |
+| Linux x64 (also lint, Knip) | `ubuntu-24.04` |
+| Linux ARM64 | `ubuntu-24.04-arm` |
+| macOS ARM64 | `macos-15` |
+| macOS x64 | `macos-15-intel` |
+| Windows x64 | `windows-2025` |
+| Windows ARM64 | `windows-11-arm` |
+
+All six labels are listed in GitHub's hosted-runner reference for public and private repositories (the repository is public); the page names no preview or deprecated status for them.
+
+**The workflow has NOT run yet**: nothing was pushed. It was parsed, checked with actionlint 1.7.12, and its commands run locally on Windows x64 only. Hosted-runner results will be credential-free evidence only: they do not qualify any platform cell (C1-C12) for authenticated use, native credential storage, sign-in, packaging or process-tree behavior. Account-backed evals, `--live` acceptance runners, real keychain tests and the opt-in native Claude tests are deliberately absent.
+
 ## D. Studio tool inventory (counted from code)
 
 Read at `4ae1e38da` in the primary checkout. The registry is identical at `ce4eea5dc`: `git diff 4ae1e38da ce4eea5dc` shows no change to `tools/index.ts` or `runtime/index.ts`; `host.ts` differs only in an added optional `options` argument on `sites.wpCli` (abort signal and pre-spawn check).
