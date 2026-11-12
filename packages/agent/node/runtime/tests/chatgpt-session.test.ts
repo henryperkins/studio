@@ -1320,14 +1320,17 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				const session = open( chatGpt.sessionFile );
 				expect( getEffectiveSessionProvider( session.getEntries(), null ) ).toBe( 'chatgpt-oauth' );
 
-				for ( const turn of [
+				const legacyTurns: Array<
+					Omit< StudioAgentTurnConfig, 'prompt' | 'session' | 'onEvent' >
+				> = [
 					{
-						model: 'gpt-6-luna' as const,
+						model: 'gpt-6-luna',
 						openAi: openAiSettingsFor( 'medium' ),
 						env: { STUDIO_OPENAI_API_KEY: API_KEY },
 					},
-					{ model: 'balanced' as const, env: { STUDIO_WPCOM_API_KEY: 'test-wpcom-token' } },
-				] ) {
+					{ model: 'balanced', env: { STUDIO_WPCOM_API_KEY: 'test-wpcom-token' } },
+				];
+				for ( const turn of legacyTurns ) {
 					const legacy = await runTurn( session, 'hi again', turn );
 					expect( legacy.error ).toBe( why );
 				}
