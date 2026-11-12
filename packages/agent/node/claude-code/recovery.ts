@@ -10,12 +10,9 @@ import {
 	escapeClaudeApprovalText,
 	isClaudeReadOnlyClass,
 } from '@studio/agent/protocol/claude-code';
-import { claudeLockDigest } from './sessions';
-import type {
-	ClaudeRecoveryClaim,
-	ClaudeRunLockRecord,
-	createNativeSessionStore,
-} from './sessions';
+import { claudeLockDigest } from './run-lock';
+import type { ClaudeRecoveryClaim, ClaudeRunLockRecord } from './run-lock';
+import type { createNativeSessionStore } from './sessions';
 import type {
 	BackendTurnEvent,
 	ClaudeJournalEvent,
