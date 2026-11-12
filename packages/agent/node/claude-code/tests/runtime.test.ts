@@ -1108,7 +1108,8 @@ it( 'deduplicates discovered model aliases by canonical ID without inventing eff
 	] );
 } );
 
-// A mock SDK that starts its process through the spawn hook, then runs `onTurn` after init.
+// A mock SDK that starts its process through the spawn hook, then runs `onTurn`
+// after init, then gives `answer`: by default a successful result.
 function fakeNativeTurn(
 	cwd: string,
 	{
@@ -1119,10 +1120,20 @@ function fakeNativeTurn(
 			apiProvider: 'firstParty',
 		} ),
 		projects,
+		answer = ( sessionId ) => [
+			{
+				type: 'result',
+				subtype: 'success',
+				is_error: false,
+				num_turns: 1,
+				session_id: sessionId,
+			},
+		],
 	}: {
 		onTurn?: ( options: Record< string, unknown > ) => Promise< void >;
 		account?: () => Record< string, string >;
 		projects?: string;
+		answer?: ( sessionId: unknown ) => Array< Record< string, unknown > >;
 	} = {}
 ) {
 	return vi.fn(
@@ -1166,13 +1177,7 @@ function fakeNativeTurn(
 							mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
 						};
 						await onTurn( input.options );
-						yield {
-							type: 'result',
-							subtype: 'success',
-							is_error: false,
-							num_turns: 1,
-							session_id: sessionId,
-						};
+						yield* answer( sessionId );
 					}
 				},
 			};
@@ -2148,6 +2153,83 @@ it( 'has an operation’s authorization on disk in the turn’s journal before t
 	}
 } );
 
+it( 'ends a turn whose journal cannot be read with an outcome the next message can retry, sends nothing, releases the lock, and runs the next turn once the journal reads (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createNativeSessionStore } = await import( '../sessions' );
+	const fs = await import( 'fs/promises' );
+	const path = await import( 'path' );
+	const fixture = await ownedNativeFixture( 'claude-journal-unreadable-' );
+	try {
+		const run = async ( id: string, query: ReturnType< typeof fakeNativeTurn > ) => {
+			const events: Array< {
+				type: string;
+				outcome?: { status: string; code?: string; message?: string };
+			} > = [];
+			await runClaudeTurn(
+				turnSnapshot( fixture.root, fixture.config, id ),
+				fixture.host,
+				{
+					prompt: 'hello',
+					signal: new AbortController().signal,
+					onEvent: ( e ) => events.push( e ),
+				},
+				{
+					storeRoot: fixture.storeRoot,
+					approve: async () => 'deny',
+					verifyTarget: async () => true,
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					prepareOwner: fixture.prepareOwner,
+					ownerIdentity: async () => ( { pid: 1234, start: id } ),
+					connection: fixture.connection,
+					prepare: fixture.prepare,
+					account: fixture.account,
+				}
+			);
+			return events;
+		};
+		// The journal's order cannot be read for a moment, as a file being replaced can be.
+		const order = path.join(
+			fixture.storeRoot,
+			`${ createHash( 'sha256' ).update( 'chat' ).digest( 'hex' ) }.journal-order.json`
+		);
+		await fs.mkdir( fixture.storeRoot, { recursive: true } );
+		await fs.writeFile( order, '{"version":1' );
+		const unreadable = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+		const events = await run( 'unreadable', unreadable );
+		expect( unreadable ).not.toHaveBeenCalled();
+		expect( events ).toEqual( [
+			{
+				type: 'turn.terminal',
+				runId: 'unreadable',
+				turnId: 'unreadable',
+				outcome: {
+					status: 'error',
+					code: 'journal_unreadable',
+					message: 'Studio could not read this chat’s history just now. Try again.',
+				},
+			},
+		] );
+		// The session view keeps Send disabled for good only after `rebind_required`.
+		expect( events[ 0 ].outcome?.code ).not.toBe( 'rebind_required' );
+		await (
+			await createNativeSessionStore( fixture.storeRoot ).lockTurn( 'chat' )
+		)();
+
+		await fs.rm( order );
+		const next = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+		expect( ( await run( 'next', next ) ).at( -1 ) ).toMatchObject( {
+			type: 'turn.terminal',
+			outcome: { status: 'success' },
+		} );
+		expect( next ).toHaveBeenCalledOnce();
+		await (
+			await createNativeSessionStore( fixture.storeRoot ).lockTurn( 'chat' )
+		)();
+	} finally {
+		await fixture.cleanup();
+	}
+} );
+
 describe( 'the run lock a turn records (mock SDK)', () => {
 	const owner = { pid: 1234, start: '134389060500000000' };
 	const lockOf = async ( storeRoot: string ) => {
@@ -2968,6 +3050,177 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 		} finally {
 			finishPreparing( { ok: false } );
 			await first;
+			await fixture.cleanup();
+		}
+	} );
+
+	// Recovers the chat after a first turn that died before it started
+	// anything, so the next prompt carries the note. Returns what ends that
+	// first turn, which is still waiting in this process.
+	async function interruptedChat( runtime: Runtime, fixture: Fixture ) {
+		const { createNativeSessionStore } = await import( '../sessions' );
+		const { recoverClaudeRun } = await import( '../recovery' );
+		let finishPreparing!: ( prepared: { ok: false } ) => void;
+		const preparing = new Promise< { ok: false } >( ( resolve ) => {
+			finishPreparing = resolve;
+		} );
+		const prepareFirst = vi.fn( () => preparing );
+		const first = turn( runtime, fixture, 'first', fakeNativeTurn( fixture.root ), {
+			prepare: prepareFirst,
+		} );
+		await vi.waitFor( () => expect( prepareFirst ).toHaveBeenCalled() );
+		expect(
+			await recoverClaudeRun(
+				createNativeSessionStore( fixture.storeRoot ),
+				bindingOf( fixture ),
+				goneSeams
+			)
+		).toMatchObject( { status: 'recovered' } );
+		return async () => {
+			finishPreparing( { ok: false } );
+			await first;
+		};
+	}
+
+	const apiError = ( sessionId: unknown ) => ( {
+		type: 'result',
+		subtype: 'success',
+		is_error: true,
+		num_turns: 1,
+		session_id: sessionId,
+	} );
+
+	it.each( [ 'an API error', 'a cancel', 'an account stop' ] as const )(
+		'keeps the note for the next turn when the turn that carried it ends with %s before Claude answered',
+		async ( ending ) => {
+			const path = await import( 'path' );
+			const { CLAUDE_ACCOUNT_RECHECK_MS } = await import( '../execution-rules' );
+			const fixture = await ownedNativeFixture( 'claude-note-kept-' );
+			let finishFirst: ( () => Promise< void > ) | undefined;
+			try {
+				const runtime = await import( '../runtime' );
+				finishFirst = await interruptedChat( runtime, fixture );
+				const stop = new AbortController();
+				const clock = { now: 1_000 };
+				const failing = fakeNativeTurn( fixture.root, {
+					projects: fixture.projects,
+					onTurn: async ( options ) => {
+						if ( ending === 'a cancel' ) stop.abort();
+						if ( ending === 'an account stop' ) {
+							// The next operation reads the sign-in again, and finds another account.
+							clock.now += CLAUDE_ACCOUNT_RECHECK_MS;
+							const hook = (
+								options.hooks as {
+									PreToolUse: Array< {
+										hooks: Array<
+											(
+												input: unknown,
+												id: string,
+												context: { signal: AbortSignal }
+											) => Promise< unknown >
+										>;
+									} >;
+								}
+							 ).PreToolUse[ 0 ].hooks[ 0 ];
+							await hook(
+								{
+									hook_event_name: 'PreToolUse',
+									tool_name: 'Read',
+									tool_input: { file_path: path.join( fixture.root, 'readme.txt' ) },
+									tool_use_id: 'read',
+								},
+								'read',
+								{ signal: new AbortController().signal }
+							);
+						}
+					},
+					answer: ( sessionId ) => ( ending === 'an API error' ? [ apiError( sessionId ) ] : [] ),
+				} );
+				const events = await turn(
+					runtime,
+					fixture,
+					'failing',
+					failing,
+					ending === 'an account stop'
+						? {
+								clock: () => clock.now,
+								account: async () => ( {
+									state: 'signed-in' as const,
+									identity: { email: 'someone-else@example.com', subscriptionType: 'max' },
+								} ),
+						  }
+						: {},
+					stop.signal
+				);
+				expect( events.at( -1 ) ).toMatchObject( {
+					type: 'turn.terminal',
+					outcome:
+						ending === 'an API error'
+							? { status: 'error' }
+							: ending === 'a cancel'
+							? { status: 'interrupted' }
+							: { status: 'interrupted', code: 'account_changed' },
+				} );
+				expect( optionsOf( failing ).systemPrompt.append ).toContain( 'interrupted' );
+				expect( await noted( fixture ) ).toEqual( [] );
+
+				const next = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+				expect( ( await turn( runtime, fixture, 'next', next ) ).at( -1 ) ).toMatchObject( {
+					type: 'turn.terminal',
+					outcome: { status: 'success' },
+				} );
+				expect( optionsOf( next ).systemPrompt.append ).toContain( 'interrupted' );
+				expect( await noted( fixture ) ).toEqual( [
+					expect.objectContaining( { turnId: 'next' } ),
+				] );
+			} finally {
+				await finishFirst?.();
+				await fixture.cleanup();
+			}
+		}
+	);
+
+	it( 'counts the note as given once Claude has answered the prompt that carried it, even when that turn then fails', async () => {
+		const fixture = await ownedNativeFixture( 'claude-note-answered-' );
+		let finishFirst: ( () => Promise< void > ) | undefined;
+		try {
+			const runtime = await import( '../runtime' );
+			finishFirst = await interruptedChat( runtime, fixture );
+			const answered = fakeNativeTurn( fixture.root, {
+				projects: fixture.projects,
+				answer: ( sessionId ) => [
+					{
+						type: 'assistant',
+						uuid: 'frame',
+						session_id: sessionId,
+						parent_tool_use_id: null,
+						message: {
+							id: 'message',
+							model: 'sonnet',
+							content: [ { type: 'text', text: 'I will check the site first.' } ],
+						},
+					},
+					apiError( sessionId ),
+				],
+			} );
+			expect( ( await turn( runtime, fixture, 'answered', answered ) ).at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'error' },
+			} );
+			expect( optionsOf( answered ).systemPrompt.append ).toContain( 'interrupted' );
+			expect( await noted( fixture ) ).toEqual( [
+				expect.objectContaining( { turnId: 'answered' } ),
+			] );
+
+			const next = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+			expect( ( await turn( runtime, fixture, 'next', next ) ).at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'success' },
+			} );
+			expect( optionsOf( next ).systemPrompt.append ).not.toContain( 'interrupted' );
+			expect( await noted( fixture ) ).toHaveLength( 1 );
+		} finally {
+			await finishFirst?.();
 			await fixture.cleanup();
 		}
 	} );

@@ -423,6 +423,10 @@ function unconfirmedMessage(): string {
 	);
 }
 
+function journalUnreadableMessage(): string {
+	return __( 'Studio could not read this chat’s history just now. Try again.' );
+}
+
 export async function discoverClaudeModels(
 	connectionId: string,
 	workingDirectory: string,
@@ -763,10 +767,18 @@ export async function runClaudeTurn(
 		try {
 			journals = await store.readJournals( workspace.conversationId );
 		} catch {
-			// Without its journal, Studio cannot tell whether an earlier turn was interrupted.
-			terminal = rebind(
-				'Studio could not read this chat’s journal. Start a new Claude chat to continue.'
-			);
+			// Without its journal, Studio cannot tell whether an earlier turn was
+			// interrupted. The next turn reads it again.
+			terminal = {
+				type: 'turn.terminal',
+				runId,
+				turnId,
+				outcome: {
+					status: 'error',
+					code: 'journal_unreadable',
+					message: journalUnreadableMessage(),
+				},
+			};
 			return;
 		}
 		let existing;
@@ -816,8 +828,30 @@ export async function runClaudeTurn(
 			nativeSessionId: randomUUID(),
 			...( accountKey ? { accountKey } : {} ),
 		};
+		// Journal-only, after everything emitted before it, and on disk when it settles.
+		const journalOnly = ( event: ClaudeTurnJournalEvent ): Promise< void > => {
+			const written = journalWork.then( () => journal!.append( event ) );
+			journalWork = written.catch( () => {
+				journalFailed = true;
+				cancel();
+			} );
+			return written;
+		};
+		// The recovery note counts as given once Claude has answered the prompt
+		// that carried it: at its first answer accepted from the SDK, or at the
+		// turn's successful end. A turn that ends before either leaves the note
+		// for the next turn; a crash before this mark is on disk gives it again.
+		let noteGiven = false;
+		const markNoteGiven = () => {
+			if ( ! note || noteGiven ) return;
+			noteGiven = true;
+			void journalOnly( { type: 'turn.recovery-noted', runId, turnId, locks: note.locks } ).catch(
+				() => {}
+			);
+		};
 		const emit = ( event: BackendTurnEvent ) => {
 			if ( event.type === 'turn.terminal' ) {
+				if ( event.outcome.status === 'success' ) markNoteGiven();
 				terminal ??= event;
 				return;
 			}
@@ -828,15 +862,6 @@ export async function runClaudeTurn(
 					cancel();
 				} );
 			input.onEvent( event );
-		};
-		// Journal-only, after everything emitted before it, and on disk when it settles.
-		const journalOnly = ( event: ClaudeTurnJournalEvent ): Promise< void > => {
-			const written = journalWork.then( () => journal!.append( event ) );
-			journalWork = written.catch( () => {
-				journalFailed = true;
-				cancel();
-			} );
-			return written;
 		};
 		policy = createClaudeExecutionPolicy( {
 			runId,
@@ -879,12 +904,9 @@ export async function runClaudeTurn(
 		};
 		const nativeInput = async function* (): AsyncGenerator< SDKUserMessage > {
 			if ( ! ( await gate ) || controller.signal.aborted ) return;
-			// The recovery note goes to Claude with this prompt and is not given again.
-			// A crash before this is on disk gives it once more, never not at all.
-			if ( note )
-				void journalOnly( { type: 'turn.recovery-noted', runId, turnId, locks: note.locks } ).catch(
-					() => {}
-				);
+			// The recovery note goes to Claude with this prompt. It is marked as given
+			// only once Claude answers (`markNoteGiven`), so it may be given again,
+			// but is never lost to a turn that failed before Claude read it.
 			yield {
 				type: 'user' as const,
 				message: {
@@ -1070,11 +1092,10 @@ export async function runClaudeTurn(
 					throw new Error();
 				nativeInitAccepted = true;
 			}
-			if (
-				message.type === 'assistant' &&
-				! qualification.acceptedModels.includes( message.message.model )
-			)
-				throw new Error();
+			if ( message.type === 'assistant' ) {
+				if ( ! qualification.acceptedModels.includes( message.message.model ) ) throw new Error();
+				markNoteGiven();
+			}
 			if ( message.type === 'result' && message.subtype === 'success' && ! nativeInitAccepted )
 				throw new Error();
 			adapter.accept( message as unknown as Record< string, unknown > );

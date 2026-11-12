@@ -70,9 +70,12 @@ export interface BackendTurnOutcome {
 	 * Studio could not take ownership of the native process tree, so nothing
 	 * was sent, and `process_unconfirmed` when Studio could not confirm that
 	 * every process of the turn ended, so the conversation stays locked until
-	 * it is recovered, and `recovered` when the turn's process ended without
+	 * it is recovered, `recovered` when the turn's process ended without
 	 * finishing it and Studio recorded this outcome when it recovered the
-	 * conversation.
+	 * conversation, and `journal_unreadable` when Studio could not read the
+	 * conversation's journal before the turn, so nothing was sent. Only
+	 * `rebind_required` means the conversation cannot continue;
+	 * `journal_unreadable` is retryable, as the next turn reads the journal again.
 	 */
 	code?:
 		| 'rebind_required'
@@ -80,7 +83,8 @@ export interface BackendTurnOutcome {
 		| 'account_unverified'
 		| 'process_unowned'
 		| 'process_unconfirmed'
-		| 'recovered';
+		| 'recovered'
+		| 'journal_unreadable';
 }
 
 interface ContentBlock {
@@ -179,8 +183,8 @@ export interface ClaudeOperationJournalEvent extends BackendTurnIds, ToolCall {
 }
 
 /**
- * Written once a turn's prompt has gone to Claude together with the note
- * about the recoveries it names, so the note is given once. Journal-only.
+ * Written once Claude has answered a prompt that carried the note about the
+ * recoveries it names, so the note is not given again. Journal-only.
  */
 export interface ClaudeRecoveryNotedJournalEvent extends BackendTurnIds {
 	type: 'turn.recovery-noted';
