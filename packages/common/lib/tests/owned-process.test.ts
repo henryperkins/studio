@@ -1491,3 +1491,48 @@ describe( 'owned process trees (real processes)', () => {
 		60_000
 	);
 } );
+
+describe.skipIf( process.platform !== 'win32' )(
+	`the keeper's tree walk, compiled and run by Windows PowerShell ${ WINDOWS_ONLY }`,
+	() => {
+		it( 'takes a process into the walk only when it was created after the parent it names, never in the same tick', async () => {
+			const keeper = Buffer.from(
+				windowsKeeperCommand( { env: process.env } as OwnedProcessSeams ).input!,
+				'base64'
+			).toString( 'utf8' );
+			const source = /\$source = @'\r?\n([\s\S]*?)\r?\n'@/.exec( keeper )?.[ 1 ];
+			expect( source ).toBeDefined();
+			// The walk asks this rule, and only this rule, about start times.
+			const walk = /static List<IntPtr> Descendants[\s\S]*?\n\t\t}\n/.exec( source! )?.[ 0 ];
+			expect( walk ).toContain( 'CreatedAfter(started, parentStarted)' );
+			expect( walk ).not.toMatch( /started\s*>=?\s*parentStarted/ );
+			const directory = await mkdtemp( path.join( os.tmpdir(), 'studio-keeper-walk-' ) );
+			try {
+				const file = path.join( directory, 'job.cs' );
+				await writeFile( file, source! );
+				const script = [
+					`Add-Type -Path '${ file.replace( /'/g, "''" ) }'`,
+					"foreach ($pair in @(@(5, 5), @(6, 5), @(4, 5), @(0, 0))) { '{0} {1} {2}' -f $pair[0], $pair[1], [StudioOwned.Job]::CreatedAfter([long]$pair[0], [long]$pair[1]) }",
+				].join( '\n' );
+				const { stdout } = await exec(
+					powershell,
+					[
+						'-NoProfile',
+						'-NonInteractive',
+						'-EncodedCommand',
+						Buffer.from( script, 'utf16le' ).toString( 'base64' ),
+					],
+					{ windowsHide: true, timeout: 60_000 }
+				);
+				expect( stdout.trim().split( /\r?\n/ ) ).toEqual( [
+					'5 5 False',
+					'6 5 True',
+					'4 5 False',
+					'0 0 False',
+				] );
+			} finally {
+				await rm( directory, { recursive: true, force: true } );
+			}
+		}, 90_000 );
+	}
+);

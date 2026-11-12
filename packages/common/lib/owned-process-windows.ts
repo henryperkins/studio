@@ -219,9 +219,15 @@ namespace StudioOwned {
 			return count;
 		}
 
+		// Whether a process created at "started" was created after the parent it
+		// names. Creation times share a clock tick, so an equal time proves nothing.
+		public static bool CreatedAfter(long started, long parentStarted) {
+			return started > parentStarted;
+		}
+
 		// Opens each live process not yet in "held" whose parent, read through
-		// its own handle, is held and that started no earlier than that parent,
-		// and adds it. null when the processes cannot be listed.
+		// its own handle, is held and that was created after that parent, and
+		// adds it. null when the processes cannot be listed.
 		static List<IntPtr> Descendants(Dictionary<uint, long> held) {
 			IntPtr snapshot = CreateToolhelp32Snapshot(2, 0);
 			if (snapshot == new IntPtr(-1)) return null;
@@ -236,7 +242,7 @@ namespace StudioOwned {
 					long started = Created(child);
 					long parent = ParentOf(child);
 					long parentStarted;
-					if (started >= 0 && parent >= 0 && parent <= uint.MaxValue && held.TryGetValue((uint)parent, out parentStarted) && started >= parentStarted) {
+					if (started >= 0 && parent >= 0 && parent <= uint.MaxValue && held.TryGetValue((uint)parent, out parentStarted) && CreatedAfter(started, parentStarted)) {
 						held[entry.ProcessId] = started;
 						found.Add(child);
 					} else CloseHandle(child);
@@ -250,7 +256,7 @@ namespace StudioOwned {
 		// Ends the process "root", held since before it could exit, and every
 		// descendant provable through handles: a process is taken only when its
 		// parent, read through its own handle, is a process already held and it
-		// started no earlier than that parent. A held handle keeps its process's
+		// was created after that parent. A held handle keeps its process's
 		// ID from reuse, so nothing unrelated can match; a process whose parent
 		// exited before it was held cannot be proven and is left alone. The
 		// whole tree is held before anything is ended, since ending a process
