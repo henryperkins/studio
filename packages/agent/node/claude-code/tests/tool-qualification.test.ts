@@ -80,6 +80,11 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 	site_delete: throughHost,
 	site_import: throughHost,
 	site_export: throughHost,
+	install_taxonomy_scripts: {
+		...throughHost,
+		readsLocalFiles: [ 'bundled' ],
+		writesLocalFiles: [ 'paths' ],
+	},
 };
 const isQualifiedName = ( name: string ) => Object.prototype.hasOwnProperty.call( QUALIFIED, name );
 // In the order the rule table, and so every enabled list, names them.
@@ -290,6 +295,13 @@ describe( 'Claude Studio tool qualification', () => {
 				),
 			],
 			[
+				'files Studio ships, read from the folder the rule names',
+				qualifiedRule(
+					{ bundled: () => 'skills' },
+					{ ...noChannels, readsLocalFiles: [ 'bundled' ] }
+				),
+			],
+			[
 				'a message by approval',
 				qualifiedRule(
 					{ operationClass: 'external-message' },
@@ -414,6 +426,27 @@ describe( 'Claude Studio tool qualification', () => {
 					{ operationClass: 'external-message' },
 					{ ...noChannels, readsLocalFiles: [ 'class' ] }
 				),
+			],
+			// Bundled files are bounded by the folder the rule names, which the
+			// policy checks; reading them binds no other channel.
+			[
+				'bundled files the rule does not name',
+				qualifiedRule( {}, { ...noChannels, readsLocalFiles: [ 'bundled' ] } ),
+			],
+			[
+				'files written as if bundled',
+				qualifiedRule(
+					{ bundled: () => 'skills' },
+					{ ...noChannels, readsLocalFiles: [ 'bundled' ], writesLocalFiles: [ 'bundled' ] }
+				),
+			],
+			[
+				'a bundled folder without the file channel',
+				qualifiedRule( { bundled: () => 'skills' }, noChannels ),
+			],
+			[
+				'a bundled folder that is not a function',
+				qualifiedRule( { bundled: 'skills' }, noChannels ),
 			],
 			[
 				'a process bound by the host guard',

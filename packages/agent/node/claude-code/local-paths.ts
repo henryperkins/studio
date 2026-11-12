@@ -1,5 +1,6 @@
 import { realpath } from 'fs/promises';
 import path from 'path';
+import { getSkillsRoot } from '../skills';
 
 export function isInside( root: string, candidate: string ): boolean {
 	const relative = path.relative( root, candidate );
@@ -96,4 +97,28 @@ export async function isAllowedNewPath(
 		! isSensitivePath( file ) &&
 		! isSensitivePath( resolved )
 	);
+}
+
+/**
+ * Whether a folder holds only files Studio ships itself: it resolves inside
+ * Studio's own bundled skills, which lie outside, and hold none of, the
+ * folders `reachable` names, so nothing a conversation writes can be in it.
+ */
+export async function isBundledFolder(
+	folder: string,
+	reachable: readonly string[]
+): Promise< boolean > {
+	if ( ! path.isAbsolute( folder ) ) return false;
+	try {
+		const [ canonical, bundle ] = await Promise.all( [
+			realpath( folder ),
+			realpath( getSkillsRoot() ),
+		] );
+		return (
+			isInside( bundle, canonical ) &&
+			! reachable.some( ( root ) => isInside( root, bundle ) || isInside( bundle, root ) )
+		);
+	} catch {
+		return false;
+	}
 }

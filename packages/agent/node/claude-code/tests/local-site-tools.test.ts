@@ -1,7 +1,10 @@
+import { existsSync, readdirSync } from 'fs';
 import { mkdir, rename, symlink, writeFile } from 'fs/promises';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { getSkillPath } from '../../skills';
 import { fakeSite } from '../../tests/fake-host';
+import { isBundledFolder } from '../local-paths';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
 
@@ -318,5 +321,65 @@ describe( 'site_export on the Claude route', () => {
 		} );
 		expect( result.isError ).toBe( true );
 		expect( host.sites.export ).not.toHaveBeenCalled();
+	} );
+} );
+
+describe( 'install_taxonomy_scripts on the Claude route', () => {
+	const scripts = readdirSync( getSkillPath( 'taxonomist', 'scripts' ) );
+	const installed = ( site: string ) =>
+		existsSync( path.join( site, 'tmp', 'taxonomist' ) )
+			? readdirSync( path.join( site, 'tmp', 'taxonomist' ) )
+			: [];
+
+	it( 'copies Studio’s own scripts into the conversation’s site, unprompted and journaled', async () => {
+		const { bridge, context, journal, site } = await setup();
+		expect( bridge.tools ).toContain( 'install_taxonomy_scripts' );
+		const result = await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'site' } );
+		expect( result.isError ).toBe( false );
+		expect( scripts.length ).toBeGreaterThan( 0 );
+		expect( installed( site ).sort() ).toEqual( [ ...scripts ].sort() );
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect( journaled( journal ) ).toEqual( [ [ 'install_taxonomy_scripts', 'local-change' ] ] );
+	} );
+
+	it( 'writes into no other site, and through no link that leads out of the site', async () => {
+		const { bridge, site, parent, other, journal } = await setup();
+		expect(
+			( await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'other' } ) ).isError
+		).toBe( true );
+		expect( installed( other ) ).toEqual( [] );
+		await mkdir( path.join( parent, 'outside' ) );
+		await symlink( path.join( parent, 'outside' ), path.join( site, 'tmp' ), 'junction' );
+		expect(
+			( await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'site' } ) ).isError
+		).toBe( true );
+		expect( readdirSync( path.join( parent, 'outside' ) ) ).toEqual( [] );
+		expect( journal ).toEqual( [] );
+	} );
+
+	it( 'after a recovery that left operations uncertain, asks first and shows every file it writes', async () => {
+		const { bridge, context, site } = await setup( () => ( { uncertainAfterRecovery: true } ) );
+		expect(
+			( await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'site' } ) ).isError
+		).toBe( false );
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		expect( request.operation.localPaths ).toEqual( [
+			path.join( site, 'tmp', 'taxonomist' ),
+			...scripts.map( ( file ) => path.join( site, 'tmp', 'taxonomist', file ) ),
+		] );
+		expect( request.operation.description ).toContain( 'may already have taken effect' );
+	} );
+} );
+
+describe( 'the folders Studio ships its read-only files in', () => {
+	it( 'are Studio’s own bundled skills, outside every folder a conversation reaches', async () => {
+		const scripts = getSkillPath( 'taxonomist', 'scripts' );
+		const { parent } = await setup();
+		expect( await isBundledFolder( scripts, [ parent ] ) ).toBe( true );
+		expect( await isBundledFolder( parent, [] ) ).toBe( false );
+		expect( await isBundledFolder( path.join( scripts, '..', '..', '..' ), [] ) ).toBe( false );
+		expect( await isBundledFolder( 'skills/taxonomist/scripts', [] ) ).toBe( false );
+		// Bundled files a conversation could reach would be no longer Studio's own.
+		expect( await isBundledFolder( scripts, [ path.dirname( scripts ) ] ) ).toBe( false );
 	} );
 } );

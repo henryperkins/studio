@@ -1,4 +1,6 @@
+import { readdirSync } from 'fs';
 import path from 'path';
+import { getSkillPath } from '../skills';
 import { createPreviewTool } from '../tools/create-preview';
 import { createSiteTool } from '../tools/create-site';
 import { deletePreviewTool } from '../tools/delete-preview';
@@ -57,6 +59,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		deleteSiteTool.name,
 		importSiteTool.name,
 		exportSiteTool.name,
+		installTaxonomyScriptsTool.name,
 	] ),
 } );
 
@@ -288,6 +291,8 @@ export type ClaudeToolChannel = ( typeof CLAUDE_TOOL_CHANNELS )[ number ];
  *   shows the files.
  * - `host`: the effect is a host operation, which runs only through
  *   `guardHost`.
+ * - `bundled`: the rule's `bundled` element, a folder of files Studio ships
+ *   itself, which the policy checks before every call. It bounds reading only.
  */
 export type ClaudeChannelBinding =
 	| 'site'
@@ -296,7 +301,8 @@ export type ClaudeChannelBinding =
 	| 'navigates'
 	| 'scope'
 	| 'class'
-	| 'host';
+	| 'host'
+	| 'bundled';
 
 /** For every channel, `false` when the implementation does not use it, or what bounds it. */
 export type ClaudeToolChannelDeclaration = {
@@ -332,6 +338,11 @@ export interface ClaudeStudioToolRule {
 	 * lie in the target site's folder; undefined denies the call.
 	 */
 	readonly paths?: ( args: unknown, siteFolder: string | undefined ) => string[] | undefined;
+	/**
+	 * The folder of files Studio ships itself that the tool reads. It must lie in
+	 * Studio's own bundled skills, outside every folder the turn reaches.
+	 */
+	readonly bundled?: () => string;
 	/**
 	 * The WordPress.com scope a call reaches directly: a site, which must be the
 	 * turn's live target, or the account. Undefined denies the call.
@@ -399,6 +410,22 @@ const LOCAL_SITE_HOST_CHANNELS: Partial< ClaudeToolChannelDeclaration > = {
 	runsWpCli: [ 'site', 'host' ],
 	callsHostOperation: [ 'site', 'host' ],
 };
+
+const taxonomistScripts = () => getSkillPath( 'taxonomist', 'scripts' );
+
+// Where `install_taxonomy_scripts` writes in a site: its folder and a copy of
+// every file the bundled folder holds. Undefined, which denies the call, when
+// either cannot be named.
+function taxonomistDestinations( siteFolder: string | undefined ): string[] | undefined {
+	if ( ! siteFolder ) return;
+	const destination = path.join( siteFolder, 'tmp', 'taxonomist' );
+	try {
+		const files = readdirSync( taxonomistScripts(), { recursive: true, encoding: 'utf8' } );
+		return [ destination, ...files.map( ( file ) => path.join( destination, file ) ) ];
+	} catch {
+		return;
+	}
+}
 
 // A declaration that marks every channel it does not name as unused.
 function using( used: Partial< ClaudeToolChannelDeclaration > ): ClaudeToolChannelDeclaration {
@@ -738,7 +765,24 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 			} )
 		),
 	],
-	[ installTaxonomyScriptsTool.name, unqualified( onSite( 'local-change' ) ) ],
+	[
+		installTaxonomyScriptsTool.name,
+		// It copies Studio's own Taxonomist scripts into `tmp/taxonomist` in the
+		// site it names: it reads only that bundled folder, and writes only the
+		// files the rule lists, each of which must resolve inside the target
+		// site's folder.
+		qualified(
+			onSite( 'local-change', {
+				bundled: taxonomistScripts,
+				paths: ( _args, siteFolder ) => taxonomistDestinations( siteFolder ),
+			} ),
+			using( {
+				...LOCAL_SITE_HOST_CHANNELS,
+				readsLocalFiles: [ 'bundled' ],
+				writesLocalFiles: [ 'paths' ],
+			} )
+		),
+	],
 	[
 		auditPerformanceTool.name,
 		unqualified( onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ) ),
@@ -983,26 +1027,30 @@ export function claudeNativeTools(
 	} );
 }
 
-// The bindings that can bound each channel. `needs` must be among those a
-// declaration names: a browser is bounded only under the navigation guard, and
-// WP-CLI and host operations only through the host guard. A file is bounded by
-// checked paths, not by naming a site, and never by an approval alone: an
+// The bindings that can bound each channel. One of `needs` must be among those
+// a declaration names: a browser is bounded only under the navigation guard,
+// and WP-CLI and host operations only through the host guard. A file is bounded
+// by checked paths, not by naming a site, and never by an approval alone: an
 // approval shows the local paths the rule names, so one that names none would
-// ask about files without showing them. A request Studio sends is bounded by a
-// scope or an approval, not by a URL check, which cannot see where a name resolves.
+// ask about files without showing them. Files Studio ships itself bound
+// reading, never writing. A request Studio sends is bounded by a scope or an
+// approval, not by a URL check, which cannot see where a name resolves.
 const CHANNEL_BOUNDS: Readonly<
 	Record<
 		ClaudeToolChannel,
-		{ readonly admits: readonly ClaudeChannelBinding[]; readonly needs?: ClaudeChannelBinding }
+		{
+			readonly admits: readonly ClaudeChannelBinding[];
+			readonly needs?: readonly ClaudeChannelBinding[];
+		}
 	>
 > = {
-	readsLocalFiles: { admits: [ 'paths', 'class' ], needs: 'paths' },
-	writesLocalFiles: { admits: [ 'paths', 'class' ], needs: 'paths' },
-	drivesBrowser: { admits: [ 'navigates', 'urls', 'site' ], needs: 'navigates' },
+	readsLocalFiles: { admits: [ 'paths', 'class', 'bundled' ], needs: [ 'paths', 'bundled' ] },
+	writesLocalFiles: { admits: [ 'paths', 'class' ], needs: [ 'paths' ] },
+	drivesBrowser: { admits: [ 'navigates', 'urls', 'site' ], needs: [ 'navigates' ] },
 	requestsNetwork: { admits: [ 'scope', 'class' ] },
 	spawnsProcess: { admits: [ 'class' ] },
-	runsWpCli: { admits: [ 'host', 'site' ], needs: 'host' },
-	callsHostOperation: { admits: [ 'host', 'site' ], needs: 'host' },
+	runsWpCli: { admits: [ 'host', 'site' ], needs: [ 'host' ] },
+	callsHostOperation: { admits: [ 'host', 'site' ], needs: [ 'host' ] },
 	reachesWpcom: { admits: [ 'scope', 'class', 'host' ] },
 };
 
@@ -1018,6 +1066,7 @@ const RULE_ELEMENTS: Readonly<
 	classify: 'function',
 	site: 'function',
 	paths: 'function',
+	bundled: 'function',
 	remote: 'function',
 	urls: 'function',
 	urlsOnSite: 'mark',
@@ -1060,6 +1109,8 @@ function ruleHas( rule: Record< string, unknown >, binding: unknown ): boolean {
 			);
 		case 'host':
 			return true;
+		case 'bundled':
+			return typeof rule.bundled === 'function';
 		default:
 			return false;
 	}
@@ -1094,7 +1145,7 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 				( binding ) =>
 					admits.includes( binding as ClaudeChannelBinding ) && ruleHas( elements, binding )
 			) ||
-			( needs && ! bindings.includes( needs ) )
+			( needs && ! needs.some( ( binding ) => bindings.includes( binding ) ) )
 		)
 			return;
 		used.add( channel );
@@ -1106,6 +1157,7 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 		( elements.paths === undefined ||
 			used.has( 'readsLocalFiles' ) ||
 			used.has( 'writesLocalFiles' ) ) &&
+		( elements.bundled === undefined || used.has( 'readsLocalFiles' ) ) &&
 		( elements.urls === undefined ||
 			used.has( 'drivesBrowser' ) ||
 			used.has( 'requestsNetwork' ) ) &&

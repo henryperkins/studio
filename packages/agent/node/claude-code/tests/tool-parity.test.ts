@@ -66,7 +66,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_import: { status: 'bridged' },
 	site_export: { status: 'bridged' },
 	scaffold_theme: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
-	install_taxonomy_scripts: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
+	install_taxonomy_scripts: { status: 'bridged' },
 	refresh_browser: {
 		status: 'unqualified',
 		step: 'C2a-2',

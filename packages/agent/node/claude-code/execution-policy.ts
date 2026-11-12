@@ -23,7 +23,12 @@ import {
 	requiresClaudeApproval,
 	studioToolName,
 } from './execution-rules';
-import { isAllowedNativePath, isAllowedNewPath, isInsideCanonicalRoot } from './local-paths';
+import {
+	isAllowedNativePath,
+	isAllowedNewPath,
+	isBundledFolder,
+	isInsideCanonicalRoot,
+} from './local-paths';
 import { classifyWpCliArgs, hasWpCliOverrides, wpCliOption } from './wp-cli-rules';
 import type {
 	ClaudeEnabledTools,
@@ -691,6 +696,9 @@ export function createClaudeExecutionPolicy(
 			}
 			localPaths = paths;
 		}
+		// What it reads of Studio's own files must still be Studio's own.
+		if ( rule.bundled && ! ( await isBundledFolder( rule.bundled(), context.localRoots ) ) )
+			return false;
 		let remote: string | undefined;
 		if ( rule.urls ) {
 			const urls = rule.urls( args, site?.url );
