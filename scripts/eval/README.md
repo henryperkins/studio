@@ -58,58 +58,94 @@ The checks in `outcome.mjs` read that state. A case names the site it asks for i
 
 > **A pass on the default provider is regression evidence only.** `npm run eval` runs on whatever provider is configured globally (WordPress.com, an Anthropic API key or an OpenAI API key), and a model name such as `STUDIO_EVAL_MODEL=gpt-6-luna` never picks a billing route: the OpenAI API also serves that slug. Such a run says nothing about a subscription route. Only a run with an explicit provider selection whose `ranOnRequestedRoute` check passed counts as evidence for a provider route, and only for the provider, connection, model and effort it reports.
 
-`subscription-parity.config.yaml` runs the same Studio workflows on one explicitly selected provider and connection. Every case sets `requireProvider` (a run that selects no provider is refused) and asserts `ranOnRequestedRoute`. The config names no provider, connection, model or effort: they come from the environment, so another subscription provider runs the same config with its own selection.
+`subscription-parity.config.yaml` runs the same Studio workflows on one explicitly selected provider and connection. Every case sets `requireProvider` (a run that selects no provider is refused) and asserts `ranOnRequestedRoute` and `noWordPressComWrites`. The config names no provider, connection, profile, model or effort: they come from the environment, so another subscription provider runs the same config with its own selection.
+
+### A dedicated ChatGPT test profile
+
+A ChatGPT eval never uses your own Studio profile (`~/.studio`) for its ChatGPT connection. It takes the connection from a **dedicated test profile**: a folder you sign in to only for testing, with the ChatGPT acceptance runner (`scripts/chatgpt-acceptance/README.md`, scenarios `provision` and `retire`). In order, from the repository root, with your consent each time (nothing here runs without `--live`):
 
 ```bash
-# A ChatGPT plan connection saved with secure storage in the Studio profile the eval reads.
+npm run cli:build
+# 1. Create the dedicated profile and sign in to it (the browser opens once). Dry check first.
+node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario provision --run-dir <new absolute folder>
+node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario provision --run-dir <new absolute folder> --live
+# 2. Run the parity eval on it. The profile is <run folder>/profile; the registration id is
+#    "registrationId" in <run folder>/state.json (a private file: it never leaves your machine).
 STUDIO_EXPERIMENTAL_CHATGPT=1 \
 STUDIO_EVAL_PROVIDER=chatgpt-oauth \
+STUDIO_EVAL_CHATGPT_PROFILE=<run folder>/profile \
 STUDIO_EVAL_CONNECTION=<registration id> \
 STUDIO_EVAL_MODEL=gpt-6-luna \
 STUDIO_EVAL_EFFORT=medium \
 npm run eval:parity -- --filter-pattern "^parity"
+# 3. The per-model smoke (gate T4) runs in the acceptance runner's own saved scenario, in another new folder.
+node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario saved --run-dir <another new absolute folder> --gates T4 --live
+# 4. Retire the dedicated profile: sign its registration out, locally and at ChatGPT.
+node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario retire --run-dir <run folder> --live
 ```
 
-PowerShell: set each with `$env:NAME = 'value'` first, then run `npm run eval:parity -- --filter-pattern "^parity"`. The registration id is shown by `/chatgpt` → Select saved account in Studio Code (`<label> · <id>`); it stays in your environment and never appears in a result (see `connectionRef` below).
+PowerShell: set each variable with `$env:NAME = 'value'` first, then run the `npm run` line; `Remove-Item env:NAME` afterwards. Run the eval from a shell where `DEV_CONFIG_DIR` is unset or points anywhere but the dedicated profile (`profile-is-config-directory` otherwise). After `retire`, the run folder still holds the account store (with the account's email address) and the signed-out records: delete the folder when you no longer need its evidence.
+
+How a case reaches the connection: before anything else, the runner checks `STUDIO_EVAL_CHATGPT_PROFILE` (an absolute path to an existing folder that is not `~/.studio`, not inside it, does not resolve into it through a link, and is not the folder the eval process keeps its own Studio config in), then points this process's ChatGPT state at it with `setChatGptStateDirectory` (`packages/agent/node/chatgpt/state-directory.ts`, development-only callers; it refuses to move the state once used), and only then lists the connections there. Every read and write of ChatGPT state (the account index, the sealed credential records, a refresh, a sign-in marked as needed) happens in the dedicated profile itself, under the lockfiles that profile's own processes take. Nothing links to or copies credential state; the case's own profile (sites, sessions, `shared.json`, global instructions) is still a temporary folder of its own. The agent runs in the eval process, so no forked process needs the profile. The runner also installs the ChatGPT token client and writes the conversation's ChatGPT record before every turn, as the CLI does.
+
+**WordPress.com login.** A provider-qualified case gets your WordPress.com login the same way every eval case does: a copy of the login from the Studio profile the eval process reads (`~/.studio`, or `DEV_CONFIG_DIR`), written into the case's temporary profile and removed with it. It is used for WordPress.com reads and, in cases labelled `[image service]`, for Studio's image service, exactly as the rest of the suite uses it; under `remote: mock` nothing can change a WordPress.com site with it (below).
 
 ### Selecting a provider
 
 | Setting | Where | Meaning |
 | --- | --- | --- |
 | `STUDIO_EVAL_PROVIDER` | environment, or the case's `provider` var (they must agree) | `chatgpt-oauth`, `openai-api-key`, `anthropic-api-key` or `wpcom`. Without it the runner takes the default path, exactly as before. |
-| `STUDIO_EVAL_CONNECTION` | environment only | The connection a subscription provider runs on. Never read from a config. |
+| `STUDIO_EVAL_CHATGPT_PROFILE` | environment only | ChatGPT: the dedicated test profile's absolute path. Never read from a config. |
+| `STUDIO_EVAL_CONNECTION` | environment only | The connection a subscription provider runs on, saved in that profile. Never read from a config. |
 | `STUDIO_EVAL_MODEL` | environment, or the case's `model` var | For ChatGPT, a slug the route is qualified for (`packages/agent/protocol/chatgpt-models.ts`, today `gpt-6-luna`); default: the table's first. For a legacy provider, one of its models; default: its default. |
 | `STUDIO_EVAL_EFFORT` | environment, or the case's `effort` var | ChatGPT only: a qualified effort for the model (`low` or `medium` for `gpt-6-luna`); default `medium`. |
 | `requireProvider: true` | case var | Refuses a run that selects no provider. |
 
-A selected run executes on that provider (and, for ChatGPT, that connection) or is refused before any site, turn or model request. The result then has `success: false`, `refusal: { code, message }` and `providerRoute.failure`, and `ranOnRequestedRoute` fails with the code. Nothing falls back to the global provider, another connection, model or effort:
+A selected run executes on that provider (and, for ChatGPT, that connection in that profile) or is refused before any site, turn or model request. The result then has `success: false`, `refusal: { code, message }` and `providerRoute.failure`, and `ranOnRequestedRoute` fails with the code. Nothing falls back to the global provider, another connection, profile, model or effort:
 
 | Code | When |
 | --- | --- |
-| `provider-unknown`, `provider-conflict`, `provider-required`, `selection-without-provider` | The selection itself: an unknown id; the environment and the case name different providers; a `requireProvider` case with no provider; a connection or effort with no provider. |
-| `experimental-flag-off` | `STUDIO_EXPERIMENTAL_CHATGPT=1` is not set. |
+| `provider-unknown`, `provider-conflict`, `provider-required`, `selection-without-provider` | The selection itself: an unknown id; the environment and the case name different providers; a `requireProvider` case with no provider; a connection, profile or effort with no provider. |
 | `connection-required`, `connection-not-applicable` | ChatGPT without `STUDIO_EVAL_CONNECTION`; a connection for a legacy provider (they have one implicit connection). |
-| `connection-unknown`, `connection-signed-out`, `connection-unsupported`, `connection-state-unavailable` | No such ChatGPT connection in the profile; it isn't signed in here (a session-only sign-in lives only in the app that holds it, so sign in with secure storage); it isn't a ChatGPT connection Studio's agent runs on; the profile's connections can't be read. |
+| `profile-required`, `profile-relative`, `profile-not-found`, `profile-in-studio-profile`, `profile-is-config-directory`, `profile-unavailable`, `profile-not-applicable` | ChatGPT without `STUDIO_EVAL_CHATGPT_PROFILE`; a relative path; no such folder; `~/.studio`, a folder inside it or a link resolving into it; the folder this process keeps its own config in (`DEV_CONFIG_DIR`); this process already reads ChatGPT state elsewhere; a profile for a legacy provider. |
+| `experimental-flag-off` | `STUDIO_EXPERIMENTAL_CHATGPT=1` is not set. |
+| `connection-unknown`, `connection-signed-out`, `connection-unsupported`, `connection-state-unavailable` | No such ChatGPT connection in the dedicated profile; it isn't signed in there (a session-only sign-in lives only in the app that holds it, so sign in with secure storage); it isn't a ChatGPT connection Studio's agent runs on; the profile's connections can't be read. |
 | `model-not-qualified`, `effort-not-qualified` | A model or effort the ChatGPT route isn't qualified for, with the same explanation the app gives. |
 | `effort-not-applicable`, `model-provider-mismatch`, `provider-not-ready` | A legacy provider given an effort, a model it doesn't serve, or no credentials. |
-| `staging-not-designated`, `staging-needs-active-site`, `history-needs-provider`, `fixture-missing`, `image-service-not-configured`, `image-service-still-configured` | A case's own setup, below. |
-
-How a ChatGPT run reaches its connection: each case runs in a Studio profile of its own (as every eval does), into which the runner links the source profile's ChatGPT sign-ins (`chatgpt-credentials/` by a directory link, so a refresh and its locks land in the source's records, and `chatgpt-accounts.json` by a file link or a copy), and removes those links as soon as the case's turns end, before its outcome is captured. The source profile is the one Studio reads: `~/.studio`, or `DEV_CONFIG_DIR` when set. The runner also installs the ChatGPT token client and writes the conversation's ChatGPT record before every turn, as the CLI does.
+| `staging-not-designated`, `staging-not-confirmed`, `staging-needs-active-site`, `history-needs-provider`, `fixture-missing`, `image-service-not-configured`, `image-service-still-configured` | A case's own setup, below. |
 
 ### What the run reports
 
 A selected run's result has `providerRoute`:
 
 - `requested`: `kind` (the provider), `backend` (where its model requests go: `chatgpt-route`, `openai-api`, `anthropic` or `wpcom-ai-proxy`), `subscription`, `connectionRef`, `model`, `wireModel` (the model id requests carry, or null where the observer can't see it) and `effort`.
-- `executed`, read back from the run, never from the selection: the runner wraps `fetch` with the ChatGPT acceptance runner's request observer (`apps/cli/ai/chatgpt-acceptance-observer.ts`), which classifies each request by destination and bearer shape and keeps no URL, header, token or content, for as long as the case's turns run. From it: `kind` and `backend` (`mixed` when the requests went to more than one route, `none` when there were none), `modelRequests`, `apiKeyBearers`, `imageServiceRequests` (Studio's separate WordPress.com image service, kept apart from inference), `models`, `efforts` and `requests` (per request: destination, bearer shape, model, effort, input and image counts, and `turn`, the user message it belongs to). `replyKinds` and `replyModels` are the providers and models the runtime stamped on its replies. `connectionRef` is, for ChatGPT, a fingerprint (`conn-` and 12 hex digits of a hash) of the connection the conversation's record names, which the runtime checks against the connection it begins before every turn; for a legacy provider, the provider id.
+- `executed`, read back from the run: the runner wraps `fetch` with the ChatGPT acceptance runner's request observer (`apps/cli/ai/chatgpt-acceptance-observer.ts`), which classifies each request by destination and bearer shape and keeps no URL, header, token or content, for as long as the case's turns run. From it: `kind` and `backend` (`mixed` when the requests went to more than one route, `none` when there were none), `modelRequests`, `apiKeyBearers`, `imageServiceRequests` (Studio's separate WordPress.com image service, kept apart from inference), `models`, `efforts` and `requests` (per request: destination, bearer shape, model, effort, input and image counts, and `turn`, the user message it belongs to). `replyKinds` and `replyModels` are the providers and models the runtime stamped on its replies.
+- `connectionRef`: for ChatGPT, a fingerprint (`conn-` and 12 hex digits of a hash of the registration id, a random local identifier) of the connection the conversation's record names. The runner writes that record from the selection before every turn and the runtime refuses a turn whose record differs from the connection it begins, so this field restates the selection: it is not evidence of which account served the run. For a legacy provider it is the provider id.
+- `connectionMatchesBearer`: the evidence. While the turns run, the observer hands each ChatGPT route request's `authorization` header, in memory, to a comparison the plan built from the selected registration's recorded identity (the `sub` of the ID token it was signed in with). The bearer's `sub` claim is read without verifying the token's signature, compared, and dropped; only the answer is kept. `true` when every route request's bearer named that identity, `false` when any named another, `unverified` when any bearer could not be decoded or carried no `sub`, `null` for a legacy provider. No claim, subject, email or hash of one is written anywhere.
 
-`ranOnRequestedRoute` fails when no provider was selected, the run was refused, no model request ran, the executed kind, backend or connection differs from the requested one, a subscription run sent an API-key bearer, a request named another model or effort, or the runtime recorded replies from another provider.
+What `connectionMatchesBearer: true` proves: every model request on the ChatGPT route carried an access token issued for the same ChatGPT identity the selected registration was signed in as. What it does not prove: which of several registrations of that same identity served it (the registration is held by the runtime's own checks, restated by `connectionRef`); that ChatGPT accepted the token (the request outcomes say that); that the token is genuine (its signature is not checked; the route checks it); or anything about requests that did not go to the ChatGPT route (kept apart by `kind`, `backend` and `apiKeyBearers`).
+
+`ranOnRequestedRoute` fails when no provider was selected, the run was refused, no model request ran, the executed kind, backend or connection differs from the requested one, a subscription run sent an API-key bearer, a request named another model or effort, the runtime recorded replies from another provider, or, for a subscription run, `connectionMatchesBearer` is `false` (`connection-mismatch`) or anything but `true` (`connection-unverified`).
+
+### What `remote: mock` guarantees
+
+Every parity case runs with `remote: mock` (the `staging:` cases excepted), and so does any selected case that names no `remote`. Under it no request that could change WordPress.com leaves the process:
+
+- each push, pull and preview create, update or delete is recorded in `remoteCalls` and answered with a fixture by the mocked host;
+- each `wpcom_request` with a method other than GET is recorded in `remoteCalls` (`operation: "wpcom-request"`, its method, site id and path) and answered with a fixture (`{"eval_mock": true, …}`); GET requests stay the real tool's;
+- any other request to a WordPress.com host (`wordpress.com`, `wp.com` and their subdomains) with a method other than GET or HEAD, sent by `fetch` or by the `http`/`https` modules (which `wpcom` requests use), is refused before it is sent, recorded in `remoteGuard.blocked` (method, host class, whether it was the image endpoint, and how it was sent; never the address), and fails the case: `success: false`, an `error` starting `wpcom-write-under-mock`, and `noWordPressComWrites` fails with that code;
+- named exceptions: Studio's image service, only in a case labelled `imageService: "required"` (the `[image service]` cases); and model requests to the WordPress.com AI proxy only on a run whose provider is WordPress.com. Under ChatGPT, any request to the AI proxy that is not the labelled image service is refused.
+
+What still reaches WordPress.com under `remote: mock`:
+
+- **reads**: GET and HEAD requests, including `wpcom_request` reads, go out with the case's copy of your login;
+- **a process the agent starts from its shell** (`Bash`), such as a `studio` CLI command or `curl`: the guard covers the eval process only, from setup until the case's turns end, and such a process reads the case's copy of your login, so it could change a WordPress.com site. No parity case asks for one; one that ran shows in the result's `toolCalls`.
+
+The result's `remoteGuard` is `{ code, blocked }`; `remoteCalls` appears only for a mocked case.
 
 ### Parity cases
 
-Every case runs with `remote: mock`: each push, pull and preview create, update or delete is recorded in `remoteCalls` and answered with a fixture, so nothing reaches WordPress.com. The `staging:` cases at the end are the exception (see below).
-
-| Case | Checks (besides `ranOnRequestedRoute`) | Needs |
+| Case | Checks (besides `ranOnRequestedRoute` and `noWordPressComWrites`) | Needs |
 | --- | --- | --- |
 | `parity-identity` | `identifiesAsStudio` | automatic |
 | `parity-global-instructions` | `replyIncludes` | automatic |
@@ -133,29 +169,51 @@ Every case runs with `remote: mock`: each push, pull and preview create, update 
 | `parity-resume` | `finalReplyIncludes`, `resumedFromDisk`, `lastTurnUsedNoTools` | automatic |
 | `parity-compaction-fixture` | `compacted`, `finalReplyIncludes`, `resumedFromDisk` | automatic; fixture-forced compaction |
 | `parity-image-generation` | `imageGenerated`, `inspectionMatches` | image service |
-| `parity-pending-work` | `imageGenerated`, `inspectionMatches` | image service |
+| `parity-pending-work` | `imageGenerated`, `toolsInOrder` (a successful `generate_images` before a successful `take_screenshot` in the recorded tool sequence), `inspectionMatches` (images saved when the turn ends) | image service |
 | `parity-image-generation-absent` | `imageGenerationUnavailable`, `noSiteCreated` | automatic (the runner turns the image service off) |
-| `staging-push` | `remoteOperationRan` | designated disposable staging site |
+| `staging-push` | `remoteOperationRan` | a staging site you name for the run |
 
-- **Image service.** The `[image service]` cases need Studio's separate WordPress.com image service (a WordPress.com login in the profile, or `STUDIO_IMAGE_API_TOKEN`) and are refused (`image-service-not-configured`) without it. `imageService: "off"` runs a case without it: the case's profile gets no WordPress.com login and `STUDIO_IMAGE_API_TOKEN` is removed; the case is refused (`image-service-still-configured`) if the service is still on, for example under a `DEV_CONFIG_DIR` profile that has a login. The result's `imageService.configured` says which held.
+- **Image service.** The `[image service]` cases need Studio's separate WordPress.com image service (a WordPress.com login in the profile the eval reads, or `STUDIO_IMAGE_API_TOKEN`) and are refused (`image-service-not-configured`) without it. They are the only cases whose image-service requests the guard lets through; in any other case an image request is refused and fails the case. `imageService: "off"` runs a case without it: the case's profile gets no WordPress.com login and `STUDIO_IMAGE_API_TOKEN` is removed; the case is refused (`image-service-still-configured`) if the service is still on, for example under a `DEV_CONFIG_DIR` profile that has a login. The result's `imageService.configured` says which held. `parity-pending-work` checks the order of the calls and the saved images; it does not time when the background generation settled.
 - **Fixture-forced compaction.** `parity-compaction-fixture` seeds a short history (`seed.history`) whose last reply reports a context of 190,000 tokens, so the next turn compacts first: a real summarization request on the route, without sending a request that size. It is labelled as a fixture: it qualifies compaction and resume on the route, not a conversation that grew to the limit by itself.
-- **Staging.** A `remote: staging` case pushes for real, and only to a WordPress.com site you designate as disposable staging: set `STUDIO_EVAL_STAGING_SITE_ID` and `STUDIO_EVAL_STAGING_SITE_URL` (https), and the runner connects that site to the case's seeded active site. Without both the case is refused (`staging-not-designated`). Leave staging cases out of automatic runs with `--filter-pattern "^parity"`; run them on their own with `--filter-pattern "^staging:"`.
+- **Staging.** A `remote: staging` case pushes for real, and only to a WordPress.com staging site you name for that run: set `STUDIO_EVAL_STAGING_SITE_ID` and `STUDIO_EVAL_STAGING_SITE_URL` (https) on the command that runs it (POSIX: as a prefix of that one command; PowerShell: set them, run, then `Remove-Item env:STUDIO_EVAL_STAGING_SITE_ID, env:STUDIO_EVAL_STAGING_SITE_URL`). Without both the case is refused (`staging-not-designated`). The variables only name the site: before any site or turn the runner asks WordPress.com (a read, with the case's login) for the account's sites, and refuses the case (`staging-not-confirmed`) unless WordPress.com lists that site, at that address, as a staging site. It connects the site as WordPress.com lists it to the case's seeded active site. The guard is off in a staging case and `remoteCalls` is absent; `remoteOperationRan` judges it by the tool's own result, because the case declares `remote: staging`. Leave staging cases out of automatic runs with `--filter-pattern "^parity"`; run them on their own with `--filter-pattern "^staging:"`.
 
 ### Vars and result fields the parity cases use
 
 These work in any config:
 
-- `remote: mock` (each remote operation recorded in the result's `remoteCalls` and answered with a fixture) or `remote: staging` (above). Without `remote`, the real host runs, as before.
+- `remote: mock` (above) or `remote: staging` (above). Without `remote`, an unselected case runs the real host, as before; a selected case runs as `remote: mock`. `remoteOperationRan` and `noRemoteOperation` read the mode the case declares, never the shape of the result.
 - `imageService: "off"` or `"required"` (above; quote `"off"`, which some YAML parsers read as false).
 - `attachments` (a list of `{ "fixture": "<file in fixtures/>" }`): images are sent as image input with the first message, other files as absolute paths appended to it, as the composer and CLI attach them. `STUDIO_EVAL_FIXTURES_DIR` overrides the folder. The result's `attachments` lists what was attached.
 - `followUps[].reopen: true`: the conversation is reopened from its session file in a fresh agent before that message, as a resumed chat is.
 - `resumeAfterStop: true`: the follow-ups still run after a `stopAt` interrupt, as a user who cancelled a turn and went on.
 - `answers[].label: "@first"`: answers the question with its first option.
 - `seed.history` (a list of `{ "role": "user" | "assistant", "text": "…", "contextTokens": n }`): messages the conversation holds before the first turn, the assistant's recorded as replies on the selected route. Needs a provider selection (`history-needs-provider`).
+- `toolOrder` (a list of `{ "name": "<tool>" }`): for `toolsInOrder`.
 
-Every result now also has `turns` (per user message: whether it was `reopened`, when it started and where its `toolCalls`, `textSegments` and `questions` start) and `compactions` (compaction entries in the session after the run); a `ui: true` run has `uiEvents` (each artifact shown, by id and widget types, and how many times the preview was reloaded).
+Every result now also has `turns` (per user message: whether it was `reopened`, when it started and where its `toolCalls`, `textSegments` and `questions` start) and `compactions` (compaction entries in the session after the run); a `ui: true` run has `uiEvents` (each artifact shown, by id and widget types, and how many times the preview was reloaded). An unselected run's other fields are those it always had.
 
 `subscription-parity.test.mjs` checks the config without running a case: it parses, names only exported checks, passes the runner only vars it reads (parsed with the runner's own parser in `apps/cli/ai/eval-input.ts`) or a check reads, keeps remote operations mocked outside the separated staging cases, and holds no identifier or credential.
+
+### Temporary folders, and a run that is killed
+
+Each case makes a site registry (`studio-eval-registry-*`) and a Studio profile (`studio-eval-config-*`, holding the copy of your WordPress.com login and links to Studio's downloads, `server-files`, `php-bin`, `import-runtime` and `mu-plugins`, in the profile the eval reads) in the system temporary folder, and a sites folder (`studio-eval-sites-*`). The runner removes the registry and the profile when the case ends, whether it passed, failed, was refused or threw (the download links first, as links), the request observations file with them, and the sites folder when no site is left in it. It keeps what the result points to: the session file (`studio-eval-sessions`), the outcome folder (`studio-eval-outcome-*`) and the result file. No folder links to ChatGPT state.
+
+A case killed before it ends (Ctrl+C on promptfoo, a closed terminal) leaves its registry and profile behind. Remove a leftover profile's links before the folder, so nothing they point to is touched:
+
+```powershell
+Get-ChildItem $env:TEMP -Directory -Filter 'studio-eval-config-*' | ForEach-Object {
+	Get-ChildItem $_.FullName -Force | Where-Object { $_.LinkType } | ForEach-Object { $_.Delete() }
+	Remove-Item $_.FullName -Recurse -Force
+}
+Get-ChildItem $env:TEMP -Directory -Filter 'studio-eval-registry-*' | Remove-Item -Recurse -Force
+```
+
+```sh
+for dir in "${TMPDIR:-/tmp}"/studio-eval-config-*; do
+	find "$dir" -maxdepth 1 -type l -delete && rm -rf "$dir"
+done
+rm -rf "${TMPDIR:-/tmp}"/studio-eval-registry-*
+```
 
 ## Running the runner directly
 

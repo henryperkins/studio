@@ -1,16 +1,20 @@
 # Subscription provider parity evaluation
-# Run: see "Provider-qualified parity runs" in README.md. In short:
+# Run: see "Provider-qualified parity runs" in README.md. In short, on a
+# dedicated ChatGPT test profile made with the acceptance runner's provision
+# scenario (never your own Studio profile):
 #   STUDIO_EXPERIMENTAL_CHATGPT=1 STUDIO_EVAL_PROVIDER=chatgpt-oauth \
-#   STUDIO_EVAL_CONNECTION=<registration id> STUDIO_EVAL_MODEL=gpt-6-luna STUDIO_EVAL_EFFORT=medium \
-#   npm run eval:parity
+#   STUDIO_EVAL_CHATGPT_PROFILE=<run folder>/profile STUDIO_EVAL_CONNECTION=<registration id> \
+#   STUDIO_EVAL_MODEL=gpt-6-luna STUDIO_EVAL_EFFORT=medium \
+#   npm run eval:parity -- --filter-pattern "^parity"
 #
 # The same Studio workflows as promptfoo.config.yaml, on one explicitly
 # selected provider and connection. No case runs on the global provider:
 # `requireProvider` refuses a run that selects none, and every case asserts
 # `ranOnRequestedRoute`, which reads the route the run actually took (the
-# model requests it made, the providers the runtime stamped on its replies
-# and the connection the conversation records). The config names no provider,
-# so another subscription provider runs it with its own selection.
+# model requests it made, whether every route request's bearer named the
+# selected connection's identity, and the providers the runtime stamped on
+# its replies). The config names no provider, so another subscription
+# provider runs it with its own selection.
 #
 # Every case is judged on a deterministic final state or on what the user was
 # shown (outcome.mjs). Under `remote: mock` no request that could change
@@ -20,7 +24,8 @@
 # host with a method other than GET or HEAD is refused and fails the case
 # (`noWordPressComWrites`, code `wpcom-write-under-mock`). The one exception is
 # Studio's image service in the cases marked `[image service]`. Reads (GET,
-# HEAD) still reach WordPress.com with the case's copy of your login. The
+# HEAD) still reach WordPress.com with the case's copy of your login, and a
+# command the agent runs in its shell is outside the guard (README). The
 # `staging:` cases at the end change only the staging site you designate for
 # the run and are refused without it. Cases marked `[image service]` need
 # Studio's separate WordPress.com image service and are refused without it; the
