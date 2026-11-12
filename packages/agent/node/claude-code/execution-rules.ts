@@ -1,7 +1,4 @@
-import { lstat, realpath } from 'fs/promises';
-import os from 'os';
 import path from 'path';
-import { types } from 'util';
 import { createPreviewTool } from '../tools/create-preview';
 import { createSiteTool } from '../tools/create-site';
 import { deletePreviewTool } from '../tools/delete-preview';
@@ -31,6 +28,9 @@ import { updatePreviewTool } from '../tools/update-preview';
 import { validateBlocksTool } from '../tools/validate-blocks';
 import { runWpCliTool, splitCommandArgs } from '../tools/wp-cli';
 import { wpcomRequestTool } from '../tools/wpcom-request';
+import { isInside } from './local-paths';
+import { hasOnlyKeys, hasOwn, plainData, plainList, plainStrings } from './plain-data';
+import { classifyWpCliArgs } from './wp-cli-rules';
 import type { SandboxSettings } from '@anthropic-ai/claude-agent-sdk/core';
 import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
@@ -180,74 +180,6 @@ const NAVIGATION_GUARD_KEYS: ReadonlySet< string > = new Set( [
 	...NAVIGATION_GUARANTEES,
 ] );
 const NAVIGATION_CONFINEMENT_KEYS: ReadonlySet< string > = new Set( [ 'mode', 'guard' ] );
-
-function hasOwn( value: object, key: string ): boolean {
-	return Object.prototype.hasOwnProperty.call( value, key );
-}
-
-/**
- * A declaration read as plain data: the own properties of an ordinary object,
- * every one enumerable, named by a string and holding a value. An inherited
- * value, an accessor, a hidden or symbol-named property, a proxy or an
- * instance of a class is not what code that copies or serializes the object
- * receives, so an object with any of them is no declaration. The result has
- * no prototype, so reading it finds only what the object itself stated.
- * Never throws.
- */
-function plainData( value: unknown ): Record< string, unknown > | undefined {
-	try {
-		if ( typeof value !== 'object' || value === null || types.isProxy( value ) ) return;
-		const prototype: unknown = Object.getPrototypeOf( value );
-		if ( prototype !== Object.prototype && prototype !== null ) return;
-		const data: Record< string, unknown > = Object.create( null );
-		for ( const key of Reflect.ownKeys( value ) ) {
-			const property = Object.getOwnPropertyDescriptor( value, key );
-			if (
-				typeof key !== 'string' ||
-				! property ||
-				! hasOwn( property, 'value' ) ||
-				! property.enumerable
-			)
-				return;
-			data[ key ] = property.value;
-		}
-		return data;
-	} catch {
-		return;
-	}
-}
-
-/** A list read the same way: an ordinary array whose only properties are its items. */
-function plainList( value: unknown ): unknown[] | undefined {
-	try {
-		if (
-			! Array.isArray( value ) ||
-			types.isProxy( value ) ||
-			Object.getPrototypeOf( value ) !== Array.prototype
-		)
-			return;
-		const items: unknown[] = [];
-		// Every own key but `length` must be the next index.
-		const count = Reflect.ownKeys( value ).length - 1;
-		for ( let index = 0; index < count; index++ ) {
-			const property = Object.getOwnPropertyDescriptor( value, String( index ) );
-			if ( ! property || ! hasOwn( property, 'value' ) || ! property.enumerable ) return;
-			items.push( property.value );
-		}
-		return items.length === value.length ? items : undefined;
-	} catch {
-		return;
-	}
-}
-
-function plainStrings( value: unknown ): string[] | undefined {
-	const items = plainList( value );
-	return items?.every( ( item ) => typeof item === 'string' ) ? ( items as string[] ) : undefined;
-}
-
-function hasOnlyKeys( data: Record< string, unknown >, keys: ReadonlySet< string > ): boolean {
-	return Object.keys( data ).every( ( key ) => keys.has( key ) );
-}
 
 /**
  * Whether a declared navigation guard can be verified: the declaration and its
@@ -911,16 +843,6 @@ export const CLAUDE_NATIVE_TOOL_RULES: ReadonlyMap< string, ClaudeNativeToolRule
 		[ 'Bash', { operationClass: 'command', accepts: isBoundedShellInput, shell: true } ],
 	] );
 
-function isInside( root: string, candidate: string ): boolean {
-	const relative = path.relative( root, candidate );
-	return (
-		relative === '' ||
-		( relative !== '..' &&
-			! relative.startsWith( '..' + path.sep ) &&
-			! path.isAbsolute( relative ) )
-	);
-}
-
 // The sandbox settings a verified confinement may use. Everything else is
 // refused, including what the SDK describes as weakening isolation or letting
 // commands out (excludedCommands, allowNestedUserNamespaces, allowAppleEvents,
@@ -1184,136 +1106,6 @@ export function claudeToolInventory(
 /** The Studio tool a native MCP tool name refers to, when it is one. */
 export function studioToolName( name: string ): string | undefined {
 	return name.startsWith( STUDIO_MCP_PREFIX ) ? name.slice( STUDIO_MCP_PREFIX.length ) : undefined;
-}
-
-function isSensitivePath( candidate: string ): boolean {
-	return candidate
-		.split( /[\\/]/ )
-		.some( ( part ) =>
-			/^(?:\.env(?:\..*)?|wp-config\.php|\.credentials(?:\..*)?|\.ssh|database|.*secret.*|.*credential.*|.*\.(?:pem|key|p12|pfx))$/i.test(
-				part
-			)
-		);
-}
-
-/**
- * Whether a native file tool may reach an existing path: inside one of the
- * canonical roots, outside the native configuration and clear of files that
- * commonly hold credentials.
- */
-export async function isAllowedNativePath(
-	file: string,
-	roots: readonly string[],
-	configDirectory: string,
-	allowRoot = false
-): Promise< boolean > {
-	if ( ! path.isAbsolute( file ) ) return false;
-	try {
-		const canonical = await realpath( file );
-		return (
-			roots.some(
-				( root ) => isInside( root, canonical ) && ( allowRoot || canonical !== root )
-			) &&
-			! isInside( configDirectory, canonical ) &&
-			! isSensitivePath( file ) &&
-			! isSensitivePath( canonical )
-		);
-	} catch {
-		return false;
-	}
-}
-
-/**
- * Whether a path, which may not exist yet, lies in a canonical root once its
- * deepest existing folder is resolved.
- */
-export async function isInsideCanonicalRoot( root: string, file: string ): Promise< boolean > {
-	if ( ! path.isAbsolute( file ) ) return false;
-	const missing: string[] = [];
-	for ( let current = path.resolve( file ); ; current = path.dirname( current ) ) {
-		try {
-			return isInside( root, path.join( await realpath( current ), ...missing ) );
-		} catch ( error ) {
-			if (
-				( error as NodeJS.ErrnoException ).code !== 'ENOENT' ||
-				path.dirname( current ) === current
-			)
-				return false;
-			missing.unshift( path.basename( current ) );
-		}
-	}
-}
-
-// The WP-CLI commands this build runs: a few reads and one bounded draft creation.
-export function classifyWpCliArgs( args: readonly unknown[] ): ClaudeOperationClass | undefined {
-	if ( ! args.every( ( arg ) => typeof arg === 'string' ) ) return;
-	const list = args as readonly string[];
-	if (
-		list.length === 3 &&
-		list[ 0 ] === 'option' &&
-		list[ 1 ] === 'get' &&
-		[ 'blogname', 'blogdescription', 'home', 'siteurl' ].includes( list[ 2 ] )
-	)
-		return 'read';
-	if ( list.length === 2 && list[ 0 ] === 'post' && list[ 1 ] === 'list' ) return 'read';
-	if (
-		list.length === 3 &&
-		list[ 0 ] === 'post' &&
-		list[ 1 ] === 'get' &&
-		/^\d{1,10}$/.test( list[ 2 ] )
-	)
-		return 'read';
-	if ( list[ 0 ] !== 'post' || list[ 1 ] !== 'create' || list.length < 4 || list.length > 5 )
-		return;
-	const options = list.slice( 2 );
-	if ( new Set( options.map( ( option ) => option.split( '=', 1 )[ 0 ] ) ).size !== options.length )
-		return;
-	if ( ! options.includes( '--post_status=draft' ) ) return;
-	if ( ! options.some( ( option ) => /^--post_title=[\s\S]{1,200}$/.test( option ) ) ) return;
-	if (
-		! options.every(
-			( option ) =>
-				option === '--post_status=draft' ||
-				/^--post_title=[\s\S]{1,200}$/.test( option ) ||
-				/^--post_content=[\s\S]{0,10000}$/.test( option )
-		)
-	)
-		return;
-	return 'command';
-}
-
-export function wpCliOption( args: readonly unknown[], name: string ): string | undefined {
-	const prefix = `--${ name }=`;
-	const option = args.find(
-		( arg ): arg is string => typeof arg === 'string' && arg.startsWith( prefix )
-	);
-	return option?.slice( prefix.length );
-}
-
-// WP-CLI reads configuration that can point a command at another site or host.
-export async function hasWpCliOverrides( siteDirectory: string ): Promise< boolean > {
-	if (
-		Object.entries( process.env ).some( ( [ name, value ] ) => /^WP_CLI_/i.test( name ) && value )
-	)
-		return true;
-	const candidates = new Set( [ path.join( os.homedir(), '.wp-cli', 'config.yml' ) ] );
-	if ( process.env.HOME && path.isAbsolute( process.env.HOME ) ) {
-		candidates.add( path.join( process.env.HOME, '.wp-cli', 'config.yml' ) );
-	}
-	for ( let directory = siteDirectory; ; directory = path.dirname( directory ) ) {
-		candidates.add( path.join( directory, 'wp-cli.local.yml' ) );
-		candidates.add( path.join( directory, 'wp-cli.yml' ) );
-		if ( path.dirname( directory ) === directory ) break;
-	}
-	for ( const candidate of candidates ) {
-		try {
-			await lstat( candidate );
-			return true;
-		} catch ( error ) {
-			if ( ( error as NodeJS.ErrnoException ).code !== 'ENOENT' ) return true;
-		}
-	}
-	return false;
 }
 
 export type HostOperationName =

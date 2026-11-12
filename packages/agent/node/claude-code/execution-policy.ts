@@ -14,19 +14,16 @@ import {
 	claudeNativeTools,
 	claudeStudioTools,
 	claudeTargetOrigin,
-	classifyWpCliArgs,
 	describeClaudeOperation,
-	hasWpCliOverrides,
-	isAllowedNativePath,
 	isContainedPattern,
-	isInsideCanonicalRoot,
 	isLocalHostname,
 	isRecord,
 	normalizeHostname,
 	requiresClaudeApproval,
 	studioToolName,
-	wpCliOption,
 } from './execution-rules';
+import { isAllowedNativePath, isInsideCanonicalRoot } from './local-paths';
+import { classifyWpCliArgs, hasWpCliOverrides, wpCliOption } from './wp-cli-rules';
 import type {
 	ClaudeEnabledTools,
 	ClaudeNavigationConfinement,

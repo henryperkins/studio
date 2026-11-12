@@ -995,7 +995,7 @@ it( 'blocks native reads of credential-bearing files and the native config tree'
 			'config/state.json',
 		] )
 			await fs.writeFile( path.join( root, file ), 'fixture' );
-		const { isAllowedNativePath } = await import( '../execution-rules' );
+		const { isAllowedNativePath } = await import( '../local-paths' );
 		expect( await isAllowedNativePath( path.join( root, 'safe.txt' ), [ root ], config ) ).toBe(
 			true
 		);
