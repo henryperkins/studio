@@ -136,6 +136,17 @@ describe( 'subscription parity config', () => {
 		}
 	} );
 
+	test( 'states the image service for every case that runs on the mocked remote', () => {
+		const mocked = cases.filter( ( { vars } ) => vars.remote !== 'staging' );
+		expect( mocked.length ).toBeGreaterThan( 0 );
+		for ( const { description, vars } of mocked ) {
+			expect( [ 'off', 'required' ], description ).toContain( vars.imageService );
+			if ( /\[image service\]/.test( description ) ) {
+				expect( vars.imageService, description ).toBe( 'required' );
+			}
+		}
+	} );
+
 	test( 'covers the parity workflows', () => {
 		const used = new Set( cases.flatMap( ( { checks: names } ) => names ) );
 		for ( const name of [

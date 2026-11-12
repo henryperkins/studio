@@ -201,9 +201,19 @@ function removeCaseFolder( dir: string ): void {
 			}
 		}
 		rmSync( dir, { recursive: true, force: true, maxRetries: 5 } );
-	} catch {
-		// Already gone, or held open: a temporary folder the system clears.
+	} catch ( error ) {
+		warnTeardown( `could not remove the case folder ${ path.basename( dir ) }`, error );
 	}
+}
+
+// A teardown failure never changes the case's outcome, but is never silent:
+// the case profile holds a copy of the owner's login.
+function warnTeardown( what: string, error: unknown ): void {
+	const code = ( error as { code?: unknown } )?.code;
+	process.stderr.write(
+		`studio-eval warning: ${ what }${ typeof code === 'string' ? ` (${ code })` : '' }
+`
+	);
 }
 
 // The environment a case points at its own folders, as it was before the case.
@@ -1150,13 +1160,21 @@ export async function runEval( input: EvalRunnerInput ) {
 			outcome,
 		};
 	} finally {
-		restore();
+		try {
+			restore();
+		} catch ( error ) {
+			warnTeardown( 'could not restore the case’s swapped-in functions', error );
+		}
 		if ( ! sitesDeleted ) {
 			await seeded?.cleanup().catch( () => undefined );
 			await deleteSites( bystanderPaths ).catch( () => undefined );
 		}
 		if ( observerFile ) {
-			await rm( observerFile, { force: true } );
+			try {
+				await rm( observerFile, { force: true } );
+			} catch ( error ) {
+				warnTeardown( 'could not remove the request observer file', error );
+			}
 		}
 		restoreCaseEnvironment();
 		for ( const dir of caseFolders ) {

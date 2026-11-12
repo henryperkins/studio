@@ -102,6 +102,45 @@ export function withMockedRemote( host: StudioAgentHost, calls: RemoteCall[] ): 
 	};
 }
 
+const READ_METHODS = new Set( [ 'GET', 'HEAD' ] );
+const OVERRIDE_PARAMETERS = new Set( [ '_method', 'method' ] );
+const OVERRIDE_HEADERS = new Set( [
+	'x-http-method-override',
+	'x-http-method',
+	'x-method-override',
+] );
+
+function overrideValues(
+	entries: Iterable< [ string, unknown ] >,
+	names: Set< string >
+): string[] {
+	const values: string[] = [];
+	for ( const [ key, value ] of entries ) {
+		if ( names.has( key.toLowerCase() ) ) {
+			values.push( ...( Array.isArray( value ) ? value : [ value ] ).map( ( v ) => String( v ) ) );
+		}
+	}
+	return values;
+}
+
+/** The method a request really has: its own, unless a method override in its query or headers names a write. */
+function effectiveMethod(
+	method: string,
+	query?: Record< string, unknown >,
+	overrides: string[] = []
+): string {
+	const declared = method.toUpperCase();
+	const named = [
+		...overrideValues( Object.entries( query ?? {} ), OVERRIDE_PARAMETERS ),
+		...overrides,
+	];
+	const write = named.find( ( value ) => ! READ_METHODS.has( value.trim().toUpperCase() ) );
+	if ( ! READ_METHODS.has( declared ) ) {
+		return declared;
+	}
+	return write === undefined ? declared : write.trim().toUpperCase() || 'OTHER';
+}
+
 /**
  * `wpcom_request` with every method but GET answered by a fixture and recorded
  * in `calls`, as the mocked host does for pushes and previews: a write the
@@ -111,18 +150,17 @@ export function withMockedRemote( host: StudioAgentHost, calls: RemoteCall[] ): 
 export function withMockedWpcomRequest( calls: RemoteCall[] ): () => void {
 	const original = wpcomRequestTool.handler;
 	wpcomRequestTool.handler = async ( args, context ) => {
-		if ( args.method === 'GET' ) {
+		const method = effectiveMethod( args.method, args.query );
+		if ( READ_METHODS.has( method ) ) {
 			return original.call( wpcomRequestTool, args, context );
 		}
 		calls.push( {
 			operation: 'wpcom-request',
-			method: args.method,
+			method,
 			site: String( args.siteId ),
 			target: args.path,
 		} );
-		return textResult(
-			JSON.stringify( { eval_mock: true, method: args.method, path: args.path } )
-		);
+		return textResult( JSON.stringify( { eval_mock: true, method, path: args.path } ) );
 	};
 	return () => {
 		wpcomRequestTool.handler = original;
@@ -130,7 +168,6 @@ export function withMockedWpcomRequest( calls: RemoteCall[] ): () => void {
 }
 
 const WPCOM_WRITE_CODE = 'wpcom-write-under-mock';
-const READ_METHODS = new Set( [ 'GET', 'HEAD' ] );
 const KNOWN_METHODS = new Set( [ 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS' ] );
 
 /** A request a guarded case tried to send to WordPress.com that could change something there. */
@@ -149,13 +186,24 @@ export interface WpcomWriteGuardOptions {
 	allowProxyInference?: boolean;
 }
 
+interface RequestTarget {
+	hostname: string;
+	pathname: string;
+	method: string;
+	search: string;
+	headers: Array< [ string, unknown ] >;
+}
+
 function classifyWpcomWrite(
-	hostname: string,
-	pathname: string,
-	rawMethod: string,
+	target: RequestTarget,
 	options: WpcomWriteGuardOptions
 ): Omit< WpcomWriteAttempt, 'via' > | null {
-	const method = rawMethod.toUpperCase();
+	const { hostname, pathname } = target;
+	const overrides = [
+		...overrideValues( new URLSearchParams( target.search ).entries(), OVERRIDE_PARAMETERS ),
+		...overrideValues( target.headers, OVERRIDE_HEADERS ),
+	];
+	const method = effectiveMethod( target.method, undefined, overrides );
 	const host = hostname.toLowerCase();
 	const wpcom =
 		host === 'wordpress.com' ||
@@ -208,7 +256,7 @@ export function blockedConnectionOptions(): {
 
 type RequestFunction = ( ...args: unknown[] ) => unknown;
 
-function readHttpTarget( args: unknown[] ): { hostname: string; pathname: string; method: string } {
+function readHttpTarget( args: unknown[] ): RequestTarget {
 	const [ first, second ] = args;
 	const url =
 		typeof first === 'string' ? new URL( first ) : first instanceof URL ? first : undefined;
@@ -217,9 +265,15 @@ function readHttpTarget( args: unknown[] ): { hostname: string; pathname: string
 	) as Record< string, unknown >;
 	const host = typeof options.host === 'string' ? options.host.replace( /:\d+$/, '' ) : undefined;
 	const hostname = String( options.hostname ?? host ?? url?.hostname ?? '' );
-	const pathname = String( options.path ?? url?.pathname ?? '/' ).split( '?' )[ 0 ];
+	const [ pathname, ...query ] = String(
+		options.path ?? `${ url?.pathname ?? '/' }${ url?.search ?? '' }`
+	).split( '?' );
 	const method = String( options.method ?? 'GET' );
-	return { hostname, pathname, method };
+	const headers =
+		typeof options.headers === 'object' && options.headers !== null
+			? Object.entries( options.headers )
+			: [];
+	return { hostname, pathname, method, search: query.join( '?' ), headers };
 }
 
 function withBlockedConnection( args: unknown[] ): unknown[] {
@@ -275,7 +329,27 @@ export function installWpcomWriteGuard(
 			url = null;
 		}
 		const method = init?.method ?? ( input instanceof Request ? input.method : undefined ) ?? 'GET';
-		const write = url ? classifyWpcomWrite( url.hostname, url.pathname, method, options ) : null;
+		const headers: Array< [ string, unknown ] > = [];
+		for ( const source of [
+			input instanceof Request ? input.headers : undefined,
+			init?.headers,
+		] ) {
+			if ( source ) {
+				headers.push( ...new Headers( source ).entries() );
+			}
+		}
+		const write = url
+			? classifyWpcomWrite(
+					{
+						hostname: url.hostname,
+						pathname: url.pathname,
+						method,
+						search: url.search,
+						headers,
+					},
+					options
+			  )
+			: null;
 		if ( write ) {
 			attempts.push( { ...write, via: 'fetch' } );
 			throw new Error( blockedMessage() );
@@ -287,7 +361,7 @@ export function installWpcomWriteGuard(
 		const original = module.request;
 		module.request = ( ...args: unknown[] ) => {
 			const target = readHttpTarget( args );
-			const write = classifyWpcomWrite( target.hostname, target.pathname, target.method, options );
+			const write = classifyWpcomWrite( target, options );
 			if ( ! write ) {
 				return original.apply( module, args );
 			}

@@ -120,6 +120,94 @@ describe( 'eval harness', () => {
 			expect( wpcomRequestTool.handler ).toBe( original );
 		} );
 
+		it( 'treats a method override in the query of a wpcom_request GET as a write', async () => {
+			const calls: RemoteCall[] = [];
+			const restore = withMockedWpcomRequest( calls );
+			try {
+				for ( const query of [
+					{ _method: 'DELETE' },
+					{ _METHOD: 'put' },
+					{ Method: 'POST' },
+					{ per_page: 5, _method: [ 'GET', 'DELETE' ] },
+				] ) {
+					const answered = await wpcomRequestTool.handler(
+						{ siteId: 113, method: 'GET', path: '/posts/7', query },
+						context()
+					);
+					expect( JSON.parse( ( answered.content[ 0 ] as { text: string } ).text ) ).toMatchObject(
+						{
+							eval_mock: true,
+						}
+					);
+				}
+				expect( calls ).toHaveLength( 4 );
+				expect( calls.map( ( call ) => call.method ) ).toEqual( [
+					'DELETE',
+					'PUT',
+					'POST',
+					'DELETE',
+				] );
+				// An override that names a read is still a read, and passes on.
+				await expect(
+					wpcomRequestTool.handler(
+						{
+							siteId: 113,
+							method: 'GET',
+							path: '/posts',
+							query: { _method: 'get', method: 'HEAD' },
+						},
+						context()
+					)
+				).rejects.toThrow( /Not logged in/ );
+				expect( calls ).toHaveLength( 4 );
+			} finally {
+				restore();
+			}
+		} );
+
+		it( 'refuses a WordPress.com request whose query or headers override the method', async () => {
+			const { reached, targets } = network();
+			const guard = installWpcomWriteGuard( {}, targets );
+			const base = 'https://public-api.wordpress.com/wp/v2/sites/1/posts/7';
+			const refused = [
+				targets.global.fetch( `${ base }?_method=DELETE` ),
+				targets.global.fetch( `${ base }?a=1&_METHOD=put` ),
+				targets.global.fetch( `${ base }?method=GET&method=DELETE` ),
+				targets.global.fetch( new URL( `${ base }?Method=PATCH` ) ),
+				targets.global.fetch( base, { headers: { 'X-HTTP-Method-Override': 'DELETE' } } ),
+				targets.global.fetch( base, { headers: new Headers( { 'x-method-override': 'PUT' } ) } ),
+				targets.global.fetch( base, { headers: [ [ 'X-HTTP-Method', 'DELETE' ] ] } ),
+				targets.global.fetch(
+					new Request( base, { headers: { 'X-HTTP-Method-Override': 'DELETE' } } )
+				),
+			];
+			for ( const request of refused ) {
+				await expect( request ).rejects.toThrow( /wpcom-write-under-mock/ );
+			}
+			targets.https.request( {
+				host: 'public-api.wordpress.com',
+				path: '/wp/v2/sites/1/posts/7?_method=DELETE',
+			} );
+			targets.https.request( new URL( `${ base }?_method=DELETE` ), {} );
+			targets.https.request( `${ base }?method=PUT` );
+			targets.https.request( {
+				host: 'public-api.wordpress.com',
+				path: '/wp/v2/sites/1/posts/7',
+				headers: { 'X-HTTP-Method-Override': 'DELETE' },
+			} );
+			expect( guard.attempts ).toHaveLength( 12 );
+			expect( reached.filter( ( entry ) => entry.startsWith( 'fetch' ) ) ).toEqual( [] );
+			expect( reached.filter( ( entry ) => entry.endsWith( 'network' ) ) ).toEqual( [] );
+
+			// An override that names a read, and a request to another host, pass.
+			await targets.global.fetch( `${ base }?_method=GET&method=head` );
+			await targets.global.fetch( base, { headers: { 'X-HTTP-Method-Override': 'GET' } } );
+			await targets.global.fetch( 'https://example.org/x?_method=DELETE' );
+			guard.uninstall();
+			expect( guard.attempts ).toHaveLength( 12 );
+			expect( reached ).toHaveLength( 3 + 4 );
+		} );
+
 		// A process's network calls, played by stand-ins that record what reached them.
 		function network() {
 			const reached: string[] = [];

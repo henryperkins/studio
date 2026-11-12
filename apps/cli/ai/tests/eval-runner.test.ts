@@ -40,6 +40,23 @@ vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 	};
 } );
 
+const removal = vi.hoisted( () => ( { failObserverFile: false } ) );
+vi.mock( 'node:fs/promises', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('node:fs/promises') >();
+	return {
+		...actual,
+		rm: async (
+			target: Parameters< typeof actual.rm >[ 0 ],
+			options?: Parameters< typeof actual.rm >[ 1 ]
+		) => {
+			if ( removal.failObserverFile && String( target ).includes( 'studio-eval-requests-' ) ) {
+				throw new Error( 'observer file is held open' );
+			}
+			return actual.rm( target, options );
+		},
+	};
+} );
+
 const legacy = vi.hoisted( () => ( {
 	resolveInitialAiProvider: vi.fn(),
 	resolveUnavailableAiProvider: vi.fn(),
@@ -629,6 +646,31 @@ describe( 'eval runner provider selection', () => {
 			const refused = await runEval( input( { imageService: 'required' }, chatGptEnv() ) );
 			expect( refused ).toMatchObject( { refusal: { code: 'image-service-not-configured' } } );
 			expect( leftovers() ).toEqual( [] );
+			expect( globalThis.fetch ).toBe( fetchSpy );
+		} );
+
+		it( 'still restores the environment and removes the case folders when removing the observer file throws', async () => {
+			agent.behavior = { replyProvider: 'studio-chatgpt' };
+			const stderr = vi.spyOn( process.stderr, 'write' ).mockImplementation( () => true );
+			removal.failObserverFile = true;
+			let result: unknown;
+			try {
+				result = await runEval( input( {}, chatGptEnv() ) );
+			} finally {
+				removal.failObserverFile = false;
+			}
+			const warned = stderr.mock.calls.map( ( call ) => String( call[ 0 ] ) ).join( '' );
+			stderr.mockRestore();
+			expect( result ).not.toHaveProperty( 'refusal' );
+			expect( warned ).toMatch( /studio-eval warning: could not remove the request observer file/ );
+			expect( process.env.E2E ).toBeUndefined();
+			expect( process.env.E2E_CLI_CONFIG_PATH ).toBeUndefined();
+			expect( process.env.E2E_SHARED_CONFIG_PATH ).toBeUndefined();
+			expect(
+				fs
+					.readdirSync( path.join( paths.root, 'tmp' ) )
+					.filter( ( name ) => /^studio-eval-(config|registry)-/.test( name ) )
+			).toEqual( [] );
 			expect( globalThis.fetch ).toBe( fetchSpy );
 		} );
 

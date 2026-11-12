@@ -17,16 +17,20 @@
 # provider runs it with its own selection.
 #
 # Every case is judged on a deterministic final state or on what the user was
-# shown (outcome.mjs). Under `remote: mock` no request that could change
-# WordPress.com leaves the process: pushes, pulls and preview create, update and
-# delete are recorded by a mocked host, writes through `wpcom_request` are
-# recorded and answered by a fixture, and any other request to a WordPress.com
-# host with a method other than GET or HEAD is refused and fails the case
+# shown (outcome.mjs). Under `remote: mock` no state-changing request leaves
+# the eval process itself: pushes, pulls and preview create, update and
+# delete are recorded by a mocked host, writes through `wpcom_request` (a
+# `_method` or `method` override included) are recorded and answered by a
+# fixture, and any other request to a WordPress.com host with a method other
+# than GET or HEAD, or a method override in its query or headers, is refused and
+# fails the case
 # (`noWordPressComWrites`, code `wpcom-write-under-mock`). The one exception is
 # Studio's image service in the cases marked `[image service]`. Reads (GET,
 # HEAD) still reach WordPress.com with the case's copy of your login, and a
-# command the agent runs in its shell is outside the guard (README). The
-# `staging:` cases at the end change only the staging site you designate for
+# command the agent starts from its shell still runs with the case's copied
+# login and is not covered, as in the rest of the eval suite (README). The
+# `staging:` cases at the end run without the write guard, belong alone in their
+# run, and change only the staging site you designate for
 # the run and are refused without it. Cases marked `[image service]` need
 # Studio's separate WordPress.com image service and are refused without it; the
 # `[fixture-forced compaction]` case starts from a seeded history whose last
@@ -57,6 +61,7 @@ tests:
 
   - description: "parity: identifies as WordPress Studio"
     vars:
+      imageService: "off"
       caseId: parity-identity
       timeoutMs: 60000
       prompt: In one short sentence, tell me who you are. Do not call any tools.
@@ -66,6 +71,7 @@ tests:
 
   - description: "parity: follows the user's global instructions"
     vars:
+      imageService: "off"
       caseId: parity-global-instructions
       expectedText: STUDIO-EVAL-TOKEN-7319
       timeoutMs: 60000
@@ -79,6 +85,7 @@ tests:
 
   - description: "parity: a contact form loads plugin-recommendations before the work"
     vars:
+      imageService: "off"
       caseId: parity-skill-routing
       timeoutMs: 300000
       skills: [{ name: plugin-recommendations }]
@@ -101,6 +108,7 @@ tests:
 
   - description: "parity: asking for a site leaves a working new site"
     vars:
+      imageService: "off"
       caseId: parity-site-creation
       siteName: "Parity Site"
       timeoutMs: 180000
@@ -114,6 +122,7 @@ tests:
 
   - description: "parity: a different site name asks before using or replacing the active site"
     vars:
+      imageService: "off"
       caseId: parity-target-selection
       timeoutMs: 180000
       seed:
@@ -131,6 +140,7 @@ tests:
 
   - description: "parity: edits the active theme's file with the file tools and leaves the site working"
     vars:
+      imageService: "off"
       caseId: parity-theme-file
       file: style.css
       expectedText: "parity-marker: PARITY-THEME-5521"
@@ -160,6 +170,7 @@ tests:
 
   - description: "parity: exports the site, changes it, and imports the export back"
     vars:
+      imageService: "off"
       caseId: parity-import-export
       expectedText: Parity Original Title
       timeoutMs: 420000
@@ -182,6 +193,7 @@ tests:
 
   - description: "parity: the question tool takes a selection and a skipped question"
     vars:
+      imageService: "off"
       caseId: parity-question
       timeoutMs: 90000
       answers:
@@ -198,6 +210,7 @@ tests:
 
   - description: "parity: offers design directions as a choice and goes on with the one picked"
     vars:
+      imageService: "off"
       caseId: parity-design-choice
       ui: true
       timeoutMs: 300000
@@ -215,6 +228,7 @@ tests:
 
   - description: "parity: screenshots show the model the home page at desktop and mobile width"
     vars:
+      imageService: "off"
       caseId: parity-screenshot-desktop-mobile
       timeoutMs: 240000
       seed:
@@ -230,6 +244,7 @@ tests:
 
   - description: "parity: reads the site title from a screenshot alone"
     vars:
+      imageService: "off"
       caseId: parity-screenshot-interpretation
       expectedText: PARITY VISION 4402
       allowedTools: [{ name: take_screenshot }, { name: Skill }]
@@ -249,6 +264,7 @@ tests:
 
   - description: "parity: refreshes the preview the user sees after a change"
     vars:
+      imageService: "off"
       caseId: parity-preview-refresh
       ui: true
       expectedText: Parity Preview 3318
@@ -268,6 +284,7 @@ tests:
 
   - description: "parity: creates a preview site (mocked remote)"
     vars:
+      imageService: "off"
       caseId: parity-preview-create
       operation: preview-create
       timeoutMs: 240000
@@ -284,6 +301,7 @@ tests:
 
   - description: "parity: a design system annotation reaches DESIGN.md and the theme palette"
     vars:
+      imageService: "off"
       caseId: parity-annotation
       ui: true
       token: primary
@@ -368,6 +386,7 @@ tests:
 
   - description: "parity: a screenshot is shown to the user as an artifact"
     vars:
+      imageService: "off"
       caseId: parity-artifact
       ui: true
       widgetType: media
@@ -385,6 +404,7 @@ tests:
 
   - description: "parity: an attached image and document are still known to a later message"
     vars:
+      imageService: "off"
       caseId: parity-attachment-replay
       timeoutMs: 180000
       attachments:
@@ -410,6 +430,7 @@ tests:
 
   - description: "parity: a push asks first, and nothing is pushed when the user declines (mocked remote)"
     vars:
+      imageService: "off"
       caseId: parity-push-declined
       timeoutMs: 180000
       answers:
@@ -441,6 +462,7 @@ tests:
 
   - description: "parity: a confirmed push runs once against the confirmed site (mocked remote)"
     vars:
+      imageService: "off"
       caseId: parity-push-approved
       operation: push
       timeoutMs: 180000
@@ -473,6 +495,7 @@ tests:
 
   - description: "parity: a cancelled turn stops its work, and the chat goes on"
     vars:
+      imageService: "off"
       caseId: parity-cancellation
       expectedText: STOPPED
       inspectPattern: 'Parity [ABC]'
@@ -498,6 +521,7 @@ tests:
 
   - description: "parity: a conversation reopened from its file goes on with what it knew"
     vars:
+      imageService: "off"
       caseId: parity-resume
       expectedTexts:
         - text: PARITY-RESUME-8841
@@ -516,6 +540,7 @@ tests:
 
   - description: "parity [fixture-forced compaction]: a conversation at its context limit compacts on the route and resumes"
     vars:
+      imageService: "off"
       caseId: parity-compaction-fixture
       expectedTexts:
         - text: AURORA-7
