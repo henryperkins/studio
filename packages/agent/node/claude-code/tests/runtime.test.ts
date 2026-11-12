@@ -147,9 +147,10 @@ describe( 'Claude SDK startup (mock control responses)', () => {
 		],
 	} );
 	it( 'requires matching effective authentication, hooks, inventory and exact model effort', async () => {
-		expect( ( await qualifyClaudeStartup( good(), identity, 'claude-xyz', 'medium' ) ).ok ).toBe(
-			true
-		);
+		const registered = [ 'wp_cli' ];
+		expect(
+			( await qualifyClaudeStartup( good(), identity, registered, 'claude-xyz', 'medium' ) ).ok
+		).toBe( true );
 		for ( const bad of [
 			{
 				...good(),
@@ -171,12 +172,48 @@ describe( 'Claude SDK startup (mock control responses)', () => {
 				mcpServerStatus: async () => [ { name: 'studio', source: 'project', status: 'connected' } ],
 			},
 		] )
-			expect( ( await qualifyClaudeStartup( bad, identity, 'claude-xyz', 'medium' ) ).ok ).toBe(
-				false
-			);
-		expect( ( await qualifyClaudeStartup( good(), identity, 'claude-xyz', 'high' ) ).ok ).toBe(
-			false
-		);
+			expect(
+				( await qualifyClaudeStartup( bad, identity, registered, 'claude-xyz', 'medium' ) ).ok
+			).toBe( false );
+		expect(
+			( await qualifyClaudeStartup( good(), identity, registered, 'claude-xyz', 'high' ) ).ok
+		).toBe( false );
+	} );
+
+	it( 'accepts exactly the Studio tools its own server registered, in any order, and nothing else', async () => {
+		const reporting = ( ...names: string[] ) => ( {
+			...good(),
+			mcpServerStatus: async () => [
+				{
+					name: 'studio',
+					source: 'sdk',
+					status: 'connected',
+					tools: names.map( ( name ) => ( { name } ) ),
+				},
+			],
+		} );
+		const registered = [ 'wp_cli', 'site_info' ];
+		const accepts = async ( ...names: string[] ) =>
+			(
+				await qualifyClaudeStartup(
+					reporting( ...names ),
+					identity,
+					registered,
+					'claude-xyz',
+					'medium'
+				)
+			).ok;
+		expect( await accepts( 'wp_cli', 'site_info' ) ).toBe( true );
+		expect( await accepts( 'site_info', 'wp_cli' ) ).toBe( true );
+		for ( const names of [
+			[ 'wp_cli' ],
+			[ 'site_info' ],
+			[ 'wp_cli', 'site_info', 'escape' ],
+			[ 'wp_cli', 'wp_cli' ],
+			[ 'wp_cli', 'site_info', 'site_info' ],
+			[],
+		] )
+			expect( await accepts( ...names ), names.join( ', ' ) ).toBe( false );
 	} );
 
 	// Discovery with a native executable on disk and a fake owner; `launch` says
@@ -342,6 +379,7 @@ it( 'rejects an unexpected SDK tool inventory', async () => {
 			await qualifyClaudeStartup(
 				query,
 				{ email: 'user@example.com', subscriptionType: 'max' },
+				[ 'wp_cli' ],
 				'sonnet',
 				'medium'
 			)
@@ -1030,6 +1068,7 @@ it( 'waits for the exact SDK server to finish connecting before qualification', 
 			await qualifyClaudeStartup(
 				query,
 				{ email: 'user@example.com', subscriptionType: 'max' },
+				[ 'wp_cli' ],
 				'sonnet',
 				'medium'
 			)
@@ -1100,6 +1139,7 @@ it( 'deduplicates discovered model aliases by canonical ID without inventing eff
 	const result = await qualifyClaudeStartup(
 		q,
 		{ email: 'user@example.com', subscriptionType: 'max' },
+		[ 'wp_cli' ],
 		'canonical',
 		'medium'
 	);

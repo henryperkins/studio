@@ -11,7 +11,7 @@ import {
 	type ToolContext,
 } from '../../tools/define-tool';
 import { runWpCliTool } from '../../tools/wp-cli';
-import { createStudioClaudeToolBridge } from '../tool-bridge';
+import { createStudioClaudeDiscoveryServer, createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
 import type { StudioAgentHost } from '../../host';
 import type { ClaudeApprover, ClaudeExecutionPolicy } from '../execution-policy';
@@ -334,6 +334,30 @@ describe( 'the Claude bridge built from the Studio registry', () => {
 		expect( ( await bridge.invoke( 'contract_offered', {} ) ).isError ).toBe( true );
 		expect( handler ).not.toHaveBeenCalled();
 		await bridge.dispose();
+	} );
+
+	it( 'names exactly the tools it lists, which a turn’s startup compares with what the executable reports', async () => {
+		const { bridge } = await setup();
+		expect( bridge.tools ).toEqual( ( await listedTools( bridge ) ).map( ( item ) => item.name ) );
+		await bridge.dispose();
+	} );
+
+	it( 'lists at discovery, which has no host, what a turn lists for a host without capabilities', async () => {
+		const discovery = createStudioClaudeDiscoveryServer();
+		const fixture = await createPolicyFixture();
+		cleanups.push( fixture.cleanup );
+		const turn = createStudioClaudeToolBridge(
+			fixture.host,
+			{ runId: 'run', turnId: 'turn', policy: fixture.policy },
+			() => {}
+		);
+		expect( discovery.tools ).toEqual( turn.tools );
+		const listed = await listedTools( {
+			server: discovery.server,
+		} as ReturnType< typeof createStudioClaudeToolBridge > );
+		expect( listed.map( ( item ) => item.name ) ).toEqual( discovery.tools );
+		await turn.dispose();
+		await discovery.server.instance.close();
 	} );
 
 	it( 'is never built from a registry with two tools of one name', async () => {

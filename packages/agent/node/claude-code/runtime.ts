@@ -26,8 +26,7 @@ import {
 	CLAUDE_NAVIGATION_CONFINEMENT,
 	CLAUDE_SHELL_CONFINEMENT,
 	claudeNativeTools,
-	claudeTargetOrigin,
-	claudeToolInventory,
+	studioMcpToolName,
 } from './execution-rules';
 import { isClaudeExecutableUnchanged } from './platform';
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
@@ -80,9 +79,30 @@ export function isQualifiedClaudePlugins(
 		plugins.every( ( plugin ) => plugin.name === 'cc-plugin-privacy' && plugin.path === 'builtin' )
 	);
 }
+// Whether the executable reports exactly the Studio tools the server it was
+// given registered: each once, in any order.
+function isRegisteredInventory(
+	reported: ReadonlyArray< { name: string } > | undefined,
+	registered: readonly string[]
+): boolean {
+	if ( ! Array.isArray( reported ) ) return false;
+	const names = reported.map( ( item ) => item?.name );
+	return (
+		names.length === registered.length &&
+		new Set( names ).size === names.length &&
+		names.every( ( name ) => typeof name === 'string' && registered.includes( name ) )
+	);
+}
+
+/**
+ * Qualifies a started native runtime: its hooks, its account, the one Studio
+ * server with exactly the tools `registered` names (the list that server was
+ * built with), and, for a turn, the exact model and effort.
+ */
 export async function qualifyClaudeStartup(
 	query: StartupControl,
 	identity: ClaudeAuthIdentity,
+	registered: readonly string[],
 	model?: string,
 	effort?: string | null
 ) {
@@ -115,8 +135,7 @@ export async function qualifyClaudeStartup(
 			inventory[ 0 ].name !== 'studio' ||
 			inventory[ 0 ].source !== 'sdk' ||
 			inventory[ 0 ].status !== 'connected' ||
-			inventory[ 0 ].tools?.length !== 1 ||
-			inventory[ 0 ].tools[ 0 ].name !== 'wp_cli'
+			! isRegisteredInventory( inventory[ 0 ].tools, registered )
 		)
 			return { ok: false as const };
 		const catalog = new Map< string, ClaudeModelOption >();
@@ -362,6 +381,7 @@ function nativeLaunchOptions(
 async function qualifyWithinDeadline(
 	query: StartupControl,
 	identity: ClaudeAuthIdentity,
+	registered: readonly string[],
 	signal: AbortSignal,
 	model?: string,
 	effort?: string
@@ -375,7 +395,7 @@ async function qualifyWithinDeadline(
 	signal.addEventListener( 'abort', stop, { once: true } );
 	try {
 		return await Promise.race( [
-			qualifyClaudeStartup( query, identity, model, effort ),
+			qualifyClaudeStartup( query, identity, registered, model, effort ),
 			interrupted,
 		] );
 	} finally {
@@ -441,7 +461,7 @@ export async function discoverClaudeModels(
 	let owner: ProcessOwner | undefined;
 	let owned: OwnedProcess | undefined;
 	let sdk: ReturnType< typeof sdkQuery > | undefined;
-	let server: ReturnType< typeof createStudioClaudeDiscoveryServer > | undefined;
+	let discovery: ReturnType< typeof createStudioClaudeDiscoveryServer > | undefined;
 	const done = new Promise< IteratorResult< SDKUserMessage > >( ( resolve ) => {
 		controller.signal.addEventListener(
 			'abort',
@@ -468,7 +488,7 @@ export async function discoverClaudeModels(
 			return { ok: false as const, blockers: prepared.blockers ?? failed.blockers };
 		owner = ( dependencies.prepareOwner ?? prepareProcessOwner )();
 		if ( ! ( await owner.prepared() ) ) return failed;
-		server = createStudioClaudeDiscoveryServer();
+		discovery = createStudioClaudeDiscoveryServer();
 		sdk = ( dependencies.query ?? sdkQuery )( {
 			prompt: { [ Symbol.asyncIterator ]: () => ( { next: () => done } ) },
 			options: {
@@ -484,7 +504,7 @@ export async function discoverClaudeModels(
 					},
 				} ),
 				persistSession: false,
-				mcpServers: { studio: server },
+				mcpServers: { studio: discovery.server },
 				hooks: {
 					PreToolUse: [
 						{
@@ -495,7 +515,12 @@ export async function discoverClaudeModels(
 				},
 			},
 		} );
-		const qualification = await qualifyWithinDeadline( sdk, prepared.identity, controller.signal );
+		const qualification = await qualifyWithinDeadline(
+			sdk,
+			prepared.identity,
+			discovery.tools,
+			controller.signal
+		);
 		// Models are reported only from a native process Studio owns, as a turn
 		// sends its prompt only to one.
 		if (
@@ -524,7 +549,7 @@ export async function discoverClaudeModels(
 			if ( owned ) {
 				if ( ! ( await owned.shutdown() ) ) result = failed;
 			} else await owner?.dispose();
-			await server?.instance.close();
+			await discovery?.server.instance.close();
 		} catch {
 			result = failed;
 		}
@@ -1036,6 +1061,7 @@ export async function runClaudeTurn(
 		const qualification = await qualifyWithinDeadline(
 			native,
 			prepared.identity,
+			bridge.tools,
 			controller.signal,
 			selection.model.modelId,
 			effort
@@ -1063,13 +1089,12 @@ export async function runClaudeTurn(
 		connectionWatch = setTimeout( () => void watchConnection(), 1000 ).unref();
 		openGate( true );
 		const adapter = createClaudeEventAdapter( runId, turnId, emit );
-		const inventory = claudeToolInventory(
-			CLAUDE_ENABLED_TOOLS,
-			CLAUDE_SHELL_CONFINEMENT,
-			prepared.cwd,
-			CLAUDE_NAVIGATION_CONFINEMENT,
-			claudeTargetOrigin( target, targetSite )
-		);
+		// What the native runtime may name at its start: the native tools the turn
+		// enables and the Studio tools its own server lists.
+		const inventory = [
+			...claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, prepared.cwd ),
+			...bridge.tools.map( studioMcpToolName ),
+		];
 		for await ( const message of native ) {
 			if ( controller.signal.aborted ) break;
 			if (

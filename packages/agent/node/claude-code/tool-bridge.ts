@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk/core';
 import { z } from 'zod';
-import { resolveStudioToolDefinitions, studioToolDefinitions } from '../tools';
+import { resolveStudioToolDefinitions } from '../tools';
 import { bindTool } from '../tools/define-tool';
 import { runStudioTool } from '../tools/execution';
 import {
@@ -32,7 +32,9 @@ const CLAUDE_STUDIO_TOOL_CAPABILITIES: StudioToolsOptions = Object.freeze( {
 } );
 
 /** The Studio tools the Claude route can bridge for a host: the registry, resolved as on the Pi route. */
-export function claudeStudioToolCandidates( host: StudioAgentHost ): StudioToolDefinition[] {
+export function claudeStudioToolCandidates(
+	host: Pick< StudioAgentHost, 'ui' >
+): StudioToolDefinition[] {
 	return resolveStudioToolDefinitions( host, CLAUDE_STUDIO_TOOL_CAPABILITIES );
 }
 
@@ -59,17 +61,23 @@ export function createStudioClaudeMcpServer(
 }
 
 /**
- * The server a native startup check lists: the tools a turn of this build can
- * enable, none of which it can run.
+ * The server a native startup check lists, none of whose tools it can run.
+ * Discovery has no host, so it lists what a turn of this build lists for a
+ * host with no capabilities: every enabled tool no capability gates. Its
+ * startup check, like a turn's, compares what the executable reports with
+ * `tools`, the list its own server registered.
  */
 export function createStudioClaudeDiscoveryServer() {
 	const enabled = new Set(
 		claudeStudioTools( CLAUDE_ENABLED_TOOLS, CLAUDE_NAVIGATION_CONFINEMENT, null )
 	);
-	return createStudioClaudeMcpServer(
-		studioToolDefinitions.filter( ( definition ) => enabled.has( definition.name ) ),
-		async () => ( { content: [], isError: true } )
+	const tools = claudeStudioToolCandidates( {} ).filter( ( definition ) =>
+		enabled.has( definition.name )
 	);
+	return {
+		server: createStudioClaudeMcpServer( tools, async () => ( { content: [], isError: true } ) ),
+		tools: Object.freeze( tools.map( ( definition ) => definition.name ) ),
+	};
 }
 
 export interface ClaudeStudioToolBridgeOptions {
@@ -163,6 +171,8 @@ export function createStudioClaudeToolBridge(
 	} );
 	return {
 		server,
+		/** The tools `server` lists, as the executable must report them at startup. */
+		tools: Object.freeze( tools.map( ( definition ) => definition.name ) ),
 		invoke,
 		async dispose() {
 			policy.dispose();

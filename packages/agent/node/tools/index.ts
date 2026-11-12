@@ -107,9 +107,9 @@ export interface StudioToolsOptions {
 // the host's capabilities leave out, with the factory-built variants those
 // capabilities call for. Every runtime builds its tools from this list, and
 // finds a tool in it by name, so a registry with two tools of one name is
-// refused.
+// refused. Of the host, only what it provides counts here.
 export function resolveStudioToolDefinitions(
-	host: StudioAgentHost,
+	host: Pick< StudioAgentHost, 'ui' >,
 	options: StudioToolsOptions = {}
 ): StudioToolDefinition[] {
 	const names = new Set< string >();

@@ -1097,10 +1097,13 @@ export function claudeToolInventory(
 ): string[] {
 	return [
 		...claudeNativeTools( enabled, confinement, workspace ),
-		...claudeStudioTools( enabled, navigation, targetOrigin ).map(
-			( name ) => STUDIO_MCP_PREFIX + name
-		),
+		...claudeStudioTools( enabled, navigation, targetOrigin ).map( studioMcpToolName ),
 	];
+}
+
+/** The name the native runtime knows a Studio tool by. */
+export function studioMcpToolName( name: string ): string {
+	return STUDIO_MCP_PREFIX + name;
 }
 
 /** The Studio tool a native MCP tool name refers to, when it is one. */
