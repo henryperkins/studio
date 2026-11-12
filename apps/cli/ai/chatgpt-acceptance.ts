@@ -537,6 +537,7 @@ const CONNECTION_CODES: readonly ChatGptConnectionErrorCode[] = [
 	'session-unavailable',
 	'changed',
 	'vault-unavailable',
+	'vault-key-unreadable',
 	'refresh-failed',
 	'identity-mismatch',
 	'invalid-sign-in',

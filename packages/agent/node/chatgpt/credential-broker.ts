@@ -39,7 +39,10 @@ import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections
  * A registration's tokens are one record in a vault file, sealed with
  * AES-256-GCM under a random key kept in the system keychain and bound to the
  * registration and the record's version. Without a keychain the vault
- * refuses; it never falls back to plaintext. A registration may instead keep
+ * refuses; it never falls back to plaintext. A keychain that says it has no
+ * key while saved records exist may only be locked, so the key reads as
+ * unreadable, never lost: no record is cleared and no new key made until the
+ * last saved registration is signed out. A registration may instead keep
  * its tokens in the memory of the app that signed in, for that session only;
  * a turn the app forks asks it for an access token over their IPC channel,
  * and loses what it was handed once the app has gone.
@@ -604,10 +607,33 @@ export function createChatGptCredentialBroker(
 		return text ? cacheWrappingKey( text ) : null;
 	}
 
+	// Whether a registration Studio lists keeps a sealed record. One no
+	// registration owns can't be signed out, so it doesn't count.
+	async function hasSealedRecords(): Promise< boolean > {
+		let names: string[];
+		try {
+			names = await fs.readdir( credentialsDirectory() );
+		} catch ( error ) {
+			if ( isErrnoException( error ) && error.code === 'ENOENT' ) {
+				return false;
+			}
+			throw error;
+		}
+		const sealed = new Set(
+			names.filter( ( name ) => name.endsWith( '.vault' ) ).map( ( name ) => name.slice( 0, -6 ) )
+		);
+		return (
+			sealed.size > 0 &&
+			( await readChatGptAccounts() ).some( ( account ) => sealed.has( account.registrationId ) )
+		);
+	}
+
 	/**
 	 * The key a record is sealed with: the one the keychain holds now, which
 	 * another process may have put there since this one last read it. Created
-	 * there, under the key's lock, only when there is none.
+	 * there, under the key's lock, only when there is none and no saved record
+	 * needs one: a keychain may say it has none when it is only locked, and a
+	 * new key would replace the one those records were sealed with.
 	 */
 	async function getSealingKey(): Promise< Buffer > {
 		const text = await withLock(
@@ -617,6 +643,9 @@ export function createChatGptCredentialBroker(
 				const existing = await readWrappingKeyText();
 				if ( existing ) {
 					return existing;
+				}
+				if ( await hasSealedRecords() ) {
+					throw new ChatGptConnectionError( 'vault-key-unreadable' );
 				}
 				const created = randomBytes( WRAPPING_KEY_BYTES ).toString( 'base64url' );
 				try {
@@ -802,6 +831,10 @@ export function createChatGptCredentialBroker(
 			if ( read.status === 'newer' ) {
 				throw new ChatGptConnectionError( 'newer-format' );
 			}
+			// A keychain that says it has no key may only be locked: the record stays.
+			if ( read.status === 'unusable' && ! key ) {
+				throw new ChatGptConnectionError( 'vault-key-unreadable' );
+			}
 			if ( read.status !== 'ok' || ! key ) {
 				await clearUnusable( current );
 				throw new ChatGptConnectionError( 'needs-sign-in' );
@@ -837,6 +870,9 @@ export function createChatGptCredentialBroker(
 		}
 		if ( read.status === 'ok' && isFresh( read.record.expiresAt ) ) {
 			return read.record.accessToken;
+		}
+		if ( read.status === 'unusable' && ! key ) {
+			throw new ChatGptConnectionError( 'vault-key-unreadable' );
 		}
 		return renewVaultRecord( account, key );
 	}

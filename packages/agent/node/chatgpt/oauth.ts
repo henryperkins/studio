@@ -175,6 +175,10 @@ function describeSignInFailure( code: ChatGptSignInFailureCode ): string {
 			return __(
 				'Studio couldn’t reach the system keychain to save your ChatGPT sign-in, so nothing was saved. Unlock it and try again.'
 			);
+		case 'vault-key-unreadable':
+			return __(
+				'Studio couldn’t read the key in the system keychain that protects your saved ChatGPT sign-ins, so it didn’t save this one. Unlock the keychain and try again, or keep this sign-in for this app session only. If the key is gone, sign out of every saved ChatGPT account first: the next sign-in kept in secure storage then makes a new key.'
+			);
 		case 'save-failed':
 			return __( 'Studio couldn’t save your ChatGPT sign-in. Try again.' );
 	}
@@ -252,6 +256,7 @@ function commitFailureCode( error: unknown ): ChatGptSignInFailureCode {
 	if ( error instanceof ChatGptConnectionError ) {
 		switch ( error.code ) {
 			case 'vault-unavailable':
+			case 'vault-key-unreadable':
 			case 'identity-mismatch':
 			case 'not-found':
 			case 'accounts-unreadable':

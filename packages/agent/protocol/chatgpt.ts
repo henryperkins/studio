@@ -72,6 +72,7 @@ export type ChatGptSignInFailureCode =
 	| 'identity-mismatch'
 	| 'permission-missing'
 	| 'vault-unavailable'
+	| 'vault-key-unreadable'
 	| 'save-failed';
 
 export type ChatGptSignInOutcome =

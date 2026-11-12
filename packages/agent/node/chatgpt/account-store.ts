@@ -86,6 +86,7 @@ export type ChatGptConnectionErrorCode =
 	| 'session-unavailable'
 	| 'changed'
 	| 'vault-unavailable'
+	| 'vault-key-unreadable'
 	| 'refresh-failed'
 	| 'identity-mismatch'
 	| 'invalid-sign-in'
@@ -118,6 +119,10 @@ function describeChatGptConnectionError(
 					'Studio couldn’t reach the system keychain that protects your ChatGPT sign-in (%s). Unlock it and try again.'
 				),
 				detail ?? __( 'unknown error' )
+			);
+		case 'vault-key-unreadable':
+			return __(
+				'Studio couldn’t read the key in the system keychain that protects your saved ChatGPT sign-ins, so it kept them as they are. Unlock the keychain and try again. If the key is gone, sign out of every saved ChatGPT account: the next sign-in kept in secure storage then makes a new key.'
 			);
 		case 'refresh-failed':
 			return __(

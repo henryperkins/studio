@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -42,16 +43,16 @@ const GRANTED_SCOPE =
 // Placeholders only: nothing here is, or looks like, a real credential.
 const TOKEN_MARKERS = [ 'test-access-token', 'test-refresh-token', 'test-id-token' ];
 
-const signIn = ( storage: 'vault' | 'session' ): ChatGptSignIn => ( {
+const signIn = ( storage: 'vault' | 'session', id = 1 ): ChatGptSignIn => ( {
 	issuer: 'https://auth.openai.com',
 	subject: 'test-subject-1',
 	email: 'someone@example.com',
 	clientId: 'test-issued-client-1',
 	storage,
 	tokens: {
-		accessToken: 'test-access-token-1',
-		refreshToken: 'test-refresh-token-1',
-		idToken: 'test-id-token-1',
+		accessToken: `test-access-token-${ id }`,
+		refreshToken: `test-refresh-token-${ id }`,
+		idToken: `test-id-token-${ id }`,
 		tokenType: 'Bearer',
 		expiresIn: 3600,
 		scope: GRANTED_SCOPE,
@@ -135,6 +136,74 @@ const FAILURES: Record< Platform, readonly Failure[] > = {
 const CASES = ( Object.keys( FAILURES ) as Platform[] ).flatMap( ( platform ) =>
 	FAILURES[ platform ].map( ( failure ) => ( { platform, ...failure } ) )
 );
+
+const WRAPPING_KEY = 'wordpress-studio/chatgpt-vault-key';
+
+// How each tool says nothing is saved under a name.
+const NOTHING_SAVED: Record< Platform, CommandResult > = {
+	darwin: answer(
+		44,
+		'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.'
+	),
+	linux: answer( 1, '' ),
+	win32: answer( 3, '' ),
+};
+
+/**
+ * Each platform's keychain tool, keeping secrets by service and account. While
+ * `saysNothingSaved` is set, it answers every read and removal as it does when
+ * nothing is saved, though its items are still there: what libsecret may
+ * answer once an unlock prompt was dismissed. A write goes through, as one
+ * whose unlock prompt was accepted would, and ends that.
+ */
+function scriptedKeychain( platform: Platform ) {
+	const items = new Map< string, string >();
+	const state = { saysNothingSaved: false };
+	const calls: Array< { args: readonly string[]; input?: string } > = [];
+	const ok = ( stdout = '' ): CommandResult => ( { code: 0, stdout, stderr: '' } );
+	const write = ( name: string, secret: string ) => {
+		items.set( name, secret );
+		state.saysNothingSaved = false;
+		return ok();
+	};
+	const read = ( name: string ) => {
+		const secret = items.get( name );
+		if ( state.saysNothingSaved || secret === undefined ) {
+			return NOTHING_SAVED[ platform ];
+		}
+		return ok( platform === 'darwin' ? `${ secret }\n` : secret );
+	};
+	const remove = ( name: string ) =>
+		! state.saysNothingSaved && items.delete( name ) ? ok() : NOTHING_SAVED[ platform ];
+	const run: CommandRunner = async ( _command, args, { input } ) => {
+		calls.push( { args, input } );
+		if ( platform === 'linux' ) {
+			const name = `${ args[ args.indexOf( 'service' ) + 1 ] }/${
+				args[ args.indexOf( 'account' ) + 1 ]
+			}`;
+			if ( args[ 0 ] === 'store' ) {
+				return write( name, input ?? '' );
+			}
+			return args[ 0 ] === 'clear' ? remove( name ) : read( name );
+		}
+		if ( platform === 'darwin' ) {
+			const added = /^add-generic-password -U -s (\S+) -a (\S+) -w (\S+)\n$/.exec( input ?? '' );
+			if ( args[ 0 ] === '-i' && added ) {
+				return write( `${ added[ 1 ] }/${ added[ 2 ] }`, added[ 3 ] );
+			}
+			const name = `${ args[ args.indexOf( '-s' ) + 1 ] }/${ args[ args.indexOf( '-a' ) + 1 ] }`;
+			return args[ 0 ] === 'delete-generic-password' ? remove( name ) : read( name );
+		}
+		const script = Buffer.from( args[ args.length - 1 ], 'base64' ).toString( 'utf16le' );
+		const named = /\('([^']+)', '([^']+)'/.exec( script );
+		const name = named ? `${ named[ 1 ] }/${ named[ 2 ] }` : '';
+		if ( script.includes( '[Console]::In.ReadToEnd()' ) ) {
+			return write( name, input ?? '' );
+		}
+		return script.includes( '$vault.Remove($credential)' ) ? remove( name ) : read( name );
+	};
+	return { store: createOsCredentialStore( { platform, run } ), items, state, calls };
+}
 
 describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 	let configDir: string;
@@ -271,4 +340,233 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 			expectNoToken( readAllFiles() );
 		}
 	);
+
+	// A locked keyring whose unlock prompt was dismissed may answer like a lost
+	// key: neither is ever treated as lost while sealed records depend on it.
+	describe( 'when it says nothing is saved while sealed records exist', () => {
+		const PLATFORMS = [ 'darwin', 'linux', 'win32' ] as const;
+
+		const records = () =>
+			Object.fromEntries(
+				vaultFiles().map( ( name ) => [
+					name,
+					fs.readFileSync( path.join( configDir, 'chatgpt-credentials', name ), 'utf8' ),
+				] )
+			);
+
+		// Two saved sign-ins under one key, which the keychain then says it doesn't have.
+		async function savedUnderUnreadableKey( platform: Platform ) {
+			const keychain = scriptedKeychain( platform );
+			const broker = () =>
+				createChatGptCredentialBroker( {
+					tokenClient: unreachableTokenService,
+					credentialStore: keychain.store,
+				} );
+			const first = await broker().saveSignIn( signIn( 'vault', 1 ) );
+			const second = await broker().saveSignIn( signIn( 'vault', 2 ) );
+			keychain.state.saysNothingSaved = true;
+			// Only a write hands the tool something on stdin.
+			const writes = () => keychain.calls.filter( ( call ) => call.input !== undefined ).length;
+			const writesBefore = writes();
+			return {
+				keychain,
+				broker,
+				first,
+				second,
+				key: keychain.items.get( WRAPPING_KEY ),
+				sealed: records(),
+				accounts: await readChatGptAccounts(),
+				keychainWrites: () => writes() - writesBefore,
+			};
+		}
+
+		function expectKeyUnreadable( error: unknown ) {
+			expect( error ).toBeInstanceOf( ChatGptConnectionError );
+			expect( error ).toMatchObject( { code: 'vault-key-unreadable' } );
+			const { message, stack } = error as Error;
+			expect( message ).toMatch( /system keychain/ );
+			expect( message ).toMatch( /sign out of every saved ChatGPT account/ );
+			expect( message ).toMatch( /makes a new key/ );
+			expectNoToken( `${ message }\n${ stack }` );
+		}
+
+		it.each( PLATFORMS )(
+			'on %s, reports the key unreadable, keeping the record and the registration as they are',
+			async ( platform ) => {
+				const saved = await savedUnderUnreadableKey( platform );
+
+				expectKeyUnreadable(
+					await saved
+						.broker()
+						.getAccessToken( saved.first.registrationId )
+						.catch( ( error: unknown ) => error )
+				);
+				const turn = await saved.broker().beginTurn( saved.second.registrationId );
+				expectKeyUnreadable( await turn.getAccessToken().catch( ( error: unknown ) => error ) );
+				turn.end();
+				await expect(
+					saved.broker().readIdTokenHint( saved.first.registrationId )
+				).resolves.toBeNull();
+
+				expect( records() ).toEqual( saved.sealed );
+				expect( await readChatGptAccounts() ).toEqual( saved.accounts );
+				expect( saved.keychain.items.get( WRAPPING_KEY ) ).toBe( saved.key );
+				expect( saved.keychainWrites() ).toBe( 0 );
+			}
+		);
+
+		it.each( PLATFORMS )(
+			'on %s, refuses a new secure save without making a key, and keeps one for the session when chosen',
+			async ( platform ) => {
+				const saved = await savedUnderUnreadableKey( platform );
+				const app = saved.broker();
+
+				for ( const save of [
+					signIn( 'vault', 3 ),
+					{ ...signIn( 'vault', 4 ), registrationId: saved.first.registrationId },
+				] ) {
+					expectKeyUnreadable( await app.saveSignIn( save ).catch( ( error: unknown ) => error ) );
+				}
+				expect( saved.keychainWrites() ).toBe( 0 );
+				expect( saved.keychain.items.get( WRAPPING_KEY ) ).toBe( saved.key );
+				expect( await readChatGptAccounts() ).toEqual( saved.accounts );
+				expect( records() ).toEqual( saved.sealed );
+
+				const kept = await app.saveSignIn( signIn( 'session', 5 ) );
+
+				await expect( app.getAccessToken( kept.registrationId ) ).resolves.toBe(
+					'test-access-token-5'
+				);
+				expect( saved.keychainWrites() ).toBe( 0 );
+				expect( records() ).toEqual( saved.sealed );
+				expectNoToken( readAllFiles() );
+			}
+		);
+
+		it.each( PLATFORMS )(
+			'on %s, opens the kept records with the same key once the keychain answers again',
+			async ( platform ) => {
+				const saved = await savedUnderUnreadableKey( platform );
+				const app = saved.broker();
+				await expect( app.getAccessToken( saved.first.registrationId ) ).rejects.toMatchObject( {
+					code: 'vault-key-unreadable',
+				} );
+
+				saved.keychain.state.saysNothingSaved = false;
+
+				await expect( app.getAccessToken( saved.first.registrationId ) ).resolves.toBe(
+					'test-access-token-1'
+				);
+				await expect( saved.broker().getAccessToken( saved.second.registrationId ) ).resolves.toBe(
+					'test-access-token-2'
+				);
+				const third = await app.saveSignIn( signIn( 'vault', 3 ) );
+				await expect( saved.broker().getAccessToken( third.registrationId ) ).resolves.toBe(
+					'test-access-token-3'
+				);
+				expect( saved.keychain.items.get( WRAPPING_KEY ) ).toBe( saved.key );
+				expect( saved.keychainWrites() ).toBe( 0 );
+			}
+		);
+
+		it.each( PLATFORMS )(
+			'on %s, makes a new key for the next secure save once every saved sign-in is signed out',
+			async ( platform ) => {
+				const saved = await savedUnderUnreadableKey( platform );
+				// The key really is gone.
+				saved.keychain.state.saysNothingSaved = false;
+				saved.keychain.items.delete( WRAPPING_KEY );
+				// A record no saved account owns, which no sign-out could remove, stops nothing.
+				fs.writeFileSync(
+					path.join( configDir, 'chatgpt-credentials', `${ randomUUID() }.vault` ),
+					Object.values( saved.sealed )[ 0 ]
+				);
+				const app = saved.broker();
+
+				await expect( app.signOut( saved.first.registrationId ) ).resolves.toEqual( {
+					localCleared: true,
+					remoteRevocationConfirmed: false,
+				} );
+				expectKeyUnreadable(
+					await app.saveSignIn( signIn( 'vault', 3 ) ).catch( ( error: unknown ) => error )
+				);
+				await app.signOut( saved.second.registrationId );
+				const next = await app.saveSignIn( signIn( 'vault', 3 ) );
+
+				const key = saved.keychain.items.get( WRAPPING_KEY );
+				expect( key ).toMatch( /^[A-Za-z0-9_-]{43}$/ );
+				expect( key ).not.toBe( saved.key );
+				await expect( saved.broker().getAccessToken( next.registrationId ) ).resolves.toBe(
+					'test-access-token-3'
+				);
+				expectNoToken( readAllFiles() );
+			}
+		);
+
+		it.each( PLATFORMS )(
+			'on %s, keeps a record its held key can’t open while the keychain says it has none',
+			async ( platform ) => {
+				const keychain = scriptedKeychain( platform );
+				const broker = () =>
+					createChatGptCredentialBroker( {
+						tokenClient: unreachableTokenService,
+						credentialStore: keychain.store,
+					} );
+				const app = broker();
+				const { registrationId } = await app.saveSignIn( signIn( 'vault', 1 ) );
+				await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-1' );
+				// Elsewhere, the key went, the account was signed out and in again under a new key.
+				keychain.items.delete( WRAPPING_KEY );
+				const other = broker();
+				await other.signOut( registrationId );
+				await other.saveSignIn( { ...signIn( 'vault', 2 ), registrationId } );
+				const sealed = records();
+				keychain.state.saysNothingSaved = true;
+
+				await expect( app.getAccessToken( registrationId ) ).rejects.toMatchObject( {
+					code: 'vault-key-unreadable',
+				} );
+
+				expect( records() ).toEqual( sealed );
+				expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+					state: 'signed-in',
+				} );
+				keychain.state.saysNothingSaved = false;
+				await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-2' );
+			}
+		);
+
+		it.each( PLATFORMS )(
+			'on %s, still clears a record its readable key can’t open, keeping the key',
+			async ( platform ) => {
+				const saved = await savedUnderUnreadableKey( platform );
+				saved.keychain.state.saysNothingSaved = false;
+				const file = path.join(
+					configDir,
+					'chatgpt-credentials',
+					`${ saved.first.registrationId }.vault`
+				);
+				const envelope = JSON.parse( fs.readFileSync( file, 'utf8' ) );
+				const ciphertext = Buffer.from( envelope.ciphertext, 'base64' );
+				ciphertext[ 0 ] ^= 0xff;
+				fs.writeFileSync(
+					file,
+					JSON.stringify( { ...envelope, ciphertext: ciphertext.toString( 'base64' ) } )
+				);
+
+				await expect(
+					saved.broker().getAccessToken( saved.first.registrationId )
+				).rejects.toMatchObject( { code: 'needs-sign-in' } );
+
+				expect( fs.existsSync( file ) ).toBe( false );
+				expect( await readChatGptAccount( saved.first.registrationId ) ).toMatchObject( {
+					state: 'needs-sign-in',
+				} );
+				expect( saved.keychain.items.get( WRAPPING_KEY ) ).toBe( saved.key );
+				await expect( saved.broker().getAccessToken( saved.second.registrationId ) ).resolves.toBe(
+					'test-access-token-2'
+				);
+			}
+		);
+	} );
 } );

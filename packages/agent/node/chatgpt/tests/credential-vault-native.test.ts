@@ -204,18 +204,29 @@ describe.skipIf( ! gate.run )(
 		);
 
 		it(
-			'asks for a sign-in again once the keychain has lost the key, and makes a new one for the next',
+			'keeps the record once the keychain has lost the key, and makes a new key only after the account is signed out',
 			withProfile( async ( { session, configDir, broker, vaultPath, readAllFiles } ) => {
 				const lost = signIn( 'vault' );
 				const account = await broker().saveSignIn( lost );
 				const oldKey = await session.store.get( WRAPPING_KEY_ACCOUNT );
+				const sealed = fs.readFileSync( vaultPath( account.registrationId ), 'utf8' );
 				await session.store.delete( WRAPPING_KEY_ACCOUNT );
 
+				// A locked keychain can answer the same, so nothing is cleared or replaced.
 				await expect(
 					readInAnotherProcess( configDir, account.registrationId, lost.tokens.accessToken )
-				).resolves.toEqual( { code: 'needs-sign-in' } );
-				expect( fs.existsSync( vaultPath( account.registrationId ) ) ).toBe( false );
+				).resolves.toEqual( { code: 'vault-key-unreadable' } );
+				expect( fs.readFileSync( vaultPath( account.registrationId ), 'utf8' ) ).toBe( sealed );
+				expect( await readChatGptAccount( account.registrationId ) ).toMatchObject( {
+					state: 'signed-in',
+				} );
+				await expect( broker().saveSignIn( signIn( 'vault' ) ) ).rejects.toMatchObject( {
+					code: 'vault-key-unreadable',
+				} );
+				await expect( session.store.get( WRAPPING_KEY_ACCOUNT ) ).resolves.toBeNull();
 
+				await broker().signOut( account.registrationId );
+				expect( fs.existsSync( vaultPath( account.registrationId ) ) ).toBe( false );
 				const next = signIn( 'vault' );
 				const again = await broker().saveSignIn( next );
 				const newKey = await session.store.get( WRAPPING_KEY_ACCOUNT );
