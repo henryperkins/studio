@@ -54,8 +54,10 @@ export type {
  *
  * The backend opens the authorization page in the system browser itself: its
  * URL can carry the account's ID token, so no caller, renderer or log ever
- * sees it. Callers get the attempt's id and wait for its outcome, which never
- * carries a secret.
+ * sees it. Nor does the browser opener's command line, which other processes
+ * can read: the opener gets a one-time address on the attempt's own loopback
+ * listener, which sends the browser on to the authorization URL. Callers get
+ * the attempt's id and wait for its outcome, which never carries a secret.
  */
 
 /** How long a sign-in waits for ChatGPT to send the browser back. */
@@ -212,6 +214,10 @@ interface PendingAttempt {
 	state: string;
 	nonce: string;
 	codeVerifier: string;
+	/** The one-time path the browser opener is given: a random segment and nothing else. */
+	startPath: string;
+	/** Where the start address sends the browser; null once it has. */
+	authorizationUrl: string | null;
 }
 
 /** The account a verified ID token names. */
@@ -290,6 +296,24 @@ function respond( response: http.ServerResponse, status: number, message: string
 				message
 			) }</p>\n`
 		);
+	} catch {
+		// The browser has gone.
+	}
+}
+
+// Sends the browser on from the start address: the URL goes in the Location
+// header only, never cached and never passed on as a referrer.
+function redirect( response: http.ServerResponse, location: string ): void {
+	try {
+		response.writeHead( 302, {
+			'Cache-Control': 'no-store',
+			Connection: 'close',
+			'Content-Length': '0',
+			Location: location,
+			'Referrer-Policy': 'no-referrer',
+			'X-Content-Type-Options': 'nosniff',
+		} );
+		response.end();
 	} catch {
 		// The browser has gone.
 	}
@@ -620,7 +644,9 @@ export function createChatGptSignInFlow(
 			respond( response, 400, rejectedPage() );
 			return;
 		}
-		if ( url.pathname !== CALLBACK_PATH ) {
+		const pending = attempt?.pending;
+		const isStart = Boolean( pending && isSameText( url.pathname, pending.startPath ) );
+		if ( url.pathname !== CALLBACK_PATH && ! isStart ) {
 			respond( response, 404, rejectedPage() );
 			return;
 		}
@@ -628,10 +654,20 @@ export function createChatGptSignInFlow(
 			respond( response, 405, rejectedPage() );
 			return;
 		}
-		const pending = attempt?.pending;
 		// Another host name is another site reaching the port, not ChatGPT's redirect.
 		if ( ! attempt || ! pending || request.headers.host !== attempt.callbackHost ) {
 			respond( response, 400, rejectedPage() );
+			return;
+		}
+		if ( isStart ) {
+			// Once only, and only while the attempt waits for its callback.
+			const { authorizationUrl } = pending;
+			if ( attempt.status !== 'waiting' || ! authorizationUrl ) {
+				respond( response, 400, rejectedPage() );
+				return;
+			}
+			pending.authorizationUrl = null;
+			redirect( response, authorizationUrl );
 			return;
 		}
 		// An unknown, missing or replayed state is refused, and the attempt goes on waiting.
@@ -707,6 +743,8 @@ export function createChatGptSignInFlow(
 			state: randomValue(),
 			nonce: randomValue(),
 			codeVerifier: randomValue(),
+			startPath: `/${ randomValue() }`,
+			authorizationUrl: null,
 		};
 
 		const params: Record< string, string > = {
@@ -735,6 +773,7 @@ export function createChatGptSignInFlow(
 		for ( const [ name, value ] of Object.entries( params ) ) {
 			authorizationUrl.searchParams.set( name, value );
 		}
+		pending.authorizationUrl = authorizationUrl.toString();
 
 		let resolve: ( outcome: ChatGptSignInOutcome ) => void = () => undefined;
 		const outcome = new Promise< ChatGptSignInOutcome >( ( settled ) => ( resolve = settled ) );
@@ -755,9 +794,10 @@ export function createChatGptSignInFlow(
 		};
 		attempts.set( attemptId, started );
 
-		// The URL goes to the browser alone, and the opener's error, which may quote it, nowhere.
+		// The opener gets the start address alone, and its error, which may quote it, goes nowhere.
+		const startUrl = `http://${ started.callbackHost }${ pending.startPath }`;
 		const opening = Promise.resolve()
-			.then( () => openBrowser( authorizationUrl.toString() ) )
+			.then( () => openBrowser( startUrl ) )
 			.then(
 				() => true,
 				() => false

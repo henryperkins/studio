@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -61,6 +61,8 @@ const REQUESTED_SCOPE =
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const RANDOM = /^[\w-]{43,128}$/;
 const CALLBACK = /^http:\/\/127\.0\.0\.1:(\d+)\/auth\/callback$/;
+// What the browser opener is given: the attempt's listener and a one-time path, nothing else.
+const START = /^http:\/\/127\.0\.0\.1:(\d+)\/([\w-]{43})$/;
 
 const sleep = ( ms: number ) => new Promise( ( resolve ) => setTimeout( resolve, ms ) );
 const nextTurn = () => new Promise( ( resolve ) => setImmediate( resolve ) );
@@ -143,6 +145,13 @@ describe( 'Signing in to ChatGPT', () => {
 		return created;
 	}
 
+	// The browser at the start address it was given: Studio sends it on to the authorize page.
+	async function follow( startUrl: string ): Promise< string > {
+		const response = await fetch( startUrl, { redirect: 'manual' } );
+		expect( response.status ).toBe( 302 );
+		return response.headers.get( 'location' )!;
+	}
+
 	async function begin(
 		registrationId?: string,
 		options?: ChatGptSignInOptions,
@@ -151,10 +160,12 @@ describe( 'Signing in to ChatGPT', () => {
 		const before = opened.length;
 		const started = await using.begin( registrationId, options );
 		begun.push( started.attemptId );
-		// The caller gets the attempt id alone; the URL went to the browser.
+		// The caller gets the attempt id alone; the start address went to the browser.
 		expect( started ).toEqual( { attemptId: expect.stringMatching( UUID ) } );
 		expect( opened ).toHaveLength( before + 1 );
-		return { attemptId: started.attemptId, url: opened[ before ] };
+		const startUrl = opened[ before ];
+		expect( startUrl ).toMatch( START );
+		return { attemptId: started.attemptId, startUrl, url: await follow( startUrl ) };
 	}
 
 	// The browser at the authorize page: ChatGPT sends it back to the callback.
@@ -951,10 +962,11 @@ describe( 'Signing in to ChatGPT', () => {
 					const using = arrange() ?? flow;
 
 					const start = await begin( existing.registrationId, { storage: 'session' }, using );
-					const urls = [ start.url ];
+					const urls = [ start.startUrl, start.url ];
 					if ( ending === 'callback' ) {
-						urls.push( await authorize( start.url ) );
-						await deliver( urls[ 1 ] );
+						const callbackUrl = await authorize( start.url );
+						urls.push( callbackUrl );
+						await deliver( callbackUrl );
 					} else if ( ending === 'cancel' ) {
 						expect( using.cancel( start.attemptId ) ).toBe( true );
 					}
@@ -1357,7 +1369,7 @@ describe( 'Signing in to ChatGPT', () => {
 	} );
 
 	describe( 'the system browser', () => {
-		it( 'is sent the URL, which, with the ID token it carries, reaches nothing returned, thrown or shown', async () => {
+		it( 'is sent only the start address, and the URL it leads to, with the ID token it carries, reaches nothing returned, thrown or shown', async () => {
 			const existing = await signInExisting();
 
 			const signedIn = await signIn( existing.registrationId );
@@ -1371,12 +1383,15 @@ describe( 'Signing in to ChatGPT', () => {
 			} );
 			const error = await refusing.begin( existing.registrationId ).catch( ( e ) => e );
 
-			const urls = opened.slice( -3 );
-			expect( urls.map( ( url ) => new URL( url ).searchParams.get( 'id_token_hint' ) ) ).toEqual( [
-				fake.issued[ 0 ].idToken,
-				fake.issued[ 1 ].idToken,
-				fake.issued[ 1 ].idToken,
-			] );
+			const sent = opened.slice( -3 );
+			for ( const url of sent ) {
+				expect( url ).toMatch( START );
+			}
+			// The ID token reached the authorization endpoint alone, by way of the start address.
+			expect(
+				fake.authorizeRequests.slice( -2 ).map( ( query ) => query.get( 'id_token_hint' ) )
+			).toEqual( [ fake.issued[ 0 ].idToken, fake.issued[ 1 ].idToken ] );
+			const urls = [ ...sent, signedIn.start.url, denied.start.url ];
 			expect( error ).toBeInstanceOf( ChatGptSignInError );
 			expect( error.code ).toBe( 'browser-unavailable' );
 			const caught = [
@@ -1412,7 +1427,8 @@ describe( 'Signing in to ChatGPT', () => {
 
 			expect( error ).toBeInstanceOf( ChatGptSignInError );
 			expect( error.code ).toBe( 'browser-unavailable' );
-			expect( await deliver( await authorize( sentTo ) ) ).toEqual( { status: 0, page: '' } );
+			expect( sentTo ).toMatch( START );
+			expect( await deliver( sentTo ) ).toEqual( { status: 0, page: '' } );
 			expect( fake.tokenRequests ).toHaveLength( 1 );
 			await expectUntouched( existing );
 		} );
@@ -1442,7 +1458,8 @@ describe( 'Signing in to ChatGPT', () => {
 			const { attemptId } = await appFlow.begin();
 			begun.push( attemptId );
 			expect( installed ).toHaveLength( 1 );
-			await deliver( await authorize( installed[ 0 ] ) );
+			expect( installed[ 0 ] ).toMatch( START );
+			await deliver( await authorize( await follow( installed[ 0 ] ) ) );
 			expect( ( await appFlow.wait( attemptId ) ).ok ).toBe( true );
 		} );
 
@@ -1450,7 +1467,7 @@ describe( 'Signing in to ChatGPT', () => {
 			fake.script.tokenDelayMs = 200;
 			const late = startFlow( {
 				openBrowser: async ( url ) => {
-					void deliver( await authorize( url ) );
+					void deliver( await authorize( await follow( url ) ) );
 					await until( () => fake.tokenRequests.length === 1 );
 					throw new Error( 'test-late-opener-failure' );
 				},
@@ -1473,6 +1490,191 @@ describe( 'Signing in to ChatGPT', () => {
 
 			expect( started ).toEqual( { attemptId: expect.stringMatching( UUID ) } );
 			expect( await hanging.wait( started.attemptId ) ).toEqual( failed( 'timed-out' ) );
+		} );
+	} );
+
+	// A process's command line can be read by others on the machine, so the
+	// browser opener is given an address on the attempt's own listener, which
+	// sends the browser on to the authorization URL once.
+	describe( 'the start address', () => {
+		// Begins an attempt, leaving the start address unused.
+		async function beginUnfollowed(
+			registrationId?: string,
+			options?: ChatGptSignInOptions,
+			using: ChatGptSignInFlow = flow
+		) {
+			const before = opened.length;
+			const { attemptId } = await using.begin( registrationId, options );
+			begun.push( attemptId );
+			expect( opened ).toHaveLength( before + 1 );
+			return { attemptId, startUrl: opened[ before ] };
+		}
+
+		// A raw request, so its Host header can be any.
+		function request( url: string, init: { method?: string; host?: string } = {} ) {
+			return new Promise< { status: number; location?: string; page: string } >(
+				( resolve, reject ) => {
+					const sent = http.request(
+						url,
+						{
+							method: init.method ?? 'GET',
+							...( init.host ? { headers: { host: init.host } } : {} ),
+						},
+						( response ) => {
+							let page = '';
+							response.setEncoding( 'utf8' );
+							response.on( 'data', ( chunk: string ) => ( page += chunk ) );
+							response.on( 'end', () =>
+								resolve( {
+									status: response.statusCode ?? 0,
+									location: response.headers.location,
+									page,
+								} )
+							);
+						}
+					);
+					sent.on( 'error', reject );
+					sent.end();
+				}
+			);
+		}
+
+		it.each< [ string, 'vault' | 'session', 'new' | 'id-token' | 'email' ] >( [
+			[ 'a new registration', 'vault', 'new' ],
+			[ 'a new registration', 'session', 'new' ],
+			[ 'a registration signed in again with its ID token as the hint', 'vault', 'id-token' ],
+			[ 'a registration signed in again with its ID token as the hint', 'session', 'id-token' ],
+			[ 'a signed-out registration signed in again with its email as the hint', 'vault', 'email' ],
+			[
+				'a signed-out registration signed in again with its email as the hint',
+				'session',
+				'email',
+			],
+		] )(
+			'is all the browser opener gets for %s, kept in %s, and leads to the same authorization request',
+			async ( _name, storage, kind ) => {
+				let registrationId: string | undefined;
+				if ( kind !== 'new' ) {
+					registrationId = registrationOf( ( await signIn() ).outcome );
+					if ( kind === 'email' ) {
+						await broker.signOut( registrationId );
+					}
+				}
+				const asked = fake.authorizeRequests.length;
+
+				const { attemptId, startUrl } = await beginUnfollowed( registrationId, { storage } );
+				const authorizationUrl = await follow( startUrl );
+				const callbackUrl = await authorize( authorizationUrl );
+
+				const sent = Object.fromEntries( fake.authorizeRequests[ asked ] );
+				expect( sent ).toMatchObject( {
+					redirect_uri: expect.stringMatching( CALLBACK ),
+					state: expect.stringMatching( RANDOM ),
+					nonce: expect.stringMatching( RANDOM ),
+					code_challenge: expect.stringMatching( /^[\w-]{43}$/ ),
+					ext_agent_host_id: await getChatGptHostId(),
+				} );
+				if ( kind === 'new' ) {
+					expect( sent.client_id ).toBe( 'dynamic_agent_client' );
+				} else {
+					expect( sent.client_id ).toBe( 'test-issued-client-1' );
+				}
+				if ( kind === 'id-token' ) {
+					expect( sent.id_token_hint ).toBe( fake.issued[ 0 ].idToken );
+				}
+				if ( kind === 'email' ) {
+					expect( sent.login_hint ).toBe( 'someone@example.com' );
+				}
+				// The same listener, at a path only Studio chose, and nothing of the request.
+				const [ , port ] = START.exec( startUrl )!;
+				expect( new URL( sent.redirect_uri ).port ).toBe( port );
+				for ( const name of [
+					'state',
+					'nonce',
+					'code_challenge',
+					'id_token_hint',
+					'login_hint',
+					'client_id',
+					'ext_agent_host_id',
+					'redirect_uri',
+				] ) {
+					if ( sent[ name ] ) {
+						expect( startUrl ).not.toContain( sent[ name ] );
+					}
+				}
+				const authorization = new URL( authorizationUrl );
+				expect( startUrl ).not.toContain( authorization.pathname );
+				expect( startUrl ).not.toContain( authorization.search.slice( 1 ) );
+				expect( startUrl ).not.toContain( 'authorize' );
+
+				await deliver( callbackUrl );
+				expect( ( await flow.wait( attemptId ) ).ok ).toBe( true );
+			}
+		);
+
+		it( 'sends the browser on once, uncached and without a referrer, and refuses anything else without the URL', async () => {
+			const { attemptId, startUrl } = await beginUnfollowed();
+			const start = new URL( startUrl );
+			const at = ( pathname: string ) => `${ start.origin }${ pathname }`;
+			const guessed = randomBytes( 32 ).toString( 'base64url' );
+
+			// None of these uses the address up.
+			const refusals = [
+				[ 400, await request( startUrl, { host: `attacker.example:${ start.port }` } ) ],
+				[ 400, await request( startUrl, { host: `localhost:${ start.port }` } ) ],
+				[ 405, await request( startUrl, { method: 'POST' } ) ],
+				[ 405, await request( startUrl, { method: 'HEAD' } ) ],
+				[ 404, await request( at( `/${ guessed }` ) ) ],
+				[ 404, await request( at( `${ start.pathname }/` ) ) ],
+				[ 404, await request( at( `${ start.pathname }x` ) ) ],
+				[ 404, await request( at( start.pathname.toUpperCase() ) ) ],
+				[ 404, await request( at( '/' ) ) ],
+			] as const;
+			const response = await fetch( startUrl, { redirect: 'manual' } );
+			const location = response.headers.get( 'location' )!;
+			const again = await request( startUrl );
+
+			expect( response.status ).toBe( 302 );
+			expect( response.headers.get( 'cache-control' ) ).toBe( 'no-store' );
+			expect( response.headers.get( 'referrer-policy' ) ).toBe( 'no-referrer' );
+			expect( await response.text() ).toBe( '' );
+			expect( location.startsWith( `${ fake.url }/api/accounts/authorize?` ) ).toBe( true );
+			expect( fake.authorizeRequests ).toHaveLength( 0 );
+			const query = new URL( location ).searchParams;
+			const values = [
+				'state',
+				'nonce',
+				'code_challenge',
+				'client_id',
+				'ext_agent_host_id',
+				'redirect_uri',
+			].map( ( name ) => query.get( name )! );
+			for ( const [ status, refused ] of [ ...refusals, [ 400, again ] as const ] ) {
+				expect( refused.status ).toBe( status );
+				expect( refused.location ).toBeUndefined();
+				expect( refused.page ).not.toMatch( /authorize|https?:/ );
+				for ( const value of values ) {
+					expect( refused.page ).not.toContain( value );
+				}
+			}
+
+			// The attempt goes on, and its address goes with it.
+			await deliver( await authorize( location ) );
+			expect( ( await flow.wait( attemptId ) ).ok ).toBe( true );
+			expect( await deliver( startUrl ) ).toEqual( { status: 0, page: '' } );
+		} );
+
+		it( 'ends with its attempt, cancelled or timed out, before it was used', async () => {
+			const cancelled = await beginUnfollowed();
+			expect( flow.cancel( cancelled.attemptId ) ).toBe( true );
+			const quick = startFlow( { timeoutMs: 100 } );
+			const timedOut = await beginUnfollowed( undefined, undefined, quick );
+			expect( await quick.wait( timedOut.attemptId ) ).toEqual( failed( 'timed-out' ) );
+
+			for ( const { startUrl } of [ cancelled, timedOut ] ) {
+				expect( await deliver( startUrl ) ).toEqual( { status: 0, page: '' } );
+			}
+			expect( fake.authorizeRequests ).toHaveLength( 0 );
 		} );
 	} );
 
