@@ -185,9 +185,9 @@ Test files are under `packages/agent/node/claude-code/tests/` in the Claude work
 | B1 | Account lifecycle: native sign-in, inspect, reconnect, disconnect, identity change detection, billing-route identity. Credentials stay vendor-owned. | C5, P1 | partial. Sign-in launch, discovery and connection code exist (`connection.ts`, `auth-status.ts`). Authenticated live acceptance open. | `connection.test.ts`, `auth-status.test.ts`, `auth-route.test.ts`, `auth-comparison.test.ts`, `managed-auth.test.ts`, `identity.test.ts` | none yet |
 | B2 | Conversations: new/global/site, target selection, model/effort, queued sends, resume, compaction, cancellation, crash recovery | C1, C4, C5 | partial. `createClaudeSession` is bound to one local site (`studio-surface.ts`). Global and explicit target transitions not implemented (C1). Crash recovery: backend and CLI in place (C4a record below), not qualified; the UI's recover action (C4b) not started. | `sessions.test.ts`, `studio-surface.test.ts`, `environment.test.ts`, `routing.test.ts`, `native-lifecycle.test.ts` (opt-in) | none yet |
 | B3 | File work: read, search, list, write, edit, shell | C1, C2 | partial. The runtime is configured with tools `['Read']` only (`runtime.ts`); `canUseTool` and init-frame checks allow only `Read` and `mcp__studio__wp_cli`. Write, Edit, Grep, Glob, Ls and Bash are not enabled. | `runtime.test.ts`, `tool-bridge.test.ts` | none yet |
-| B4 | Studio operations: every host-applicable Studio tool | C2 | partial. One bridged tool, `wp_cli`, restricted to an allowlist (see section D). The other 28 registered Studio tools are not bridged. | `tool-bridge.test.ts` | none yet |
+| B4 | Studio operations: every host-applicable Studio tool | C2 | partial. Since C2a-1 the bridge is built from the capability-filtered registry and runs every call through the shared execution semantics (`node/tools/execution.ts`) against the host the policy guards. The policy still enables one Studio tool, `wp_cli`, restricted to the C1 allowlist (see section D); the other 28 registry tools, and the three runtime-bound ones, are not qualified, each with a named step in D.3. | `tool-bridge.test.ts`, `tool-parity.test.ts`, `node/tools/tests/execution.test.ts` | none yet |
 | B5 | User interaction: questions, choices, design alternatives, approvals; reconnect restores only the current run's unresolved requests | C1, C3 | partial. Approval for draft creation exists (`approval.requested` events in `tool-bridge.ts`). Questions and design choice not implemented. Reconnect behavior not verified. | `tool-bridge.test.ts`, `event-adapter.test.ts` | none yet |
-| B6 | Rich results: images, attachments, artifacts, background completion, preview refresh, annotations | C3 | not started. The plan baseline says image results, artifacts and preview/annotations are outside the current proof of concept. | none yet | none yet |
+| B6 | Rich results: images, attachments, artifacts, background completion, preview refresh, annotations | C2, C3 | partial, offline only. The bridge returns what the shared execution returns: text and image blocks in order, progress as `tool.progress`, work a tool leaves running awaited and reported with its result, artifacts shown only through the guarded host; MCP App data and the service account never reach Claude. Tested with injected tools; no enabled tool produces images, artifacts or background work yet. Attachments, preview refresh and annotations not started (C3). | `tool-bridge.test.ts` (*every bridged call*) | none yet |
 | B7 | Guidance: identity, user instructions, skills, tool-name mapping for the native runtime | C2, C3 | not started (no `Skill` tool bridged). | none yet | none yet |
 | B8 | Models: runtime discovery intersected with qualified capabilities | C5, P1 | partial. `discoverClaudeModels` and `requireSupportedSelection` exist (`studio-surface.ts`). | `runtime.test.ts`, `studio-surface.test.ts` | none yet |
 | B9 | Failures: no false completion, duplicate side effects, API fallback, account substitution, leaks, orphan processes | C1, C4, P2 | partial. Environment scrubbing, init-frame verification and approval fencing exist per PR #3 reviewers and code. Orphan-process and crash cases not qualified. | `windows-preflight.test.ts`, `native-startup.test.ts` (opt-in), `native-lifecycle.test.ts` (opt-in) | none yet |
@@ -224,6 +224,17 @@ Commits `ea17805da`, `c508e89e9`, `b42a5045a`, `8caafdfb3`, `773c180f3`, `1d2bec
   - Three consecutive runs passed before fix round 1, three again after it, and three after fix round 2. A waiting recovery is retried only on the reason the test waits to see change, so a failed process listing is reported, not retried away.
 - **Through seams only:** the full decision table, the replacement-lock race, a concurrent claim, a stale claim, an unreadable claim, idempotence after an interrupted recovery, two recoveries run at once, a replacement between the record and the release, a stage advanced by the same token after inspection, the update and release race on the lock, a linkless filesystem (emulated by refusing links), the authorization journal for every rule, the uncertain-operation classification, the note to the next turn, and the POSIX group check.
 - **Open.** The POSIX real-process cases are written and skipped on Windows; they have not run on Linux or macOS. Windows ARM64 has not run. Windows with CIM/WMI disabled, a real linkless filesystem, and a real Claude executable killed mid-turn, recovered and resumed have not run. Native-run checklist additions from fix round 2: the procedure's macOS and Linux commands on real hosts, and, on a real host, that a prompt sent after a recovery carries the note to the model on resume. The plan's "on all six native platforms" item is an open platform gate.
+
+### C2a-1 record (shared tool execution and the registry-built bridge, November 12, 2026)
+
+Commits `5491b8123`, `95b394261`, `1c3256e72`, `8ab15fead`, `63308e8f2` and this record's update, on `add-claude-code-runtime`. This record qualifies no tool: the Claude route still enables native `Read` and the bridged `wp_cli` only. B4 and B6 change as their rows say; no other row or cell changes.
+
+- **Pi and `studio mcp` pinned first.** `node/runtime/tests/pi-tool-results.test.ts` runs Studio tools as a real Pi turn registers them, through pi's own tool-call steps: optional and coerced arguments, schema-invalid calls refused before the tool runs with pi's message, text and image blocks, MCP App data and the service account kept out of what the model sees, artifacts shown only with a UI and never failing the call, progress, failures by their message, cancellation before and during a call, pending work and `settlesPendingWork`, result notes. `apps/cli/ai/runtimes/mcp/tests/served-tool.test.ts` pins the MCP rendering the same way. Both passed before the extraction and pass unchanged after it.
+- **Shared semantics.** `node/tools/execution.ts` holds them once: argument validation against the canonical schema, the runtime's gate, cancellation before a call starts, progress, artifacts (shown only after success; a failed show is logged), failures as outcomes that keep the error for the route to word, and completion with notes and pending work, either tracked across calls (Pi) or awaited with the call (`studio mcp`, Claude). Pi's own loop validates and coerces before Studio runs a tool, so the Pi form does not validate again. The routes keep only their transport: Pi's `{content, details}` and thrown errors, MCP's `{content, _meta, isError}` with the tool's message, Claude's content or a fixed refusal sentence.
+- **The bridge.** Built from `resolveStudioToolDefinitions` for the host's capabilities (vision on; questions, design choices and the image service not offered yet), limited to the policy's `studioTools`, each tool under its canonical name, description and schema. Every call is bound to `policy.guardHost` for that call, and the policy's `authorizeStudioCall` (with its journal entry for anything that does more than read) runs before the tool. `wp_cli`'s description on Claude is now the canonical one.
+- **Contract.** `claude-code/tests/tool-parity.test.ts` reads the registry from real Pi turns under all eight combinations of UI, question handler and image service, gives each of the 39 tools one status (D.3), and fails when a tool has no status, when a status and the policy disagree, or when the bridge lists anything but the qualified tools Pi registers for that host.
+- **Carry items.** 4: a bridge test pins that each call runs against the host `guardHost` returned for that call. 5: a file channel now needs `paths`; `class` alone no longer bounds it. 6: `ui.showArtifact` and `ui.reloadPreview` need no channel of their own, because tools return artifacts and the shared execution shows them, but `guardHost` now fences `ui`, so nothing reaches the conversation once the call or turn has ended; `selectSite` is already a fenced host operation (carry item 7 still applies before `create_site` is qualified).
+- **Open.** No tool beyond `wp_cli` is qualified (C2a-2, C2a-3, C2b, C2c). Result notes are not added on the Claude route yet. The startup check still expects exactly `wp_cli` in the server's tool list and must compare against the enabled set once a second tool is qualified.
 
 ## C. Platform cells
 
@@ -374,8 +385,8 @@ Read at `4ae1e38da` in the primary checkout. The registry is identical at `ce4ee
 
 ### D.1 How the set is assembled
 
-- `studioToolDefinitions` in `packages/agent/node/tools/index.ts` lists **29** Studio tools.
-- `resolveStudioTools(host, options)` removes or substitutes some of them (D.2).
+- `studioToolDefinitions` in `packages/agent/node/tools/index.ts` lists **29** Studio tools (unchanged at C2a-1).
+- `resolveStudioToolDefinitions(host, options)` removes or substitutes some of them (D.2); since C2a-1 `resolveStudioTools` binds that list for the Pi route, and the Claude bridge builds its tools from the same list.
 - The Pi runtime (`buildAgentTools` in `packages/agent/node/runtime/index.ts`) adds three tools conditionally and seven file/shell tools: **up to 39** tools in total (29 + 3 + 7). The count of 29 in the plans equals the Studio-tool list only; it excludes the ten runtime-bound tools.
 - The MCP server (`apps/cli/ai/runtimes/mcp/index.ts`) also calls `agent.tools(...)` and adds `present_design_options` and `studio_instructions`, which are outside this count and are not listed in D.3.
 - The registry does not branch on the session target. The session records `activeEnvironment: 'local' | 'live'` and `lastSelectedWpcomSiteId` (`packages/agent/protocol/sessions/types.ts`), and a `studio.site_selected` entry carries `siteId`, `remote`, `url`, `wpcomSiteId` (`protocol/sessions/entry-types.ts`). `resolveStudioTools` and `buildAgentTools` do not read them, and `ToolContext` holds only the host and a progress callback (`tools/define-tool.ts`). The active site reaches the Pi runtime only as `config.activeSite` (`SiteInfo`, `node/types.ts`), which the runtime uses in two places: the system prompt's "Active site" section (`buildActiveSiteSection`, which appends the remote-site runbook when `site.remote`), and result notes, enabled only for a non-remote site (`runtime/index.ts`, near line 675). No tool handler receives the target. Each tool takes its target as an argument. How each tool behaves in a global, local-site and live-site conversation is in D.4.
@@ -391,60 +402,60 @@ Read at `4ae1e38da` in the primary checkout. The registry is identical at `ce4ee
 | `host.ui` absent | `refresh_browser` left out |
 | `visionEnabled` | `take_screenshot` and `inspect_design` are rebuilt with vision on or off; `take_screenshot` also depends on `imageLink` and `host.ui` for whether the user sees the capture |
 | `canAskUser` or `tracks` | `pick_design` is rebuilt so it can offer choices |
-| `host.ui` present | Results are wrapped so chat artifacts are emitted to the UI |
+| `host.ui` present | Chat artifacts are shown to the UI by the shared execution (`tools/execution.ts`); on the Claude route through the host the policy guards |
 | `config.onAskUser` set | `AskUserQuestion` is added |
 | `config.onAskUser` and `host.ui` | `present_design_options` is added (Pi runtime). The MCP server adds it separately. |
 | skills discovered | `Skill` is added; absent when no skills load |
 
 ### D.3 Registered tools, gates and Claude status
 
-Annotation class: RO read-only, RR remote read, LC local change, LO local overwrite/destructive, RC remote change, RO-W remote overwrite/destructive (`define-tool.ts`). Claude status values: `bridged` (reachable through the Studio MCP bridge), `native` (a vendor-runtime equivalent is configured), `not yet` (not enabled; owner shown). Today the Claude runtime enables native `Read` and the bridged `wp_cli` only.
+Annotation class: RO read-only, RR remote read, LC local change, LO local overwrite/destructive, RC remote change, RO-W remote overwrite/destructive (`define-tool.ts`). Claude status values, as `claude-code/tests/tool-parity.test.ts` states and checks them against the execution policy and the bridge: `bridged` (built from the registry, qualified and enabled by the policy), `native` (Claude Code's tool of that name stands for it and the policy enables it), `absent` (neither route registers it without a host capability; no tool has this status today), `not yet` (not enabled; the step that qualifies it, and why). The Claude runtime enables native `Read` and the bridged `wp_cli` only.
 
-| # | Registered name | Origin | Gate (UI / host) | Class | Claude status at `ce4eea5dc` |
+| # | Registered name | Origin | Gate (UI / host) | Class | Claude status at C2a-1 (`63308e8f2`) |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `site_create` | Studio | always | LC | not yet: C2 |
-| 2 | `site_list` | Studio | always | RR | not yet: C2 |
-| 3 | `site_info` | Studio | always | RO | not yet: C2 |
-| 4 | `site_start` | Studio | always | LC | not yet: C2 |
-| 5 | `site_stop` | Studio | always | LC | not yet: C2 |
-| 6 | `site_delete` | Studio | always | LO | not yet: C1 (approval policy), C2 |
-| 7 | `preview_create` | Studio | always | RC | not yet: C2 |
-| 8 | `preview_list` | Studio | always | RO | not yet: C2 |
-| 9 | `preview_update` | Studio | always | RO-W | not yet: C1, C2 |
-| 10 | `preview_delete` | Studio | always | RO-W | not yet: C1, C2 |
-| 11 | `wp_cli` | Studio | always | RO-W | bridged, restricted: only `option get` of four named options, `post list`, `post get <id>`, and `post create` as draft with title (and optional content) after user approval (`classify` in `tool-bridge.ts`). Everything else is denied. Broader coverage: C1, C2. |
-| 12 | `scaffold_theme` | Studio | always | LC | not yet: C2 |
-| 13 | `pick_design` | Studio | rebuilt when `canAskUser` or `tracks` | RO | not yet: C2, C3 |
-| 14 | `validate_blocks` | Studio | always | LO | not yet: C2 |
-| 15 | `take_screenshot` | Studio | variant by vision, `imageLink`, `host.ui` | LC | not yet: C2, C3 (image result) |
-| 16 | `inspect_design` | Studio | variant by vision | RO | not yet: C2, C3 |
-| 17 | `generate_images` | Studio | only when `imageGeneration` is set | RC | not yet: C2 (see section G) |
-| 18 | `install_taxonomy_scripts` | Studio | always | LC | not yet: C2 |
-| 19 | `need_for_speed` | Studio | always | RO | not yet: C2 |
-| 20 | `rank_me_up` | Studio | always | RO | not yet: C2 |
-| 21 | `site_connected_remote_sites` | Studio | always | RR | not yet: C2 |
-| 22 | `wpcom_request` | Studio | unless `wpcomRequest === false` | RO-W | not yet: C1 (remote policy), C2 |
-| 23 | `site_push` | Studio | always | RO-W | not yet: C1, C2 |
-| 24 | `site_pull` | Studio | always | RO-W | not yet: C1, C2 |
-| 25 | `site_import` | Studio | always | LO | not yet: C1, C2 |
-| 26 | `site_export` | Studio | always | LO | not yet: C2 |
-| 27 | `open_annotation_browser` | Studio | always | LC | not yet: C2, C3 |
-| 28 | `refresh_browser` | Studio | only when `host.ui` is present | RO | not yet: C3 |
-| 29 | `send_feedback` | Studio | always | RC | not yet: C1 (external message), C2 |
-| 30 | `AskUserQuestion` | Runtime | only when `onAskUser` | RO | not yet: C3 (native equivalent or bridge to be decided) |
-| 31 | `present_design_options` | Runtime | `onAskUser` and `host.ui` (Pi runtime) | LC | not yet: C3 |
-| 32 | `Skill` | Runtime | only when skills are found | RO | not yet: C2, C3 (guidance) |
-| 33 | `Read` | Pi file tool | always | n/a | native: configured as the one native tool on Claude |
-| 34 | `Write` | Pi file tool | always (with design-system preview wrapper) | n/a | not yet: C1, C2 |
-| 35 | `Edit` | Pi file tool | always (same wrapper) | n/a | not yet: C1, C2 |
-| 36 | `Bash` | Pi file tool | always (provider secrets removed from spawn env) | n/a | not yet: C1 (bounded approval), C2, P2 |
-| 37 | `Grep` | Pi file tool | always | n/a | not yet: C2 |
-| 38 | `Glob` | Pi file tool | always | n/a | not yet: C2 |
-| 39 | `Ls` | Pi file tool | always | n/a | not yet: C2 (native equivalent to be determined) |
+| 1 | `site_create` | Studio | always | LC | not yet: C2a-2, local site operation; `selectSite` must update the persisted target first (carry item 7) |
+| 2 | `site_list` | Studio | always | RR | not yet: C2a-3, reaches WordPress.com |
+| 3 | `site_info` | Studio | always | RO | not yet: C2a-2, local site operation |
+| 4 | `site_start` | Studio | always | LC | not yet: C2a-2, local site operation |
+| 5 | `site_stop` | Studio | always | LC | not yet: C2a-2, local site operation |
+| 6 | `site_delete` | Studio | always | LO | not yet: C2a-2, local site operation |
+| 7 | `preview_create` | Studio | always | RC | not yet: C2a-3, reaches WordPress.com |
+| 8 | `preview_list` | Studio | always | RO | not yet: C2a-3, reaches WordPress.com |
+| 9 | `preview_update` | Studio | always | RO-W | not yet: C2a-3; preview hosts not tied to the target (carry item 12) |
+| 10 | `preview_delete` | Studio | always | RO-W | not yet: C2a-3; preview hosts not tied to the target (carry item 12) |
+| 11 | `wp_cli` | Studio | always | RO-W | bridged from the registry, canonical description and schema, run through the shared execution against the guarded host. The policy still runs only `option get` of four named options, `post list`, `post get <id>`, and `post create` as draft with title (and optional content) after user approval; everything else is denied. Broader coverage: C2a-2. |
+| 12 | `scaffold_theme` | Studio | always | LC | not yet: C2a-2, local site operation |
+| 13 | `pick_design` | Studio | rebuilt when `canAskUser` or `tracks` | RO | not yet: C2c, design choice |
+| 14 | `validate_blocks` | Studio | always | LO | not yet: C2b, drives a browser (navigation guard) |
+| 15 | `take_screenshot` | Studio | variant by vision, `imageLink`, `host.ui` | LC | not yet: C2b, drives a browser (navigation guard) |
+| 16 | `inspect_design` | Studio | variant by vision | RO | not yet: C2b, drives a browser (navigation guard) |
+| 17 | `generate_images` | Studio | only when `imageGeneration` is set | RC | not yet: C2a-3; the Claude turn does not resolve the image service yet, so the bridge leaves it out, and it runs `wp eval`, which the policy refuses (carry item 11; section G) |
+| 18 | `install_taxonomy_scripts` | Studio | always | LC | not yet: C2a-2, local site operation |
+| 19 | `need_for_speed` | Studio | always | RO | not yet: C2b, drives a browser (navigation guard) |
+| 20 | `rank_me_up` | Studio | always | RO | not yet: C2b, drives a browser (navigation guard) |
+| 21 | `site_connected_remote_sites` | Studio | always | RR | not yet: C2a-3, reaches WordPress.com |
+| 22 | `wpcom_request` | Studio | unless `wpcomRequest === false` | RO-W | not yet: C2a-3, reaches WordPress.com |
+| 23 | `site_push` | Studio | always | RO-W | not yet: C2a-3; the remote is not matched to the live target (carry item 12) |
+| 24 | `site_pull` | Studio | always | RO-W | not yet: C2a-3; the remote is not matched to the live target (carry item 12) |
+| 25 | `site_import` | Studio | always | LO | not yet: C2a-2, local site operation |
+| 26 | `site_export` | Studio | always | LO | not yet: C2a-2, local site operation |
+| 27 | `open_annotation_browser` | Studio | always | LC | not yet: C2b, drives a browser (navigation guard) |
+| 28 | `refresh_browser` | Studio | only when `host.ui` is present | RO | not yet: C2a-2; reloads the app's preview, which the guarded host fences. The bridge resolves it only with `host.ui`, as the Pi route does. |
+| 29 | `send_feedback` | Studio | always | RC | not yet: C2a-3, sends a message outside Studio |
+| 30 | `AskUserQuestion` | Runtime | only when `onAskUser` | RO | not yet: C2c, no question channel on the Claude route yet |
+| 31 | `present_design_options` | Runtime | `onAskUser` and `host.ui` (Pi runtime) | LC | not yet: C2c, design choices; also drives a browser |
+| 32 | `Skill` | Runtime | only when skills are found | RO | not yet: C2c, skills and their capability gates |
+| 33 | `Read` | Pi file tool | always | n/a | native: Claude Code's `Read`, enabled since C1, paths bounded by the policy; argument parity review in C2b |
+| 34 | `Write` | Pi file tool | always (with design-system preview wrapper) | n/a | not yet: C2b, native `Write` |
+| 35 | `Edit` | Pi file tool | always (same wrapper) | n/a | not yet: C2b, native `Edit` |
+| 36 | `Bash` | Pi file tool | always (provider secrets removed from spawn env) | n/a | not yet: C2b, native `Bash` needs a verified shell confinement |
+| 37 | `Grep` | Pi file tool | always | n/a | not yet: C2b, native `Grep` |
+| 38 | `Glob` | Pi file tool | always | n/a | not yet: C2b, native `Glob` |
+| 39 | `Ls` | Pi file tool | always | n/a | not yet: C2b, native `LS` |
 
-Counted from code: 29 Studio definitions, 3 runtime-bound conditional, 7 Pi file tools, 39 total possible. For the Claude runtime today: 1 native tool (`Read`) and 1 bridged tool (`wp_cli`, restricted); 37 of 39 are not yet covered. The plan requires every entry mapped to a tested native equivalent or a shared bridge operation with no unexplained exclusions; none of these 37 has that yet, and each has an owning task above.
+Counted from code: 29 Studio definitions, 3 runtime-bound conditional, 7 Pi file tools, 39 total possible. The contract test derives this set from what real Pi turns register under every combination of UI, question handler and image service, rather than from this list. For the Claude runtime: 1 native tool (`Read`) and 1 bridged tool (`wp_cli`, restricted); 37 of 39 are not yet covered, each with its step above. The test fails if this table, the policy's enabled set and the bridge's listed tools disagree.
 
-Acceptance condition for each Claude row, per C2: a contract test and an outcome test that exercise the real tool, with required work settled before successful completion. These do not exist yet (`none yet`).
+Acceptance condition for each Claude row, per C2: a contract test and an outcome test that exercise the real tool, with required work settled before successful completion. The contract half exists for the statuses above (`tool-parity.test.ts`); the outcome tests per tool come with each tool's qualification (`none yet`).
 
 ### D.4 Behavior by conversation target (global, local site, live site)
 
