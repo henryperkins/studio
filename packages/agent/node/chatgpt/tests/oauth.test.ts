@@ -1508,6 +1508,9 @@ describe( 'Signing in to ChatGPT', () => {
 			const appFlow = app.createChatGptSignInFlow( {
 				discoveryUrl: fake.discoveryUrl,
 				credentials: broker,
+				// As every flow here: never this machine's own platform or socket tables.
+				platform: 'linux',
+				loopbackPeers: () => ( { ownerOf: async () => 'same-user', close: async () => undefined } ),
 			} );
 			flows.push( appFlow );
 
