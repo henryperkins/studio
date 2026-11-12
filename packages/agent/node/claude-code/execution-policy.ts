@@ -128,7 +128,17 @@ export interface ClaudeExecutionContext {
 	 * Every operation that does more than read is recorded this way before it runs.
 	 */
 	recordOperation: ( event: ClaudeOperationJournalEvent ) => Promise< void >;
+	/**
+	 * The turn carries the note of a recovery that left at least one operation
+	 * of the interrupted turn uncertain. For this turn only, everything that
+	 * does more than read asks first, saying so.
+	 */
+	uncertainAfterRecovery?: boolean;
 }
+
+/** What an approval the recovery gate asks for adds to its description. */
+const AFTER_RECOVERY =
+	'The previous turn was interrupted, so an attempt it made may already have taken effect.';
 
 /**
  * The outcome of reading the native sign-in: the turn's account, another
@@ -255,6 +265,25 @@ export function createClaudeExecutionPolicy(
 	const refuse = ( toolCallId: string, reason: string ) => {
 		if ( ! refusals.has( toolCallId ) ) refusals.set( toolCallId, new Set() );
 		refusals.get( toolCallId )!.add( reason );
+	};
+	// Whether an operation of this class asks the user first: by its class, or,
+	// in the turn after a recovery that left operations uncertain, whenever it
+	// does more than read.
+	const gatedAfterRecovery = ( operationClass: ClaudeOperationClass ) =>
+		context.uncertainAfterRecovery === true &&
+		! requiresClaudeApproval( operationClass ) &&
+		! isClaudeReadOnlyClass( operationClass );
+	const asksFirst = ( operationClass: ClaudeOperationClass ) =>
+		requiresClaudeApproval( operationClass ) || gatedAfterRecovery( operationClass );
+	const describe = (
+		operationClass: ClaudeOperationClass,
+		tool: string,
+		shell?: ClaudeShellConfinement
+	) => {
+		const description = describeClaudeOperation( operationClass, tool, shell );
+		return gatedAfterRecovery( operationClass )
+			? `${ description }. ${ AFTER_RECOVERY }`
+			: description;
 	};
 	// A tool use is asked about at most once, whether by the hook or by the
 	// permission request, so a hook that times out cannot be answered later.
@@ -555,13 +584,13 @@ export function createClaudeExecutionPolicy(
 		const operation = {
 			tool: toolName,
 			operationClass: rule.operationClass,
-			description: describeClaudeOperation(
+			description: describe(
 				rule.operationClass,
 				toolName,
 				rule.shell ? context.shellConfinement : undefined
 			),
 		};
-		if ( ! requiresClaudeApproval( rule.operationClass ) )
+		if ( ! asksFirst( rule.operationClass ) )
 			return ( await checkpoint( callSignal ) ) && admit( operation, use.toolUseId, callSignal );
 		const toolUseId = use.toolUseId;
 		if ( ! toolUseId || askedToolUses.has( toolUseId ) ) return false;
@@ -672,10 +701,10 @@ export function createClaudeExecutionPolicy(
 				remote = `WordPress.com site ${ scope.wpcomSiteId }`;
 			}
 		}
-		const description = describeClaudeOperation( operationClass, name );
+		const description = describe( operationClass, name );
 		// A tool approved at its host operations is journaled here too: the
 		// host operations it reaches are journaled again as they run.
-		if ( ! requiresClaudeApproval( operationClass ) || rule.approval === 'host' )
+		if ( ! asksFirst( operationClass ) || rule.approval === 'host' )
 			return (
 				( await checkpoint( callSignal ) ) &&
 				admit( { tool: name, operationClass, description }, toolCallId, callSignal )
@@ -746,7 +775,7 @@ export function createClaudeExecutionPolicy(
 			description:
 				draftTitle !== undefined && site
 					? 'Create a draft post on the current local site'
-					: describeClaudeOperation( operationClass, request.name ),
+					: describe( operationClass, request.name ),
 			...( draftTitle !== undefined && site
 				? {
 						draft: {
@@ -757,7 +786,7 @@ export function createClaudeExecutionPolicy(
 				  }
 				: {} ),
 		};
-		if ( ! requiresClaudeApproval( operationClass ) ) return { operation, site };
+		if ( ! asksFirst( operationClass ) ) return { operation, site };
 		const grant = await requestApproval( operation, toolCallId, callSignal );
 		return grant ? { operation, grant, site } : undefined;
 	}

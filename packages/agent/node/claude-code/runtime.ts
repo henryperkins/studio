@@ -271,11 +271,12 @@ const oneLine = ( text: unknown ) => String( text ).replace( /\s+/g, ' ' ).trim(
  * turn was interrupted and nothing was replayed; and, when operations of it
  * may or may not have taken effect, which ones, and to inspect the current
  * state before repeating any of them. Covers every recovery no prompt has
- * carried yet; undefined when there is none.
+ * carried yet; undefined when there is none. `uncertain` says whether it
+ * names any operation, which makes the turn ask before every change.
  */
-function recoveryNote(
+export function recoveryNote(
 	journals: ClaudeJournalEvent[][]
-): { text: string; locks: string[] } | undefined {
+): { text: string; locks: string[]; uncertain: boolean } | undefined {
 	const events = journals.flat();
 	const noted = new Set(
 		events.flatMap( ( event ) => ( event.type === 'turn.recovery-noted' ? event.locks : [] ) )
@@ -313,7 +314,11 @@ function recoveryNote(
 			...uncertain,
 			'Before repeating any of them, inspect the current state to see whether it already took effect. Do not repeat any of them automatically: repeat one only when the user’s request still needs it and your inspection shows that it did not take effect.'
 		);
-	return { text: lines.join( '\n' ), locks: recoveries.map( ( recovery ) => recovery.lock ) };
+	return {
+		text: lines.join( '\n' ),
+		locks: recoveries.map( ( recovery ) => recovery.lock ),
+		uncertain: uncertain.length > 0,
+	};
 }
 
 function nativeLaunchOptions(
@@ -923,6 +928,8 @@ export async function runClaudeTurn(
 			verifyTarget: ( expected ) => options.verifyTarget( snapshot, expected ),
 			onEvent: emit,
 			recordOperation: journalOnly,
+			// The turn that carries the note asks before every change.
+			uncertainAfterRecovery: note?.uncertain === true,
 		} );
 		const guard = policy;
 		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy: guard }, emit );
