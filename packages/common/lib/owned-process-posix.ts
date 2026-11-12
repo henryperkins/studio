@@ -15,26 +15,47 @@ import type {
  * (a daemonizing double fork, `setsid`, some job-control shells) leaves the
  * group and is not reached. Once the leader is reaped, a check and the signal
  * after it are separate system calls; only a complete wrap of the PID space in
- * between could make the group ID name an unrelated group.
+ * between could make the group ID name an unrelated group. Until the
+ * supervisor reports ready, nothing ends the group if Studio's process dies:
+ * the group leads its own session, so it outlives Studio.
  */
 
 // Start identities. Linux: the boot id and the start time in clock ticks from
 // /proc. Elsewhere: `ps` lstart in UTC, which has one-second resolution; macOS
 // assigns PIDs sequentially, so reuse within a second needs a full wrap.
+// Reads the proc filesystem at "$proc", which the keeper sets to /proc.
+// Returns 0 with the identity printed, 1 only when no such process runs (no
+// /proc entry; ps exiting 1 with no output; a zombie), and 2 for anything
+// that cannot be read or parsed, exactly as Node's probe decides.
 const PROBE = `probe() {
-	if [ -r /proc/self/stat ]; then
-		stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+	if [ -r "$proc/self/stat" ]; then
+		if ! stat=$(cat "$proc/$1/stat" 2>/dev/null); then
+			[ -e "$proc/$1" ] && return 2
+			return 1
+		fi
 		rest=\${stat##*) }
 		set -- $rest
 		case $1 in Z|X) return 1 ;; esac
-		IFS= read -r boot < /proc/sys/kernel/random/boot_id || return 2
+		case \${20} in ''|*[!0-9]*) return 2 ;; esac
+		IFS= read -r boot < "$proc/sys/kernel/random/boot_id" || return 2
+		case $boot in ''|*[!0-9a-fA-F-]*) return 2 ;; esac
+		[ \${#boot} -ge 8 ] && [ \${#boot} -le 64 ] || return 2
 		printf 'linux:%s:%s' "$boot" "\${20}"
 	else
-		out=$(TZ=UTC LC_ALL=C ps -o stat= -o lstart= -p "$1" 2>/dev/null) || return 1
-		[ -n "$out" ] || return 1
+		out=$(TZ=UTC LC_ALL=C ps -o stat= -o lstart= -p "$1" 2>/dev/null)
+		found=$?
+		[ "$found" -eq 1 ] && [ -z "$out" ] && return 1
+		[ "$found" -eq 0 ] && [ -n "$out" ] || return 2
 		set -- $out
+		[ $# -ge 1 ] || return 2
 		case $1 in Z*) return 1 ;; esac
 		shift
+		[ $# -eq 5 ] || return 2
+		case "$1 $2 $4 $5" in
+			[A-Z][a-z][a-z]' '[A-Z][a-z][a-z]' '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]' '[0-9][0-9][0-9][0-9]) ;;
+			*) return 2 ;;
+		esac
+		case $3 in [0-9]|[0-9][0-9]) ;; *) return 2 ;; esac
 		printf 'ps:%s' "$*"
 	fi
 }`;
@@ -69,7 +90,11 @@ done
 reap
 exit 0`;
 
-/** The shell function that prints a process's start identity exactly as Node reads it. */
+/**
+ * The shell function that prints a process's start identity exactly as Node
+ * reads it and returns 0, or returns 1 when no such process runs and 2 when
+ * that cannot be told. It reads the proc filesystem at `$proc`.
+ */
 export function posixProbeScript(): string {
 	return PROBE;
 }
@@ -78,7 +103,7 @@ export function posixProbeScript(): string {
 export function posixKeeperCommand( pgid: number, start: string ): SupervisedCommand {
 	return {
 		command: '/bin/sh',
-		args: [ '-c', `${ PROBE }\n${ KEEPER }`, 'sh', String( pgid ), start ],
+		args: [ '-c', `proc=/proc\n${ PROBE }\n${ KEEPER }`, 'sh', String( pgid ), start ],
 		env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
 		timeout: 30_000,
 	};

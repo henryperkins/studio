@@ -4,12 +4,13 @@
 import { execFile, fork, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter, once } from 'node:events';
-import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { promisify } from 'node:util';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
 	checkProcessIdentity,
 	prepareProcessOwner,
@@ -18,7 +19,21 @@ import {
 	type OwnedProcessSeams,
 	type ProcessIdentity,
 } from '@studio/common/lib/owned-process';
-import { posixProbeScript } from '@studio/common/lib/owned-process-posix';
+import { posixKeeperCommand, posixProbeScript } from '@studio/common/lib/owned-process-posix';
+import { windowsKeeperCommand } from '@studio/common/lib/owned-process-windows';
+import {
+	BOOT,
+	enoent,
+	errno,
+	exitChild,
+	fakeChild,
+	fakeSpawn,
+	keeperAnswering,
+	LEADER_STAT,
+	linuxSeams,
+	WINDOWS_START,
+	windowsSeams,
+} from './fixtures/owned-process-seams';
 import type { ChildProcess } from 'node:child_process';
 
 const exec = promisify( execFile );
@@ -48,16 +63,7 @@ function spawnOwnedProcess(
 	return prepareProcessOwner( seams ).spawn( command, args, options );
 }
 
-function enoent( file: string ) {
-	return Object.assign( new Error( `ENOENT: ${ file }` ), { code: 'ENOENT' } );
-}
-
-function errno( code: string ) {
-	return Object.assign( new Error( code ), { code } );
-}
-
 const STAT_AFTER_COMM = 'S 1 41 41 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 987654 1000 10';
-const BOOT = '6f1c1b6e-9a51-4c5d-8d1e-3b1a7c2f9e10';
 
 function linuxFiles( files: Record< string, string | Error > ): Partial< OwnedProcessSeams > {
 	return {
@@ -206,112 +212,7 @@ describe( 'process identity (injected seams)', () => {
 	} );
 } );
 
-interface FakeChild extends EventEmitter {
-	pid: number | undefined;
-	exitCode: number | null;
-	signalCode: NodeJS.Signals | null;
-	stdin: PassThrough;
-	stdout: PassThrough;
-	stderr: PassThrough;
-	killed: NodeJS.Signals[];
-	kill( signal?: NodeJS.Signals ): boolean;
-	unref(): void;
-}
-
-function fakeChild( pid: number | undefined ): FakeChild {
-	const child = new EventEmitter() as FakeChild;
-	Object.assign( child, {
-		pid,
-		exitCode: null,
-		signalCode: null,
-		stdin: new PassThrough(),
-		stdout: new PassThrough(),
-		stderr: new PassThrough(),
-		killed: [],
-		unref: () => {},
-	} );
-	child.kill = ( signal: NodeJS.Signals = 'SIGTERM' ) => {
-		child.killed.push( signal );
-		return true;
-	};
-	return child;
-}
-
-function exitChild( child: FakeChild, code = 0 ) {
-	child.exitCode = code;
-	child.emit( 'exit', code, null );
-}
-
-// A spawn seam: the Windows keeper (PowerShell) and the POSIX supervisor
-// (`-e`, whose first line names its keeper) are helpers; anything else is the
-// owned process. `keeper` gives the lines a keeper writes when it starts
-// (undefined) and in answer to each line it reads; null makes it exit.
-type KeeperScript = ( line: string | undefined ) => string[] | null;
-function fakeSpawn( owned: FakeChild, keeper: KeeperScript = () => [] ) {
-	const calls: Array< {
-		command: string;
-		args: readonly string[];
-		options: Record< string, unknown >;
-	} > = [];
-	const helpers: Array< { child: FakeChild; lines: string[] } > = [];
-	const spawnSeam = ( (
-		command: string,
-		args: readonly string[],
-		options: Record< string, unknown >
-	) => {
-		calls.push( { command, args, options } );
-		if ( args[ 0 ] !== '-e' && ! /powershell\.exe$/i.test( command ) ) return owned;
-		const child = fakeChild( 9000 + helpers.length );
-		const record = { child, lines: [] as string[] };
-		helpers.push( record );
-		const reply = ( line: string | undefined ) => {
-			const out = keeper( line );
-			setImmediate( () => {
-				if ( out === null ) return exitChild( child, 1 );
-				for ( const item of out ) child.stdout.write( item + '\n' );
-			} );
-		};
-		let configured = args[ 0 ] !== '-e';
-		if ( configured ) reply( undefined );
-		let buffer = '';
-		child.stdin.setEncoding( 'utf8' );
-		child.stdin.on( 'data', ( chunk: string ) => {
-			buffer += chunk;
-			for ( let end = buffer.indexOf( '\n' ); end >= 0; end = buffer.indexOf( '\n' ) ) {
-				const line = buffer.slice( 0, end );
-				buffer = buffer.slice( end + 1 );
-				record.lines.push( line );
-				if ( configured ) reply( line );
-				else {
-					configured = true;
-					reply( undefined );
-				}
-			}
-		} );
-		child.stdin.on( 'finish', () => setImmediate( () => exitChild( child ) ) );
-		return child;
-	} ) as unknown as OwnedProcessSeams[ 'spawn' ];
-	return { spawn: spawnSeam, calls, helpers };
-}
-
 describe( 'POSIX group ownership (injected seams)', () => {
-	const leaderStat = `500 (claude) S 1 500 500 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 777 1000 10`;
-	// Reads `files` live, so a test can change what /proc shows after the fact.
-	function posix( files: Record< string, string | Error >, kill: OwnedProcessSeams[ 'kill' ] ) {
-		return {
-			platform: 'linux',
-			readFile: async ( file: string ) => {
-				const value = file === '/proc/sys/kernel/random/boot_id' ? `${ BOOT }\n` : files[ file ];
-				if ( value === undefined ) throw enoent( file );
-				if ( value instanceof Error ) throw value;
-				return value;
-			},
-			kill,
-			nodePath: '/usr/bin/node',
-			delay: () => new Promise< void >( ( resolve ) => setImmediate( resolve ) ),
-		} satisfies Partial< OwnedProcessSeams >;
-	}
-
 	it( 'starts the process in its own group, asks the whole group to stop, then kills only that group', async () => {
 		const child = fakeChild( 500 );
 		const { spawn: spawnSeam, calls } = fakeSpawn( child );
@@ -322,7 +223,7 @@ describe( 'POSIX group ownership (injected seams)', () => {
 			[ '--print' ],
 			{ cwd: '/site', env: { PATH: '/bin' } },
 			{
-				...posix( { '/proc/500/stat': leaderStat }, ( pid, signal ) => {
+				...linuxSeams( { '/proc/500/stat': LEADER_STAT }, ( pid, signal ) => {
 					signals.push( [ pid, signal ] );
 					if ( signal === 'SIGKILL' ) groupAlive = false;
 					if ( signal === 0 && ! groupAlive ) throw errno( 'ESRCH' );
@@ -353,20 +254,20 @@ describe( 'POSIX group ownership (injected seams)', () => {
 	it( 'leaves a group alone once its leader was reaped and another process holds the ID', async () => {
 		const child = fakeChild( 500 );
 		const { spawn: spawnSeam } = fakeSpawn( child );
-		const files: Record< string, string > = { '/proc/500/stat': leaderStat };
+		const files: Record< string, string > = { '/proc/500/stat': LEADER_STAT };
 		const signals: Array< [ number, NodeJS.Signals | 0 ] > = [];
 		const owned = spawnOwnedProcess(
 			'/opt/claude',
 			[],
 			{ env: {} },
 			{
-				...posix( files, ( pid, signal ) => void signals.push( [ pid, signal ] ) ),
+				...linuxSeams( files, ( pid, signal ) => void signals.push( [ pid, signal ] ) ),
 				spawn: spawnSeam,
 			}
 		);
 		expect( await owned.ready() ).toBe( true );
 		exitChild( child );
-		files[ '/proc/500/stat' ] = leaderStat.replace( ' 777 ', ' 901 ' );
+		files[ '/proc/500/stat' ] = LEADER_STAT.replace( ' 777 ', ' 901 ' );
 		expect( await owned.terminate( 1000 ) ).toBe( true );
 		expect( signals ).toEqual( [] );
 	} );
@@ -374,7 +275,7 @@ describe( 'POSIX group ownership (injected seams)', () => {
 	it( 'kills an orphaned group whose leader is gone, and stops when the group is empty', async () => {
 		const child = fakeChild( 500 );
 		const { spawn: spawnSeam } = fakeSpawn( child );
-		const files: Record< string, string > = { '/proc/500/stat': leaderStat };
+		const files: Record< string, string > = { '/proc/500/stat': LEADER_STAT };
 		const signals: Array< [ number, NodeJS.Signals | 0 ] > = [];
 		let members = 1;
 		const owned = spawnOwnedProcess(
@@ -382,7 +283,7 @@ describe( 'POSIX group ownership (injected seams)', () => {
 			[],
 			{ env: {} },
 			{
-				...posix( files, ( pid, signal ) => {
+				...linuxSeams( files, ( pid, signal ) => {
 					signals.push( [ pid, signal ] );
 					if ( signal === 'SIGKILL' ) members = 0;
 					if ( signal === 0 && ! members ) throw errno( 'ESRCH' );
@@ -400,14 +301,14 @@ describe( 'POSIX group ownership (injected seams)', () => {
 	it( 'does not signal a reaped group it cannot verify, and reports the tree as not stopped', async () => {
 		const child = fakeChild( 500 );
 		const { spawn: spawnSeam } = fakeSpawn( child );
-		const files: Record< string, string | Error > = { '/proc/500/stat': leaderStat };
+		const files: Record< string, string | Error > = { '/proc/500/stat': LEADER_STAT };
 		const signals: Array< [ number, NodeJS.Signals | 0 ] > = [];
 		const owned = spawnOwnedProcess(
 			'/opt/claude',
 			[],
 			{ env: {} },
 			{
-				...posix( files, ( pid, signal ) => void signals.push( [ pid, signal ] ) ),
+				...linuxSeams( files, ( pid, signal ) => void signals.push( [ pid, signal ] ) ),
 				spawn: spawnSeam,
 			}
 		);
@@ -427,7 +328,7 @@ describe( 'POSIX group ownership (injected seams)', () => {
 			[],
 			{ env: {} },
 			{
-				...posix( { '/proc/500/stat': errno( 'EACCES' ) }, ( pid, signal ) => {
+				...linuxSeams( { '/proc/500/stat': errno( 'EACCES' ) }, ( pid, signal ) => {
 					signals.push( [ pid, signal ] );
 					if ( signal === 'SIGKILL' ) setImmediate( () => exitChild( child ) );
 				} ),
@@ -457,7 +358,7 @@ describe( 'POSIX group ownership (injected seams)', () => {
 			[],
 			{ env: {}, supervise: true },
 			{
-				...posix( { '/proc/500/stat': leaderStat }, ( _pid, signal ) => {
+				...linuxSeams( { '/proc/500/stat': LEADER_STAT }, ( _pid, signal ) => {
 					if ( signal === 'SIGKILL' ) alive = false;
 					if ( signal === 0 && ! alive ) throw errno( 'ESRCH' );
 				} ),
@@ -485,53 +386,274 @@ describe( 'POSIX group ownership (injected seams)', () => {
 			'/opt/claude',
 			[],
 			{ env: {}, supervise: true },
-			{ ...posix( { '/proc/500/stat': leaderStat }, () => {} ), spawn: spawnSeam }
+			{ ...linuxSeams( { '/proc/500/stat': LEADER_STAT }, () => {} ), spawn: spawnSeam }
 		);
 		expect( await owned.ready() ).toBe( false );
 	} );
+	it( 'reports a leader that is already a zombie as exited', async () => {
+		const child = fakeChild( 500 );
+		const { spawn: spawnSeam } = fakeSpawn( child );
+		const owned = spawnOwnedProcess(
+			'/opt/claude',
+			[],
+			{ env: {} },
+			{
+				...linuxSeams( { '/proc/500/stat': LEADER_STAT.replace( ' S ', ' Z ' ) }, () => {} ),
+				spawn: spawnSeam,
+			}
+		);
+		expect( await owned.ready() ).toBe( false );
+		expect( owned.failure() ).toBe( 'process-exited' );
+	} );
+
+	it( 'reports a process that did not start, with nothing to signal', async () => {
+		const signals: Array< [ number, NodeJS.Signals | 0 ] > = [];
+		const { spawn: spawnSeam } = fakeSpawn( fakeChild( undefined ) );
+		const owned = spawnOwnedProcess(
+			'/opt/missing',
+			[],
+			{ env: {} },
+			{
+				...linuxSeams( {}, ( pid, signal ) => void signals.push( [ pid, signal ] ) ),
+				spawn: spawnSeam,
+			}
+		);
+		expect( await owned.ready() ).toBe( false );
+		expect( owned.failure() ).toBe( 'spawn-failed' );
+		expect( await owned.shutdown( { graceMs: 0 } ) ).toBe( true );
+		expect( signals ).toEqual( [] );
+	} );
+
+	it.each( [
+		[ 'is empty', true ],
+		[ 'still has members', false ],
+	] )(
+		'after a leader was reaped before its identity was read, counts its group as ended only when the group %s, and never signals it',
+		async ( _name, empty ) => {
+			const child = fakeChild( 500 );
+			const { spawn: spawnSeam } = fakeSpawn( child );
+			const signals: Array< [ number, NodeJS.Signals | 0 ] > = [];
+			const owned = spawnOwnedProcess(
+				'/opt/claude',
+				[],
+				{ env: {}, supervise: true },
+				{
+					...linuxSeams( {}, ( pid, signal ) => {
+						signals.push( [ pid, signal ] );
+						if ( signal === 0 && empty ) throw errno( 'ESRCH' );
+					} ),
+					readFile: async ( file: string ) => {
+						// The leader exits, and is reaped, while its identity is read.
+						if ( child.exitCode === null ) exitChild( child );
+						throw enoent( file );
+					},
+					spawn: spawnSeam,
+				}
+			);
+			expect( await owned.ready() ).toBe( false );
+			expect( owned.failure() ).toBe( 'process-exited' );
+			expect( await owned.shutdown( { graceMs: 0, timeoutMs: 200 } ) ).toBe( empty );
+			expect( signals.filter( ( [ , signal ] ) => signal !== 0 ) ).toEqual( [] );
+			expect( signals.every( ( [ pid ] ) => pid === -500 ) ).toBe( true );
+		}
+	);
 } );
 
+// A POSIX shell for the shell probe and keeper: /bin/sh, or on Windows the sh
+// that Git for Windows installs, which reads the same fake /proc and stub ps.
+function posixShell(): string | undefined {
+	if ( process.platform !== 'win32' ) return '/bin/sh';
+	const candidate = path.win32.join(
+		process.env.ProgramFiles ?? 'C:\\Program Files',
+		'Git',
+		'bin',
+		'sh.exe'
+	);
+	return existsSync( candidate ) ? candidate : undefined;
+}
+const SHELL = posixShell();
+// The path a shell given by `posixShell` sees for a local path.
+const shellPath = ( local: string ) =>
+	process.platform === 'win32'
+		? '/' + local[ 0 ].toLowerCase() + local.slice( 2 ).split( path.sep ).join( '/' )
+		: local;
+
+describe.skipIf( ! SHELL )(
+	'POSIX shell probe and keeper (injected /proc and ps, run by a POSIX shell; skipped without one)',
+	() => {
+		let root: string;
+		beforeAll( async () => {
+			root = await realpath( await mkdtemp( path.join( os.tmpdir(), 'studio-shell-probe-' ) ) );
+			await mkdir( path.join( root, 'stub' ) );
+			await writeFile(
+				path.join( root, 'stub', 'ps' ),
+				'#!/bin/sh\n[ -n "$PS_OUT" ] && printf \'%s\\n\' "$PS_OUT"\nexit "$PS_CODE"\n',
+				{ mode: 0o755 }
+			);
+		} );
+		afterAll( async () => {
+			if ( root )
+				await rm( root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 } );
+		} );
+
+		// A fake proc filesystem: `self` selects the Linux probe; `stat` of
+		// null leaves the process out; an Error makes its stat unreadable.
+		async function procRoot(
+			name: string,
+			files: { self: boolean; stat?: string | null | Error; boot?: boolean }
+		) {
+			const proc = path.join( root, name );
+			await mkdir( proc );
+			if ( files.self ) {
+				await mkdir( path.join( proc, 'self' ) );
+				await writeFile( path.join( proc, 'self', 'stat' ), `1 (sh) ${ STAT_AFTER_COMM }` );
+			}
+			if ( files.boot !== false ) {
+				await mkdir( path.join( proc, 'sys', 'kernel', 'random' ), { recursive: true } );
+				await writeFile( path.join( proc, 'sys', 'kernel', 'random', 'boot_id' ), `${ BOOT }\n` );
+			}
+			if ( files.stat instanceof Error )
+				await mkdir( path.join( proc, '41', 'stat' ), { recursive: true } );
+			else if ( typeof files.stat === 'string' ) {
+				await mkdir( path.join( proc, '41' ) );
+				await writeFile( path.join( proc, '41', 'stat' ), files.stat );
+			}
+			return proc;
+		}
+
+		async function shellProbe( proc: string, ps: { out?: string; code?: number } = {} ) {
+			const { stdout } = await exec(
+				SHELL!,
+				[
+					'-c',
+					`PATH="$2:$PATH"\nproc=$1\n${ posixProbeScript() }\nprobe 41\nprintf ' rc=%s' $?`,
+					'sh',
+					shellPath( proc ),
+					shellPath( path.join( root, 'stub' ) ),
+				],
+				{ env: { ...process.env, PS_OUT: ps.out ?? '', PS_CODE: String( ps.code ?? 0 ) } }
+			);
+			const found = / rc=(\d)$/.exec( stdout );
+			return { token: stdout.slice( 0, found!.index ), rc: Number( found![ 1 ] ) };
+		}
+
+		const RC = { running: 0, gone: 1, unknown: 2 } as const;
+
+		// What Node's probe reads for PID 41 through `seams`.
+		async function nodeProbe( seams: Partial< OwnedProcessSeams > ) {
+			const identity = await readProcessIdentity( 41, seams );
+			if ( identity ) return { state: 'running' as const, start: identity.start };
+			const check = await checkProcessIdentity( { pid: 41, start: 'none' }, seams );
+			return { state: check === 'unknown' ? ( 'unknown' as const ) : ( 'gone' as const ) };
+		}
+
+		it.each( [
+			[ 'a running process', { stat: `41 (a b) ${ STAT_AFTER_COMM }` }, 'running' ],
+			[ 'no process', { stat: null }, 'gone' ],
+			[ 'a zombie', { stat: `41 (a) ${ STAT_AFTER_COMM.replace( /^S/, 'Z' ) }` }, 'gone' ],
+			[ 'a dead process', { stat: `41 (a) ${ STAT_AFTER_COMM.replace( /^S/, 'X' ) }` }, 'gone' ],
+			[ 'an unreadable stat', { stat: errno( 'EISDIR' ) }, 'unknown' ],
+			[ 'a missing boot id', { stat: `41 (a) ${ STAT_AFTER_COMM }`, boot: false }, 'unknown' ],
+			[ 'a short stat', { stat: '41 (a) S 1 41' }, 'unknown' ],
+			[
+				'a start time that is not a number',
+				{ stat: `41 (a) ${ STAT_AFTER_COMM.replace( '987654', '98x654' ) }` },
+				'unknown',
+			],
+		] as const )( 'classifies %s on Linux as Node does', async ( name, files, state ) => {
+			const proc = await procRoot( `linux ${ name }`, { self: true, ...files } );
+			const node = await nodeProbe(
+				linuxFiles( {
+					...( files.stat === null ? {} : { '/proc/41/stat': files.stat } ),
+					...( 'boot' in files ? {} : { '/proc/sys/kernel/random/boot_id': `${ BOOT }\n` } ),
+				} )
+			);
+			expect( node.state ).toBe( state );
+			const shell = await shellProbe( proc );
+			expect( shell.rc ).toBe( RC[ state ] );
+			if ( node.state === 'running' ) expect( shell.token ).toBe( node.start );
+		} );
+
+		it.each( [
+			[ 'a running process', { out: 'Ss   Wed Nov  1 10:30:54 2026', code: 0 }, 'running' ],
+			[ 'no process', { out: '', code: 1 }, 'gone' ],
+			[ 'a zombie', { out: 'Z    Wed Nov  1 10:30:54 2026', code: 0 }, 'gone' ],
+			[ 'ps failing', { out: '', code: 2 }, 'unknown' ],
+			[ 'ps failing with output', { out: 'ps: illegal option', code: 1 }, 'unknown' ],
+			[ 'empty output', { out: '', code: 0 }, 'unknown' ],
+			[ 'an unreadable start time', { out: 'S    not a date', code: 0 }, 'unknown' ],
+		] as const )( 'classifies %s from ps as Node does', async ( name, ps, state ) => {
+			const proc = await procRoot( `ps ${ name }`, { self: false, boot: false } );
+			const node = await nodeProbe( {
+				platform: 'darwin',
+				run: async () => ( { code: ps.code, stdout: ps.out ? ps.out + '\n' : '' } ),
+			} );
+			expect( node.state ).toBe( state );
+			const shell = await shellProbe( proc, ps );
+			expect( shell.rc ).toBe( RC[ state ] );
+			if ( node.state === 'running' ) expect( shell.token ).toBe( node.start );
+		} );
+
+		it.each( [
+			[ 'is still the leader', { stat: `41 (a) ${ STAT_AFTER_COMM }` }, true ],
+			[ 'is gone, leaving the group', { stat: null }, true ],
+			[
+				'is another process now',
+				{ stat: `41 (a) ${ STAT_AFTER_COMM.replace( '987654', '987655' ) }` },
+				false,
+			],
+			[ 'cannot be read', { stat: errno( 'EACCES' ) }, false ],
+			[ 'has no readable boot id', { stat: `41 (a) ${ STAT_AFTER_COMM }`, boot: false }, false ],
+		] as const )(
+			'has the keeper signal the group when the owner is gone only if its leader %s',
+			async ( name, files, signalled ) => {
+				const proc = await procRoot( `keeper ${ name }`, { self: true, ...files } );
+				const log = path.join( root, `keeper ${ name }.log` );
+				await writeFile( log, '' );
+				const keeper = posixKeeperCommand( 41, `linux:${ BOOT }:987654` );
+				const script = keeper.args[ 1 ];
+				expect( script.startsWith( 'proc=/proc\n' ) ).toBe( true );
+				// The keeper's own `kill` is replaced by one that records it; `kill -0` finds no group.
+				const stubbed = script.replace(
+					'proc=/proc\n',
+					`proc='${ shellPath( proc ) }'\nkill() { printf '%s\\n' "$*" >> '${ shellPath(
+						log
+					) }'; [ "$1" != -0 ]; }\n`
+				);
+				const run = execFile( SHELL!, [ '-c', stubbed, 'sh', '41', keeper.args[ 4 ] ] );
+				run.stdin!.end( 'gone\n' );
+				const [ code ] = await once( run, 'exit' );
+				expect( code ).toBe( 0 );
+				const signals = ( await readFile( log, 'utf8' ) )
+					.split( '\n' )
+					.filter( ( line ) => line && ! line.startsWith( '-0 ' ) );
+				expect( signals ).toEqual( signalled ? [ '-s TERM -- -41', '-s KILL -- -41' ] : [] );
+			}
+		);
+	}
+);
+
 describe( 'Windows job ownership (injected seams)', () => {
-	const START = '134389060548247995';
 	const POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-	const seams = {
-		platform: 'win32',
-		env: { SystemRoot: 'C:\\Windows', TEMP: 'C:\\Temp', PATH: 'C:\\elsewhere' },
-		nodePath: 'C:\\node\\node.exe',
-		kill: () => {
-			throw new Error( 'Windows ownership must never signal a bare PID' );
-		},
-		run: async () => {
-			throw new Error( 'The keeper reads identities itself' );
-		},
-		delay: () => new Promise< void >( ( resolve ) => setImmediate( resolve ) ),
-	} satisfies Partial< OwnedProcessSeams >;
 	const decode = ( args: readonly string[] ) =>
 		Buffer.from( args[ 3 ], 'base64' ).toString( 'utf16le' );
-	// A keeper that answers like the real one, with `overrides` for some lines.
-	const keeperAnswering =
-		(
-			overrides: Record< string, readonly string[] | null | ( () => string[] | null ) > = {}
-		): KeeperScript =>
-		( line ) => {
-			const key = line ?? 'start';
-			if ( key in overrides ) {
-				const answer = overrides[ key ];
-				return typeof answer === 'function' ? answer() : answer && [ ...answer ];
-			}
-			if ( line === undefined ) return [ 'prepared' ];
-			if ( line.startsWith( 'own ' ) ) return [ `assigned ${ START }` ];
-			if ( line === 'confirm' ) return [ `ready ${ START } in-job` ];
-			if ( line.startsWith( 'reap ' ) ) return [ 'reaped clean' ];
-			if ( line === 'children' ) return [ 'children 0' ];
-			if ( line === 'active' ) return [ 'active 0' ];
-			return [];
+	const keeperScript = ( input: string | undefined ) =>
+		Buffer.from( input ?? '', 'base64' ).toString( 'utf8' );
+	// A child that exits when it is killed through its own handle.
+	function killableChild() {
+		const child = fakeChild( 4242 );
+		child.kill = ( signal: NodeJS.Signals = 'SIGTERM' ) => {
+			child.killed.push( signal );
+			setImmediate( () => exitChild( child, 1 ) );
+			return true;
 		};
+		return child;
+	}
 
 	it( 'prepares the job before the process exists, assigns it at once and ends the tree through the job', async () => {
 		const child = fakeChild( 4242 );
 		const { spawn: spawnSeam, calls, helpers } = fakeSpawn( child, keeperAnswering() );
-		const owner = prepareProcessOwner( { ...seams, spawn: spawnSeam } );
+		const owner = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } );
 		expect( calls ).toHaveLength( 1 );
 		expect( calls[ 0 ].command ).toBe( POWERSHELL );
 		expect( calls[ 0 ].options ).toMatchObject( {
@@ -540,32 +662,47 @@ describe( 'Windows job ownership (injected seams)', () => {
 		} );
 		expect( calls[ 0 ].options.env ).not.toHaveProperty( 'PATH' );
 		expect( calls[ 0 ].options.detached ).toBeFalsy();
-		const script = decode( calls[ 0 ].args );
+		expect( await owner.prepared() ).toBe( true );
+		const script = keeperScript( helpers[ 0 ].input );
 		expect( script ).toContain( 'Add-Type -TypeDefinition $source' );
 		// Kill on close is the job's only limit: no breakaway flag is ever set.
 		expect( script ).toContain( 'info.Basic.LimitFlags = KillOnJobClose;' );
 		expect( script.match( /LimitFlags =/g ) ).toHaveLength( 1 );
-		expect( await owner.prepared() ).toBe( true );
 		const owned = owner.spawn( 'C:\\claude.exe', [ '--print' ], { env: {} } );
 		expect( calls[ 1 ] ).toMatchObject( {
 			command: 'C:\\claude.exe',
 			options: { detached: false, windowsHide: true, stdio: 'pipe' },
 		} );
 		expect( await owned.ready() ).toBe( true );
-		expect( owned.identity() ).toEqual( { pid: 4242, start: START } );
+		expect( owned.identity() ).toEqual( { pid: 4242, start: WINDOWS_START } );
 		expect( helpers[ 0 ].lines ).toEqual( [ 'own 4242', 'confirm' ] );
 		expect( await owned.shutdown( { graceMs: 0, timeoutMs: 1000 } ) ).toBe( true );
 		expect( helpers[ 0 ].lines.slice( 2 ) ).toEqual( [ 'reap 1000', 'release' ] );
 		expect( child.killed ).toEqual( [] );
 	} );
 
+	it( 'starts the keeper with a short command line and sends its script as its first line of input', async () => {
+		const { spawn: spawnSeam, calls, helpers } = fakeSpawn( fakeChild( 1 ), keeperAnswering() );
+		const owner = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } );
+		expect( await owner.prepared() ).toBe( true );
+		// Windows caps a command line at 32,767 characters; the keeper's stays far below.
+		const commandLine = [ calls[ 0 ].command, ...calls[ 0 ].args ].join( ' ' );
+		expect( commandLine.length ).toBeLessThan( 2_000 );
+		expect( decode( calls[ 0 ].args ) ).not.toContain( 'Add-Type' );
+		expect( decode( calls[ 0 ].args ) ).toContain( "'FullLanguage'" );
+		expect( helpers[ 0 ].input ).toMatch( /^[A-Za-z0-9+/]+=*$/ );
+		expect( keeperScript( helpers[ 0 ].input ) ).toContain( 'Add-Type -TypeDefinition $source' );
+	} );
+
 	it( 'gives the keeper the same script for every run, with no input in it', async () => {
-		const scripts = [ 1, 2 ].map( () => {
-			const { spawn: spawnSeam, calls } = fakeSpawn( fakeChild( 1 ), keeperAnswering() );
-			prepareProcessOwner( { ...seams, spawn: spawnSeam } );
-			return decode( calls[ 0 ].args );
-		} );
-		expect( scripts[ 0 ] ).toBe( scripts[ 1 ] );
+		const runs = await Promise.all(
+			[ 1, 2 ].map( async () => {
+				const { spawn: spawnSeam, calls, helpers } = fakeSpawn( fakeChild( 1 ), keeperAnswering() );
+				await prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).prepared();
+				return [ decode( calls[ 0 ].args ), helpers[ 0 ].input ];
+			} )
+		);
+		expect( runs[ 0 ] ).toEqual( runs[ 1 ] );
 	} );
 
 	it.each( [
@@ -574,63 +711,178 @@ describe( 'Windows job ownership (injected seams)', () => {
 			{ start: [ 'failed keeper 0' ] },
 			'keeper-unavailable',
 		],
+		[
+			'a keeper outside Full Language mode',
+			{ start: [ 'failed keeper language' ] },
+			'keeper-blocked',
+		],
 		[ 'a keeper that cannot create the job', { start: [ 'failed job 1450' ] }, 'job-unavailable' ],
 		[ 'a keeper that exits at once', { start: null }, 'keeper-unavailable' ],
 	] as const )( 'is not prepared, and says why, for %s', async ( _name, overrides, failure ) => {
 		const { spawn: spawnSeam } = fakeSpawn( fakeChild( 4242 ), keeperAnswering( overrides ) );
-		const owner = prepareProcessOwner( { ...seams, spawn: spawnSeam } );
+		const owner = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } );
 		expect( await owner.prepared() ).toBe( false );
 		expect( owner.failure() ).toBe( failure );
 	} );
 
-	it.each( [
-		[ 'denied', 'failed assign 5 ' + START, 'job-assignment-denied' ],
-		[ 'refused otherwise', 'failed assign 1 ' + START, 'job-assignment-failed' ],
-	] as const )(
-		'fails closed when the assignment is %s, ends the child through its own handle and checks it left no child',
-		async ( _name, answer, failure ) => {
-			const child = fakeChild( 4242 );
-			child.kill = ( signal: NodeJS.Signals = 'SIGTERM' ) => {
-				child.killed.push( signal );
-				setImmediate( () => exitChild( child, 1 ) );
-				return true;
-			};
-			const { spawn: spawnSeam, helpers } = fakeSpawn(
-				child,
-				keeperAnswering( { 'own 4242': [ answer ] } )
-			);
-			const owned = prepareProcessOwner( { ...seams, spawn: spawnSeam } ).spawn(
+	it( 'reports a keeper that does not answer in time as timed out, not as unavailable', async () => {
+		vi.useFakeTimers( { toFake: [ 'setTimeout', 'clearTimeout' ] } );
+		try {
+			const { spawn: spawnSeam } = fakeSpawn( fakeChild( 4242 ), keeperAnswering( { start: [] } ) );
+			const owner = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } );
+			const prepared = owner.prepared();
+			await vi.advanceTimersByTimeAsync( 60_000 );
+			expect( await prepared ).toBe( false );
+			expect( owner.failure() ).toBe( 'keeper-timeout' );
+
+			const late = fakeSpawn( fakeChild( 4242 ), keeperAnswering( { 'own 4242': [] } ) );
+			const owned = prepareProcessOwner( { ...windowsSeams, spawn: late.spawn } ).spawn(
 				'C:\\claude.exe',
 				[],
-				{
-					env: {},
-				}
+				{ env: {} }
+			);
+			const ready = owned.ready();
+			await vi.advanceTimersByTimeAsync( 30_000 );
+			expect( await ready ).toBe( false );
+			expect( owned.failure() ).toBe( 'keeper-timeout' );
+		} finally {
+			vi.useRealTimers();
+		}
+	} );
+
+	it( 'reports a process that did not start, with nothing left to end', async () => {
+		const unstarted = fakeSpawn( fakeChild( undefined ), keeperAnswering() );
+		const owned = prepareProcessOwner( { ...windowsSeams, spawn: unstarted.spawn } ).spawn(
+			'C:\\missing.exe',
+			[],
+			{ env: {} }
+		);
+		expect( await owned.ready() ).toBe( false );
+		expect( owned.failure() ).toBe( 'spawn-failed' );
+		expect( await owned.shutdown( { graceMs: 0 } ) ).toBe( true );
+	} );
+
+	it( 'releases the keeper when the spawn throws before any process exists', async () => {
+		const throwing = fakeSpawn( () => {
+			throw Object.assign( new Error( 'spawn EINVAL' ), { code: 'EINVAL' } );
+		}, keeperAnswering() );
+		const owner = prepareProcessOwner( { ...windowsSeams, spawn: throwing.spawn } );
+		expect( await owner.prepared() ).toBe( true );
+		expect( () => owner.spawn( 'C:\\claude.exe', [], { env: {} } ) ).toThrow( 'EINVAL' );
+		await owner.dispose();
+		expect( throwing.helpers[ 0 ].lines ).toEqual( [ 'release' ] );
+		expect( throwing.helpers[ 0 ].child.exitCode ).not.toBeNull();
+	} );
+
+	it( 'ends the keeper of an owner disposed while its job is still being prepared', async () => {
+		const { spawn: spawnSeam, helpers } = fakeSpawn(
+			fakeChild( 4242 ),
+			keeperAnswering( { start: [] } )
+		);
+		const owner = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } );
+		await owner.dispose();
+		expect( helpers[ 0 ].lines ).toEqual( [ 'release' ] );
+		expect( helpers[ 0 ].child.exitCode ).not.toBeNull();
+	} );
+
+	it.each( [
+		[ 'denied', 'failed assign 5 ' + WINDOWS_START, 'job-assignment-denied' ],
+		[ 'refused otherwise', 'failed assign 1 ' + WINDOWS_START, 'job-assignment-failed' ],
+	] as const )(
+		'fails closed when the assignment is %s: ends the child and its provable tree, and never reports the tree as stopped',
+		async ( _name, answer, failure ) => {
+			const child = killableChild();
+			const { spawn: spawnSeam, helpers } = fakeSpawn(
+				child,
+				// The keeper finds nothing left to end, which is also what a
+				// grandchild whose parent already exited looks like.
+				keeperAnswering( { 'own 4242': [ answer ], 'end-tree': [ 'ended 0' ] } )
+			);
+			const owned = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).spawn(
+				'C:\\claude.exe',
+				[],
+				{ env: {} }
 			);
 			expect( await owned.ready() ).toBe( false );
 			expect( owned.failure() ).toBe( failure );
 			expect( owned.identity() ).toBeUndefined();
-			expect( await owned.shutdown( { graceMs: 0, timeoutMs: 1000 } ) ).toBe( true );
+			expect( await owned.shutdown( { graceMs: 0, timeoutMs: 1000 } ) ).toBe( false );
 			expect( child.killed ).toEqual( [ 'SIGKILL' ] );
-			expect( helpers[ 0 ].lines ).toEqual( [ 'own 4242', 'children', 'release' ] );
+			expect( helpers[ 0 ].lines ).toEqual( [ 'own 4242', 'end-tree', 'release' ] );
 		}
 	);
+
+	it( 'ends no tree through a handle opened after its child was reaped', async () => {
+		const child = fakeChild( 4242 );
+		const { spawn: spawnSeam, helpers } = fakeSpawn(
+			child,
+			keeperAnswering( {
+				'own 4242': () => {
+					exitChild( child );
+					return [ 'failed assign 5 ' + WINDOWS_START ];
+				},
+			} )
+		);
+		const owned = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).spawn(
+			'C:\\claude.exe',
+			[],
+			{ env: {} }
+		);
+		expect( await owned.ready() ).toBe( false );
+		expect( await owned.shutdown( { graceMs: 0, timeoutMs: 1000 } ) ).toBe( false );
+		expect( helpers[ 0 ].lines ).toEqual( [ 'own 4242', 'release' ] );
+		expect( child.killed ).toEqual( [] );
+	} );
 
 	it.each( [
 		[ 'cannot be limited', 'failed limit 87', 'job-unverified' ],
 		[ 'does not show the process', 'failed verify 0', 'job-unverified' ],
 		[ 'finds a child already outside it', 'failed outside 1', 'job-incomplete' ],
-	] as const )( 'fails closed when the job %s', async ( _name, answer, failure ) => {
-		const child = fakeChild( 4242 );
-		const { spawn: spawnSeam } = fakeSpawn( child, keeperAnswering( { confirm: [ answer ] } ) );
-		const owned = prepareProcessOwner( { ...seams, spawn: spawnSeam } ).spawn(
+	] as const )(
+		'fails closed when the job %s: ends the provable tree, then the job, and never reports the tree as stopped',
+		async ( _name, answer, failure ) => {
+			const child = killableChild();
+			const { spawn: spawnSeam, helpers } = fakeSpawn(
+				child,
+				keeperAnswering( { confirm: [ answer ], 'end-tree': [ 'ended 0' ] } )
+			);
+			const owned = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).spawn(
+				'C:\\claude.exe',
+				[],
+				{ env: {} }
+			);
+			expect( await owned.ready() ).toBe( false );
+			expect( owned.failure() ).toBe( failure );
+			expect( await owned.shutdown( { graceMs: 0, timeoutMs: 1000 } ) ).toBe( false );
+			expect( helpers[ 0 ].lines ).toEqual( [
+				'own 4242',
+				'confirm',
+				'end-tree',
+				'reap 1000',
+				'release',
+			] );
+		}
+	);
+
+	it.each( [
+		[ 'failed open 87', 'process-exited' ],
+		[ 'failed open 5', 'process-unavailable' ],
+		[ 'failed start 0', 'identity-unavailable' ],
+	] as const )( 'reports %s as %s, and the tree as not stopped', async ( answer, failure ) => {
+		const child = killableChild();
+		const { spawn: spawnSeam, helpers } = fakeSpawn(
+			child,
+			keeperAnswering( { 'own 4242': [ answer ] } )
+		);
+		const owned = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).spawn(
 			'C:\\claude.exe',
 			[],
-			{
-				env: {},
-			}
+			{ env: {} }
 		);
 		expect( await owned.ready() ).toBe( false );
 		expect( owned.failure() ).toBe( failure );
+		expect( await owned.shutdown( { graceMs: 0, timeoutMs: 1000 } ) ).toBe( false );
+		expect( helpers[ 0 ].lines ).toEqual( [ 'own 4242', 'release' ] );
 	} );
 
 	it( 'trusts an assignment only if the child was still unreaped when it was reported, and then kills nothing', async () => {
@@ -640,32 +892,29 @@ describe( 'Windows job ownership (injected seams)', () => {
 			keeperAnswering( {
 				'own 4242': () => {
 					exitChild( child );
-					return [ `assigned ${ START }` ];
+					return [ `assigned ${ WINDOWS_START }` ];
 				},
 			} )
 		);
-		const owned = prepareProcessOwner( { ...seams, spawn: spawnSeam } ).spawn(
+		const owned = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).spawn(
 			'C:\\claude.exe',
 			[],
-			{
-				env: {},
-			}
+			{ env: {} }
 		);
 		expect( await owned.ready() ).toBe( false );
 		expect( owned.failure() ).toBe( 'process-exited' );
+		expect( await owned.shutdown( { graceMs: 0, timeoutMs: 1000 } ) ).toBe( false );
 		expect( helpers[ 0 ].lines ).toEqual( [ 'own 4242', 'release' ] );
-		expect( helpers[ 0 ].lines ).not.toContain( 'confirm' );
+		expect( child.killed ).toEqual( [] );
 	} );
 
 	it( 'counts a tree as ended when its keeper died after confirming, once the child is gone', async () => {
 		const child = fakeChild( 4242 );
 		const { spawn: spawnSeam } = fakeSpawn( child, keeperAnswering( { 'reap 1000': null } ) );
-		const owned = prepareProcessOwner( { ...seams, spawn: spawnSeam } ).spawn(
+		const owned = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).spawn(
 			'C:\\claude.exe',
 			[],
-			{
-				env: {},
-			}
+			{ env: {} }
 		);
 		expect( await owned.ready() ).toBe( true );
 		setImmediate( () => exitChild( child, 1 ) );
@@ -677,12 +926,10 @@ describe( 'Windows job ownership (injected seams)', () => {
 			fakeChild( 4242 ),
 			keeperAnswering( { 'reap 1000': [ 'reaped dirty' ] } )
 		);
-		const owned = prepareProcessOwner( { ...seams, spawn: spawnSeam } ).spawn(
+		const owned = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).spawn(
 			'C:\\claude.exe',
 			[],
-			{
-				env: {},
-			}
+			{ env: {} }
 		);
 		expect( await owned.ready() ).toBe( true );
 		expect( await owned.terminate( 1000 ) ).toBe( false );
@@ -692,20 +939,18 @@ describe( 'Windows job ownership (injected seams)', () => {
 		const { spawn: spawnSeam } = fakeSpawn(
 			fakeChild( 4242 ),
 			keeperAnswering( {
-				inspect: [ `live 4242 ${ START }`, 'live 4300 134389060548250000', 'inspected' ],
+				inspect: [ `live 4242 ${ WINDOWS_START }`, 'live 4300 134389060548250000', 'inspected' ],
 			} )
 		);
-		const owned = prepareProcessOwner( { ...seams, spawn: spawnSeam } ).spawn(
+		const owned = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).spawn(
 			'C:\\claude.exe',
 			[],
-			{
-				env: {},
-			}
+			{ env: {} }
 		);
 		expect( await owned.ready() ).toBe( true );
 		expect( await owned.inspect() ).toEqual( {
 			live: [
-				{ pid: 4242, start: START },
+				{ pid: 4242, start: WINDOWS_START },
 				{ pid: 4300, start: '134389060548250000' },
 			],
 			uncertain: false,
@@ -714,13 +959,10 @@ describe( 'Windows job ownership (injected seams)', () => {
 
 	it( 'starts no supervisor on Windows, where the job ends with this process', async () => {
 		const { spawn: spawnSeam, calls } = fakeSpawn( fakeChild( 4242 ), keeperAnswering() );
-		const owned = prepareProcessOwner( { ...seams, spawn: spawnSeam } ).spawn(
+		const owned = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } ).spawn(
 			'C:\\claude.exe',
 			[],
-			{
-				env: {},
-				supervise: true,
-			}
+			{ env: {}, supervise: true }
 		);
 		expect( await owned.ready() ).toBe( true );
 		expect( calls.map( ( call ) => call.command ) ).toEqual( [ POWERSHELL, 'C:\\claude.exe' ] );
@@ -728,7 +970,7 @@ describe( 'Windows job ownership (injected seams)', () => {
 
 	it( 'ends the keeper of an owner that never spawned', async () => {
 		const { spawn: spawnSeam, helpers } = fakeSpawn( fakeChild( 4242 ), keeperAnswering() );
-		const owner = prepareProcessOwner( { ...seams, spawn: spawnSeam } );
+		const owner = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } );
 		expect( await owner.prepared() ).toBe( true );
 		await owner.dispose();
 		expect( helpers[ 0 ].lines ).toEqual( [ 'release' ] );
@@ -936,7 +1178,7 @@ describe( 'owned process trees (real processes)', () => {
 		}
 	}, 60_000 );
 
-	it( 'ends the owned tree through its supervisor when the owner dies, and the supervisor exits too', async () => {
+	it( 'ends the owned tree when the owner dies (through the job on Windows, the supervisor on POSIX), and leaves no helper behind', async () => {
 		const owner = fork( fixture, [ 'owner', marker, String( LIFETIME ), bundle ], {
 			execArgv: [],
 			stdio: [ 'ignore', 'ignore', 'ignore', 'ipc' ],
@@ -991,7 +1233,7 @@ describe( 'owned process trees (real processes)', () => {
 				await ready;
 				const { stdout } = await exec( '/bin/sh', [
 					'-c',
-					`${ posixProbeScript() }\nprobe "$1"`,
+					`proc=/proc\n${ posixProbeScript() }\nprobe "$1"`,
 					'sh',
 					String( leaf.pid ),
 				] );
@@ -1064,10 +1306,10 @@ describe( 'owned process trees (real processes)', () => {
 			const tree = await identities( [ Number( treePid ), Number( shellPid ), Number( leafPid ) ] );
 			owned.child.stdin.write( 'spawn\n' );
 			const [ , latePid ] = ( await next() ).split( ' ' );
-			// Ended at once, with nothing else looking for it first.
+			const late = await readProcessIdentity( Number( latePid ) );
+			expect( late ).toBeDefined();
 			expect( await owned.terminate() ).toBe( true );
-			const late = { pid: Number( latePid ), start: 'unread' };
-			expect( await checkProcessIdentity( { ...late, start: 'unread' } ) ).toBe( 'gone' );
+			expect( await goneWithin( [ late! ], 5_000 ) ).toEqual( [] );
 			expect( await goneWithin( tree, 5_000 ) ).toEqual( [] );
 			expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
 		} finally {
@@ -1108,6 +1350,107 @@ describe( 'owned process trees (real processes)', () => {
 			} finally {
 				if ( owned.child.exitCode === null && owned.child.signalCode === null )
 					owned.child.kill( 'SIGKILL' );
+			}
+		},
+		60_000
+	);
+
+	// The job keeper driven directly, as Studio drives it after a failed
+	// assignment, so its tree walk runs natively. It owns a fixture tree that
+	// is the test's own unreaped child, so the keeper's handle is that
+	// child's; its job still holds the tree, so the test can end whatever the
+	// walk leaves.
+	function keeperOwningTree() {
+		const command = windowsKeeperCommand( { env: process.env } as OwnedProcessSeams );
+		const keeper = spawn( command.command, command.args, {
+			env: command.env,
+			stdio: [ 'pipe', 'pipe', 'ignore' ],
+			windowsHide: true,
+		} );
+		const reply = lines( keeper.stdout );
+		const answer = ( line?: string ) => {
+			if ( line !== undefined ) keeper.stdin.write( line + '\n' );
+			return Promise.race( [
+				reply(),
+				new Promise< string >( ( _resolve, reject ) =>
+					setTimeout( () => reject( new Error( `No answer to ${ line }` ) ), 20_000 ).unref()
+				),
+			] );
+		};
+		keeper.stdin.write( command.input + '\n' );
+		let tree: ChildProcess | undefined;
+		let assigned = false;
+		return {
+			answer,
+			// Starts the tree once the job exists, so it is assigned before it
+			// starts its shell and the job holds everything it starts.
+			async own() {
+				expect( await answer() ).toBe( 'prepared' );
+				const started = spawn(
+					process.execPath,
+					[ fixture, 'tree', marker, String( LIFETIME ), 'ignore-eof' ],
+					{ stdio: 'pipe', windowsHide: true }
+				);
+				tree = started;
+				expect( await answer( `own ${ started.pid }` ) ).toMatch( /^assigned \d+$/ );
+				assigned = true;
+				const next = lines( started.stdout );
+				const [ , treePid, shellPid, leafPid ] = ( await next() ).split( ' ' );
+				return { root: started, treePid, shellPid, leafPid, next };
+			},
+			async close() {
+				if ( assigned && keeper.exitCode === null ) await answer( 'reap 5000' ).catch( () => {} );
+				const exited = once( keeper, 'exit' );
+				if ( keeper.exitCode === null ) keeper.stdin.end( 'release\n' );
+				await exited;
+				if ( tree && tree.exitCode === null && tree.signalCode === null ) tree.kill( 'SIGKILL' );
+			},
+		};
+	}
+
+	it.skipIf( process.platform !== 'win32' )(
+		`ends a tree through the keeper's handles, the shell's child included ${ WINDOWS_ONLY }`,
+		async () => {
+			const driven = keeperOwningTree();
+			try {
+				const { root, treePid, shellPid, leafPid, next } = await driven.own();
+				root.stdin.write( 'spawn\n' );
+				const [ , latePid ] = ( await next() ).split( ' ' );
+				const tree = await identities( [ treePid, shellPid, leafPid, latePid ].map( Number ) );
+				expect( tree ).toHaveLength( 4 );
+				expect( await driven.answer( 'end-tree' ) ).toMatch( /^ended [1-9]\d*$/ );
+				// The shell's child is outside the tree's own Node job and outlives
+				// the tree (the next test shows it), so only the walk ends it here.
+				expect( await goneWithin( tree, 5_000 ) ).toEqual( [] );
+				expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
+			} finally {
+				await driven.close();
+			}
+		},
+		60_000
+	);
+
+	it.skipIf( process.platform !== 'win32' )(
+		`leaves alone a process whose parent exited before the keeper held it ${ WINDOWS_ONLY }`,
+		async () => {
+			const driven = keeperOwningTree();
+			try {
+				const { root, shellPid, leafPid } = await driven.own();
+				const [ shell, leaf ] = await identities( [ shellPid, leafPid ].map( Number ) );
+				// The test's own unreaped child. Its own Node job ends the shell
+				// with it; the shell's child outlives both, with a parent nothing
+				// holds, which is what a grandchild whose parent exited looks like.
+				root.kill( 'SIGKILL' );
+				expect( await goneWithin( [ shell ], 10_000 ) ).toEqual( [] );
+				expect( await checkProcessIdentity( leaf ) ).toBe( 'alive' );
+				expect( await driven.answer( 'end-tree' ) ).toMatch( /^ended \d+$/ );
+				expect( await goneWithin( [ leaf ], 2_000 ) ).toEqual( [ leaf ] );
+				// The job still holds it.
+				expect( await driven.answer( 'reap 5000' ) ).toBe( 'reaped clean' );
+				expect( await goneWithin( [ leaf ], 5_000 ) ).toEqual( [] );
+				expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
+			} finally {
+				await driven.close();
 			}
 		},
 		60_000

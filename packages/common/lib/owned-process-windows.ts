@@ -9,22 +9,27 @@ import type {
  * Windows ownership through a kernel job object. A keeper (trusted Windows
  * PowerShell with static C# through Add-Type) creates the job before the
  * process starts, assigns the process to it as soon as it exists and holds
- * the only handle to the job. Windows puts every process that a job member
- * creates into the job too, unless the job permits breakaway, and this one
- * does not: a double fork, a re-parented child and a child started at any
- * moment all stay in it. Ending the job (TerminateJobObject), or closing its
- * handle once JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is set, terminates every
- * member. The keeper is this process's own child, so Windows ends it, and
- * with it the job, when this process ends.
+ * the only handle to the job. A process that a job member creates joins the
+ * member's job, and this job permits no breakaway: a double fork, a detached
+ * child and a child started at any moment all stay in it. Ending the job
+ * (TerminateJobObject), or closing its handle once
+ * JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is set, terminates every member. The
+ * keeper is this process's own child, so Windows ends it, and with it the
+ * job, when this process ends.
  *
- * What the job does not cover: a process another service creates on the
- * run's behalf (WMI, the Task Scheduler, a COM server) is not a descendant and
- * is not in the job; nor is anything the process started before it was
- * assigned, which the keeper checks for its direct children. Needs PowerShell
- * in Full Language mode.
+ * What the job does not cover:
+ * - a process another service creates on the run's behalf (WMI, the Task
+ *   Scheduler, a COM server), which is not a descendant;
+ * - a process a member creates with PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+ *   naming a process outside the job: it takes that process's job, not the
+ *   creator's;
+ * - anything the process started before it was assigned. The keeper checks
+ *   its direct children for that, other than its console host.
+ * Needs PowerShell in Full Language mode.
  */
 const JOB_SOURCE = String.raw`
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -32,6 +37,7 @@ namespace StudioOwned {
 	public static class Job {
 		const uint ProcessAccess = 0x0001 | 0x0100 | 0x1000 | 0x00100000;
 		const uint QueryAccess = 0x1000;
+		const uint EndAccess = 0x0001 | 0x1000;
 		const uint KillOnJobClose = 0x2000;
 		const int BasicAccountingInformation = 1;
 		const int BasicProcessIdList = 3;
@@ -92,6 +98,18 @@ namespace StudioOwned {
 			[MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string ExeFile;
 		}
 
+		[StructLayout(LayoutKind.Sequential)]
+		struct BasicInformation {
+			public IntPtr ExitStatus;
+			public IntPtr PebBaseAddress;
+			public UIntPtr AffinityMask;
+			public IntPtr BasePriority;
+			public UIntPtr UniqueProcessId;
+			public UIntPtr InheritedFromUniqueProcessId;
+		}
+
+		[DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr process, int infoClass, out BasicInformation info, int length, IntPtr returned);
+		[DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr process, uint exitCode);
 		[DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateJobObjectW(IntPtr attributes, IntPtr name);
 		[DllImport("kernel32.dll", SetLastError = true)] static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref ExtendedLimit info, uint length);
 		[DllImport("kernel32.dll", SetLastError = true)] static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out Accounting info, uint length, IntPtr returned);
@@ -159,11 +177,19 @@ namespace StudioOwned {
 			return TerminateJobObject(job, 1) ? 0 : Marshal.GetLastWin32Error();
 		}
 
+		// The ID of the process that created this one, read through its own
+		// handle, or -1. A snapshot's parent ID belongs to whatever process had
+		// the ID when the snapshot was taken; this one belongs to the handle.
+		static long ParentOf(IntPtr process) {
+			BasicInformation info;
+			if (NtQueryInformationProcess(process, 0, out info, Marshal.SizeOf(typeof(BasicInformation)), IntPtr.Zero) != 0) return -1;
+			return (long)info.InheritedFromUniqueProcessId.ToUInt64();
+		}
+
 		// Live children of the process "parent", created at "created" and kept
-		// from reuse by the keeper's handle, other than its console host: all of
-		// them when job is zero, otherwise those outside the job. -1 when they
-		// cannot all be read.
-		public static int Children(IntPtr job, uint parent, long created) {
+		// from reuse by the keeper's handle, that are outside the job, other than
+		// its console host. -1 when they cannot all be read.
+		public static int Outside(IntPtr job, uint parent, long created) {
 			IntPtr snapshot = CreateToolhelp32Snapshot(2, 0);
 			if (snapshot == new IntPtr(-1)) return -1;
 			int count = 0;
@@ -179,9 +205,10 @@ namespace StudioOwned {
 					}
 					try {
 						long started = Created(child);
-						if (started < 0) return -1;
-						if (started < created || IsConsoleHost(child)) continue;
-						if (job == IntPtr.Zero || Contains(job, child) != 1) count++;
+						long actual = ParentOf(child);
+						if (started < 0 || actual < 0) return -1;
+						if (actual != parent || started < created || IsConsoleHost(child)) continue;
+						if (Contains(job, child) != 1) count++;
 					} finally {
 						CloseHandle(child);
 					}
@@ -190,6 +217,74 @@ namespace StudioOwned {
 				CloseHandle(snapshot);
 			}
 			return count;
+		}
+
+		// Opens each live process not yet in "held" whose parent, read through
+		// its own handle, is held and that started no earlier than that parent,
+		// and adds it. null when the processes cannot be listed.
+		static List<IntPtr> Descendants(Dictionary<uint, long> held) {
+			IntPtr snapshot = CreateToolhelp32Snapshot(2, 0);
+			if (snapshot == new IntPtr(-1)) return null;
+			List<IntPtr> found = new List<IntPtr>();
+			try {
+				ProcessEntry entry = new ProcessEntry();
+				entry.Size = (uint)Marshal.SizeOf(typeof(ProcessEntry));
+				for (bool more = Process32FirstW(snapshot, ref entry); more; more = Process32NextW(snapshot, ref entry)) {
+					if (held.ContainsKey(entry.ProcessId) || !held.ContainsKey(entry.ParentProcessId)) continue;
+					IntPtr child = OpenProcess(EndAccess, false, entry.ProcessId);
+					if (child == IntPtr.Zero) continue;
+					long started = Created(child);
+					long parent = ParentOf(child);
+					long parentStarted;
+					if (started >= 0 && parent >= 0 && parent <= uint.MaxValue && held.TryGetValue((uint)parent, out parentStarted) && started >= parentStarted) {
+						held[entry.ProcessId] = started;
+						found.Add(child);
+					} else CloseHandle(child);
+				}
+			} finally {
+				CloseHandle(snapshot);
+			}
+			return found;
+		}
+
+		// Ends the process "root", held since before it could exit, and every
+		// descendant provable through handles: a process is taken only when its
+		// parent, read through its own handle, is a process already held and it
+		// started no earlier than that parent. A held handle keeps its process's
+		// ID from reuse, so nothing unrelated can match; a process whose parent
+		// exited before it was held cannot be proven and is left alone. The
+		// whole tree is held before anything is ended, since ending a process
+		// can end others with it (its own kill-on-close jobs) before they are
+		// held, leaving their children unprovable. Returns how many processes
+		// were ended, or -1 when they could not be listed.
+		public static int EndTree(IntPtr root, uint rootId, long rootStart) {
+			Dictionary<uint, long> held = new Dictionary<uint, long>();
+			held[rootId] = rootStart;
+			List<IntPtr> handles = new List<IntPtr>();
+			int ended = 0;
+			try {
+				for (int pass = 0; pass < 64; pass++) {
+					List<IntPtr> found = Descendants(held);
+					if (found == null) return -1;
+					if (found.Count == 0) break;
+					handles.AddRange(found);
+				}
+				if (TerminateProcess(root, 1)) ended++;
+				foreach (IntPtr handle in handles) if (TerminateProcess(handle, 1)) ended++;
+				// Children started while the tree was being held.
+				for (int pass = 0; pass < 16; pass++) {
+					List<IntPtr> found = Descendants(held);
+					if (found == null) return -1;
+					if (found.Count == 0) break;
+					foreach (IntPtr child in found) {
+						handles.Add(child);
+						if (TerminateProcess(child, 1)) ended++;
+					}
+				}
+			} finally {
+				foreach (IntPtr handle in handles) CloseHandle(handle);
+			}
+			return ended;
 		}
 
 		// "pid start" for every live member of the job, one per line.
@@ -215,17 +310,18 @@ namespace StudioOwned {
 }
 `;
 
-// The keeper's protocol, one line each way:
-//   prepared | failed keeper|job <code>            once the job exists
-//   own <pid>   -> assigned <start> | failed open <code> | failed assign <code> <start>
+// The keeper's protocol, one line each way, after its script as the first line:
+//   prepared | failed keeper language|<code> | failed job <code>   once the job exists
+//   own <pid>   -> assigned <start> | failed open <code> | failed start 0 | failed assign <code> <start>
 //   confirm     -> ready <start> in-job | failed limit|verify <code> | failed outside <count>
-//   children    -> children <count>   live children of the process, in the job or not
+//   end-tree    -> ended <count>      ends the process and its descendants provable by handle
 //   active      -> active <count>
 //   inspect     -> live <pid> <start> ... inspected
 //   reap <ms>   -> reaped clean|dirty
 //   release, or the end of input: the keeper exits, closing the job.
-// Kill on close is set only at `confirm`, once Studio knows the assigned
-// process is its own child, so a keeper that ends before then kills nothing.
+// Studio sends `confirm` and `end-tree` only after it knows the opened process
+// is its own child. Kill on close is set only at `confirm`, so a keeper that
+// ends before then kills nothing.
 const KEEPER = String.raw`
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -249,6 +345,7 @@ while ($true) {
 		$process = [StudioOwned.Job]::Open($rootId, [ref]$failure)
 		if ($process -eq [IntPtr]::Zero) { Send "failed open $failure"; continue }
 		$start = [StudioOwned.Job]::Created($process)
+		if ($start -lt 0) { Send 'failed start 0'; continue }
 		$failure = [StudioOwned.Job]::Assign($job, $process)
 		if ($failure -ne 0) { Send "failed assign $failure $start"; continue }
 		Send "assigned $start"
@@ -257,11 +354,13 @@ while ($true) {
 		$failure = [StudioOwned.Job]::KillOnClose($job)
 		if ($failure -ne 0) { Send "failed limit $failure"; continue }
 		if ([StudioOwned.Job]::Contains($job, $process) -ne 1) { Send 'failed verify 0'; continue }
-		$outside = [StudioOwned.Job]::Children($job, $rootId, $start)
+		$outside = [StudioOwned.Job]::Outside($job, $rootId, $start)
 		if ($outside -ne 0) { Send "failed outside $outside"; continue }
 		Send "ready $start in-job"
 	}
-	elseif ($line -eq 'children') { Send "children $([StudioOwned.Job]::Children([IntPtr]::Zero, $rootId, $start))" }
+	elseif ($line -eq 'end-tree') {
+		if ($start -lt 0) { Send 'ended -1' } else { Send "ended $([StudioOwned.Job]::EndTree($process, $rootId, $start))" }
+	}
 	elseif ($line -eq 'active') { Send "active $([StudioOwned.Job]::Active($job))" }
 	elseif ($line -eq 'inspect') {
 		$members = [StudioOwned.Job]::Members($job)
@@ -287,6 +386,17 @@ if ($null -eq $p) { [Console]::Out.WriteLine('gone') } else {
 	try { $null = $p.Handle; $s = [long]$p.StartTime.ToFileTimeUtc() } catch { }
 	if ($null -eq $s) { [Console]::Out.WriteLine('unknown') } else { [Console]::Out.WriteLine("start $s") }
 }
+`;
+
+// Starts the keeper. Its script is too long for a command line, which Windows
+// caps at 32,767 characters, so it arrives as the first line of input: Base64
+// UTF-8, written by Studio to a pipe only Studio holds. This part refuses to
+// run outside Full Language mode, where the keeper's Add-Type would fail.
+const KEEPER_LOADER = String.raw`
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') { 'failed keeper language'; exit 1 }
+$script = [Console]::In.ReadLine()
+if ($null -eq $script) { exit 1 }
+. ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($script))))
 `;
 
 function powerShell(
@@ -323,7 +433,10 @@ function powerShell(
 
 /** The job keeper. Its script is the same for every run; it takes only protocol lines. */
 export function windowsKeeperCommand( seams: OwnedProcessSeams ): SupervisedCommand {
-	return powerShell( KEEPER, seams, 60_000 );
+	return {
+		...powerShell( KEEPER_LOADER, seams, 60_000 ),
+		input: Buffer.from( KEEPER, 'utf8' ).toString( 'base64' ),
+	};
 }
 
 export async function probeWindowsProcess(

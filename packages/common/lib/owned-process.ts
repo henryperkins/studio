@@ -55,6 +55,8 @@ export interface SupervisedCommand {
 	args: string[];
 	env: NodeJS.ProcessEnv;
 	timeout: number;
+	/** A first line of input the helper reads before anything else. */
+	input?: string;
 }
 
 export interface OwnedProcessSeams {
@@ -155,11 +157,17 @@ export async function checkProcessIdentity(
 
 /** Why Studio could not take ownership of a process tree. */
 export type OwnershipFailure =
-	/** The Windows keeper did not start: PowerShell or Add-Type failed or was blocked. */
+	/** The process could not be started. */
+	| 'spawn-failed'
+	/** The Windows keeper could not be started, could not compile its job code, or exited before answering. */
 	| 'keeper-unavailable'
+	/** Windows PowerShell does not run in Full Language mode, so the keeper refused to start. */
+	| 'keeper-blocked'
+	/** The Windows keeper did not answer within its bound. */
+	| 'keeper-timeout'
 	/** Windows could not create the job object. */
 	| 'job-unavailable'
-	/** The keeper could not open the process. */
+	/** The keeper could not open the process for a reason other than its having exited. */
 	| 'process-unavailable'
 	/** The process exited before its ownership was confirmed. */
 	| 'process-exited'
@@ -170,7 +178,7 @@ export type OwnershipFailure =
 	| 'job-unverified'
 	/** The process already had a child outside the job when it was assigned. */
 	| 'job-incomplete'
-	/** POSIX: the process's start identity could not be read. */
+	/** The process's start identity could not be read. */
 	| 'identity-unavailable'
 	/** POSIX: the supervisor or its keeper did not start. */
 	| 'supervisor-unavailable';
@@ -203,7 +211,13 @@ export interface OwnedProcess {
 	requestShutdown(): Promise< void >;
 	/** Whether the child and everything owned with it exited within the bound. */
 	waitForExit( timeoutMs: number ): Promise< boolean >;
-	/** Kills whatever remains of the owned tree; true only when nothing owned is left. */
+	/**
+	 * Kills whatever remains of the owned tree. True only when the OS shows
+	 * that nothing of it is left: the job is empty, or the process group is.
+	 * On Windows a tree the job never fully held is ended as far as handles
+	 * prove, and is never reported as ended, since a descendant whose parent
+	 * already exited cannot be seen.
+	 */
 	terminate( timeoutMs?: number ): Promise< boolean >;
 	/**
 	 * `requestShutdown`, `waitForExit( graceMs )`, then `terminate`. Lets the
@@ -298,6 +312,7 @@ function converse( helper: ChildProcessByStdio< Writable, Readable, null > ) {
 	const lines: string[] = [];
 	let buffer = '';
 	let ended = false;
+	let drained = false;
 	let wake: ( () => void ) | undefined;
 	let turn = Promise.resolve();
 	helper.once( 'error', () => {} );
@@ -315,7 +330,18 @@ function converse( helper: ChildProcessByStdio< Writable, Readable, null > ) {
 		ended = true;
 		wake?.();
 	};
-	helper.once( 'exit', stop );
+	helper.stdout.once( 'end', () => {
+		drained = true;
+	} );
+	// A helper's last lines can arrive after its exit, so they are read first.
+	helper.once( 'exit', () => {
+		if ( drained ) return stop();
+		const timer = setTimeout( stop, 1_000 ).unref();
+		helper.stdout.once( 'end', () => {
+			clearTimeout( timer );
+			stop();
+		} );
+	} );
 	helper.once( 'error', stop );
 
 	function collect( last: RegExp, timeoutMs: number ): Promise< string[] | undefined > {
@@ -389,12 +415,28 @@ function converse( helper: ChildProcessByStdio< Writable, Readable, null > ) {
 type Conversation = ReturnType< typeof converse >;
 
 const WINDOWS_FAILURES: ReadonlyArray< [ RegExp, OwnershipFailure ] > = [
+	[ /^failed keeper language$/, 'keeper-blocked' ],
+	[ /^failed keeper /, 'keeper-unavailable' ],
+	[ /^failed job /, 'job-unavailable' ],
+	// ERROR_INVALID_PARAMETER: no process has the ID any more.
+	[ /^failed open 87$/, 'process-exited' ],
 	[ /^failed open /, 'process-unavailable' ],
+	[ /^failed start /, 'identity-unavailable' ],
 	[ /^failed assign 5 /, 'job-assignment-denied' ],
 	[ /^failed assign /, 'job-assignment-failed' ],
 	[ /^failed (limit|verify) /, 'job-unverified' ],
 	[ /^failed outside /, 'job-incomplete' ],
 ];
+
+// Why the keeper's answer is not the expected one: what it said, or that it
+// ended or went quiet.
+function keeperFailure( answer: string | undefined, keeper: Conversation ): OwnershipFailure {
+	if ( answer === undefined ) return keeper.ended() ? 'keeper-unavailable' : 'keeper-timeout';
+	return (
+		WINDOWS_FAILURES.find( ( [ pattern ] ) => pattern.test( answer ) )?.[ 1 ] ??
+		'keeper-unavailable'
+	);
+}
 
 /**
  * Prepares ownership for one process. On Windows this starts the keeper, which
@@ -408,18 +450,20 @@ export function prepareProcessOwner( overrides: Partial< OwnedProcessSeams > = {
 	if ( seams.platform === 'win32' ) {
 		try {
 			const helper = windowsKeeperCommand( seams );
-			keeper = converse(
+			const started = converse(
 				seams.spawn( helper.command, helper.args, {
 					env: helper.env,
 					stdio: [ 'pipe', 'pipe', 'ignore' ],
 					windowsHide: true,
 				} )
 			);
+			keeper = started;
 			keeper.detach();
+			if ( helper.input !== undefined ) keeper.send( helper.input );
 			prepared = keeper.ask( undefined, /^(prepared|failed .*)$/, 60_000 ).then( ( replies ) => {
 				const last = replies?.at( -1 );
 				if ( last === 'prepared' ) return true;
-				failure = last?.startsWith( 'failed job ' ) ? 'job-unavailable' : 'keeper-unavailable';
+				failure = keeperFailure( last, started );
 				return false;
 			} );
 		} catch {
@@ -433,8 +477,11 @@ export function prepareProcessOwner( overrides: Partial< OwnedProcessSeams > = {
 		failure: () => failure,
 		spawn( command, args, options ) {
 			if ( used ) throw new Error( 'An owner owns one process' );
+			// A spawn that throws starts no process, so the owner stays unused
+			// and `dispose` still ends its keeper.
+			const owned = ownProcess( command, args, options, seams, keeper, prepared, () => failure );
 			used = true;
-			return ownProcess( command, args, options, seams, keeper, prepared, () => failure );
+			return owned;
 		},
 		async dispose() {
 			if ( ! used ) await keeper?.release();
@@ -467,12 +514,13 @@ function ownProcess(
 	if ( jobKeeper && child.pid ) jobKeeper.send( `own ${ child.pid }` );
 
 	let identity: ProcessIdentity | undefined;
-	let failure: OwnershipFailure | undefined;
+	let failure: OwnershipFailure | undefined = failed ? 'spawn-failed' : undefined;
 	let keeper: Conversation | undefined = jobKeeper;
-	// Windows: whether the keeper holds a handle to the child, and whether it
-	// put the child in the job after Studio confirmed it was its own.
-	let opened = false;
-	let confirmed = false;
+	// Windows: whether the keeper's handle is proven to be the child's (it
+	// answered while the child was unreaped), and whether the job then took
+	// the child, so that whatever the job holds is the child's tree.
+	let rootProven = false;
+	let assignedProven = false;
 
 	async function establishWindows( pid: number ): Promise< boolean > {
 		if ( ! keeper || ! ( await prepared ) ) {
@@ -482,20 +530,20 @@ function ownProcess(
 		const assigned = (
 			await keeper.ask( undefined, /^(assigned \d{1,19}|failed .*)$/, 30_000 )
 		)?.at( -1 );
-		const start = /^assigned (\d{1,19})$/.exec( assigned ?? '' )?.[ 1 ];
-		opened = !! start || /^failed assign \d+ \d+$/.test( assigned ?? '' );
-		if ( ! start ) {
-			failure =
-				WINDOWS_FAILURES.find( ( [ pattern ] ) => pattern.test( assigned ?? '' ) )?.[ 1 ] ??
-				'keeper-unavailable';
-			return false;
-		}
+		const start = /^(?:assigned|failed assign \d+) (\d{1,19})$/.exec( assigned ?? '' )?.[ 1 ];
 		// The keeper opened the PID while this process had not reaped the child,
 		// so the handle is the child's. Otherwise nothing proves it: the keeper
 		// ends without having set kill-on-close, so it kills nothing.
-		if ( ! unreaped() ) {
+		if ( start && unreaped() ) {
+			rootProven = true;
+			assignedProven = assigned!.startsWith( 'assigned ' );
+		}
+		if ( ! assigned?.startsWith( 'assigned ' ) ) {
+			failure = keeperFailure( assigned, keeper );
+			return false;
+		}
+		if ( ! assignedProven ) {
 			failure = 'process-exited';
-			opened = false;
 			await keeper.release();
 			keeper = undefined;
 			return false;
@@ -503,22 +551,19 @@ function ownProcess(
 		const ready = (
 			await keeper.ask( 'confirm', /^(ready \d{1,19} in-job|failed .*)$/, 30_000 )
 		)?.at( -1 );
-		// Kill-on-close is set unless the keeper said otherwise or went quiet.
-		confirmed = !! ready && ! ready.startsWith( 'failed limit ' );
 		if ( ready !== `ready ${ start } in-job` ) {
-			failure =
-				WINDOWS_FAILURES.find( ( [ pattern ] ) => pattern.test( ready ?? '' ) )?.[ 1 ] ??
-				'keeper-unavailable';
+			failure = keeperFailure( ready, keeper );
 			return false;
 		}
-		identity = { pid, start };
+		identity = { pid, start: start! };
 		return true;
 	}
 
 	async function establishPosix( pid: number ): Promise< boolean > {
 		const found = await probe( pid, seams );
 		if ( found.state !== 'running' || ! unreaped() ) {
-			failure = found.state === 'running' ? 'process-exited' : 'identity-unavailable';
+			// Gone while unreaped means a zombie: it has exited.
+			failure = found.state === 'unknown' ? 'identity-unavailable' : 'process-exited';
 			return false;
 		}
 		if ( options.supervise ) {
@@ -559,15 +604,17 @@ function ownProcess(
 		return false;
 	} );
 
-	// POSIX: signals the child's group, if it is still the child's. 'empty'
-	// when the group no longer exists, 'unknown' when that cannot be told.
+	// POSIX: signals the child's group if it is provably still the child's:
+	// 'sent' when it was; 'empty' when no group has the ID; 'occupied' when a
+	// group has it but cannot be proven the child's, so nothing was sent;
+	// 'unknown' when the OS could not be read.
 	async function signalGroup(
 		signal: NodeJS.Signals | 0
-	): Promise< 'sent' | 'empty' | 'unknown' > {
+	): Promise< 'sent' | 'empty' | 'occupied' | 'unknown' > {
 		const pgid = child.pid;
 		if ( failed || ! pgid ) return 'empty';
 		if ( ! unreaped() ) {
-			if ( ! identity ) return 'unknown';
+			if ( ! identity ) return groupState( pgid );
 			const leader = await probe( pgid, seams );
 			if ( leader.state === 'unknown' ) return 'unknown';
 			// POSIX reuses a group's ID as a PID only once the group has no members.
@@ -578,6 +625,20 @@ function ownProcess(
 			return 'sent';
 		} catch ( error ) {
 			return ( error as NodeJS.ErrnoException ).code === 'ESRCH' ? 'empty' : 'unknown';
+		}
+	}
+
+	// Whether any process is in group `pgid`, by signal 0, which delivers
+	// nothing. ESRCH is the kernel saying no process has that group ID, so
+	// it cannot mistake an unreadable group for an empty one.
+	function groupState( pgid: number ): 'empty' | 'occupied' | 'unknown' {
+		try {
+			seams.kill( -pgid, 0 );
+			return 'occupied';
+		} catch ( error ) {
+			const code = ( error as NodeJS.ErrnoException ).code;
+			if ( code === 'ESRCH' ) return 'empty';
+			return code === 'EPERM' ? 'occupied' : 'unknown';
 		}
 	}
 
@@ -603,42 +664,37 @@ function ownProcess(
 			}
 		}
 		let state = await signalGroup( 0 );
-		while ( state === 'sent' && seams.now() < deadline ) {
+		while ( ( state === 'sent' || state === 'occupied' ) && seams.now() < deadline ) {
 			await seams.delay( 50 );
 			state = await signalGroup( 0 );
 		}
 		return state === 'empty';
 	}
 
-	// Windows: whether the child's live children, in the job or not, are none.
-	async function noChildren(): Promise< boolean > {
-		if ( ! keeper || ! opened ) return false;
-		return (
-			( await keeper.ask( 'children', /^children -?\d+$/, 20_000 ) )?.at( -1 ) === 'children 0'
-		);
-	}
-
 	async function terminateWindows( timeoutMs: number ): Promise< boolean > {
-		if ( confirmed && keeper ) {
-			const reaped = (
-				await keeper.ask(
-					`reap ${ Math.max( 0, Math.round( timeoutMs ) ) }`,
-					/^reaped (clean|dirty)$/,
-					timeoutMs + 30_000
-				)
-			)?.at( -1 );
+		const reap = () =>
+			keeper!.ask(
+				`reap ${ Math.max( 0, Math.round( timeoutMs ) ) }`,
+				/^reaped (clean|dirty)$/,
+				timeoutMs + 30_000
+			);
+		if ( identity && keeper ) {
+			const reaped = ( await reap() )?.at( -1 );
 			// A keeper that has ended closed the job, and kill-on-close ended
 			// everything in it; what is left to see is the child itself.
-			if ( ! reaped && keeper.ended() ) return !! identity && exitedWithin( child, 5_000 );
-			if ( reaped !== 'reaped clean' ) return false;
-			if ( identity ) return true;
+			if ( ! reaped && keeper.ended() ) return exitedWithin( child, 5_000 );
+			return reaped === 'reaped clean';
 		}
-		// The child is not, or not provably, in a kill-on-close job: only the
-		// child itself can be ended, through this process's own handle, and
-		// then its children must be none.
+		// The job never fully held the tree. Only processes whose parents the
+		// keeper holds can be proven the child's, so those are ended first,
+		// before ending the job can end their parents; then what the job holds,
+		// which is the child's own. A descendant whose parent exited before the
+		// keeper held it cannot be seen, so the tree is never reported as ended.
+		if ( keeper && rootProven ) await keeper.ask( 'end-tree', /^ended -?\d+$/, 30_000 );
+		if ( keeper && assignedProven ) await reap();
 		if ( unreaped() ) child.kill( 'SIGKILL' );
 		await exitedWithin( child, 5_000 );
-		return noChildren();
+		return false;
 	}
 
 	async function terminate( timeoutMs = 10_000 ): Promise< boolean > {
@@ -647,7 +703,7 @@ function ownProcess(
 		if ( windows ) return terminateWindows( timeoutMs );
 		const deadline = seams.now() + timeoutMs;
 		let state = await signalGroup( 'SIGKILL' );
-		while ( state === 'sent' && seams.now() < deadline ) {
+		while ( ( state === 'sent' || state === 'occupied' ) && seams.now() < deadline ) {
 			await seams.delay( 50 );
 			state = await signalGroup( 0 );
 			if ( state === 'sent' ) state = await signalGroup( 'SIGKILL' );
@@ -670,7 +726,7 @@ function ownProcess(
 			return { live, uncertain: replies.includes( 'uncertain' ) };
 		}
 		const state = await signalGroup( 0 );
-		if ( state !== 'sent' ) return { live: [], uncertain: state === 'unknown' };
+		if ( state !== 'sent' ) return { live: [], uncertain: state !== 'empty' };
 		const members = await posixGroupMembers( identity.pid, seams );
 		if ( ! members ) return { live: [], uncertain: true };
 		const found = await Promise.all( members.map( ( pid ) => probe( pid, seams ) ) );

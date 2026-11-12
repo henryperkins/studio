@@ -6,7 +6,8 @@
 //   leaf  <marker> <lifetime> [stubborn]   prints `ready <pid> <ppid>`; stubborn ignores SIGTERM
 //   tree  <marker> <lifetime> [ignore-eof] starts a leaf through the platform shell and prints
 //                                          `ready <pid> <shell pid> <leaf pid>`; exits on stdin EOF.
-//                                          A `spawn` line starts another stubborn leaf (`spawned <pid>`);
+//                                          A `spawn` line starts another stubborn leaf, outside this
+//                                          process's own Node job on Windows (`spawned <pid>`);
 //                                          a `fork` line runs a double fork (`forked <middle pid> <leaf pid>`)
 //   fork  <marker> <lifetime>              starts a stubborn leaf and exits at once
 //   owner <marker> <lifetime> <bundle>     owns a tree through the bundled owned-process module and
@@ -62,7 +63,10 @@ async function tree() {
 		for ( let end = buffer.indexOf( '\n' ); end >= 0; end = buffer.indexOf( '\n' ) ) {
 			const line = buffer.slice( 0, end ).trim();
 			buffer = buffer.slice( end + 1 );
-			if ( line === 'spawn' ) process.stdout.write( `spawned ${ stubbornLeaf( false ).pid }\n` );
+			// On Windows the leaf is detached, so Node leaves it out of this
+			// process's own kill-on-close job: only the owner can end it.
+			if ( line === 'spawn' )
+				process.stdout.write( `spawned ${ stubbornLeaf( process.platform === 'win32' ).pid }\n` );
 			if ( line === 'fork' ) {
 				const middle = spawn( process.execPath, [ script, 'fork', marker, String( lifetime ) ], {
 					stdio: [ 'ignore', 'pipe', 'ignore' ],
@@ -98,7 +102,7 @@ async function owner() {
 	);
 	const ready = await owned.ready();
 	const [ , treePid, shellPid, leafPid ] = ( await firstLine( owned.child.stdout ) ).split( ' ' );
-	// Makes the keeper look now rather than at its next poll.
+	// The processes the job or group holds now, the tree's among them.
 	const { live } = await owned.inspect();
 	process.send( {
 		type: 'ready',
