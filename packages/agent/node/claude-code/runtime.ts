@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
-import { prepareProcessOwner, readProcessIdentity } from '@studio/common/lib/owned-process';
+import { prepareProcessOwner, readOwnProcessIdentity } from '@studio/common/lib/owned-process';
 import { __ } from '@wordpress/i18n';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
 import {
@@ -213,17 +213,6 @@ interface RuntimeDependencies {
 	prepareOwner?: () => ProcessOwner;
 	/** This process's identity, which the run lock records as its owner. */
 	ownerIdentity?: () => Promise< ProcessIdentity | undefined >;
-}
-
-let ownIdentity: Promise< ProcessIdentity | undefined > | undefined;
-
-// Read once per process: a process's start never changes.
-function readOwnIdentity(): Promise< ProcessIdentity | undefined > {
-	ownIdentity ??= readProcessIdentity( process.pid ).then( ( found ) => {
-		if ( ! found ) ownIdentity = undefined;
-		return found;
-	} );
-	return ownIdentity;
 }
 
 interface RuntimeOptions extends RuntimeDependencies {
@@ -627,7 +616,7 @@ export async function runClaudeTurn(
 		if ( input.signal.aborted ) throw new Error();
 		const store = createNativeSessionStore( options.storeRoot );
 		// A lock that cannot name its owner could never be recovered, so no turn starts without one.
-		const ownerIdentity = await ( options.ownerIdentity ?? readOwnIdentity )();
+		const ownerIdentity = await ( options.ownerIdentity ?? readOwnProcessIdentity )();
 		if ( ! ownerIdentity ) throw new Error();
 		let lock: Awaited< ReturnType< typeof store.lockRun > >;
 		try {
@@ -953,10 +942,13 @@ export async function runClaudeTurn(
 								const identity = started.identity();
 								if ( ! ready ) return 'unowned';
 								if ( ! identity ) return 'unrecorded';
+								// Without the helper that guards the tree, a recovery could
+								// never prove the tree ended, so no prompt goes to it.
 								const guardian = await started.guardian();
+								if ( ! guardian ) return 'unowned';
 								await lock.update( {
 									stage: 'owned',
-									processes: { native: identity, ...( guardian ? { guardian } : {} ) },
+									processes: { native: identity, guardian },
 								} );
 								return 'recorded';
 							},

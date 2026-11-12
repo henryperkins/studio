@@ -145,6 +145,37 @@ export async function readProcessIdentity(
 	return found.state === 'running' ? { pid, start: found.start } : undefined;
 }
 
+/**
+ * Reads a process's own identity once and keeps it, since a process's start
+ * never changes. A read that found nothing, or failed, is not kept, so the
+ * next call reads again; calls made while a read runs share it.
+ */
+export function createOwnIdentityReader(
+	read: () => Promise< ProcessIdentity | undefined >
+): () => Promise< ProcessIdentity | undefined > {
+	let pending: Promise< ProcessIdentity | undefined > | undefined;
+	return () => {
+		pending ??= Promise.resolve()
+			.then( read )
+			.then(
+				( found ) => {
+					if ( ! found ) pending = undefined;
+					return found;
+				},
+				( error: unknown ) => {
+					pending = undefined;
+					throw error;
+				}
+			);
+		return pending;
+	};
+}
+
+/** This process's own identity, which a run lock and a recovery claim name. */
+export const readOwnProcessIdentity = createOwnIdentityReader( () =>
+	readProcessIdentity( process.pid )
+);
+
 /** Whether `identity` is still the same live process. */
 export async function checkProcessIdentity(
 	identity: ProcessIdentity,

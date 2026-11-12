@@ -2342,6 +2342,61 @@ describe( 'the run lock a turn records (mock SDK)', () => {
 		}
 	} );
 
+	it( 'sends no prompt, and says it could not own the process, when the helper guarding the tree cannot be identified', async () => {
+		const { runClaudeTurn } = await import( '../runtime' );
+		const { createNativeSessionStore } = await import( '../sessions' );
+		const fixture = await ownedNativeFixture( 'claude-lock-unguarded-', {
+			guardian: async () => undefined,
+		} );
+		try {
+			const read = await lockOf( fixture.storeRoot );
+			let stage: unknown;
+			const onTurn = vi.fn( async () => 'result' as const );
+			const inner = spawningNativeTurn( fixture.root, onTurn );
+			const query = vi.fn( ( input: Parameters< typeof inner >[ 0 ] ) =>
+				Object.assign( inner( input ), {
+					close: () => {
+						stage = read().stage;
+					},
+				} )
+			);
+			const events: Array< { type: string; outcome?: { status: string; code?: string } } > = [];
+			await runClaudeTurn(
+				turnSnapshot( fixture.root, fixture.config, 'turn' ),
+				fixture.host,
+				{
+					prompt: 'hello',
+					signal: new AbortController().signal,
+					onEvent: ( event ) => events.push( event ),
+				},
+				{
+					storeRoot: fixture.storeRoot,
+					approve: async () => 'deny',
+					verifyTarget: async () => true,
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					prepareOwner: fixture.prepareOwner,
+					ownerIdentity: async () => owner,
+					connection: fixture.connection,
+					prepare: fixture.prepare,
+					account: fixture.account,
+				}
+			);
+			expect( onTurn ).not.toHaveBeenCalled();
+			expect( events ).toEqual( [
+				expect.objectContaining( {
+					type: 'turn.terminal',
+					outcome: expect.objectContaining( { status: 'error', code: 'process_unowned' } ),
+				} ),
+			] );
+			expect( stage ).toBe( 'starting' );
+			await expect(
+				createNativeSessionStore( fixture.storeRoot ).inspectLock( 'chat' )
+			).resolves.toEqual( { state: 'none' } );
+		} finally {
+			await fixture.cleanup();
+		}
+	} );
+
 	it( 'releases the lock only once the ownership it is recording has settled, and never recreates it', async () => {
 		const { runClaudeTurn } = await import( '../runtime' );
 		const { createNativeSessionStore } = await import( '../sessions' );

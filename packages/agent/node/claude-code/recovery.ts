@@ -3,7 +3,7 @@ import path from 'path';
 import {
 	checkOwnedTreeEnded,
 	checkProcessIdentity,
-	readProcessIdentity,
+	readOwnProcessIdentity,
 } from '@studio/common/lib/owned-process';
 import { __ } from '@wordpress/i18n';
 import {
@@ -44,17 +44,9 @@ export interface ClaudeRecoverySeams {
 	): Promise< OwnedTreeCheck >;
 }
 
-let ownIdentity: Promise< ProcessIdentity | undefined > | undefined;
-
 const systemSeams: ClaudeRecoverySeams = {
 	platform: process.platform,
-	self: () => {
-		ownIdentity ??= readProcessIdentity( process.pid ).then( ( found ) => {
-			if ( ! found ) ownIdentity = undefined;
-			return found;
-		} );
-		return ownIdentity;
-	},
+	self: readOwnProcessIdentity,
 	checkIdentity: ( identity ) => checkProcessIdentity( identity ),
 	checkTree: ( processes ) => checkOwnedTreeEnded( processes ),
 };

@@ -15,7 +15,9 @@ import {
 	checkOwnedTreeEnded,
 	checkProcessGroup,
 	checkProcessIdentity,
+	createOwnIdentityReader,
 	prepareProcessOwner,
+	readOwnProcessIdentity,
 	readProcessIdentity,
 	type OwnedProcessOptions,
 	type OwnedProcessSeams,
@@ -212,6 +214,32 @@ describe( 'process identity (injected seams)', () => {
 		] )
 			expect( await checkProcessIdentity( identity, linuxFiles( {} ) ) ).toBe( 'unknown' );
 		expect( await readProcessIdentity( 0, linuxFiles( {} ) ) ).toBeUndefined();
+	} );
+
+	it( 'reads this process’s own identity once, and again only after a read that found nothing or failed', async () => {
+		const own = { pid: 4321, start: '134389060548247995' };
+		const read = vi
+			.fn< () => Promise< ProcessIdentity | undefined > >()
+			.mockRejectedValueOnce( new Error( 'The probe could not run' ) )
+			.mockResolvedValueOnce( undefined )
+			.mockResolvedValue( own );
+		const readOwn = createOwnIdentityReader( read );
+		await expect( readOwn() ).rejects.toThrow( 'The probe could not run' );
+		expect( await readOwn() ).toBeUndefined();
+		expect( await readOwn() ).toEqual( own );
+		expect( await readOwn() ).toEqual( own );
+		expect( read ).toHaveBeenCalledTimes( 3 );
+		// Concurrent first reads share one probe.
+		const shared = vi.fn( async () => own );
+		const readShared = createOwnIdentityReader( shared );
+		expect( await Promise.all( [ readShared(), readShared() ] ) ).toEqual( [ own, own ] );
+		expect( shared ).toHaveBeenCalledOnce();
+	} );
+
+	it( 'reads the identity of the running process itself', async () => {
+		const own = await readOwnProcessIdentity();
+		expect( own ).toMatchObject( { pid: process.pid, start: expect.any( String ) } );
+		expect( await readOwnProcessIdentity() ).toBe( own );
 	} );
 } );
 
