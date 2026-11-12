@@ -613,6 +613,41 @@ describe( 'Claude Studio tools that act outside the host', () => {
 			fenced.sites.findByFolder( path.join( site, 'nowhere' ) )
 		).resolves.toBeUndefined();
 	} );
+
+	it( 'shows nothing in the conversation for a call or turn that has ended', async () => {
+		const { policy, host, controller } = await setup();
+		const ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
+		host.ui = ui;
+		const artifact = { version: 1, id: 'a', widgets: [] } as never;
+		const call = new AbortController();
+		const fenced = policy.guardHost( host, 'call', call.signal );
+		expect( fenced.ui ).not.toBe( ui );
+		await fenced.ui!.showArtifact( artifact );
+		fenced.ui!.reloadPreview();
+		expect( ui.showArtifact ).toHaveBeenCalledTimes( 1 );
+		expect( ui.reloadPreview ).toHaveBeenCalledTimes( 1 );
+
+		call.abort();
+		await expect( fenced.ui!.showArtifact( artifact ) ).rejects.toThrow( 'Denied' );
+		fenced.ui!.reloadPreview();
+		const later = policy.guardHost( host, 'later' );
+		controller.abort();
+		await expect( later.ui!.showArtifact( artifact ) ).rejects.toThrow( 'Denied' );
+		later.ui!.reloadPreview();
+		expect( ui.showArtifact ).toHaveBeenCalledTimes( 1 );
+		expect( ui.reloadPreview ).toHaveBeenCalledTimes( 1 );
+
+		// Without an app showing the conversation there is nothing to fence.
+		host.ui = undefined;
+		expect( policy.guardHost( host, 'none' ).ui ).toBeUndefined();
+	} );
+
+	it( 'names the Studio tools the turn may run, as its selection enables them', async () => {
+		const { policy } = await setup();
+		expect( policy.studioTools ).toEqual( [ 'wp_cli' ] );
+		const disabled = await setup( () => ( { enabledTools: { native: [ 'Read' ], studio: [] } } ) );
+		expect( disabled.policy.studioTools ).toEqual( [] );
+	} );
 } );
 
 describe( 'Claude WordPress.com requests', () => {

@@ -1,83 +1,134 @@
 import { randomUUID } from 'crypto';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk/core';
-import { Value } from 'typebox/value';
 import { z } from 'zod';
+import { resolveStudioToolDefinitions, studioToolDefinitions } from '../tools';
 import { bindTool } from '../tools/define-tool';
-import { runWpCliTool } from '../tools/wp-cli';
-import { isRecord } from './execution-rules';
+import { runStudioTool } from '../tools/execution';
+import {
+	CLAUDE_ENABLED_TOOLS,
+	CLAUDE_NAVIGATION_CONFINEMENT,
+	claudeStudioTools,
+	isRecord,
+} from './execution-rules';
 import type { ClaudeExecutionPolicy } from './execution-policy';
 import type { StudioAgentHost } from '../host';
-import type { ToolResult } from '../tools/define-tool';
+import type { StudioToolsOptions } from '../tools';
+import type { StudioToolDefinition, ToolResult } from '../tools/define-tool';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 
+type BridgeResult = { content: ToolResult[ 'content' ]; isError: boolean };
+
+/**
+ * What the Claude route offers the registry, as the Pi route passes a turn's
+ * capabilities. Claude's models see images. Questions and design choices are
+ * not bridged yet (C2c), and the turn does not resolve the image service yet,
+ * so `generate_images` is left out (C2a-3).
+ */
+const CLAUDE_STUDIO_TOOL_CAPABILITIES: StudioToolsOptions = Object.freeze( {
+	visionEnabled: true,
+	canAskUser: false,
+	imageGeneration: false,
+	wpcomRequest: true,
+} );
+
+/** The Studio tools the Claude route can bridge for a host: the registry, resolved as on the Pi route. */
+export function claudeStudioToolCandidates( host: StudioAgentHost ): StudioToolDefinition[] {
+	return resolveStudioToolDefinitions( host, CLAUDE_STUDIO_TOOL_CAPABILITIES );
+}
+
+/**
+ * Studio's tools as an in-process MCP server: each one under its canonical
+ * name and description, with its canonical schema in the shape the SDK takes.
+ */
 export function createStudioClaudeMcpServer(
-	invoke: (
-		args: unknown,
-		extra?: unknown
-	) => Promise< { content: ToolResult[ 'content' ]; isError: boolean } >
+	tools: readonly Pick< StudioToolDefinition, 'name' | 'description' | 'parameters' >[],
+	invoke: ( name: string, args: unknown, extra?: unknown ) => Promise< BridgeResult >
 ) {
-	const schema = z.fromJSONSchema(
-		runWpCliTool.parameters as unknown as Parameters< typeof z.fromJSONSchema >[ 0 ]
-	);
-	if ( ! ( schema instanceof z.ZodObject ) ) throw new Error( 'Unsupported tool schema' );
 	return createSdkMcpServer( {
 		name: 'studio',
-		tools: [
-			tool(
-				runWpCliTool.name,
-				'Read the current local WordPress site or request approval to create a draft post.',
-				schema.shape,
-				invoke
-			),
-		],
+		tools: tools.map( ( definition ) => {
+			const schema = z.fromJSONSchema(
+				definition.parameters as unknown as Parameters< typeof z.fromJSONSchema >[ 0 ]
+			);
+			if ( ! ( schema instanceof z.ZodObject ) ) throw new Error( 'Unsupported tool schema' );
+			return tool( definition.name, definition.description, schema.shape, ( args, extra ) =>
+				invoke( definition.name, args, extra )
+			);
+		} ),
 	} );
 }
 
-// Studio's tools as an in-process MCP server. Each call is authorized by the
-// execution policy before its handler runs, and runs against a host whose
+/**
+ * The server a native startup check lists: the tools a turn of this build can
+ * enable, none of which it can run.
+ */
+export function createStudioClaudeDiscoveryServer() {
+	const enabled = new Set(
+		claudeStudioTools( CLAUDE_ENABLED_TOOLS, CLAUDE_NAVIGATION_CONFINEMENT, null )
+	);
+	return createStudioClaudeMcpServer(
+		studioToolDefinitions.filter( ( definition ) => enabled.has( definition.name ) ),
+		async () => ( { content: [], isError: true } )
+	);
+}
+
+export interface ClaudeStudioToolBridgeOptions {
+	/** The tools a call can name before the policy selects; by default the host's candidates. */
+	candidates?: readonly StudioToolDefinition[];
+}
+
+// Studio's tools as an in-process MCP server, built from the registry and
+// limited to the tools the execution policy enables. Each call runs through the
+// shared execution semantics: its arguments are checked against the canonical
+// schema, the policy authorizes it, and its tool runs against a host whose
 // operations the policy fences again immediately before their CLI commands.
+// Claude sees a result's content only, and of a failure a fixed sentence.
 export function createStudioClaudeToolBridge(
 	host: StudioAgentHost,
 	turn: { runId: string; turnId: string; policy: ClaudeExecutionPolicy },
-	onEvent: ( event: BackendTurnEvent ) => void
+	onEvent: ( event: BackendTurnEvent ) => void,
+	options: ClaudeStudioToolBridgeOptions = {}
 ) {
 	const { runId, turnId, policy } = turn;
+	const enabled = new Set( policy.studioTools );
+	const tools = ( options.candidates ?? claudeStudioToolCandidates( host ) ).filter(
+		( definition ) => enabled.has( definition.name )
+	);
 	const active = new Set< Promise< unknown > >();
-	async function execute( name: string, args: unknown, signal?: AbortSignal ) {
+	async function execute(
+		name: string,
+		args: unknown,
+		signal?: AbortSignal
+	): Promise< BridgeResult > {
 		const toolCallId = randomUUID();
 		onEvent( { type: 'tool.started', runId, turnId, toolCallId, name } );
-		const fail = () => {
+		const definition = tools.find( ( candidate ) => candidate.name === name );
+		let run: Awaited< ReturnType< typeof runStudioTool > > | undefined;
+		if ( definition ) {
+			try {
+				// The tool reaches the host only as the policy guards it for this call.
+				const guarded = policy.guardHost( host, toolCallId, signal );
+				run = await runStudioTool( bindTool( definition, guarded ), args, {
+					signal: signal ? AbortSignal.any( [ policy.signal, signal ] ) : policy.signal,
+					authorize: () => policy.authorizeStudioCall( { host, name, args, toolCallId, signal } ),
+					onProgress: ( message, update ) =>
+						onEvent( { type: 'tool.progress', runId, turnId, toolCallId, message, update } ),
+					ui: guarded.ui,
+					completion: {},
+				} );
+			} catch {
+				run = undefined;
+			}
+		}
+		if ( run?.status !== 'completed' ) {
 			onEvent( { type: 'tool.result', runId, turnId, toolCallId, isError: true } );
 			return {
-				isError: true as const,
-				content: [ { type: 'text' as const, text: 'Studio operation denied or failed.' } ],
+				isError: true,
+				content: [ { type: 'text', text: 'Studio operation denied or failed.' } ],
 			};
-		};
-		try {
-			if (
-				policy.signal.aborted ||
-				signal?.aborted ||
-				name !== runWpCliTool.name ||
-				! Value.Check( runWpCliTool.parameters, args ) ||
-				! ( await policy.authorizeStudioCall( { host, name, args, toolCallId, signal } ) )
-			)
-				return fail();
-			const bound = bindTool( runWpCliTool, policy.guardHost( host, toolCallId, signal ) );
-			const result = await bound.rawHandler( args, {
-				onProgress: ( message, update ) =>
-					onEvent( { type: 'tool.progress', runId, turnId, toolCallId, message, update } ),
-			} );
-			const pending = await result.pending;
-			onEvent( { type: 'tool.result', runId, turnId, toolCallId, isError: false } );
-			return {
-				isError: false as const,
-				content: pending
-					? [ ...result.content, { type: 'text' as const, text: pending } ]
-					: result.content,
-			};
-		} catch {
-			return fail();
 		}
+		onEvent( { type: 'tool.result', runId, turnId, toolCallId, isError: false } );
+		return { isError: false, content: run.result.content };
 	}
 	// `signal` is the MCP call's own: the SDK aborts it when the native runtime
 	// gives up on the call, which cancels its approval and anything not yet started.
@@ -90,9 +141,9 @@ export function createStudioClaudeToolBridge(
 			active.delete( operation );
 		}
 	}
-	const server = createStudioClaudeMcpServer( ( args, extra ) => {
+	const server = createStudioClaudeMcpServer( tools, ( name, args, extra ) => {
 		const signal = isRecord( extra ) ? extra.signal : undefined;
-		return invoke( runWpCliTool.name, args, signal instanceof AbortSignal ? signal : undefined );
+		return invoke( name, args, signal instanceof AbortSignal ? signal : undefined );
 	} );
 	return {
 		server,

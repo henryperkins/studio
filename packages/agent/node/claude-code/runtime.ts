@@ -31,7 +31,7 @@ import {
 } from './execution-rules';
 import { isClaudeExecutableUnchanged } from './platform';
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
-import { createStudioClaudeMcpServer, createStudioClaudeToolBridge } from './tool-bridge';
+import { createStudioClaudeDiscoveryServer, createStudioClaudeToolBridge } from './tool-bridge';
 import type { ClaudeAuthIdentity } from './auth-status';
 import type { ClaudeAccountStatus, ClaudeAccountStatusRequest } from './connection';
 import type { ClaudeAccountCheck, ClaudeApprover } from './execution-policy';
@@ -441,7 +441,7 @@ export async function discoverClaudeModels(
 	let owner: ProcessOwner | undefined;
 	let owned: OwnedProcess | undefined;
 	let sdk: ReturnType< typeof sdkQuery > | undefined;
-	let server: ReturnType< typeof createStudioClaudeMcpServer > | undefined;
+	let server: ReturnType< typeof createStudioClaudeDiscoveryServer > | undefined;
 	const done = new Promise< IteratorResult< SDKUserMessage > >( ( resolve ) => {
 		controller.signal.addEventListener(
 			'abort',
@@ -468,7 +468,7 @@ export async function discoverClaudeModels(
 			return { ok: false as const, blockers: prepared.blockers ?? failed.blockers };
 		owner = ( dependencies.prepareOwner ?? prepareProcessOwner )();
 		if ( ! ( await owner.prepared() ) ) return failed;
-		server = createStudioClaudeMcpServer( async () => ( { content: [], isError: true } ) );
+		server = createStudioClaudeDiscoveryServer();
 		sdk = ( dependencies.query ?? sdkQuery )( {
 			prompt: { [ Symbol.asyncIterator ]: () => ( { next: () => done } ) },
 			options: {

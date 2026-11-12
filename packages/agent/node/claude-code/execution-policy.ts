@@ -157,6 +157,8 @@ export interface ClaudeStudioCall {
 export interface ClaudeExecutionPolicy {
 	/** Aborts when the turn ends or anything it was authorized against changes. */
 	readonly signal: AbortSignal;
+	/** The Studio tools this turn may run: enabled, qualified and, when they drive a browser, guarded. */
+	readonly studioTools: readonly string[];
 	/**
 	 * The SDK PreToolUse hook and the native permission request. `signal` is the
 	 * caller's own: when it aborts, the decision is deny.
@@ -164,7 +166,11 @@ export interface ClaudeExecutionPolicy {
 	authorizeToolUse( use: ClaudeToolUse, signal?: AbortSignal ): Promise< boolean >;
 	/** A Studio MCP tool call, before its handler runs. */
 	authorizeStudioCall( call: ClaudeStudioCall ): Promise< boolean >;
-	/** The host a Studio tool call runs against: every operation with an effect is fenced. */
+	/**
+	 * The host a Studio tool call runs against: every operation with an effect is
+	 * fenced, and the app showing the conversation hears nothing from a call or
+	 * turn that has ended.
+	 */
 	guardHost( host: StudioAgentHost, toolCallId: string, signal?: AbortSignal ): StudioAgentHost;
 	requestApproval(
 		operation: ClaudeOperation,
@@ -801,8 +807,20 @@ export function createClaudeExecutionPolicy(
 			);
 		};
 		const selectSite = host.selectSite;
+		const { ui } = host;
 		return {
 			...host,
+			// What a call shows in the conversation is written to the chat's record
+			// and can bind the chat to a site, so it stops with the call's authority.
+			ui: ui && {
+				showArtifact: async ( artifact ) => {
+					if ( operationSignal.aborted ) throw denied();
+					await ui.showArtifact( artifact );
+				},
+				reloadPreview: () => {
+					if ( ! operationSignal.aborted ) ui.reloadPreview();
+				},
+			},
 			sites: {
 				...host.sites,
 				resolve: async ( reference ) => {
@@ -907,6 +925,7 @@ export function createClaudeExecutionPolicy(
 
 	return {
 		signal,
+		studioTools: Object.freeze( [ ...studioTools ] ),
 		authorizeToolUse,
 		authorizeStudioCall,
 		guardHost,
