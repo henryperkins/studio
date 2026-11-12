@@ -73,6 +73,7 @@ import {
 	resolveUnavailableAiProvider,
 	saveSelectedAiProvider,
 } from 'cli/ai/auth';
+import { runsOnChatGpt } from 'cli/ai/chatgpt';
 import { cliAgentHost } from 'cli/ai/host';
 import { emitEvent } from 'cli/ai/json-events';
 import { type AiOutputAdapter, JsonAdapter } from 'cli/ai/output-adapter';
@@ -577,10 +578,10 @@ export async function runCommand( options: {
 		if ( provider === 'chatgpt-oauth' ) {
 			throw new LoggerError( __( 'Use /chatgpt to choose a saved account and model.' ) );
 		}
-		if (
-			currentProvider === 'chatgpt-oauth' &&
-			readChatGptSessionSelection( ( await ensureSession() ).getEntries() )
-		) {
+		// The entries this run has, without starting a session to read them.
+		const entries =
+			session?.getEntries() ?? resumedById?.getEntries() ?? options.resumeSession?.entries ?? [];
+		if ( runsOnChatGpt( currentProvider, entries ) ) {
 			await clearConversation( { preserveConnection: false } );
 		}
 		// The pin written below carries the model, so the quota-based default
@@ -1161,6 +1162,8 @@ export async function runCommand( options: {
 				currentProvider = 'chatgpt-oauth';
 				ui.currentProvider = currentProvider;
 				quotaDefaultApplicable = false;
+				// Chosen: setting a key or logging in later doesn't move this chat elsewhere.
+				showCapabilitiesOnConnect = false;
 				if ( isAiModelId( selected.model ) ) currentModel = selected.model;
 				ui.currentModel = currentModel;
 				if ( ! sameConnection ) {

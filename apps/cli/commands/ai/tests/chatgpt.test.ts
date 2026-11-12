@@ -23,7 +23,12 @@ import {
 	getEffectiveSessionProvider,
 } from '@studio/agent/protocol/providers';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { resolveAiEnvironment, saveSelectedAiProvider } from 'cli/ai/auth';
+import {
+	resolveAiEnvironment,
+	resolveInitialAiProvider,
+	saveSelectedAiProvider,
+} from 'cli/ai/auth';
+import { runsOnChatGpt } from 'cli/ai/chatgpt';
 import { getActiveSlashCommands } from 'cli/ai/slash-commands';
 import { AiChatUI } from 'cli/ai/ui';
 import { runCommand } from '../index';
@@ -67,7 +72,7 @@ vi.mock( 'cli/lib/tracks', async ( original ) => ( {
 } ) );
 vi.mock( 'cli/ai/sessions/replay', () => ( { replaySessionHistory: vi.fn() } ) );
 vi.mock( 'cli/ai/auth', () => ( {
-	resolveInitialAiProvider: async () => 'openai-api-key',
+	resolveInitialAiProvider: vi.fn( async () => 'openai-api-key' ),
 	resolveUnavailableAiProvider: async () => undefined,
 	isAiProviderReady: async () => true,
 	getAvailableAiProviders: async () => [ 'wpcom', 'anthropic-api-key', 'openai-api-key' ],
@@ -395,6 +400,63 @@ describe( 'ChatGPT interactive CLI', () => {
 		expect( runs ).toHaveLength( 0 );
 		expect( resolveAiEnvironment ).not.toHaveBeenCalled();
 		expect( listChatGptConnections ).not.toHaveBeenCalled();
+	} );
+
+	it( 'keeps a ChatGPT chat chosen on a first run when an API key is set afterwards', async () => {
+		vi.mocked( readSelectedAiProvider ).mockResolvedValue( undefined );
+		// A first run offers to choose how to connect only off OpenAI and ChatGPT.
+		vi.mocked( resolveInitialAiProvider ).mockResolvedValueOnce( 'wpcom' );
+		const ui = terminal(
+			[ '/chatgpt', '/api-key', 'New request' ],
+			[
+				'Select saved account',
+				`Personal · ${ A }`,
+				'GPT-6 Luna · gpt-6-luna',
+				'Low',
+				'Start new chat',
+			]
+		);
+		const answer = ui.askUser;
+		// The first run's "Choose how to connect" is closed without a choice.
+		ui.askUser = vi.fn( async ( questions: Parameters< typeof answer >[ 0 ] ) =>
+			questions[ 0 ].question === 'Choose how to connect' ? {} : answer( questions )
+		);
+
+		await runCommand( { adapter: ui } );
+
+		expect( ui.showOnboarding ).toHaveBeenCalled();
+		expect( ui.showError ).not.toHaveBeenCalled();
+		expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
+		expect( runs ).toHaveLength( 1 );
+		expect( runs[ 0 ].config.connection?.connectionId ).toBe( A );
+		expect( readChatGptSessionSelection( runs[ 0 ].entries ) ).toMatchObject( {
+			connectionId: A,
+			reasoningEffort: 'low',
+		} );
+	} );
+
+	it( 'leaves a conversation that ran on ChatGPT when switching provider, pinned there or only by its last reply', () => {
+		const reply = {
+			type: 'message',
+			id: 'reply',
+			parentId: null,
+			timestamp: new Date( 0 ).toISOString(),
+			message: { role: 'assistant', content: [], provider: 'studio-chatgpt', model: 'x' },
+		} as unknown as SessionEntry;
+		const pin = {
+			type: 'custom',
+			id: 'pin',
+			parentId: null,
+			timestamp: new Date( 0 ).toISOString(),
+			customType: 'studio.session_context',
+			data: { provider: 'chatgpt-oauth', connectionId: A, revision: 1 },
+		} as unknown as SessionEntry;
+
+		expect( runsOnChatGpt( 'chatgpt-oauth', [] ) ).toBe( true );
+		expect( runsOnChatGpt( 'wpcom', [ reply ] ) ).toBe( true );
+		expect( runsOnChatGpt( 'chatgpt-oauth', [ reply ] ) ).toBe( true );
+		expect( runsOnChatGpt( 'wpcom', [ pin ] ) ).toBe( true );
+		expect( runsOnChatGpt( 'openai-api-key', [] ) ).toBe( false );
 	} );
 
 	it( 'with ChatGPT off, says so at /chatgpt and offers only signing out of the saved sign-ins', async () => {

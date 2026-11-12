@@ -12,7 +12,9 @@ import {
 import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { getChatGptModelCapabilities } from '@studio/agent/protocol/chatgpt-models';
 import { getOpenAiReasoningEffortLabel } from '@studio/agent/protocol/openai-models';
+import { getEffectiveSessionProvider, type AiProviderId } from '@studio/agent/protocol/providers';
 import { __, sprintf } from '@wordpress/i18n';
+import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import type {
 	ChatGptAccountView,
 	ChatGptCredentialStorage,
@@ -178,6 +180,17 @@ async function configure(
 			0,
 			8
 		) } · ${ model } · ${ getOpenAiReasoningEffortLabel( effort ) }`
+	);
+}
+
+/**
+ * Whether the conversation runs on ChatGPT, pinned there or by its last
+ * reply: switching provider then leaves it for a new conversation.
+ */
+export function runsOnChatGpt( currentProvider: AiProviderId, entries: SessionEntry[] ): boolean {
+	return (
+		currentProvider === 'chatgpt-oauth' ||
+		getEffectiveSessionProvider( entries, null ) === 'chatgpt-oauth'
 	);
 }
 
