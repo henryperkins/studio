@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
 import path from 'path';
-import { escapeClaudeApprovalText } from '@studio/agent/protocol/claude-code';
+import {
+	escapeClaudeApprovalText,
+	isClaudeReadOnlyClass,
+} from '@studio/agent/protocol/claude-code';
 import {
 	CLAUDE_ACCOUNT_RECHECK_MS,
 	CLAUDE_NATIVE_TOOL_RULES,
@@ -33,6 +36,7 @@ import type { HostOperationOptions, HostSite, StudioAgentHost } from '../host';
 import type {
 	BackendApprovalOperation,
 	BackendTurnEvent,
+	ClaudeOperationJournalEvent,
 } from '@studio/agent/protocol/backend-events';
 import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
@@ -120,6 +124,11 @@ export interface ClaudeExecutionContext {
 	/** The conversation still has the turn's native binding and this persisted target. */
 	verifyTarget: ( expected: ClaudeStudioTarget ) => Promise< boolean >;
 	onEvent: ( event: BackendTurnEvent ) => void;
+	/**
+	 * Writes an entry to the turn's journal and resolves once it is on disk.
+	 * Every operation that does more than read is recorded this way before it runs.
+	 */
+	recordOperation: ( event: ClaudeOperationJournalEvent ) => Promise< void >;
 }
 
 /**
@@ -422,13 +431,50 @@ export function createClaudeExecutionPolicy(
 		return expected === actual && ( await accountCheckpoint( callSignal ) );
 	}
 
+	// The last step before anything that does more than read runs: its record
+	// in the turn's journal, on disk, so a recovery can name it if the turn ends
+	// before its result is recorded. What cannot be recorded does not run, and
+	// the turn stops, since it could no longer account for what it runs.
+	async function admit(
+		operation: Pick< ClaudeOperation, 'tool' | 'operationClass' | 'description' >,
+		toolCallId: string | undefined,
+		callSignal?: AbortSignal,
+		requestId?: string
+	): Promise< boolean > {
+		if ( isClaudeReadOnlyClass( operation.operationClass ) ) return true;
+		if ( ! toolCallId || signal.aborted || callSignal?.aborted ) return false;
+		try {
+			await context.recordOperation( {
+				type: 'operation.authorized',
+				runId: context.runId,
+				turnId: context.turnId,
+				toolCallId,
+				...( requestId ? { requestId } : {} ),
+				operation: {
+					tool: escapeClaudeApprovalText( operation.tool ),
+					operationClass: operation.operationClass,
+					target: { ...context.target },
+				},
+				description: escapeClaudeApprovalText( operation.description ),
+			} );
+		} catch {
+			controller.abort();
+			return false;
+		}
+		return ! signal.aborted && ! callSignal?.aborted;
+	}
+
 	async function approveOnce(
 		operation: ClaudeOperation,
 		toolCallId: string,
 		callSignal?: AbortSignal
 	) {
 		const grant = await requestApproval( operation, toolCallId, callSignal );
-		return !! grant && ( await authorizeExecution( grant, operation, toolCallId, callSignal ) );
+		return (
+			!! grant &&
+			( await authorizeExecution( grant, operation, toolCallId, callSignal ) ) &&
+			admit( operation, toolCallId, callSignal, grant.requestId )
+		);
 	}
 
 	async function authorizeToolUse(
@@ -476,25 +522,21 @@ export function createClaudeExecutionPolicy(
 				localPaths = [ value ];
 			}
 		}
-		if ( ! requiresClaudeApproval( rule.operationClass ) ) return checkpoint( callSignal );
+		const operation = {
+			tool: toolName,
+			operationClass: rule.operationClass,
+			description: describeClaudeOperation(
+				rule.operationClass,
+				toolName,
+				rule.shell ? context.shellConfinement : undefined
+			),
+		};
+		if ( ! requiresClaudeApproval( rule.operationClass ) )
+			return ( await checkpoint( callSignal ) ) && admit( operation, use.toolUseId, callSignal );
 		const toolUseId = use.toolUseId;
 		if ( ! toolUseId || askedToolUses.has( toolUseId ) ) return false;
 		askedToolUses.add( toolUseId );
-		return approveOnce(
-			{
-				tool: toolName,
-				operationClass: rule.operationClass,
-				args: input,
-				localPaths,
-				description: describeClaudeOperation(
-					rule.operationClass,
-					toolName,
-					rule.shell ? context.shellConfinement : undefined
-				),
-			},
-			toolUseId,
-			callSignal
-		);
+		return approveOnce( { ...operation, args: input, localPaths }, toolUseId, callSignal );
 	}
 
 	// Resolves a site reference and requires it to be the turn's target site,
@@ -600,8 +642,14 @@ export function createClaudeExecutionPolicy(
 				remote = `WordPress.com site ${ scope.wpcomSiteId }`;
 			}
 		}
+		const description = describeClaudeOperation( operationClass, name );
+		// A tool approved at its host operations is journaled here too: the
+		// host operations it reaches are journaled again as they run.
 		if ( ! requiresClaudeApproval( operationClass ) || rule.approval === 'host' )
-			return checkpoint( callSignal );
+			return (
+				( await checkpoint( callSignal ) ) &&
+				admit( { tool: name, operationClass, description }, toolCallId, callSignal )
+			);
 		return approveOnce(
 			{
 				tool: name,
@@ -610,7 +658,7 @@ export function createClaudeExecutionPolicy(
 				siteId: site?.id,
 				localPaths,
 				remote,
-				description: describeClaudeOperation( operationClass, name ),
+				description,
 			},
 			toolCallId,
 			callSignal
@@ -730,8 +778,14 @@ export function createClaudeExecutionPolicy(
 			const prepared = await prepare( host, request, toolCallId, callSignal );
 			if ( ! prepared || ! ( await fence( prepared, callSignal ) ) ) throw denied();
 			if (
-				prepared.grant &&
-				! ( await authorizeExecution( prepared.grant, prepared.operation, toolCallId, callSignal ) )
+				( prepared.grant &&
+					! ( await authorizeExecution(
+						prepared.grant,
+						prepared.operation,
+						toolCallId,
+						callSignal
+					) ) ) ||
+				! ( await admit( prepared.operation, toolCallId, callSignal, prepared.grant?.requestId ) )
 			)
 				throw denied();
 			operationSignal.throwIfAborted();

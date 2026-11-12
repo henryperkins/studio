@@ -9,7 +9,10 @@ import {
 } from '../../execution-policy';
 import { CLAUDE_ENABLED_TOOLS, CLAUDE_NAVIGATION_RULE_REVISION } from '../../execution-rules';
 import type { ClaudeExecutionContext } from '../../execution-policy';
-import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
+import type {
+	BackendTurnEvent,
+	ClaudeOperationJournalEvent,
+} from '@studio/agent/protocol/backend-events';
 
 export const targetOrigin = new URL( fakeSite.url ).origin;
 
@@ -163,6 +166,8 @@ export async function createPolicyFixture(
 	host.sites.all = vi.fn( async () => [ localSite, otherSite ] );
 	const controller = new AbortController();
 	const events: BackendTurnEvent[] = [];
+	// What the policy wrote to the turn's journal before letting an operation run.
+	const journal: ClaudeOperationJournalEvent[] = [];
 	const clock = { now: 0 };
 	const context: ClaudeExecutionContext = {
 		runId: 'run',
@@ -187,6 +192,9 @@ export async function createPolicyFixture(
 		now: () => clock.now,
 		verifyTarget: vi.fn( async () => true ),
 		onEvent: ( event ) => events.push( event ),
+		recordOperation: async ( event ) => {
+			journal.push( event );
+		},
 		...overrides( { site, config, parent } ),
 	};
 	return {
@@ -197,6 +205,7 @@ export async function createPolicyFixture(
 		otherSite,
 		controller,
 		events,
+		journal,
 		clock,
 		site,
 		other,

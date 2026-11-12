@@ -420,10 +420,18 @@ describe( 'recovery once the owner is gone (Node test processes)', () => {
 				turnId: 'turn',
 				recordedTerminal: true,
 				invalidatedApprovals: [ ( requested as { requestId: string } ).requestId ],
+				// The tool call was authorized and journaled; the draft it asked for
+				// was waiting for its approval.
 				uncertainOperations: [
+					expect.objectContaining( {
+						tool: 'wp_cli',
+						operationClass: 'command',
+						evidence: 'authorized',
+					} ),
 					expect.objectContaining( {
 						requestId: ( requested as { requestId: string } ).requestId,
 						tool: 'sites.wpCli',
+						evidence: 'requested',
 						resolved: false,
 					} ),
 				],

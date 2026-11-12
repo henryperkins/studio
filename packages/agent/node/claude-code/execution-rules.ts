@@ -1328,6 +1328,19 @@ export const HOST_OPERATION_CLASSES: Readonly<
 	'sync.pull': 'remote-overwrite',
 };
 
+/**
+ * Whether this build has a rule for a tool or host operation of that name.
+ * Recovery takes a tool it does not recognise to have done more than read.
+ */
+export function isKnownClaudeTool( name: string ): boolean {
+	return (
+		CLAUDE_STUDIO_TOOL_RULES.has( name ) ||
+		CLAUDE_NATIVE_TOOL_RULES.has( name ) ||
+		name === 'sites.wpCli' ||
+		Object.prototype.hasOwnProperty.call( HOST_OPERATION_CLASSES, name )
+	);
+}
+
 const CLASS_DESCRIPTIONS: Readonly< Record< ClaudeOperationClass, string > > = {
 	read: 'Read',
 	'remote-read': 'Read from WordPress.com',

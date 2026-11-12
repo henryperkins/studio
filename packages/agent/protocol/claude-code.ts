@@ -35,6 +35,11 @@ export type ClaudeOperationClass =
 	| 'external-message'
 	| 'command';
 
+/** Whether an operation of this class only reads. Studio journals every other one before it runs. */
+export function isClaudeReadOnlyClass( operationClass: unknown ): boolean {
+	return operationClass === 'read' || operationClass === 'remote-read';
+}
+
 /**
  * Why Studio did not recover a locked Claude conversation. Every reason leaves
  * the run lock, the journal and the native history exactly as they were.
@@ -95,19 +100,29 @@ export const CLAUDE_RECOVERY_BLOCKED_REASONS = [
 export type ClaudeRecoveryBlockedReason = ( typeof CLAUDE_RECOVERY_BLOCKED_REASONS )[ number ];
 
 /**
- * An operation of an interrupted turn that may or may not have run: its
- * approval was requested and no result was recorded. Nothing retries it.
+ * An operation of an interrupted turn that may or may not have run, and has
+ * no recorded result. Nothing retries it.
  */
 export interface ClaudeUncertainOperation {
-	requestId: string;
 	toolCallId: string;
-	/** Display-safe, as the approval showed it. */
+	/** Display-safe: the canonical Studio tool, native tool or host operation. */
 	tool: string;
-	operationClass: ClaudeOperationClass;
-	target: ClaudeStudioTarget;
+	/** Absent for a tool Studio does not recognize, which is never taken to only read. */
+	operationClass?: ClaudeOperationClass;
+	/** The turn's target, when the journal recorded it. */
+	target?: ClaudeStudioTarget;
+	/** Display-safe, as an approval shows it. */
 	description: string;
-	/** Whether the approval was recorded as answered. The answer itself never is. */
-	resolved: boolean;
+	/**
+	 * What the journal shows of it: Studio let it run (`authorized`), asked
+	 * for its approval (`requested`), or saw a tool it does not recognize start
+	 * (`started`).
+	 */
+	evidence: 'authorized' | 'requested' | 'started';
+	/** The approval it was asked for, if any. */
+	requestId?: string;
+	/** Whether that approval was recorded as answered. The answer itself never is. */
+	resolved?: boolean;
 }
 
 /** What recovering a locked Claude conversation did. Serializable, for every Studio app. */

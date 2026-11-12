@@ -41,6 +41,7 @@ import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk/cor
 import type {
 	BackendTurnEvent,
 	ClaudeBackendTurnSnapshot,
+	ClaudeOperationJournalEvent,
 } from '@studio/agent/protocol/backend-events';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type { ClaudeModelOption, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
@@ -774,6 +775,15 @@ export async function runClaudeTurn(
 				} );
 			input.onEvent( event );
 		};
+		// Journal-only, after everything emitted before it, and on disk when it settles.
+		const recordOperation = ( event: ClaudeOperationJournalEvent ): Promise< void > => {
+			const written = journalWork.then( () => journal!.append( event ) );
+			journalWork = written.catch( () => {
+				journalFailed = true;
+				cancel();
+			} );
+			return written;
+		};
 		policy = createClaudeExecutionPolicy( {
 			runId,
 			turnId,
@@ -804,6 +814,7 @@ export async function runClaudeTurn(
 			now: clock,
 			verifyTarget: ( expected ) => options.verifyTarget( snapshot, expected ),
 			onEvent: emit,
+			recordOperation,
 		} );
 		const guard = policy;
 		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy: guard }, emit );

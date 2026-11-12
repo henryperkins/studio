@@ -2075,6 +2075,79 @@ it( 'on cancel ends the pending approval before the native process hears of it, 
 	}
 } );
 
+it( 'has an operation’s authorization on disk in the turn’s journal before the host runs it (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createNativeSessionStore } = await import( '../sessions' );
+	const { Client } = await import( '@modelcontextprotocol/sdk/client/index.js' );
+	// The SDK's wildcard export resolves at runtime, although the ESLint resolver misses it.
+	// eslint-disable-next-line import-x/no-unresolved
+	const { InMemoryTransport } = await import( '@modelcontextprotocol/sdk/inMemory.js' );
+	const fixture = await ownedNativeFixture( 'claude-authorized-' );
+	try {
+		const site = {
+			id: 'site',
+			path: fixture.root,
+			name: 'site',
+			url: 'http://localhost',
+			phpVersion: '8.4',
+		};
+		vi.mocked( fixture.host.sites.resolve ).mockResolvedValue( site );
+		const store = createNativeSessionStore( fixture.storeRoot );
+		let onDisk: unknown[] = [];
+		vi.mocked( fixture.host.sites.wpCli ).mockImplementation( async () => {
+			onDisk = ( await store.readJournals( 'chat' ) ).flat();
+			return { exitCode: 0, stdout: '', stderr: '' };
+		} );
+		const query = spawningNativeTurn( fixture.root, async ( options ) => {
+			const [ clientTransport, serverTransport ] = InMemoryTransport.createLinkedPair();
+			const client = new Client( { name: 'studio-test', version: '1.0.0' } );
+			const server = (
+				options.mcpServers as { studio: { instance: { connect( t: unknown ): Promise< void > } } }
+			 ).studio.instance;
+			await Promise.all( [ server.connect( serverTransport ), client.connect( clientTransport ) ] );
+			await client.callTool( {
+				name: 'wp_cli',
+				arguments: {
+					nameOrPath: 'site',
+					command: 'post create --post_status=draft --post_title=Hello',
+				},
+			} );
+			return 'result';
+		} );
+		await runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'turn' ),
+			fixture.host,
+			{ prompt: 'hello', signal: new AbortController().signal, onEvent: () => {} },
+			{
+				storeRoot: fixture.storeRoot,
+				approve: async () => 'allow',
+				verifyTarget: async () => true,
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				prepareOwner: fixture.prepareOwner,
+				ownerIdentity: async () => ( { pid: 1234, start: '1' } ),
+				connection: fixture.connection,
+				prepare: fixture.prepare,
+				account: fixture.account,
+			}
+		);
+		expect( fixture.host.sites.wpCli ).toHaveBeenCalledOnce();
+		expect( onDisk ).toContainEqual(
+			expect.objectContaining( {
+				type: 'operation.authorized',
+				operation: expect.objectContaining( { tool: 'sites.wpCli', operationClass: 'command' } ),
+				description: 'Create a draft post on the current local site',
+			} )
+		);
+		expect(
+			JSON.stringify(
+				onDisk.filter( ( event ) => ( event as { type: string } ).type === 'operation.authorized' )
+			)
+		).not.toContain( 'Hello' );
+	} finally {
+		await fixture.cleanup();
+	}
+} );
+
 describe( 'the run lock a turn records (mock SDK)', () => {
 	const owner = { pid: 1234, start: '134389060500000000' };
 	const lockOf = async ( storeRoot: string ) => {

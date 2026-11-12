@@ -162,8 +162,27 @@ export interface ClaudeRecoveryJournalEvent extends BackendTurnIds {
 	uncertainOperations: ClaudeUncertainOperation[];
 }
 
+/**
+ * On disk before Studio lets an operation that does more than read run,
+ * whether it was approved, needed no approval, or is approved at the host
+ * operation it reaches, so a recovery can name it if the turn ends before its
+ * result is recorded. Journal-only and display-safe: the tool, its class, the
+ * turn's target and the description an approval shows; never the operation's
+ * arguments, file contents, paths or account details.
+ */
+export interface ClaudeOperationJournalEvent extends BackendTurnIds, ToolCall {
+	type: 'operation.authorized';
+	/** The approval it runs under, when it needed one. */
+	requestId?: string;
+	operation: { tool: string; operationClass: ClaudeOperationClass; target: ClaudeStudioTarget };
+	description: string;
+}
+
+/** What a running Claude turn writes to its own journal. */
+export type ClaudeTurnJournalEvent = BackendTurnEvent | ClaudeOperationJournalEvent;
+
 /** What a Claude conversation's display journal holds once read back. */
 export type ClaudeJournalEvent =
-	| BackendTurnEvent
+	| ClaudeTurnJournalEvent
 	| LegacyApprovalRequestedEvent
 	| ClaudeRecoveryJournalEvent;

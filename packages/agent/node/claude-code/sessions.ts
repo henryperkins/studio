@@ -19,7 +19,11 @@ import { createInterface } from 'readline';
 import { writeFile as atomicWriteFile } from 'atomically';
 import { resolveClaudeResume } from '../backends/resume';
 import type { ClaudeTranscriptCandidate } from '../backends/resume';
-import type { BackendTurnEvent, ClaudeJournalEvent } from '@studio/agent/protocol/backend-events';
+import type {
+	BackendTurnEvent,
+	ClaudeJournalEvent,
+	ClaudeTurnJournalEvent,
+} from '@studio/agent/protocol/backend-events';
 import type {
 	ClaudeBackendSessionBinding,
 	ClaudeBackendSessionRef,
@@ -457,7 +461,7 @@ export function createNativeSessionStore( root: string ) {
 			let pending = Promise.resolve();
 			let indexed = false;
 			return {
-				append( event: BackendTurnEvent ) {
+				append( event: ClaudeTurnJournalEvent ) {
 					if ( event.turnId !== turnId ) throw new Error( 'Turn mismatch' );
 					pending = pending.then( async () => {
 						if ( ! indexed ) {

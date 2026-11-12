@@ -3,11 +3,17 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { fakeSite } from '../../tests/fake-host';
+import { createClaudeEventAdapter } from '../event-adapter';
 import { recoverClaudeRun } from '../recovery';
 import { claudeLockDigest, createNativeSessionStore } from '../sessions';
+import { createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
 import type { ClaudeRecoverySeams } from '../recovery';
-import type { BackendTurnEvent, ClaudeJournalEvent } from '@studio/agent/protocol/backend-events';
+import type {
+	ClaudeJournalEvent,
+	ClaudeTurnJournalEvent,
+} from '@studio/agent/protocol/backend-events';
 import type { OwnedTreeCheck, ProcessIdentityCheck } from '@studio/common/lib/owned-process';
 
 const cleanups: Array< () => Promise< void > > = [];
@@ -20,24 +26,73 @@ const native = { pid: 2222, start: 'native-start' };
 const guardian = { pid: 3333, start: 'guardian-start' };
 const self = { pid: 4444, start: 'self-start' };
 const ids = { runId: 'run', turnId: 'turn' };
-const target = { environment: 'local' as const, siteId: 'site' };
+const target = { environment: 'local' as const, siteId: fakeSite.id };
+const draft = { nameOrPath: 'site', command: 'post create --post_status=draft --post_title=Hello' };
 
-function approval( requestId: string, toolCallId: string ): BackendTurnEvent {
-	return {
-		type: 'approval.requested',
-		...ids,
-		toolCallId,
-		requestId,
-		description: 'Create a draft post on the current local site',
-		operation: {
-			tool: 'wp_cli',
-			operationClass: 'local-change',
-			target,
-			args: '{}',
-			localPaths: [],
+type Turn = Omit< Awaited< ReturnType< typeof createPolicyFixture > >, 'events' > & {
+	bridge: ReturnType< typeof createStudioClaudeToolBridge >;
+	events: ClaudeTurnJournalEvent[];
+};
+
+// What a turn journals through the real execution policy, tool bridge and
+// event adapter, in the order the runtime journals it, up to the moment it
+// dies: `act` drives the turn, and whatever is still running when it returns
+// never records a result.
+async function journalOf(
+	act: ( turn: Turn ) => Promise< void >,
+	overrides: Parameters< typeof createPolicyFixture >[ 0 ] = () => ( {} )
+): Promise< ClaudeTurnJournalEvent[] > {
+	const events: ClaudeTurnJournalEvent[] = [];
+	const fixture = await createPolicyFixture( ( paths ) => ( {
+		onEvent: ( event ) => events.push( event ),
+		recordOperation: async ( event ) => {
+			events.push( event );
 		},
-	};
+		...overrides( paths ),
+	} ) );
+	const bridge = createStudioClaudeToolBridge(
+		fixture.host,
+		{ ...ids, policy: fixture.policy },
+		( event ) => events.push( event )
+	);
+	await act( { ...fixture, bridge, events } );
+	const recorded = structuredClone( events );
+	// The turn dies here: nothing it left running records anything more.
+	fixture.controller.abort();
+	cleanups.push( fixture.cleanup );
+	return recorded;
 }
+
+const hangs = () => new Promise< never >( () => {} );
+
+// A draft whose approval is still waiting for its answer.
+const pendingDraft = () =>
+	journalOf(
+		async ( { bridge, events } ) => {
+			void bridge.invoke( 'wp_cli', draft );
+			await vi.waitFor( () =>
+				expect( events.some( ( event ) => event.type === 'approval.requested' ) ).toBe( true )
+			);
+		},
+		() => ( { approve: hangs, approvalTimeoutMs: 60_000 } )
+	);
+
+// A draft the user allowed, whose WP-CLI command was still running.
+const runningDraft = () =>
+	journalOf( async ( { bridge, host } ) => {
+		vi.mocked( host.sites.wpCli ).mockImplementation( hangs );
+		void bridge.invoke( 'wp_cli', draft );
+		await vi.waitFor( () => expect( host.sites.wpCli ).toHaveBeenCalled() );
+	} );
+
+const idsOf = ( events: ClaudeTurnJournalEvent[] ) => ( {
+	toolCallId: (
+		events.find( ( event ) => event.type === 'tool.started' ) as { toolCallId: string }
+	 ).toolCallId,
+	requestId: (
+		events.find( ( event ) => event.type === 'approval.requested' ) as { requestId: string }
+	 ).requestId,
+} );
 
 async function recoveryFixture() {
 	const parent = await realpath( await mkdtemp( path.join( os.tmpdir(), 'claude-recovery-' ) ) );
@@ -90,7 +145,7 @@ async function recoveryFixture() {
 		ref?: boolean;
 		history?: boolean;
 		lockSessionId?: string;
-		journal?: BackendTurnEvent[];
+		journal?: ClaudeTurnJournalEvent[];
 	} = {} ) {
 		const nativeSessionId = randomUUID();
 		if ( ref ) await store.create( { backend: 'claude-code', ...binding, nativeSessionId } );
@@ -141,42 +196,53 @@ const terminals = ( journals: ClaudeJournalEvent[][] ) =>
 describe( 'recovering a conversation whose run outlived its owner', () => {
 	it( 'recovers once the owner and the whole native tree are provably gone: one interrupted outcome, partial output kept, pending approvals closed, and the same native session resumes next', async () => {
 		const fixture = await recoveryFixture();
-		const journal: BackendTurnEvent[] = [
+		// The prompt as the runtime journals it, the partial answer through the
+		// real event adapter, then a draft waiting for its approval.
+		const journal: ClaudeTurnJournalEvent[] = [
 			{ type: 'turn.prompt', ...ids, text: 'Write a draft' },
-			{
-				type: 'content.confirmed',
-				...ids,
-				messageId: 'message',
-				blockId: '0',
-				blockType: 'text',
-				text: 'Partial answer',
-			},
-			approval( 'request', 'call' ),
 		];
+		createClaudeEventAdapter( ids.runId, ids.turnId, ( event ) => journal.push( event ) ).accept( {
+			type: 'assistant',
+			uuid: 'frame',
+			message: { id: 'message', content: [ { type: 'text', text: 'Partial answer' } ] },
+		} );
+		journal.push( ...( await pendingDraft() ) );
+		const { toolCallId, requestId } = idsOf( journal );
 		const { nativeSessionId } = await fixture.deadTurn( { journal } );
 		const result = await fixture.recover();
-		const uncertain = {
-			requestId: 'request',
-			toolCallId: 'call',
-			tool: 'wp_cli',
-			operationClass: 'local-change',
-			target,
-			description: 'Create a draft post on the current local site',
-			resolved: false,
-		};
+		const uncertain = [
+			{
+				toolCallId,
+				tool: 'wp_cli',
+				operationClass: 'command',
+				target,
+				description: 'Run a command: wp_cli',
+				evidence: 'authorized',
+			},
+			{
+				toolCallId,
+				tool: 'sites.wpCli',
+				operationClass: 'command',
+				target,
+				description: 'Create a draft post on the current local site',
+				evidence: 'requested',
+				requestId,
+				resolved: false,
+			},
+		];
 		expect( result ).toEqual( {
 			status: 'recovered',
 			...ids,
 			recordedTerminal: true,
-			invalidatedApprovals: [ 'request' ],
-			uncertainOperations: [ uncertain ],
+			invalidatedApprovals: [ requestId ],
+			uncertainOperations: uncertain,
 		} );
 		expect( fixture.seams.checkIdentity ).toHaveBeenCalledWith( owner );
 		expect( fixture.seams.checkTree ).toHaveBeenCalledWith( { native, guardian } );
 		const journals = await fixture.store.readJournals( 'chat' );
 		expect( journals[ 0 ] ).toEqual( journal );
 		expect( journals[ 1 ] ).toEqual( [
-			{ type: 'approval.resolved', ...ids, toolCallId: 'call', requestId: 'request' },
+			{ type: 'approval.resolved', ...ids, toolCallId, requestId },
 			{
 				type: 'turn.terminal',
 				...ids,
@@ -190,8 +256,8 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 				type: 'turn.recovered',
 				...ids,
 				lock: expect.stringMatching( /^[0-9a-f]{64}$/ ),
-				invalidatedApprovals: [ 'request' ],
-				uncertainOperations: [ uncertain ],
+				invalidatedApprovals: [ requestId ],
+				uncertainOperations: uncertain,
 			},
 		] );
 		expect( terminals( journals ) ).toHaveLength( 1 );
@@ -253,35 +319,129 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 
 	it( 'reports an approved mutation with no recorded result as uncertain, one with a result as settled, and retries neither', async () => {
 		const fixture = await recoveryFixture();
-		await fixture.deadTurn( {
-			journal: [
-				approval( 'answered', 'pending-result' ),
-				{ type: 'approval.resolved', ...ids, toolCallId: 'pending-result', requestId: 'answered' },
-				approval( 'done', 'finished' ),
-				{ type: 'approval.resolved', ...ids, toolCallId: 'finished', requestId: 'done' },
-				{ type: 'tool.result', ...ids, toolCallId: 'finished', isError: false, message: 'Created' },
-				{ type: 'tool.started', ...ids, toolCallId: 'read', name: 'Read' },
-			],
+		const finished = await journalOf( async ( { bridge } ) => {
+			await bridge.invoke( 'wp_cli', draft );
 		} );
+		const running = await runningDraft();
+		const { toolCallId, requestId } = idsOf( running );
+		await fixture.deadTurn( { journal: [ ...finished, ...running ] } );
 		const result = await fixture.recover();
-		expect( result ).toMatchObject( {
+		expect( result ).toEqual( {
 			status: 'recovered',
+			...ids,
+			recordedTerminal: true,
 			invalidatedApprovals: [],
 			uncertainOperations: [
-				expect.objectContaining( {
-					requestId: 'answered',
-					toolCallId: 'pending-result',
+				expect.objectContaining( { toolCallId, tool: 'wp_cli', evidence: 'authorized' } ),
+				{
+					toolCallId,
+					tool: 'sites.wpCli',
+					operationClass: 'command',
+					target,
+					description: 'Create a draft post on the current local site',
+					evidence: 'authorized',
+					requestId,
 					resolved: true,
-				} ),
+				},
 			],
 		} );
 		const added = ( await fixture.store.readJournals( 'chat' ) )[ 1 ];
 		expect( added.map( ( event ) => event.type ) ).toEqual( [ 'turn.terminal', 'turn.recovered' ] );
 	} );
 
+	it( 'reports an operation that needed no approval and has no result as uncertain, and a read as settled', async () => {
+		const fixture = await recoveryFixture();
+		const journal = await journalOf(
+			async ( { policy, site } ) => {
+				const file = path.join( site, 'readme.txt' );
+				await writeFile( file, 'fixture' );
+				for ( const toolName of [ 'Read', 'Write' ] )
+					expect(
+						await policy.authorizeToolUse( {
+							toolName,
+							input: { file_path: file, content: 'changed' },
+							toolUseId: `${ toolName }-use`,
+						} )
+					).toBe( true );
+			},
+			() => ( { enabledTools: { native: [ 'Read', 'Write' ], studio: [] } } )
+		);
+		await fixture.deadTurn( { journal } );
+		expect( await fixture.recover() ).toMatchObject( {
+			status: 'recovered',
+			invalidatedApprovals: [],
+			uncertainOperations: [
+				{
+					toolCallId: 'Write-use',
+					tool: 'Write',
+					operationClass: 'local-change',
+					target,
+					description: 'Change local work: Write',
+					evidence: 'authorized',
+				},
+			],
+		} );
+		const terminal = terminals( await fixture.store.readJournals( 'chat' ) )[ 0 ];
+		expect( ( terminal as { outcome: { message: string } } ).outcome.message ).toContain(
+			'may or may not'
+		);
+	} );
+
+	// The one case built by hand: journal entries of shapes this build no longer
+	// writes, or of a tool it does not know.
+	it( 'reports an approval from an earlier build and a tool it does not recognise as uncertain, never as reads', async () => {
+		const fixture = await recoveryFixture();
+		await fixture.deadTurn( {
+			journal: [
+				{
+					type: 'approval.requested',
+					...ids,
+					toolCallId: 'earlier',
+					requestId: 'earlier-request',
+					description: 'Create a draft post on the current local site',
+					operation: {
+						tool: 'sites.wpCli',
+						operationClass: 'command',
+						target,
+						args: '[]',
+						localPaths: [],
+					},
+				},
+				{ type: 'approval.resolved', ...ids, toolCallId: 'earlier', requestId: 'earlier-request' },
+				{ type: 'tool.started', ...ids, toolCallId: 'unknown', name: 'future_tool' },
+				{ type: 'tool.started', ...ids, toolCallId: 'known-read', name: 'site_info' },
+			],
+		} );
+		const result = await fixture.recover();
+		expect( result ).toMatchObject( {
+			status: 'recovered',
+			uncertainOperations: [
+				{
+					toolCallId: 'earlier',
+					tool: 'sites.wpCli',
+					operationClass: 'command',
+					evidence: 'requested',
+					requestId: 'earlier-request',
+					resolved: true,
+				},
+				{
+					toolCallId: 'unknown',
+					tool: 'future_tool',
+					description: expect.stringContaining( 'future_tool' ),
+					evidence: 'started',
+				},
+			],
+		} );
+		const unknown = result.status === 'recovered' ? result.uncertainOperations[ 1 ] : undefined;
+		expect( unknown ).not.toHaveProperty( 'operationClass' );
+		expect( result.status === 'recovered' && result.uncertainOperations ).toHaveLength( 2 );
+	} );
+
 	it( 'leaves the dead run’s approvals unanswerable by any later run', async () => {
 		const fixture = await recoveryFixture();
-		await fixture.deadTurn( { journal: [ approval( 'stale', 'call' ) ] } );
+		const journal = await pendingDraft();
+		const { requestId: stale, toolCallId } = idsOf( journal );
+		await fixture.deadTurn( { journal } );
 		await fixture.recover();
 		const events = ( await fixture.store.readJournals( 'chat' ) ).flat();
 		// A reconnecting app restores only unresolved requests of the current run.
@@ -300,15 +460,15 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 		cleanups.push( next.cleanup );
 		expect(
 			await next.policy.authorizeExecution(
-				{ requestId: 'stale' },
+				{ requestId: stale },
 				{
-					tool: 'wp_cli',
-					operationClass: 'local-change',
-					args: {},
+					tool: 'sites.wpCli',
+					operationClass: 'command',
+					args: [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ],
 					localPaths: [],
 					description: 'Create a draft post on the current local site',
 				},
-				'call'
+				toolCallId
 			)
 		).toBe( false );
 	} );
@@ -362,7 +522,7 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 				ref?: boolean;
 				platform?: string;
 			};
-			const journal = [ approval( 'request', 'call' ) ];
+			const journal = await pendingDraft();
 			const { raw } = await fixture.deadTurn( {
 				stage: options.stage,
 				history: options.history,
@@ -466,7 +626,9 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 
 	it( 'records itself once: a recovery interrupted before it released the lock completes later without a second record', async () => {
 		const fixture = await recoveryFixture();
-		const { raw } = await fixture.deadTurn( { journal: [ approval( 'request', 'call' ) ] } );
+		const journal = await pendingDraft();
+		const { requestId } = idsOf( journal );
+		const { raw } = await fixture.deadTurn( { journal } );
 		const interrupted = {
 			...fixture.store,
 			releaseRecoveredLock: async () => {
@@ -484,8 +646,11 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 			status: 'recovered',
 			...ids,
 			recordedTerminal: true,
-			invalidatedApprovals: [ 'request' ],
-			uncertainOperations: [ expect.objectContaining( { requestId: 'request' } ) ],
+			invalidatedApprovals: [ requestId ],
+			uncertainOperations: [
+				expect.objectContaining( { tool: 'wp_cli' } ),
+				expect.objectContaining( { requestId } ),
+			],
 		} );
 		const events = ( await fixture.store.readJournals( 'chat' ) ).flat();
 		expect( events.filter( ( event ) => event.type === 'turn.terminal' ) ).toHaveLength( 1 );
