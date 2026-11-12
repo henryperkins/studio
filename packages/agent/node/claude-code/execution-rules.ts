@@ -344,7 +344,8 @@ export type ClaudeToolChannel = ( typeof CLAUDE_TOOL_CHANNELS )[ number ];
  * - `site`, `paths`, `urls`, `navigates`: that element of the tool's rule.
  * - `scope`: the rule's `remote` element.
  * - `class`: the rule's operation class, which asks the user to approve every
- *   exact call.
+ *   exact call. A file channel takes it only next to `paths`, so the approval
+ *   shows the files.
  * - `host`: the effect is a host operation, which runs only through
  *   `guardHost`.
  */
@@ -995,16 +996,18 @@ export function claudeNativeTools(
 // The bindings that can bound each channel. `needs` must be among those a
 // declaration names: a browser is bounded only under the navigation guard, and
 // WP-CLI and host operations only through the host guard. A file is bounded by
-// checked paths, not by naming a site, and a request Studio sends by a scope
-// or an approval, not by a URL check, which cannot see where a name resolves.
+// checked paths, not by naming a site, and never by an approval alone: an
+// approval shows the local paths the rule names, so one that names none would
+// ask about files without showing them. A request Studio sends is bounded by a
+// scope or an approval, not by a URL check, which cannot see where a name resolves.
 const CHANNEL_BOUNDS: Readonly<
 	Record<
 		ClaudeToolChannel,
 		{ readonly admits: readonly ClaudeChannelBinding[]; readonly needs?: ClaudeChannelBinding }
 	>
 > = {
-	readsLocalFiles: { admits: [ 'paths', 'class' ] },
-	writesLocalFiles: { admits: [ 'paths', 'class' ] },
+	readsLocalFiles: { admits: [ 'paths', 'class' ], needs: 'paths' },
+	writesLocalFiles: { admits: [ 'paths', 'class' ], needs: 'paths' },
 	drivesBrowser: { admits: [ 'navigates', 'urls', 'site' ], needs: 'navigates' },
 	requestsNetwork: { admits: [ 'scope', 'class' ] },
 	spawnsProcess: { admits: [ 'class' ] },

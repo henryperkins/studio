@@ -266,6 +266,13 @@ describe( 'Claude Studio tool qualification', () => {
 				),
 			],
 			[
+				'files by path under an approval that shows them',
+				qualifiedRule(
+					{ paths: noPaths, operationClass: 'local-overwrite' },
+					{ ...noChannels, writesLocalFiles: [ 'paths', 'class' ] }
+				),
+			],
+			[
 				'a message by approval',
 				qualifiedRule(
 					{ operationClass: 'external-message' },
@@ -374,6 +381,22 @@ describe( 'Claude Studio tool qualification', () => {
 			[
 				'files bound by the site name alone',
 				qualifiedRule( { site: named }, { ...noChannels, writesLocalFiles: [ 'site' ] } ),
+			],
+			// An approval of a call shows the local paths its rule names, so a file
+			// channel bound by the approval alone would ask the user without them.
+			[
+				'files written under an approval that names no paths',
+				qualifiedRule(
+					{ operationClass: 'local-overwrite' },
+					{ ...noChannels, writesLocalFiles: [ 'class' ] }
+				),
+			],
+			[
+				'files read under an approval that names no paths',
+				qualifiedRule(
+					{ operationClass: 'external-message' },
+					{ ...noChannels, readsLocalFiles: [ 'class' ] }
+				),
 			],
 			[
 				'a process bound by the host guard',
