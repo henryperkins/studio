@@ -712,9 +712,11 @@ export function createChatGptSignInFlow(
 	 * `another-user`, told the link isn't valid, or `unchecked`, told to
 	 * reload, as the start address and the attempt are left as they were.
 	 *
-	 * Only on Linux, where any local user can read the browser opener's
-	 * command line, start address and all, from /proc; macOS and Windows show
-	 * a process's arguments only to its own user and administrators.
+	 * Only on Linux, where xdg-open takes the start address as an argument and
+	 * any local user can read it there, from /proc. On macOS, whose `ps` shows
+	 * every user's arguments, and on Windows the CLI's opener reads the address
+	 * from its environment instead (`apps/cli/lib/browser.ts`), and the Desktop
+	 * app's opener takes no arguments at all.
 	 *
 	 * The request goes on only when the kernel's socket tables show it comes
 	 * from this process's user or root, when a table that could be read has no

@@ -70,6 +70,64 @@ describe( 'opening the system browser on a host without one', () => {
 	} );
 } );
 
+// Another local user can read a process's arguments (`ps` on macOS, /proc on
+// Linux): the one-time sign-in address goes through the environment instead.
+describe( 'what the opener’s command line shows of the address', () => {
+	const platform = process.platform;
+	const HOSTILE = `http://127.0.0.1:1/start?a=$(touch /tmp/x)&b=\`id\`&c="'quoted'"&d=$HOME`;
+
+	async function capture( host: NodeJS.Platform, url: string ) {
+		onPlatform( host );
+		opener( ( child ) => child.emit( 'exit', 0 ) );
+		await openBrowser( url );
+		const [ command, args, options ] = spawnMock.mock.calls.at( -1 ) as [
+			string,
+			string[],
+			{ env?: NodeJS.ProcessEnv } | undefined,
+		];
+		return { command, args, env: options?.env };
+	}
+
+	afterEach( () => {
+		onPlatform( platform );
+		spawnMock.mockReset();
+	} );
+
+	it.each( [ 'darwin', 'win32' ] as const )(
+		'on %s, is nothing: a fixed command reads it from the environment, exactly as given',
+		async ( host ) => {
+			const hostile = await capture( host, HOSTILE );
+			const plain = await capture( host, URL );
+
+			expect( hostile.command ).toBe( plain.command );
+			expect( hostile.args ).toEqual( plain.args );
+			const commandLine = [ hostile.command, ...hostile.args ].join( ' ' );
+			for ( const piece of [ '127.0.0.1', 'start?', '$(', '`', '&', 'quoted', '$HOME' ] ) {
+				expect( commandLine ).not.toContain( piece );
+			}
+			expect( hostile.env?.STUDIO_OPEN_URL ).toBe( HOSTILE );
+			expect( plain.env?.STUDIO_OPEN_URL ).toBe( URL );
+		}
+	);
+
+	it( 'on macOS, is AppleScript’s `open location` of `system attribute`, which reads the variable as text and runs nothing in it', async () => {
+		const { command, args } = await capture( 'darwin', HOSTILE );
+
+		expect( command ).toBe( '/usr/bin/osascript' );
+		expect( args ).toEqual( [ '-e', 'open location (system attribute "STUDIO_OPEN_URL")' ] );
+	} );
+
+	// xdg-open takes the address only as an argument; the sign-in listener
+	// checks which user each request on Linux comes from instead.
+	it( 'on Linux, is the address, as xdg-open requires', async () => {
+		const { command, args, env } = await capture( 'linux', HOSTILE );
+
+		expect( command ).toBe( 'xdg-open' );
+		expect( args ).toEqual( [ HOSTILE ] );
+		expect( env?.STUDIO_OPEN_URL ).toBeUndefined();
+	} );
+} );
+
 // What reaches PowerShell when the Windows opener runs it.
 describe( 'opening the system browser on Windows', () => {
 	const platform = process.platform;
