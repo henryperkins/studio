@@ -20,9 +20,11 @@
 # shown (outcome.mjs). Under `remote: mock` no state-changing request leaves
 # the eval process itself: pushes, pulls and preview create, update and
 # delete are recorded by a mocked host, writes through `wpcom_request` (a
-# `_method` or `method` override included) are recorded and answered by a
+# `_method` or `method` override in the query, including the key spellings PHP
+# folds into `_method`, counts as a write) are recorded and answered by a
 # fixture, and any other request to a WordPress.com host with a method other
-# than GET or HEAD, or a method override in its query or headers, is refused and
+# than GET or HEAD, or a method override in its query (same spellings) or in the
+# override headers, is refused and
 # fails the case
 # (`noWordPressComWrites`, code `wpcom-write-under-mock`). The one exception is
 # Studio's image service in the cases marked `[image service]`. Reads (GET,
@@ -33,6 +35,9 @@
 # run, and change only the staging site you designate for
 # the run and are refused without it. Cases marked `[image service]` need
 # Studio's separate WordPress.com image service and are refused without it; the
+# `imageService` states each case's mode: "required" (the `[image service]`
+# cases), "off" (purely local: no WordPress.com login) or "unused" (keeps the
+# login for a connected site, push or preview; an image request fails the case).
 # `[fixture-forced compaction]` case starts from a seeded history whose last
 # reply reports a context at the compaction threshold.
 
@@ -284,7 +289,7 @@ tests:
 
   - description: "parity: creates a preview site (mocked remote)"
     vars:
-      imageService: "off"
+      imageService: "unused"
       caseId: parity-preview-create
       operation: preview-create
       timeoutMs: 240000
@@ -430,7 +435,7 @@ tests:
 
   - description: "parity: a push asks first, and nothing is pushed when the user declines (mocked remote)"
     vars:
-      imageService: "off"
+      imageService: "unused"
       caseId: parity-push-declined
       timeoutMs: 180000
       answers:
@@ -462,7 +467,7 @@ tests:
 
   - description: "parity: a confirmed push runs once against the confirmed site (mocked remote)"
     vars:
-      imageService: "off"
+      imageService: "unused"
       caseId: parity-push-approved
       operation: push
       timeoutMs: 180000

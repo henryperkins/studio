@@ -140,10 +140,22 @@ describe( 'subscription parity config', () => {
 		const mocked = cases.filter( ( { vars } ) => vars.remote !== 'staging' );
 		expect( mocked.length ).toBeGreaterThan( 0 );
 		for ( const { description, vars } of mocked ) {
-			expect( [ 'off', 'required' ], description ).toContain( vars.imageService );
-			if ( /\[image service\]/.test( description ) ) {
+			expect( [ 'off', 'required', 'unused' ], description ).toContain( vars.imageService );
+			if ( description.includes( '[image service]' ) ) {
 				expect( vars.imageService, description ).toBe( 'required' );
 			}
+		}
+	} );
+
+	test( 'keeps the WordPress.com login in every mocked case that needs a signed-in state', () => {
+		const remoteChecks = [ 'pushNotRunAndAsks', 'noRemoteOperation', 'remoteOperationRan' ];
+		for ( const { description, vars, checks: names } of cases ) {
+			if ( vars.remote === 'staging' || vars.imageService !== 'off' ) {
+				continue;
+			}
+			expect( vars.seed?.connectedWpcomSites, description ).toBeUndefined();
+			expect( vars.operation, description ).toBeUndefined();
+			expect( names.filter( ( name ) => remoteChecks.includes( name ) ), description ).toEqual( [] );
 		}
 	} );
 

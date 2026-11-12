@@ -103,14 +103,66 @@ export function withMockedRemote( host: StudioAgentHost, calls: RemoteCall[] ): 
 }
 
 const READ_METHODS = new Set( [ 'GET', 'HEAD' ] );
-const OVERRIDE_PARAMETERS = new Set( [ '_method', 'method' ] );
 const OVERRIDE_HEADERS = new Set( [
 	'x-http-method-override',
 	'x-http-method',
 	'x-method-override',
 ] );
 
-function overrideValues(
+const hasControlCharacter = ( text: string ): boolean =>
+	[ ...text ].some( ( char ) => char.charCodeAt( 0 ) < 32 || char.charCodeAt( 0 ) === 127 );
+
+function decodeKey( key: string ): string {
+	try {
+		return decodeURIComponent( key );
+	} catch {
+		return key;
+	}
+}
+
+/**
+ * Whether a query key could become a `_method` or `method` override on the
+ * server, which folds some other spellings into `_method` when it fills its
+ * parameters. Deliberately stricter than the server: a read refused here costs
+ * the model one retry.
+ */
+export function couldBeMethodOverrideKey( rawKey: string ): boolean {
+	const key = decodeKey( rawKey );
+	if ( hasControlCharacter( rawKey ) || hasControlCharacter( key ) ) {
+		return true;
+	}
+	const stripped = key.replace( /^s+/, '' );
+	const bracket = stripped.indexOf( '[' );
+	const base = bracket > 0 ? stripped.slice( 0, bracket ) : stripped;
+	const folded = base.replace( /[.s[]/g, '_' ).toLowerCase();
+	return (
+		folded === '_method' ||
+		folded === 'method' ||
+		key.replace( /[^a-z0-9]/gi, '' ).toLowerCase() === 'method'
+	);
+}
+
+function queryOverrideValues( entries: Iterable< [ string, unknown ] > ): string[] {
+	const values: string[] = [];
+	for ( const [ key, value ] of entries ) {
+		if ( ! couldBeMethodOverrideKey( key ) ) {
+			continue;
+		}
+		const listed = ( Array.isArray( value ) ? value : [ value ] ).map( ( v ) => String( v ) );
+		const array = Array.isArray( value ) || decodeKey( key ).includes( '[' );
+		const hidden = hasControlCharacter( key ) || hasControlCharacter( decodeKey( key ) );
+		if (
+			hidden ||
+			( array && listed.every( ( v ) => READ_METHODS.has( v.trim().toUpperCase() ) ) )
+		) {
+			values.push( 'OTHER' );
+		}
+		values.push( ...listed );
+	}
+	return values;
+}
+
+function headerOverrideValues(
 	entries: Iterable< [ string, unknown ] >,
 	names: Set< string >
 ): string[] {
@@ -130,10 +182,7 @@ function effectiveMethod(
 	overrides: string[] = []
 ): string {
 	const declared = method.toUpperCase();
-	const named = [
-		...overrideValues( Object.entries( query ?? {} ), OVERRIDE_PARAMETERS ),
-		...overrides,
-	];
+	const named = [ ...queryOverrideValues( Object.entries( query ?? {} ) ), ...overrides ];
 	const write = named.find( ( value ) => ! READ_METHODS.has( value.trim().toUpperCase() ) );
 	if ( ! READ_METHODS.has( declared ) ) {
 		return declared;
@@ -200,8 +249,8 @@ function classifyWpcomWrite(
 ): Omit< WpcomWriteAttempt, 'via' > | null {
 	const { hostname, pathname } = target;
 	const overrides = [
-		...overrideValues( new URLSearchParams( target.search ).entries(), OVERRIDE_PARAMETERS ),
-		...overrideValues( target.headers, OVERRIDE_HEADERS ),
+		...queryOverrideValues( new URLSearchParams( target.search ).entries() ),
+		...headerOverrideValues( target.headers, OVERRIDE_HEADERS ),
 	];
 	const method = effectiveMethod( target.method, undefined, overrides );
 	const host = hostname.toLowerCase();

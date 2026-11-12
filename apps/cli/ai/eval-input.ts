@@ -119,9 +119,11 @@ export interface EvalRunnerVars {
 	// a fixture, never run. `staging`: they run for real, only against the
 	// disposable staging site the environment designates.
 	remote?: 'mock' | 'staging';
-	// `off`: the run has no image service. `required`: it is refused unless
-	// Studio's separate WordPress.com image service is configured.
-	imageService?: 'off' | 'required';
+	// `off`: the run has no image service (and no WordPress.com login).
+	// `required`: it is refused unless Studio's separate WordPress.com image
+	// service is configured. `unused`: the login is kept, and any image request
+	// fails the case.
+	imageService?: 'off' | 'required' | 'unused';
 	// Files from scripts/eval/fixtures attached to the first message.
 	attachments?: Array< { fixture: string } >;
 }
@@ -141,7 +143,7 @@ export function parseEvalRunnerVars( vars: Record< string, unknown > ): EvalRunn
 			vars.remote !== undefined ? z.enum( [ 'mock', 'staging' ] ).parse( vars.remote ) : undefined,
 		imageService:
 			vars.imageService !== undefined
-				? z.enum( [ 'off', 'required' ] ).parse( vars.imageService )
+				? z.enum( [ 'off', 'required', 'unused' ] ).parse( vars.imageService )
 				: undefined,
 		attachments: vars.attachments ? attachmentsSchema.parse( vars.attachments ) : undefined,
 	};

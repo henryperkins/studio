@@ -921,6 +921,32 @@ describe( 'eval runner provider selection', () => {
 			expect( agent.turns ).toEqual( [] );
 		} );
 
+		it( 'runs imageService: unused with the WordPress.com login kept, and fails the case if an image is made', async () => {
+			imageService.configured = true;
+			const images = 'https://public-api.wordpress.com/wpcom/v2/ai-api-proxy/v1/images/generations';
+			let caseShared: unknown;
+			agent.behavior = {
+				replyProvider: 'studio-wpcom',
+				act: async () => {
+					caseShared = JSON.parse(
+						fs.readFileSync(
+							path.join( process.env.E2E_SHARED_CONFIG_PATH ?? '', 'shared.json' ),
+							'utf8'
+						)
+					);
+					await fetch( images, { method: 'POST', body: '{}' } ).catch( () => undefined );
+				},
+			};
+			const result = await runEval( input( { remote: 'mock', imageService: 'unused' } ) );
+			expect( result.refusal ).toBeUndefined();
+			expect( caseShared ).toHaveProperty( 'authToken' );
+			expect( result.remoteGuard ).toMatchObject( {
+				code: 'wpcom-write-under-mock',
+				blocked: [ { host: 'wpcom-ai-proxy', endpoint: 'images' } ],
+			} );
+			expect( result.imageService ).toEqual( { configured: true } );
+		} );
+
 		it( 'attaches fixture images and documents to the first message only', async () => {
 			const result = await runEval(
 				input( {
