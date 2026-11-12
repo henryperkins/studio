@@ -1110,7 +1110,11 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 			used.has( 'drivesBrowser' ) ||
 			used.has( 'requestsNetwork' ) ) &&
 		( elements.approval !== 'host' || used.has( 'callsHostOperation' ) ) &&
-		( ! used.has( 'runsWpCli' ) || used.has( 'callsHostOperation' ) );
+		( ! used.has( 'runsWpCli' ) || used.has( 'callsHostOperation' ) ) &&
+		// A rule approved at its host operations is admitted without an approval
+		// of its own, so files it wrote itself would be written without an
+		// approval that shows them.
+		( elements.approval !== 'host' || ! used.has( 'writesLocalFiles' ) );
 	return covers ? elements : undefined;
 }
 

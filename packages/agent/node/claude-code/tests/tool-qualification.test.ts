@@ -445,6 +445,22 @@ describe( 'Claude Studio tool qualification', () => {
 				'host approval without the host channel',
 				qualifiedRule( { approval: 'host', operationClass: 'command' }, noChannels ),
 			],
+			// A rule approved at its host operation is admitted without an approval of
+			// its own, so files it wrote itself would be written without one that
+			// shows them, whatever its class.
+			...( [ 'local-change', 'local-overwrite' ] as const ).map(
+				( operationClass ): [ string, unknown ] => [
+					`files written by a ${ operationClass } rule approved at its host operation`,
+					qualifiedRule(
+						{ approval: 'host', operationClass, site: named, paths: noPaths },
+						{
+							...noChannels,
+							writesLocalFiles: [ 'paths' ],
+							callsHostOperation: [ 'site', 'host' ],
+						}
+					),
+				]
+			),
 			// A rule has only the elements a rule can have, each of its own kind.
 			[
 				'an unknown rule element',

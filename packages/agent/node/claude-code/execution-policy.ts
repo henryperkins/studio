@@ -719,6 +719,9 @@ export function createClaudeExecutionPolicy(
 				( await checkpoint( callSignal ) ) &&
 				admit( { tool: name, operationClass, description }, toolCallId, callSignal )
 			);
+		// An approval shows the files the rule names; one that names none for
+		// this call would ask about files without showing them.
+		if ( rule.paths && ! localPaths.length ) return false;
 		return approveOnce(
 			{
 				tool: name,

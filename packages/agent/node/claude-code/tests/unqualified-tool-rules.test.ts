@@ -96,6 +96,10 @@ describe( 'Rules for Claude Studio tools that act outside the host', () => {
 		).toBe( false );
 		expect( await call( 'take_screenshot', { url: 'http://localhost:8888' } ) ).toBe( true );
 		expect( context.approve ).toHaveBeenCalledTimes( 2 );
+		// An approval of a rule that names files shows them, so a call whose rule
+		// names none at approval time is refused rather than asked about blind.
+		expect( await call( 'validate_blocks', { nameOrPath: 'site' } ) ).toBe( false );
+		expect( context.approve ).toHaveBeenCalledTimes( 2 );
 	} );
 
 	it( 'bind them to no site in a global conversation', async () => {
