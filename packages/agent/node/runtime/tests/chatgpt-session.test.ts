@@ -11,11 +11,13 @@ import {
 	readChatGptSessionSelection,
 	toChatGptSessionContext,
 } from '@studio/agent/protocol/chatgpt';
+import { describeConnectionSelectionError } from '@studio/agent/protocol/connections';
 import { getToolResultImageService } from '@studio/agent/protocol/image-service';
 import { getAiModelFamily, isAiModelId } from '@studio/agent/protocol/models';
 import { OPENAI_MODEL_CAPABILITIES } from '@studio/agent/protocol/openai-models';
 import {
 	getAiModelFamilyProvider,
+	getEffectiveSessionProvider,
 	readLastReplyProvider,
 	resolveSessionProvider,
 	type AiProviderId,
@@ -1283,6 +1285,72 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( requests ).toHaveLength( sent );
 			expect( fakeBroker.handles ).toHaveLength( 0 );
 		} );
+
+		it.each( [
+			[
+				'pinned there',
+				( file: string ) => reopen( file ),
+				'The selected connection doesn’t match the model this turn runs on.',
+			],
+			[
+				'only by its last reply',
+				( file: string ) => {
+					const lines = fs
+						.readFileSync( file, 'utf8' )
+						.split( '\n' )
+						.filter( ( line ) => line && ! line.includes( 'studio.session_context' ) );
+					fs.writeFileSync( file, lines.join( '\n' ) + '\n' );
+					return reopen( file );
+				},
+				describeConnectionSelectionError( { code: 'unsupported', providerId: 'chatgpt-oauth' } ),
+			],
+		] )(
+			'refuses a turn on another provider in a conversation that ran on ChatGPT, %s',
+			async ( how, open, why ) => {
+				const selection = selectionFor();
+				replies.push( () => textReply( 'From the plan.' ) );
+				const chatGpt = await runChatGptTurn(
+					newChatGptSession( selection ),
+					'hi',
+					selection,
+					'medium'
+				);
+				expect( chatGpt.error ).toBeUndefined();
+				const sent = requests.length;
+				const session = open( chatGpt.sessionFile );
+				expect( getEffectiveSessionProvider( session.getEntries(), null ) ).toBe( 'chatgpt-oauth' );
+
+				for ( const turn of [
+					{
+						model: 'gpt-6-luna' as const,
+						openAi: openAiSettingsFor( 'medium' ),
+						env: { STUDIO_OPENAI_API_KEY: API_KEY },
+					},
+					{ model: 'balanced' as const, env: { STUDIO_WPCOM_API_KEY: 'test-wpcom-token' } },
+				] ) {
+					const legacy = await runTurn( session, 'hi again', turn );
+					expect( legacy.error ).toBe( why );
+				}
+				expect( requests ).toHaveLength( sent );
+				expect( fetchSpy ).toHaveBeenCalledTimes( sent );
+
+				// Signed out since, a pinned one says so.
+				fakeBroker.connections = [];
+				const signedOut = await runTurn( reopen( chatGpt.sessionFile ), 'hi again', {
+					model: 'balanced',
+					env: { STUDIO_WPCOM_API_KEY: 'test-wpcom-token' },
+				} );
+				expect( signedOut.error ).toBe(
+					how === 'pinned there'
+						? describeConnectionSelectionError( {
+								code: 'disconnected',
+								providerId: 'chatgpt-oauth',
+						  } )
+						: why
+				);
+				expect( requests ).toHaveLength( sent );
+			}
+		);
 
 		it.each( [ 'gpt-7-nova', 'gpt-6.1-sol' ] )(
 			'refuses %s, a ChatGPT model Studio doesn’t support, saying it isn’t qualified',

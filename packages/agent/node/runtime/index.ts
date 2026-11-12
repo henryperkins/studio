@@ -445,6 +445,24 @@ function validateChatGptSessionBinding(
 }
 
 /**
+ * Why a turn on another provider can't run in this conversation: it ran on
+ * ChatGPT, pinned there or by its last reply, and continues only there.
+ * Undefined for any other conversation.
+ */
+async function describeChatGptConversation(
+	entries: SessionEntry[]
+): Promise< string | undefined > {
+	if ( getEffectiveSessionProvider( entries, null ) !== 'chatgpt-oauth' ) {
+		return undefined;
+	}
+	const connections = await listChatGptConnections().catch( () => [] );
+	const resolved = resolveConnectionSelection( entries, { connections, settings: null } );
+	return resolved.ok
+		? 'The selected connection doesn’t match the model this turn runs on.'
+		: describeConnectionSelectionError( resolved.error );
+}
+
+/**
  * A ChatGPT turn's routing, or why it can't run: the model and effort
  * checked, the selection live and bound to the session, then the
  * connection's turn begun. No API key is read: a disconnected connection
@@ -562,6 +580,11 @@ async function runAgentSessionTurn(
 		}
 		routing = resolved.routing;
 	} else {
+		const chatGptProblem = await describeChatGptConversation( config.session.getEntries() );
+		if ( chatGptProblem ) {
+			config.onEvent( syntheticErrorAgentEnd( 'error', chatGptProblem, CHATGPT_PI_PROVIDER ) );
+			return;
+		}
 		const family = getAiModelFamily( config.model );
 		const resolved = resolveCredentials( family, config.env );
 		if ( ! resolved.ok ) {
