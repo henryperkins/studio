@@ -16,6 +16,8 @@ import type { ProcessIdentity } from '@studio/common/lib/owned-process';
 const executable = process.env.STUDIO_TEST_NATIVE_CLAUDE_LIFECYCLE_EXE;
 const exec = promisify( execFile );
 const LIFETIME = 45_000;
+// The unrelated process outlives the whole suite, and still ends on its own.
+const SENTINEL_LIFETIME = 300_000;
 
 // An ES module bundle of a fixture, written under the repository's
 // node_modules so its external packages resolve from there.
@@ -123,10 +125,14 @@ describe( 'native lifecycle with an owned process tree (Node test processes)', (
 		owner = await bundle(
 			'packages/agent/node/claude-code/tests/fixtures/offline-lifecycle-owner.ts'
 		);
-		sentinel = spawn( process.execPath, [ nativeFixture, 'leaf', marker, String( LIFETIME ) ], {
-			stdio: [ 'ignore', 'pipe', 'ignore' ],
-			windowsHide: true,
-		} );
+		sentinel = spawn(
+			process.execPath,
+			[ nativeFixture, 'leaf', marker, String( SENTINEL_LIFETIME ) ],
+			{
+				stdio: [ 'ignore', 'pipe', 'ignore' ],
+				windowsHide: true,
+			}
+		);
 		await once( sentinel.stdout!, 'data' );
 		sentinelIdentity = ( await readProcessIdentity( sentinel.pid! ) )!;
 		expect( sentinelIdentity ).toBeDefined();
@@ -140,81 +146,87 @@ describe( 'native lifecycle with an owned process tree (Node test processes)', (
 		if ( root ) await rm( root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 } );
 	} );
 
+	async function interrupt( action: string ) {
+		const directory = await realpath( await mkdtemp( path.join( root, action + ' ' ) ) );
+		await Promise.all(
+			[ 'site', 'config' ].map( ( name ) => mkdir( path.join( directory, name ) ) )
+		);
+		const runner = fork( owner.file, [ nativeFixture, marker, String( LIFETIME ), directory ], {
+			env: { ...process.env, NODE_PATH: path.resolve( 'node_modules' ) },
+			execArgv: [],
+			stdio: [ 'ignore', 'ignore', 'ignore', 'ipc' ],
+		} );
+		const exited = once( runner, 'exit' );
+		const messages: Array< Record< string, unknown > > = [];
+		const arrived = ( type: string ) =>
+			new Promise< Record< string, unknown > >( ( resolve, reject ) => {
+				const found = messages.find( ( message ) => message.type === type );
+				if ( found ) return resolve( found );
+				const timer = setTimeout( () => reject( new Error( `No ${ type } message` ) ), 30_000 );
+				runner.on( 'message', ( message: Record< string, unknown > ) => {
+					if ( message.type === type ) {
+						clearTimeout( timer );
+						resolve( message );
+					}
+				} );
+			} );
+		runner.on( 'message', ( message: Record< string, unknown > ) => messages.push( message ) );
+		try {
+			const native = ( await arrived( 'native' ) ) as {
+				native: number;
+				shell: number;
+				leaf: number;
+			};
+			await arrived( 'approval' );
+			const descendants = await identities( await descendantsOf( runner.pid! ) );
+			const pids = descendants.map( ( identity ) => identity.pid );
+			for ( const pid of [ native.native, native.shell, native.leaf ] )
+				expect( pids ).toContain( pid );
+			if ( action === 'kill-owner' ) runner.kill( 'SIGKILL' );
+			else runner.send( action );
+			await exited;
+			expect( await goneWithin( descendants, 20_000 ) ).toEqual( [] );
+			expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
+			const store = createNativeSessionStore( path.join( directory, 'store' ) );
+			if ( action === 'kill-owner' ) {
+				await expect( store.lockTurn( 'chat' ) ).rejects.toThrow();
+				return;
+			}
+			const report = ( await arrived( 'done' ) ) as {
+				events: BackendTurnEvent[];
+				approvalCancelled: boolean;
+				wpCli: number;
+			};
+			const terminals = report.events.filter( ( event ) => event.type === 'turn.terminal' );
+			expect( terminals ).toEqual( [
+				expect.objectContaining( {
+					outcome: expect.objectContaining( {
+						status: action === 'abort' ? 'interrupted' : 'unknown_process_exit',
+					} ),
+				} ),
+			] );
+			expect( report.approvalCancelled ).toBe( true );
+			expect( report.wpCli ).toBe( 0 );
+			expect( ( await store.readJournals( 'chat' ) ).at( -1 )?.at( -1 ) ).toEqual( terminals[ 0 ] );
+			await (
+				await store.lockTurn( 'chat' )
+			)();
+		} finally {
+			// The test's own unreaped child; everything below it is the runtime's to end.
+			if ( runner.exitCode === null && runner.signalCode === null ) runner.kill( 'SIGKILL' );
+			await exited;
+		}
+	}
+
 	it.each( [ 'close', 'abort', 'eof', 'kill-native', 'kill-owner' ] )(
 		'leaves no owned process after %s, spares an unrelated one, and runs nothing the cancelled approval held',
-		async ( action ) => {
-			const directory = await realpath( await mkdtemp( path.join( root, action + ' ' ) ) );
-			await Promise.all(
-				[ 'site', 'config' ].map( ( name ) => mkdir( path.join( directory, name ) ) )
-			);
-			const runner = fork( owner.file, [ nativeFixture, marker, String( LIFETIME ), directory ], {
-				env: { ...process.env, NODE_PATH: path.resolve( 'node_modules' ) },
-				execArgv: [],
-				stdio: [ 'ignore', 'ignore', 'ignore', 'ipc' ],
-			} );
-			const exited = once( runner, 'exit' );
-			const messages: Array< Record< string, unknown > > = [];
-			const arrived = ( type: string ) =>
-				new Promise< Record< string, unknown > >( ( resolve, reject ) => {
-					const found = messages.find( ( message ) => message.type === type );
-					if ( found ) return resolve( found );
-					const timer = setTimeout( () => reject( new Error( `No ${ type } message` ) ), 30_000 );
-					runner.on( 'message', ( message: Record< string, unknown > ) => {
-						if ( message.type === type ) {
-							clearTimeout( timer );
-							resolve( message );
-						}
-					} );
-				} );
-			runner.on( 'message', ( message: Record< string, unknown > ) => messages.push( message ) );
-			try {
-				const native = ( await arrived( 'native' ) ) as {
-					native: number;
-					shell: number;
-					leaf: number;
-				};
-				await arrived( 'approval' );
-				const descendants = await identities( await descendantsOf( runner.pid! ) );
-				const pids = descendants.map( ( identity ) => identity.pid );
-				for ( const pid of [ native.native, native.shell, native.leaf ] )
-					expect( pids ).toContain( pid );
-				if ( action === 'kill-owner' ) runner.kill( 'SIGKILL' );
-				else runner.send( action );
-				await exited;
-				expect( await goneWithin( descendants, 20_000 ) ).toEqual( [] );
-				expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
-				const store = createNativeSessionStore( path.join( directory, 'store' ) );
-				if ( action === 'kill-owner' ) {
-					await expect( store.lockTurn( 'chat' ) ).rejects.toThrow();
-					return;
-				}
-				const report = ( await arrived( 'done' ) ) as {
-					events: BackendTurnEvent[];
-					approvalCancelled: boolean;
-					wpCli: number;
-				};
-				const terminals = report.events.filter( ( event ) => event.type === 'turn.terminal' );
-				expect( terminals ).toEqual( [
-					expect.objectContaining( {
-						outcome: expect.objectContaining( {
-							status: action === 'abort' ? 'interrupted' : 'unknown_process_exit',
-						} ),
-					} ),
-				] );
-				expect( report.approvalCancelled ).toBe( true );
-				expect( report.wpCli ).toBe( 0 );
-				expect( ( await store.readJournals( 'chat' ) ).at( -1 )?.at( -1 ) ).toEqual(
-					terminals[ 0 ]
-				);
-				await (
-					await store.lockTurn( 'chat' )
-				)();
-			} finally {
-				// The test's own unreaped child; everything below it is the runtime's to end.
-				if ( runner.exitCode === null && runner.signalCode === null ) runner.kill( 'SIGKILL' );
-				await exited;
-			}
-		},
+		interrupt,
+		90_000
+	);
+
+	it.skipIf( process.platform !== 'win32' )(
+		'leaves no owned process when the job keeper dies, and ends the turn once, without success (Windows only: the job keeper is the Windows mechanism)',
+		() => interrupt( 'kill-keeper' ),
 		90_000
 	);
 } );

@@ -1,13 +1,15 @@
+import { spawn } from 'child_process';
 import { statSync } from 'fs';
 import path from 'path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 // The SDK's wildcard export resolves at runtime, although the ESLint resolver misses it.
 // eslint-disable-next-line import-x/no-unresolved
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { prepareProcessOwner } from '@studio/common/lib/owned-process';
 import { runClaudeTurn } from '../../runtime';
 import type { StudioAgentHost } from '../../../host';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
-import type { ChildProcessWithoutNullStreams } from 'child_process';
+import type { ChildProcess, ChildProcessWithoutNullStreams } from 'child_process';
 
 // The real Studio runtime, policy and owned-process tree, with a Node test
 // process in place of the vendor executable and an SDK stand-in that drives
@@ -49,11 +51,21 @@ const host = {
 	},
 } as unknown as StudioAgentHost;
 
+// The first process the owner starts is its Windows job keeper.
+const helpers: ChildProcess[] = [];
+const recording = ( ( ...args: Parameters< typeof spawn > ) => {
+	const started = spawn( ...args );
+	helpers.push( started );
+	return started;
+} ) as typeof spawn;
+
 process.on( 'message', ( command ) => {
 	if ( command === 'abort' ) controller.abort();
 	if ( command === 'close' ) closeNative();
 	if ( command === 'eof' ) child?.stdin.end();
 	if ( command === 'kill-native' ) child?.kill( 'SIGKILL' );
+	// This process's own unreaped child.
+	if ( command === 'kill-keeper' ) helpers[ 0 ]?.kill( 'SIGKILL' );
 } );
 
 function firstLine( stream: NodeJS.ReadableStream ): Promise< string > {
@@ -93,6 +105,7 @@ async function main() {
 		{ prompt: 'TEST_ONLY', signal: controller.signal, onEvent: ( event ) => events.push( event ) },
 		{
 			storeRoot: path.join( root, 'store' ),
+			prepareOwner: () => prepareProcessOwner( { spawn: recording } ),
 			approve: ( _request, signal ) => {
 				signal.addEventListener(
 					'abort',
