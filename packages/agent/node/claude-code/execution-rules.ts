@@ -714,7 +714,14 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 			}
 		),
 	],
-	[ scaffoldThemeTool.name, unqualified( onSite( 'local-change' ) ) ],
+	[
+		scaffoldThemeTool.name,
+		// Besides the theme files it writes in the site, it downloads the fonts
+		// its DESIGN.md names: a Google Fonts stylesheet, then each font file at
+		// the address that response gives. Nothing in the rule bounds a request
+		// Studio sends outside a browser to an address a response chose.
+		unqualified( onSite( 'local-change' ), [ 'requestsNetwork' ] ),
+	],
 	[ pickDesignTool.name, unqualified( studioRule( 'read' ) ) ],
 	[
 		validateBlocksTool.name,

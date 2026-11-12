@@ -65,7 +65,12 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_delete: { status: 'bridged' },
 	site_import: { status: 'bridged' },
 	site_export: { status: 'bridged' },
-	scaffold_theme: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
+	scaffold_theme: {
+		status: 'unqualified',
+		step: 'C2b',
+		reason:
+			'Requests the network itself: it downloads the fonts its DESIGN.md names from Google Fonts, then font files at addresses the stylesheet response gives, which no binding bounds outside a browser yet (a request guard, with the navigation guard). Its theme activation also runs `theme activate`, which this route’s WP-CLI rules refuse',
+	},
 	install_taxonomy_scripts: { status: 'bridged' },
 	refresh_browser: { status: 'absent', capability: 'ui' },
 	site_list: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
