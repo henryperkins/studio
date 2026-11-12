@@ -1764,7 +1764,7 @@ describe( 'Signing in to ChatGPT', () => {
 				if ( ending === 'completed' ) {
 					const delivery = await deliver( await authorize( start.url ) );
 					expect( delivery.status ).toBe( 200 );
-					expect( delivery.page ).toMatch( /^<!doctype html>.*<\/p>\n$/s );
+					expect( delivery.page ).toMatch( /^<!doctype html>[\s\S]*<\/p>\n$/ );
 					expect( ( await using.wait( start.attemptId ) ).ok ).toBe( true );
 				} else if ( ending === 'been cancelled' ) {
 					expect( using.cancel( start.attemptId ) ).toBe( true );
