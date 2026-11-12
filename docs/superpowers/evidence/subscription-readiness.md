@@ -164,6 +164,32 @@ Test files are under `packages/agent/node/claude-code/tests/` in the Claude work
 | B10 | Surfaces: Desktop, `studio ui`, interactive CLI, noninteractive CLI; UI-only tools gated | C3, C5, P4 | partial. Settings and CLI surfaces exist per the plan; not verified by M1. | `apps/ui/src/features/chats/session-view/claude-session-view.test.tsx`; `apps/cli/commands/ai/tests/*` | none yet |
 | B11 | Existing providers unchanged | M2, M3 | not verified. The branch added a cross-runtime isolation test (per PR #3 comment). | `packages/agent/node/sessions/tests/chatgpt-selection.test.ts` and backend tests under `node/backends/tests/` | none yet |
 
+### C4a record (Claude crash recovery, backend, November 12, 2026)
+
+Commits `ea17805da`, `c508e89e9`, `b42a5045a`, `8caafdfb3`, `773c180f3`, `1d2bece7e`, `66fa79b9c` on `add-claude-code-runtime`. This record changes no row's or cell's status and qualifies nothing. B2 and B9 stay partial: the UI's recover action (C4b) and the native runs elsewhere are open.
+
+- **What recovery requires.** The run lock is now a versioned record (version 2). It names its owner process (PID and OS start time) and the run, connection and native binding from the moment it is taken. Before the SDK starts, it adds the native session; once Studio owns the native tree, and before any prompt, it adds the native process and the helper that guards the tree (the Windows job keeper or the POSIX supervisor). `recoverClaudeSession( sessionId )`, and `studio code claude recover --session <id>`, release a lock only when all of these hold:
+  - the record is this build's, for this conversation, OS and binding;
+  - the owner is provably gone; unknown is never gone, and a live process with the owner's PID and another start is a different process;
+  - either no native process could have started, or the owned tree is provably ended;
+  - the workspace, configuration and native session are the conversation's own, and its native history still verifies;
+  - the recovery holds an exclusive claim on that exact lock, and re-reads it byte for byte at takeover and again at release.
+  Anything else returns `blocked` with a typed reason and changes nothing. A lock's age is never a reason.
+- **What "the tree ended" means.**
+  - Windows: kill-on-close was set when ownership was confirmed, and the keeper held the job's only handle. The native process and the keeper are gone, so the kernel has closed the job and ended its members. In addition, no live process names the native process as its parent with a creation time at or after it.
+  - POSIX: the leader and supervisor are gone, and `kill(-pgid, 0)` reports `ESRCH`.
+  - Not established on either: a process outside the job or group whose parent is not the native process, and a job kept open by a duplicated handle. These are the same limits as P2's.
+- **What it records.** It records once, in its own journal file written whole: the dead turn's pending approvals as resolved, one `unknown_process_exit` outcome with code `recovered` (none if the turn recorded its own), and a `turn.recovered` entry. That entry lists the closed approvals and every requested mutation with no recorded result, as uncertain. Nothing is replayed or retried; the same native session resumes on the next turn.
+- **Legacy locks.** A bare-token lock from before this record is reported as `legacy-lock` and left in place. A reviewed manual procedure is in the task report for the C4b UI and docs work.
+- **Native here (Windows x64, Node test processes).**
+  - A turn whose owner was killed mid-approval is refused recovery while the owner lives. After the owner is killed, it recovers with one outcome, the approval closed and reported as uncertain, and the lock released; the native history still verifies.
+  - A live process holding the owner's PID with another start is not taken for the owner, and is left running.
+  - A live child of a dead native process keeps the lock until it ends.
+  - The tree check names the live native process, keeper and child in turn.
+  - Three consecutive runs passed.
+- **Through seams only:** the full decision table, the replacement-lock race, a concurrent claim, a stale claim, idempotence after an interrupted recovery, the uncertain-mutation classification, and the POSIX group check.
+- **Open.** The POSIX real-process cases are written and skipped on Windows; they have not run on Linux or macOS. Windows ARM64 has not run. The plan's "on all six native platforms" item is an open platform gate.
+
 ## C. Platform cells
 
 Spec target: Desktop, CLI and the local browser backend on six targets, for each provider. The only runner available to this program is this machine, Windows 11 Pro x64 (build 10.0.26320). Per decision of the program owner, the other five cells have **no runner assigned**; that is a scheduling blocker, not a dropped cell. Owner tasks: P1 (runtime/sign-in portability), P2 (process trees), P3 (ChatGPT native storage and browser), P4 (packaged app and CLI on each runner), G3/C5 (authenticated acceptance).
@@ -231,7 +257,7 @@ Commits `88d7dc4fa`, `59caf8c01`, `feaae16ff`, then fix round 1 (`9644af6dc`, `5
   - The run lock is released only on proof that nothing of the run remains: the job reports no members after `TerminateJobObject`; the keeper died after a verified assignment with kill-on-close set, and the child has exited; or the process group is empty (`kill(-pgid, 0)` fails with `ESRCH`). Otherwise the lock is kept and the turn ends with `process_unconfirmed`, whose message says the chat stays locked until it is recovered.
 - **Mechanisms.**
   - Windows: a kernel job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no breakaway. A PowerShell keeper (static C# through `Add-Type`) creates the job before the native process starts, assigns it within moments, verifies it is in the job and that no direct child of it other than its console host is outside, and holds the only handle. The keeper's script arrives as its first line of input from Studio, because Windows caps a command line at 32,767 characters; it refuses to start outside Full Language mode. A process a job member creates joins the job; Node's own nested job, which allows silent breakaway, does not take it out of ours. Escalation is `TerminateJobObject`. The job also ends when its keeper dies or Studio's process ends.
-  - Windows, when the assignment fails or is incomplete: the keeper ends the native process and every descendant it can prove by handle (its parent, read through its own handle, is a process already held, and it started no earlier). It holds the whole provable tree before ending any of it, then ends what the job holds, and Studio ends its own child. Such a turn always keeps its lock: a descendant whose parent has already exited cannot be seen.
+  - Windows, when the assignment fails or is incomplete: the keeper ends the native process and every descendant it can prove by handle (its parent, read through its own handle, is a process already held, and it was created strictly after that parent; since C4a, an equal creation time no longer counts). It holds the whole provable tree before ending any of it, then ends what the job holds, and Studio ends its own child. Such a turn always keeps its lock: a descendant whose parent has already exited cannot be seen.
   - POSIX: a new session and process group. The group is signalled only while the leader is unreaped, or after the leader's identity has been re-checked. A leader reaped before its identity was read is never signalled; its group counts as ended only on `ESRCH`. A detached supervisor ends the group if Studio's process dies; its shell probe reports a process as gone only when no such process exists, and anything it cannot read as unknown, which it does not signal.
 - **Proven natively on Windows x64 (this machine), with Node test processes only.**
   - Each of close, abort, stdin EOF, native death, owner death and keeper death ends the child and its shell grandchild.
