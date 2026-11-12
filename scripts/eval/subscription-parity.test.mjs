@@ -155,7 +155,10 @@ describe( 'subscription parity config', () => {
 			}
 			expect( vars.seed?.connectedWpcomSites, description ).toBeUndefined();
 			expect( vars.operation, description ).toBeUndefined();
-			expect( names.filter( ( name ) => remoteChecks.includes( name ) ), description ).toEqual( [] );
+			expect(
+				names.filter( ( name ) => remoteChecks.includes( name ) ),
+				description
+			).toEqual( [] );
 		}
 	} );
 

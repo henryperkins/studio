@@ -115,9 +115,11 @@ jobs:
         if: matrix.primary
         run: npm run knip
 
+      # The same test also runs inside `npm test`; it is its own step so a failure is attributable.
       - name: Dependency ranges
         run: npx vitest run --config scripts/vitest.config.ts scripts/dependency-ranges.test.mjs --maxWorkers=2
 
+      # STUDIO_EXPERIMENTAL_CLAUDE_CODE is the stacked Claude branch's flag; listed so this covers it once that branch merges this workflow.
       - name: Assert the experimental flags are off for the main test run
         run: |
           status=0
