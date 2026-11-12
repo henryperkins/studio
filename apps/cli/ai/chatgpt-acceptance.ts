@@ -349,6 +349,7 @@ export interface ChatGptAcceptanceServices {
 	sessions: AcceptanceSessions;
 	processes: AcceptanceProcesses;
 	buildPresent(): boolean;
+	credentialStoreKind(): CredentialStoreKind | null;
 	secureStorageAvailable(): Promise< boolean >;
 	imageServiceConfigured(): Promise< boolean >;
 }
@@ -1381,6 +1382,22 @@ async function waitUntil(
 	}
 }
 
+export type CredentialStoreKind = 'password-vault' | 'keychain' | 'secret-service';
+
+/** The system keychain `createOsCredentialStore` uses on a platform, or null where it has none. */
+export function credentialStoreKindFor( platform: NodeJS.Platform ): CredentialStoreKind | null {
+	switch ( platform ) {
+		case 'win32':
+			return 'password-vault';
+		case 'darwin':
+			return 'keychain';
+		case 'linux':
+			return 'secret-service';
+		default:
+			return null;
+	}
+}
+
 const prerequisitesStage: StageDefinition = {
 	name: 'prerequisites',
 	async run( ctx, observations ) {
@@ -1388,11 +1405,15 @@ const prerequisitesStage: StageDefinition = {
 		if ( ! observations.buildPresent ) {
 			block( 'build-missing' );
 		}
-		if ( ctx.options.scenario !== 'session' ) {
-			observations.secureStorageAvailable = await ctx.services.secureStorageAvailable();
-			if ( ! observations.secureStorageAvailable ) {
-				block( 'secure-storage-unavailable' );
-			}
+		// Which keychain, and whether it answered: a session-only run records it
+		// too, so a result on a machine without one is told apart.
+		const store = ctx.services.credentialStoreKind();
+		observations.storePasswordVault = store === 'password-vault';
+		observations.storeKeychain = store === 'keychain';
+		observations.storeSecretService = store === 'secret-service';
+		observations.secureStorageAvailable = await ctx.services.secureStorageAvailable();
+		if ( ctx.options.scenario !== 'session' && ! observations.secureStorageAvailable ) {
+			block( 'secure-storage-unavailable' );
 		}
 		observations.isolated = true;
 	},
@@ -3122,6 +3143,7 @@ async function createLiveServices( {
 		},
 		processes: createLiveProcesses( { mainScript, observerScript, paths } ),
 		buildPresent: () => fs.existsSync( mainScript ) && fs.existsSync( observerScript ),
+		credentialStoreKind: () => credentialStoreKindFor( process.platform ),
 		secureStorageAvailable: async () => ( await createOsCredentialStore().check() ).available,
 		imageServiceConfigured: () => isImageGenerationAvailable(),
 	};

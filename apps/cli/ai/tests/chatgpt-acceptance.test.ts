@@ -35,6 +35,7 @@ import {
 	classifyToolCall,
 	classifyTurnFailure,
 	createAcceptanceTokenService,
+	credentialStoreKindFor,
 	digestTurnEvents,
 	isToolResultPersisted,
 	isWpCliReadCommand,
@@ -399,6 +400,7 @@ function scriptedServices(
 			},
 		},
 		buildPresent: () => true,
+		credentialStoreKind: () => 'password-vault',
 		secureStorageAvailable: async () => true,
 		imageServiceConfigured: async () => false,
 		...overrides,
@@ -730,6 +732,33 @@ describe( 'ChatGPT acceptance runner', () => {
 			runDir,
 			...extra,
 		];
+
+		it.each( [
+			[ 'win32', 'password-vault' ],
+			[ 'darwin', 'keychain' ],
+			[ 'linux', 'secret-service' ],
+			[ 'freebsd', null ],
+		] as const )( 'names the system keychain Studio uses on %s', ( platform, kind ) => {
+			expect( credentialStoreKindFor( platform ) ).toBe( kind );
+		} );
+
+		it( 'records which system keychain the run used and whether it answered, as booleans only', async () => {
+			const { services } = scriptedServices( { credentialStoreKind: () => 'secret-service' } );
+
+			expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 0 );
+
+			expect( stageOf( 'prerequisites' )[ 0 ] ).toMatchObject( {
+				status: 'passed',
+				observations: {
+					buildPresent: true,
+					storePasswordVault: false,
+					storeKeychain: false,
+					storeSecretService: true,
+					secureStorageAvailable: true,
+					isolated: true,
+				},
+			} );
+		} );
 
 		it( 'runs every stage, records each before judging it, and cleans up after itself', async () => {
 			const { services, calls } = scriptedServices();
@@ -2097,6 +2126,29 @@ describe( 'ChatGPT acceptance runner', () => {
 				windowForkReportedUnavailable: true,
 			} );
 			expectNothingUnsafe( [ 'test-access-token' ], [ REGISTRATION ] );
+		} );
+
+		it( 'records a system keychain it can’t use, without blocking a session-only run', async () => {
+			const { services } = scriptedSession();
+			services.credentialStoreKind = () => 'secret-service';
+			services.secureStorageAvailable = async () => false;
+
+			expect( await runChatGptAcceptance( sessionArgs(), dependencies( services ) ) ).toBe( 0 );
+
+			expect( stageOf( 'prerequisites' ) ).toEqual( [
+				expect.objectContaining( {
+					run: 2,
+					status: 'passed',
+					observations: {
+						buildPresent: true,
+						storePasswordVault: false,
+						storeKeychain: false,
+						storeSecretService: true,
+						secureStorageAvailable: false,
+						isolated: true,
+					},
+				} ),
+			] );
 		} );
 
 		const failures: Array<

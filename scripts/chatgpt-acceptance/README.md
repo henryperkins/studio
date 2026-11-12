@@ -45,7 +45,7 @@ Every stage records `passed`, `failed`, `blocked` or `skipped`, a typed code and
 
 | Stage | What it does | Key observations |
 | --- | --- | --- |
-| `prerequisites` | Build present; system keychain available. | `buildPresent`, `secureStorageAvailable` |
+| `prerequisites` | Build present; which system keychain this platform uses, and that it is available (`blocked`, `secure-storage-unavailable`, when it isn't). | `buildPresent`, `storePasswordVault`, `storeKeychain`, `storeSecretService`, `secureStorageAvailable` |
 | `sign-in` | Browser sign-in, saved credential, new registration. | `browserOpened`, `completedAfterS`, `timeoutS`, `timedOut`, `storedInVault` |
 | `re-sign-in` | Browser sign-in again to the same registration. | `sameRegistration`, `sameRevision` |
 | `model-discovery` | Reads the account's model list. | `listedModels`, `selectedModelListed`, `unqualifiedModelsListed` |
@@ -74,7 +74,7 @@ The active run is judged from the moment the sign-out **begins**, against the pr
 
 | Stage | What it does | Key observations |
 | --- | --- | --- |
-| `prerequisites` | Build present. | `buildPresent` |
+| `prerequisites` | Build present. Which system keychain this platform uses and whether it answered are recorded but never block: session-only storage needs no keychain, so a run on a machine without one (headless Linux, for example) is told apart from one where the keychain was there and unused. | `buildPresent`, `storePasswordVault`, `storeKeychain`, `storeSecretService`, `secureStorageAvailable` |
 | `returning-sign-in` | Browser sign-in to the saved run's registration, kept for this runner's session only. | `browserOpened`, `completedAfterS`, `timeoutS`, `timedOut`, `sameRegistration` |
 | `no-persisted-record` | No credential record on disk. | `storageSession`, `vaultRecordPresent` |
 | `offered-fork-inference` | A forked turn offered the session asks the runner for its token over IPC and completes a read-only reply. | `tokenAsks`, `tokensHandedOut`, `modelRequests`, `answeredReady` |
@@ -91,9 +91,9 @@ A provider-qualified eval (`scripts/eval/README.md`, "Provider-qualified parity 
 
 | Scenario | Stage | What it does | Key observations |
 | --- | --- | --- | --- |
-| `provision` | `prerequisites` | Build present; system keychain available. | `buildPresent`, `secureStorageAvailable` |
+| `provision` | `prerequisites` | Build present; system keychain available. | `buildPresent`, `storePasswordVault`, `storeKeychain`, `storeSecretService`, `secureStorageAvailable` |
 | `provision` | `profile-sign-in` | One browser sign-in into the run's own profile (`<run>/profile`), saved with secure storage, and **left signed in**. Cleanup signs it out again only when the stage failed after the sign-in committed (or the run was interrupted). | `browserOpened`, `completedAfterS`, `timeoutS`, `timedOut`, `signedIn`, `storedInVault`, `leftSignedIn` |
-| `retire` | `prerequisites` | Build present; system keychain available. | `buildPresent`, `secureStorageAvailable` |
+| `retire` | `prerequisites` | Build present; system keychain available. | `buildPresent`, `storePasswordVault`, `storeKeychain`, `storeSecretService`, `secureStorageAvailable` |
 | `retire` | `profile-sign-out` | Signs the provisioned registration out: its local records cleared and its grant revoked at ChatGPT. `failed` (`remote-revocation-unconfirmed`) when the local records were cleared but ChatGPT did not confirm the revocation: remove WordPress Studio's access in ChatGPT's settings yourself. `blocked` (`already-signed-out`) when it was not signed in. | `wasSignedIn`, `localCleared`, `remoteRevocationConfirmed` |
 
 - `provision` needs a new or empty run directory and starts no site, turn or CLI process. When it passes it prints how to use the profile: `STUDIO_EVAL_CHATGPT_PROFILE` is `<run>/profile`, and `STUDIO_EVAL_CONNECTION` is `registrationId` in `<run>/state.json` (a private file; the runner never prints identifiers or paths).
