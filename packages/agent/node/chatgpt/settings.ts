@@ -87,8 +87,9 @@ export function readChatGptSettings( signInSupported = true ): Promise< ChatGptS
 				providerId: 'chatgpt-oauth',
 				backend: 'pi',
 				revision: account.revision,
+				// The subject stays in the backend: a renderer only needs to know there is one.
 				identity: {
-					subject: account.subject,
+					verified: true,
 					...( account.email ? { email: account.email } : {} ),
 				},
 				authStatus:

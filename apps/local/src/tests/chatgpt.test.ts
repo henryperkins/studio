@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { createChatGptAccount } from '@studio/agent/node/chatgpt/account-store';
 import { listChatGptConnections } from '@studio/agent/node/chatgpt/credential-broker';
 import {
 	beginChatGptSignIn,
@@ -75,6 +76,29 @@ afterEach( async () => {
 } );
 
 describe( 'ChatGPT HTTP boundary', () => {
+	it( 'lists saved accounts without their subject', async () => {
+		await createChatGptAccount( ID, {
+			issuer: 'https://auth.example.test',
+			subject: 'test-private-subject',
+			email: 'someone@example.test',
+			clientId: 'test-issued-client',
+			storage: 'vault',
+		} );
+
+		const response = await request( '/chatgpt', undefined, 'GET' );
+		const text = await response.text();
+
+		expect( response.status ).toBe( 200 );
+		expect( JSON.parse( text ).accounts ).toEqual( [
+			expect.objectContaining( {
+				connectionId: ID,
+				identity: { verified: true, email: 'someone@example.test' },
+			} ),
+		] );
+		expect( text ).not.toContain( 'test-private-subject' );
+		expect( text ).not.toContain( 'subject' );
+	} );
+
 	it( 'rejects a global ChatGPT default with a settings error and preserves the saved provider', async () => {
 		const configPath = path.join( root, 'shared.json' );
 		const config = JSON.stringify( { version: 1, aiProvider: 'wpcom', locale: 'es' } );

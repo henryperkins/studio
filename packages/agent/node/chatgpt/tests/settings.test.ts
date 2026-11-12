@@ -112,7 +112,7 @@ describe( 'ChatGPT application settings facade', () => {
 		expect( beginChatGptSignIn ).not.toHaveBeenCalled();
 	} );
 
-	it( 'projects only renderer-safe account fields and treats a stale registry as disconnected', async () => {
+	it( 'projects only renderer-safe account fields, never the subject, and treats a stale registry as disconnected', async () => {
 		vi.mocked( readChatGptAccounts ).mockResolvedValue( [ { ...ACCOUNT, revision: 2 } ] );
 		const settings = await readChatGptSettings();
 		expect( settings.accounts[ 0 ] ).toEqual( {
@@ -120,7 +120,7 @@ describe( 'ChatGPT application settings facade', () => {
 			providerId: 'chatgpt-oauth',
 			backend: 'pi',
 			revision: 2,
-			identity: { subject: ACCOUNT.subject, email: ACCOUNT.email },
+			identity: { verified: true, email: ACCOUNT.email },
 			authStatus: 'disconnected',
 			label: ACCOUNT.label,
 			email: ACCOUNT.email,
@@ -128,6 +128,8 @@ describe( 'ChatGPT application settings facade', () => {
 			state: 'signed-in',
 		} );
 		expect( JSON.stringify( settings ) ).not.toContain( ACCOUNT.clientId );
+		expect( JSON.stringify( settings ) ).not.toContain( ACCOUNT.subject );
+		expect( JSON.stringify( settings ) ).not.toContain( 'subject' );
 	} );
 
 	it( 'returns only an attempt id for a returning sign-in', async () => {

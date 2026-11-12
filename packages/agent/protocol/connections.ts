@@ -51,6 +51,25 @@ export interface ConnectionIdentity {
 	displayName?: string;
 }
 
+/**
+ * A connection's identity as an app's renderer is told it: verified by the
+ * host, which keeps the subject to itself.
+ */
+export interface ConnectionIdentityView {
+	verified: true;
+	/** Display only: two accounts can share an email or a name. */
+	email?: string;
+	displayName?: string;
+}
+
+/** Whether the connection has verified who it signs in as: a subject, or the host's word for one. */
+function hasVerifiedIdentity( identity: ConnectionRegistryEntry[ 'identity' ] ): boolean {
+	if ( ! identity ) {
+		return false;
+	}
+	return 'subject' in identity ? Boolean( identity.subject ) : identity.verified === true;
+}
+
 export interface ConnectionRegistryEntry {
 	/** Opaque: compared whole, never parsed. */
 	connectionId: string;
@@ -61,8 +80,8 @@ export interface ConnectionRegistryEntry {
 	 * it ran under, and doesn't continue under another.
 	 */
 	revision: number;
-	/** Null until the connection has verified who it signs in as. */
-	identity: ConnectionIdentity | null;
+	/** Null until the connection has verified who it signs in as. A renderer gets the view. */
+	identity: ConnectionIdentity | ConnectionIdentityView | null;
 	/** Read as disconnected without a verified identity. */
 	authStatus: ConnectionAuthStatus;
 }
@@ -196,7 +215,7 @@ function resolveChatGptConnection(
 			},
 		};
 	}
-	if ( connection.authStatus !== 'connected' || ! connection.identity?.subject ) {
+	if ( connection.authStatus !== 'connected' || ! hasVerifiedIdentity( connection.identity ) ) {
 		return { ok: false, error: { code: 'disconnected', providerId, connectionId } };
 	}
 	return { ok: true, selection: { connectionId, model: { providerId, modelId }, revision } };

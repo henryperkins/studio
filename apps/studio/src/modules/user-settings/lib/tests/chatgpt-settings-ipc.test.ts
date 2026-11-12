@@ -2,6 +2,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { readChatGptAccounts } from '@studio/agent/node/chatgpt/account-store';
 import {
 	beginChatGptSignIn as start,
 	cancelChatGptSignIn as cancel,
@@ -30,6 +31,11 @@ vi.mock( '@studio/agent/node/chatgpt/oauth', async ( original ) => ( {
 	waitForChatGptSignIn: vi.fn(),
 	cancelChatGptSignIn: vi.fn(),
 } ) );
+// This app's tests write no files (`atomically` is mocked), so saved accounts come from here.
+vi.mock( '@studio/agent/node/chatgpt/account-store', async ( original ) => {
+	const actual = await original< typeof import('@studio/agent/node/chatgpt/account-store') >();
+	return { ...actual, readChatGptAccounts: vi.fn( actual.readChatGptAccounts ) };
+} );
 
 const ID = 'f84d75a0-4e60-4168-a1ab-3134542c637a';
 const ATTEMPT = 'b69a1ddf-d1a2-4ff6-b293-75c358ff42df';
@@ -49,6 +55,37 @@ afterEach( async () => {
 } );
 
 describe( 'ChatGPT desktop IPC boundary', () => {
+	it( 'lists saved accounts without their subject', async () => {
+		vi.mocked( readChatGptAccounts ).mockResolvedValue( [
+			{
+				registrationId: ID,
+				issuer: 'https://auth.example.test',
+				subject: 'test-private-subject',
+				email: 'someone@example.test',
+				clientId: 'test-issued-client',
+				label: 'someone@example.test',
+				revision: 1,
+				logoutGeneration: 0,
+				storage: 'vault',
+				state: 'signed-in',
+				createdAt: '2026-11-10T00:00:00Z',
+				updatedAt: '2026-11-10T00:00:00Z',
+			},
+		] );
+
+		const settings = await getChatGptSettings();
+
+		expect( settings.accounts ).toEqual( [
+			expect.objectContaining( {
+				connectionId: ID,
+				identity: { verified: true, email: 'someone@example.test' },
+				authStatus: 'connected',
+			} ),
+		] );
+		expect( JSON.stringify( settings ) ).not.toContain( 'test-private-subject' );
+		expect( JSON.stringify( settings ) ).not.toContain( 'subject' );
+	} );
+
 	it( 'rejects ChatGPT as a global default before writing settings', async () => {
 		await expect( setAiProvider( event, 'chatgpt-oauth' ) ).rejects.toThrow(
 			'Choose a ChatGPT account in a new chat instead of setting a default provider.'

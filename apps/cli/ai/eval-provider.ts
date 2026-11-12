@@ -389,7 +389,9 @@ async function planChatGpt(
 			'That connection is not a ChatGPT connection Studio’s agent can run on.'
 		);
 	}
-	if ( entry.authStatus !== 'connected' || ! entry.identity?.subject ) {
+	const subject =
+		entry.identity && 'subject' in entry.identity ? entry.identity.subject : undefined;
+	if ( entry.authStatus !== 'connected' || ! subject ) {
 		return failure(
 			'connection-signed-out',
 			'That ChatGPT connection is not signed in to the dedicated profile. Sign in again with secure storage: a session-only sign-in lives only in the app that holds it.'
@@ -401,7 +403,6 @@ async function planChatGpt(
 		model,
 		reasoningEffort: reasoning.effort,
 	} );
-	const { subject } = entry.identity;
 	return {
 		ok: true,
 		plan: {

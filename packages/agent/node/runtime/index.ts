@@ -397,7 +397,12 @@ function validateChatGptSelectionLive(
 	if ( connection.revision !== selection.revision ) {
 		return describeConnectionSelectionError( { code: 'changed', providerId } );
 	}
-	if ( connection.authStatus !== 'connected' || ! connection.identity?.subject ) {
+	// The broker's own entry, with the subject it verified: never a renderer's view.
+	const identity = connection.identity;
+	if ( connection.authStatus !== 'connected' || ! ( identity && 'subject' in identity ) ) {
+		return describeConnectionSelectionError( { code: 'disconnected', providerId } );
+	}
+	if ( ! identity.subject ) {
 		return describeConnectionSelectionError( { code: 'disconnected', providerId } );
 	}
 	return undefined;

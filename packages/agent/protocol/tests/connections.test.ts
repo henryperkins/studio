@@ -413,6 +413,34 @@ describe( 'ChatGPT records', () => {
 		} );
 	} );
 
+	it( 'takes a renderer’s view of a connection, which the host says is verified without its subject', () => {
+		const view = ( identity: ConnectionRegistryEntry[ 'identity' ] ) =>
+			registry( { connections: [ chatGptConnection( { identity } ) ] } );
+		const disconnected = {
+			ok: false,
+			error: {
+				code: 'disconnected',
+				providerId: 'chatgpt-oauth',
+				connectionId: CHATGPT_CONNECTION_ID,
+			},
+		};
+
+		expect(
+			resolveConnectionSelection(
+				[ chatGptRecord() ],
+				view( { verified: true, email: 'someone@example.com' } )
+			)
+		).toEqual( chatGpt() );
+		for ( const identity of [ null, { subject: '' }, { verified: false } ] ) {
+			expect(
+				resolveConnectionSelection(
+					[ chatGptRecord() ],
+					view( identity as ConnectionRegistryEntry[ 'identity' ] )
+				)
+			).toEqual( disconnected );
+		}
+	} );
+
 	it( 'takes the connection and model from the latest ChatGPT record only', () => {
 		const entries = [
 			chatGptRecord( { model: 'gpt-6-astra', revision: 2 } ),
