@@ -2275,6 +2275,22 @@ describe( 'Signing in to ChatGPT', () => {
 			expect( keychain.items.size ).toBe( 1 );
 		} );
 
+		it( 'asks the keychain nothing before the browser for a first sign-in, while no sign-in is saved', async () => {
+			const get = vi.spyOn( keychain.store, 'get' );
+			const listen = vi.spyOn( http.Server.prototype, 'listen' );
+
+			const { attemptId, url } = await begin( undefined, { storage: 'vault' } );
+
+			expect( get ).not.toHaveBeenCalled();
+			expect( listen ).toHaveBeenCalledTimes( 1 );
+			expect( opened ).toHaveLength( 1 );
+			await deliver( await authorize( url ) );
+			expect( ( await flow.wait( attemptId ) ).ok ).toBe( true );
+			// The save, after the browser, made the key.
+			expect( get ).toHaveBeenCalled();
+			expect( keychain.items.size ).toBe( 1 );
+		} );
+
 		it( 'leaves a sign-in for this app session only to go on', async () => {
 			await savedUnderUnreadableKey();
 

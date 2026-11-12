@@ -665,9 +665,11 @@ export function createChatGptCredentialBroker(
 		return cacheWrappingKey( text );
 	}
 
-	// The check `getSealingKey` makes before it would make a key, without making one.
+	// The check `getSealingKey` makes before it would make a key, without making
+	// one. The keychain, and any prompt it shows, is asked only when a saved
+	// sign-in needs the key.
 	async function checkVaultKey(): Promise< void > {
-		if ( ! ( await readWrappingKeyText() ) && ( await hasSealedRecords() ) ) {
+		if ( ( await hasSealedRecords() ) && ! ( await readWrappingKeyText() ) ) {
 			throw new ChatGptConnectionError( 'vault-key-unreadable' );
 		}
 	}

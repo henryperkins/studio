@@ -341,6 +341,35 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 		}
 	);
 
+	// What a secure sign-in checks before the browser opens: a keychain read,
+	// and the prompt or tool run it may cost, only while a saved sign-in needs the key.
+	it.each( [ 'darwin', 'linux', 'win32' ] as const )(
+		'on %s, runs no keychain tool to check the key while no sign-in is saved, and refuses as before while saved ones’ key can’t be read',
+		async ( platform ) => {
+			const keychain = scriptedKeychain( platform );
+			const broker = () =>
+				createChatGptCredentialBroker( {
+					tokenClient: unreachableTokenService,
+					credentialStore: keychain.store,
+				} );
+
+			await expect( broker().checkVaultKey() ).resolves.toBeUndefined();
+			await broker().saveSignIn( signIn( 'session', 1 ) );
+			await expect( broker().checkVaultKey() ).resolves.toBeUndefined();
+
+			expect( keychain.calls ).toHaveLength( 0 );
+
+			await broker().saveSignIn( signIn( 'vault', 2 ) );
+			const callsBefore = keychain.calls.length;
+			await expect( broker().checkVaultKey() ).resolves.toBeUndefined();
+			expect( keychain.calls.length ).toBeGreaterThan( callsBefore );
+			keychain.state.saysNothingSaved = true;
+			await expect( broker().checkVaultKey() ).rejects.toMatchObject( {
+				code: 'vault-key-unreadable',
+			} );
+		}
+	);
+
 	// A locked keyring whose unlock prompt was dismissed may answer like a lost
 	// key: neither is ever treated as lost while sealed records depend on it.
 	describe( 'when it says nothing is saved while sealed records exist', () => {
