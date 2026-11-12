@@ -596,8 +596,13 @@ describe( 'Claude Studio tool qualification', () => {
 				isQualifiedStudioRule( { operationClass: 'read', approval: 'tool' } ),
 				isVerifiedNavigationGuard( {} as never, targetOrigin ),
 				isVerifiedNavigationGuard( { mode: 'guarded', guard: {} } as never, targetOrigin ),
-				// A rule has only the elements it states, so none of the planted ones.
+				// A rule has only the elements it states, so none of the planted ones:
+				// `wp_cli` states only its own `classify`, which still applies.
 				stated( rule( 'wp_cli' ) ),
+				( rule( 'wp_cli' ) as never as { classify( args: unknown ): unknown } ).classify( {
+					nameOrPath: 'site',
+					command: 'post create --post_status=draft --post_title=Hello',
+				} ),
 				stated( CLAUDE_NATIVE_TOOL_RULES.get( 'Read' ) ),
 			];
 		} finally {
@@ -610,7 +615,8 @@ describe( 'Claude Studio tool qualification', () => {
 			false,
 			false,
 			false,
-			elements.map( () => 'undefined' ),
+			elements.map( ( key ) => ( key === 'classify' ? 'function' : 'undefined' ) ),
+			'command',
 			elements.map( () => 'undefined' ),
 		] );
 	} );

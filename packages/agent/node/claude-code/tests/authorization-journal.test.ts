@@ -50,7 +50,12 @@ const STUDIO_CALLS: Record< string, { args: ( paths: Paths ) => unknown; live?: 
 	preview_create: { args: () => ( { nameOrPath: 'site' } ) },
 	preview_update: { args: () => ( { nameOrPath: 'site' } ) },
 	preview_delete: { args: () => ( {} ) },
-	wp_cli: { args: () => ( { nameOrPath: 'site', command: 'post list' } ) },
+	wp_cli: {
+		args: () => ( {
+			nameOrPath: 'site',
+			command: 'post create --post_status=draft --post_title=Hello',
+		} ),
+	},
 	scaffold_theme: { args: () => ( { nameOrPath: 'site', name: 'Theme' } ) },
 	validate_blocks: { args: () => ( { nameOrPath: 'site', filePath: 'templates/index.html' } ) },
 	take_screenshot: { args: () => ( { url: fakeSite.url } ) },
@@ -128,13 +133,27 @@ async function setup( ...args: Parameters< typeof createPolicyFixture > ) {
 	return fixture;
 }
 
+// The rules that can let a call do more than read: by their class, or, for a
+// rule classified by its arguments, whatever its class says.
+const mayDoMoreThanRead = (
+	rules: ReadonlyMap< string, { operationClass: ClaudeOperationClass; classify?: unknown } >
+) =>
+	[ ...rules ]
+		.filter( ( [ , rule ] ) => doesMoreThanRead( rule.operationClass ) || !! rule.classify )
+		.map( ( [ name ] ) => name )
+		.sort();
+
 describe( 'what the policy journals before an operation that does more than read runs', () => {
 	it( 'has a case for every rule and host operation whose class does more than read', () => {
-		const names = ( rules: ReadonlyMap< string, { operationClass: ClaudeOperationClass } > ) =>
-			[ ...rules ]
-				.filter( ( [ , rule ] ) => doesMoreThanRead( rule.operationClass ) )
-				.map( ( [ name ] ) => name )
-				.sort();
+		const names = mayDoMoreThanRead;
+		expect(
+			names(
+				new Map( [
+					[ 'reads', { operationClass: 'read' as const } ],
+					[ 'classified', { operationClass: 'read' as const, classify: () => 'command' } ],
+				] )
+			)
+		).toEqual( [ 'classified' ] );
 		expect( Object.keys( STUDIO_CALLS ).sort() ).toEqual( names( CLAUDE_STUDIO_TOOL_RULES ) );
 		expect( Object.keys( NATIVE_USES ).sort() ).toEqual( names( CLAUDE_NATIVE_TOOL_RULES ) );
 		expect( Object.keys( HOST_CALLS ).sort() ).toEqual(
@@ -307,6 +326,65 @@ describe( 'what the policy journals before an operation that does more than read
 		await policy.guardHost( host, 'call' ).sites.wpCli( site, [ 'option', 'get', 'blogname' ] );
 		expect( host.sites.wpCli ).toHaveBeenCalledOnce();
 		expect( journal ).toEqual( [] );
+	} );
+
+	it( 'journals nothing at the tool for a WP-CLI call that only reads, and journals one it cannot place as a command', async () => {
+		const { policy, host, journal } = await setup();
+		const call = ( command: string, toolCallId: string ) =>
+			policy.authorizeStudioCall( {
+				host,
+				name: 'wp_cli',
+				args: { nameOrPath: 'site', command },
+				toolCallId,
+			} );
+		expect( await call( 'post list', 'list' ) ).toBe( true );
+		expect( await call( 'option get blogname', 'option' ) ).toBe( true );
+		expect( journal ).toEqual( [] );
+		expect( await call( 'plugin install hello-dolly', 'install' ) ).toBe( true );
+		expect( await call( 'post   list --format=json', 'formatted' ) ).toBe( true );
+		expect( journal ).toEqual( [
+			expect.objectContaining( {
+				toolCallId: 'install',
+				operation: expect.objectContaining( { tool: 'wp_cli', operationClass: 'command' } ),
+			} ),
+			expect.objectContaining( {
+				toolCallId: 'formatted',
+				operation: expect.objectContaining( { tool: 'wp_cli', operationClass: 'command' } ),
+			} ),
+		] );
+	} );
+
+	it( 'journals a WP-CLI command that does more than read at its host operation, whatever its tool call was classified as', async () => {
+		const { policy, host, journal, context } = await setup();
+		const order: string[] = [];
+		const record = context.recordOperation;
+		context.recordOperation = async ( event ) => {
+			order.push( `journal ${ event.operation.tool }` );
+			await record( event );
+		};
+		vi.mocked( host.sites.wpCli ).mockImplementation( async () => {
+			order.push( 'host sites.wpCli' );
+			return { exitCode: 0, stdout: '', stderr: '' };
+		} );
+		// The tool call reads as a read; the command that reaches the host is a draft.
+		expect(
+			await policy.authorizeStudioCall( {
+				host,
+				name: 'wp_cli',
+				args: { nameOrPath: 'site', command: 'post list' },
+				toolCallId: 'call',
+			} )
+		).toBe( true );
+		await policy
+			.guardHost( host, 'call' )
+			.sites.wpCli( site, [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ] );
+		expect( order ).toEqual( [ 'journal sites.wpCli', 'host sites.wpCli' ] );
+		expect( journal ).toEqual( [
+			expect.objectContaining( {
+				toolCallId: 'call',
+				operation: expect.objectContaining( { tool: 'sites.wpCli', operationClass: 'command' } ),
+			} ),
+		] );
 	} );
 
 	it( 'runs nothing it could not journal', async () => {

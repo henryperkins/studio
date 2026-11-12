@@ -29,7 +29,7 @@ import { stopSiteTool } from '../tools/stop-site';
 import { takeScreenshotTool } from '../tools/take-screenshot';
 import { updatePreviewTool } from '../tools/update-preview';
 import { validateBlocksTool } from '../tools/validate-blocks';
-import { runWpCliTool } from '../tools/wp-cli';
+import { runWpCliTool, splitCommandArgs } from '../tools/wp-cli';
 import { wpcomRequestTool } from '../tools/wpcom-request';
 import type { SandboxSettings } from '@anthropic-ai/claude-agent-sdk/core';
 import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
@@ -675,16 +675,31 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		runWpCliTool.name,
 		// The tool only resolves the site it names and hands the command to the
 		// host, which classifies the command, binds it to the target and asks.
-		qualified( onSite( 'command', { approval: 'host' } ), {
-			readsLocalFiles: false,
-			writesLocalFiles: false,
-			drivesBrowser: false,
-			requestsNetwork: false,
-			spawnsProcess: false,
-			runsWpCli: [ 'site', 'host' ],
-			callsHostOperation: [ 'host' ],
-			reachesWpcom: false,
-		} ),
+		// The call itself is a read only when the host would take its command for
+		// one; anything else is a command. The host operation is classified and
+		// journaled on its own arguments, whatever this says.
+		qualified(
+			onSite( 'command', {
+				approval: 'host',
+				classify: ( args ) => {
+					const command = isRecord( args ) ? args.command : undefined;
+					return typeof command === 'string' &&
+						classifyWpCliArgs( splitCommandArgs( command ) ) === 'read'
+						? 'read'
+						: 'command';
+				},
+			} ),
+			{
+				readsLocalFiles: false,
+				writesLocalFiles: false,
+				drivesBrowser: false,
+				requestsNetwork: false,
+				spawnsProcess: false,
+				runsWpCli: [ 'site', 'host' ],
+				callsHostOperation: [ 'host' ],
+				reachesWpcom: false,
+			}
+		),
 	],
 	[ scaffoldThemeTool.name, unqualified( onSite( 'local-change' ) ) ],
 	[ pickDesignTool.name, unqualified( studioRule( 'read' ) ) ],
@@ -1328,6 +1343,13 @@ export const HOST_OPERATION_CLASSES: Readonly<
 	'sync.pull': 'remote-overwrite',
 };
 
+/** Whether a name is one of the host operations a Studio tool reaches. */
+export function isClaudeHostOperation( name: string ): boolean {
+	return (
+		name === 'sites.wpCli' || Object.prototype.hasOwnProperty.call( HOST_OPERATION_CLASSES, name )
+	);
+}
+
 /**
  * Whether this build has a rule for a tool or host operation of that name.
  * Recovery takes a tool it does not recognise to have done more than read.
@@ -1336,8 +1358,7 @@ export function isKnownClaudeTool( name: string ): boolean {
 	return (
 		CLAUDE_STUDIO_TOOL_RULES.has( name ) ||
 		CLAUDE_NATIVE_TOOL_RULES.has( name ) ||
-		name === 'sites.wpCli' ||
-		Object.prototype.hasOwnProperty.call( HOST_OPERATION_CLASSES, name )
+		isClaudeHostOperation( name )
 	);
 }
 

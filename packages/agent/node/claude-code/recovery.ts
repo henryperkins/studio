@@ -122,23 +122,33 @@ function recoveredMessage( uncertain: boolean ): string {
 // - every tool it does not recognise that started: such a tool is never taken
 //   to only read. A recognised tool that started with nothing authorized has
 //   run nothing that does more than read.
+// A Studio tool call journaled at the tool and at the host operations it
+// reached is reported by those host operations, which say what would have
+// changed. Only entries that name their tool call are matched with others:
+// one that names none is never merged, settled or taken as accounted for.
 async function uncertainOperationsOf(
 	events: ClaudeJournalEvent[],
 	resolved: ReadonlySet< string >
 ): Promise< ClaudeUncertainOperation[] > {
+	const idOf = ( event: { toolCallId?: unknown } ) =>
+		typeof event.toolCallId === 'string' && event.toolCallId ? event.toolCallId : undefined;
 	const completed = new Set(
-		events.flatMap( ( event ) => ( event.type === 'tool.result' ? [ event.toolCallId ] : [] ) )
+		events.flatMap( ( event ) => {
+			const id = event.type === 'tool.result' ? idOf( event ) : undefined;
+			return id ? [ id ] : [];
+		} )
 	);
 	const found = new Map< string, ClaudeUncertainOperation >();
 	const accounted = new Set< string >();
-	for ( const event of events ) {
+	for ( const [ index, event ] of events.entries() ) {
 		if ( event.type !== 'operation.authorized' && event.type !== 'approval.requested' ) continue;
-		accounted.add( event.toolCallId );
+		const id = idOf( event );
+		if ( id ) accounted.add( id );
 		const operation: Partial< typeof event.operation > = event.operation ?? {};
-		if ( completed.has( event.toolCallId ) || isClaudeReadOnlyClass( operation.operationClass ) )
+		if ( ( id && completed.has( id ) ) || isClaudeReadOnlyClass( operation.operationClass ) )
 			continue;
 		const tool = typeof operation.tool === 'string' ? operation.tool : '';
-		const key = JSON.stringify( [ event.toolCallId, event.requestId ?? null, tool ] );
+		const key = id ? JSON.stringify( [ id, event.requestId ?? null, tool ] ) : `unnamed ${ index }`;
 		const evidence = event.type === 'operation.authorized' ? 'authorized' : 'requested';
 		const known = found.get( key );
 		if ( known ) {
@@ -159,27 +169,41 @@ async function uncertainOperationsOf(
 				: {} ),
 		} );
 	}
-	const started = events.filter(
-		( event ): event is Extract< ClaudeJournalEvent, { type: 'tool.started' } > =>
-			event.type === 'tool.started' &&
-			! completed.has( event.toolCallId ) &&
-			! accounted.has( event.toolCallId )
-	);
+	const started = events.flatMap( ( event, index ) => {
+		if ( event.type !== 'tool.started' ) return [];
+		const id = idOf( event );
+		return id && ( completed.has( id ) || accounted.has( id ) ) ? [] : [ { event, index } ];
+	} );
+	const named = [ ...found.values() ].flatMap( ( operation ) => idOf( operation ) ?? [] );
+	const shared = new Set( named ).size !== named.length;
 	// The rules are loaded only when needed: they bring every tool's module with them.
-	const { isKnownClaudeTool } = started.length
-		? await import( './execution-rules' )
-		: { isKnownClaudeTool: () => true };
-	for ( const event of started ) {
-		if ( isKnownClaudeTool( event.name ) ) continue;
+	const rules = started.length || shared ? await import( './execution-rules' ) : undefined;
+	for ( const { event, index } of started ) {
+		if ( rules?.isKnownClaudeTool( event.name ) ) continue;
 		const tool = escapeClaudeApprovalText( String( event.name ) );
-		found.set( JSON.stringify( [ event.toolCallId, null, tool ] ), {
+		const id = idOf( event );
+		found.set( id ? JSON.stringify( [ id, null, tool ] ) : `unnamed ${ index }`, {
 			toolCallId: event.toolCallId,
 			tool,
 			description: `Run an operation Studio does not recognize: ${ tool }`,
 			evidence: 'started',
 		} );
 	}
-	return [ ...found.values() ];
+	const operations = [ ...found.values() ];
+	if ( ! rules ) return operations;
+	const reachedHost = new Set(
+		operations.flatMap( ( operation ) =>
+			rules.isClaudeHostOperation( operation.tool ) ? idOf( operation ) ?? [] : []
+		)
+	);
+	return operations.filter( ( operation ) => {
+		const id = idOf( operation );
+		return ! (
+			id &&
+			reachedHost.has( id ) &&
+			rules.CLAUDE_STUDIO_TOOL_RULES.has( operation.tool )
+		);
+	} );
 }
 
 // What recovery records for the dead turn: each approval it left pending,

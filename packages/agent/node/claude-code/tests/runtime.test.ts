@@ -2931,7 +2931,6 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 			expect( await recoverClaudeRun( store, bindingOf( fixture ), goneSeams ) ).toMatchObject( {
 				status: 'recovered',
 				uncertainOperations: [
-					expect.objectContaining( { tool: 'wp_cli', evidence: 'authorized' } ),
 					expect.objectContaining( { tool: 'sites.wpCli', evidence: 'authorized' } ),
 				],
 			} );
@@ -2955,7 +2954,7 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 			expect( note.startsWith( base ) ).toBe( true );
 			expect( note ).toContain( 'the previous turn' );
 			expect( note ).toContain( 'interrupted' );
-			expect( note ).toContain( 'Run a command: wp_cli' );
+			expect( note ).not.toContain( 'Run a command: wp_cli' );
 			expect( note ).toContain( 'Create a draft post on the current local site' );
 			expect( note ).toMatch( /inspect/i );
 			expect( note ).toMatch( /do not repeat/i );

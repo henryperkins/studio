@@ -211,15 +211,9 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 		const { toolCallId, requestId } = idsOf( journal );
 		const { nativeSessionId } = await fixture.deadTurn( { journal } );
 		const result = await fixture.recover();
+		// The tool call is journaled at the tool and at the host operation it
+		// reached; the host operation says what would have changed.
 		const uncertain = [
-			{
-				toolCallId,
-				tool: 'wp_cli',
-				operationClass: 'command',
-				target,
-				description: 'Run a command: wp_cli',
-				evidence: 'authorized',
-			},
 			{
 				toolCallId,
 				tool: 'sites.wpCli',
@@ -333,7 +327,6 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 			recordedTerminal: true,
 			invalidatedApprovals: [],
 			uncertainOperations: [
-				expect.objectContaining( { toolCallId, tool: 'wp_cli', evidence: 'authorized' } ),
 				{
 					toolCallId,
 					tool: 'sites.wpCli',
@@ -436,6 +429,48 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 		const unknown = result.status === 'recovered' ? result.uncertainOperations[ 1 ] : undefined;
 		expect( unknown ).not.toHaveProperty( 'operationClass' );
 		expect( result.status === 'recovered' && result.uncertainOperations ).toHaveLength( 2 );
+	} );
+
+	it( 'reports one operation for a tool call journaled at the tool and at its host operation, the host one, and never merges entries that name no tool call', async () => {
+		const fixture = await recoveryFixture();
+		const authorized = ( toolCallId: string | undefined, tool: string ) =>
+			( {
+				type: 'operation.authorized',
+				...ids,
+				toolCallId,
+				operation: { tool, operationClass: 'command', target },
+				description: `Run a command: ${ tool }`,
+			} ) as ClaudeTurnJournalEvent;
+		await fixture.deadTurn( {
+			journal: [
+				// One call, journaled at the tool and at the host operation it reached.
+				authorized( 'call', 'wp_cli' ),
+				authorized( 'call', 'sites.wpCli' ),
+				// One call that reached two host operations: each may have changed something.
+				authorized( 'create', 'site_create' ),
+				authorized( 'create', 'sites.create' ),
+				authorized( 'create', 'sites.start' ),
+				// A call that never reached its host operation.
+				authorized( 'alone', 'wp_cli' ),
+				// Entries that name no tool call, and a result that names none either.
+				authorized( undefined, 'wp_cli' ),
+				authorized( undefined, 'wp_cli' ),
+				authorized( undefined, 'sites.wpCli' ),
+				authorized( '', 'wp_cli' ),
+				{ type: 'tool.result', ...ids, isError: false } as ClaudeTurnJournalEvent,
+			],
+		} );
+		const result = await fixture.recover();
+		expect( result.status === 'recovered' && result.uncertainOperations ).toEqual( [
+			expect.objectContaining( { toolCallId: 'call', tool: 'sites.wpCli' } ),
+			expect.objectContaining( { toolCallId: 'create', tool: 'sites.create' } ),
+			expect.objectContaining( { toolCallId: 'create', tool: 'sites.start' } ),
+			expect.objectContaining( { toolCallId: 'alone', tool: 'wp_cli' } ),
+			expect.objectContaining( { tool: 'wp_cli' } ),
+			expect.objectContaining( { tool: 'wp_cli' } ),
+			expect.objectContaining( { tool: 'sites.wpCli' } ),
+			expect.objectContaining( { toolCallId: '', tool: 'wp_cli' } ),
+		] );
 	} );
 
 	it( 'leaves the dead run’s approvals unanswerable by any later run', async () => {
@@ -648,10 +683,7 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 			...ids,
 			recordedTerminal: true,
 			invalidatedApprovals: [ requestId ],
-			uncertainOperations: [
-				expect.objectContaining( { tool: 'wp_cli' } ),
-				expect.objectContaining( { requestId } ),
-			],
+			uncertainOperations: [ expect.objectContaining( { tool: 'sites.wpCli', requestId } ) ],
 		} );
 		const events = ( await fixture.store.readJournals( 'chat' ) ).flat();
 		expect( events.filter( ( event ) => event.type === 'turn.terminal' ) ).toHaveLength( 1 );
