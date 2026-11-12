@@ -64,9 +64,16 @@ export interface BackendTurnOutcome {
 	 * `account_changed` when the native sign-in became another account or none,
 	 * `account_unverified` when it could not be read, `process_unowned` when
 	 * Studio could not take ownership of the native process tree, so nothing
-	 * was sent.
+	 * was sent, and `process_unconfirmed` when Studio could not confirm that
+	 * every process of the turn ended, so the conversation stays locked until
+	 * it is recovered.
 	 */
-	code?: 'rebind_required' | 'account_changed' | 'account_unverified' | 'process_unowned';
+	code?:
+		| 'rebind_required'
+		| 'account_changed'
+		| 'account_unverified'
+		| 'process_unowned'
+		| 'process_unconfirmed';
 }
 
 interface ContentBlock {

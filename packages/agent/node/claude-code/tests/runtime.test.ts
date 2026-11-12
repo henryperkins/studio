@@ -1,9 +1,25 @@
 import { createHash } from 'crypto';
+import { EventEmitter } from 'events';
 import { mkdtemp, realpath, rm, stat, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { PassThrough } from 'stream';
+import { prepareProcessOwner } from '@studio/common/lib/owned-process';
+import {
+	enoent,
+	errno,
+	exitChild,
+	fakeChild,
+	fakeSpawn,
+	keeperAnswering,
+	linuxSeams,
+	WINDOWS_START,
+	windowsSeams,
+	type FakeChild,
+} from '@studio/common/lib/tests/fixtures/owned-process-seams';
 import { describe, expect, it, vi } from 'vitest';
 import { discoverClaudeModels, qualifyClaudeStartup } from '../runtime';
+import type { OwnershipFailure, ProcessOwner } from '@studio/common/lib/owned-process';
 
 const fakeIdentity = {
 	path: 'fake',
@@ -14,6 +30,94 @@ const fakeIdentity = {
 	changed: '0',
 	sha256: '',
 };
+
+// A native executable on disk, so the identity check before every spawn holds.
+async function nativeExecutable( directory: string ) {
+	const executablePath = path.join( directory, 'claude.exe' );
+	await writeFile( executablePath, 'native fixture' );
+	const found = await stat( executablePath, { bigint: true } );
+	return {
+		executablePath,
+		executableIdentity: {
+			path: executablePath,
+			size: Number( found.size ),
+			device: found.dev.toString(),
+			inode: found.ino.toString(),
+			modified: found.mtimeNs.toString(),
+			changed: found.ctimeNs.toString(),
+			sha256: createHash( 'sha256' ).update( 'native fixture' ).digest( 'hex' ),
+		},
+	};
+}
+
+// Starts the native process as the SDK does when a query begins: through the spawn hook.
+function launchNative( options: Record< string, unknown > ) {
+	return ( options.spawnClaudeCodeProcess as ( invocation: Record< string, unknown > ) => unknown )(
+		{
+			command: options.pathToClaudeCodeExecutable,
+			args: [],
+			cwd: options.cwd,
+			env: options.env,
+			signal: new AbortController().signal,
+		}
+	);
+}
+
+// An owner whose process records what the runtime asks of it, so no real
+// process or keeper starts; only the tests of the native mechanism start one.
+function fakeProcessOwner(
+	owned: {
+		prepared?: boolean;
+		ready?: boolean;
+		clean?: boolean;
+		failure?: OwnershipFailure;
+	} = {},
+	order: string[] = []
+) {
+	const spawnOwned = vi.fn( () => {
+		const child = Object.assign( new EventEmitter(), {
+			pid: 4321,
+			exitCode: null,
+			signalCode: null,
+			stdin: new PassThrough(),
+			stdout: new PassThrough(),
+			stderr: new PassThrough(),
+		} );
+		return {
+			child,
+			ready: async () => {
+				order.push( 'owned-ready' );
+				return owned.ready ?? true;
+			},
+			failure: () => owned.failure,
+			identity: () => ( { pid: 4321, start: '1' } ),
+			inspect: async () => ( { live: [], uncertain: false } ),
+			requestShutdown: async () => {},
+			waitForExit: async () => true,
+			terminate: async () => owned.clean ?? true,
+			shutdown: async () => {
+				order.push( 'owned-shutdown' );
+				return owned.clean ?? true;
+			},
+		};
+	} );
+	return {
+		order,
+		spawnOwned,
+		prepareOwner: () =>
+			( {
+				prepared: async () => {
+					order.push( 'owner-prepared' );
+					return owned.prepared ?? true;
+				},
+				failure: () => owned.failure,
+				spawn: spawnOwned,
+				dispose: async () => {
+					order.push( 'owner-disposed' );
+				},
+			} ) as unknown as ProcessOwner,
+	};
+}
 
 describe( 'Claude SDK startup (mock control responses)', () => {
 	const identity = { email: 'user@example.com', subscriptionType: 'max' };
@@ -69,51 +173,82 @@ describe( 'Claude SDK startup (mock control responses)', () => {
 		);
 	} );
 
-	it( 'discovers available models without starting a turn or sending user input', async () => {
-		let launch: Record< string, unknown > | undefined;
-		let input: Promise< IteratorResult< unknown > > | undefined;
-		let closed = false;
-		let inventoryRequests = 0;
-		const query = ( request: {
-			prompt: AsyncIterable< unknown >;
-			options: Record< string, unknown >;
-		} ) => {
-			launch = request.options;
-			input = request.prompt[ Symbol.asyncIterator ]().next();
-			return {
-				...good(),
-				mcpServerStatus: () =>
-					inventoryRequests++ === 0 ? Promise.resolve( [] ) : good().mcpServerStatus(),
-				close: () => {
-					closed = true;
-				},
+	// Discovery with a native executable on disk and a fake owner; `launch` says
+	// whether the SDK stand-in starts its process through the spawn hook.
+	async function discover(
+		owner: ReturnType< typeof fakeProcessOwner >,
+		{ launch = true }: { launch?: boolean } = {}
+	) {
+		const directory = await realpath(
+			await mkdtemp( path.join( os.tmpdir(), 'Studio Claude Discovery ' ) )
+		);
+		try {
+			const native = await nativeExecutable( directory );
+			let options: Record< string, unknown > | undefined;
+			let input: Promise< IteratorResult< unknown > > | undefined;
+			let closed = false;
+			let inventoryRequests = 0;
+			const query = ( request: {
+				prompt: AsyncIterable< unknown >;
+				options: Record< string, unknown >;
+			} ) => {
+				options = request.options;
+				if ( launch ) launchNative( request.options );
+				input = request.prompt[ Symbol.asyncIterator ]().next();
+				return {
+					...good(),
+					mcpServerStatus: () =>
+						inventoryRequests++ === 0 ? Promise.resolve( [] ) : good().mcpServerStatus(),
+					close: () => {
+						closed = true;
+					},
+				};
 			};
-		};
-		await expect(
-			discoverClaudeModels( 'connection', '.', {
+			const result = await discoverClaudeModels( 'connection', '.', {
 				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-				connection: async () => ( { id: 'connection', executablePath: 'fake' } ),
+				prepareOwner: owner.prepareOwner,
+				connection: async () => ( { id: 'connection', executablePath: native.executablePath } ),
 				prepare: async () => ( {
 					ok: true as const,
-					executablePath: 'fake',
-					executableIdentity: fakeIdentity,
+					...native,
 					cwd: '.',
 					configDirectory: '.',
 					projectsDirectory: '.',
 					env: {},
 					identity,
 				} ),
-			} )
-		).resolves.toEqual( {
+			} );
+			return { result, options, input, closed };
+		} finally {
+			await rm( directory, { recursive: true, force: true, maxRetries: 4 } );
+		}
+	}
+
+	it( 'discovers available models without starting a turn or sending user input', async () => {
+		const owner = fakeProcessOwner();
+		const { result, options, input, closed } = await discover( owner );
+		expect( result ).toEqual( {
 			ok: true,
 			models: [ { id: 'claude-xyz', displayName: 'Sonnet', efforts: [ 'medium' ] } ],
 			workingDirectory: '.',
 			configDirectory: '.',
 		} );
-		expect( launch ).toMatchObject( { persistSession: false, strictMcpConfig: true } );
-		expect( launch?.model ).toBeUndefined();
+		expect( options ).toMatchObject( { persistSession: false, strictMcpConfig: true } );
+		expect( options?.model ).toBeUndefined();
 		expect( closed ).toBe( true );
 		await expect( input ).resolves.toMatchObject( { done: true } );
+		expect( owner.order ).toEqual( [ 'owner-prepared', 'owned-ready', 'owned-shutdown' ] );
+	} );
+
+	it( 'reports no models from a native process Studio does not own, as a turn would refuse it', async () => {
+		const unready = fakeProcessOwner( { ready: false, failure: 'job-assignment-denied' } );
+		expect( ( await discover( unready ) ).result ).toMatchObject( { ok: false } );
+		const unhooked = fakeProcessOwner();
+		expect( ( await discover( unhooked, { launch: false } ) ).result ).toMatchObject( {
+			ok: false,
+		} );
+		expect( unhooked.spawnOwned ).not.toHaveBeenCalled();
+		expect( unhooked.order ).toEqual( [ 'owner-prepared', 'owner-disposed' ] );
 	} );
 
 	it( 'refuses to spawn an executable that changed after it was prepared', async () => {
@@ -140,6 +275,7 @@ describe( 'Claude SDK startup (mock control responses)', () => {
 			};
 			await discoverClaudeModels( 'connection', directory, {
 				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				prepareOwner: fakeProcessOwner().prepareOwner,
 				connection: async () => ( { id: 'connection', executablePath: executable } ),
 				prepare: async () => ( {
 					ok: true as const,
@@ -262,6 +398,7 @@ it.each( [ 'missing native reference', 'moved workspace' ] )(
 				{
 					storeRoot: root,
 					query,
+					prepareOwner: fakeProcessOwner().prepareOwner,
 					approve: async () => 'deny',
 					verifyTarget: async () => true,
 					connection: async () => ( { id: 'connection', executablePath: 'fake' } ),
@@ -303,6 +440,7 @@ it( 'resumes the exact native session after restart with the next model and effo
 	const projects = path.join( root, 'projects' );
 	try {
 		await fs.mkdir( projects );
+		const native = await nativeExecutable( root );
 		const host = createFakeHost();
 		host.sites.all = async () => [
 			{ id: 'site', path: root, name: 'site', url: 'http://localhost', phpVersion: '8.4' },
@@ -311,6 +449,7 @@ it( 'resumes the exact native session after restart with the next model and effo
 			( input: { prompt: AsyncIterable< unknown >; options: Record< string, unknown > } ) => {
 				const model = input.options.model;
 				const sessionId = input.options.resume ?? input.options.sessionId;
+				launchNative( input.options );
 				return {
 					initializationResult: async () => ( {
 						hooks_applied: true,
@@ -397,11 +536,11 @@ it( 'resumes the exact native session after restart with the next model and effo
 					approve: async () => 'deny',
 					verifyTarget: async () => true,
 					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+					prepareOwner: fakeProcessOwner().prepareOwner,
+					connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
 					prepare: async () => ( {
 						ok: true,
-						executablePath: 'fake',
-						executableIdentity: fakeIdentity,
+						...native,
 						cwd: root,
 						configDirectory: root,
 						projectsDirectory: projects,
@@ -439,32 +578,42 @@ it( 'releases no prompt and reports startup failure even if closing the SDK thro
 	const os = await import( 'os' );
 	const path = await import( 'path' );
 	const storeRoot = await fs.mkdtemp( path.join( os.tmpdir(), 'claude-test-' ) );
+	const native = await nativeExecutable( storeRoot );
 	let promptRead = false;
 	let closed = false;
-	const fakeQuery = ( input: { prompt: AsyncIterable< unknown > } ) => ( {
-		initializationResult: async () => ( { hooks_applied: false, hook_on_failure_supported: true } ),
-		accountInfo: async () => ( {
-			email: 'user@example.com',
-			subscriptionType: 'Max',
-			apiProvider: 'firstParty',
-		} ),
-		mcpServerStatus: async () => [
-			{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-		],
-		supportedModels: async () => [
-			{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
-		],
-		close: () => {
-			closed = true;
-			throw new Error( 'Private details from the SDK close' );
-		},
-		async *[ Symbol.asyncIterator ]() {
-			for await ( const message of input.prompt ) {
-				promptRead = true;
-				yield message;
-			}
-		},
-	} );
+	const fakeQuery = ( input: {
+		prompt: AsyncIterable< unknown >;
+		options: Record< string, unknown >;
+	} ) => {
+		launchNative( input.options );
+		return {
+			initializationResult: async () => ( {
+				hooks_applied: false,
+				hook_on_failure_supported: true,
+			} ),
+			accountInfo: async () => ( {
+				email: 'user@example.com',
+				subscriptionType: 'Max',
+				apiProvider: 'firstParty',
+			} ),
+			mcpServerStatus: async () => [
+				{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+			],
+			supportedModels: async () => [
+				{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+			],
+			close: () => {
+				closed = true;
+				throw new Error( 'Private details from the SDK close' );
+			},
+			async *[ Symbol.asyncIterator ]() {
+				for await ( const message of input.prompt ) {
+					promptRead = true;
+					yield message;
+				}
+			},
+		};
+	};
 	const snapshot = {
 		backend: 'claude-code' as const,
 		runId: 'run',
@@ -499,11 +648,11 @@ it( 'releases no prompt and reports startup failure even if closing the SDK thro
 		},
 		{
 			query: fakeQuery as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-			connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+			prepareOwner: fakeProcessOwner().prepareOwner,
+			connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
 			prepare: async () => ( {
 				ok: true as const,
-				executablePath: 'fake',
-				executableIdentity: fakeIdentity,
+				...native,
 				cwd: process.cwd(),
 				configDirectory: process.cwd(),
 				projectsDirectory: process.cwd(),
@@ -557,6 +706,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 					configDirectory: root,
 				},
 			};
+			const native = await nativeExecutable( root );
 			let emittedPrompt = false;
 			let seenInput: unknown;
 			let seenOptions: Record< string, unknown > = {};
@@ -565,6 +715,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 				options: Record< string, unknown >;
 			} ) => {
 				seenOptions = input.options;
+				launchNative( input.options );
 				return {
 					initializationResult: async () => ( {
 						hooks_applied: true,
@@ -643,11 +794,11 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 				},
 				{
 					query: fakeQuery as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+					prepareOwner: fakeProcessOwner().prepareOwner,
+					connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
 					prepare: async () => ( {
 						ok: true as const,
-						executablePath: 'fake',
-						executableIdentity: fakeIdentity,
+						...native,
 						cwd: root,
 						configDirectory: root,
 						projectsDirectory: path.join( root, 'projects' ),
@@ -672,7 +823,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 				},
 			} );
 			expect( seenOptions ).toMatchObject( {
-				pathToClaudeCodeExecutable: 'fake',
+				pathToClaudeCodeExecutable: native.executablePath,
 				cwd: root,
 				model: 'sonnet',
 				effort: 'medium',
@@ -732,6 +883,7 @@ it( 'denies native tools until system init has been verified (mock SDK)', async 
 				configDirectory: root,
 			},
 		};
+		const native = await nativeExecutable( root );
 		let before: unknown;
 		const fakeQuery = ( input: {
 			prompt: AsyncIterable< unknown >;
@@ -741,50 +893,53 @@ it( 'denies native tools until system init has been verified (mock SDK)', async 
 				};
 				sessionId: string;
 			};
-		} ) => ( {
-			initializationResult: async () => ( {
-				hooks_applied: true,
-				hook_on_failure_supported: true,
-			} ),
-			accountInfo: async () => ( {
-				email: 'user@example.com',
-				subscriptionType: 'Max',
-				apiProvider: 'firstParty',
-			} ),
-			mcpServerStatus: async () => [
-				{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-			],
-			supportedModels: async () => [
-				{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
-			],
-			close: () => {},
-			async *[ Symbol.asyncIterator ]() {
-				for await ( const _message of input.prompt ) {
-					before = await input.options.hooks.PreToolUse[ 0 ].hooks[ 0 ]( {
-						hook_event_name: 'PreToolUse',
-						tool_name: 'mcp__studio__wp_cli',
-						mcp_server: { name: 'studio', source: 'sdk' },
-					} );
-					yield {
-						type: 'result',
-						subtype: 'success',
-						is_error: false,
-						session_id: input.options.sessionId,
-					};
-				}
-			},
-		} );
+		} ) => {
+			launchNative( input.options );
+			return {
+				initializationResult: async () => ( {
+					hooks_applied: true,
+					hook_on_failure_supported: true,
+				} ),
+				accountInfo: async () => ( {
+					email: 'user@example.com',
+					subscriptionType: 'Max',
+					apiProvider: 'firstParty',
+				} ),
+				mcpServerStatus: async () => [
+					{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+				],
+				supportedModels: async () => [
+					{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+				],
+				close: () => {},
+				async *[ Symbol.asyncIterator ]() {
+					for await ( const _message of input.prompt ) {
+						before = await input.options.hooks.PreToolUse[ 0 ].hooks[ 0 ]( {
+							hook_event_name: 'PreToolUse',
+							tool_name: 'mcp__studio__wp_cli',
+							mcp_server: { name: 'studio', source: 'sdk' },
+						} );
+						yield {
+							type: 'result',
+							subtype: 'success',
+							is_error: false,
+							session_id: input.options.sessionId,
+						};
+					}
+				},
+			};
+		};
 		await runClaudeTurn(
 			snapshot,
 			host,
 			{ prompt: 'hello', signal: new AbortController().signal, onEvent: () => {} },
 			{
 				query: fakeQuery as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-				connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+				prepareOwner: fakeProcessOwner().prepareOwner,
+				connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
 				prepare: async () => ( {
 					ok: true as const,
-					executablePath: 'fake',
-					executableIdentity: fakeIdentity,
+					...native,
 					cwd: root,
 					configDirectory: root,
 					projectsDirectory: path.join( root, 'projects' ),
@@ -947,6 +1102,7 @@ it( 'deduplicates discovered model aliases by canonical ID without inventing eff
 	] );
 } );
 
+// A mock SDK that starts its process through the spawn hook, then runs `onTurn` after init.
 function fakeNativeTurn(
 	cwd: string,
 	{
@@ -964,54 +1120,57 @@ function fakeNativeTurn(
 	} = {}
 ) {
 	return vi.fn(
-		( input: { prompt: AsyncIterable< unknown >; options: Record< string, unknown > } ) => ( {
-			initializationResult: async () => ( {
-				hooks_applied: true,
-				hook_on_failure_supported: true,
-			} ),
-			accountInfo: async () => account(),
-			mcpServerStatus: async () => [
-				{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-			],
-			supportedModels: async () => [
-				{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
-			],
-			close: () => {},
-			async *[ Symbol.asyncIterator ]() {
-				const sessionId = input.options.resume ?? input.options.sessionId;
-				for await ( const _prompt of input.prompt ) {
-					if ( projects ) {
-						const { appendFile } = await import( 'fs/promises' );
-						const { join } = await import( 'path' );
-						await appendFile(
-							join( projects, `${ sessionId }.jsonl` ),
-							JSON.stringify( { sessionId, cwd } ) + '\n'
-						);
+		( input: { prompt: AsyncIterable< unknown >; options: Record< string, unknown > } ) => {
+			launchNative( input.options );
+			return {
+				initializationResult: async () => ( {
+					hooks_applied: true,
+					hook_on_failure_supported: true,
+				} ),
+				accountInfo: async () => account(),
+				mcpServerStatus: async () => [
+					{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
+				],
+				supportedModels: async () => [
+					{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+				],
+				close: () => {},
+				async *[ Symbol.asyncIterator ]() {
+					const sessionId = input.options.resume ?? input.options.sessionId;
+					for await ( const _prompt of input.prompt ) {
+						if ( projects ) {
+							const { appendFile } = await import( 'fs/promises' );
+							const { join } = await import( 'path' );
+							await appendFile(
+								join( projects, `${ sessionId }.jsonl` ),
+								JSON.stringify( { sessionId, cwd } ) + '\n'
+							);
+						}
+						yield {
+							type: 'system',
+							subtype: 'init',
+							session_id: sessionId,
+							permissionMode: 'default',
+							plugins: [],
+							tools: [ 'Read', 'mcp__studio__wp_cli' ],
+							cwd,
+							apiKeySource: 'none',
+							claude_code_version: '2.1.319',
+							model: 'sonnet',
+							mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
+						};
+						await onTurn( input.options );
+						yield {
+							type: 'result',
+							subtype: 'success',
+							is_error: false,
+							num_turns: 1,
+							session_id: sessionId,
+						};
 					}
-					yield {
-						type: 'system',
-						subtype: 'init',
-						session_id: sessionId,
-						permissionMode: 'default',
-						plugins: [],
-						tools: [ 'Read', 'mcp__studio__wp_cli' ],
-						cwd,
-						apiKeySource: 'none',
-						claude_code_version: '2.1.319',
-						model: 'sonnet',
-						mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
-					};
-					await onTurn( input.options );
-					yield {
-						type: 'result',
-						subtype: 'success',
-						is_error: false,
-						num_turns: 1,
-						session_id: sessionId,
-					};
-				}
-			},
-		} )
+				},
+			};
+		}
 	);
 }
 
@@ -1031,6 +1190,7 @@ it( 'runs a global conversation only in the dedicated global workspace (mock SDK
 		await fs.mkdir( elsewhere );
 		const host = createFakeHost();
 		host.sites.all = async () => [];
+		const native = await nativeExecutable( root );
 		const query = fakeNativeTurn( workspace );
 		const run = async ( conversationId: string, workingDirectory: string ) => {
 			const events: Array< { type: string; outcome?: unknown } > = [];
@@ -1060,11 +1220,11 @@ it( 'runs a global conversation only in the dedicated global workspace (mock SDK
 					approve: async () => 'deny',
 					verifyTarget: async () => true,
 					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+					prepareOwner: fakeProcessOwner().prepareOwner,
+					connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
 					prepare: async () => ( {
 						ok: true,
-						executablePath: 'fake',
-						executableIdentity: fakeIdentity,
+						...native,
 						cwd: workingDirectory,
 						configDirectory: root,
 						projectsDirectory: path.join( root, 'projects' ),
@@ -1115,6 +1275,7 @@ it( 'routes the SDK hook and native permission request through the execution pol
 			input: Record< string, unknown >,
 			options: Record< string, unknown >
 		) => Promise< { behavior: string } >;
+		const native = await nativeExecutable( config );
 		const query = fakeNativeTurn( site, {
 			onTurn: async ( options ) => {
 				const hooks = options.hooks as { PreToolUse: Array< { hooks: Hook[] } > };
@@ -1175,11 +1336,11 @@ it( 'routes the SDK hook and native permission request through the execution pol
 				approve: async () => 'deny',
 				verifyTarget: async () => targetUnchanged,
 				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-				connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+				prepareOwner: fakeProcessOwner().prepareOwner,
+				connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
 				prepare: async () => ( {
 					ok: true,
-					executablePath: 'fake',
-					executableIdentity: fakeIdentity,
+					...native,
 					cwd: site,
 					configDirectory: config,
 					projectsDirectory: path.join( config, 'projects' ),
@@ -1248,8 +1409,11 @@ function nativeAccount( email: string ) {
 	return { email, subscriptionType: 'max', apiProvider: 'firstParty' };
 }
 
-// A selected launcher that links to the binary a turn was prepared with, on a simulated disk.
-async function preparedBinary() {
+// A selected launcher that links to the binary a turn was prepared with, on a
+// simulated disk, and a native executable on the real disk for the spawn
+// check. The runtime reads the account with the executable it prepared;
+// `simulated` checks that it did and points the read at the simulated binary.
+async function preparedBinary( directory: string ) {
 	const { memoryFileSystem, sha256 } = await import( './fixtures/native-binaries' );
 	const path = await import( 'path' );
 	const disk = memoryFileSystem( path.posix );
@@ -1259,18 +1423,30 @@ async function preparedBinary() {
 	disk.write( inspected, bytes );
 	disk.link( selected, inspected );
 	const found = await disk.files.stat( inspected );
+	const executableIdentity = {
+		path: inspected,
+		size: found.size,
+		device: found.device,
+		inode: found.inode,
+		modified: found.modified,
+		changed: found.changed,
+		sha256: sha256( bytes ),
+	};
+	const native = await nativeExecutable( directory );
 	return {
 		disk,
 		selected,
 		inspected,
-		executableIdentity: {
-			path: inspected,
-			size: found.size,
-			device: found.device,
-			inode: found.inode,
-			modified: found.modified,
-			changed: found.changed,
-			sha256: sha256( bytes ),
+		native,
+		simulated: (
+			request: import('../connection').ClaudeAccountStatusRequest
+		): import('../connection').ClaudeAccountStatusRequest => {
+			if (
+				request.executablePath !== native.executablePath ||
+				request.executableIdentity !== native.executableIdentity
+			)
+				throw new Error( 'The account was read with another executable than the prepared one' );
+			return { ...request, executablePath: inspected, executableIdentity };
 		},
 	};
 }
@@ -1283,6 +1459,7 @@ it( 'registers a PreToolUse hook that outlasts any approval and denies a cancell
 	try {
 		const decisions: unknown[] = [];
 		let timeout: unknown;
+		const native = await nativeExecutable( fixture.config );
 		const query = fakeNativeTurn( fixture.root, {
 			onTurn: async ( options ) => {
 				const matcher = (
@@ -1324,11 +1501,11 @@ it( 'registers a PreToolUse hook that outlasts any approval and denies a cancell
 				approve: async () => 'deny',
 				verifyTarget: async () => true,
 				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-				connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+				prepareOwner: fakeProcessOwner().prepareOwner,
+				connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
 				prepare: async () => ( {
 					ok: true,
-					executablePath: 'fake',
-					executableIdentity: fakeIdentity,
+					...native,
 					cwd: fixture.root,
 					configDirectory: fixture.config,
 					projectsDirectory: fixture.projects,
@@ -1404,7 +1581,7 @@ it( 'stops the turn within the recheck bound when the stored sign-in changes or 
 			[ status( 'someone-else@example.com' ), 'account_changed' ],
 			[ 'unreadable output', 'account_unverified' ],
 		] ) {
-			const { disk, selected, inspected, executableIdentity } = await preparedBinary();
+			const { disk, selected, native, simulated } = await preparedBinary( fixture.config );
 			let stored = status( 'user@example.com' );
 			const now = { value: 1_000 };
 			const preflight = 400;
@@ -1471,18 +1648,18 @@ it( 'stops the turn within the recheck bound when the stored sign-in changes or 
 					verifyTarget: async () => true,
 					clock: () => now.value,
 					account: ( request ) =>
-						readClaudeAccountStatus( request, {
+						readClaudeAccountStatus( simulated( request ), {
 							run: async () => ( { stdout: stored } ),
 							files: disk.files,
 						} ),
 					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					prepareOwner: fakeProcessOwner().prepareOwner,
 					connection: async () => ( { id: 'native', executablePath: selected } ),
 					prepare: async () => {
 						now.value += preflight;
 						return {
 							ok: true,
-							executablePath: inspected,
-							executableIdentity,
+							...native,
 							cwd: fixture.root,
 							configDirectory: fixture.config,
 							projectsDirectory: fixture.projects,
@@ -1515,7 +1692,9 @@ it( 'runs no account re-check against a binary the selected path was re-pointed 
 	const fixture = await runtimeFixture( 'claude-repointed-' );
 	try {
 		for ( const change of [ 're-pointed', 'replaced' ] as const ) {
-			const { disk, selected, inspected, executableIdentity } = await preparedBinary();
+			const { disk, selected, inspected, native, simulated } = await preparedBinary(
+				fixture.config
+			);
 			const other = '/home/tester/.local/share/claude/versions/2.1.320';
 			disk.write( other, Buffer.from( 'another binary' ) );
 			const runner = recordingRunner( () =>
@@ -1592,13 +1771,13 @@ it( 'runs no account re-check against a binary the selected path was re-pointed 
 					verifyTarget: async () => true,
 					clock: () => now.value,
 					account: ( request ) =>
-						readClaudeAccountStatus( request, { run: runner.run, files: disk.files } ),
+						readClaudeAccountStatus( simulated( request ), { run: runner.run, files: disk.files } ),
 					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					prepareOwner: fakeProcessOwner().prepareOwner,
 					connection: async () => ( { id: 'native', executablePath: selected } ),
 					prepare: async () => ( {
 						ok: true,
-						executablePath: inspected,
-						executableIdentity,
+						...native,
 						cwd: fixture.root,
 						configDirectory: fixture.config,
 						projectsDirectory: fixture.projects,
@@ -1631,6 +1810,7 @@ it( 'keeps a conversation on the Claude account it started with, adopting it for
 	try {
 		const run = async ( conversationId: string, email: string ) => {
 			const events: Array< { type: string; outcome?: { status: string; code?: string } } > = [];
+			const native = await nativeExecutable( fixture.config );
 			const query = fakeNativeTurn( fixture.root, {
 				account: () => nativeAccount( email ),
 				projects: fixture.projects,
@@ -1656,11 +1836,11 @@ it( 'keeps a conversation on the Claude account it started with, adopting it for
 					approve: async () => 'deny',
 					verifyTarget: async () => true,
 					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
-					connection: async () => ( { id: 'native', executablePath: 'fake' } ),
+					prepareOwner: fakeProcessOwner().prepareOwner,
+					connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
 					prepare: async () => ( {
 						ok: true,
-						executablePath: 'fake',
-						executableIdentity: fakeIdentity,
+						...native,
 						cwd: fixture.root,
 						configDirectory: fixture.config,
 						projectsDirectory: fixture.projects,
@@ -1720,72 +1900,21 @@ async function ownedNativeFixture(
 		prepared?: boolean;
 		ready?: boolean;
 		clean?: boolean;
-		failure?: import('@studio/common/lib/owned-process').OwnershipFailure;
+		failure?: OwnershipFailure;
 	} = {}
 ) {
-	const { EventEmitter } = await import( 'events' );
-	const { PassThrough } = await import( 'stream' );
 	const fixture = await runtimeFixture( prefix );
-	const executable = path.join( fixture.config, 'claude.exe' );
-	await writeFile( executable, 'native fixture' );
-	const found = await stat( executable, { bigint: true } );
-	const order: string[] = [];
-	const spawnOwned = vi.fn( () => {
-		const child = Object.assign( new EventEmitter(), {
-			pid: 4321,
-			exitCode: null,
-			signalCode: null,
-			stdin: new PassThrough(),
-			stdout: new PassThrough(),
-			stderr: new PassThrough(),
-		} );
-		return {
-			child,
-			ready: async () => {
-				order.push( 'owned-ready' );
-				return owned.ready ?? true;
-			},
-			failure: () => owned.failure,
-			identity: () => ( { pid: 4321, start: '1' } ),
-			inspect: async () => ( { live: [], uncertain: false } ),
-			requestShutdown: async () => {},
-			waitForExit: async () => true,
-			terminate: async () => owned.clean ?? true,
-			shutdown: async () => {
-				order.push( 'owned-shutdown' );
-				return owned.clean ?? true;
-			},
-		};
-	} );
+	const native = await nativeExecutable( fixture.config );
+	const owner = fakeProcessOwner( owned );
 	return {
 		...fixture,
-		order,
-		spawnOwned,
-		prepareOwner: () =>
-			( {
-				prepared: async () => {
-					order.push( 'owner-prepared' );
-					return owned.prepared ?? true;
-				},
-				failure: () => owned.failure,
-				spawn: spawnOwned,
-				dispose: async () => {
-					order.push( 'owner-disposed' );
-				},
-			} ) as unknown as import('@studio/common/lib/owned-process').ProcessOwner,
-		connection: async () => ( { id: 'native', executablePath: executable } ),
+		order: owner.order,
+		spawnOwned: owner.spawnOwned,
+		prepareOwner: owner.prepareOwner,
+		connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
 		prepare: async () => ( {
 			ok: true as const,
-			executablePath: executable,
-			executableIdentity: {
-				path: executable,
-				size: Number( found.size ),
-				device: found.dev.toString(),
-				inode: found.ino.toString(),
-				modified: found.mtimeNs.toString(),
-				changed: found.ctimeNs.toString(),
-				sha256: createHash( 'sha256' ).update( 'native fixture' ).digest( 'hex' ),
-			},
+			...native,
 			cwd: fixture.root,
 			configDirectory: fixture.config,
 			projectsDirectory: fixture.projects,
@@ -1799,21 +1928,17 @@ async function ownedNativeFixture(
 	};
 }
 
-// A mock SDK that launches its process the way the real one does, then runs `onTurn` after init.
+// A mock SDK that launches its process the way the real one does, unless
+// `launch` is false, then runs `onTurn` after init.
 function spawningNativeTurn(
 	cwd: string,
-	onTurn: ( options: Record< string, unknown > ) => Promise< 'result' | 'end' >
+	onTurn: ( options: Record< string, unknown > ) => Promise< 'result' | 'end' >,
+	{ launch = true }: { launch?: boolean } = {}
 ) {
 	return vi.fn(
 		( input: { prompt: AsyncIterable< unknown >; options: Record< string, unknown > } ) => {
 			const options = input.options;
-			( options.spawnClaudeCodeProcess as ( invocation: Record< string, unknown > ) => unknown )( {
-				command: options.pathToClaudeCodeExecutable,
-				args: [],
-				cwd: options.cwd,
-				env: options.env,
-				signal: new AbortController().signal,
-			} );
+			if ( launch ) launchNative( options );
 			return {
 				initializationResult: async () => ( {
 					hooks_applied: true,
@@ -1979,7 +2104,13 @@ it( 'reports no success and keeps the run lock when the owned tree cannot be con
 		);
 		expect( fixture.order ).toEqual( [ 'owner-prepared', 'owned-ready', 'owned-shutdown' ] );
 		expect( events.filter( ( event ) => event.type === 'turn.terminal' ) ).toEqual( [
-			expect.objectContaining( { outcome: expect.objectContaining( { status: 'error' } ) } ),
+			expect.objectContaining( {
+				outcome: expect.objectContaining( {
+					status: 'error',
+					code: 'process_unconfirmed',
+					message: expect.stringContaining( 'stays locked' ),
+				} ),
+			} ),
 		] );
 		await expect(
 			createNativeSessionStore( fixture.storeRoot ).lockTurn( 'chat' )
@@ -2037,15 +2168,68 @@ it( 'sends no prompt to a native process it could not put in the job, and says w
 	}
 } );
 
-it( 'starts no native process when the job cannot be prepared, and says why (mock SDK)', async () => {
+it.each( [
+	[ 'keeper-blocked', 'Full Language mode' ],
+	[ 'keeper-unavailable', 'could not start' ],
+	[ 'keeper-timeout', 'did not answer in time' ],
+] as const )(
+	'starts no native process when the job cannot be prepared (%s), and says why (mock SDK)',
+	async ( failure, reason ) => {
+		const { runClaudeTurn } = await import( '../runtime' );
+		const { createNativeSessionStore } = await import( '../sessions' );
+		const fixture = await ownedNativeFixture( 'claude-unprepared-', { prepared: false, failure } );
+		try {
+			const query = spawningNativeTurn( fixture.root, async () => 'result' );
+			const events: Array< { type: string; outcome?: { status: string } } > = [];
+			await runClaudeTurn(
+				turnSnapshot( fixture.root, fixture.config, 'turn' ),
+				fixture.host,
+				{
+					prompt: 'hello',
+					signal: new AbortController().signal,
+					onEvent: ( event ) => events.push( event ),
+				},
+				{
+					storeRoot: fixture.storeRoot,
+					approve: async () => 'deny',
+					verifyTarget: async () => true,
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					prepareOwner: fixture.prepareOwner,
+					connection: fixture.connection,
+					prepare: fixture.prepare,
+					account: fixture.account,
+				}
+			);
+			expect( query ).not.toHaveBeenCalled();
+			expect( fixture.spawnOwned ).not.toHaveBeenCalled();
+			expect( fixture.order ).toEqual( [ 'owner-prepared', 'owner-disposed' ] );
+			expect( events ).toEqual( [
+				expect.objectContaining( {
+					type: 'turn.terminal',
+					outcome: expect.objectContaining( {
+						status: 'error',
+						code: 'process_unowned',
+						message: expect.stringContaining( reason ),
+					} ),
+				} ),
+			] );
+			if ( failure !== 'keeper-blocked' )
+				expect( JSON.stringify( events ) ).not.toContain( 'Language' );
+			await (
+				await createNativeSessionStore( fixture.storeRoot ).lockTurn( 'chat' )
+			)();
+		} finally {
+			await fixture.cleanup();
+		}
+	}
+);
+
+it( 'sends no prompt, and keeps the run lock, when the SDK starts without Studio’s spawn hook (mock SDK)', async () => {
 	const { runClaudeTurn } = await import( '../runtime' );
 	const { createNativeSessionStore } = await import( '../sessions' );
-	const fixture = await ownedNativeFixture( 'claude-unprepared-', {
-		prepared: false,
-		failure: 'keeper-unavailable',
-	} );
+	const fixture = await ownedNativeFixture( 'claude-unhooked-' );
 	try {
-		const query = spawningNativeTurn( fixture.root, async () => 'result' );
+		const onTurn = vi.fn( async () => 'result' as const );
 		const events: Array< { type: string; outcome?: { status: string } } > = [];
 		await runClaudeTurn(
 			turnSnapshot( fixture.root, fixture.config, 'turn' ),
@@ -2059,14 +2243,16 @@ it( 'starts no native process when the job cannot be prepared, and says why (moc
 				storeRoot: fixture.storeRoot,
 				approve: async () => 'deny',
 				verifyTarget: async () => true,
-				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				query: spawningNativeTurn( fixture.root, onTurn, {
+					launch: false,
+				} ) as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
 				prepareOwner: fixture.prepareOwner,
 				connection: fixture.connection,
 				prepare: fixture.prepare,
 				account: fixture.account,
 			}
 		);
-		expect( query ).not.toHaveBeenCalled();
+		expect( onTurn ).not.toHaveBeenCalled();
 		expect( fixture.spawnOwned ).not.toHaveBeenCalled();
 		expect( fixture.order ).toEqual( [ 'owner-prepared', 'owner-disposed' ] );
 		expect( events ).toEqual( [
@@ -2074,9 +2260,73 @@ it( 'starts no native process when the job cannot be prepared, and says why (moc
 				type: 'turn.terminal',
 				outcome: expect.objectContaining( {
 					status: 'error',
-					code: 'process_unowned',
-					message: expect.stringContaining( 'Full Language mode' ),
+					code: 'process_unconfirmed',
+					message: expect.stringContaining( 'stays locked' ),
 				} ),
+			} ),
+		] );
+		await expect(
+			createNativeSessionStore( fixture.storeRoot ).lockTurn( 'chat' )
+		).rejects.toThrow();
+	} finally {
+		await fixture.cleanup();
+	}
+} );
+
+it( 'starts no native process, and leaves no keeper, when the turn is cancelled while the job is being prepared (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createNativeSessionStore } = await import( '../sessions' );
+	const fixture = await ownedNativeFixture( 'claude-cancel-prepare-' );
+	try {
+		const turn = new AbortController();
+		let finishPreparing!: ( prepared: boolean ) => void;
+		const preparing = new Promise< boolean >( ( resolve ) => {
+			finishPreparing = resolve;
+		} );
+		const owner = {
+			prepared: () => {
+				fixture.order.push( 'owner-prepared' );
+				// The user stops the turn while the keeper is still creating the job.
+				queueMicrotask( () => turn.abort() );
+				return preparing;
+			},
+			failure: () => undefined,
+			spawn: fixture.spawnOwned,
+			dispose: async () => {
+				fixture.order.push( 'owner-disposed' );
+			},
+		} as unknown as import('@studio/common/lib/owned-process').ProcessOwner;
+		const query = spawningNativeTurn( fixture.root, async () => 'result' );
+		const events: Array< { type: string; outcome?: { status: string } } > = [];
+		const run = runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'turn' ),
+			fixture.host,
+			{ prompt: 'hello', signal: turn.signal, onEvent: ( event ) => events.push( event ) },
+			{
+				storeRoot: fixture.storeRoot,
+				approve: async () => 'deny',
+				verifyTarget: async () => true,
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				prepareOwner: () => owner,
+				connection: fixture.connection,
+				prepare: fixture.prepare,
+				account: fixture.account,
+			}
+		);
+		const settled = await Promise.race( [
+			run.then( () => 'ended' ),
+			new Promise( ( resolve ) => setTimeout( () => resolve( 'still waiting' ), 2_000 ) ),
+		] );
+		finishPreparing( true );
+		await run;
+		expect( settled ).toBe( 'ended' );
+		expect( query ).not.toHaveBeenCalled();
+		expect( fixture.spawnOwned ).not.toHaveBeenCalled();
+		expect( fixture.order ).toEqual( [ 'owner-prepared', 'owner-disposed' ] );
+		expect( events ).toEqual( [
+			expect.objectContaining( {
+				type: 'turn.terminal',
+				outcome: expect.objectContaining( { status: 'interrupted' } ),
 			} ),
 		] );
 		await (
@@ -2085,4 +2335,140 @@ it( 'starts no native process when the job cannot be prepared, and says why (moc
 	} finally {
 		await fixture.cleanup();
 	}
+} );
+
+// The real ownership logic, with the OS answered through seams: each case is
+// a native process that exits, or cannot be owned, before Studio owns it.
+describe( 'a native process Studio could not own (mock SDK, owned-process with injected OS seams)', () => {
+	function windowsOwner( own: ( child: FakeChild ) => string[] ) {
+		const child = fakeChild( 4242 );
+		child.kill = ( signal: NodeJS.Signals = 'SIGTERM' ) => {
+			child.killed.push( signal );
+			setImmediate( () => exitChild( child, 1 ) );
+			return true;
+		};
+		const { spawn: spawnSeam } = fakeSpawn(
+			child,
+			keeperAnswering( { 'own 4242': () => own( child ), 'end-tree': [ 'ended 0' ] } )
+		);
+		return () => prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } );
+	}
+
+	function posixOwner( groupEmpty: boolean ) {
+		const child = fakeChild( 500 );
+		const { spawn: spawnSeam } = fakeSpawn( child );
+		let clock = 0;
+		return () =>
+			prepareProcessOwner( {
+				...linuxSeams( {}, ( _pid, signal ) => {
+					if ( signal !== 0 ) throw new Error( 'An unverified group must never be signalled' );
+					if ( groupEmpty ) throw errno( 'ESRCH' );
+				} ),
+				// The leader exits, and is reaped, while its identity is read.
+				readFile: async ( file: string ) => {
+					if ( child.exitCode === null ) exitChild( child );
+					throw enoent( file );
+				},
+				now: () => clock,
+				delay: async () => {
+					clock += 100;
+					await new Promise( ( resolve ) => setImmediate( resolve ) );
+				},
+				spawn: spawnSeam,
+			} );
+	}
+
+	it.each( [
+		[
+			'Windows: the child was reaped before its assignment was read',
+			() =>
+				windowsOwner( ( child ) => {
+					exitChild( child );
+					return [ `assigned ${ WINDOWS_START }` ];
+				} ),
+			false,
+		],
+		[
+			'Windows: the child was gone before the keeper could open it',
+			() =>
+				windowsOwner( ( child ) => {
+					exitChild( child );
+					return [ 'failed open 87' ];
+				} ),
+			false,
+		],
+		[
+			'Windows: the assignment was denied, so a grandchild whose parent exited could not be seen',
+			() => windowsOwner( () => [ `failed assign 5 ${ WINDOWS_START }` ] ),
+			false,
+		],
+		[
+			'POSIX: the leader was reaped before its identity was read, and its group is empty',
+			() => posixOwner( true ),
+			true,
+		],
+		[
+			'POSIX: the leader was reaped before its identity was read, and its group remains',
+			() => posixOwner( false ),
+			false,
+		],
+	] )(
+		'%s: releases the run lock only on proof that nothing remains, and otherwise says it stays locked',
+		async ( _name, owner, released ) => {
+			const { runClaudeTurn } = await import( '../runtime' );
+			const { createNativeSessionStore } = await import( '../sessions' );
+			const fixture = await ownedNativeFixture( 'claude-fast-exit-' );
+			try {
+				const onTurn = vi.fn( async () => 'result' as const );
+				const events: Array< { type: string; outcome?: { status: string } } > = [];
+				await runClaudeTurn(
+					turnSnapshot( fixture.root, fixture.config, 'turn' ),
+					fixture.host,
+					{
+						prompt: 'hello',
+						signal: new AbortController().signal,
+						onEvent: ( event ) => events.push( event ),
+					},
+					{
+						storeRoot: fixture.storeRoot,
+						approve: async () => 'deny',
+						verifyTarget: async () => true,
+						query: spawningNativeTurn(
+							fixture.root,
+							onTurn
+						) as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+						prepareOwner: owner(),
+						connection: fixture.connection,
+						prepare: fixture.prepare,
+						account: fixture.account,
+					}
+				);
+				expect( onTurn ).not.toHaveBeenCalled();
+				const store = createNativeSessionStore( fixture.storeRoot );
+				if ( released ) {
+					expect( events ).toEqual( [
+						expect.objectContaining( {
+							outcome: expect.objectContaining( { status: 'error', code: 'process_unowned' } ),
+						} ),
+					] );
+					await (
+						await store.lockTurn( 'chat' )
+					)();
+				} else {
+					expect( events ).toEqual( [
+						expect.objectContaining( {
+							outcome: expect.objectContaining( {
+								status: 'error',
+								code: 'process_unconfirmed',
+								message: expect.stringContaining( 'stays locked' ),
+							} ),
+						} ),
+					] );
+					await expect( store.lockTurn( 'chat' ) ).rejects.toThrow();
+				}
+			} finally {
+				await fixture.cleanup();
+			}
+		}
+	);
 } );

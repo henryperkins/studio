@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
 import { prepareProcessOwner } from '@studio/common/lib/owned-process';
+import { __ } from '@wordpress/i18n';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
 import {
 	isClaudeEffort,
@@ -225,11 +226,18 @@ async function findSavedConnection( id: string ) {
 	return ( await getClaudeConnections() ).find( ( item ) => item.id === id );
 }
 
+interface NativeLaunch {
+	owner: ProcessOwner;
+	supervise: boolean;
+	/** Called on every spawn request, before any check. */
+	onRequested: () => void;
+	onOwned: ( owned: OwnedProcess ) => void;
+}
+
 function nativeLaunchOptions(
 	prepared: Extract< Prepared, { ok: true } >,
 	controller: AbortController,
-	launch: { owner: ProcessOwner; supervise: boolean },
-	onOwned: ( owned: OwnedProcess ) => void
+	launch: NativeLaunch
 ): Options {
 	const env = { ...prepared.env, CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1' };
 	return {
@@ -238,6 +246,7 @@ function nativeLaunchOptions(
 		cwd: prepared.cwd,
 		env,
 		spawnClaudeCodeProcess: ( invocation ) => {
+			launch.onRequested();
 			if (
 				! isQualifiedClaudeSpawn( invocation, {
 					command: prepared.executablePath,
@@ -252,7 +261,7 @@ function nativeLaunchOptions(
 				env: invocation.env,
 				supervise: launch.supervise,
 			} );
-			onOwned( owned );
+			launch.onOwned( owned );
 			// The SDK aborts this once it stops waiting for the process to exit;
 			// escalation stays with the owned shutdown, within the owned tree.
 			invocation.signal?.addEventListener( 'abort', () => void owned.requestShutdown(), {
@@ -313,14 +322,47 @@ async function qualifyWithinDeadline(
 	}
 }
 
+// Settles with `work`, or with undefined as soon as `signal` aborts.
+function untilAborted< T >( work: Promise< T >, signal: AbortSignal ): Promise< T | undefined > {
+	if ( signal.aborted ) return Promise.resolve( undefined );
+	return new Promise( ( resolve, reject ) => {
+		const stop = () => resolve( undefined );
+		signal.addEventListener( 'abort', stop, { once: true } );
+		work.then(
+			( value ) => {
+				signal.removeEventListener( 'abort', stop );
+				resolve( value );
+			},
+			( error ) => {
+				signal.removeEventListener( 'abort', stop );
+				reject( error );
+			}
+		);
+	} );
+}
+
 function unownedMessage( failure: OwnershipFailure | undefined ): string {
-	const reason =
-		failure === 'keeper-unavailable'
-			? ' Windows PowerShell could not run its process keeper, which needs Full Language mode.'
-			: failure?.startsWith( 'job-' )
-			? ' Windows did not let Studio put Claude Code in a job object it controls.'
-			: '';
-	return `Studio could not take ownership of the Claude Code process, so nothing was sent.${ reason }`;
+	const message = __(
+		'Studio could not take ownership of the Claude Code process, so nothing was sent.'
+	);
+	let reason: string | undefined;
+	if ( failure === 'keeper-blocked' )
+		reason = __(
+			'Windows PowerShell does not run in Full Language mode here, which Studio’s process keeper needs.'
+		);
+	else if ( failure === 'keeper-unavailable' )
+		reason = __( 'Windows PowerShell could not start Studio’s process keeper.' );
+	else if ( failure === 'keeper-timeout' )
+		reason = __( 'Studio’s process keeper did not answer in time.' );
+	else if ( failure?.startsWith( 'job-' ) )
+		reason = __( 'Windows did not let Studio put Claude Code in a job object it controls.' );
+	return reason ? `${ message } ${ reason }` : message;
+}
+
+function unconfirmedMessage(): string {
+	return __(
+		'Studio could not confirm that every process of this Claude Code turn has ended, so this chat stays locked until it is recovered.'
+	);
 }
 
 export async function discoverClaudeModels(
@@ -367,8 +409,13 @@ export async function discoverClaudeModels(
 				// Discovery sends no prompt, so nothing it starts can run a tool; it
 				// also runs in the Desktop's main process, which is not a Node binary
 				// a POSIX supervisor could run on.
-				...nativeLaunchOptions( prepared, controller, { owner, supervise: false }, ( started ) => {
-					owned = started;
+				...nativeLaunchOptions( prepared, controller, {
+					owner,
+					supervise: false,
+					onRequested: () => {},
+					onOwned: ( started ) => {
+						owned = started;
+					},
 				} ),
 				persistSession: false,
 				mcpServers: { studio: server },
@@ -383,7 +430,14 @@ export async function discoverClaudeModels(
 			},
 		} );
 		const qualification = await qualifyWithinDeadline( sdk, prepared.identity, controller.signal );
-		if ( qualification.ok && ( await findConnection( connectionId ) ) ) {
+		// Models are reported only from a native process Studio owns, as a turn
+		// sends its prompt only to one.
+		if (
+			qualification.ok &&
+			owned &&
+			( await owned.ready() ) &&
+			( await findConnection( connectionId ) )
+		) {
 			result = {
 				ok: true,
 				models: qualification.models,
@@ -450,6 +504,17 @@ export async function runClaudeTurn(
 			message: unownedMessage( failure ),
 		},
 	} );
+	// The run lock stays: the turn says so, after whatever it said already.
+	const unconfirmed = ( previous: TerminalEvent ): TerminalEvent => ( {
+		type: 'turn.terminal',
+		runId,
+		turnId,
+		outcome: {
+			status: previous.outcome.status === 'interrupted' ? 'interrupted' : 'error',
+			code: 'process_unconfirmed',
+			message: [ previous.outcome.message, unconfirmedMessage() ].filter( Boolean ).join( ' ' ),
+		},
+	} );
 	const controller = new AbortController();
 	let policy: ReturnType< typeof createClaudeExecutionPolicy > | undefined;
 	// Stopping first makes the policy refuse every new operation and end every
@@ -464,6 +529,9 @@ export async function runClaudeTurn(
 	let native: ReturnType< typeof sdkQuery > | undefined;
 	let owner: ProcessOwner | undefined;
 	let owned: OwnedProcess | undefined;
+	// Whether the SDK asked Studio's spawn hook for its process; one that never
+	// did may have started a process Studio knows nothing of.
+	let spawnRequested = false;
 	let bridge: ReturnType< typeof createStudioClaudeToolBridge > | undefined;
 	let openGate: ( allow: boolean ) => void = () => {};
 	const gate = new Promise< boolean >( ( resolve ) => {
@@ -737,7 +805,11 @@ export async function runClaudeTurn(
 		};
 		const effort = snapshot.effort;
 		if ( ! isClaudeEffort( effort ) ) throw new Error();
-		if ( ! ( await owner.prepared() ) ) {
+		// The keeper may take a while to create the job; a cancel ends the wait,
+		// and nothing is started after it.
+		const jobPrepared = await untilAborted( owner.prepared(), controller.signal );
+		if ( controller.signal.aborted ) throw new Error();
+		if ( ! jobPrepared ) {
 			terminal = unowned( owner.failure() );
 			return;
 		}
@@ -745,14 +817,16 @@ export async function runClaudeTurn(
 		native = ( options.query ?? sdkQuery )( {
 			prompt: nativeInput(),
 			options: {
-				...nativeLaunchOptions(
-					prepared,
-					controller,
-					{ owner: processOwner, supervise: true },
-					( started ) => {
+				...nativeLaunchOptions( prepared, controller, {
+					owner: processOwner,
+					supervise: true,
+					onRequested: () => {
+						spawnRequested = true;
+					},
+					onOwned: ( started ) => {
 						owned = started;
-					}
-				),
+					},
+				} ),
 				...( existing
 					? { resume: session.nativeSessionId }
 					: { sessionId: session.nativeSessionId } ),
@@ -812,9 +886,10 @@ export async function runClaudeTurn(
 		);
 		if ( ! qualification.ok || controller.signal.aborted || ! ( await stillConnected() ) )
 			throw new Error();
-		// No prompt reaches a native process whose tree Studio could not take ownership of.
-		if ( owned && ! ( await owned.ready() ) ) {
-			terminal = unowned( owned.failure() );
+		// No prompt reaches a native process whose tree Studio could not take
+		// ownership of, nor one the SDK started without Studio's spawn hook.
+		if ( ! owned || ! ( await owned.ready() ) ) {
+			terminal = unowned( owned?.failure() );
 			return;
 		}
 		if ( ! accountKey ) throw new Error();
@@ -889,10 +964,16 @@ export async function runClaudeTurn(
 		} catch {
 			failIfSuccessful();
 		}
+		// The run lock is released only on proof that nothing of the run remains.
 		let stopped = true;
 		try {
 			if ( owned ) stopped = await owned.shutdown();
-			else await owner?.dispose();
+			else {
+				await owner?.dispose();
+				// The SDK was started but never asked the spawn hook for its
+				// process, so whatever it started is not Studio's to prove gone.
+				if ( native && ! spawnRequested ) stopped = false;
+			}
 		} catch {
 			stopped = false;
 		}
@@ -920,7 +1001,7 @@ export async function runClaudeTurn(
 					'Studio could not verify the Claude account, so this turn stopped. Check the Claude Code sign-in and send again.';
 			} else terminal.outcome.message = 'Claude Code was detached during this turn.';
 		}
-		if ( ! stopped ) failIfSuccessful();
+		if ( ! stopped ) terminal = unconfirmed( terminal );
 		try {
 			await journalWork;
 			if ( journalFailed ) failIfSuccessful();
