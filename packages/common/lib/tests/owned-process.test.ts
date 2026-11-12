@@ -12,6 +12,8 @@ import { PassThrough } from 'node:stream';
 import { promisify } from 'node:util';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
+	checkOwnedTreeEnded,
+	checkProcessGroup,
 	checkProcessIdentity,
 	prepareProcessOwner,
 	readProcessIdentity,
@@ -28,6 +30,7 @@ import {
 	exitChild,
 	fakeChild,
 	fakeSpawn,
+	KEEPER_START,
 	keeperAnswering,
 	LEADER_STAT,
 	linuxSeams,
@@ -1104,6 +1107,246 @@ function startLeaf( marker: string, lifetime = LIFETIME ) {
 	return { leaf, ready: firstLine( leaf.stdout ) };
 }
 
+// A Windows `run` seam that answers the identity probe from `processes`
+// (missing: gone) and the child listing from `children`, keyed by PID.
+function windowsRun(
+	processes: Record< number, string >,
+	children: Record< number, readonly string[] | 'fail' | 'cut' > = {}
+) {
+	const scripts: string[] = [];
+	const run: OwnedProcessSeams[ 'run' ] = async ( _file, args ) => {
+		const script = Buffer.from( args[ 3 ], 'base64' ).toString( 'utf16le' );
+		scripts.push( script );
+		const parent = /\$parentId = \[long\](\d+)/.exec( script );
+		if ( parent ) {
+			const listed = children[ Number( parent[ 1 ] ) ] ?? [];
+			if ( listed === 'fail' ) return { code: 1, stdout: '' };
+			if ( listed === 'cut' ) return { code: 0, stdout: 'child 77 134389060548248000\r\n' };
+			return {
+				code: 0,
+				stdout: [ ...listed, 'listed' ].map( ( line ) => line + '\r\n' ).join( '' ),
+			};
+		}
+		const pid = Number( /\$rootId = \[long\](\d+)/.exec( script )![ 1 ] );
+		const start = processes[ pid ];
+		if ( start === undefined ) return { code: 0, stdout: 'gone\r\n' };
+		if ( start === 'unknown' ) return { code: 0, stdout: 'unknown\r\n' };
+		return { code: 0, stdout: `start ${ start }\r\n` };
+	};
+	return { run, scripts };
+}
+
+describe( 'what a recovery can prove of a tree once its owner is gone (injected seams)', () => {
+	const native = { pid: 4242, start: WINDOWS_START };
+	const keeper = { pid: 9000, start: KEEPER_START };
+
+	it( 'reads the job keeper as the guardian of a confirmed tree, and none before', async () => {
+		const child = fakeChild( 4242 );
+		const { spawn: spawnSeam, helpers } = fakeSpawn( child, keeperAnswering() );
+		const owner = prepareProcessOwner( { ...windowsSeams, spawn: spawnSeam } );
+		const owned = owner.spawn( 'C:\\claude.exe', [], { env: {} } );
+		expect( await owned.ready() ).toBe( true );
+		expect( await owned.guardian() ).toEqual( keeper );
+		expect( helpers[ 0 ].lines ).toEqual( [ 'own 4242', 'confirm', 'self' ] );
+
+		const unconfirmed = fakeSpawn(
+			fakeChild( 4242 ),
+			keeperAnswering( { 'own 4242': [ 'failed assign 5 1' ], 'end-tree': [ 'ended 0' ] } )
+		);
+		const refused = prepareProcessOwner( { ...windowsSeams, spawn: unconfirmed.spawn } ).spawn(
+			'C:\\claude.exe',
+			[],
+			{ env: {} }
+		);
+		expect( await refused.ready() ).toBe( false );
+		expect( await refused.guardian() ).toBeUndefined();
+		expect( unconfirmed.helpers[ 0 ].lines ).not.toContain( 'self' );
+
+		const unreadable = fakeSpawn( fakeChild( 4242 ), keeperAnswering( { self: [ 'self -1' ] } ) );
+		const blind = prepareProcessOwner( { ...windowsSeams, spawn: unreadable.spawn } ).spawn(
+			'C:\\claude.exe',
+			[],
+			{ env: {} }
+		);
+		expect( await blind.ready() ).toBe( true );
+		expect( await blind.guardian() ).toBeUndefined();
+	} );
+
+	it( 'reads the POSIX supervisor as the guardian of a supervised group, and none without one', async () => {
+		const files: Record< string, string > = {
+			'/proc/500/stat': LEADER_STAT,
+			'/proc/9000/stat': LEADER_STAT.replace( ' 777 ', ' 778 ' ),
+		};
+		const supervised = fakeSpawn( fakeChild( 500 ), () => [ 'ready' ] );
+		const owned = prepareProcessOwner( {
+			...linuxSeams( files, () => {} ),
+			spawn: supervised.spawn,
+		} ).spawn( '/opt/claude', [], { env: {}, supervise: true } );
+		expect( await owned.ready() ).toBe( true );
+		expect( await owned.guardian() ).toEqual( { pid: 9000, start: `linux:${ BOOT }:778` } );
+
+		const plain = fakeSpawn( fakeChild( 500 ) );
+		const alone = prepareProcessOwner( {
+			...linuxSeams( files, () => {} ),
+			spawn: plain.spawn,
+		} ).spawn( '/opt/claude', [], { env: {} } );
+		expect( await alone.ready() ).toBe( true );
+		expect( await alone.guardian() ).toBeUndefined();
+	} );
+
+	describe( 'a POSIX process group', () => {
+		const leader = { pid: 500, start: `linux:${ BOOT }:777` };
+
+		it.each( [
+			[ 'empty when no process is in it', errno( 'ESRCH' ), LEADER_STAT, 'empty' ],
+			[ 'its leader’s while the leader is that same process', undefined, LEADER_STAT, 'alive' ],
+			[
+				'its leader’s when the leader is that same process another user runs',
+				errno( 'EPERM' ),
+				LEADER_STAT,
+				'alive',
+			],
+			[ 'undecided when it has members and its leader is gone', undefined, undefined, 'unknown' ],
+			[
+				'undecided when it has members and another process has its leader’s ID',
+				undefined,
+				LEADER_STAT.replace( ' 777 ', ' 901 ' ),
+				'unknown',
+			],
+			[
+				'undecided when its leader cannot be read',
+				undefined,
+				errno( 'EACCES' ) as unknown as string,
+				'unknown',
+			],
+			[ 'undecided when the kernel says neither', errno( 'EINVAL' ), LEADER_STAT, 'unknown' ],
+		] as const )( 'is %s', async ( _name, failure, stat, expected ) => {
+			const signals: Array< [ number, NodeJS.Signals | 0 ] > = [];
+			const files: Record< string, string | Error > = {};
+			if ( stat !== undefined ) files[ '/proc/500/stat' ] = stat;
+			expect(
+				await checkProcessGroup(
+					leader,
+					linuxSeams( files, ( pid, signal ) => {
+						signals.push( [ pid, signal ] );
+						if ( failure ) throw failure;
+					} )
+				)
+			).toBe( expected );
+			expect( signals ).toEqual( [ [ -500, 0 ] ] );
+		} );
+
+		it( 'is undecided on Windows, and for an identity that names no process', async () => {
+			const kill = vi.fn();
+			expect( await checkProcessGroup( leader, { ...windowsSeams, kill } ) ).toBe( 'unknown' );
+			expect( await checkProcessGroup( { pid: 0, start: 'x' }, linuxSeams( {}, kill ) ) ).toBe(
+				'unknown'
+			);
+			expect( await checkProcessGroup( { pid: 500, start: '' }, linuxSeams( {}, kill ) ) ).toBe(
+				'unknown'
+			);
+			expect( kill ).not.toHaveBeenCalled();
+		} );
+	} );
+
+	describe( 'a Windows tree, which the job held', () => {
+		it( 'is ended only when its native process and keeper are gone and nothing names the native process as its parent', async () => {
+			const { run, scripts } = windowsRun( {} );
+			expect(
+				await checkOwnedTreeEnded( { native, guardian: keeper }, { ...windowsSeams, run } )
+			).toEqual( { state: 'ended' } );
+			const listing = scripts.find( ( script ) => script.includes( 'Get-CimInstance' ) );
+			expect( listing ).toContain( '$parentId = [long]4242' );
+			expect( listing ).toContain( '-Filter "ParentProcessId = $parentId"' );
+		} );
+
+		it.each( [
+			[ 'its native process is running', { 4242: WINDOWS_START }, {}, 'alive', 'native' ],
+			[ 'its native process cannot be read', { 4242: 'unknown' }, {}, 'unknown', 'native' ],
+			[ 'its keeper is running', { 9000: KEEPER_START }, {}, 'alive', 'guardian' ],
+			[ 'its keeper cannot be read', { 9000: 'unknown' }, {}, 'unknown', 'guardian' ],
+			[
+				'a process created after the native process names it as its parent',
+				{},
+				{ 4242: [ 'child 77 134389060548248000' ] },
+				'alive',
+				'descendant',
+			],
+			[
+				'a process created in the same microsecond names it as its parent',
+				{},
+				{ 4242: [ 'child 77 134389060548247990' ] },
+				'alive',
+				'descendant',
+			],
+			[ 'the processes cannot be listed', {}, { 4242: 'fail' }, 'unknown', 'descendant' ],
+			[ 'the listing was cut short', {}, { 4242: 'cut' }, 'unknown', 'descendant' ],
+		] as const )( 'is not ended when %s', async ( _name, processes, children, state, which ) => {
+			const { run } = windowsRun( { ...processes }, { ...children } );
+			expect(
+				await checkOwnedTreeEnded( { native, guardian: keeper }, { ...windowsSeams, run } )
+			).toEqual( { state, process: which } );
+		} );
+
+		it( 'treats a process with the native process’s ID and another start as another process', async () => {
+			const { run } = windowsRun(
+				{ 4242: '134389070000000000', 9000: '134389070000000001' },
+				{ 4242: [ 'child 78 134389060548240000' ] }
+			);
+			expect(
+				await checkOwnedTreeEnded( { native, guardian: keeper }, { ...windowsSeams, run } )
+			).toEqual( { state: 'ended' } );
+		} );
+
+		it( 'is never ended without a keeper to show the job was closed', async () => {
+			const { run } = windowsRun( {} );
+			expect( await checkOwnedTreeEnded( { native }, { ...windowsSeams, run } ) ).toEqual( {
+				state: 'unknown',
+				process: 'guardian',
+			} );
+		} );
+	} );
+
+	describe( 'a POSIX tree, which its group held', () => {
+		const leader = { pid: 500, start: `linux:${ BOOT }:777` };
+		const supervisor = { pid: 9000, start: `linux:${ BOOT }:778` };
+
+		it( 'is ended once its group is empty and its supervisor is gone, signalling nothing', async () => {
+			const signals: Array< [ number, NodeJS.Signals | 0 ] > = [];
+			const seams = linuxSeams( {}, ( pid, signal ) => {
+				signals.push( [ pid, signal ] );
+				throw errno( 'ESRCH' );
+			} );
+			expect(
+				await checkOwnedTreeEnded( { native: leader, guardian: supervisor }, seams )
+			).toEqual( { state: 'ended' } );
+			expect( await checkOwnedTreeEnded( { native: leader }, seams ) ).toEqual( {
+				state: 'ended',
+			} );
+			expect( signals.every( ( [ pid, signal ] ) => pid === -500 && signal === 0 ) ).toBe( true );
+		} );
+
+		it.each( [
+			[ 'its leader is running', { '/proc/500/stat': LEADER_STAT }, 'ESRCH', 'alive', 'native' ],
+			[
+				'its supervisor is running',
+				{ '/proc/9000/stat': LEADER_STAT.replace( ' 777 ', ' 778 ' ) },
+				'ESRCH',
+				'alive',
+				'guardian',
+			],
+			[ 'its group still has members', {}, undefined, 'unknown', 'descendant' ],
+		] as const )( 'is not ended when %s', async ( _name, files, failure, state, which ) => {
+			const seams = linuxSeams( { ...files }, () => {
+				if ( failure ) throw errno( failure );
+			} );
+			expect(
+				await checkOwnedTreeEnded( { native: leader, guardian: supervisor }, seams )
+			).toEqual( { state, process: which } );
+		} );
+	} );
+} );
+
 describe( 'owned process trees (real processes)', () => {
 	const marker = `studio-p2-fixture-${ randomUUID() }`;
 	let sentinel: ReturnType< typeof startLeaf >[ 'leaf' ];
@@ -1317,6 +1560,105 @@ describe( 'owned process trees (real processes)', () => {
 				owned.child.kill( 'SIGKILL' );
 		}
 	}, 60_000 );
+
+	// Polls until the tree check gives `expected`, which a console host that
+	// outlives its last client by moments may delay.
+	async function treeCheckWithin(
+		processes: Parameters< typeof checkOwnedTreeEnded >[ 0 ],
+		ms: number
+	): Promise< Awaited< ReturnType< typeof checkOwnedTreeEnded > > > {
+		const deadline = Date.now() + ms;
+		let found = await checkOwnedTreeEnded( processes );
+		while ( found.state !== 'ended' && Date.now() < deadline ) {
+			await new Promise( ( resolve ) => setTimeout( resolve, 250 ) );
+			found = await checkOwnedTreeEnded( processes );
+		}
+		return found;
+	}
+
+	it.skipIf( process.platform !== 'win32' )(
+		`proves a tree ended only once its native process, its keeper and every process naming the native process as its parent are gone ${ WINDOWS_ONLY }`,
+		async () => {
+			const owned = await ownedTree( [ 'tree', marker, String( LIFETIME ), 'ignore-eof' ] );
+			try {
+				expect( await owned.ready() ).toBe( true );
+				const native = owned.identity()!;
+				const keeper = ( await owned.guardian() )!;
+				expect( keeper ).toBeDefined();
+				expect( keeper.pid ).not.toBe( native.pid );
+				expect( await checkProcessIdentity( keeper ) ).toBe( 'alive' );
+				const next = lines( owned.child.stdout );
+				await next();
+				expect( await checkOwnedTreeEnded( { native, guardian: keeper } ) ).toEqual( {
+					state: 'alive',
+					process: 'native',
+				} );
+				owned.child.stdin.write( 'spawn\n' );
+				const [ , latePid ] = ( await next() ).split( ' ' );
+				const late = ( await readProcessIdentity( Number( latePid ) ) )!;
+				expect( late ).toBeDefined();
+				// The test's own unreaped child. The late child is outside its Node
+				// job, and the keeper still holds ours, so it outlives the native process.
+				const exited = once( owned.child, 'exit' );
+				owned.child.kill( 'SIGKILL' );
+				await exited;
+				expect( await goneWithin( [ native ], 10_000 ) ).toEqual( [] );
+				expect( await checkProcessIdentity( late ) ).toBe( 'alive' );
+				expect( await checkOwnedTreeEnded( { native, guardian: keeper } ) ).toEqual( {
+					state: 'alive',
+					process: 'guardian',
+				} );
+				// A live process with the keeper's ID and another start is not the keeper.
+				const recycled = { pid: keeper.pid, start: `${ keeper.start }0` };
+				expect( await checkOwnedTreeEnded( { native, guardian: recycled } ) ).toEqual( {
+					state: 'alive',
+					process: 'descendant',
+				} );
+				expect( await owned.shutdown( { graceMs: 0 } ) ).toBe( true );
+				expect( await goneWithin( [ late, keeper ], 10_000 ) ).toEqual( [] );
+				expect( await treeCheckWithin( { native, guardian: keeper }, 10_000 ) ).toEqual( {
+					state: 'ended',
+				} );
+				expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
+			} finally {
+				if ( owned.child.exitCode === null && owned.child.signalCode === null )
+					owned.child.kill( 'SIGKILL' );
+			}
+		},
+		90_000
+	);
+
+	it.skipIf( process.platform === 'win32' )(
+		`counts a group as ended only when the kernel shows it empty ${ POSIX_ONLY }`,
+		async () => {
+			const owned = await ownedTree( [ 'tree', marker, String( LIFETIME ), 'ignore-eof' ] );
+			try {
+				expect( await owned.ready() ).toBe( true );
+				const native = owned.identity()!;
+				const [ , , , leafPid ] = ( await firstLine( owned.child.stdout ) ).split( ' ' );
+				const leaf = ( await readProcessIdentity( Number( leafPid ) ) )!;
+				expect( await checkProcessGroup( native ) ).toBe( 'alive' );
+				// The test's own unreaped child: its shell and leaf stay in its group.
+				const exited = once( owned.child, 'exit' );
+				owned.child.kill( 'SIGKILL' );
+				await exited;
+				expect( await checkProcessIdentity( leaf ) ).toBe( 'alive' );
+				expect( await checkProcessGroup( native ) ).toBe( 'unknown' );
+				expect( await checkOwnedTreeEnded( { native } ) ).toEqual( {
+					state: 'unknown',
+					process: 'descendant',
+				} );
+				expect( await owned.terminate() ).toBe( true );
+				expect( await checkProcessGroup( native ) ).toBe( 'empty' );
+				expect( await checkOwnedTreeEnded( { native } ) ).toEqual( { state: 'ended' } );
+				expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
+			} finally {
+				if ( owned.child.exitCode === null && owned.child.signalCode === null )
+					owned.child.kill( 'SIGKILL' );
+			}
+		},
+		60_000
+	);
 
 	it.skipIf( process.platform !== 'win32' )(
 		`ends the whole tree when its keeper dies, and counts that as ended ${ WINDOWS_ONLY }`,

@@ -49,7 +49,7 @@ export function exitChild( child: FakeChild, code = 0 ) {
 // line it reads; null makes it exit.
 export type KeeperScript = ( line: string | undefined ) => string[] | null;
 
-const PROTOCOL = /^(own |confirm$|end-tree$|active$|inspect$|reap |release$)/;
+const PROTOCOL = /^(own |confirm$|end-tree$|active$|inspect$|reap |self$|release$)/;
 
 /**
  * A spawn seam: the Windows keeper (PowerShell) and the POSIX supervisor
@@ -121,6 +121,8 @@ export function fakeSpawn(
 }
 
 export const WINDOWS_START = '134389060548247995';
+// The start the first keeper a fake spawn starts (PID 9000) reports for itself.
+export const KEEPER_START = '134389060541000000';
 
 // A keeper that answers like the real one, with `overrides` for some lines.
 export function keeperAnswering(
@@ -138,6 +140,7 @@ export function keeperAnswering(
 		if ( line.startsWith( 'reap ' ) ) return [ 'reaped clean' ];
 		if ( line === 'end-tree' ) return [ 'ended 1' ];
 		if ( line === 'active' ) return [ 'active 0' ];
+		if ( line === 'self' ) return [ `self ${ KEEPER_START }` ];
 		return [];
 	};
 }

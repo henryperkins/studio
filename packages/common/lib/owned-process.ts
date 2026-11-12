@@ -7,6 +7,7 @@ import {
 	probePosixProcess,
 } from '@studio/common/lib/owned-process-posix';
 import {
+	listWindowsChildren,
 	probeWindowsProcess,
 	windowsKeeperCommand,
 } from '@studio/common/lib/owned-process-windows';
@@ -155,6 +156,79 @@ export async function checkProcessIdentity(
 	return found.state === 'running' && found.start === identity.start ? 'alive' : 'gone';
 }
 
+/**
+ * POSIX: whether the process group a recorded leader led still has members.
+ * `empty` only when the kernel reports that no process is in the group;
+ * `alive` when it has members and its leader is still that same process, so
+ * the group is still the leader's; `unknown` otherwise: members whose leader is
+ * gone or replaced cannot be told from a later group that reused the ID, and
+ * an unreadable leader proves nothing. Windows has no process groups. Sends
+ * only signal 0, which delivers nothing.
+ */
+export type ProcessGroupCheck = 'empty' | 'alive' | 'unknown';
+
+export async function checkProcessGroup(
+	leader: ProcessIdentity,
+	overrides: Partial< OwnedProcessSeams > = {}
+): Promise< ProcessGroupCheck > {
+	const seams = seamsWith( overrides );
+	if ( seams.platform === 'win32' || ! isPid( leader.pid ) || ! leader.start ) return 'unknown';
+	try {
+		seams.kill( -leader.pid, 0 );
+	} catch ( error ) {
+		const code = ( error as NodeJS.ErrnoException ).code;
+		if ( code === 'ESRCH' ) return 'empty';
+		if ( code !== 'EPERM' ) return 'unknown';
+	}
+	return ( await checkProcessIdentity( leader, overrides ) ) === 'alive' ? 'alive' : 'unknown';
+}
+
+/**
+ * Whether the tree an owner owned has provably ended, once that owner is gone.
+ * `native` is the owned child's verified identity and `guardian` the helper
+ * that held the tree (`OwnedProcess.guardian`). The first process that is
+ * running, or that cannot be read, is named; nothing is signalled.
+ *
+ * Windows: the job's kill-on-close was set when ownership was confirmed and
+ * the keeper held its only handle, so once the keeper is gone the kernel has
+ * terminated every member. The tree has ended when the native process and the
+ * keeper are gone and no running process names the native process as its
+ * parent with a creation time at or after it (one could be a child created
+ * outside the job; or the child of a later process with the reused ID, which
+ * is counted too). Not established: a process outside the job whose parent is
+ * not the native process (service-created, created with another parent, or
+ * the child of a child that exited before assignment), and a job kept open by
+ * a duplicated handle.
+ *
+ * POSIX: the native process led its own group. The tree has ended when the
+ * leader and the supervisor are gone and the kernel shows the group empty.
+ * Not established: a descendant that left the group (`setsid`).
+ */
+export type OwnedTreeCheck =
+	| { state: 'ended' }
+	| { state: 'alive' | 'unknown'; process: 'native' | 'guardian' | 'descendant' };
+
+export async function checkOwnedTreeEnded(
+	processes: { native: ProcessIdentity; guardian?: ProcessIdentity },
+	overrides: Partial< OwnedProcessSeams > = {}
+): Promise< OwnedTreeCheck > {
+	const seams = seamsWith( overrides );
+	const native = await checkProcessIdentity( processes.native, overrides );
+	if ( native !== 'gone' ) return { state: native, process: 'native' };
+	if ( processes.guardian ) {
+		const guardian = await checkProcessIdentity( processes.guardian, overrides );
+		if ( guardian !== 'gone' ) return { state: guardian, process: 'guardian' };
+	} else if ( seams.platform === 'win32' ) return { state: 'unknown', process: 'guardian' };
+	if ( seams.platform === 'win32' ) {
+		const children = await listWindowsChildren( processes.native, seams ).catch( () => undefined );
+		if ( ! children ) return { state: 'unknown', process: 'descendant' };
+		return children.length ? { state: 'alive', process: 'descendant' } : { state: 'ended' };
+	}
+	const group = await checkProcessGroup( processes.native, overrides );
+	if ( group === 'empty' ) return { state: 'ended' };
+	return { state: group, process: 'descendant' };
+}
+
 /** Why Studio could not take ownership of a process tree. */
 export type OwnershipFailure =
 	/** The process could not be started. */
@@ -205,6 +279,13 @@ export interface OwnedProcess {
 	failure(): OwnershipFailure | undefined;
 	/** The child's verified identity. */
 	identity(): ProcessIdentity | undefined;
+	/**
+	 * The helper that ends the owned tree if this process dies: the Windows job
+	 * keeper, which holds the job's only handle, or the POSIX supervisor.
+	 * Undefined before ownership is confirmed, without a helper, or when its
+	 * identity cannot be read.
+	 */
+	guardian(): Promise< ProcessIdentity | undefined >;
 	/** The owned processes alive now, and whether any could not be decided. */
 	inspect(): Promise< { live: ProcessIdentity[]; uncertain: boolean } >;
 	/** Ends the child's input and, on POSIX, sends SIGTERM to its group. */
@@ -368,6 +449,10 @@ function converse( helper: ChildProcessByStdio< Writable, Readable, null > ) {
 	return {
 		/** Whether the helper has exited. */
 		ended: () => ended,
+		/** The helper's PID, which names it while it has not exited. */
+		pid: helper.pid,
+		/** Whether the helper has not exited, so its PID cannot name another process. */
+		running: () => helper.exitCode === null && helper.signalCode === null,
 		send( line: string ) {
 			try {
 				helper.stdin.write( line + '\n' );
@@ -738,11 +823,29 @@ function ownProcess(
 		};
 	}
 
+	async function guardian(): Promise< ProcessIdentity | undefined > {
+		if ( failed ) return undefined;
+		await established;
+		const helper = keeper;
+		if ( ! identity || ! helper?.pid ) return undefined;
+		let start: string | undefined;
+		if ( windows ) {
+			const answer = ( await helper.ask( 'self', /^self -?\d{1,19}$/, 10_000 ) )?.at( -1 );
+			start = /^self (\d{1,19})$/.exec( answer ?? '' )?.[ 1 ];
+		} else {
+			const found = await probe( helper.pid, seams );
+			if ( found.state === 'running' ) start = found.start;
+		}
+		// Read while the helper had not exited, so the PID was still its own.
+		return start && helper.running() ? { pid: helper.pid, start } : undefined;
+	}
+
 	return {
 		child,
 		ready: () => established,
 		failure: () => failure,
 		identity: () => identity,
+		guardian,
 		inspect,
 		requestShutdown,
 		waitForExit,

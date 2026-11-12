@@ -1,6 +1,7 @@
 import path from 'node:path';
 import type {
 	OwnedProcessSeams,
+	ProcessIdentity,
 	ProcessProbe,
 	SupervisedCommand,
 } from '@studio/common/lib/owned-process';
@@ -324,6 +325,7 @@ namespace StudioOwned {
 //   active      -> active <count>
 //   inspect     -> live <pid> <start> ... inspected
 //   reap <ms>   -> reaped clean|dirty
+//   self        -> self <start>      the keeper's own creation time, -1 when unreadable
 //   release, or the end of input: the keeper exits, closing the job.
 // Studio sends `confirm` and `end-tree` only after it knows the opened process
 // is its own child. Kill on close is set only at `confirm`, so a keeper that
@@ -368,6 +370,7 @@ while ($true) {
 		if ($start -lt 0) { Send 'ended -1' } else { Send "ended $([StudioOwned.Job]::EndTree($process, $rootId, $start))" }
 	}
 	elseif ($line -eq 'active') { Send "active $([StudioOwned.Job]::Active($job))" }
+	elseif ($line -eq 'self') { Send "self $([StudioOwned.Job]::Created([System.Diagnostics.Process]::GetCurrentProcess().Handle))" }
 	elseif ($line -eq 'inspect') {
 		$members = [StudioOwned.Job]::Members($job)
 		if ($null -eq $members) { Send 'uncertain' } else { foreach ($member in $members.Split([char]10)) { if ($member) { Send "live $member" } } }
@@ -392,6 +395,18 @@ if ($null -eq $p) { [Console]::Out.WriteLine('gone') } else {
 	try { $null = $p.Handle; $s = [long]$p.StartTime.ToFileTimeUtc() } catch { }
 	if ($null -eq $s) { [Console]::Out.WriteLine('unknown') } else { [Console]::Out.WriteLine("start $s") }
 }
+`;
+
+// The live processes that name $parentId as their parent, each with its
+// creation time, then `listed`. CIM reads creation times to the microsecond.
+const CHILDREN = String.raw`
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId = $parentId" -Property ProcessId,CreationDate)) {
+	if ($null -eq $p.CreationDate) { [Console]::Out.WriteLine('unknown'); exit 0 }
+	[Console]::Out.WriteLine("child $($p.ProcessId) $($p.CreationDate.ToFileTimeUtc())")
+}
+[Console]::Out.WriteLine('listed')
 `;
 
 // Starts the keeper. Its script is too long for a command line, which Windows
@@ -459,4 +474,37 @@ export async function probeWindowsProcess(
 	if ( line === 'gone' ) return { state: 'gone' };
 	const start = /^start (\d{1,19})$/.exec( line ?? '' )?.[ 1 ];
 	return start ? { state: 'running', start } : { state: 'unknown' };
+}
+
+const MICROSECOND = BigInt( 10 );
+
+/**
+ * The live processes that name `parent` as their parent and were created no
+ * earlier than it, to the microsecond CIM reports, or undefined when they
+ * cannot all be listed. Windows keeps a parent ID after the parent exits and
+ * reuses PIDs, so these may also be children of a later process with that ID;
+ * for proving a tree ended, counting them is the safe side.
+ */
+export async function listWindowsChildren(
+	parent: ProcessIdentity,
+	seams: OwnedProcessSeams
+): Promise< ProcessIdentity[] | undefined > {
+	if ( ! /^\d{1,19}$/.test( parent.start ) ) return undefined;
+	const helper = powerShell( `$parentId = [long]${ parent.pid }\n${ CHILDREN }`, seams, 30_000 );
+	const result = await seams.run( helper.command, helper.args, {
+		env: helper.env,
+		timeout: helper.timeout,
+	} );
+	if ( result.code !== 0 ) return undefined;
+	const lines = result.stdout.split( /\r?\n/ ).filter( Boolean );
+	if ( lines.at( -1 ) !== 'listed' ) return undefined;
+	const after = BigInt( parent.start ) / MICROSECOND;
+	const children: ProcessIdentity[] = [];
+	for ( const line of lines.slice( 0, -1 ) ) {
+		const found = /^child (\d{1,10}) (\d{1,19})$/.exec( line );
+		if ( ! found ) return undefined;
+		if ( BigInt( found[ 2 ] ) / MICROSECOND >= after )
+			children.push( { pid: Number( found[ 1 ] ), start: found[ 2 ] } );
+	}
+	return children;
 }
