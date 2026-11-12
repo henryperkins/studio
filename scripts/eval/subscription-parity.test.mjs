@@ -52,6 +52,16 @@ describe( 'subscription parity config', () => {
 		}
 	} );
 
+	test( 'a case that says one step comes before another checks that order', () => {
+		const pending = cases.find( ( { vars } ) => vars.caseId === 'parity-pending-work' );
+		expect( pending.checks ).toContain( 'toolsInOrder' );
+		expect( pending.vars.toolOrder ).toEqual( [
+			{ name: 'generate_images' },
+			{ name: 'take_screenshot' },
+		] );
+		expect( pending.description ).not.toMatch( /settles/ );
+	} );
+
 	test( 'every case has a unique id, a description and checks outcome.mjs exports', () => {
 		const ids = cases.map( ( { vars } ) => vars.caseId );
 		expect( new Set( ids ).size ).toBe( ids.length );

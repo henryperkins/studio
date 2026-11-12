@@ -875,6 +875,29 @@ export const remoteOperationRan = check( ( d, vars ) => {
 		: fail( `${ REMOTE_TOOL[ vars.operation ] } never succeeded` );
 } );
 
+// The tools in `vars.toolOrder` each succeeded, in that order in the recorded
+// tool sequence (other calls may come between them).
+export const toolsInOrder = check( ( d, vars ) => {
+	const calls = d.toolCalls || [];
+	const failed = new Set(
+		( d.toolResults || [] ).filter( ( r ) => r.isError ).map( ( r ) => r.toolUseId )
+	);
+	let after = -1;
+	for ( const { name } of vars.toolOrder || [] ) {
+		const index = calls.findIndex(
+			( call, position ) => position > after && call.name === name && ! failed.has( call.id )
+		);
+		if ( index < 0 )
+			return fail(
+				`no successful ${ name } after ${ after < 0 ? 'the start' : calls[ after ].name }: ${ calls
+					.map( ( c ) => c.name )
+					.join( ', ' ) }`
+			);
+		after = index;
+	}
+	return pass( `${ ( vars.toolOrder || [] ).map( ( t ) => t.name ).join( ' then ' ) }` );
+} );
+
 // Under `remote: mock`, no remote operation was even attempted.
 export const noRemoteOperation = check( ( d, vars ) => {
 	if ( vars.remote !== 'mock' || ! Array.isArray( d.remoteCalls ) )

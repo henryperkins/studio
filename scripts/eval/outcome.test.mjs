@@ -1,13 +1,14 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, test } from 'vitest';
+import { afterAll, describe, expect, test } from 'vitest';
 import { parse } from 'yaml';
 import * as checks from './outcome.mjs';
 
 // Each check reads the runner's result file named on stdout, as promptfoo
 // hands it over. These results carry only the fields a check reads.
 const dir = mkdtempSync( path.join( tmpdir(), 'studio-eval-outcome-test-' ) );
+afterAll( () => rmSync( dir, { recursive: true, force: true } ) );
 let count = 0;
 function run( check, result, vars = {} ) {
 	const file = path.join( dir, `result-${ count++ }.json` );
@@ -1019,6 +1020,35 @@ describe( 'parity checks', () => {
 		// Without the mock nothing says no remote operation ran.
 		expect( run( checks.noRemoteOperation, { remoteCalls: [] }, {} ).pass ).toBe( false );
 		expect( run( checks.noRemoteOperation, {}, { remote: 'mock' } ).pass ).toBe( false );
+	} );
+
+	test( 'toolsInOrder', () => {
+		const order = { toolOrder: [ { name: 'generate_images' }, { name: 'take_screenshot' } ] };
+		const ran = ( ...calls ) => ( {
+			toolCalls: calls.map( ( [ name ], index ) => ( { id: `c${ index }`, name } ) ),
+			toolResults: calls.map( ( [ name, isError ], index ) => ( {
+				toolUseId: `c${ index }`,
+				toolName: name,
+				isError: Boolean( isError ),
+			} ) ),
+		} );
+		expect(
+			run(
+				checks.toolsInOrder,
+				ran( [ 'generate_images' ], [ 'Read' ], [ 'take_screenshot' ] ),
+				order
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.toolsInOrder, ran( [ 'take_screenshot' ], [ 'generate_images' ] ), order ).pass
+		).toBe( false );
+		expect(
+			run( checks.toolsInOrder, ran( [ 'generate_images', true ], [ 'take_screenshot' ] ), order )
+				.pass
+		).toBe( false );
+		expect( run( checks.toolsInOrder, ran( [ 'generate_images' ] ), order ).reason ).toMatch(
+			/take_screenshot/
+		);
 	} );
 
 	test( 'imageGenerated and imageGenerationUnavailable', () => {

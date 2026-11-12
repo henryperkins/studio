@@ -324,6 +324,62 @@ describe( 'eval runner provider selection', () => {
 		expect( broker.setTokenClient ).not.toHaveBeenCalled();
 	} );
 
+	it( 'keeps an unselected result as its readers know it: every field and timing as before, new fields only added', async () => {
+		const result = ( await runEvalUntyped( input( { model: 'gpt-6-luna' } ) ) ) as Record<
+			string,
+			unknown
+		>;
+		const beforeG4a = [
+			'success',
+			'error',
+			'timedOut',
+			'stoppedAt',
+			'model',
+			'numTurns',
+			'stopReason',
+			'errorMessage',
+			'usage',
+			'sessionFile',
+			'phaseTimingsMs',
+			'timing',
+			'requests',
+			'turnDurationsMs',
+			'toolCalls',
+			'toolResults',
+			'toolEvents',
+			'firstToolError',
+			'textSegments',
+			'questions',
+			'inspections',
+			'outcome',
+		];
+		const added = [ 'turns', 'compactions' ];
+		expect( Object.keys( result ).sort() ).toEqual( [ ...beforeG4a, ...added ].sort() );
+		expect( Object.keys( result.phaseTimingsMs as object ).sort() ).toEqual( [
+			'first_assistant_message_ms',
+			'resolve_ai_environment_ms',
+			'resolve_initial_provider_ms',
+			'resolve_unavailable_provider_ms',
+			'start_ai_agent_ms',
+			'total_eval_ms',
+		] );
+		expect( result ).toMatchObject( { success: true, model: 'gpt-6-luna', error: null } );
+	} );
+
+	it( 'resolves an unavailable global provider as before: its replacement, or the global one', async () => {
+		legacy.resolveUnavailableAiProvider.mockResolvedValue( 'wpcom' );
+		await runEval( input() );
+		expect( legacy.resolveUnavailableAiProvider ).toHaveBeenCalledWith( 'openai-api-key' );
+		expect( legacy.resolveAiEnvironment ).toHaveBeenCalledWith( 'wpcom' );
+
+		legacy.resolveAiEnvironment.mockClear();
+		legacy.resolveUnavailableAiProvider.mockResolvedValue( undefined );
+		await runEval( input() );
+		expect( legacy.resolveAiEnvironment ).toHaveBeenCalledWith( 'openai-api-key' );
+		expect( broker.setTokenClient ).not.toHaveBeenCalled();
+		expect( broker.readFrom ).toEqual( [] );
+	} );
+
 	it( 'runs a ChatGPT-selected eval on the connection, never the global API key, and pins the conversation first', async () => {
 		agent.behavior = {
 			request: {

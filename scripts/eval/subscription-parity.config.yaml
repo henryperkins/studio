@@ -564,10 +564,13 @@ tests:
       - type: javascript
         value: file://outcome.mjs:inspectionMatches
 
-  - description: "parity [image service]: background image generation settles before a screenshot and the turn's end"
+  - description: "parity [image service]: a screenshot is taken after background image generation, and the images are saved when the turn ends"
     vars:
       caseId: parity-pending-work
       imageService: required
+      toolOrder:
+        - name: generate_images
+        - name: take_screenshot
       inspectPattern: 'UPLOADED_IMAGES=[1-9]'
       timeoutMs: 360000
       seed:
@@ -579,6 +582,8 @@ tests:
     assert:
       - type: javascript
         value: file://outcome.mjs:imageGenerated
+      - type: javascript
+        value: file://outcome.mjs:toolsInOrder
       - type: javascript
         value: file://outcome.mjs:inspectionMatches
 
