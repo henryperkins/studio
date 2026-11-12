@@ -19,6 +19,8 @@ import {
 	type ChatGptSignIn,
 	type ChatGptTokenClient,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
+import { answer, scriptedKeychain } from './fixtures/scripted-keychain';
 
 // Every store here runs over a scripted tool; the real keychain is never reached.
 vi.mock( '@studio/common/lib/os-credential-store', async ( importOriginal ) => {
@@ -69,7 +71,6 @@ const unreachableTokenService: ChatGptTokenClient = {
 	},
 };
 
-const answer = ( code: number, stderr: string ): CommandResult => ( { code, stdout: '', stderr } );
 const missing = ( command: string ): CommandResult => ( {
 	code: null,
 	stdout: '',
@@ -137,73 +138,8 @@ const CASES = ( Object.keys( FAILURES ) as Platform[] ).flatMap( ( platform ) =>
 	FAILURES[ platform ].map( ( failure ) => ( { platform, ...failure } ) )
 );
 
-const WRAPPING_KEY = 'wordpress-studio/chatgpt-vault-key';
-
-// How each tool says nothing is saved under a name.
-const NOTHING_SAVED: Record< Platform, CommandResult > = {
-	darwin: answer(
-		44,
-		'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.'
-	),
-	linux: answer( 1, '' ),
-	win32: answer( 3, '' ),
-};
-
-/**
- * Each platform's keychain tool, keeping secrets by service and account. While
- * `saysNothingSaved` is set, it answers every read and removal as it does when
- * nothing is saved, though its items are still there: what libsecret may
- * answer once an unlock prompt was dismissed. A write goes through, as one
- * whose unlock prompt was accepted would, and ends that.
- */
-function scriptedKeychain( platform: Platform ) {
-	const items = new Map< string, string >();
-	const state = { saysNothingSaved: false };
-	const calls: Array< { args: readonly string[]; input?: string } > = [];
-	const ok = ( stdout = '' ): CommandResult => ( { code: 0, stdout, stderr: '' } );
-	const write = ( name: string, secret: string ) => {
-		items.set( name, secret );
-		state.saysNothingSaved = false;
-		return ok();
-	};
-	const read = ( name: string ) => {
-		const secret = items.get( name );
-		if ( state.saysNothingSaved || secret === undefined ) {
-			return NOTHING_SAVED[ platform ];
-		}
-		return ok( platform === 'darwin' ? `${ secret }\n` : secret );
-	};
-	const remove = ( name: string ) =>
-		! state.saysNothingSaved && items.delete( name ) ? ok() : NOTHING_SAVED[ platform ];
-	const run: CommandRunner = async ( _command, args, { input } ) => {
-		calls.push( { args, input } );
-		if ( platform === 'linux' ) {
-			const name = `${ args[ args.indexOf( 'service' ) + 1 ] }/${
-				args[ args.indexOf( 'account' ) + 1 ]
-			}`;
-			if ( args[ 0 ] === 'store' ) {
-				return write( name, input ?? '' );
-			}
-			return args[ 0 ] === 'clear' ? remove( name ) : read( name );
-		}
-		if ( platform === 'darwin' ) {
-			const added = /^add-generic-password -U -s (\S+) -a (\S+) -w (\S+)\n$/.exec( input ?? '' );
-			if ( args[ 0 ] === '-i' && added ) {
-				return write( `${ added[ 1 ] }/${ added[ 2 ] }`, added[ 3 ] );
-			}
-			const name = `${ args[ args.indexOf( '-s' ) + 1 ] }/${ args[ args.indexOf( '-a' ) + 1 ] }`;
-			return args[ 0 ] === 'delete-generic-password' ? remove( name ) : read( name );
-		}
-		const script = Buffer.from( args[ args.length - 1 ], 'base64' ).toString( 'utf16le' );
-		const named = /\('([^']+)', '([^']+)'/.exec( script );
-		const name = named ? `${ named[ 1 ] }/${ named[ 2 ] }` : '';
-		if ( script.includes( '[Console]::In.ReadToEnd()' ) ) {
-			return write( name, input ?? '' );
-		}
-		return script.includes( '$vault.Remove($credential)' ) ? remove( name ) : read( name );
-	};
-	return { store: createOsCredentialStore( { platform, run } ), items, state, calls };
-}
+// The test profile's own key item.
+const wrappingKeyItem = () => `wordpress-studio/${ getChatGptVaultKeyAccounts().own }`;
 
 describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 	let configDir: string;
@@ -402,7 +338,7 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 				broker,
 				first,
 				second,
-				key: keychain.items.get( WRAPPING_KEY ),
+				key: keychain.items.get( wrappingKeyItem() ),
 				sealed: records(),
 				accounts: await readChatGptAccounts(),
 				keychainWrites: () => writes() - writesBefore,
@@ -439,7 +375,7 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 
 				expect( records() ).toEqual( saved.sealed );
 				expect( await readChatGptAccounts() ).toEqual( saved.accounts );
-				expect( saved.keychain.items.get( WRAPPING_KEY ) ).toBe( saved.key );
+				expect( saved.keychain.items.get( wrappingKeyItem() ) ).toBe( saved.key );
 				expect( saved.keychainWrites() ).toBe( 0 );
 			}
 		);
@@ -457,7 +393,7 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 					expectKeyUnreadable( await app.saveSignIn( save ).catch( ( error: unknown ) => error ) );
 				}
 				expect( saved.keychainWrites() ).toBe( 0 );
-				expect( saved.keychain.items.get( WRAPPING_KEY ) ).toBe( saved.key );
+				expect( saved.keychain.items.get( wrappingKeyItem() ) ).toBe( saved.key );
 				expect( await readChatGptAccounts() ).toEqual( saved.accounts );
 				expect( records() ).toEqual( saved.sealed );
 
@@ -493,7 +429,7 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 				await expect( saved.broker().getAccessToken( third.registrationId ) ).resolves.toBe(
 					'test-access-token-3'
 				);
-				expect( saved.keychain.items.get( WRAPPING_KEY ) ).toBe( saved.key );
+				expect( saved.keychain.items.get( wrappingKeyItem() ) ).toBe( saved.key );
 				expect( saved.keychainWrites() ).toBe( 0 );
 			}
 		);
@@ -504,7 +440,7 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 				const saved = await savedUnderUnreadableKey( platform );
 				// The key really is gone.
 				saved.keychain.state.saysNothingSaved = false;
-				saved.keychain.items.delete( WRAPPING_KEY );
+				saved.keychain.items.delete( wrappingKeyItem() );
 				// A record no saved account owns, which no sign-out could remove, stops nothing.
 				fs.writeFileSync(
 					path.join( configDir, 'chatgpt-credentials', `${ randomUUID() }.vault` ),
@@ -522,7 +458,7 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 				await app.signOut( saved.second.registrationId );
 				const next = await app.saveSignIn( signIn( 'vault', 3 ) );
 
-				const key = saved.keychain.items.get( WRAPPING_KEY );
+				const key = saved.keychain.items.get( wrappingKeyItem() );
 				expect( key ).toMatch( /^[A-Za-z0-9_-]{43}$/ );
 				expect( key ).not.toBe( saved.key );
 				await expect( saved.broker().getAccessToken( next.registrationId ) ).resolves.toBe(
@@ -545,7 +481,7 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 				const { registrationId } = await app.saveSignIn( signIn( 'vault', 1 ) );
 				await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-1' );
 				// Elsewhere, the key went, the account was signed out and in again under a new key.
-				keychain.items.delete( WRAPPING_KEY );
+				keychain.items.delete( wrappingKeyItem() );
 				const other = broker();
 				await other.signOut( registrationId );
 				await other.saveSignIn( { ...signIn( 'vault', 2 ), registrationId } );
@@ -591,7 +527,7 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 				expect( await readChatGptAccount( saved.first.registrationId ) ).toMatchObject( {
 					state: 'needs-sign-in',
 				} );
-				expect( saved.keychain.items.get( WRAPPING_KEY ) ).toBe( saved.key );
+				expect( saved.keychain.items.get( wrappingKeyItem() ) ).toBe( saved.key );
 				await expect( saved.broker().getAccessToken( saved.second.registrationId ) ).resolves.toBe(
 					'test-access-token-2'
 				);

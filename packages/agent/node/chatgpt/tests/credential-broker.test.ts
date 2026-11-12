@@ -30,6 +30,7 @@ import {
 	type ChatGptTokenSet,
 	type ChatGptTurnHandle,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
 import {
 	createFakeCredentialStore,
 	type FakeCredentialStore,
@@ -302,6 +303,8 @@ describe( 'ChatGPT credential broker', () => {
 					: fs.readFileSync( entryPath, 'utf8' );
 			} )
 			.join( '\n' );
+	// The test profile's own vault key item, which `vault-key-scope.test.ts` names.
+	const keyItem = () => getChatGptVaultKeyAccounts().own;
 
 	// One process's broker; a test starts another to play a second app.
 	function startBroker( options: Partial< ChatGptCredentialBrokerOptions > = {} ) {
@@ -505,10 +508,8 @@ describe( 'ChatGPT credential broker', () => {
 			expect( envelope ).toMatchObject( { version: 1 } );
 			expect( Buffer.from( envelope.iv, 'base64' ) ).toHaveLength( 12 );
 			expect( Buffer.from( envelope.tag, 'base64' ) ).toHaveLength( 16 );
-			expect( [ ...keychain.items.keys() ] ).toEqual( [ 'chatgpt-vault-key' ] );
-			expect( Buffer.from( keychain.items.get( 'chatgpt-vault-key' )!, 'base64url' ) ).toHaveLength(
-				32
-			);
+			expect( [ ...keychain.items.keys() ] ).toEqual( [ keyItem() ] );
+			expect( Buffer.from( keychain.items.get( keyItem() )!, 'base64url' ) ).toHaveLength( 32 );
 
 			await broker.saveSignIn(
 				signIn( { registrationId: first.registrationId, tokens: tokens( 3 ) } )
@@ -532,7 +533,7 @@ describe( 'ChatGPT credential broker', () => {
 			const first = await broker.saveSignIn( signIn() );
 			const second = await broker.saveSignIn( signIn( { tokens: tokens( 2 ) } ) );
 			// The vault's own format and key, as only something holding the key could use them.
-			const key = Buffer.from( keychain.items.get( 'chatgpt-vault-key' )!, 'base64url' );
+			const key = Buffer.from( keychain.items.get( keyItem() )!, 'base64url' );
 			const aad = ( registrationId: string ) =>
 				Buffer.from( `studio.chatgpt-credentials.v1:${ registrationId }` );
 			const sealed = JSON.parse( fs.readFileSync( vaultPath( first.registrationId ), 'utf8' ) );
@@ -637,11 +638,11 @@ describe( 'ChatGPT credential broker', () => {
 					tokens: tokens( 2 ),
 				} )
 			);
-			const replacement = keychain.items.get( 'chatgpt-vault-key' );
+			const replacement = keychain.items.get( keyItem() );
 
 			await app.saveSignIn( signIn( { registrationId, tokens: tokens( 3 ) } ) );
 
-			expect( keychain.items.get( 'chatgpt-vault-key' ) ).toBe( replacement );
+			expect( keychain.items.get( keyItem() ) ).toBe( replacement );
 			for ( const reader of [ other, startBroker(), app ] ) {
 				await expect( reader.getAccessToken( registrationId ) ).resolves.toBe(
 					'test-access-token-3'
@@ -652,7 +653,7 @@ describe( 'ChatGPT credential broker', () => {
 		it( 'refuses to save a sign-in while the keychain is locked, even with a key from before, and makes no new one', async () => {
 			const app = startBroker();
 			const { registrationId } = await app.saveSignIn( signIn() );
-			const key = keychain.items.get( 'chatgpt-vault-key' );
+			const key = keychain.items.get( keyItem() );
 			keychain.state.available = false;
 
 			await expect(
@@ -660,7 +661,7 @@ describe( 'ChatGPT credential broker', () => {
 			).rejects.toMatchObject( { code: 'vault-unavailable' } );
 
 			keychain.state.available = true;
-			expect( [ ...keychain.items.entries() ] ).toEqual( [ [ 'chatgpt-vault-key', key ] ] );
+			expect( [ ...keychain.items.entries() ] ).toEqual( [ [ keyItem(), key ] ] );
 			await expect( startBroker().getAccessToken( registrationId ) ).resolves.toBe(
 				'test-access-token-1'
 			);
@@ -749,9 +750,7 @@ describe( 'ChatGPT credential broker', () => {
 			expect( service.revocations ).toEqual( [
 				{ clientId: 'test-issued-client-1', refreshToken: large.refreshToken },
 			] );
-			expect( [ ...passwordVault.items.keys() ] ).toEqual( [
-				'wordpress-studio/chatgpt-vault-key',
-			] );
+			expect( [ ...passwordVault.items.keys() ] ).toEqual( [ `wordpress-studio/${ keyItem() }` ] );
 			const [ key ] = passwordVault.items.values();
 			expect( key ).toMatch( /^[A-Za-z0-9_-]{43}$/ );
 			expect( Buffer.from( key, 'base64url' ) ).toHaveLength( 32 );
@@ -2454,7 +2453,7 @@ describe( 'ChatGPT credential broker', () => {
 			code: 'refresh-failed',
 		} );
 		expect( await readChatGptAccount( registrationId ) ).toMatchObject( { state: 'signed-in' } );
-		expect( [ ...keychain.items.keys() ] ).toEqual( [ 'chatgpt-vault-key' ] );
+		expect( [ ...keychain.items.keys() ] ).toEqual( [ keyItem() ] );
 
 		broker.setChatGptTokenClient( service.client );
 		await expect( broker.getChatGptAccessToken( registrationId ) ).resolves.toBe(

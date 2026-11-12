@@ -21,6 +21,8 @@ const PATH_MODULES: Record< string, () => Promise< Record< string, unknown > > >
 const OUTSIDE_THE_RUN: Record< string, string > = {
 	'cli/lib/paths#STUDIO_CLI_HOME':
 		'only the default under PROCESS_MANAGER_HOME, which the run sets; migration 03 keeps its own copy, and the runner refuses the one profile state in which it renames anything',
+	'@studio/common/lib/well-known-paths#getDefaultConfigDirectory':
+		'names your own profile only so the run can tell it is another one and keep its ChatGPT vault key under an item of its own; nothing is read from or written there',
 };
 
 const isWithin = ( inner: string, outer: string ) => {
