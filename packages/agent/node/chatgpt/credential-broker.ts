@@ -295,6 +295,12 @@ interface ActiveTurn {
 const isNonEmptyString = ( value: unknown ): value is string =>
 	typeof value === 'string' && value !== '';
 
+// Which sign-in of a registration an account read belongs to.
+const signInOf = ( account: ChatGptAccount ) => ( {
+	logoutGeneration: account.logoutGeneration,
+	signInGeneration: account.signInGeneration ?? 0,
+} );
+
 const splitScopes = ( scope: string ) => scope.split( /\s+/ ).filter( Boolean );
 
 const isFresh = ( expiresAt: number ) => expiresAt - Date.now() > RENEWAL_MARGIN_MS;
@@ -892,7 +898,7 @@ export function createChatGptCredentialBroker(
 	// sign-in, unless it was signed out meanwhile.
 	async function clearUnusable( account: ChatGptAccount ): Promise< void > {
 		await removeRecord( account.registrationId );
-		await markChatGptSignInNeeded( account.registrationId, account.logoutGeneration );
+		await markChatGptSignInNeeded( account.registrationId, signInOf( account ) );
 	}
 
 	// Under the registration's refresh lock, the record is read again: another
@@ -1070,7 +1076,8 @@ export function createChatGptCredentialBroker(
 			}
 			if ( renewal.status === 'rejected' ) {
 				dropSession( registrationId );
-				await markChatGptSignInNeeded( registrationId, logoutGeneration );
+				// Only the sign-in whose token was refused: one made since stays.
+				await markChatGptSignInNeeded( registrationId, signInOf( current ) );
 				throw new ChatGptConnectionError( 'needs-sign-in' );
 			}
 			if ( ! isUnchanged( await readChatGptAccount( registrationId ), logoutGeneration ) ) {

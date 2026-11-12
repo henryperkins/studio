@@ -1540,6 +1540,82 @@ describe( 'ChatGPT credential broker', () => {
 			expect( service.revocations ).toEqual( [] );
 		} );
 
+		// A re-sign-in commits while an older session token's refresh is still out;
+		// that refresh is then refused: the new sign-in stays, and its grant with it.
+		it.each( [
+			[ 'in the same process', 'session' as const, false ],
+			[ 'in another process', 'vault' as const, true ],
+		] )(
+			'keeps a sign-in again that commits while a rejected refresh of the old session token is out, %s',
+			async ( _where, storage, otherProcess ) => {
+				const app = startBroker();
+				const { registrationId } = await app.saveSignIn(
+					signIn( { storage: 'session', tokens: expiring() } )
+				);
+				const refresh = deferred< ChatGptTokenServiceResult< ChatGptTokenSet > >();
+				service.answerRefresh( () => refresh.promise );
+				const renewing = settled( app.getAccessToken( registrationId ) );
+				await vi.waitFor( () => expect( service.refreshes ).toHaveLength( 1 ) );
+
+				const signer = otherProcess ? startBroker() : app;
+				const signingIn = signer.saveSignIn(
+					signIn( { registrationId, storage, email: 'again@example.com', tokens: tokens( 3 ) } )
+				);
+				try {
+					await vi.waitFor( async () =>
+						expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+							email: 'again@example.com',
+							storage,
+						} )
+					);
+				} finally {
+					refresh.resolve( {
+						ok: false,
+						error: { kind: 'terminal', code: 'invalid_grant', status: 400 },
+					} );
+				}
+				await signingIn;
+
+				expect( await renewing ).toEqual( {
+					error: expect.objectContaining( { code: 'needs-sign-in' } ),
+				} );
+				expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+					state: 'signed-in',
+					storage,
+				} );
+				await expect( signer.getAccessToken( registrationId ) ).resolves.toBe(
+					'test-access-token-3'
+				);
+				expect( service.revocations ).toEqual( [] );
+			}
+		);
+
+		it( 'reads an account saved before sign-ins were counted as its first, and still marks a refused one', async () => {
+			const broker = startBroker();
+			const { registrationId } = await broker.saveSignIn( signIn( { tokens: expiring() } ) );
+			const index = JSON.parse( fs.readFileSync( accountsPath(), 'utf8' ) );
+			delete index.accounts[ 0 ].signInGeneration;
+			fs.writeFileSync( accountsPath(), JSON.stringify( index ) );
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				signInGeneration: 0,
+				state: 'signed-in',
+			} );
+			service.answerRefresh( async () => ( {
+				ok: false,
+				error: { kind: 'terminal', code: 'invalid_grant', status: 400 },
+			} ) );
+
+			await expect( startBroker().getAccessToken( registrationId ) ).rejects.toMatchObject( {
+				code: 'needs-sign-in',
+			} );
+
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				state: 'needs-sign-in',
+			} );
+			const again = await broker.saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) );
+			expect( again ).toMatchObject( { state: 'signed-in', signInGeneration: 1 } );
+		} );
+
 		it( 'keeps each overlapping session sign-out’s revocation tied to its own generation', async () => {
 			const broker = startBroker();
 			const { registrationId } = await broker.saveSignIn( signIn( { storage: 'session' } ) );
