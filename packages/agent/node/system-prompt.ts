@@ -21,9 +21,9 @@ export interface BuildSystemPromptOptions {
 	// Another agent (Codex, Claude Code, …) drives the Studio tools over MCP,
 	// with its own file tools and conversation.
 	external?: boolean;
-	// That agent makes images with a tool of its own, for which Studio leaves
-	// generate_images out.
-	ownImageTool?: boolean;
+	// The conversation runs on the ChatGPT route, where the prompt says when
+	// no image tool is available. Every other prompt is as it was before it.
+	chatGptRoute?: boolean;
 	// The site this turn works on. The prompt is rebuilt every turn, so this
 	// always reflects the current site, also after compaction.
 	activeSite?: SiteInfo | null;
@@ -33,10 +33,11 @@ export function buildSystemPrompt( options: BuildSystemPromptOptions = {} ): str
 	const intro = options.external
 		? EXTERNAL_INTRO
 		: `${ AGENT_IDENTITY } You manage and modify local WordPress sites and the user's WordPress.com sites using your Studio tools, and generate content for these sites.`;
-	// generate_images is registered only with Studio's image service, so its
-	// guidance follows the tool rather than being stated to a model that can't act on it.
-	const canMakeImages =
-		options.ownImageTool === true ||
+	// generate_images is registered only with Studio's image service. On the
+	// ChatGPT route its guidance follows the tool rather than being stated to a
+	// model that can't act on it.
+	const imageryRouting =
+		! options.chatGptRoute ||
 		( options.tools ?? [] ).some( ( tool ) => tool.name === 'generate_images' );
 
 	return `${ intro }
@@ -52,7 +53,7 @@ ${ options.external ? '' : `${ WORKING_CADENCE }\n\n` }${ renderToolSections(
 		options.tools ?? []
 	) }
 
-${ buildSkillRouting( canMakeImages ) }${ buildActiveSiteSection(
+${ buildSkillRouting( imageryRouting ) }${ buildActiveSiteSection(
 		options.activeSite
 	) }${ buildUserInstructionsSection( options.userInstructions ) }
 `;
@@ -112,7 +113,7 @@ const WORKING_CADENCE = `## Working cadence
 
 - One file per turn: a single \`Write\`, or a single \`Edit\` call (read-only \`site_info\`, \`site_list\`, \`wp_cli\` queries may be combined). Short prose between tools — no long design-plan essays. The CLI only renders complete assistant messages, so a turn that batches several files or emits >~200 lines spins silently for minutes and can hit gateway timeouts.`;
 
-function buildSkillRouting( canMakeImages: boolean ): string {
+function buildSkillRouting( imageryRouting: boolean ): string {
 	return `## Skill routing
 
 When the request is to create, build, make, design, redesign, or rebuild a site, load the \`build-site\` skill first — it starts by picking or creating the site — and follow it to the end, even when the prompt already answers its questions. Any other work on an existing local site — answering questions about it, adding a page or section, adjusting styles, plugin work — loads the \`edit-manage-site\` skill first.
@@ -121,7 +122,7 @@ For any site creation, redesign, landing page, homepage, layout, style, CSS, typ
 
 For any page/post content, template or template-part content, change to an existing theme's files, block markup, block-theme layout, full-width section, or \`core/html\` use, load the \`block-content\` skill before writing markup or validating block content. For long CSS or page-content files (>~200 lines), use its skeleton-first recipes instead of writing the full payload at once.
 
-${ canMakeImages ? IMAGERY_ROUTING : NO_IMAGES }
+${ imageryRouting ? IMAGERY_ROUTING : NO_IMAGES }
 
 ${ SKILL_ROUTING_REST }`;
 }

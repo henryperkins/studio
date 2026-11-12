@@ -464,12 +464,13 @@ describe( 'pi runtime', () => {
 			expect( prompt ).toContain( 'load the `imagery` skill and make the images' );
 		} );
 
-		it( 'offers neither the tool nor its guidance without it', async () => {
+		it( 'leaves the tool out without it, with trunk’s guidance unchanged off the ChatGPT route', async () => {
 			const { tools, prompt } = await run( '' );
 
 			expect( tools ).not.toContain( 'generate_images' );
-			expect( prompt ).not.toContain( 'generate_images' );
-			expect( prompt ).toContain( 'You cannot make images in this conversation' );
+			expect( prompt ).not.toContain( '- generate_images:' );
+			expect( prompt ).not.toContain( 'You cannot make images in this conversation' );
+			expect( prompt ).toContain( 'load the `imagery` skill and make the images' );
 		} );
 	} );
 

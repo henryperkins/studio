@@ -683,6 +683,7 @@ async function createStudioAgentSession(
 		userInstructions,
 		tools: tools.map( toolPromptContribution ),
 		activeSite: config.activeSite,
+		chatGptRoute: routing.kind === 'chatgpt',
 	} );
 
 	const pendingWork = getPendingWork( config.session );
