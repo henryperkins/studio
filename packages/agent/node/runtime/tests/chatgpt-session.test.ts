@@ -1747,14 +1747,14 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				{ STUDIO_IMAGE_API_TOKEN: IMAGE_SERVICE_TOKEN },
 				null,
 				IMAGE_SERVICE_TOKEN,
-				{ service: 'wordpress-com', credential: 'environment-token', account: null },
+				{ service: 'wordpress-com', credential: 'environment-token' },
 			],
 			[
 				'a WordPress.com login',
 				{},
 				'test-wpcom-login-token',
 				'test-wpcom-login-token',
-				{ service: 'wordpress-com', credential: 'wordpress-com-login', account: IMAGE_ACCOUNT },
+				{ service: 'wordpress-com', credential: 'wordpress-com-login' },
 			],
 		] as const )(
 			'offers image generation with %s, on its own credential',
@@ -1807,6 +1807,13 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 						( message ) => message?.role === 'toolResult' && message.toolName === 'generate_images'
 					);
 				expect( getToolResultImageService( result?.details ) ).toEqual( expectedService );
+				// Never the WordPress.com account, in the result or the session file.
+				expect( JSON.stringify( result?.details ?? {} ) ).not.toMatch(
+					/Image Account|images@example\.test|account/
+				);
+				expect( fs.readFileSync( turn.sessionFile, 'utf8' ) ).not.toMatch(
+					/Image Account|images@example\.test/
+				);
 				// The record is Studio's: no ChatGPT request carries it, nor the
 				// image service's credential.
 				expect( JSON.stringify( requests.map( ( request ) => request.body ) ) ).not.toMatch(

@@ -1,8 +1,8 @@
 import { __, sprintf } from '@wordpress/i18n';
 import type {
 	ImageServiceAccount,
+	ImageServiceRecord,
 	ImageServiceState,
-	ImageServiceUse,
 } from '@studio/agent/protocol/image-service';
 
 /** The account as Studio's account menu names it. */
@@ -17,15 +17,9 @@ function formatImageServiceAccount( { displayName, email }: ImageServiceAccount 
 		: email;
 }
 
-/** Which service and account made a tool result's images. */
-export function describeImageServiceUse( use: ImageServiceUse ): string {
-	return use.account
-		? sprintf(
-				/* translators: %s: the WordPress.com account. */
-				__( 'Made with Studio’s WordPress.com image service, as %s.' ),
-				formatImageServiceAccount( use.account )
-		  )
-		: __( 'Made with Studio’s WordPress.com image service, with the token set for it.' );
+/** Which service made a tool result's images: never the account it acted as. */
+export function describeImageServiceUse( _record: ImageServiceRecord ): string {
+	return __( 'Made with Studio’s WordPress.com image service.' );
 }
 
 /**

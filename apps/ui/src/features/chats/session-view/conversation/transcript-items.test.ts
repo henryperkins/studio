@@ -125,22 +125,28 @@ describe( 'entriesToRenderItems', () => {
 		expect( edit( true ) ).toMatchObject( [ { result: { isError: true, diff: undefined } } ] );
 	} );
 
-	it( 'keeps the image service a result records it was made with', () => {
-		const studioService = {
-			service: 'wordpress-com',
-			credential: 'wordpress-com-login',
-			account: { displayName: 'Someone', email: 'someone@example.test' },
-		};
+	it( 'keeps the image service a result records it was made with, never an account an older record kept', () => {
+		const studioService = { service: 'wordpress-com', credential: 'wordpress-com-login' };
 		const result = toolResultEntry( 'Generating 1 image in the background.' ) as {
 			message: object;
 		};
-
-		expect(
+		const withDetails = ( details: object ) =>
 			entriesToRenderItems( [
 				assistantToolCallEntry( 'generate_images', { images: [] } ),
-				{ ...result, message: { ...result.message, details: { studioService } } } as SessionEntry,
-			] )
-		).toMatchObject( [ { kind: 'tool-use', result: { imageService: studioService } } ] );
+				{ ...result, message: { ...result.message, details } } as SessionEntry,
+			] );
+
+		expect( withDetails( { studioService } ) ).toMatchObject( [
+			{ kind: 'tool-use', result: { imageService: studioService } },
+		] );
+		const older = withDetails( {
+			studioService: {
+				...studioService,
+				account: { displayName: 'Someone', email: 'someone@example.test' },
+			},
+		} );
+		expect( older ).toMatchObject( [ { result: { imageService: studioService } } ] );
+		expect( JSON.stringify( older ) ).not.toMatch( /Someone|someone@example/ );
 		expect(
 			entriesToRenderItems( [
 				assistantToolCallEntry( 'generate_images', { images: [] } ),

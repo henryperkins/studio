@@ -240,7 +240,7 @@ export const generateImagesTool = defineTool(
 				].join( '\n' )
 			),
 			pending: generation,
-			studioService: imageService.use,
+			studioService: { service: imageService.use.service, credential: imageService.use.credential },
 		};
 	},
 	{

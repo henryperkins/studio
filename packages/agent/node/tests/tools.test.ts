@@ -880,7 +880,7 @@ describe( 'Studio AI MCP tools', () => {
 		}
 	} );
 
-	it( 'keeps the image service and account that made the images with the result, out of what the model reads', async () => {
+	it( 'keeps only which image service made the images and how Studio signed in to it with the result, never the account, out of what the model reads', async () => {
 		const sitePath = await mkdtemp( path.join( os.tmpdir(), 'studio-generate-images-' ) );
 		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );
 		const use = {
@@ -898,11 +898,19 @@ describe( 'Studio AI MCP tools', () => {
 			const executed = await executeTool( getTool( 'generate_images' ), args );
 			await ( executed.details as { pending?: Promise< unknown > } ).pending;
 
-			expect( raw.studioService ).toEqual( use );
-			expect( getToolResultImageService( executed.details ) ).toEqual( use );
+			const record = { service: 'wordpress-com', credential: 'wordpress-com-login' };
+			expect( raw.studioService ).toEqual( record );
+			expect( getToolResultImageService( executed.details ) ).toEqual( record );
+			expect(
+				JSON.stringify( { ...( executed.details as object ), pending: undefined } )
+			).not.toMatch( /Someone|someone@example|account/ );
 			for ( const content of [ raw.content, executed.content ] ) {
 				expect( JSON.stringify( content ) ).not.toMatch( /Someone|someone@example|wordpress-com/ );
 			}
+			// A record written before kept the account too: it is read without it.
+			expect(
+				getToolResultImageService( { studioService: { ...record, account: use.account } } )
+			).toEqual( record );
 		} finally {
 			await rm( sitePath, { recursive: true, force: true } );
 		}

@@ -1068,6 +1068,11 @@ function toToolDefinition(
 				pendingWork.add( details.pending );
 				delete details.pending;
 			}
+			// Which service made the images is shown only beside a subscription
+			// plan, which doesn't pay for them; elsewhere the result is as before.
+			if ( details?.studioService && ! chatGptTurn ) {
+				delete details.studioService;
+			}
 			const resultText = result.content
 				.map( ( part ) => ( part.type === 'text' ? part.text : '' ) )
 				.join( '\n' );

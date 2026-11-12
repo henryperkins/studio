@@ -2,7 +2,7 @@ import { Type, type Static, type TObject, type TProperties } from 'typebox';
 import type { AgentTool, AgentToolUpdateCallback } from '@earendil-works/pi-agent-core';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 import type { StudioChatArtifactWidgetDraft } from '@studio/agent/protocol/chat-artifacts';
-import type { ImageServiceUse } from '@studio/agent/protocol/image-service';
+import type { ImageServiceRecord } from '@studio/agent/protocol/image-service';
 import type { StudioToolProgressUpdate } from '@studio/agent/protocol/tool-progress';
 
 /**
@@ -35,16 +35,17 @@ export interface ToolResult {
 	// report for the agent. A runtime that cannot wait for it later awaits it
 	// before answering.
 	pending?: Promise< string | undefined >;
-	// The separately signed-in Studio service that did the work, and the account
-	// it acted as. Kept with the result for Studio to show, like the artifacts:
+	// The separately signed-in Studio service that did the work, and how Studio
+	// signed in to it, never the account. Kept with the result, on a
+	// subscription plan's route only, for Studio to show like the artifacts:
 	// never sent to the model, nor to an MCP client.
-	studioService?: ImageServiceUse;
+	studioService?: ImageServiceRecord;
 }
 
 export interface StudioToolResultDetails {
 	studioArtifacts?: StudioChatArtifactWidgetDraft[];
 	pending?: Promise< string | undefined >;
-	studioService?: ImageServiceUse;
+	studioService?: ImageServiceRecord;
 }
 
 export interface ToolContext {
