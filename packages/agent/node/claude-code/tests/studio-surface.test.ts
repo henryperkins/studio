@@ -1,4 +1,5 @@
-import { mkdtemp, realpath, rm, stat } from 'fs/promises';
+import { createHash, randomUUID } from 'crypto';
+import { mkdtemp, readFile, realpath, rm, stat, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
@@ -24,6 +25,7 @@ import {
 	configureClaudeRuntime,
 	createClaudeSession,
 	getClaudeRuntimeState,
+	recoverClaudeSession,
 	setClaudeSessionSelection,
 	validateClaudeSendSelection,
 	verifyClaudeTurnSession,
@@ -265,4 +267,71 @@ it.runIf( surfaceTarget )(
 			verifyClaudeTurnTarget( root, turn, { environment: 'local', siteId: request.siteId } )
 		).resolves.toBe( true );
 	}
+);
+
+it.runIf( surfaceTarget )(
+	'recovers a locked Claude chat through the shared surface, and says why when it does not',
+	async () => {
+		const { root, config } = await createFixture();
+		const summary = await createClaudeSession( root, request );
+		await expect( recoverClaudeSession( summary.id ) ).resolves.toEqual( {
+			status: 'blocked',
+			reason: 'not-locked',
+		} );
+		const storeRoot = getClaudeSessionStoreRoot( root );
+		// A turn whose owner died before it started anything. No process has this identity.
+		await createNativeSessionStore( storeRoot ).lockRun( summary.id, {
+			owner: { pid: 2147483644, start: '1' },
+			runId: 'run',
+			turnId: 'turn',
+			connection: { id: request.connectionId, revision: 1 },
+			workspace: { siteId: request.siteId, workingDirectory: config, configDirectory: config },
+		} );
+		expect( ( await loadHydratedAiSession( root, summary.id ) ).claudeRecovery ).toBe(
+			'run-locked'
+		);
+		expect( structuredClone( await recoverClaudeSession( summary.id ) ) ).toEqual( {
+			status: 'recovered',
+			runId: 'run',
+			turnId: 'turn',
+			recordedTerminal: true,
+			invalidatedApprovals: [],
+			uncertainOperations: [],
+		} );
+		const recovered = await loadHydratedAiSession( root, summary.id );
+		expect( recovered.claudeRecovery ).toBeUndefined();
+		expect( recovered.claudeJournal?.flat().map( ( event ) => event.type ) ).toEqual( [
+			'turn.terminal',
+			'turn.recovered',
+		] );
+
+		const lockFile = path.join(
+			storeRoot,
+			`${ createHash( 'sha256' ).update( summary.id ).digest( 'hex' ) }.json.lock`
+		);
+		const legacy = randomUUID();
+		await writeFile( lockFile, legacy );
+		await expect( recoverClaudeSession( summary.id ) ).resolves.toEqual( {
+			status: 'blocked',
+			reason: 'legacy-lock',
+		} );
+		expect( await readFile( lockFile, 'utf8' ) ).toBe( legacy );
+
+		const pi = await createAiSession( root );
+		await expect( recoverClaudeSession( pi.id ) ).resolves.toEqual( {
+			status: 'blocked',
+			reason: 'not-claude-session',
+		} );
+		await expect( recoverClaudeSession( 'no-such-chat' ) ).resolves.toEqual( {
+			status: 'blocked',
+			reason: 'not-claude-session',
+		} );
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CLAUDE_CODE', undefined );
+		await expect( recoverClaudeSession( summary.id ) ).resolves.toEqual( {
+			status: 'blocked',
+			reason: 'runtime-disabled',
+		} );
+		expect( await readFile( lockFile, 'utf8' ) ).toBe( legacy );
+	},
+	60_000
 );

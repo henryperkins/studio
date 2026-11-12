@@ -20,12 +20,18 @@ import {
 } from './connection';
 import { inspectClaudeExecutable } from './discovery';
 import { currentClaudeHost, isClaudeRuntimeSurfaceEnabled } from './platform';
-import { getClaudeGlobalWorkspace, getClaudeSessionStoreRoot } from './sessions';
+import { recoverClaudeRun } from './recovery';
+import {
+	createNativeSessionStore,
+	getClaudeGlobalWorkspace,
+	getClaudeSessionStoreRoot,
+} from './sessions';
 import type { ClaudeSignInRefusalReason } from './connection';
 import type { ClaudeSignInActionReason } from './platform';
 import type { ClaudeBackendTurnSnapshot } from '@studio/agent/protocol/backend-events';
 import type {
 	ClaudeModelCatalog,
+	ClaudeRecoveryResult,
 	ClaudeRuntimeAction,
 	ClaudeRuntimeState,
 	ClaudeSessionSelection,
@@ -209,6 +215,27 @@ export async function createClaudeSession( root: string, request: CreateClaudeSe
 			selection,
 		},
 	} );
+}
+
+/**
+ * Recovers a Claude chat whose run lock outlived the run that took it, so the
+ * same native conversation can continue with its next turn. Nothing is
+ * replayed. When ownership or the native binding cannot be proven, nothing
+ * changes and the result says why.
+ */
+export async function recoverClaudeSession( sessionId: string ): Promise< ClaudeRecoveryResult > {
+	if ( ! isClaudeRuntimeEnabled() ) return { status: 'blocked', reason: 'runtime-disabled' };
+	const root = getSessionsDirectory();
+	let binding;
+	try {
+		const { summary, entries } = await loadAiSession( root, sessionId );
+		const context = resolveClaudeSession( entries );
+		if ( context ) binding = { ...context.binding, conversationId: summary.id };
+	} catch {
+		// An unreadable chat or binding proves nothing.
+	}
+	if ( ! binding ) return { status: 'blocked', reason: 'not-claude-session' };
+	return recoverClaudeRun( createNativeSessionStore( getClaudeSessionStoreRoot( root ) ), binding );
 }
 
 export async function setClaudeSessionSelection(
