@@ -131,10 +131,10 @@ export function couldBeMethodOverrideKey( rawKey: string ): boolean {
 	if ( hasControlCharacter( rawKey ) || hasControlCharacter( key ) ) {
 		return true;
 	}
-	const stripped = key.replace( /^s+/, '' );
+	const stripped = key.replace( /^\s+/, '' );
 	const bracket = stripped.indexOf( '[' );
 	const base = bracket > 0 ? stripped.slice( 0, bracket ) : stripped;
-	const folded = base.replace( /[.s[]/g, '_' ).toLowerCase();
+	const folded = base.replace( /[.\s[]/g, '_' ).toLowerCase();
 	return (
 		folded === '_method' ||
 		folded === 'method' ||
@@ -190,16 +190,29 @@ function effectiveMethod(
 	return write === undefined ? declared : write.trim().toUpperCase() || 'OTHER';
 }
 
+/** The query a request path carries: from its first `?` up to any `#`, since a fragment is never sent. */
+function pathQuery( requestPath: string ): string {
+	const [ beforeFragment ] = requestPath.split( '#' );
+	const start = beforeFragment.indexOf( '?' );
+	return start < 0 ? '' : beforeFragment.slice( start + 1 );
+}
+
 /**
- * `wpcom_request` with every method but GET answered by a fixture and recorded
- * in `calls`, as the mocked host does for pushes and previews: a write the
- * agent asks for never leaves the process. Reads stay the real tool's. The
- * returned function puts the real tool back.
+ * `wpcom_request` with every request whose effective method is not GET or HEAD
+ * (declared, or named by a method override in its `query` or in a query written
+ * into its `path`) answered by a fixture and recorded in `calls`, as the mocked
+ * host does for pushes and previews: a write the agent asks for never leaves
+ * the process. Reads stay the real tool's. The returned function puts the real
+ * tool back.
  */
 export function withMockedWpcomRequest( calls: RemoteCall[] ): () => void {
 	const original = wpcomRequestTool.handler;
 	wpcomRequestTool.handler = async ( args, context ) => {
-		const method = effectiveMethod( args.method, args.query );
+		const method = effectiveMethod(
+			args.method,
+			args.query,
+			queryOverrideValues( new URLSearchParams( pathQuery( args.path ) ).entries() )
+		);
 		if ( READ_METHODS.has( method ) ) {
 			return original.call( wpcomRequestTool, args, context );
 		}

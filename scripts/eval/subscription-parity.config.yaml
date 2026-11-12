@@ -20,13 +20,13 @@
 # shown (outcome.mjs). Under `remote: mock` no state-changing request leaves
 # the eval process itself: pushes, pulls and preview create, update and
 # delete are recorded by a mocked host, writes through `wpcom_request` (a
-# `_method` or `method` override in the query, including the key spellings PHP
-# folds into `_method`, counts as a write) are recorded and answered by a
-# fixture, and any other request to a WordPress.com host with a method other
-# than GET or HEAD, or a method override in its query (same spellings) or in the
-# override headers, is refused and
-# fails the case
-# (`noWordPressComWrites`, code `wpcom-write-under-mock`). The one exception is
+# `_method` or `method` override in its query argument or in a query written
+# into its path, including the key spellings PHP folds into `_method`, counts as
+# a write) are recorded and answered by a fixture, and any other request to a
+# WordPress.com host with a method other than GET or HEAD, or a method override
+# in its query (same spellings) or in the override headers, is refused and fails
+# the case (`noWordPressComWrites`, code `wpcom-write-under-mock`). README,
+# "What `remote: mock` guarantees", says which keys count. The one exception is
 # Studio's image service in the cases marked `[image service]`. Reads (GET,
 # HEAD) still reach WordPress.com with the case's copy of your login, and a
 # command the agent starts from its shell still runs with the case's copied

@@ -138,6 +138,14 @@ describe( 'eval harness', () => {
 			[ '_method%00foo', true ],
 			[ 'me%74hod', true ],
 			[ 'me\tthod', true ],
+			[ ' _method[x]', true ],
+			[ '%20_method[x]', true ],
+			[ '\t_method[x]', true ],
+			[ ' .method[x]', true ],
+			[ '_method [x]', false ],
+			[ 'smethod', false ],
+			[ 'sMethod', false ],
+			[ 's_method', false ],
 			[ 'payment_method', false ],
 			[ 'methods', false ],
 			[ 'method_name', false ],
@@ -149,6 +157,15 @@ describe( 'eval harness', () => {
 				expect( couldBeMethodOverrideKey( key ) ).toBe( expected );
 			}
 		);
+
+		// Each key is caught by one rule alone, so a mistake in that rule cannot hide behind the others.
+		it.each( [
+			[ 'the folded name', ' .Method[x]' ],
+			[ 'the letters and digits', 'Me-Thod' ],
+			[ 'the control character', 'per\u0000page' ],
+		] )( 'finds an override through %s alone: %j', ( _rule, key ) => {
+			expect( couldBeMethodOverrideKey( key ) ).toBe( true );
+		} );
 
 		it( 'treats a method override in the query of a wpcom_request GET as a write', async () => {
 			const calls: RemoteCall[] = [];
@@ -163,6 +180,10 @@ describe( 'eval harness', () => {
 					{ '%2Emethod': 'DELETE' },
 					{ '%20_method': 'DELETE' },
 					{ '_method\u0000': 'DELETE' },
+					{ ' _method[x]': 'DELETE' },
+					{ ' _method[x]': [ 'GET' ] },
+					{ '%20_method[x]': 'DELETE' },
+					{ '%20_method[x]': 'GET' },
 				] ) {
 					const answered = await wpcomRequestTool.handler(
 						{ siteId: 113, method: 'GET', path: '/posts/7', query },
@@ -174,7 +195,7 @@ describe( 'eval harness', () => {
 						}
 					);
 				}
-				expect( calls ).toHaveLength( 8 );
+				expect( calls ).toHaveLength( 12 );
 				expect( calls.map( ( call ) => call.method ) ).toEqual( [
 					'DELETE',
 					'PUT',
@@ -182,6 +203,10 @@ describe( 'eval harness', () => {
 					'DELETE',
 					'DELETE',
 					'DELETE',
+					'DELETE',
+					'OTHER',
+					'DELETE',
+					'OTHER',
 					'DELETE',
 					'OTHER',
 				] );
@@ -197,7 +222,50 @@ describe( 'eval harness', () => {
 						context()
 					)
 				).rejects.toThrow( /Not logged in/ );
-				expect( calls ).toHaveLength( 8 );
+				expect( calls ).toHaveLength( 12 );
+			} finally {
+				restore();
+			}
+		} );
+
+		it( 'reads a query written into a wpcom_request path as the request would send it', async () => {
+			const calls: RemoteCall[] = [];
+			const restore = withMockedWpcomRequest( calls );
+			try {
+				const overriding = [
+					'/posts/7?_method=DELETE',
+					'/posts/7?%20_method[x]=DELETE',
+					'/posts/7?+_method[x]=GET',
+					'/posts/7?context=edit&_method=PUT#top',
+				];
+				for ( const path of overriding ) {
+					const answered = await wpcomRequestTool.handler(
+						{ siteId: 113, method: 'GET', path },
+						context()
+					);
+					expect( JSON.parse( ( answered.content[ 0 ] as { text: string } ).text ) ).toMatchObject(
+						{ eval_mock: true }
+					);
+				}
+				expect( calls ).toEqual(
+					[ 'DELETE', 'DELETE', 'OTHER', 'PUT' ].map( ( method, index ) => ( {
+						operation: 'wpcom-request',
+						method,
+						site: '113',
+						target: overriding[ index ],
+					} ) )
+				);
+				// A harmless query is a read, and so is an override after `#`: the fragment is never sent.
+				for ( const path of [
+					'/posts?per_page=5&status=publish',
+					'/posts?per_page=5#&_method=DELETE',
+					'/posts#?_method=DELETE',
+				] ) {
+					await expect(
+						wpcomRequestTool.handler( { siteId: 113, method: 'GET', path }, context() )
+					).rejects.toThrow( /Not logged in/ );
+				}
+				expect( calls ).toHaveLength( 4 );
 			} finally {
 				restore();
 			}
@@ -218,6 +286,11 @@ describe( 'eval harness', () => {
 				targets.global.fetch( `${ base }?_method%00=DELETE` ),
 				targets.global.fetch( `${ base }?_method%00=GET` ),
 				targets.global.fetch( `${ base }?_method[]=GET` ),
+				targets.global.fetch( `${ base }? _method[x]=DELETE` ),
+				targets.global.fetch( `${ base }? _method[x]=GET` ),
+				targets.global.fetch( `${ base }?%20_method[x]=DELETE` ),
+				targets.global.fetch( `${ base }?%20_method[x]=GET` ),
+				targets.global.fetch( `${ base }?+_method[x]=DELETE` ),
 				targets.global.fetch( base, { headers: { 'X-HTTP-Method-Override': 'DELETE' } } ),
 				targets.global.fetch( base, { headers: new Headers( { 'x-method-override': 'PUT' } ) } ),
 				targets.global.fetch( base, { headers: [ [ 'X-HTTP-Method', 'DELETE' ] ] } ),
@@ -239,7 +312,12 @@ describe( 'eval harness', () => {
 				path: '/wp/v2/sites/1/posts/7',
 				headers: { 'X-HTTP-Method-Override': 'DELETE' },
 			} );
-			expect( guard.attempts ).toHaveLength( 18 );
+			targets.https.request( {
+				host: 'public-api.wordpress.com',
+				path: '/wp/v2/sites/1/posts/7?%20_method[x]=DELETE',
+			} );
+			targets.https.request( `${ base }?+_method[x]=GET` );
+			expect( guard.attempts ).toHaveLength( 25 );
 			expect( reached.filter( ( entry ) => entry.startsWith( 'fetch' ) ) ).toEqual( [] );
 			expect( reached.filter( ( entry ) => entry.endsWith( 'network' ) ) ).toEqual( [] );
 
@@ -248,8 +326,8 @@ describe( 'eval harness', () => {
 			await targets.global.fetch( base, { headers: { 'X-HTTP-Method-Override': 'GET' } } );
 			await targets.global.fetch( 'https://example.org/x?_method=DELETE' );
 			guard.uninstall();
-			expect( guard.attempts ).toHaveLength( 18 );
-			expect( reached ).toHaveLength( 3 + 4 );
+			expect( guard.attempts ).toHaveLength( 25 );
+			expect( reached ).toHaveLength( 3 + 6 );
 		} );
 
 		// A process's network calls, played by stand-ins that record what reached them.
