@@ -23,9 +23,8 @@ import {
 	type ChatGptCredentialBroker,
 } from '@studio/agent/node/chatgpt/credential-broker';
 import {
-	readLoopbackPeerOwner,
-	type LoopbackConnection,
-	type LoopbackPeerOwner,
+	openLoopbackPeerLookup,
+	type LoopbackPeerLookup,
 } from '@studio/agent/node/chatgpt/loopback-peer';
 import {
 	CHATGPT_RESOURCE,
@@ -102,6 +101,15 @@ const REVOKE_TIMEOUT_MS = 10_000;
 const OUTCOME_RETENTION_MS = 10 * 60_000;
 // Port 0 can't collide; should listening still fail that way, the system picks again.
 const LISTEN_ATTEMPTS = 3;
+// A browser opens at most six connections to one host at a time; two more
+// leave room for it to retry. Beyond these the listener drops a connection
+// unread, so no one can hold the process's open files through it.
+const MAX_CALLBACK_CONNECTIONS = 8;
+// A connection that hasn't sent its whole request this long after it was
+// accepted is closed, checked each second, so none can be parked there. Once
+// a request is in, answering it isn't timed.
+const CALLBACK_REQUEST_TIMEOUT_MS = 10_000;
+const CALLBACK_CONNECTIONS_CHECK_MS = 1_000;
 
 /** Opens a URL in the system browser; rejects when it can't. */
 export type ChatGptBrowserOpener = ( url: string ) => Promise< void >;
@@ -117,8 +125,8 @@ export interface ChatGptSignInFlowOptions {
 	openBrowser?: ChatGptBrowserOpener;
 	/** Replaced only by tests: the platform whose rules the listener follows. */
 	platform?: NodeJS.Platform;
-	/** Replaced only by tests: whose socket a request to the listener comes from, on Linux. */
-	loopbackPeerOwner?: ( connection: LoopbackConnection ) => Promise< LoopbackPeerOwner >;
+	/** Replaced only by tests: on Linux, what a listener asks whose socket a request comes from. */
+	loopbackPeers?: () => LoopbackPeerLookup;
 }
 
 export interface ChatGptSignInFlow {
@@ -245,6 +253,8 @@ interface Attempt {
 	/** The `Host` a browser sends to the callback. */
 	callbackHost: string;
 	server: http.Server;
+	/** On Linux, whose socket a request to the listener comes from; null elsewhere. */
+	peers: LoopbackPeerLookup | null;
 	timer: ReturnType< typeof setTimeout >;
 	/** Aborts the attempt's requests when it is cancelled or times out. */
 	controller: AbortController;
@@ -346,7 +356,15 @@ async function openCallbackListener(
 	answer: http.RequestListener
 ): Promise< { server: http.Server; port: number } > {
 	for ( let tries = 1; ; tries++ ) {
-		const server = http.createServer( answer );
+		const server = http.createServer(
+			{
+				connectionsCheckingInterval: CALLBACK_CONNECTIONS_CHECK_MS,
+				headersTimeout: CALLBACK_REQUEST_TIMEOUT_MS,
+				requestTimeout: CALLBACK_REQUEST_TIMEOUT_MS,
+			},
+			answer
+		);
+		server.maxConnections = MAX_CALLBACK_CONNECTIONS;
 		try {
 			await new Promise< void >( ( resolve, reject ) => {
 				server.once( 'error', reject );
@@ -392,7 +410,7 @@ export function createChatGptSignInFlow(
 		readIdTokenHint: readChatGptIdTokenHint,
 	};
 	const platform = options.platform ?? process.platform;
-	const loopbackPeerOwner = options.loopbackPeerOwner ?? readLoopbackPeerOwner;
+	const openLoopbackPeers = options.loopbackPeers ?? ( () => openLoopbackPeerLookup() );
 	const attempts = new Map< string, Attempt >();
 	const keySets = new Map< string, ReturnType< typeof createRemoteJWKSet > >();
 	const tokenClient = createChatGptTokenClient( { discoveryUrl: options.discoveryUrl } );
@@ -509,6 +527,7 @@ export function createChatGptSignInFlow(
 		clearTimeout( attempt.timer );
 		attempt.controller.abort();
 		attempt.server.close();
+		void attempt.peers?.close().catch( () => undefined );
 		attempt.resolve( outcome );
 		const forget = setTimeout( () => attempts.delete( attempt.attemptId ), OUTCOME_RETENTION_MS );
 		forget.unref?.();
@@ -672,11 +691,11 @@ export function createChatGptSignInFlow(
 			respond( response, 400, rejectedPage() );
 			return;
 		}
-		void isFromAnotherUser( request ).then( ( refused ) => {
+		void isRefusedPeer( attempt, request ).then( ( refused ) => {
 			if ( refused ) {
 				respond( response, 400, rejectedPage() );
 			} else if ( isStart ) {
-				answerStart( attempt, response );
+				answerStart( attempt, request, response );
 			} else {
 				answerReturn( attempt, url.searchParams, response );
 			}
@@ -684,46 +703,62 @@ export function createChatGptSignInFlow(
 	}
 
 	/**
-	 * Whether the kernel's socket table proves the request comes from another
-	 * local user than this process's, root aside.
+	 * Whether the request is refused for whose socket it comes from.
 	 *
 	 * Only on Linux, where any local user can read the browser opener's
 	 * command line, start address and all, from /proc; macOS and Windows show
 	 * a process's arguments only to its own user and administrators.
 	 *
-	 * Anything short of proof lets the request through. Refusing when the
-	 * owner can't be established would break signing in where the table is
-	 * hidden or the connection is relayed (a hardened kernel, WSL's localhost
-	 * forwarding), and an unprivileged user in the same network namespace
-	 * can't keep their socket out of the tables while still reading the
-	 * answer. Root may read everything anyway.
+	 * The request goes on only when the kernel's socket tables show it comes
+	 * from this process's user or root, when a table that could be read has no
+	 * row proving its owner, or when the kernel hides a table from this
+	 * process (absent or forbidden). Refusing those would break signing in
+	 * where the tables are hidden or the connection is relayed (a hardened
+	 * kernel, WSL's localhost forwarding); an unprivileged user in the same
+	 * network namespace can't keep their socket out of a table the kernel shows
+	 * while still reading the answer, and root may read everything anyway.
+	 * Any other failure to read or parse a table, or to look the socket up, is
+	 * refused: another user can bring one about, by holding the process at its
+	 * limit of open files, say.
 	 */
-	async function isFromAnotherUser( request: http.IncomingMessage ): Promise< boolean > {
-		if ( platform !== 'linux' ) {
+	async function isRefusedPeer(
+		attempt: Attempt,
+		request: http.IncomingMessage
+	): Promise< boolean > {
+		if ( ! attempt.peers ) {
 			return false;
 		}
 		const { remoteAddress, remotePort, localAddress, localPort } = request.socket;
 		if ( ! remoteAddress || ! remotePort || ! localAddress || ! localPort ) {
-			return false;
+			return true;
 		}
 		try {
-			const owner = await loopbackPeerOwner( {
+			const owner = await attempt.peers.ownerOf( {
 				remoteAddress,
 				remotePort,
 				localAddress,
 				localPort,
 			} );
-			return owner === 'other-user';
+			return owner === 'other-user' || owner === 'unreadable';
 		} catch {
-			return false;
+			return true;
 		}
 	}
 
 	// Once only, and only while the attempt waits for its callback.
-	function answerStart( attempt: Attempt, response: http.ServerResponse ): void {
+	function answerStart(
+		attempt: Attempt,
+		request: http.IncomingMessage,
+		response: http.ServerResponse
+	): void {
 		const authorizationUrl = attempt.pending?.authorizationUrl;
 		if ( attempt.status !== 'waiting' || ! attempt.pending || ! authorizationUrl ) {
 			respond( response, 400, rejectedPage() );
+			return;
+		}
+		// A client gone while its owner was looked up can't be sent on: the
+		// address stays for the browser.
+		if ( request.destroyed || ! request.socket?.writable ) {
 			return;
 		}
 		attempt.pending.authorizationUrl = null;
@@ -805,6 +840,14 @@ export function createChatGptSignInFlow(
 		const { server, port } = await openCallbackListener( ( request, response ) =>
 			answerCallback( attempts.get( attemptId ), request, response )
 		);
+		// Opened with the listener, before the opener is given its port.
+		let peers: LoopbackPeerLookup | null = null;
+		try {
+			peers = platform === 'linux' ? openLoopbackPeers() : null;
+		} catch {
+			server.close();
+			throw new ChatGptSignInError( 'callback-unavailable' );
+		}
 		const pending: PendingAttempt = {
 			version: PENDING_ATTEMPT_VERSION,
 			attemptId,
@@ -863,6 +906,7 @@ export function createChatGptSignInFlow(
 			status: 'waiting',
 			callbackHost: `${ CALLBACK_HOST }:${ port }`,
 			server,
+			peers,
 			controller: new AbortController(),
 			outcome,
 			resolve,

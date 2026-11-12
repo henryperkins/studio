@@ -1,7 +1,9 @@
 // @vitest-environment node
 import { createHash, randomBytes } from 'node:crypto';
+import { once } from 'node:events';
 import fs from 'node:fs';
 import http from 'node:http';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { base64url, SignJWT, type JWTPayload } from 'jose';
@@ -20,6 +22,7 @@ import {
 	type ChatGptSignIn,
 	type ChatGptTokenRequest,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { openLoopbackPeerLookup } from '@studio/agent/node/chatgpt/loopback-peer';
 import {
 	CHATGPT_SIGN_IN_TIMEOUT_MS,
 	ChatGptSignInError,
@@ -44,6 +47,26 @@ import {
 	type FakeAuthorizationServerScript,
 	type SigningKey,
 } from './fixtures/fake-authorization-server';
+import {
+	INITIAL_UID_MAP,
+	OTHER_UID,
+	OVERFLOW_UID_FILE,
+	OWN_UID,
+	TCP6_FILE,
+	TCP_FILE,
+	UID_MAP_FILE,
+	at,
+	createFakeProc,
+	hex4,
+	mapped,
+	systemError,
+	tcp6Row,
+	tcp6Table,
+	tcpRow,
+	tcpTable,
+	v4,
+	type FakeProc,
+} from './fixtures/proc-net-tcp';
 import type {
 	LoopbackConnection,
 	LoopbackPeerOwner,
@@ -90,6 +113,35 @@ async function closedPort(): Promise< number > {
 	return port;
 }
 
+/**
+ * A GET from a socket of its own, so a test knows the port it comes from
+ * before it is sent; status 0 when the connection is dropped unanswered.
+ */
+async function requestFrom(
+	url: string,
+	beforeSending: ( localPort: number ) => void = () => undefined
+): Promise< { status: number; location?: string; page: string } > {
+	const target = new URL( url );
+	const socket = net.connect( Number( target.port ), target.hostname );
+	let text = '';
+	socket.setEncoding( 'utf8' );
+	socket.on( 'data', ( chunk: string ) => ( text += chunk ) );
+	socket.on( 'error', () => undefined );
+	const closed = new Promise( ( resolve ) => socket.on( 'close', resolve ) );
+	await once( socket, 'connect' );
+	beforeSending( socket.localPort! );
+	socket.write(
+		`GET ${ target.pathname }${ target.search } HTTP/1.1\r\nHost: ${ target.host }\r\n\r\n`
+	);
+	await closed;
+	const [ head, ...body ] = text.split( '\r\n\r\n' );
+	return {
+		status: Number( /^HTTP\/1\.1 (\d{3}) /.exec( head )?.[ 1 ] ?? 0 ),
+		location: /\r\nlocation: ([^\r\n]*)/i.exec( head )?.[ 1 ],
+		page: body.join( '\r\n\r\n' ),
+	};
+}
+
 const failed = ( code: string ) => ( { ok: false, code, message: expect.any( String ) } );
 
 describe( 'Signing in to ChatGPT', () => {
@@ -132,6 +184,9 @@ describe( 'Signing in to ChatGPT', () => {
 		} );
 	}
 
+	// Every flow here follows Linux's rules, the strictest, whatever machine runs
+	// the tests, with a socket-table lookup that finds each request this user's;
+	// a test that needs another platform or answer says so.
 	function startFlow( options: ChatGptSignInFlowOptions = {} ) {
 		const created = createChatGptSignInFlow( {
 			discoveryUrl: fake.discoveryUrl,
@@ -144,6 +199,11 @@ describe( 'Signing in to ChatGPT', () => {
 				checkVaultKey: () => broker.checkVaultKey(),
 			},
 			openBrowser,
+			platform: 'linux',
+			loopbackPeers: () => ( {
+				ownerOf: async () => 'same-user',
+				close: async () => undefined,
+			} ),
 			...options,
 		} );
 		flows.push( created );
@@ -1684,11 +1744,55 @@ describe( 'Signing in to ChatGPT', () => {
 			expect( fake.authorizeRequests ).toHaveLength( 0 );
 		} );
 
+		it.each< NodeJS.Platform >( [ 'linux', 'darwin', 'win32' ] )(
+			'on %s, is served on 8 connections at most, each closed when it sends no request within 10 seconds, and one beyond doesn’t use it up',
+			async ( platform ) => {
+				const createServer = vi.spyOn( http, 'createServer' );
+				const capped = startFlow( { platform } );
+				const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, capped );
+				const server = createServer.mock.results.at( -1 )!.value as http.Server & {
+					connectionsCheckingInterval: number;
+				};
+				let connected = 0;
+				server.on( 'connection', ( socket: net.Socket ) => {
+					connected++;
+					socket.on( 'close', () => connected-- );
+				} );
+				const start = new URL( startUrl );
+
+				const idle = await Promise.all(
+					Array.from( { length: 8 }, async () => {
+						const socket = net.connect( Number( start.port ), start.hostname );
+						socket.on( 'error', () => undefined );
+						await once( socket, 'connect' );
+						return socket;
+					} )
+				);
+				await until( () => connected === 8 );
+				const beyond = await requestFrom( startUrl );
+				for ( const socket of idle ) {
+					socket.destroy();
+				}
+				await until( () => connected === 0 );
+
+				expect( server.maxConnections ).toBe( 8 );
+				// Checked every second, from the moment a connection is accepted.
+				expect( server.headersTimeout ).toBe( 10_000 );
+				expect( server.requestTimeout ).toBe( 10_000 );
+				expect( server.connectionsCheckingInterval ).toBe( 1_000 );
+				expect( beyond ).toEqual( { status: 0, location: undefined, page: '' } );
+				await deliver( await authorize( await follow( startUrl ) ) );
+				expect( ( await capped.wait( attemptId ) ).ok ).toBe( true );
+			}
+		);
+
 		// Another user on a Linux machine can read the start address from the
 		// opener's command line: the listener answers only its own user.
 		describe( 'on Linux', () => {
-			// A flow whose socket-table reader gives these answers, in order.
-			function linuxFlow( answers: Array< LoopbackPeerOwner | Error > ) {
+			// A flow whose socket-table lookup gives these answers, in order.
+			function linuxFlow(
+				answers: Array< LoopbackPeerOwner | Error | Promise< LoopbackPeerOwner > >
+			) {
 				const queue = [ ...answers ];
 				const owner = vi.fn( async ( _connection: LoopbackConnection ) => {
 					const next = queue.shift();
@@ -1700,7 +1804,12 @@ describe( 'Signing in to ChatGPT', () => {
 					}
 					return next;
 				} );
-				return { flow: startFlow( { platform: 'linux', loopbackPeerOwner: owner } ), owner };
+				const close = vi.fn( async () => undefined );
+				const linux = startFlow( {
+					platform: 'linux',
+					loopbackPeers: () => ( { ownerOf: owner, close } ),
+				} );
+				return { flow: linux, owner, close };
 			}
 
 			function expectNothingDisclosed(
@@ -1716,78 +1825,380 @@ describe( 'Signing in to ChatGPT', () => {
 				}
 			}
 
-			it( 'refuses another user’s requests without disclosing anything, leaving the address and the attempt to the browser', async () => {
-				const { flow: linux, owner } = linuxFlow( [
-					'other-user',
-					'same-user',
-					'other-user',
-					'same-user',
-				] );
-				const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
-				const listenerPort = Number( new URL( startUrl ).port );
+			it.each< [ string, LoopbackPeerOwner | Error ] >( [
+				[ 'another user', 'other-user' ],
+				[ 'an owner whose socket tables can’t be read', 'unreadable' ],
+				[ 'an owner the lookup failed to find', new Error( 'test-lookup-failure' ) ],
+			] )(
+				'refuses a request from %s without disclosing anything, leaving the address and the attempt to the browser',
+				async ( _name, refusal ) => {
+					const { flow: linux, owner } = linuxFlow( [
+						refusal,
+						'same-user',
+						refusal,
+						'same-user',
+					] );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const listenerPort = Number( new URL( startUrl ).port );
 
-				const intruded = await request( startUrl );
-				const response = await fetch( startUrl, { redirect: 'manual' } );
-				const location = response.headers.get( 'location' )!;
-				const callbackUrl = await authorize( location );
-				const intrudedCallback = await deliver( callbackUrl );
-				const exchangedBefore = fake.tokenRequests.length;
-				const delivered = await deliver( callbackUrl );
+					const intruded = await request( startUrl );
+					const response = await fetch( startUrl, { redirect: 'manual' } );
+					const location = response.headers.get( 'location' )!;
+					const callbackUrl = await authorize( location );
+					const intrudedCallback = await deliver( callbackUrl );
+					const exchangedBefore = fake.tokenRequests.length;
+					const delivered = await deliver( callbackUrl );
 
-				expectNothingDisclosed( intruded, location );
-				expect( response.status ).toBe( 302 );
-				expect( location.startsWith( `${ fake.url }/api/accounts/authorize?` ) ).toBe( true );
-				expectNothingDisclosed( intrudedCallback, location );
-				expect( exchangedBefore ).toBe( 0 );
-				expect( delivered.status ).toBe( 200 );
-				expect( ( await linux.wait( attemptId ) ).ok ).toBe( true );
-				expect( owner ).toHaveBeenCalledTimes( 4 );
-				for ( const [ connection ] of owner.mock.calls ) {
-					expect( connection ).toEqual( {
-						remoteAddress: '127.0.0.1',
-						remotePort: expect.any( Number ),
-						localAddress: '127.0.0.1',
-						localPort: listenerPort,
-					} );
+					expectNothingDisclosed( intruded, location );
+					expect( response.status ).toBe( 302 );
+					expect( location.startsWith( `${ fake.url }/api/accounts/authorize?` ) ).toBe( true );
+					expectNothingDisclosed( intrudedCallback, location );
+					expect( exchangedBefore ).toBe( 0 );
+					expect( delivered.status ).toBe( 200 );
+					expect( ( await linux.wait( attemptId ) ).ok ).toBe( true );
+					expect( owner ).toHaveBeenCalledTimes( 4 );
+					for ( const [ connection ] of owner.mock.calls ) {
+						expect( connection ).toEqual( {
+							remoteAddress: '127.0.0.1',
+							remotePort: expect.any( Number ),
+							localAddress: '127.0.0.1',
+							localPort: listenerPort,
+						} );
+					}
 				}
-			} );
+			);
 
 			it.each< LoopbackPeerOwner >( [ 'same-user', 'root', 'unknown' ] )(
-				'lets a request whose owner is %s through, as before',
+				'lets a request whose owner is %s through, as before, and closes the tables with the attempt',
 				async ( answer ) => {
-					const { flow: linux, owner } = linuxFlow( [ answer, answer ] );
+					const { flow: linux, owner, close } = linuxFlow( [ answer, answer ] );
 
 					const { outcome } = await signIn( undefined, undefined, linux );
 
 					expect( outcome.ok ).toBe( true );
 					expect( owner ).toHaveBeenCalledTimes( 2 );
+					expect( close ).toHaveBeenCalledTimes( 1 );
 				}
 			);
 
-			it( 'lets a request through when its owner can’t be looked up at all', async () => {
-				const { flow: linux, owner } = linuxFlow( [
-					new Error( 'test-no-socket-table' ),
-					new Error( 'test-no-socket-table' ),
-				] );
+			it( 'closes the tables with an attempt that ends before any request', async () => {
+				const cancelled = linuxFlow( [] );
+				const { attemptId } = await beginUnfollowed( undefined, undefined, cancelled.flow );
+				expect( cancelled.close ).not.toHaveBeenCalled();
+				expect( cancelled.flow.cancel( attemptId ) ).toBe( true );
+				const timedOut = linuxFlow( [] );
+				const quick = startFlow( {
+					timeoutMs: 100,
+					platform: 'linux',
+					loopbackPeers: () => ( { ownerOf: timedOut.owner, close: timedOut.close } ),
+				} );
+				const late = await beginUnfollowed( undefined, undefined, quick );
 
-				const { outcome } = await signIn( undefined, undefined, linux );
-
-				expect( outcome.ok ).toBe( true );
-				expect( owner ).toHaveBeenCalledTimes( 2 );
+				expect( await quick.wait( late.attemptId ) ).toEqual( failed( 'timed-out' ) );
+				expect( cancelled.close ).toHaveBeenCalledTimes( 1 );
+				expect( timedOut.close ).toHaveBeenCalledTimes( 1 );
 			} );
 
 			it.each< NodeJS.Platform >( [ 'darwin', 'win32' ] )(
-				'is never asked on %s, which keeps other users from reading the opener’s arguments',
+				'opens no socket table and asks nothing on %s, which keeps other users from reading the opener’s arguments',
 				async ( platform ) => {
 					const owner = vi.fn( async () => 'other-user' as const );
-					const other = startFlow( { platform, loopbackPeerOwner: owner } );
+					const peers = vi.fn( () => ( { ownerOf: owner, close: async () => undefined } ) );
+					const other = startFlow( { platform, loopbackPeers: peers } );
 
 					const { outcome } = await signIn( undefined, undefined, other );
 
 					expect( outcome.ok ).toBe( true );
+					expect( peers ).not.toHaveBeenCalled();
 					expect( owner ).not.toHaveBeenCalled();
 				}
 			);
+
+			it.each( [ 'closes', 'resets' ] )(
+				'leaves the address to the browser when a client %s its connection before its lookup settles',
+				async ( how ) => {
+					let settle: ( owner: LoopbackPeerOwner ) => void = () => undefined;
+					const unsettled = new Promise< LoopbackPeerOwner >( ( resolve ) => ( settle = resolve ) );
+					const { flow: linux, owner } = linuxFlow( [ unsettled, 'same-user', 'same-user' ] );
+					const createServer = vi.spyOn( http, 'createServer' );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const server = createServer.mock.results.at( -1 )!.value as http.Server;
+					const accepted: net.Socket[] = [];
+					server.on( 'connection', ( socket: net.Socket ) => accepted.push( socket ) );
+					const start = new URL( startUrl );
+					const client = net.connect( Number( start.port ), start.hostname );
+					client.on( 'error', () => undefined );
+					await once( client, 'connect' );
+
+					client.write( `GET ${ start.pathname } HTTP/1.1\r\nHost: ${ start.host }\r\n\r\n` );
+					await until( () => owner.mock.calls.length === 1 );
+					if ( how === 'closes' ) {
+						client.destroy();
+					} else {
+						client.resetAndDestroy();
+					}
+					await until( () => accepted.length === 1 && ! accepted[ 0 ].writable );
+					settle( 'same-user' );
+					await nextTurn();
+
+					const location = await follow( startUrl );
+					await deliver( await authorize( location ) );
+					expect( ( await linux.wait( attemptId ) ).ok ).toBe( true );
+					expect( owner ).toHaveBeenCalledTimes( 3 );
+				}
+			);
+
+			// Through the reader itself, over stand-in /proc files the test scripts.
+			describe( 'reading the socket tables', () => {
+				const MAX_TABLE_BYTES = 4 * 1024 * 1024;
+				const CONTAINER_UID_MAP = '         0     100000      65536\n';
+				const oversized = new Map< string, string >();
+
+				function linuxProc( files: Record< string, string > = {} ) {
+					return createFakeProc( {
+						[ TCP_FILE ]: tcpTable(),
+						[ TCP6_FILE ]: tcp6Table(),
+						[ OVERFLOW_UID_FILE ]: '65534\n',
+						[ UID_MAP_FILE ]: INITIAL_UID_MAP,
+						...files,
+					} );
+				}
+
+				function procFlow(
+					proc: FakeProc,
+					{
+						lookupTimeoutMs,
+						...options
+					}: ChatGptSignInFlowOptions & { lookupTimeoutMs?: number } = {}
+				) {
+					return startFlow( {
+						platform: 'linux',
+						loopbackPeers: () =>
+							openLoopbackPeerLookup( {
+								open: proc.open,
+								uid: OWN_UID,
+								littleEndian: true,
+								...( lookupTimeoutMs ? { timeoutMs: lookupTimeoutMs } : {} ),
+							} ),
+						...options,
+					} );
+				}
+
+				// Lists the socket a request is about to come from as `uid`'s, in one table.
+				const listedAs =
+					( proc: FakeProc, startUrl: string, uid: number, file = TCP_FILE ) =>
+					( localPort: number ) => {
+						const listener = Number( new URL( startUrl ).port );
+						proc.content.set(
+							TCP_FILE,
+							file === TCP_FILE
+								? tcpTable( tcpRow( 1, at( localPort ), at( listener ), { uid } ) )
+								: tcpTable()
+						);
+						proc.content.set(
+							TCP6_FILE,
+							file === TCP6_FILE
+								? tcp6Table(
+										tcp6Row(
+											1,
+											`${ mapped( 1 ) }:${ hex4( localPort ) }`,
+											`${ mapped( 1 ) }:${ hex4( listener ) }`,
+											uid
+										)
+								  )
+								: tcp6Table()
+						);
+					};
+
+				// A well-formed table just over the bound, of other sockets.
+				function oversizedTable( file: string ): string {
+					let table = oversized.get( file );
+					if ( ! table ) {
+						const rows = Array.from( { length: 30_000 }, ( _, slot ) =>
+							file === TCP_FILE
+								? tcpRow( slot + 10, at( 20_000 + slot, v4( 9 ) ), at( 443, 'C0A80001' ), {
+										uid: OTHER_UID,
+								  } )
+								: tcp6Row(
+										slot + 10,
+										`${ mapped( 9 ) }:${ hex4( 20_000 + slot ) }`,
+										`${ mapped( 9 ) }:01BB`,
+										OTHER_UID
+								  )
+						);
+						table = file === TCP_FILE ? tcpTable( ...rows ) : tcp6Table( ...rows );
+						oversized.set( file, table );
+					}
+					expect( Buffer.byteLength( table ) ).toBeGreaterThan( MAX_TABLE_BYTES );
+					return table;
+				}
+
+				it( 'opens the tables as its listener starts, before the browser, reads them again for each request, and closes them with the attempt', async () => {
+					const proc = linuxProc();
+					const openWhenBrowsing: string[][] = [];
+					const linux = procFlow( proc, {
+						openBrowser: async ( url ) => {
+							openWhenBrowsing.push( [ ...proc.opens ] );
+							opened.push( url );
+						},
+					} );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const mine = listedAs( proc, startUrl, OWN_UID );
+
+					const intruded = await requestFrom( startUrl, listedAs( proc, startUrl, OTHER_UID ) );
+					const location = ( await requestFrom( startUrl, mine ) ).location!;
+					const delivered = await requestFrom( await authorize( location ), mine );
+
+					expect( openWhenBrowsing ).toEqual( [
+						expect.arrayContaining( [ TCP_FILE, TCP6_FILE ] ),
+					] );
+					expectNothingDisclosed( intruded, location );
+					expect( delivered.status ).toBe( 200 );
+					expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+					for ( const file of [ TCP_FILE, TCP6_FILE ] ) {
+						expect( proc.opens.filter( ( opened ) => opened === file ) ).toHaveLength( 1 );
+						expect(
+							proc.reads.filter( ( read ) => read.file === file && read.position === 0 )
+						).toHaveLength( 3 );
+					}
+					await until(
+						() => proc.closes.includes( TCP_FILE ) && proc.closes.includes( TCP6_FILE )
+					);
+				} );
+
+				const FAILURES: Array< {
+					name: string;
+					fail: ( proc: FakeProc, file: string ) => void;
+					lookupTimeoutMs?: number;
+					recoverMs?: number;
+				} > = [
+					...[ 'EMFILE', 'ENFILE', 'ENOMEM', 'EIO' ].map( ( code ) => ( {
+						name: `a read failing with ${ code }`,
+						fail: ( proc: FakeProc, file: string ) =>
+							proc.failNextRead( file, systemError( code ) ),
+					} ) ),
+					{
+						name: 'a read slower than a lookup may take',
+						fail: ( proc, file ) => proc.failNextRead( file, { stallMs: 300 } ),
+						lookupTimeoutMs: 100,
+						recoverMs: 300,
+					},
+					{
+						name: 'a read failing in a way it doesn’t expect',
+						fail: ( proc, file ) =>
+							proc.failNextRead( file, new TypeError( 'test-unexpected-read' ) ),
+					},
+					{
+						name: 'a table larger than 4 MiB',
+						fail: ( proc, file ) => proc.failNextRead( file, { text: oversizedTable( file ) } ),
+					},
+					{
+						name: 'a table in a layout it doesn’t know',
+						fail: ( proc, file ) => proc.failNextRead( file, { text: 'not a socket table\n' } ),
+					},
+				];
+				const CASES = FAILURES.flatMap( ( failure ) =>
+					[ TCP_FILE, TCP6_FILE ].flatMap( ( file ) =>
+						( [ 'start address', 'callback' ] as const ).map( ( kind ) => ( {
+							...failure,
+							file,
+							kind,
+						} ) )
+					)
+				);
+
+				it.each( CASES )(
+					'refuses the $kind for $name in $file, though its owner is this user, leaving the address and the attempt to the browser',
+					async ( { fail, file, kind, lookupTimeoutMs, recoverMs } ) => {
+						const proc = linuxProc();
+						const linux = procFlow( proc, { lookupTimeoutMs } );
+						const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+						const mine = listedAs( proc, startUrl, OWN_UID );
+						let target = startUrl;
+						let location: string | undefined;
+						if ( kind === 'callback' ) {
+							location = ( await requestFrom( startUrl, mine ) ).location!;
+							target = await authorize( location );
+						}
+
+						fail( proc, file );
+						const refused = await requestFrom( target, mine );
+						await sleep( recoverMs ?? 0 );
+						const exchangedBefore = fake.tokenRequests.length;
+						const answered = await requestFrom( target, mine );
+						if ( kind === 'start address' ) {
+							location = answered.location!;
+							expect( ( await requestFrom( await authorize( location ), mine ) ).status ).toBe(
+								200
+							);
+						}
+
+						expect( answered.status ).toBe( kind === 'start address' ? 302 : 200 );
+						expectNothingDisclosed( refused, location! );
+						expect( exchangedBefore ).toBe( 0 );
+						expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+					}
+				);
+
+				it.each( [ 'ENOENT', 'EACCES' ] )(
+					'decides from the other table when the kernel hides one with %s',
+					async ( code ) => {
+						const proc = linuxProc();
+						proc.failNextOpen( TCP_FILE, systemError( code ) );
+						const linux = procFlow( proc );
+						const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+
+						// Listed in the table it can read: another user is refused, this one let through.
+						const intruded = await requestFrom(
+							startUrl,
+							listedAs( proc, startUrl, OTHER_UID, TCP6_FILE )
+						);
+						const response = await requestFrom(
+							startUrl,
+							listedAs( proc, startUrl, OWN_UID, TCP6_FILE )
+						);
+						// Listed only where the kernel hides it, with the other table hidden too: let through.
+						proc.failNextRead( TCP6_FILE, systemError( code ) );
+						const delivered = await requestFrom(
+							await authorize( response.location! ),
+							listedAs( proc, startUrl, OTHER_UID, TCP_FILE )
+						);
+
+						expectNothingDisclosed( intruded, response.location! );
+						expect( response.status ).toBe( 302 );
+						expect( delivered.status ).toBe( 200 );
+						expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+					}
+				);
+
+				it( 'refuses a request listed as the overflow uid where every uid is mapped, the initial user namespace', async () => {
+					const proc = linuxProc();
+					const linux = procFlow( proc );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const mine = listedAs( proc, startUrl, OWN_UID );
+
+					const nobody = await requestFrom( startUrl, listedAs( proc, startUrl, 65534 ) );
+					const location = ( await requestFrom( startUrl, mine ) ).location!;
+					await requestFrom( await authorize( location ), mine );
+
+					expectNothingDisclosed( nobody, location );
+					expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+				} );
+
+				it( 'lets a request listed as the overflow uid through under another uid map, where it proves no owner', async () => {
+					const proc = linuxProc( { [ UID_MAP_FILE ]: CONTAINER_UID_MAP } );
+					const linux = procFlow( proc );
+					const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+					const nobody = listedAs( proc, startUrl, 65534 );
+
+					const response = await requestFrom( startUrl, nobody );
+					const delivered = await requestFrom( await authorize( response.location! ), nobody );
+
+					expect( response.status ).toBe( 302 );
+					expect( delivered.status ).toBe( 200 );
+					expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+				} );
+			} );
 		} );
 	} );
 
