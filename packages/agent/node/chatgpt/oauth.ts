@@ -527,11 +527,20 @@ export function createChatGptSignInFlow(
 		if ( attempt.status === 'done' ) {
 			return;
 		}
+		// A callback being answered closes the connections once its page is out.
+		const answering = attempt.status === 'completing' || attempt.status === 'committing';
 		attempt.status = 'done';
 		attempt.pending = null;
 		clearTimeout( attempt.timer );
 		attempt.controller.abort();
 		attempt.server.close();
+		// Including any that sent part of a request, which would otherwise be
+		// held until the request timeout.
+		if ( answering ) {
+			attempt.server.closeIdleConnections();
+		} else {
+			attempt.server.closeAllConnections();
+		}
 		void attempt.peers?.close().catch( () => undefined );
 		attempt.resolve( outcome );
 		const forget = setTimeout( () => attempts.delete( attempt.attemptId ), OUTCOME_RETENTION_MS );
@@ -796,6 +805,8 @@ export function createChatGptSignInFlow(
 			return;
 		}
 		attempt.status = 'completing';
+		// The last answer: every connection goes once it is out, or the browser has left.
+		response.once( 'close', () => attempt.server.closeAllConnections() );
 		void settle( attempt, pending, params ).then( ( outcome ) =>
 			respond( response, 200, finishedPage( outcome ) )
 		);
