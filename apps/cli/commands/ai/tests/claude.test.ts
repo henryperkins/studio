@@ -84,6 +84,24 @@ describe( 'studio code claude recover', () => {
 		expect( process.exitCode ).toBe( 1 );
 	} );
 
+	it( 'says on stderr what to do next: wait for the other app, or follow the manual procedure', async () => {
+		vi.mocked( recoverClaudeSession ).mockResolvedValue( {
+			status: 'blocked',
+			reason: 'owner-alive',
+		} );
+		expect( ( await run( [ 'claude', 'recover', '--session', 'abc' ] ) ).stderr ).toMatch(
+			/wait/i
+		);
+		vi.mocked( recoverClaudeSession ).mockResolvedValue( {
+			status: 'blocked',
+			reason: 'legacy-lock',
+		} );
+		const legacy = await run( [ 'claude', 'recover', '--session', 'abc' ] );
+		expect( legacy.stderr ).toContain( 'docs/design-docs/claude-code-recovery.md' );
+		expect( JSON.parse( legacy.stdout ) ).toEqual( { status: 'blocked', reason: 'legacy-lock' } );
+		expect( process.exitCode ).toBe( 1 );
+	} );
+
 	it( 'requires a session and recovers nothing without one', async () => {
 		const { error } = await run( [ 'claude', 'recover' ] );
 		expect( String( error ) ).toContain( '--session is required.' );

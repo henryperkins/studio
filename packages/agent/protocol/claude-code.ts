@@ -1,4 +1,4 @@
-import { __ } from '@wordpress/i18n';
+import { __, sprintf } from '@wordpress/i18n';
 import { isStudioCustomEntryOfType } from './sessions/entry-types';
 import type { ClaudeBackendSessionBinding } from './backend-sessions';
 import type { StudioSiteSelectedData } from './sessions/entry-types';
@@ -144,57 +144,137 @@ export type ClaudeRecoveryResult =
 			turnId?: string;
 	  };
 
-/** A display message for why a conversation was not recovered. */
+/**
+ * The repository document with the procedure for unlocking by hand a chat
+ * Studio cannot recover by itself.
+ */
+export const CLAUDE_RECOVERY_PROCEDURE_DOCUMENT = 'docs/design-docs/claude-code-recovery.md';
+
+function byHand( what: string ): string {
+	return sprintf(
+		/* translators: 1: why Studio cannot recover the chat. 2: a documentation file in the Studio repository. */
+		__( '%1$s To unlock it by hand, follow the procedure in %2$s.' ),
+		what,
+		CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
+	);
+}
+
+function retryThenByHand( what: string ): string {
+	return sprintf(
+		/* translators: 1: why Studio cannot recover the chat. 2: a documentation file in the Studio repository. */
+		__(
+			'%1$s Try again in a moment. If this keeps happening, follow the procedure in %2$s to unlock it by hand.'
+		),
+		what,
+		CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
+	);
+}
+
+/** A display message for why a conversation was not recovered, and what to do next. */
 export function getClaudeRecoveryBlockedMessage( reason: ClaudeRecoveryBlockedReason ): string {
 	switch ( reason ) {
 		case 'runtime-disabled':
-			return __( 'The Claude Code experiment is turned off.' );
+			return __( 'The Claude Code experiment is turned off. Turn it on and try again.' );
 		case 'not-claude-session':
-			return __( 'This chat does not use Claude Code, or its workspace binding cannot be read.' );
-		case 'not-locked':
-			return __( 'This chat is not locked, so there is nothing to recover.' );
-		case 'deletion-pending':
-			return __( 'This chat is being deleted. Delete it again to finish.' );
-		case 'legacy-lock':
 			return __(
-				'This chat was locked by an earlier version of Studio, which did not record the process that held the lock, so Studio cannot prove it has ended.'
+				'This chat does not use Claude Code, or its workspace binding cannot be read, so there is nothing to recover. To continue with Claude Code, start a new chat.'
+			);
+		case 'not-locked':
+			return __(
+				'This chat is not locked, so there is nothing to recover. Send your next message.'
+			);
+		case 'deletion-pending':
+			return sprintf(
+				/* translators: %s: a documentation file in the Studio repository. */
+				__(
+					'This chat is being deleted. Wait for that to finish, or delete the chat again to finish it. If Studio reports that the chat is locked, follow the procedure in %s.'
+				),
+				CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
+			);
+		case 'legacy-lock':
+			return byHand(
+				__(
+					'This chat was locked by an earlier version of Studio, which did not record the process that held the lock, so Studio cannot prove it has ended.'
+				)
 			);
 		case 'lock-unreadable':
+			return retryThenByHand(
+				__( 'Studio could not read the lock on this chat, or does not recognize it.' )
+			);
 		case 'lock-not-a-run':
+			return sprintf(
+				/* translators: %s: a documentation file in the Studio repository. */
+				__(
+					'A deletion of this chat holds its lock. Wait for the deletion to finish. If no Studio app is deleting the chat, the deletion was interrupted and Studio cannot tell which process held it: follow the procedure in %s.'
+				),
+				CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
+			);
 		case 'lock-other-conversation':
 		case 'platform-mismatch':
-			return __( 'Studio does not recognize the lock on this chat, so it left it in place.' );
+			return byHand(
+				__( 'Studio does not recognize the lock on this chat, so it left it in place.' )
+			);
 		case 'owner-alive':
-			return __( 'The Studio process that ran the last turn is still running.' );
+			return __(
+				'The Studio process that ran the last turn is still running. Wait for the turn to finish, or quit that Studio app, then try again.'
+			);
 		case 'native-alive':
 		case 'guardian-alive':
 		case 'descendants-alive':
-			return __( 'A process of the last Claude Code turn is still running.' );
+			return sprintf(
+				/* translators: %s: a documentation file in the Studio repository. */
+				__(
+					'A process of the last Claude Code turn is still running. Wait for it to end, or quit the Studio app that started it, then try again. If it is still running once every Studio app is closed, follow the procedure in %s.'
+				),
+				CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
+			);
 		case 'owner-unverifiable':
 		case 'native-unverifiable':
 		case 'guardian-unverifiable':
 		case 'descendants-unverifiable':
-			return __( 'Studio could not check whether every process of the last turn has ended.' );
+			return retryThenByHand(
+				__( 'Studio could not check whether every process of the last turn has ended.' )
+			);
 		case 'native-unowned':
-			return __(
-				'A Claude Code process of the last turn may have started without Studio confirming that it owned it, so Studio cannot prove it has ended.'
+			return byHand(
+				__(
+					'A Claude Code process of the last turn may have started without Studio confirming that it owned it, so Studio cannot prove it has ended.'
+				)
 			);
 		case 'binding-mismatch':
 		case 'native-session-mismatch':
-			return __( 'The lock does not match this chat’s Claude workspace and session.' );
+			return sprintf(
+				/* translators: %s: a documentation file in the Studio repository. */
+				__(
+					'The lock does not match this chat’s Claude workspace and session. To continue, start a new Claude chat; this chat’s history stays available. To unlock this chat by hand, follow the procedure in %s.'
+				),
+				CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
+			);
 		case 'workspace-missing':
-			return __( 'This chat’s workspace or Claude configuration folder is no longer available.' );
+			return __(
+				'This chat’s workspace or Claude configuration folder is no longer available. Restore it where it was and try again, or start a new Claude chat.'
+			);
 		case 'native-session-missing':
 		case 'native-history-missing':
-			return __( 'This chat’s Claude Code history could not be found or verified.' );
+			return __(
+				'This chat’s Claude Code history could not be found or verified. To continue, start a new Claude chat; this chat’s history stays available.'
+			);
 		case 'journal-unreadable':
-			return __( 'Studio could not read this chat’s journal.' );
+			return __(
+				'Studio could not read this chat’s journal. Try again in a moment. If this keeps happening, start a new Claude chat.'
+			);
 		case 'lock-changed':
-			return __( 'The lock on this chat changed while Studio was checking it.' );
+			return __(
+				'The lock on this chat changed while Studio was checking it, so another Studio app may have recovered or used the chat. Reload the chat and try again.'
+			);
 		case 'recovery-in-progress':
-			return __( 'Another Studio app is recovering this chat.' );
+			return __(
+				'Another Studio app is recovering this chat, or may be. Wait for it to finish, or quit the other Studio apps, then try again.'
+			);
 		case 'recovery-failed':
-			return __( 'Studio could not record the recovery, so it kept the lock.' );
+			return retryThenByHand(
+				__( 'Studio could not record the recovery or release the lock, so it kept the lock.' )
+			);
 	}
 }
 
