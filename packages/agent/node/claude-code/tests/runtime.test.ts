@@ -2677,6 +2677,247 @@ it( 'starts no native process, and leaves no keeper, when the turn is cancelled 
 	}
 } );
 
+describe( 'the turns after a recovery (mock SDK)', () => {
+	// The OS answered as if the turn's owner and its tree had gone. In these
+	// tests the turn the recovery stands for is still waiting in this process;
+	// it is ended only once the test is done.
+	const goneSeams = {
+		platform: process.platform,
+		self: async () => ( { pid: 999999, start: 'recoverer' } ),
+		checkIdentity: async () => 'gone' as const,
+		checkTree: async () => ( { state: 'ended' as const } ),
+	};
+	type Runtime = typeof import('../runtime');
+	type Fixture = Awaited< ReturnType< typeof ownedNativeFixture > >;
+	type Query = ReturnType< typeof fakeNativeTurn >;
+	const bindingOf = ( fixture: Fixture ) => ( {
+		connectionId: 'native',
+		conversationId: 'chat',
+		siteId: 'site',
+		workingDirectory: fixture.root,
+		configDirectory: fixture.config,
+	} );
+	const optionsOf = ( query: Query ) =>
+		query.mock.calls[ 0 ][ 0 ].options as Record< string, unknown > & {
+			systemPrompt: { append: string };
+		};
+	async function turn(
+		runtime: Runtime,
+		fixture: Fixture,
+		id: string,
+		query: Query,
+		overrides: Partial< Parameters< Runtime[ 'runClaudeTurn' ] >[ 3 ] > = {},
+		signal = new AbortController().signal
+	) {
+		const events: Array< { type: string; outcome?: { status: string; code?: string } } > = [];
+		await runtime.runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, id ),
+			fixture.host,
+			{ prompt: 'hello', signal, onEvent: ( event ) => events.push( event ) },
+			{
+				storeRoot: fixture.storeRoot,
+				approve: async () => 'allow',
+				verifyTarget: async () => true,
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				prepareOwner: fixture.prepareOwner,
+				ownerIdentity: async () => ( { pid: 1234, start: id } ),
+				connection: fixture.connection,
+				prepare: fixture.prepare,
+				account: fixture.account,
+				...overrides,
+			}
+		);
+		return events;
+	}
+	const noted = async ( fixture: Fixture ) => {
+		const { createNativeSessionStore } = await import( '../sessions' );
+		return ( await createNativeSessionStore( fixture.storeRoot ).readJournals( 'chat' ) )
+			.flat()
+			.filter( ( event ) => ( event.type as string ) === 'turn.recovery-noted' );
+	};
+
+	it( 'resumes the same native session, tells Claude once what may or may not have run, and runs the next turn as a normal one, across a restart', async () => {
+		const { createNativeSessionStore } = await import( '../sessions' );
+		const { recoverClaudeRun } = await import( '../recovery' );
+		const { Client } = await import( '@modelcontextprotocol/sdk/client/index.js' );
+		// The SDK's wildcard export resolves at runtime, although the ESLint resolver misses it.
+		// eslint-disable-next-line import-x/no-unresolved
+		const { InMemoryTransport } = await import( '@modelcontextprotocol/sdk/inMemory.js' );
+		const fixture = await ownedNativeFixture( 'claude-after-recovery-' );
+		let finishCommand!: () => void;
+		const commandRunning = new Promise< void >( ( resolve ) => {
+			finishCommand = resolve;
+		} );
+		const stopFirst = new AbortController();
+		let first: Promise< unknown > | undefined;
+		try {
+			vi.mocked( fixture.host.sites.resolve ).mockResolvedValue( {
+				id: 'site',
+				path: fixture.root,
+				name: 'site',
+				url: 'http://localhost',
+				phpVersion: '8.4',
+			} );
+			vi.mocked( fixture.host.sites.wpCli ).mockImplementation( async () => {
+				await commandRunning;
+				return { exitCode: 0, stdout: '', stderr: '' };
+			} );
+			const runtime = await import( '../runtime' );
+			// The first turn dies while the draft the user allowed is being created.
+			const dying = fakeNativeTurn( fixture.root, {
+				projects: fixture.projects,
+				onTurn: async ( options ) => {
+					const [ clientTransport, serverTransport ] = InMemoryTransport.createLinkedPair();
+					const client = new Client( { name: 'studio-test', version: '1.0.0' } );
+					const server = (
+						options.mcpServers as {
+							studio: { instance: { connect( t: unknown ): Promise< void > } };
+						}
+					 ).studio.instance;
+					await Promise.all( [
+						server.connect( serverTransport ),
+						client.connect( clientTransport ),
+					] );
+					await client.callTool( {
+						name: 'wp_cli',
+						arguments: {
+							nameOrPath: 'site',
+							command: 'post create --post_status=draft --post_title=Hello',
+						},
+					} );
+				},
+			} );
+			first = turn( runtime, fixture, 'first', dying, {}, stopFirst.signal );
+			await vi.waitFor( () => expect( fixture.host.sites.wpCli ).toHaveBeenCalled() );
+			const store = createNativeSessionStore( fixture.storeRoot );
+			const { nativeSessionId } = ( await store.load( 'chat' ) )!;
+			expect( await recoverClaudeRun( store, bindingOf( fixture ), goneSeams ) ).toMatchObject( {
+				status: 'recovered',
+				uncertainOperations: [
+					expect.objectContaining( { tool: 'wp_cli', evidence: 'authorized' } ),
+					expect.objectContaining( { tool: 'sites.wpCli', evidence: 'authorized' } ),
+				],
+			} );
+			const recoveredLock = ( await store.readJournals( 'chat' ) )
+				.flat()
+				.find( ( event ) => event.type === 'turn.recovered' ) as { lock: string };
+
+			// Studio restarts between the recovery and the next turn.
+			vi.resetModules();
+			const restarted = await import( '../runtime' );
+			const next = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+			expect( ( await turn( restarted, fixture, 'next', next ) ).at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'success' },
+			} );
+			const resumed = optionsOf( next );
+			expect( resumed.resume ).toBe( nativeSessionId );
+			expect( resumed.sessionId ).toBeUndefined();
+			const base = optionsOf( dying ).systemPrompt.append;
+			const note = resumed.systemPrompt.append;
+			expect( note.startsWith( base ) ).toBe( true );
+			expect( note ).toContain( 'the previous turn' );
+			expect( note ).toContain( 'interrupted' );
+			expect( note ).toContain( 'Run a command: wp_cli' );
+			expect( note ).toContain( 'Create a draft post on the current local site' );
+			expect( note ).toMatch( /inspect/i );
+			expect( note ).toMatch( /do not repeat/i );
+			expect( note ).not.toContain( 'Hello' );
+			expect( await noted( fixture ) ).toEqual( [
+				{
+					type: 'turn.recovery-noted',
+					runId: 'next',
+					turnId: 'next',
+					locks: [ recoveredLock.lock ],
+				},
+			] );
+
+			const after = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+			expect( ( await turn( restarted, fixture, 'after', after ) ).at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'success' },
+			} );
+			expect( optionsOf( after ).resume ).toBe( nativeSessionId );
+			expect( optionsOf( after ).systemPrompt.append ).toBe( base );
+			expect( await noted( fixture ) ).toHaveLength( 1 );
+		} finally {
+			stopFirst.abort();
+			finishCommand();
+			await first;
+			await fixture.cleanup();
+		}
+	} );
+
+	it( 'starts one native session for a recovered chat that had none, says only that the turn was interrupted when nothing was uncertain, and keeps that until a prompt carries it', async () => {
+		const { createNativeSessionStore } = await import( '../sessions' );
+		const { recoverClaudeRun } = await import( '../recovery' );
+		const fixture = await ownedNativeFixture( 'claude-after-recovery-fresh-' );
+		let finishPreparing!: ( prepared: { ok: false } ) => void;
+		const preparing = new Promise< { ok: false } >( ( resolve ) => {
+			finishPreparing = resolve;
+		} );
+		const prepareFirst = vi.fn( () => preparing );
+		let first: Promise< unknown > | undefined;
+		try {
+			const runtime = await import( '../runtime' );
+			// The first turn dies before it starts anything: its lock names no native session.
+			first = turn( runtime, fixture, 'first', fakeNativeTurn( fixture.root ), {
+				prepare: prepareFirst,
+			} );
+			await vi.waitFor( () => expect( prepareFirst ).toHaveBeenCalled() );
+			const store = createNativeSessionStore( fixture.storeRoot );
+			expect( await store.load( 'chat' ) ).toBeUndefined();
+			expect( await recoverClaudeRun( store, bindingOf( fixture ), goneSeams ) ).toMatchObject( {
+				status: 'recovered',
+				uncertainOperations: [],
+			} );
+
+			// The next turn cannot own its native process, so no prompt carries the note.
+			const unowned = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+			expect(
+				await turn( runtime, fixture, 'unowned', unowned, {
+					prepareOwner: fakeProcessOwner( { ready: false, failure: 'job-assignment-denied' } )
+						.prepareOwner,
+				} )
+			).toEqual( [
+				expect.objectContaining( {
+					outcome: expect.objectContaining( { code: 'process_unowned' } ),
+				} ),
+			] );
+			expect( await noted( fixture ) ).toEqual( [] );
+
+			const fresh = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+			expect( ( await turn( runtime, fixture, 'fresh', fresh ) ).at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'success' },
+			} );
+			const started = optionsOf( fresh );
+			expect( started.resume ).toBeUndefined();
+			expect( typeof started.sessionId ).toBe( 'string' );
+			const note = started.systemPrompt.append;
+			expect( note ).toContain( 'interrupted' );
+			expect( note ).not.toMatch( /may or may not|inspect/i );
+			expect( await noted( fixture ) ).toEqual( [
+				expect.objectContaining( { turnId: 'fresh' } ),
+			] );
+
+			const after = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+			expect( ( await turn( runtime, fixture, 'after', after ) ).at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'success' },
+			} );
+			expect( optionsOf( after ).resume ).toBe( started.sessionId );
+			expect( optionsOf( after ).sessionId ).toBeUndefined();
+			expect( optionsOf( after ).systemPrompt.append ).not.toContain( 'interrupted' );
+			expect( await noted( fixture ) ).toHaveLength( 1 );
+		} finally {
+			finishPreparing( { ok: false } );
+			await first;
+			await fixture.cleanup();
+		}
+	} );
+} );
+
 // The real ownership logic, with the OS answered through seams: each case is
 // a native process that exits, or cannot be owned, before Studio owns it.
 describe( 'a native process Studio could not own (mock SDK, owned-process with injected OS seams)', () => {

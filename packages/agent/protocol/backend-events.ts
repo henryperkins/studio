@@ -178,8 +178,21 @@ export interface ClaudeOperationJournalEvent extends BackendTurnIds, ToolCall {
 	description: string;
 }
 
+/**
+ * Written once a turn's prompt has gone to Claude together with the note
+ * about the recoveries it names, so the note is given once. Journal-only.
+ */
+export interface ClaudeRecoveryNotedJournalEvent extends BackendTurnIds {
+	type: 'turn.recovery-noted';
+	/** The `lock` of each `turn.recovered` the note covered. */
+	locks: string[];
+}
+
 /** What a running Claude turn writes to its own journal. */
-export type ClaudeTurnJournalEvent = BackendTurnEvent | ClaudeOperationJournalEvent;
+export type ClaudeTurnJournalEvent =
+	| BackendTurnEvent
+	| ClaudeOperationJournalEvent
+	| ClaudeRecoveryNotedJournalEvent;
 
 /** What a Claude conversation's display journal holds once read back. */
 export type ClaudeJournalEvent =

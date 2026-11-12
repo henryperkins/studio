@@ -41,7 +41,9 @@ import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk/cor
 import type {
 	BackendTurnEvent,
 	ClaudeBackendTurnSnapshot,
-	ClaudeOperationJournalEvent,
+	ClaudeJournalEvent,
+	ClaudeRecoveryJournalEvent,
+	ClaudeTurnJournalEvent,
 } from '@studio/agent/protocol/backend-events';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type { ClaudeModelOption, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
@@ -247,6 +249,59 @@ interface NativeLaunch {
 	/** Called on every spawn request, before any check. */
 	onRequested: () => void;
 	onOwned: ( owned: OwnedProcess ) => void;
+	/** Said to Claude for this turn only, after Studio's standing instructions. */
+	instructions?: string;
+}
+
+const STUDIO_INSTRUCTIONS =
+	'Work only in the current local WordPress site. Use Studio tools for WordPress operations. Do not publish or access production.';
+
+const oneLine = ( text: unknown ) => String( text ).replace( /\s+/g, ' ' ).trim();
+
+/**
+ * What the first turn after a recovery tells Claude, once: that the previous
+ * turn was interrupted and nothing was replayed; and, when operations of it
+ * may or may not have taken effect, which ones, and to inspect the current
+ * state before repeating any of them. Covers every recovery no prompt has
+ * carried yet; undefined when there is none.
+ */
+function recoveryNote(
+	journals: ClaudeJournalEvent[][]
+): { text: string; locks: string[] } | undefined {
+	const events = journals.flat();
+	const noted = new Set(
+		events.flatMap( ( event ) => ( event.type === 'turn.recovery-noted' ? event.locks : [] ) )
+	);
+	const recoveries = events.filter(
+		( event ): event is ClaudeRecoveryJournalEvent =>
+			event.type === 'turn.recovered' && ! noted.has( event.lock )
+	);
+	if ( ! recoveries.length ) return;
+	const uncertain = [
+		...new Set(
+			recoveries.flatMap( ( recovery ) =>
+				( Array.isArray( recovery.uncertainOperations ) ? recovery.uncertainOperations : [] ).map(
+					( operation ) => {
+						const description = oneLine( operation.description );
+						const tool = oneLine( operation.tool );
+						return description.includes( tool )
+							? `- ${ description }`
+							: `- ${ description } (${ tool })`;
+					}
+				)
+			)
+		),
+	];
+	const lines = [
+		'Studio note: Claude Code stopped before the previous turn of this conversation finished, so that turn was interrupted. Studio recovered the conversation and replayed nothing from that turn.',
+	];
+	if ( uncertain.length )
+		lines.push(
+			'These operations of the interrupted turn may or may not have taken effect:',
+			...uncertain,
+			'Before repeating any of them, inspect the current state to see whether it already took effect. Do not repeat any of them automatically: repeat one only when the user’s request still needs it and your inspection shows that it did not take effect.'
+		);
+	return { text: lines.join( '\n' ), locks: recoveries.map( ( recovery ) => recovery.lock ) };
 }
 
 function nativeLaunchOptions(
@@ -306,8 +361,7 @@ function nativeLaunchOptions(
 		systemPrompt: {
 			type: 'preset',
 			preset: 'claude_code',
-			append:
-				'Work only in the current local WordPress site. Use Studio tools for WordPress operations. Do not publish or access production.',
+			append: [ STUDIO_INSTRUCTIONS, launch.instructions ].filter( Boolean ).join( '\n\n' ),
 		},
 	};
 }
@@ -716,12 +770,22 @@ export async function runClaudeTurn(
 			stop( 'account' );
 			return 'changed';
 		};
+		let journals: ClaudeJournalEvent[][];
+		try {
+			journals = await store.readJournals( workspace.conversationId );
+		} catch {
+			// Without its journal, Studio cannot tell whether an earlier turn was interrupted.
+			terminal = rebind(
+				'Studio could not read this chat’s journal. Start a new Claude chat to continue.'
+			);
+			return;
+		}
 		let existing;
 		try {
 			existing = await store.load( workspace.conversationId );
 			if (
 				! existing &&
-				( await store.readJournals( workspace.conversationId ) ).some( ( events ) =>
+				journals.some( ( events ) =>
 					events.some(
 						( event ) =>
 							event.type !== 'turn.recovered' &&
@@ -736,6 +800,7 @@ export async function runClaudeTurn(
 			terminal = rebind();
 			return;
 		}
+		const note = recoveryNote( journals );
 		if ( existing?.accountKey && existing.accountKey !== accountKey ) {
 			terminal = rebind(
 				'This chat belongs to another Claude account. Sign that account back in, or start a new chat.'
@@ -776,7 +841,7 @@ export async function runClaudeTurn(
 			input.onEvent( event );
 		};
 		// Journal-only, after everything emitted before it, and on disk when it settles.
-		const recordOperation = ( event: ClaudeOperationJournalEvent ): Promise< void > => {
+		const journalOnly = ( event: ClaudeTurnJournalEvent ): Promise< void > => {
 			const written = journalWork.then( () => journal!.append( event ) );
 			journalWork = written.catch( () => {
 				journalFailed = true;
@@ -814,7 +879,7 @@ export async function runClaudeTurn(
 			now: clock,
 			verifyTarget: ( expected ) => options.verifyTarget( snapshot, expected ),
 			onEvent: emit,
-			recordOperation,
+			recordOperation: journalOnly,
 		} );
 		const guard = policy;
 		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy: guard }, emit );
@@ -824,29 +889,35 @@ export async function runClaudeTurn(
 			connectionWatch = setTimeout( () => void watchConnection(), 1000 ).unref();
 		};
 		const nativeInput = async function* (): AsyncGenerator< SDKUserMessage > {
-			if ( ( await gate ) && ! controller.signal.aborted )
-				yield {
-					type: 'user' as const,
-					message: {
-						role: 'user',
-						content: images.length
-							? [
-									{ type: 'text', text: input.prompt },
-									...images.map( ( image ) => ( {
-										type: 'image' as const,
-										source: {
-											type: 'base64' as const,
-											media_type: image.mimeType,
-											data: image.dataBase64,
-										},
-									} ) ),
-							  ]
-							: input.prompt,
-					},
-					parent_tool_use_id: null,
-					session_id: session.nativeSessionId,
-					client_composed: true as const,
-				};
+			if ( ! ( await gate ) || controller.signal.aborted ) return;
+			// The recovery note goes to Claude with this prompt and is not given again.
+			// A crash before this is on disk gives it once more, never not at all.
+			if ( note )
+				void journalOnly( { type: 'turn.recovery-noted', runId, turnId, locks: note.locks } ).catch(
+					() => {}
+				);
+			yield {
+				type: 'user' as const,
+				message: {
+					role: 'user',
+					content: images.length
+						? [
+								{ type: 'text', text: input.prompt },
+								...images.map( ( image ) => ( {
+									type: 'image' as const,
+									source: {
+										type: 'base64' as const,
+										media_type: image.mimeType,
+										data: image.dataBase64,
+									},
+								} ) ),
+						  ]
+						: input.prompt,
+				},
+				parent_tool_use_id: null,
+				session_id: session.nativeSessionId,
+				client_composed: true as const,
+			};
 		};
 		const effort = snapshot.effort;
 		if ( ! isClaudeEffort( effort ) ) throw new Error();
@@ -874,6 +945,7 @@ export async function runClaudeTurn(
 					onRequested: () => {
 						spawnRequested = true;
 					},
+					instructions: note?.text,
 					onOwned: ( started ) => {
 						owned = started;
 						ownership = started.ready().then(
