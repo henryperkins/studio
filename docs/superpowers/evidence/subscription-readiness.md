@@ -223,26 +223,39 @@ Commits `646753a68` and `b72c109b0`. No cell's status changes, and Windows x64 s
 
 ### P2 record (Claude process trees, November 11, 2026)
 
-Commits `88d7dc4fa`, `59caf8c01`, `feaae16ff`, then fix round 1 (`9644af6dc`, `5f431aad4`). This record changes no cell's status and qualifies nothing.
+Commits `88d7dc4fa`, `59caf8c01`, `feaae16ff`, then fix round 1 (`9644af6dc`, `5f431aad4`), then fix round 2 (`21cc4078e`, `b698bd6e2`). This record changes no cell's status and qualifies nothing.
 
 - **What changed.** `packages/common/lib/owned-process.ts` gives a process identity (PID plus the start time the OS recorded) and an owned-process handle. The Claude runtime starts its native process through it.
-  - On cancel, the execution policy refuses new operations and ends pending approvals first. The runtime then asks the process to stop, waits a bounded time, and escalates only within the owned tree.
-  - A turn starts no native process unless the Windows job exists, and sends no prompt unless the process is verified in it. It then ends with `process_unowned` and the reason.
-  - A turn keeps its run lock unless the whole tree is gone.
+  - On cancel, the execution policy refuses new operations and ends pending approvals first. The runtime then asks the process to stop, waits a bounded time, and escalates only within the owned tree. A cancel while the keeper is still creating the job ends the wait, and nothing is started.
+  - A turn starts no native process unless the Windows job exists. It sends no prompt unless the SDK started its process through Studio's spawn hook and the process is verified as owned (Windows: in the job; POSIX: its identity read and its supervisor running). Otherwise it ends with `process_unowned` and the reason. Model discovery reports models only under the same condition.
+  - The run lock is released only on proof that nothing of the run remains: the job reports no members after `TerminateJobObject`; the keeper died after a verified assignment with kill-on-close set, and the child has exited; or the process group is empty (`kill(-pgid, 0)` fails with `ESRCH`). Otherwise the lock is kept and the turn ends with `process_unconfirmed`, whose message says the chat stays locked until it is recovered.
 - **Mechanisms.**
-  - Windows: a kernel job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no breakaway. A PowerShell keeper (static C# through `Add-Type`) creates the job before the native process starts, assigns it within moments, verifies it is in the job and that no child of it is outside, and holds the only handle. Every descendant joins the job. Escalation is `TerminateJobObject`. The job also ends when its keeper dies or Studio's process ends.
-  - POSIX: a new session and process group. The group is signalled only while the leader is unreaped, or after the leader's identity has been re-checked. A detached supervisor ends the group if Studio's process dies.
+  - Windows: a kernel job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no breakaway. A PowerShell keeper (static C# through `Add-Type`) creates the job before the native process starts, assigns it within moments, verifies it is in the job and that no direct child of it other than its console host is outside, and holds the only handle. The keeper's script arrives as its first line of input from Studio, because Windows caps a command line at 32,767 characters; it refuses to start outside Full Language mode. A process a job member creates joins the job; Node's own nested job, which allows silent breakaway, does not take it out of ours. Escalation is `TerminateJobObject`. The job also ends when its keeper dies or Studio's process ends.
+  - Windows, when the assignment fails or is incomplete: the keeper ends the native process and every descendant it can prove by handle (its parent, read through its own handle, is a process already held, and it started no earlier). It holds the whole provable tree before ending any of it, then ends what the job holds, and Studio ends its own child. Such a turn always keeps its lock: a descendant whose parent has already exited cannot be seen.
+  - POSIX: a new session and process group. The group is signalled only while the leader is unreaped, or after the leader's identity has been re-checked. A leader reaped before its identity was read is never signalled; its group counts as ended only on `ESRCH`. A detached supervisor ends the group if Studio's process dies; its shell probe reports a process as gone only when no such process exists, and anything it cannot read as unknown, which it does not signal.
 - **Proven natively on Windows x64 (this machine), with Node test processes only.**
   - Each of close, abort, stdin EOF, native death, owner death and keeper death ends the child and its shell grandchild.
-  - So are a double-forked orphan, a child started just before shutdown, and the orphan left when the child's own job kills the shell.
+  - So are a double-forked orphan, a child started after the tree was first seen, and the orphan left when the child's own job kills the shell. The late-child test reads the child's identity before ending the tree; with the job's breakaway allowed (a mutation, reverted) it fails at that child, and it passes without.
+  - The keeper's handle-proven walk ends a tree, including a descendant outside the tree's own Node job, and leaves alone a process whose parent exited before the keeper held it.
   - An unrelated process survives.
   - Exactly one non-success terminal is emitted, and a host operation queued behind the cancelled approval never runs.
   - Three consecutive runs passed. No real Claude executable was run and no sign-in was opened.
-- **Awaiting native runs elsewhere.** The same lifecycle and owned-process tests are written to run natively on Linux and macOS but have not run there. The Linux `/proc` and macOS `ps` identity readings and the POSIX group logic were checked only through injected seams here. The shell probe parity test is skipped on Windows. Windows ARM64 has not run.
+- **Checked here through injected seams only.** The failed-assignment, keeper-timeout, language-mode and fast-exit outcomes, and the lock each leaves, through the real ownership logic with the OS answered by fakes. The shell probe's error classes, run by Git for Windows' `sh` against a fake `/proc` and a stub `ps` and compared with Node's probe; and the shell keeper's decision to signal.
+- **Awaiting native runs elsewhere.** The same lifecycle and owned-process tests are written to run natively on Linux and macOS but have not run there. The Linux `/proc` and macOS `ps` identity readings and the POSIX group logic were checked only through injected seams here. The shell probe parity test against real processes is skipped on Windows. Windows ARM64 has not run.
 - **Known limits.**
-  - Windows: a process another service creates for the run (WMI, the Task Scheduler, a COM server) is not in the job. The keeper needs PowerShell in Full Language mode; without it, no turn starts. It costs about 0.7 s of CPU to start and about 70 MB private memory, and is idle afterwards.
-  - POSIX: a descendant that leaves the process group (setsid, a daemonizing double fork) is not reached.
-  - Recovery after an owner crash (lock races, uncertain mutations) is C4's.
+  - Windows:
+    - A process another service creates for the run (WMI `Win32_Process.Create`, the Task Scheduler, a COM out-of-process server) is not a descendant and is not in the job.
+    - A process a member creates with `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` naming a process outside the job takes that process's job, so it can land outside ours.
+    - The pre-assignment window (about 40 ms here, from spawn to assignment): a child the native process starts in it is outside the job. At `confirm` the keeper checks only direct children, so a child that started and exited in that window, leaving its own child, is not detected. No prompt and no tool runs in the window.
+    - The native process's console host (`%SystemRoot%\System32\conhost.exe`) is excluded from that check by its exact path; Windows creates it with the process, before assignment, and it ends with its last client.
+    - Constrained Language Mode is unsupported: the keeper refuses to start (`keeper-blocked`), and no turn starts.
+    - A native process that exits before its assignment is confirmed, or whose assignment fails, leaves the chat locked (`process_unconfirmed`) until it is recovered.
+    - The keeper costs about 0.6 s of CPU to start (about 0.66 s to `prepared`) and about 63 MB private memory, and used no CPU over the next 30 s idle (measured here once).
+  - POSIX:
+    - A descendant that leaves the process group (setsid, a daemonizing double fork) is not reached.
+    - Before the supervisor reports ready, nothing ends the group if Studio's process dies: the group leads its own session and outlives Studio.
+    - Once the leader is reaped, a check and the signal after it are separate system calls; only a complete wrap of the PID space between them could make the group ID name another group.
+  - Recovery after an owner crash (lock races, uncertain mutations) is C4's. On POSIX it needs a group-level check: a leader whose identity is gone does not mean its group is empty.
 
 ## D. Studio tool inventory (counted from code)
 
