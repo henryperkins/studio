@@ -60,10 +60,13 @@ import {
 import {
 	evalHistoryMessages,
 	findEvalFixturesDir,
+	installWpcomWriteGuard,
 	loadEvalAttachments,
 	withMockedRemote,
+	withMockedWpcomRequest,
 	type EvalAttachments,
 	type RemoteCall,
+	type WpcomWriteGuard,
 } from 'cli/ai/eval-harness';
 import { parseEvalRunnerVars, type EvalRunnerVars, type EvalSeed } from 'cli/ai/eval-input';
 import { captureTurnOutcome, fingerprintSites, type TurnOutcome } from 'cli/ai/eval-outcome';
@@ -619,6 +622,7 @@ export async function runEval( input: EvalRunnerInput ) {
 	let phaseStartedAt = Date.now();
 
 	let plan: EvalProviderPlan | null = null;
+	let runProvider: AiProviderId;
 	let aiEnvironment: Record< string, string >;
 	if ( input.provider ) {
 		if ( ! input.provider.ok ) {
@@ -630,6 +634,7 @@ export async function runEval( input: EvalRunnerInput ) {
 			return refusedRun( resolved.failure, { requested: null } );
 		}
 		plan = resolved.plan;
+		runProvider = plan.requested.kind;
 		aiEnvironment = plan.env;
 		if ( plan.requested.kind === 'chatgpt-oauth' ) {
 			setChatGptTokenClient( createChatGptTokenClient() );
@@ -645,7 +650,11 @@ export async function runEval( input: EvalRunnerInput ) {
 		phaseStartedAt = Date.now();
 		aiEnvironment = await resolveAiEnvironment( aiProvider );
 		phaseTimingsMs.resolve_ai_environment_ms = Date.now() - phaseStartedAt;
+		runProvider = aiProvider;
 	}
+	// A selected case never changes anything on WordPress.com unless it is a
+	// staging case: without a `remote` var it runs as `remote: mock`.
+	const remote = input.remote ?? ( plan ? 'mock' : undefined );
 	// Mirrors the fallback in the agent runtime (packages/agent/node/runtime) — keep in sync.
 	const resolvedModel = plan ? plan.requested.model : input.model ?? DEFAULT_MODEL;
 	const providerRefusal = ( failure: EvalRefusal ) =>
@@ -698,8 +707,7 @@ export async function runEval( input: EvalRunnerInput ) {
 
 	const remoteCalls: RemoteCall[] = [];
 	const uiEvents: UiEvents = { artifacts: [], previewReloads: 0 };
-	const baseHost =
-		input.remote === 'mock' ? withMockedRemote( cliAgentHost, remoteCalls ) : cliAgentHost;
+	const baseHost = remote === 'mock' ? withMockedRemote( cliAgentHost, remoteCalls ) : cliAgentHost;
 	const host = input.ui
 		? {
 				...baseHost,
@@ -783,7 +791,14 @@ export async function runEval( input: EvalRunnerInput ) {
 	const restoreCaseEnvironment = saveCaseEnvironment();
 	const caseFolders: string[] = [];
 	let observerFile: string | null = null;
-	let uninstallObserver: ( () => void ) | null = null;
+	// What the case swaps in for its turns, put back in reverse order.
+	const restorers: Array< () => void > = [];
+	const restore = () => {
+		while ( restorers.length ) {
+			restorers.pop()?.();
+		}
+	};
+	let wpcomGuard: WpcomWriteGuard | null = null;
 	let bystanderPaths: string[] = [];
 	let seeded: SeededFixtures | null = null;
 	let sitesDeleted = false;
@@ -812,11 +827,21 @@ export async function runEval( input: EvalRunnerInput ) {
 		observerFile = plan
 			? path.join( os.tmpdir(), `studio-eval-requests-${ Date.now() }-${ process.pid }.ndjson` )
 			: null;
-		uninstallObserver = observerFile
-			? installAcceptanceObserver( observerFile, globalThis, {
+		if ( observerFile ) {
+			restorers.push(
+				installAcceptanceObserver( observerFile, globalThis, {
 					bearerIdentity: plan?.bearerIdentity,
-			  } )
-			: null;
+				} )
+			);
+		}
+		if ( remote === 'mock' ) {
+			restorers.push( withMockedWpcomRequest( remoteCalls ) );
+			wpcomGuard = installWpcomWriteGuard( {
+				allowImageService: input.imageService === 'required',
+				allowProxyInference: runProvider === 'wpcom',
+			} );
+			restorers.push( wpcomGuard.uninstall );
+		}
 		const replies: Array< { provider?: unknown; model?: unknown } > = [];
 
 		let inspections: Inspection[] = [];
@@ -999,9 +1024,8 @@ export async function runEval( input: EvalRunnerInput ) {
 			error = caught instanceof Error ? caught.message : String( caught );
 		} finally {
 			clearTimeout( timeout );
-			// The turns are over: the route report covers their requests only.
-			uninstallObserver?.();
-			uninstallObserver = null;
+			// The turns are over: the route report and the guard cover theirs only.
+			restore();
 			outcome = await captureTurnOutcome(
 				sitesBeforeTurn,
 				seeded?.activeSitePath,
@@ -1017,6 +1041,15 @@ export async function runEval( input: EvalRunnerInput ) {
 			await deleteSites( bystanderPaths );
 		}
 		phaseTimingsMs.total_eval_ms = elapsed();
+		const blockedWrites = wpcomGuard?.attempts ?? [];
+		if ( blockedWrites.length ) {
+			success = false;
+			error = `wpcom-write-under-mock: the case tried ${
+				blockedWrites.length
+			} request(s) that could change WordPress.com under remote: mock; none was sent.${
+				error ? ` ${ error }` : ''
+			}`;
+		}
 
 		const providerRoute: ProviderRouteReport | null =
 			plan && observerFile
@@ -1035,7 +1068,15 @@ export async function runEval( input: EvalRunnerInput ) {
 
 		return {
 			...( providerRoute ? { providerRoute } : {} ),
-			...( input.remote ? { remoteCalls } : {} ),
+			...( remote ? { remoteCalls } : {} ),
+			...( wpcomGuard
+				? {
+						remoteGuard: {
+							code: blockedWrites.length ? 'wpcom-write-under-mock' : null,
+							blocked: blockedWrites,
+						},
+				  }
+				: {} ),
 			...( input.ui ? { uiEvents } : {} ),
 			...( input.imageService ? { imageService: { configured: imageServiceConfigured } } : {} ),
 			...( attachments ? { attachments: attachments.summary } : {} ),
@@ -1065,7 +1106,7 @@ export async function runEval( input: EvalRunnerInput ) {
 			outcome,
 		};
 	} finally {
-		uninstallObserver?.();
+		restore();
 		if ( ! sitesDeleted ) {
 			await seeded?.cleanup().catch( () => undefined );
 			await deleteSites( bystanderPaths ).catch( () => undefined );

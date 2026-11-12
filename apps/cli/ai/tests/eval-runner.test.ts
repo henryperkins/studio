@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
+import { wpcomRequestTool } from '@studio/agent/node/tools/wpcom-request';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { evalConnectionRef } from 'cli/ai/eval-provider';
 import { readEvalRunnerInput, runEval as runEvalUntyped } from 'cli/ai/eval-runner';
@@ -183,6 +184,7 @@ interface RunReport {
 	};
 	stoppedAt?: unknown;
 	remoteCalls?: unknown[];
+	remoteGuard?: { code: string | null; blocked: unknown[] };
 	imageService?: { configured: boolean };
 	attachments?: unknown[];
 	turns?: Array< Record< string, unknown > >;
@@ -581,6 +583,101 @@ describe( 'eval runner provider selection', () => {
 				},
 				{ operation: 'preview-create', site: 'Parity Site' },
 			] );
+		} );
+
+		describe( 'WordPress.com under remote: mock', () => {
+			const site = 'https://public-api.wordpress.com/rest/v1.1/sites/113/posts/new';
+			const images = 'https://public-api.wordpress.com/wpcom/v2/ai-api-proxy/v1/images/generations';
+			const sentToNetwork = () =>
+				fetchSpy.mock.calls.map(
+					( [ url, init ]: [ unknown, RequestInit | undefined ] ) =>
+						`${ init?.method ?? 'GET' } ${ String( url ) }`
+				);
+
+			it( 'records a write through wpcom_request instead of sending it, and the case stays green', async () => {
+				agent.behavior = {
+					replyProvider: 'studio-wpcom',
+					act: async ( { host } ) => {
+						await wpcomRequestTool.handler(
+							{ siteId: 113, method: 'POST', path: '/posts', body: { title: 'Hi' } },
+							{ host, onProgress: () => undefined }
+						);
+					},
+				};
+				const result = await runEval( input( { remote: 'mock' } ) );
+				expect( result.success ).toBe( true );
+				expect( result.remoteCalls ).toEqual( [
+					{ operation: 'wpcom-request', method: 'POST', site: '113', target: '/posts' },
+				] );
+				expect( result.remoteGuard ).toEqual( { code: null, blocked: [] } );
+				expect( sentToNetwork() ).toEqual( [] );
+			} );
+
+			it( 'fails the case with its code on a write sent around the mock, which never leaves the process', async () => {
+				agent.behavior = {
+					replyProvider: 'studio-wpcom',
+					act: async () => {
+						await fetch( site, { method: 'POST', body: '{}' } ).catch( () => undefined );
+						await fetch( 'https://public-api.wordpress.com/rest/v1.1/me' );
+					},
+				};
+				const result = await runEval( input( { remote: 'mock' } ) );
+				expect( result ).toMatchObject( {
+					success: false,
+					error: expect.stringMatching( /^wpcom-write-under-mock/ ),
+					remoteGuard: {
+						code: 'wpcom-write-under-mock',
+						blocked: [ { method: 'POST', host: 'wpcom', endpoint: 'other', via: 'fetch' } ],
+					},
+				} );
+				// Reads still reach WordPress.com.
+				expect( sentToNetwork() ).toEqual( [
+					'GET https://public-api.wordpress.com/rest/v1.1/me',
+				] );
+				expect( globalThis.fetch ).toBe( fetchSpy );
+			} );
+
+			it( 'lets the image service write only in a case labelled imageService: required', async () => {
+				imageService.configured = true;
+				agent.behavior = {
+					replyProvider: 'studio-wpcom',
+					act: async () => {
+						await fetch( images, { method: 'POST', body: '{}' } ).catch( () => undefined );
+					},
+				};
+				const labelled = await runEval( input( { remote: 'mock', imageService: 'required' } ) );
+				expect( labelled.remoteGuard ).toEqual( { code: null, blocked: [] } );
+				expect( sentToNetwork() ).toEqual( [ `POST ${ images }` ] );
+
+				fetchSpy.mockClear();
+				const unlabelled = await runEval( input( { remote: 'mock' } ) );
+				expect( unlabelled.remoteGuard ).toMatchObject( {
+					code: 'wpcom-write-under-mock',
+					blocked: [ { host: 'wpcom-ai-proxy', endpoint: 'images' } ],
+				} );
+				expect( sentToNetwork() ).toEqual( [] );
+			} );
+
+			it( 'guards every selected case, and leaves an unselected case without remote as it was', async () => {
+				let fetchInTurn: unknown;
+				agent.behavior = {
+					replyProvider: 'studio-chatgpt',
+					act: async () => {
+						fetchInTurn = globalThis.fetch;
+						await fetch( site, { method: 'POST' } ).catch( () => undefined );
+					},
+				};
+				const selected = await runEval( input( {}, chatGptEnv() ) );
+				expect( selected.remoteGuard ).toMatchObject( { code: 'wpcom-write-under-mock' } );
+				expect( selected.remoteCalls ).toEqual( [] );
+
+				fetchSpy.mockClear();
+				const unselected = await runEval( input() );
+				expect( fetchInTurn ).toBe( fetchSpy );
+				expect( unselected ).not.toHaveProperty( 'remoteGuard' );
+				expect( unselected ).not.toHaveProperty( 'remoteCalls' );
+				expect( sentToNetwork() ).toEqual( [ `POST ${ site }` ] );
+			} );
 		} );
 
 		it( 'refuses remote: staging without a designated staging site, before any site or turn', async () => {

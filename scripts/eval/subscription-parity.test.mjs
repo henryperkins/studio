@@ -43,6 +43,8 @@ describe( 'subscription parity config', () => {
 		expect( config.defaultTest.vars ).toMatchObject( { requireProvider: true, remote: 'mock' } );
 		for ( const { vars, checks: names } of cases ) {
 			expect( names, vars.caseId ).toContain( 'ranOnRequestedRoute' );
+			// Under remote: mock, a write to WordPress.com fails the case.
+			expect( names, vars.caseId ).toContain( 'noWordPressComWrites' );
 			// The selection comes from the environment, never from a case.
 			expect( vars, vars.caseId ).not.toHaveProperty( 'provider' );
 			expect( vars, vars.caseId ).not.toHaveProperty( 'model' );

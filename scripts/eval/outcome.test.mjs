@@ -798,6 +798,36 @@ describe( 'provider route checks', () => {
 	} );
 } );
 
+describe( 'WordPress.com writes under remote: mock', () => {
+	const guarded = ( blocked = [] ) => ( {
+		remoteGuard: { code: blocked.length ? 'wpcom-write-under-mock' : null, blocked },
+	} );
+
+	test( 'noWordPressComWrites passes when the guard refused nothing', () => {
+		expect( run( checks.noWordPressComWrites, guarded(), { remote: 'mock' } ).pass ).toBe( true );
+	} );
+
+	test( 'noWordPressComWrites fails with its code on a refused write', () => {
+		const verdict = run(
+			checks.noWordPressComWrites,
+			guarded( [ { method: 'POST', host: 'wpcom', endpoint: 'other', via: 'http' } ] ),
+			{ remote: 'mock' }
+		);
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( /^wpcom-write-under-mock:.*POST/ );
+	} );
+
+	test( 'noWordPressComWrites fails a mocked case that ran without the guard', () => {
+		const verdict = run( checks.noWordPressComWrites, { textSegments: [] }, { remote: 'mock' } );
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( /^remote-guard-missing:/ );
+	} );
+
+	test( 'noWordPressComWrites leaves a staging case to its own checks', () => {
+		expect( run( checks.noWordPressComWrites, {}, { remote: 'staging' } ).pass ).toBe( true );
+	} );
+} );
+
 describe( 'parity checks', () => {
 	const site = ( extra = {} ) => outcome( { ...workingSite, ...extra } );
 	const turns = ( ...starts ) =>

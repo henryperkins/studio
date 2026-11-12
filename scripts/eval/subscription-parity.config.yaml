@@ -13,12 +13,17 @@
 # so another subscription provider runs it with its own selection.
 #
 # Every case is judged on a deterministic final state or on what the user was
-# shown (outcome.mjs). Remote operations (push, pull, preview create, update,
-# delete) are recorded by a mocked host (`remote: mock`) and never reach
-# WordPress.com, except in the `staging:` cases at the end, which change only
-# the disposable staging site the runner is told about and are refused
-# without it. Cases marked `[image service]` need Studio's separate
-# WordPress.com image service and are refused without it; the
+# shown (outcome.mjs). Under `remote: mock` no request that could change
+# WordPress.com leaves the process: pushes, pulls and preview create, update and
+# delete are recorded by a mocked host, writes through `wpcom_request` are
+# recorded and answered by a fixture, and any other request to a WordPress.com
+# host with a method other than GET or HEAD is refused and fails the case
+# (`noWordPressComWrites`, code `wpcom-write-under-mock`). The one exception is
+# Studio's image service in the cases marked `[image service]`. Reads (GET,
+# HEAD) still reach WordPress.com with the case's copy of your login. The
+# `staging:` cases at the end change only the staging site you designate for
+# the run and are refused without it. Cases marked `[image service]` need
+# Studio's separate WordPress.com image service and are refused without it; the
 # `[fixture-forced compaction]` case starts from a seeded history whose last
 # reply reports a context at the compaction threshold.
 
@@ -39,6 +44,8 @@ defaultTest:
   assert:
     - type: javascript
       value: file://outcome.mjs:ranOnRequestedRoute
+    - type: javascript
+      value: file://outcome.mjs:noWordPressComWrites
 
 tests:
   # --- Guidance: identity, instructions and skills ---------------------------

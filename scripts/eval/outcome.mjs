@@ -881,6 +881,31 @@ export const noRemoteOperation = check( ( d ) => {
 		: pass( 'no remote operation was attempted' );
 } );
 
+// Under `remote: mock` (every selected case that is not a staging case), the
+// runner refused, and recorded, every request that could change something on
+// WordPress.com: anything but GET or HEAD to a WordPress.com host, by `fetch`
+// or the `http` modules, except Studio's image service in a case labelled
+// `imageService: required`. A refused write fails the case. Reads still reach
+// WordPress.com.
+export const noWordPressComWrites = check( ( d, vars ) => {
+	if ( vars.remote === 'staging' )
+		return pass( 'a staging case changes its designated staging site by design' );
+	if ( ! d.remoteGuard )
+		return fail(
+			'remote-guard-missing: the case ran without the guard that keeps writes from WordPress.com'
+		);
+	const blocked = d.remoteGuard.blocked || [];
+	return blocked.length
+		? fail(
+				`wpcom-write-under-mock: ${
+					blocked.length
+				} request(s) that could change WordPress.com were refused: ${ blocked
+					.map( ( b ) => `${ b.method } ${ b.host }${ b.endpoint === 'images' ? ' images' : '' }` )
+					.join( ', ' ) }`
+		  )
+		: pass( 'no request that could change WordPress.com was attempted' );
+} );
+
 // With Studio's separate image service configured, generate_images made
 // images, its result names the service that made them, and that service's
 // requests stayed apart from the model's.
