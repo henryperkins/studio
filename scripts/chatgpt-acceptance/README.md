@@ -161,3 +161,58 @@ node apps/cli/dist/cli/main.mjs site stop --all
 ```
 
 Then sign the test registration out: in the same terminal, with the same variables and `STUDIO_EXPERIMENTAL_CHATGPT=1` (PowerShell: `$env:STUDIO_EXPERIMENTAL_CHATGPT = '1'`), run `node apps/cli/dist/cli/main.mjs code` and use `/chatgpt` → Sign out. You can also remove WordPress Studio's access in ChatGPT's settings. A session-only sign-in lives only in the runner's memory, so it went with the runner's process. In PowerShell the variables stay set until you close that terminal.
+
+## Saved sign-ins on Linux: what persistent storage needs
+
+A sign-in kept with "Secure storage" is a sealed record in the Studio profile whose key lives in the system keychain; on Linux that is the Secret Service, reached through libsecret's `secret-tool`. The Desktop app, the standalone CLI (`studio code`, `/chatgpt`) and this runner need all of:
+
+- `secret-tool` on the `PATH`: `libsecret-tools` on Debian and Ubuntu, `libsecret` on Fedora and Arch. The Desktop `.deb` recommends `libsecret-tools`, so `apt` installs it unless recommended packages are turned off (`--no-install-recommends`). The standalone CLI declares no system packages: install it yourself.
+- A Secret Service running on your session's D-Bus: GNOME Keyring, KWallet's Secret Service interface on KDE Plasma, or KeePassXC with its Secret Service integration turned on.
+- Its default collection unlocked, or a desktop session that can ask you to unlock it. An installed `secret-tool` alone is not enough.
+
+Without them Studio says so before it offers to keep a sign-in. When `secret-tool` is missing, or there is no session bus (SSH, a container, a server without a desktop), or no Secret Service on it, the keychain check fails with the tool's reason: Settings shows secure storage as unavailable, `/chatgpt` offers only "This app session", and a saved sign-in tried anyway fails with `vault-unavailable` and writes nothing. Studio never falls back to a plaintext file and never switches to session-only storage by itself. "This app session" keeps the sign-in in that process's memory until it exits.
+
+Signing in needs a browser **on the same machine**: Studio opens the system browser and waits for ChatGPT's answer on `127.0.0.1` there. Without one (no `xdg-open`, or `xdg-open` finds no browser), the sign-in fails at once with "Studio couldn't open your web browser" (`browser-unavailable`). A browser on another machine can't complete it, and Studio offers no remote or device-code callback.
+
+## Opt-in native keychain tests
+
+Two test files use this machine's **real** system keychain (Windows Credential Manager, the macOS Keychain or the Linux Secret Service) and are skipped, with the reason in the test name, unless `STUDIO_NATIVE_CREDENTIAL_STORE_TEST=1` is set:
+
+- `packages/common/lib/tests/os-credential-store-native.test.ts`: the store itself. It checks the keychain is available; saves, reads, replaces and removes a secret; reads in a fresh process what this one saved and the other way round; keeps option- and shell-looking secrets exactly; takes long secrets (1,024 to 16,384 characters) whole or refuses them, never storing part of one or losing the previous value, and prints which lengths it took; refuses secrets that would need escaping before anything is written.
+- `packages/agent/node/chatgpt/tests/credential-vault-native.test.ts`: the ChatGPT vault on that keychain. A sign-in with 26 KB of tokens read back by a fresh process, with only the 43-character key in the keychain; a damaged record (ciphertext changed) asking for a sign-in again while the key stays; a deleted key asking for a sign-in again, and the next sign-in making a new key; a session-only sign-in staying out of the keychain and off the disk.
+
+Their gating, naming and cleanup live in `packages/common/lib/tests/utils/native-credential-store.ts` and are proven offline, against an in-memory keychain, by `packages/common/lib/tests/os-credential-store-native-harness.test.ts`, which runs everywhere.
+
+**What they write and remove.** Everything goes under one keychain service named for the run, `studio-native-test-<16 random hex digits>`, never Studio's own `wordpress-studio`, so Studio's saved keys and other programs' entries are never read or touched. Accounts under it: `round-trip`, `across-processes`, `option-like`, `long` and `needs-escaping` (refused before anything is written) from the store file, and `chatgpt-vault-key` from the vault file. Values are generated at random by the tests, never taken from the machine; longer ones start `test-only-`, and the vault's tokens `test-access-token-`, `test-id-token-` and `test-refresh-token-`. The vault file also uses a temporary profile, `studio-native-vault-*` in the system temporary folder. Each test removes the entries it wrote under that service, and the temporary profile, whether it passes or fails; an entry it can't remove fails the test with its account and service names, and never a value.
+
+**Never in CI.** The tests refuse to run when `CI` is set, whatever the opt-in says. `.github/workflows/subscription-provider-checks.yml` doesn't set the variable (its header forbids `STUDIO_NATIVE_*` variables), so its `npm test` step lists both files as skipped.
+
+**Running them**, from the repository root, on a machine whose owner agreed to test entries in their keychain:
+
+```sh
+STUDIO_NATIVE_CREDENTIAL_STORE_TEST=1 npx vitest run packages/common/lib/tests/os-credential-store-native.test.ts packages/agent/node/chatgpt/tests/credential-vault-native.test.ts --maxWorkers=1
+```
+
+```powershell
+$env:STUDIO_NATIVE_CREDENTIAL_STORE_TEST = '1'
+npx vitest run packages/common/lib/tests/os-credential-store-native.test.ts packages/agent/node/chatgpt/tests/credential-vault-native.test.ts --maxWorkers=1
+Remove-Item env:STUDIO_NATIVE_CREDENTIAL_STORE_TEST
+```
+
+Each test allows three minutes, for a keychain prompt that waits for you.
+
+**Per platform:**
+
+- **Windows:** an interactive desktop logon, and Windows PowerShell (`powershell.exe`) on the `PATH`. Over SSH or as a service, expect "A specified logon session does not exist": that is the headless result, recorded as such, not a pass.
+- **macOS:** a logged-in desktop session with the login keychain unlocked. The first write may ask to allow `security`: allow it. Over SSH `security` can't ask, so the tests fail with "User interaction is not allowed" unless you unlock the keychain first (`security unlock-keychain`): record either as the headless result.
+- **Linux:** what "Saved sign-ins on Linux" above lists, from a terminal inside the desktop session (so `DBUS_SESSION_BUS_ADDRESS` is set). Without a session bus or a Secret Service, every test fails at its first keychain call with the tool's reason: the headless result. A Secret Service started in a throwaway D-Bus session is a separate result again ("headless with a keyring").
+
+**Not automated, Linux:** with the default collection locked, `secret-tool lookup` asks to unlock it. libsecret's lookup returns no value and no error when that unlock leaves nothing unlocked, which is also how `secret-tool` reports that nothing is saved (exit 1, no output). Whether a *dismissed* unlock prompt ends that way depends on the Secret Service and is not established offline. If it does, Studio would read a locked key as a lost one, and the vault would ask for a sign-in again and clear the record instead of reporting the keychain unavailable. On a test account only: keep a sign-in with Secure storage, lock the collection (for example in Seahorse), start a ChatGPT turn, dismiss the unlock prompt twice, and record whether the account then needs a sign-in and its `.vault` record is gone.
+
+**If a run is killed** before a test cleans up, remove what the failure or the console named:
+
+- Windows PowerShell: `[void][Windows.Security.Credentials.PasswordVault, Windows.Security.Credentials, ContentType = WindowsRuntime]; $vault = New-Object Windows.Security.Credentials.PasswordVault; $vault.RetrieveAll() | Where-Object Resource -like 'studio-native-test-*' | ForEach-Object { $vault.Remove($_) }` (it lists entries without their passwords, and removes only test services).
+- macOS: `security delete-generic-password -s studio-native-test-<run id> -a <account>` for each account.
+- Linux: `secret-tool clear service studio-native-test-<run id> account <account>` for each account.
+
+**What to record** for each platform: the OS, its version and architecture, Node, the source commit, each test's result, and the "took secrets of … characters whole" line. Neither file prints a secret; a failed assertion may show the fake test values.
