@@ -1,6 +1,6 @@
 import { LOCKFILE_STALE_TIME, LOCKFILE_WAIT_TIME } from '@studio/common/constants';
-import { lockFileAsync, unlockFileAsync } from '@studio/common/lib/lockfile';
 import { __ } from '@wordpress/i18n';
+import { lockChatGptFile } from '@studio/agent/node/chatgpt/account-store';
 import { ChatGptSettingsError } from '@studio/agent/node/chatgpt/settings';
 import {
 	appendModelChangeEntry,
@@ -26,12 +26,15 @@ export async function withSessionSelection< T >(
 	write: ( entries: SessionEntry[] ) => Promise< T >
 ): Promise< T > {
 	const { summary } = await loadAiSession( sessionsRoot, sessionId );
-	const lockPath = `${ summary.filePath }.settings.lock`;
-	await lockFileAsync( lockPath, { stale: LOCKFILE_STALE_TIME, wait: LOCKFILE_WAIT_TIME } );
+	// Retried while Windows refuses a lockfile another process is letting go.
+	const release = await lockChatGptFile( `${ summary.filePath }.settings.lock`, {
+		stale: LOCKFILE_STALE_TIME,
+		wait: LOCKFILE_WAIT_TIME,
+	} );
 	try {
 		return await write( await readPiFileEntries( summary.filePath ) );
 	} finally {
-		await unlockFileAsync( lockPath );
+		await release();
 	}
 }
 

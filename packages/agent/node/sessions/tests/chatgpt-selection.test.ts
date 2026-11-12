@@ -23,11 +23,30 @@ vi.mock( '@studio/common/lib/shared-config', async ( original ) => ( {
 	...( await original< object >() ),
 	readSharedSession: async () => undefined,
 } ) );
+// Windows refuses to open a lockfile for a moment while another program
+// deletes it; a test makes the selection's lock refused that many times.
+const lockRace = vi.hoisted( () => ( { refusals: 0 } ) );
+vi.mock( '@studio/common/lib/lockfile', async ( original ) => {
+	const actual = await original< typeof import('@studio/common/lib/lockfile') >();
+	return {
+		...actual,
+		lockFileAsync: async ( ...args: Parameters< typeof actual.lockFileAsync > ) => {
+			if ( args[ 0 ].endsWith( '.settings.lock' ) && lockRace.refusals > 0 ) {
+				lockRace.refusals--;
+				throw Object.assign( new Error( 'EPERM: operation not permitted, open' ), {
+					code: 'EPERM',
+				} );
+			}
+			return actual.lockFileAsync( ...args );
+		},
+	};
+} );
 const A = 'f84d75a0-4e60-4168-a1ab-3134542c637a';
 const B = '1c8e270b-9b5c-4687-b989-de052014b9e8';
 const selection = { connectionId: A, revision: 1, model: 'gpt-6-luna', reasoningEffort: 'medium' };
 let root: string;
 beforeEach( async () => {
+	lockRace.refusals = 0;
 	root = await fs.mkdtemp( path.join( os.tmpdir(), 'studio-chatgpt-selection-' ) );
 	vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' );
 	vi.mocked( listChatGptConnections ).mockResolvedValue(
@@ -88,6 +107,23 @@ describe( 'ChatGPT session selection', () => {
 			expect( readChatGptSessionSelection( entries ) ).toEqual( selection );
 		}
 	);
+
+	it( 'takes the selection’s lock that Windows refuses for a moment while another process lets it go', async () => {
+		const { id } = await createAiSession( root );
+		lockRace.refusals = 3;
+		await setSessionChatGptSelection( root, id, selection );
+		expect( lockRace.refusals ).toBe( 0 );
+
+		const other = await createAiSession( root );
+		lockRace.refusals = 3;
+		await setSessionProvider( root, other.id, 'wpcom', 'balanced' );
+		lockRace.refusals = 3;
+		await setSessionModel( root, other.id, 'fast' );
+		expect( lockRace.refusals ).toBe( 0 );
+		expect( readChatGptSessionSelection( ( await loadAiSession( root, id ) ).entries ) ).toEqual(
+			selection
+		);
+	} );
 
 	it( 'records the model and effort only where the ChatGPT reader looks, and still reads a record written before', async () => {
 		const { id } = await createAiSession( root );
