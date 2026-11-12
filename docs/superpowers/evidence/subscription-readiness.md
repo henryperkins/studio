@@ -223,16 +223,24 @@ Commits `646753a68` and `b72c109b0`. No cell's status changes, and Windows x64 s
 
 ### P2 record (Claude process trees, November 11, 2026)
 
-Commits `88d7dc4fa`, `59caf8c01`, `feaae16ff`. This record changes no cell's status and qualifies nothing.
+Commits `88d7dc4fa`, `59caf8c01`, `feaae16ff`, then fix round 1 (`9644af6dc`, `5f431aad4`). This record changes no cell's status and qualifies nothing.
 
-- **What changed.** `packages/common/lib/owned-process.ts` gives a process identity (PID plus the start time the OS recorded) and an owned-process handle. The Claude runtime starts its native process through it. On cancel, the execution policy refuses new operations and ends pending approvals first. The runtime then asks the process to stop, waits a bounded time, and escalates only within the owned tree. A turn sends no prompt to a tree Studio could not take ownership of, and it keeps its run lock unless the whole tree is gone.
+- **What changed.** `packages/common/lib/owned-process.ts` gives a process identity (PID plus the start time the OS recorded) and an owned-process handle. The Claude runtime starts its native process through it.
+  - On cancel, the execution policy refuses new operations and ends pending approvals first. The runtime then asks the process to stop, waits a bounded time, and escalates only within the owned tree.
+  - A turn starts no native process unless the Windows job exists, and sends no prompt unless the process is verified in it. It then ends with `process_unowned` and the reason.
+  - A turn keeps its run lock unless the whole tree is gone.
 - **Mechanisms.**
-  - Windows: Node's own job object ends the child with Studio. A PowerShell keeper tracks every descendant by parent ID and start time, and holds a handle to each, so PIDs cannot be reused. A detached supervisor ends the tree if Studio's process dies.
-  - POSIX: a new session and process group. The group is signalled only while the leader is unreaped, or after the leader's identity has been re-checked.
-- **Proven natively on Windows x64 (this machine), with Node test processes only.** Each of close, abort, stdin EOF, native death and owner death ends the child and its shell grandchild, including the orphan left when the child's own job kills the shell. An unrelated process survives. Exactly one non-success terminal is emitted, and a host operation queued behind the cancelled approval never runs. Three consecutive runs passed. No real Claude executable was run and no sign-in was opened.
+  - Windows: a kernel job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no breakaway. A PowerShell keeper (static C# through `Add-Type`) creates the job before the native process starts, assigns it within moments, verifies it is in the job and that no child of it is outside, and holds the only handle. Every descendant joins the job. Escalation is `TerminateJobObject`. The job also ends when its keeper dies or Studio's process ends.
+  - POSIX: a new session and process group. The group is signalled only while the leader is unreaped, or after the leader's identity has been re-checked. A detached supervisor ends the group if Studio's process dies.
+- **Proven natively on Windows x64 (this machine), with Node test processes only.**
+  - Each of close, abort, stdin EOF, native death, owner death and keeper death ends the child and its shell grandchild.
+  - So are a double-forked orphan, a child started just before shutdown, and the orphan left when the child's own job kills the shell.
+  - An unrelated process survives.
+  - Exactly one non-success terminal is emitted, and a host operation queued behind the cancelled approval never runs.
+  - Three consecutive runs passed. No real Claude executable was run and no sign-in was opened.
 - **Awaiting native runs elsewhere.** The same lifecycle and owned-process tests are written to run natively on Linux and macOS but have not run there. The Linux `/proc` and macOS `ps` identity readings and the POSIX group logic were checked only through injected seams here. The shell probe parity test is skipped on Windows. Windows ARM64 has not run.
 - **Known limits.**
-  - Windows: a descendant whose parent started and exited between keeper polls, as in a double fork, is not tracked. Neither is a process created for the tree by another service. The keeper costs a few percent of one core and about 125 MB per running native process. It needs PowerShell in Full Language mode.
+  - Windows: a process another service creates for the run (WMI, the Task Scheduler, a COM server) is not in the job. The keeper needs PowerShell in Full Language mode; without it, no turn starts. It costs about 0.7 s of CPU to start and about 70 MB private memory, and is idle afterwards.
   - POSIX: a descendant that leaves the process group (setsid, a daemonizing double fork) is not reached.
   - Recovery after an owner crash (lock races, uncertain mutations) is C4's.
 
