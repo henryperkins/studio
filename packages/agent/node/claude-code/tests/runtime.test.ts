@@ -3081,6 +3081,42 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 		};
 	}
 
+	it( 'names an operation Studio does not recognize to Claude in the note, in the note’s own words', async () => {
+		const { createNativeSessionStore } = await import( '../sessions' );
+		const fixture = await ownedNativeFixture( 'claude-note-unknown-' );
+		try {
+			const runtime = await import( '../runtime' );
+			// A recovery as recorded of a turn that started a tool this build does not know.
+			const dead = { runId: 'dead', turnId: 'dead' };
+			await createNativeSessionStore( fixture.storeRoot ).recordRecovery( 'chat', 'token', [
+				{
+					type: 'turn.terminal',
+					...dead,
+					outcome: { status: 'unknown_process_exit', code: 'recovered' },
+				},
+				{
+					type: 'turn.recovered',
+					...dead,
+					lock: 'f'.repeat( 64 ),
+					invalidatedApprovals: [],
+					uncertainOperations: [
+						{ toolCallId: 'unknown', tool: 'future_tool', evidence: 'started' },
+					],
+				},
+			] );
+			const next = fakeNativeTurn( fixture.root, { projects: fixture.projects } );
+			expect( ( await turn( runtime, fixture, 'next', next ) ).at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'success' },
+			} );
+			const note = optionsOf( next ).systemPrompt.append;
+			expect( note ).toContain( '\n- Run an operation Studio does not recognize: future_tool\n' );
+			expect( note ).not.toContain( 'undefined' );
+		} finally {
+			await fixture.cleanup();
+		}
+	} );
+
 	const apiError = ( sessionId: unknown ) => ( {
 		type: 'result',
 		subtype: 'success',

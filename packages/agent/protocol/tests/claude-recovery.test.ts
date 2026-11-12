@@ -1,12 +1,16 @@
 import { readFileSync } from 'fs';
 import path from 'path';
-import { describe, expect, it } from 'vitest';
+import { resetLocaleData, setLocaleData } from '@wordpress/i18n';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
 	CLAUDE_RECOVERY_BLOCKED_REASONS,
 	CLAUDE_RECOVERY_PROCEDURE_DOCUMENT,
 	getClaudeRecoveryBlockedMessage,
+	getClaudeUncertainOperationDescription,
 	type ClaudeRecoveryBlockedReason,
 } from '../claude-code';
+
+afterEach( () => resetLocaleData() );
 
 // Reasons with no automatic way forward, or none once waiting or retrying has
 // not helped: their message names the manual procedure.
@@ -112,4 +116,36 @@ describe( 'why Studio did not recover a Claude chat, and what to do next', () =>
 			expect( section ).toContain( 'studio code sessions delete' );
 		}
 	);
+} );
+
+describe( 'what an app shows for an operation that may or may not have taken effect', () => {
+	const target = { environment: 'local' as const, siteId: 'site' };
+
+	it( 'words an operation Studio does not recognize in the current language, when it is shown', () => {
+		const unknown = { toolCallId: 'call', tool: 'future_tool', evidence: 'started' as const };
+		expect( getClaudeUncertainOperationDescription( unknown ) ).toBe(
+			'Run an operation Studio does not recognize: future_tool'
+		);
+		setLocaleData( {
+			'Run an operation Studio does not recognize: %s': [
+				'Exécuter une opération que Studio ne reconnaît pas : %s',
+			],
+		} );
+		expect( getClaudeUncertainOperationDescription( unknown ) ).toBe(
+			'Exécuter une opération que Studio ne reconnaît pas : future_tool'
+		);
+	} );
+
+	it( 'shows any other operation as its approval described it', () => {
+		expect(
+			getClaudeUncertainOperationDescription( {
+				toolCallId: 'call',
+				tool: 'sites.wpCli',
+				operationClass: 'command',
+				target,
+				description: 'Create a draft post on the current local site',
+				evidence: 'authorized',
+			} )
+		).toBe( 'Create a draft post on the current local site' );
+	} );
 } );

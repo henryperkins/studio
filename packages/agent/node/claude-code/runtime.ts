@@ -271,8 +271,12 @@ function recoveryNote(
 			recoveries.flatMap( ( recovery ) =>
 				( Array.isArray( recovery.uncertainOperations ) ? recovery.uncertainOperations : [] ).map(
 					( operation ) => {
-						const description = oneLine( operation.description );
 						const tool = oneLine( operation.tool );
+						let description = tool;
+						if ( typeof operation.description === 'string' )
+							description = oneLine( operation.description );
+						else if ( operation.evidence === 'started' )
+							description = `Run an operation Studio does not recognize: ${ tool }`;
 						return description.includes( tool )
 							? `- ${ description }`
 							: `- ${ description } (${ tool })`;

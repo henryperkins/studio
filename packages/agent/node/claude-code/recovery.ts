@@ -182,10 +182,10 @@ async function uncertainOperationsOf(
 		if ( rules?.isKnownClaudeTool( event.name ) ) continue;
 		const tool = escapeClaudeApprovalText( String( event.name ) );
 		const id = idOf( event );
+		// Its kind is the evidence: each app words it in its own language.
 		found.set( id ? JSON.stringify( [ id, null, tool ] ) : `unnamed ${ index }`, {
 			toolCallId: event.toolCallId,
 			tool,
-			description: `Run an operation Studio does not recognize: ${ tool }`,
 			evidence: 'started',
 		} );
 	}

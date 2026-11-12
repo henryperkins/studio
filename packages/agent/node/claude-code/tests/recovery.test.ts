@@ -421,13 +421,14 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 				{
 					toolCallId: 'unknown',
 					tool: 'future_tool',
-					description: expect.stringContaining( 'future_tool' ),
 					evidence: 'started',
 				},
 			],
 		} );
 		const unknown = result.status === 'recovered' ? result.uncertainOperations[ 1 ] : undefined;
 		expect( unknown ).not.toHaveProperty( 'operationClass' );
+		// Its kind is the evidence; the apps word it in their own language.
+		expect( unknown ).not.toHaveProperty( 'description' );
 		expect( result.status === 'recovered' && result.uncertainOperations ).toHaveLength( 2 );
 	} );
 

@@ -121,8 +121,12 @@ export interface ClaudeUncertainOperation {
 	operationClass?: ClaudeOperationClass;
 	/** The turn's target, when the journal recorded it. */
 	target?: ClaudeStudioTarget;
-	/** Display-safe, as an approval shows it. */
-	description: string;
+	/**
+	 * Display-safe, as an approval shows it. Absent for a tool Studio does not
+	 * recognize (`started`). Apps show every one through
+	 * `getClaudeUncertainOperationDescription`.
+	 */
+	description?: string;
 	/**
 	 * What the journal shows of it: Studio let it run (`authorized`), asked
 	 * for its approval (`requested`), or saw a tool it does not recognize start
@@ -133,6 +137,19 @@ export interface ClaudeUncertainOperation {
 	requestId?: string;
 	/** Whether that approval was recorded as answered. The answer itself never is. */
 	resolved?: boolean;
+}
+
+/** What an app shows for an operation that may or may not have taken effect. */
+export function getClaudeUncertainOperationDescription(
+	operation: ClaudeUncertainOperation
+): string {
+	if ( operation.evidence === 'started' )
+		return sprintf(
+			/* translators: %s: the name of a tool Studio does not recognize. */
+			__( 'Run an operation Studio does not recognize: %s' ),
+			operation.tool
+		);
+	return operation.description ?? operation.tool;
 }
 
 /** What recovering a locked Claude conversation did. Serializable, for every Studio app. */
