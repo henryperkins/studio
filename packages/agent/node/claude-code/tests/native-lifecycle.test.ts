@@ -5,10 +5,15 @@ import { mkdir, mkdtemp, realpath, rm } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
-import { checkProcessIdentity, readProcessIdentity } from '@studio/common/lib/owned-process';
+import {
+	checkProcessIdentity,
+	prepareProcessOwner,
+	readProcessIdentity,
+} from '@studio/common/lib/owned-process';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildClaudeEnvironment } from '../auth-status';
 import { inspectClaudeExecutable, trustedPowerShellPath } from '../discovery';
+import { recoverClaudeRun } from '../recovery';
 import { createNativeSessionStore } from '../sessions';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 import type { ProcessIdentity } from '@studio/common/lib/owned-process';
@@ -229,6 +234,294 @@ describe( 'native lifecycle with an owned process tree (Node test processes)', (
 		() => interrupt( 'kill-keeper' ),
 		90_000
 	);
+} );
+
+// The resolved message of `type` from a forked test process.
+function nextMessage(
+	child: ReturnType< typeof fork >,
+	type: string
+): Promise< Record< string, unknown > > {
+	return new Promise( ( resolve, reject ) => {
+		const timer = setTimeout( () => reject( new Error( `No ${ type } message` ) ), 30_000 );
+		const listen = ( message: Record< string, unknown > ) => {
+			if ( message?.type !== type ) return;
+			clearTimeout( timer );
+			child.off( 'message', listen );
+			resolve( message );
+		};
+		child.on( 'message', listen );
+	} );
+}
+
+// Reads a stream line by line: each call resolves with the next line.
+function lines( stream: NodeJS.ReadableStream ): () => Promise< string > {
+	const ready: string[] = [];
+	const waiting: Array< ( line: string ) => void > = [];
+	let buffer = '';
+	stream.setEncoding( 'utf8' );
+	stream.on( 'data', ( chunk: string ) => {
+		buffer += chunk;
+		for ( let end = buffer.indexOf( '\n' ); end >= 0; end = buffer.indexOf( '\n' ) ) {
+			const line = buffer.slice( 0, end ).trim();
+			buffer = buffer.slice( end + 1 );
+			const waiter = waiting.shift();
+			if ( waiter ) waiter( line );
+			else ready.push( line );
+		}
+	} );
+	return () =>
+		new Promise( ( resolve ) => {
+			const line = ready.shift();
+			if ( line !== undefined ) resolve( line );
+			else waiting.push( resolve );
+		} );
+}
+
+// Recovery with the real OS checks, through the same calls Studio makes. It
+// is retried while a process it waits for may still be ending, such as a
+// console host that outlives its last client by moments; a blocked recovery
+// changes nothing.
+async function recoverWithin(
+	store: ReturnType< typeof createNativeSessionStore >,
+	binding: Parameters< typeof recoverClaudeRun >[ 1 ],
+	ms: number
+) {
+	const deadline = Date.now() + ms;
+	let result = await recoverClaudeRun( store, binding );
+	while (
+		result.status === 'blocked' &&
+		[ 'native-alive', 'guardian-alive', 'descendants-alive', 'descendants-unverifiable' ].includes(
+			result.reason
+		) &&
+		Date.now() < deadline
+	) {
+		await new Promise( ( resolve ) => setTimeout( resolve, 500 ) );
+		result = await recoverClaudeRun( store, binding );
+	}
+	return result;
+}
+
+describe( 'recovery once the owner is gone (Node test processes)', () => {
+	const marker = `studio-c4a-fixture-${ randomUUID() }`;
+	const nativeFixture = path.resolve(
+		'packages/common/lib/tests/fixtures/owned-process-fixture.mjs'
+	);
+	let root: string;
+	let owner: Awaited< ReturnType< typeof bundle > >;
+	let sentinel: ReturnType< typeof spawn >;
+	let sentinelIdentity: ProcessIdentity;
+
+	beforeAll( async () => {
+		root = await realpath( await mkdtemp( path.join( os.tmpdir(), 'Studio Owned Recovery ' ) ) );
+		owner = await bundle(
+			'packages/agent/node/claude-code/tests/fixtures/offline-lifecycle-owner.ts'
+		);
+		sentinel = spawn(
+			process.execPath,
+			[ nativeFixture, 'leaf', marker, String( SENTINEL_LIFETIME ) ],
+			{ stdio: [ 'ignore', 'pipe', 'ignore' ], windowsHide: true }
+		);
+		await once( sentinel.stdout!, 'data' );
+		sentinelIdentity = ( await readProcessIdentity( sentinel.pid! ) )!;
+		expect( sentinelIdentity ).toBeDefined();
+	}, 60_000 );
+
+	afterAll( async () => {
+		// The test's own unreaped child.
+		if ( sentinel && sentinel.exitCode === null && sentinel.signalCode === null )
+			sentinel.kill( 'SIGKILL' );
+		await owner?.remove();
+		if ( root ) await rm( root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 } );
+	} );
+
+	async function conversation( name: string ) {
+		const directory = await realpath( await mkdtemp( path.join( root, name + ' ' ) ) );
+		await Promise.all(
+			[ 'site', 'config' ].map( ( folder ) => mkdir( path.join( directory, folder ) ) )
+		);
+		const binding = {
+			connectionId: 'offline',
+			conversationId: 'chat',
+			siteId: 'site',
+			workingDirectory: path.join( directory, 'site' ),
+			configDirectory: path.join( directory, 'config' ),
+		};
+		const store = createNativeSessionStore( path.join( directory, 'store' ) );
+		const lock = ( ownerIdentity: ProcessIdentity ) =>
+			store.lockRun( 'chat', {
+				owner: ownerIdentity,
+				runId: 'run',
+				turnId: 'turn',
+				connection: { id: 'offline', revision: 1 },
+				workspace: {
+					siteId: 'site',
+					workingDirectory: binding.workingDirectory,
+					configDirectory: binding.configDirectory,
+				},
+			} );
+		return { directory, binding, store, lock };
+	}
+
+	// The identity of a fixture process that has exited.
+	async function exitedIdentity(): Promise< ProcessIdentity > {
+		const leaf = spawn( process.execPath, [ nativeFixture, 'leaf', marker, String( LIFETIME ) ], {
+			stdio: [ 'ignore', 'pipe', 'ignore' ],
+			windowsHide: true,
+		} );
+		await once( leaf.stdout!, 'data' );
+		const identity = ( await readProcessIdentity( leaf.pid! ) )!;
+		const exited = once( leaf, 'exit' );
+		// The test's own unreaped child.
+		leaf.kill( 'SIGKILL' );
+		await exited;
+		expect( await goneWithin( [ identity ], 10_000 ) ).toEqual( [] );
+		return identity;
+	}
+
+	it( 'recovers the same conversation once the process that ran its turn has died, and not while it lives', async () => {
+		const { directory, binding, store } = await conversation( 'owner death' );
+		const runner = fork( owner.file, [ nativeFixture, marker, String( LIFETIME ), directory ], {
+			env: { ...process.env, NODE_PATH: path.resolve( 'node_modules' ) },
+			execArgv: [],
+			stdio: [ 'ignore', 'ignore', 'ignore', 'ipc' ],
+		} );
+		const exited = once( runner, 'exit' );
+		try {
+			await nextMessage( runner, 'approval' );
+			// The approval reaches the journal moments after it is asked.
+			const deadline = Date.now() + 10_000;
+			while (
+				! ( await store.readJournals( 'chat' ) )
+					.flat()
+					.some( ( event ) => event.type === 'approval.requested' ) &&
+				Date.now() < deadline
+			)
+				await new Promise( ( resolve ) => setTimeout( resolve, 100 ) );
+			const [ requested ] = ( await store.readJournals( 'chat' ) )
+				.flat()
+				.filter( ( event ) => event.type === 'approval.requested' );
+			expect( requested ).toBeDefined();
+			const descendants = await identities( await descendantsOf( runner.pid! ) );
+			const locked = await store.inspectLock( 'chat' );
+			expect( locked ).toMatchObject( { state: 'run', record: { stage: 'owned' } } );
+			expect( await recoverClaudeRun( store, binding ) ).toEqual( {
+				status: 'blocked',
+				reason: 'owner-alive',
+				runId: 'run',
+				turnId: 'turn',
+			} );
+			expect( await store.inspectLock( 'chat' ) ).toEqual( locked );
+			runner.kill( 'SIGKILL' );
+			await exited;
+			expect( await goneWithin( descendants, 20_000 ) ).toEqual( [] );
+			expect( await recoverWithin( store, binding, 15_000 ) ).toEqual( {
+				status: 'recovered',
+				runId: 'run',
+				turnId: 'turn',
+				recordedTerminal: true,
+				invalidatedApprovals: [ ( requested as { requestId: string } ).requestId ],
+				uncertainOperations: [
+					expect.objectContaining( {
+						requestId: ( requested as { requestId: string } ).requestId,
+						tool: 'sites.wpCli',
+						resolved: false,
+					} ),
+				],
+			} );
+			const events = ( await store.readJournals( 'chat' ) ).flat();
+			expect( events.filter( ( event ) => event.type === 'turn.terminal' ) ).toHaveLength( 1 );
+			expect( events.some( ( event ) => event.type === 'turn.prompt' ) ).toBe( true );
+			expect( await store.inspectLock( 'chat' ) ).toEqual( { state: 'none' } );
+			const session = ( await store.load( 'chat' ) )!;
+			expect(
+				(
+					await store.resolve( session, binding, path.join( binding.configDirectory, 'projects' ) )
+				).status
+			).toBe( 'ready' );
+			await (
+				await store.lockTurn( 'chat' )
+			)();
+			expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
+		} finally {
+			// The test's own unreaped child; everything below it is the runtime's to end.
+			if ( runner.exitCode === null && runner.signalCode === null ) runner.kill( 'SIGKILL' );
+			await exited;
+		}
+	}, 120_000 );
+
+	it( 'treats a live process holding the owner’s PID with another start as another process, and leaves it running', async () => {
+		const { store, binding, lock } = await conversation( 'recycled owner' );
+		const held = await lock( sentinelIdentity );
+		expect( await recoverClaudeRun( store, binding ) ).toMatchObject( {
+			status: 'blocked',
+			reason: 'owner-alive',
+		} );
+		await held.release();
+		await lock( { pid: sentinelIdentity.pid, start: `${ sentinelIdentity.start }0` } );
+		expect( await recoverClaudeRun( store, binding ) ).toEqual( {
+			status: 'recovered',
+			runId: 'run',
+			turnId: 'turn',
+			recordedTerminal: true,
+			invalidatedApprovals: [],
+			uncertainOperations: [],
+		} );
+		expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
+	}, 60_000 );
+
+	it( 'stays blocked while a process that may descend from the native process runs, and recovers once it has ended', async () => {
+		const { store, binding, lock } = await conversation( 'live descendant' );
+		const [ deadOwner, deadGuardian ] = [ await exitedIdentity(), await exitedIdentity() ];
+		const processOwner = prepareProcessOwner();
+		expect( await processOwner.prepared() ).toBe( true );
+		const owned = processOwner.spawn(
+			process.execPath,
+			[ nativeFixture, 'tree', marker, String( LIFETIME ), 'ignore-eof' ],
+			{ env: process.env }
+		);
+		let shutDown = false;
+		try {
+			expect( await owned.ready() ).toBe( true );
+			const native = owned.identity()!;
+			const next = lines( owned.child.stdout );
+			await next();
+			owned.child.stdin.write( 'spawn\n' );
+			const [ , latePid ] = ( await next() ).split( ' ' );
+			const late = ( await readProcessIdentity( Number( latePid ) ) )!;
+			expect( late ).toBeDefined();
+			// The test's own unreaped child. Its late child outlives it, still held by the job.
+			const exited = once( owned.child, 'exit' );
+			owned.child.kill( 'SIGKILL' );
+			await exited;
+			expect( await goneWithin( [ native ], 10_000 ) ).toEqual( [] );
+			const held = await lock( deadOwner );
+			await held.update( {
+				stage: 'starting',
+				session: { nativeSessionId: randomUUID(), resume: false },
+			} );
+			await held.update( { stage: 'owned', processes: { native, guardian: deadGuardian } } );
+			const locked = await store.inspectLock( 'chat' );
+			expect( await recoverClaudeRun( store, binding ) ).toEqual( {
+				status: 'blocked',
+				reason: process.platform === 'win32' ? 'descendants-alive' : 'descendants-unverifiable',
+				runId: 'run',
+				turnId: 'turn',
+			} );
+			expect( await store.inspectLock( 'chat' ) ).toEqual( locked );
+			expect( await checkProcessIdentity( late ) ).toBe( 'alive' );
+			shutDown = true;
+			expect( await owned.shutdown( { graceMs: 0 } ) ).toBe( true );
+			expect( await goneWithin( [ late ], 10_000 ) ).toEqual( [] );
+			expect( await recoverWithin( store, binding, 15_000 ) ).toMatchObject( {
+				status: 'recovered',
+			} );
+			expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );
+		} finally {
+			if ( owned.child.exitCode === null && owned.child.signalCode === null )
+				owned.child.kill( 'SIGKILL' );
+			if ( ! shutDown ) await owned.shutdown( { graceMs: 0 } );
+		}
+	}, 120_000 );
 } );
 
 describe.runIf( process.platform === 'win32' && !! executable )(

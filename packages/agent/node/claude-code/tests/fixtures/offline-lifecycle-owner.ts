@@ -1,5 +1,5 @@
 import { spawn } from 'child_process';
-import { statSync } from 'fs';
+import { appendFileSync, mkdirSync, statSync } from 'fs';
 import path from 'path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 // The SDK's wildcard export resolves at runtime, although the ESLint resolver misses it.
@@ -181,6 +181,13 @@ async function main() {
 					close: () => closeNative(),
 					async *[ Symbol.asyncIterator ]() {
 						for await ( const _prompt of input.prompt as AsyncIterable< unknown > ) {
+							// The native history the vendor runtime keeps for the conversation.
+							const projects = path.join( config, 'projects', 'studio-lifecycle' );
+							mkdirSync( projects, { recursive: true } );
+							appendFileSync(
+								path.join( projects, `${ options.sessionId }.jsonl` ),
+								JSON.stringify( { sessionId: options.sessionId, cwd: site } ) + '\n'
+							);
 							yield {
 								type: 'system',
 								subtype: 'init',
