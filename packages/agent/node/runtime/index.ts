@@ -87,6 +87,7 @@ import { findLastAssistant, isEmptyStop } from '@studio/agent/protocol/session-e
 import {
 	buildChatGptModel,
 	createChatGptProviderConfig,
+	sendsChatGptToolImages,
 	type ChatGptTurnSnapshot,
 } from './chatgpt-transport';
 import { getFileToolPrompt } from './file-tool-prompts';
@@ -655,9 +656,11 @@ async function createStudioAgentSession(
 			: routing.openAiSettings
 			? buildOpenAiModel( routing.openAiSettings, getAiModelLabel( routing.openAiSettings.model ) )
 			: buildModel( config.model, routing.family, routing.creds );
+	// Whether tool results may carry images. On the ChatGPT route that is
+	// qualified apart from the images a user attaches.
 	const visionEnabled =
 		routing.kind === 'chatgpt'
-			? routing.model.input.includes( 'image' )
+			? sendsChatGptToolImages( routing.model.id )
 			: aiModelSupportsImages( config.model );
 	const [ userInstructions, imageGenerationEnabled ] = await Promise.all( [
 		readGlobalInstructions(),

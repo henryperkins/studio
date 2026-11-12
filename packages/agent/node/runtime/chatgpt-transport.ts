@@ -3,6 +3,7 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
+	type Message,
 	type Model,
 	type SimpleStreamOptions,
 	type ThinkingLevelMap,
@@ -17,6 +18,7 @@ import {
 	type ChatGptRouteResponse,
 	type ChatGptTokenSource,
 } from '@studio/agent/node/chatgpt/route';
+import { isChatGptToolImageLiveCheckOn } from '@studio/agent/node/chatgpt/tool-images';
 import { OPENAI_API_BASE_URL } from '@studio/agent/node/openai-model-list';
 import { toPiThinkingLevel } from '@studio/agent/node/runtime/openai-transport';
 import {
@@ -344,6 +346,52 @@ function buildThinkingLevelMap( efforts: readonly OpenAiReasoningEffort[] ): Thi
 			efforts.includes( effort ) ? effort : null,
 		] )
 	) as ThinkingLevelMap;
+}
+
+/**
+ * Whether a turn on this ChatGPT-route model sends the images tool results
+ * carry. Off unless the table qualifies them, or the live check's override is
+ * on for a model that takes images at all.
+ */
+export function sendsChatGptToolImages( modelId: string ): boolean {
+	const capabilities = getChatGptModelCapabilities( modelId );
+	return Boolean(
+		capabilities?.imageInput && ( capabilities.toolImageInput || isChatGptToolImageLiveCheckOn() )
+	);
+}
+
+// What the model reads where a tool result's image was, on a route that isn't
+// sent images from tools.
+const TOOL_IMAGE_LEFT_OUT = {
+	type: 'text' as const,
+	text: '(image left out: images from tools aren’t sent on this route)',
+};
+
+// Every image a tool result carries, this turn's or one recorded before,
+// replaced by one note; images the user attached stay.
+function withoutToolResultImages< T extends { messages: Message[] } >( context: T ): T {
+	const carriesImage = ( message: Message ) =>
+		message.role === 'toolResult' && message.content.some( ( block ) => block.type === 'image' );
+	if ( ! context.messages.some( carriesImage ) ) {
+		return context;
+	}
+	return {
+		...context,
+		messages: context.messages.map( ( message ) => {
+			if ( message.role !== 'toolResult' || ! carriesImage( message ) ) {
+				return message;
+			}
+			const content: typeof message.content = [];
+			for ( const block of message.content ) {
+				if ( block.type !== 'image' ) {
+					content.push( block );
+				} else if ( content.at( -1 ) !== TOOL_IMAGE_LEFT_OUT ) {
+					content.push( TOOL_IMAGE_LEFT_OUT );
+				}
+			}
+			return { ...message, content };
+		} ),
+	};
 }
 
 /** The pi model of one ChatGPT-route model, by the slug the route lists it under. */
@@ -730,6 +778,7 @@ export function createChatGptProviderConfig(
 		throw new Error( describeChatGptReasoningProblem( reasoning.problem ) );
 	}
 	const target = { model: model.id, reasoningEffort: reasoning.effort };
+	const toolImages = sendsChatGptToolImages( model.id );
 	return {
 		baseUrl: OPENAI_API_BASE_URL,
 		apiKey: TOKEN_FROM_TURN,
@@ -741,8 +790,9 @@ export function createChatGptProviderConfig(
 				turnSnapshot.invalidateAccessToken
 			);
 			const userSignal = options?.signal;
+			const sent = toolImages ? context : withoutToolResultImages( context );
 			return withChatGptOutcome(
-				streamOpenAiResponses( m as Model< 'openai-responses' >, context, {
+				streamOpenAiResponses( m as Model< 'openai-responses' >, sent, {
 					...options,
 					signal: userSignal
 						? AbortSignal.any( [ userSignal, turnSnapshot.signal ] )

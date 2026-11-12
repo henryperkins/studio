@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
 	ChatGptConnectionError,
 	readChatGptAccount,
@@ -32,6 +33,7 @@ import { findUnsafeText, openAcceptanceEvidence } from 'cli/ai/acceptance-eviden
 import { acceptanceRunPaths, acceptanceStartsNewRun } from 'cli/ai/acceptance-isolation';
 import {
 	acceptancePlatform,
+	acceptanceTurnExecArgv,
 	askOwnerForSessionToken,
 	classifyToolCall,
 	classifyTurnFailure,
@@ -1481,9 +1483,21 @@ describe( 'ChatGPT acceptance runner', () => {
 				}
 				return runCli( label, args );
 			};
+			const startTurn = services.processes.startTurn;
+			const toolImages: Record< string, boolean | undefined > = {};
+			services.processes.startTurn = ( options ) => {
+				toolImages[ options.label ] = options.toolImages;
+				return startTurn( options );
+			};
 			expect(
 				await runChatGptAcceptance( savedArgs( '--gates', 'T1' ), dependencies( services ) )
 			).toBe( 0 );
+			// Only the live check's own turn turns images in tool results on, through the override.
+			expect( toolImages[ 'gate-t1' ] ).toBe( true );
+			expect(
+				Object.entries( toolImages ).filter( ( [ label, on ] ) => label !== 'gate-t1' && on )
+			).toEqual( [] );
+			expect( Object.keys( toolImages ).length ).toBeGreaterThan( 1 );
 			expect( stageOf( 'gate-t1-image-tool-result' )[ 0 ] ).toMatchObject( {
 				status: 'passed',
 				observations: expect.objectContaining( {
@@ -1493,6 +1507,26 @@ describe( 'ChatGPT acceptance runner', () => {
 					otherToolCalls: 0,
 				} ),
 			} );
+		} );
+
+		it( 'loads the tool-image override into a turn’s CLI process only when the turn asks for it, after the observer', () => {
+			const scripts = {
+				observer: path.join( os.tmpdir(), 'cli', 'chatgpt-acceptance-observer.mjs' ),
+				toolImages: path.join( os.tmpdir(), 'cli', 'chatgpt-acceptance-tool-images.mjs' ),
+			};
+			const imports = ( argv: string[] ) =>
+				argv.filter( ( _arg, index ) => argv[ index - 1 ] === '--import' );
+
+			expect( imports( acceptanceTurnExecArgv( scripts, {} ) ) ).toEqual( [
+				pathToFileURL( scripts.observer ).href,
+			] );
+			expect( imports( acceptanceTurnExecArgv( scripts, { toolImages: false } ) ) ).toEqual( [
+				pathToFileURL( scripts.observer ).href,
+			] );
+			expect( imports( acceptanceTurnExecArgv( scripts, { toolImages: true } ) ) ).toEqual( [
+				pathToFileURL( scripts.observer ).href,
+				pathToFileURL( scripts.toolImages ).href,
+			] );
 		} );
 
 		it( 'passes gate T3 only when the service details arrive before the result is persisted', async () => {

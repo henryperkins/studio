@@ -485,13 +485,15 @@ describe( 'fetchChatGptModels', () => {
 } );
 
 // What the route is qualified for (ledger section A, "G2 record"): gpt-6-luna
-// at the efforts a captured run completed, with image input per the route's
-// documentation. Every other model and effort is unknown, so unavailable.
+// at the efforts a captured run completed, with attached images per the route's
+// documentation. Images in tool results stay off until gate T1 observes the
+// route accept one. Every other model and effort is unknown, so unavailable.
 const QUALIFIED_ROUTE_CAPABILITIES = {
 	'gpt-6-luna': {
 		reasoningEfforts: [ 'low', 'medium' ],
 		reasoningModes: [ 'standard' ],
 		imageInput: true,
+		toolImageInput: false,
 	},
 };
 

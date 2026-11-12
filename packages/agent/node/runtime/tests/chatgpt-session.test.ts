@@ -5,6 +5,7 @@ import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAgent } from '@studio/agent/node/agent';
 import { ChatGptConnectionError } from '@studio/agent/node/chatgpt/account-store';
+import { setChatGptToolImagesForLiveCheck } from '@studio/agent/node/chatgpt/tool-images';
 import { buildAttachedFilesPromptBlock } from '@studio/agent/protocol/chat-files';
 import { getToolResultImageService } from '@studio/agent/protocol/image-service';
 import { OPENAI_MODEL_CAPABILITIES } from '@studio/agent/protocol/openai-models';
@@ -520,6 +521,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 	afterEach( () => {
 		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
+		setChatGptToolImagesForLiveCheck( false );
 		fs.rmSync( paths.root, { recursive: true, force: true } );
 	} );
 
@@ -817,7 +819,8 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( turn.entries.some( ( entry ) => entry.type === 'compaction' ) ).toBe( false );
 	} );
 
-	it( 'sends an image tool result back as image input', async () => {
+	it( 'with the live check’s override on, sends an image tool result back as image input', async () => {
+		setChatGptToolImagesForLiveCheck( true );
 		const selection = selectionFor();
 		replies.push( imageToolCallReply, () => textReply( 'It is a tiny image.' ) );
 
@@ -835,6 +838,70 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( JSON.stringify( output.output ) ).toContain( 'input_image' );
 		expect( JSON.stringify( output.output ) ).toContain( 'data:image/png;base64,' );
 		expect( fakeBroker.handles[ 0 ].tokenRequests ).toBe( 2 );
+	} );
+
+	it( 'leaves the image out of a tool result by default, sending its text, while attached images still go', async () => {
+		const selection = selectionFor();
+		replies.push( imageToolCallReply, () => textReply( 'It is a tiny image.' ) );
+
+		const turn = await runTurn( newChatGptSession( selection ), 'Describe screenshot.png', {
+			connection: selection,
+			chatGpt: { reasoningEffort: 'medium' },
+			images: [
+				{
+					id: 'attached',
+					name: 'attached.png',
+					mimeType: 'image/png',
+					size: Buffer.from( TINY_PNG_BASE64, 'base64' ).length,
+					dataBase64: TINY_PNG_BASE64,
+				},
+			],
+		} );
+
+		expect( turn.error ).toBeUndefined();
+		expect( requests ).toHaveLength( 2 );
+		const [ output ] = itemsOfType( requests[ 1 ], 'function_call_output' );
+		expect( output.call_id ).toBe( IMAGE_READ_CALL.call_id );
+		expect( JSON.stringify( output.output ) ).not.toContain( 'input_image' );
+		expect( JSON.stringify( output.output ) ).not.toContain( 'data:image/png;base64,' );
+		expect( JSON.stringify( output.output ) ).toContain( 'image left out' );
+		// The image the user attached is image input on both requests.
+		for ( const request of requests ) {
+			expect( JSON.stringify( request.body.input ) ).toMatch(
+				/"type":"input_image"[^}]*"image_url":"data:image\/png;base64,/
+			);
+			expect( JSON.stringify( request.body.input ).match( /"type":"input_image"/g ) ).toHaveLength(
+				1
+			);
+		}
+	} );
+
+	it( 'leaves out, on the next request, an image a tool result recorded while the override was on', async () => {
+		setChatGptToolImagesForLiveCheck( true );
+		const selection = selectionFor();
+		replies.push( imageToolCallReply, () => textReply( 'It is a tiny image.' ) );
+		const first = await runChatGptTurn(
+			newChatGptSession( selection ),
+			'Describe screenshot.png',
+			selection,
+			'medium'
+		);
+		expect( JSON.stringify( requests[ 1 ].body.input ) ).toContain( 'input_image' );
+		setChatGptToolImagesForLiveCheck( false );
+		replies.push( () => textReply( 'Still tiny.' ) );
+
+		const next = await runChatGptTurn(
+			reopen( first.sessionFile ),
+			'And now?',
+			selection,
+			'medium'
+		);
+
+		expect( next.error ).toBeUndefined();
+		expect( requests ).toHaveLength( 3 );
+		expect( JSON.stringify( requests[ 2 ].body.input ) ).not.toContain( 'input_image' );
+		const [ output ] = itemsOfType( requests[ 2 ], 'function_call_output' );
+		expect( JSON.stringify( output.output ) ).toContain( 'image left out' );
 	} );
 
 	it( 'ends the turn when the connection is signed out mid-stream', async () => {
@@ -1159,7 +1226,51 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( declaredTools( requests[ 0 ] ) ).not.toContain( 'generate_images' );
 		} );
 
-		it( 'returns a screenshot to the model as image input, shows it as an artifact with progress, and refreshes the preview', async () => {
+		it( 'with the live check’s override on, returns a screenshot to the model as image input and replays it', async () => {
+			setChatGptToolImagesForLiveCheck( true );
+			const selection = selectionFor();
+			const shot = toolCalls( {
+				name: 'take_screenshot',
+				args: { url: 'http://localhost:8881/' },
+			} );
+			replies.push(
+				shot.reply,
+				() => textReply( 'The page renders.' ),
+				() => textReply( 'Still fine.' )
+			);
+			const first = await runChatGptTurn(
+				newChatGptSession( selection ),
+				'Check the home page.',
+				selection,
+				'medium'
+			);
+
+			expect( first.error ).toBeUndefined();
+			const declared = requests[ 0 ].body.input[ 0 ].tools as Array< {
+				name: string;
+				description: string;
+			} >;
+			expect( declared.find( ( tool ) => tool.name === 'take_screenshot' )?.description ).toContain(
+				'Returns the screenshot as an image that you can analyze visually'
+			);
+			expect( seams.captureScreenshotBuffer ).toHaveBeenCalledWith(
+				'http://localhost:8881/',
+				expect.anything(),
+				expect.objectContaining( { forModel: true } )
+			);
+			expect( outputFor( requests[ 1 ], shot.callIds[ 0 ] ) ).toEqual( [
+				{ type: 'input_text', text: expect.stringContaining( 'Screenshot captured' ) },
+				expect.objectContaining( {
+					type: 'input_image',
+					image_url: `data:image/jpeg;base64,${ SCREENSHOT_JPEG.toString( 'base64' ) }`,
+				} ),
+			] );
+			// The next request replays the capture with the rest of the history.
+			await runChatGptTurn( reopen( first.sessionFile ), 'And now?', selection, 'medium' );
+			expect( imageCount( outputFor( requests[ 2 ], shot.callIds[ 0 ] ) ) ).toBe( 1 );
+		} );
+
+		it( 'returns a screenshot to the model as text by default, shows it as an artifact with progress, and refreshes the preview', async () => {
 			const ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
 			host.ui = ui;
 			const selection = selectionFor();
@@ -1184,23 +1295,20 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				name: string;
 				description: string;
 			} >;
+			// As for any model that can't view images: the tool, without the image block.
 			expect( declared.find( ( tool ) => tool.name === 'take_screenshot' )?.description ).toContain(
-				'Returns the screenshot as an image that you can analyze visually'
+				'This model cannot view images'
 			);
 			expect( seams.captureScreenshotBuffer ).toHaveBeenCalledWith(
 				'http://localhost:8881/',
 				expect.anything(),
-				expect.objectContaining( { forModel: true } )
+				expect.objectContaining( { forModel: false } )
 			);
-			expect( outputFor( requests[ 1 ], shot.callIds[ 0 ] ) ).toEqual( [
-				{ type: 'input_text', text: expect.stringContaining( 'Screenshot captured' ) },
-				expect.objectContaining( {
-					type: 'input_image',
-					image_url: `data:image/jpeg;base64,${ SCREENSHOT_JPEG.toString( 'base64' ) }`,
-				} ),
-			] );
-			// The next request replays the capture with the rest of the history.
-			expect( imageCount( outputFor( requests[ 2 ], shot.callIds[ 0 ] ) ) ).toBe( 1 );
+			const output = outputFor( requests[ 1 ], shot.callIds[ 0 ] );
+			expect( imageCount( output ) ).toBe( 0 );
+			expect( JSON.stringify( output ) ).toContain( 'Screenshot captured' );
+			expect( JSON.stringify( output ) ).toContain( 'This model cannot view images' );
+			expect( imageCount( requests[ 2 ].body.input ) ).toBe( 0 );
 			expect( ui.showArtifact ).toHaveBeenCalledTimes( 1 );
 			expect( ui.showArtifact.mock.calls[ 0 ][ 0 ].widgets ).toEqual( [
 				expect.objectContaining( {
@@ -1301,7 +1409,9 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			);
 			const output = outputFor( requests[ 1 ], browse.callIds[ 0 ] );
 			expect( JSON.stringify( output ) ).toContain( 'Use the brand blue here.' );
-			expect( imageCount( output ) ).toBe( 1 );
+			// The annotation browser's image comes back in a tool result, which this route isn't sent.
+			expect( imageCount( output ) ).toBe( 0 );
+			expect( JSON.stringify( output ) ).toContain( 'image left out' );
 		} );
 
 		it( 'reads an attached document, reports a missing one and refuses a core-file write to the model, without failing the turn', async () => {
@@ -1569,7 +1679,8 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				}
 			);
 			expect( first.error ).toBeUndefined();
-			expect( imageCount( requests[ 1 ].body.input ) ).toBe( 3 );
+			// The two attached; the image file read is left out of its tool result on this route.
+			expect( imageCount( requests[ 1 ].body.input ) ).toBe( 2 );
 			expectPinned( 'medium' );
 
 			// Reopened in a fresh agent, at another effort, near the budget.
@@ -1591,7 +1702,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expectPinned( 'low' );
 			const [ turnRequest, ...summaryRequests ] = requests;
 			expect( isSummaryRequest( turnRequest ) ).toBe( false );
-			expect( imageCount( turnRequest.body.input ) ).toBe( 3 );
+			expect( imageCount( turnRequest.body.input ) ).toBe( 2 );
 			expect( summaryRequests.length ).toBeGreaterThan( 0 );
 			for ( const request of summaryRequests ) {
 				expect( isSummaryRequest( request ) ).toBe( true );

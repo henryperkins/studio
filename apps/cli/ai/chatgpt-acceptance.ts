@@ -308,6 +308,8 @@ export interface TurnOptions {
 	policy: ToolPolicy;
 	/** The session file, to see whether a tool result was persisted when its event arrived. */
 	persistenceFile?: string;
+	/** Gate T1's live check: images in tool results turned on, in this turn's process only. */
+	toolImages?: boolean;
 }
 
 export interface TimedEvent {
@@ -1722,6 +1724,7 @@ const SAVED_STAGES: StageDefinition[] = [
 				offerSessions: false,
 				ipc: true,
 				policy,
+				toolImages: true,
 			} );
 			const digest = judgeTurn( observations, result, policy );
 			const screenshots = digest.toolCalls.filter(
@@ -2872,18 +2875,32 @@ function refuseQuestions(
 	);
 }
 
+/**
+ * What a turn's CLI process preloads: the request observer, and for gate T1's
+ * live check alone the module that turns images in tool results on in it.
+ */
+export function acceptanceTurnExecArgv(
+	scripts: { observer: string; toolImages: string },
+	options: Pick< TurnOptions, 'toolImages' >
+): string[] {
+	return [
+		'--import',
+		pathToFileURL( scripts.observer ).href,
+		...( options.toolImages ? [ '--import', pathToFileURL( scripts.toolImages ).href ] : [] ),
+	];
+}
+
 function createLiveProcesses( {
 	mainScript,
-	observerScript,
+	scripts,
 	paths,
 }: {
 	mainScript: string;
-	observerScript: string;
+	scripts: { observer: string; toolImages: string };
 	paths: AcceptanceRunPaths;
 } ): AcceptanceProcesses {
 	const owned = new Set< ChildProcess >();
 	let sequence = 0;
-	const execArgv = [ '--import', pathToFileURL( observerScript ).href ];
 
 	function track( child: ChildProcess ): Promise< number | null > {
 		owned.add( child );
@@ -2927,6 +2944,7 @@ function createLiveProcesses( {
 				'--json',
 				'--avoid-telemetry',
 			];
+			const execArgv = acceptanceTurnExecArgv( scripts, options );
 			const child = options.ipc
 				? fork( mainScript, args, {
 						env,
@@ -3094,7 +3112,10 @@ async function createLiveServices( {
 	process.env.STUDIO_EXPERIMENTAL_CHATGPT = '1';
 	const cliDirectory = import.meta.dirname;
 	const mainScript = path.join( cliDirectory, 'main.mjs' );
-	const observerScript = path.join( cliDirectory, 'chatgpt-acceptance-observer.mjs' );
+	const scripts = {
+		observer: path.join( cliDirectory, 'chatgpt-acceptance-observer.mjs' ),
+		toolImages: path.join( cliDirectory, 'chatgpt-acceptance-tool-images.mjs' ),
+	};
 	installAcceptanceObserver( path.join( paths.observerDir, '00-runner.ndjson' ) );
 	const tokens = createAcceptanceTokenService( createChatGptTokenClient() );
 	setChatGptTokenClient( tokens.client );
@@ -3130,8 +3151,11 @@ async function createLiveServices( {
 			filePath: async ( sessionId ) =>
 				( await loadAiSession( getSessionsDirectory(), sessionId ) ).summary.filePath,
 		},
-		processes: createLiveProcesses( { mainScript, observerScript, paths } ),
-		buildPresent: () => fs.existsSync( mainScript ) && fs.existsSync( observerScript ),
+		processes: createLiveProcesses( { mainScript, scripts, paths } ),
+		buildPresent: () =>
+			[ mainScript, scripts.observer, scripts.toolImages ].every( ( file ) =>
+				fs.existsSync( file )
+			),
 		credentialStoreKind: () => credentialStoreKindFor( process.platform ),
 		secureStorageAvailable: async () => ( await createOsCredentialStore().check() ).available,
 		imageServiceConfigured: () => isImageGenerationAvailable(),
