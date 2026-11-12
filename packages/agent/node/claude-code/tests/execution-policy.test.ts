@@ -151,7 +151,7 @@ describe( 'Claude tool use at the SDK hook and native permission request', () =>
 			[ 'Task', { prompt: 'anything' } ],
 			[ 'mcp__studio__wp_cli', {}, { name: 'studio', source: 'project' } ],
 			[ 'mcp__studio__wp_cli', {} ],
-			[ 'mcp__studio__site_delete', {}, studioServer ],
+			[ 'mcp__studio__site_push', {}, studioServer ],
 			[ 'mcp__other__wp_cli', {}, { name: 'other', source: 'sdk' } ],
 		];
 		for ( const [ toolName, input, server ] of denied )

@@ -65,14 +65,19 @@ const verifiedSandbox = {
 };
 const allStudioTools = () => [ ...CLAUDE_STUDIO_TOOL_RULES.keys() ];
 
+// What a tool that acts on the site it names only through the host declares.
+const throughHost = {
+	...noChannels,
+	runsWpCli: [ 'site', 'host' ],
+	callsHostOperation: [ 'site', 'host' ],
+};
 // The tools this build qualifies, each with the channels it declares.
 const QUALIFIED: Record< string, Record< string, unknown > > = {
 	wp_cli: { ...noChannels, runsWpCli: [ 'site', 'host' ], callsHostOperation: [ 'host' ] },
-	site_info: {
-		...noChannels,
-		runsWpCli: [ 'site', 'host' ],
-		callsHostOperation: [ 'site', 'host' ],
-	},
+	site_info: throughHost,
+	site_start: throughHost,
+	site_stop: throughHost,
+	site_delete: throughHost,
 };
 const isQualifiedName = ( name: string ) => Object.prototype.hasOwnProperty.call( QUALIFIED, name );
 // In the order the rule table, and so every enabled list, names them.

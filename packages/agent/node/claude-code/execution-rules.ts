@@ -49,7 +49,13 @@ export interface ClaudeEnabledTools {
  */
 export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 	native: Object.freeze( [ 'Read' ] ),
-	studio: Object.freeze( [ runWpCliTool.name, getSiteInfoTool.name ] ),
+	studio: Object.freeze( [
+		runWpCliTool.name,
+		getSiteInfoTool.name,
+		startSiteTool.name,
+		stopSiteTool.name,
+		deleteSiteTool.name,
+	] ),
 } );
 
 /** How long the user has to answer an approval. */
@@ -626,9 +632,24 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		// can reach WP-CLI only through the guarded host.
 		qualified( onSite( 'read' ), using( LOCAL_SITE_HOST_CHANNELS ) ),
 	],
-	[ startSiteTool.name, unqualified( onSite( 'local-change', { approval: 'host' } ) ) ],
-	[ stopSiteTool.name, unqualified( onSite( 'local-change', { approval: 'host' } ) ) ],
-	[ deleteSiteTool.name, unqualified( onSite( 'local-overwrite', { approval: 'host' } ) ) ],
+	// These resolve the site they name and run the CLI's own command for it
+	// through the host, which binds it to the target site, journals it, asks
+	// for what its class asks for and fences it immediately before it starts.
+	[
+		startSiteTool.name,
+		qualified( onSite( 'local-change', { approval: 'host' } ), using( LOCAL_SITE_HOST_CHANNELS ) ),
+	],
+	[
+		stopSiteTool.name,
+		qualified( onSite( 'local-change', { approval: 'host' } ), using( LOCAL_SITE_HOST_CHANNELS ) ),
+	],
+	[
+		deleteSiteTool.name,
+		qualified(
+			onSite( 'local-overwrite', { approval: 'host' } ),
+			using( LOCAL_SITE_HOST_CHANNELS )
+		),
+	],
 	[ createPreviewTool.name, unqualified( onSite( 'remote-change', { approval: 'host' } ) ) ],
 	[ listPreviewsTool.name, unqualified( onSite( 'read' ) ) ],
 	[ updatePreviewTool.name, unqualified( onSite( 'remote-overwrite', { approval: 'host' } ) ) ],
