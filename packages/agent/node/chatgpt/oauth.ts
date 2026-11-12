@@ -25,6 +25,7 @@ import {
 import {
 	openLoopbackPeerLookup,
 	type LoopbackPeerLookup,
+	type LoopbackPeerOwner,
 } from '@studio/agent/node/chatgpt/loopback-peer';
 import {
 	CHATGPT_RESOURCE,
@@ -341,6 +342,10 @@ function redirect( response: http.ServerResponse, location: string ): void {
 
 const rejectedPage = () =>
 	__( 'This sign-in link isn’t valid. Go back to WordPress Studio to sign in again.' );
+
+// For a request whose owner couldn't be checked just now: the link still works.
+const retryPage = () =>
+	__( 'WordPress Studio couldn’t check this sign-in just now. Reload this page to try again.' );
 
 const finishedPage = ( outcome: ChatGptSignInOutcome ) =>
 	outcome.ok
@@ -691,9 +696,9 @@ export function createChatGptSignInFlow(
 			respond( response, 400, rejectedPage() );
 			return;
 		}
-		void isRefusedPeer( attempt, request ).then( ( refused ) => {
-			if ( refused ) {
-				respond( response, 400, rejectedPage() );
+		void peerRefusal( attempt, request ).then( ( refusal ) => {
+			if ( refusal ) {
+				respond( response, 400, refusal === 'unchecked' ? retryPage() : rejectedPage() );
 			} else if ( isStart ) {
 				answerStart( attempt, request, response );
 			} else {
@@ -703,7 +708,9 @@ export function createChatGptSignInFlow(
 	}
 
 	/**
-	 * Whether the request is refused for whose socket it comes from.
+	 * Why the request is refused for whose socket it comes from, if it is:
+	 * `another-user`, told the link isn't valid, or `unchecked`, told to
+	 * reload, as the start address and the attempt are left as they were.
 	 *
 	 * Only on Linux, where any local user can read the browser opener's
 	 * command line, start address and all, from /proc; macOS and Windows show
@@ -721,28 +728,32 @@ export function createChatGptSignInFlow(
 	 * refused: another user can bring one about, by holding the process at its
 	 * limit of open files, say.
 	 */
-	async function isRefusedPeer(
+	async function peerRefusal(
 		attempt: Attempt,
 		request: http.IncomingMessage
-	): Promise< boolean > {
+	): Promise< 'another-user' | 'unchecked' | null > {
 		if ( ! attempt.peers ) {
-			return false;
+			return null;
 		}
 		const { remoteAddress, remotePort, localAddress, localPort } = request.socket;
 		if ( ! remoteAddress || ! remotePort || ! localAddress || ! localPort ) {
-			return true;
+			return 'unchecked';
 		}
+		let owner: LoopbackPeerOwner;
 		try {
-			const owner = await attempt.peers.ownerOf( {
+			owner = await attempt.peers.ownerOf( {
 				remoteAddress,
 				remotePort,
 				localAddress,
 				localPort,
 			} );
-			return owner === 'other-user' || owner === 'unreadable';
 		} catch {
-			return true;
+			return 'unchecked';
 		}
+		if ( owner === 'other-user' ) {
+			return 'another-user';
+		}
+		return owner === 'unreadable' ? 'unchecked' : null;
 	}
 
 	// Once only, and only while the attempt waits for its callback.

@@ -100,16 +100,46 @@ describe( 'whose socket a loopback connection comes from', () => {
 		expect( ownerIn( { tcp: known, tcp6: tcpTable() } ) ).toBe( 'unreadable' );
 	} );
 
-	it( 'is unreadable when a row can’t be parsed, even beside a whole row for the peer', () => {
-		for ( const garbled of [
-			peerRow( OTHER_UID ).replace( /\s+1001\s/, ' 10x1 ' ),
-			peerRow( OTHER_UID ).slice( 0, 60 ),
-			`   7: ${ at( PEER_PORT ) }`,
-			'not a row at all',
-		] ) {
-			expect( ownerIn( { tcp: tcpTable( garbled ) } ) ).toBe( 'unreadable' );
-			expect( ownerIn( { tcp: tcpTable( garbled, peerRow( OWN_UID, 8 ) ) } ) ).toBe( 'unreadable' );
-		}
+	// Rows that aren't the request's, however garbled, can't hide its own: an
+	// emulated /proc, or a row form the kernel changes, doesn't stop every sign-in.
+	it.each( [
+		[ 'with no remote end', `   7: ${ at( PEER_PORT ) }` ],
+		[ 'that isn’t a row at all', 'not a row at all' ],
+		[
+			'with ends that aren’t hex',
+			`   7: 0100007G:${ hex4( PEER_PORT ) } ${ at( LISTENER_PORT ) } 01`,
+		],
+		[
+			'of another socket, its uid garbled',
+			tcpRow( 7, at( PEER_PORT, v4( 2 ) ), at( LISTENER_PORT ), { uid: OTHER_UID } ).replace(
+				/\s+1001\s/,
+				' 10x1 '
+			),
+		],
+		[ 'of another socket, cut short', tcpRow( 7, at( 443 ), at( LISTENER_PORT ) ).slice( 0, 60 ) ],
+		[
+			'of another socket, in a future form',
+			`   7: ${ at( 443 ) } ${ at( LISTENER_PORT ) } 01 new-column`,
+		],
+	] )( 'skips a row %s, and answers from the request’s own', ( _name, garbled ) => {
+		expect( ownerIn( { tcp: tcpTable( garbled, peerRow( OTHER_UID, 8 ) ) } ) ).toBe( 'other-user' );
+		expect( ownerIn( { tcp: tcpTable( peerRow( OWN_UID, 8 ), garbled ) } ) ).toBe( 'same-user' );
+		expect( ownerIn( { tcp: tcpTable( garbled ) } ) ).toBe( 'unknown' );
+	} );
+
+	it.each( [
+		[ 'uid', peerRow( OTHER_UID ).replace( /\s+1001\s/, ' 10x1 ' ) ],
+		[ 'uid, missing', peerRow( OTHER_UID ).slice( 0, 75 ) ],
+		[ 'state', peerRow( OTHER_UID ).replace( ' 01 00000000:', ' 1Z 00000000:' ) ],
+		[ 'timer', peerRow( OTHER_UID ).slice( 0, 60 ) ],
+		[ 'slot', peerRow( OTHER_UID ).replace( '   2:', '  2x:' ) ],
+	] )( 'is unreadable when the request’s own row has a %s it can’t parse', ( _name, garbled ) => {
+		expect( ownerIn( { tcp: tcpTable( garbled ) } ) ).toBe( 'unreadable' );
+		expect( ownerIn( { tcp: tcpTable( garbled, peerRow( OWN_UID, 8 ) ) } ) ).toBe( 'unreadable' );
+		const garbled6 = peerRow6( OTHER_UID ).replace( /\s+1001\s/, ' 10x1 ' );
+		expect( ownerIn( { tcp: tcpTable( peerRow( OWN_UID ) ), tcp6: tcp6Table( garbled6 ) } ) ).toBe(
+			'unreadable'
+		);
 	} );
 
 	it( 'reads past blank lines and the padding the kernel adds', () => {
@@ -252,7 +282,6 @@ describe( 'whose socket a loopback connection comes from', () => {
 
 describe( 'reading the socket tables', () => {
 	const CONTAINER_UID_MAP = '         0     100000      65536\n';
-	const MAX_TABLE_BYTES = 4 * 1024 * 1024;
 	const lookups: LoopbackPeerLookup[] = [];
 
 	// This machine's /proc as a test sets it: no row for the peer yet.
@@ -368,16 +397,11 @@ describe( 'reading the socket tables', () => {
 			}
 		);
 
-		it( 'reads up to 4 MiB of it, and is unreadable beyond', async () => {
-			const fill = ( bytes: number, table: string ) => {
-				const padding = bytes - Buffer.byteLength( table );
-				expect( padding ).toBeGreaterThanOrEqual( 0 );
-				// The last row padded with spaces, as the kernel pads /proc/net/tcp's.
-				return `${ table.slice( 0, -1 ) }${ ' '.repeat( padding ) }\n`;
-			};
-			const others = Array.from( { length: 23_000 }, ( _, slot ) =>
+		// A busy host's table, over the 4 MiB an earlier bound refused.
+		function busyTable( uid: number ) {
+			const others = Array.from( { length: 40_000 }, ( _, slot ) =>
 				file === TCP_FILE
-					? tcpRow( slot + 10, at( 20_000 + ( slot % 40_000 ), v4( 9 ) ), at( 443, 'C0A80001' ), {
+					? tcpRow( slot + 10, at( 20_000 + slot, v4( 9 ) ), at( 443, 'C0A80001' ), {
 							uid: OTHER_UID,
 					  } )
 					: tcp6Row(
@@ -389,16 +413,68 @@ describe( 'reading the socket tables', () => {
 			);
 			const table =
 				file === TCP_FILE
-					? tcpTable( ...others, peerRow( OWN_UID ) )
-					: tcp6Table( ...others, peerRow6( OWN_UID ) );
-			const fake = proc( { [ file ]: fill( MAX_TABLE_BYTES, table ) } );
+					? tcpTable( ...others, peerRow( uid ) )
+					: tcp6Table( ...others, peerRow6( uid ) );
+			expect( Buffer.byteLength( table ) ).toBeGreaterThan( 5 * 1024 * 1024 );
+			return table;
+		}
+
+		it( 'finds the request’s row at the very end of a table over 4 MiB, reading it through one buffer, contiguously from offset 0', async () => {
+			const fake = proc( { [ file ]: busyTable( OWN_UID ) } );
 			const lookup = lookUp( fake );
 
 			await expect( lookup.ownerOf( connection ) ).resolves.toBe( 'same-user' );
+			fake.content.set( file, busyTable( OTHER_UID ) );
+			const before = fake.reads.length;
+			await expect( lookup.ownerOf( connection ) ).resolves.toBe( 'other-user' );
 
-			fake.content.set( file, fill( MAX_TABLE_BYTES + 1, table ) );
+			const pass = fake.reads.slice( before ).filter( ( read ) => read.file === file );
+			expect( pass.length ).toBeGreaterThan( 80 );
+			expect( pass[ 0 ].position ).toBe( 0 );
+			for ( let index = 1; index < pass.length; index++ ) {
+				expect( pass[ index ].position ).toBe(
+					pass[ index - 1 ].position + pass[ index - 1 ].bytes
+				);
+			}
+			expect( pass.at( -1 )!.bytes ).toBe( 0 );
+			expect( new Set( pass.map( ( read ) => read.buffer ) ).size ).toBe( 1 );
+		} );
+
+		it( 'parses a row split across reads, inside its addresses, its uid or anywhere else', async () => {
+			const own = file === TCP_FILE ? peerRow( OTHER_UID ) : peerRow6( OTHER_UID );
+			const before = file === TCP_FILE ? tcpTable( LISTENING ).length : tcp6Table().length;
+			const table = file === TCP_FILE ? tcpTable( LISTENING, own ) : tcp6Table( own );
+			const peerEnd =
+				file === TCP_FILE ? at( PEER_PORT ) : `${ mapped( 1 ) }:${ hex4( PEER_PORT ) }`;
+			const listenerEnd =
+				file === TCP_FILE ? at( LISTENER_PORT ) : `${ mapped( 1 ) }:${ hex4( LISTENER_PORT ) }`;
+			const local = own.indexOf( peerEnd );
+			const remote = own.indexOf( listenerEnd, local + 1 );
+			const uid = own.indexOf( ` ${ OTHER_UID } ` );
+			expect( [ local, remote, uid ].every( ( found ) => found > 0 ) ).toBe( true );
+			const fake = proc( { [ file ]: table } );
+			const lookup = lookUp( fake );
+
+			// Inside its local address, its remote address and its uid, and at its start.
+			for ( const offset of [ local + 5, remote + 3, uid + 3, 0 ] ) {
+				fake.cutReadsAt( file, [ before + offset ] );
+				await expect( lookup.ownerOf( connection ) ).resolves.toBe( 'other-user' );
+			}
+			// Every byte its own read: every split at once, the header's too.
+			fake.cutReadsAt(
+				file,
+				Array.from( { length: table.length }, ( _, offset ) => offset + 1 )
+			);
+			await expect( lookup.ownerOf( connection ) ).resolves.toBe( 'other-user' );
+		} );
+
+		it( 'is unreadable for a read that fails partway through, and answers again once it reads', async () => {
+			const fake = proc( { [ file ]: busyTable( OWN_UID ) } );
+			const lookup = lookUp( fake );
+			fake.failNextRead( file, { failAfter: 300_000, error: systemError( 'EIO' ) } );
 
 			await expect( lookup.ownerOf( connection ) ).resolves.toBe( 'unreadable' );
+			await expect( lookup.ownerOf( connection ) ).resolves.toBe( 'same-user' );
 		} );
 	} );
 
@@ -421,9 +497,13 @@ describe( 'reading the socket tables', () => {
 		}
 	);
 
-	it( 'gives up on a lookup that takes 2 seconds, and answers the next once the table reads', async () => {
+	it( 'gives up on a lookup that takes 2 seconds, stops reading at its next read, and answers the next once the table reads', async () => {
 		vi.useFakeTimers();
-		const fake = proc( { [ TCP_FILE ]: tcpTable( peerRow( OWN_UID ) ) } );
+		// More than one read's worth, the request's row last.
+		const others = Array.from( { length: 2_000 }, ( _, slot ) =>
+			tcpRow( slot + 10, at( 20_000 + slot, v4( 9 ) ), at( 443, 'C0A80001' ) )
+		);
+		const fake = proc( { [ TCP_FILE ]: tcpTable( ...others, peerRow( OWN_UID ) ) } );
 		const lookup = lookUp( fake );
 		fake.failNextRead( TCP_FILE, { stallMs: 5_000 } );
 		let answer: string | undefined;
@@ -433,9 +513,12 @@ describe( 'reading the socket tables', () => {
 		expect( answer ).toBeUndefined();
 		await vi.advanceTimersByTimeAsync( 1 );
 		expect( answer ).toBe( 'unreadable' );
-
 		await vi.advanceTimersByTimeAsync( 3_000 );
+
+		// The stalled read came back, and nothing more of that table was read.
+		expect( fake.reads.filter( ( read ) => read.file === TCP_FILE ) ).toHaveLength( 1 );
 		await expect( lookup.ownerOf( connection ) ).resolves.toBe( 'same-user' );
+		expect( fake.reads.filter( ( read ) => read.file === TCP_FILE ).length ).toBeGreaterThan( 3 );
 	} );
 
 	it( 'answers one lookup at a time, so no two read a table at once', async () => {

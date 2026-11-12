@@ -1815,9 +1815,17 @@ describe( 'Signing in to ChatGPT', () => {
 				return { flow: linux, owner, close };
 			}
 
+			// Another user's request is told the link isn't valid; one that couldn't
+			// be checked, to reload the page, which works.
+			const PAGES = {
+				invalid: /This sign-in link isn’t valid\./,
+				reload: /Reload this page to try again\./,
+			};
+
 			function expectNothingDisclosed(
 				refused: { status: number; location?: string | null; page: string },
-				location: string
+				location: string,
+				page: keyof typeof PAGES
 			) {
 				expect( refused.status ).toBe( 400 );
 				expect( refused.location ?? undefined ).toBeUndefined();
@@ -1826,15 +1834,17 @@ describe( 'Signing in to ChatGPT', () => {
 				for ( const name of [ 'state', 'nonce', 'code_challenge', 'client_id', 'redirect_uri' ] ) {
 					expect( refused.page ).not.toContain( query.get( name )! );
 				}
+				expect( refused.page ).toMatch( PAGES[ page ] );
+				expect( refused.page ).not.toMatch( PAGES[ page === 'invalid' ? 'reload' : 'invalid' ] );
 			}
 
-			it.each< [ string, LoopbackPeerOwner | Error ] >( [
-				[ 'another user', 'other-user' ],
-				[ 'an owner whose socket tables can’t be read', 'unreadable' ],
-				[ 'an owner the lookup failed to find', new Error( 'test-lookup-failure' ) ],
+			it.each< [ string, LoopbackPeerOwner | Error, keyof typeof PAGES ] >( [
+				[ 'another user', 'other-user', 'invalid' ],
+				[ 'an owner whose socket tables can’t be read', 'unreadable', 'reload' ],
+				[ 'an owner the lookup failed to find', new Error( 'test-lookup-failure' ), 'reload' ],
 			] )(
 				'refuses a request from %s without disclosing anything, leaving the address and the attempt to the browser',
-				async ( _name, refusal ) => {
+				async ( _name, refusal, page ) => {
 					const { flow: linux, owner } = linuxFlow( [
 						refusal,
 						'same-user',
@@ -1852,10 +1862,10 @@ describe( 'Signing in to ChatGPT', () => {
 					const exchangedBefore = fake.tokenRequests.length;
 					const delivered = await deliver( callbackUrl );
 
-					expectNothingDisclosed( intruded, location );
+					expectNothingDisclosed( intruded, location, page );
 					expect( response.status ).toBe( 302 );
 					expect( location.startsWith( `${ fake.url }/api/accounts/authorize?` ) ).toBe( true );
-					expectNothingDisclosed( intrudedCallback, location );
+					expectNothingDisclosed( intrudedCallback, location, page );
 					expect( exchangedBefore ).toBe( 0 );
 					expect( delivered.status ).toBe( 200 );
 					expect( ( await linux.wait( attemptId ) ).ok ).toBe( true );
@@ -1953,9 +1963,8 @@ describe( 'Signing in to ChatGPT', () => {
 
 			// Through the reader itself, over stand-in /proc files the test scripts.
 			describe( 'reading the socket tables', () => {
-				const MAX_TABLE_BYTES = 4 * 1024 * 1024;
 				const CONTAINER_UID_MAP = '         0     100000      65536\n';
-				const oversized = new Map< string, string >();
+				const busy = new Map< string, string >();
 
 				function linuxProc( files: Record< string, string > = {} ) {
 					return createFakeProc( {
@@ -2013,28 +2022,45 @@ describe( 'Signing in to ChatGPT', () => {
 						);
 					};
 
-				// A well-formed table just over the bound, of other sockets.
-				function oversizedTable( file: string ): string {
-					let table = oversized.get( file );
-					if ( ! table ) {
-						const rows = Array.from( { length: 30_000 }, ( _, slot ) =>
+				// Lists the request's socket as `uid`'s at the very end of a busy host's
+				// table, over the 4 MiB an earlier bound refused.
+				const listedLastAs =
+					( proc: FakeProc, startUrl: string, uid: number, file = TCP_FILE ) =>
+					( localPort: number ) => {
+						const listener = Number( new URL( startUrl ).port );
+						let others = busy.get( file );
+						if ( ! others ) {
+							const rows = Array.from( { length: 40_000 }, ( _, slot ) =>
+								file === TCP_FILE
+									? tcpRow( slot + 10, at( 20_000 + slot, v4( 9 ) ), at( 443, 'C0A80001' ), {
+											uid: OTHER_UID,
+									  } )
+									: tcp6Row(
+											slot + 10,
+											`${ mapped( 9 ) }:${ hex4( 20_000 + slot ) }`,
+											`${ mapped( 9 ) }:01BB`,
+											OTHER_UID
+									  )
+							);
+							others = file === TCP_FILE ? tcpTable( ...rows ) : tcp6Table( ...rows );
+							busy.set( file, others );
+						}
+						const row =
 							file === TCP_FILE
-								? tcpRow( slot + 10, at( 20_000 + slot, v4( 9 ) ), at( 443, 'C0A80001' ), {
-										uid: OTHER_UID,
-								  } )
+								? tcpRow( 1, at( localPort ), at( listener ), { uid } )
 								: tcp6Row(
-										slot + 10,
-										`${ mapped( 9 ) }:${ hex4( 20_000 + slot ) }`,
-										`${ mapped( 9 ) }:01BB`,
-										OTHER_UID
-								  )
+										1,
+										`${ mapped( 1 ) }:${ hex4( localPort ) }`,
+										`${ mapped( 1 ) }:${ hex4( listener ) }`,
+										uid
+								  );
+						proc.content.set( TCP_FILE, tcpTable() );
+						proc.content.set( TCP6_FILE, tcp6Table() );
+						proc.content.set( file, `${ others }${ row }\n` );
+						expect( Buffer.byteLength( proc.content.get( file )! ) ).toBeGreaterThan(
+							5 * 1024 * 1024
 						);
-						table = file === TCP_FILE ? tcpTable( ...rows ) : tcp6Table( ...rows );
-						oversized.set( file, table );
-					}
-					expect( Buffer.byteLength( table ) ).toBeGreaterThan( MAX_TABLE_BYTES );
-					return table;
-				}
+					};
 
 				it( 'opens the tables as its listener starts, before the browser, reads them again for each request, and closes them with the attempt', async () => {
 					const proc = linuxProc();
@@ -2055,7 +2081,7 @@ describe( 'Signing in to ChatGPT', () => {
 					expect( openWhenBrowsing ).toEqual( [
 						expect.arrayContaining( [ TCP_FILE, TCP6_FILE ] ),
 					] );
-					expectNothingDisclosed( intruded, location );
+					expectNothingDisclosed( intruded, location, 'invalid' );
 					expect( delivered.status ).toBe( 200 );
 					expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
 					for ( const file of [ TCP_FILE, TCP6_FILE ] ) {
@@ -2092,8 +2118,9 @@ describe( 'Signing in to ChatGPT', () => {
 							proc.failNextRead( file, new TypeError( 'test-unexpected-read' ) ),
 					},
 					{
-						name: 'a table larger than 4 MiB',
-						fail: ( proc, file ) => proc.failNextRead( file, { text: oversizedTable( file ) } ),
+						name: 'a read failing partway through the table',
+						fail: ( proc, file ) =>
+							proc.failNextRead( file, { failAfter: 1, error: systemError( 'EIO' ) } ),
 					},
 					{
 						name: 'a table in a layout it doesn’t know',
@@ -2137,7 +2164,8 @@ describe( 'Signing in to ChatGPT', () => {
 						}
 
 						expect( answered.status ).toBe( kind === 'start address' ? 302 : 200 );
-						expectNothingDisclosed( refused, location! );
+						// Told to reload, which, as `answered` shows, works.
+						expectNothingDisclosed( refused, location!, 'reload' );
 						expect( exchangedBefore ).toBe( 0 );
 						expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
 					}
@@ -2167,7 +2195,29 @@ describe( 'Signing in to ChatGPT', () => {
 							listedAs( proc, startUrl, OTHER_UID, TCP_FILE )
 						);
 
-						expectNothingDisclosed( intruded, response.location! );
+						expectNothingDisclosed( intruded, response.location!, 'invalid' );
+						expect( response.status ).toBe( 302 );
+						expect( delivered.status ).toBe( 200 );
+						expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
+					}
+				);
+
+				it.each( [ TCP_FILE, TCP6_FILE ] )(
+					'finds the request’s row at the end of a busy host’s %s, over 4 MiB: another user refused, this user let through',
+					async ( file ) => {
+						const proc = linuxProc();
+						const linux = procFlow( proc );
+						const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+						const mine = listedLastAs( proc, startUrl, OWN_UID, file );
+
+						const intruded = await requestFrom(
+							startUrl,
+							listedLastAs( proc, startUrl, OTHER_UID, file )
+						);
+						const response = await requestFrom( startUrl, mine );
+						const delivered = await requestFrom( await authorize( response.location! ), mine );
+
+						expectNothingDisclosed( intruded, response.location!, 'invalid' );
 						expect( response.status ).toBe( 302 );
 						expect( delivered.status ).toBe( 200 );
 						expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
@@ -2184,7 +2234,7 @@ describe( 'Signing in to ChatGPT', () => {
 					const location = ( await requestFrom( startUrl, mine ) ).location!;
 					await requestFrom( await authorize( location ), mine );
 
-					expectNothingDisclosed( nobody, location );
+					expectNothingDisclosed( nobody, location, 'invalid' );
 					expect( await linux.wait( attemptId ) ).toMatchObject( { ok: true } );
 				} );
 

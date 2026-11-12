@@ -77,23 +77,32 @@ export const INITIAL_UID_MAP = `${ '0'.padStart( 10 ) } ${ '0'.padStart( 10 ) } 
 export const systemError = ( code: string ) =>
 	Object.assign( new Error( `${ code }: test-proc-error` ), { code, syscall: 'read' } );
 
-/** What the next read of a file from its start does instead of reading it as it is. */
-type NextRead = Error | { stallMs: number } | { text: string };
+/**
+ * What the next read-through of a file from its start does instead of reading
+ * it as it is: fail at once, stall first, read other text, or fail at the
+ * first read from `failAfter` bytes on.
+ */
+type NextRead =
+	| Error
+	| { stallMs: number }
+	| { text: string }
+	| { failAfter: number; error: Error };
 
 /**
  * The files under /proc a lookup opens, as a scriptable stand-in. A read from
  * a file's start sees its content at that moment and the reads after it go on
  * through that same text, as the kernel's seq_file does; a test can make the
- * next open of a file fail, or the next read from its start fail, stall or
- * return other text.
+ * next open of a file fail, change the next read-through from its start, or
+ * end reads at chosen offsets, as a short read may.
  */
 export function createFakeProc( files: Record< string, string > ) {
 	const content = new Map( Object.entries( files ) );
 	const opens: string[] = [];
 	const closes: string[] = [];
-	const reads: Array< { file: string; position: number } > = [];
+	const reads: Array< { file: string; position: number; bytes: number; buffer: Buffer } > = [];
 	const openFailures = new Map< string, Error[] >();
 	const nextReads = new Map< string, NextRead[] >();
+	const cuts = new Map< string, number[] >();
 
 	const queue = < T >( map: Map< string, T[] >, file: string, item: T ) =>
 		map.set( file, [ ...( map.get( file ) ?? [] ), item ] );
@@ -108,9 +117,11 @@ export function createFakeProc( files: Record< string, string > ) {
 			throw systemError( 'ENOENT' );
 		}
 		let pass = Buffer.alloc( 0 );
+		let failing: { failAfter: number; error: Error } | undefined;
 		return {
 			read: async ( buffer, position ) => {
-				reads.push( { file, position } );
+				const entry = { file, position, bytes: 0, buffer };
+				reads.push( entry );
 				if ( position === 0 ) {
 					const next = nextReads.get( file )?.shift();
 					if ( next instanceof Error ) {
@@ -119,12 +130,16 @@ export function createFakeProc( files: Record< string, string > ) {
 					if ( next && 'stallMs' in next ) {
 						await new Promise( ( resolve ) => setTimeout( resolve, next.stallMs ) );
 					}
+					failing = next && 'failAfter' in next ? next : undefined;
 					pass = Buffer.from( next && 'text' in next ? next.text : content.get( file ) ?? '' );
 				}
-				if ( position >= pass.length ) {
-					return 0;
+				if ( failing && position >= failing.failAfter ) {
+					throw failing.error;
 				}
-				return pass.copy( buffer, 0, position, Math.min( pass.length, position + buffer.length ) );
+				const cut = ( cuts.get( file ) ?? [] ).find( ( offset ) => offset > position );
+				const end = Math.min( pass.length, position + buffer.length, cut ?? Infinity );
+				entry.bytes = position >= end ? 0 : pass.copy( buffer, 0, position, end );
+				return entry.bytes;
 			},
 			close: async () => {
 				closes.push( file );
@@ -140,6 +155,12 @@ export function createFakeProc( files: Record< string, string > ) {
 		reads,
 		failNextOpen: ( file: string, error: Error ) => queue( openFailures, file, error ),
 		failNextRead: ( file: string, next: NextRead ) => queue( nextReads, file, next ),
+		/** Ends every read of `file` at these offsets, as short reads. */
+		cutReadsAt: ( file: string, offsets: number[] ) =>
+			cuts.set(
+				file,
+				[ ...offsets ].sort( ( a, b ) => a - b )
+			),
 	};
 }
 

@@ -47,13 +47,17 @@ const TCP6_HEADER =
 const DEFAULT_OVERFLOW_UID = 65534;
 // timer_active 3: a TIME_WAIT socket, whose uid the kernel prints as 0.
 const TIME_WAIT_TIMER = '03';
-// A row takes about 150 bytes, so this is some 28,000 sockets in a table, where
-// a desktop lists hundreds; up to it, reading and parsing a table stays quick.
-const MAX_TABLE_BYTES = 4 * 1024 * 1024;
-const MAX_SETTING_BYTES = 64 * 1024;
+// A table is read through one buffer of this size, whatever its length, and
+// scanned as it arrives: only the request's own rows are kept.
 const READ_CHUNK_BYTES = 64 * 1024;
+// The kernel's lines here are under 200 characters; a longer one is kept to its
+// start, which holds every field read here.
+const MAX_LINE_CHARS = 512;
+const MAX_SETTING_BYTES = 64 * 1024;
 // A lookup normally takes milliseconds; a browser waiting this long for its
-// answer is still fine, and a stalled read refuses rather than hold a request.
+// answer is still fine. It also bounds a lookup's work, with no limit on a
+// table's size: past it the answer is `unreadable` and the scan stops at its
+// next read.
 const LOOKUP_TIMEOUT_MS = 2_000;
 // How the kernel says a table isn't this process's to see: absent (a kernel
 // without IPv6, say) or forbidden (a hardened /proc).
@@ -62,48 +66,82 @@ const HIDDEN_CODES = new Set( [ 'ENOENT', 'EACCES', 'EPERM' ] );
 const isHidden = ( error: unknown ) =>
 	isErrnoException( error ) && HIDDEN_CODES.has( error.code ?? '' );
 
-interface Row {
+/** A table's header, and the request's two ends as that table prints them. */
+interface TableTarget {
+	header: RegExp;
+	endpoint: RegExp;
 	local: string;
 	remote: string;
-	timer: string;
-	uid: number;
 }
 
-// One table's rows; null when it isn't in the layout above, or a row of it isn't.
-function parseTable( text: string, header: RegExp, addressDigits: number ): Row[] | null {
-	const [ first, ...lines ] = text.split( '\n' );
-	if ( ! header.test( first ) ) {
-		return null;
-	}
-	const endpoint = new RegExp( `^[0-9A-F]{${ addressDigits }}:[0-9A-F]{4}$`, 'i' );
-	const rows: Row[] = [];
-	for ( const line of lines ) {
-		if ( line.trim() === '' ) {
-			continue;
+/**
+ * One table, scanned as it arrives in pieces that may split a line anywhere,
+ * keeping only the uids of the rows for the request's socket. A row whose two
+ * ends don't parse, or aren't the request's, is skipped whatever else it
+ * holds: another user can't make their own row malformed, and an unrelated
+ * row can't hide theirs. `end` gives null when the first line isn't the
+ * kernel's header, or a row for the request has a field that doesn't parse.
+ */
+function scanTable( target: TableTarget ) {
+	const uids: number[] = [];
+	let header: boolean | undefined;
+	let failed = false;
+	let line = '';
+
+	function take( text: string ) {
+		if ( header === undefined ) {
+			header = target.header.test( text );
+			return;
 		}
-		const [ slot, local, remote, state, queues, timers, retransmits, uid ] = line
+		const [ slot, local, remote, state, queues, timers, retransmits, uid ] = text
 			.trim()
 			.split( /\s+/ );
 		if (
+			! target.endpoint.test( local ?? '' ) ||
+			! target.endpoint.test( remote ?? '' ) ||
+			local.toUpperCase() !== target.local ||
+			remote.toUpperCase() !== target.remote
+		) {
+			return;
+		}
+		if (
 			! /^\d+:$/.test( slot ?? '' ) ||
-			! endpoint.test( local ?? '' ) ||
-			! endpoint.test( remote ?? '' ) ||
 			! /^[0-9A-F]{2}$/i.test( state ?? '' ) ||
 			! /^[0-9A-F]{8}:[0-9A-F]{8}$/i.test( queues ?? '' ) ||
 			! /^[0-9A-F]{2}:[0-9A-F]{8,16}$/i.test( timers ?? '' ) ||
 			! /^[0-9A-F]{8}$/i.test( retransmits ?? '' ) ||
 			! /^\d{1,10}$/.test( uid ?? '' )
 		) {
-			return null;
+			failed = true;
+			return;
 		}
-		rows.push( {
-			local: local.toUpperCase(),
-			remote: remote.toUpperCase(),
-			timer: timers.slice( 0, 2 ),
-			uid: Number( uid ),
-		} );
+		if ( timers.slice( 0, 2 ) !== TIME_WAIT_TIMER ) {
+			uids.push( Number( uid ) );
+		}
 	}
-	return rows;
+
+	return {
+		push( text: string ): void {
+			for ( let start = 0; ;  ) {
+				const end = text.indexOf( '\n', start );
+				const piece = end === -1 ? text.slice( start ) : text.slice( start, end );
+				line += piece.slice( 0, Math.max( 0, MAX_LINE_CHARS - line.length ) );
+				if ( end === -1 ) {
+					return;
+				}
+				take( line );
+				line = '';
+				start = end + 1;
+			}
+		},
+		end(): number[] | null {
+			if ( line !== '' ) {
+				take( line );
+				line = '';
+			}
+			return header && ! failed ? uids : null;
+		},
+	};
 }
 
 /**
@@ -143,60 +181,55 @@ const word = ( bytes: number[], littleEndian: boolean ) =>
 const port = ( value: number ) => value.toString( 16 ).toUpperCase().padStart( 4, '0' );
 
 /**
- * Whose socket the peer's end of `connection` is: its row is the one whose
- * local end is the peer's address and port and whose remote end is the
- * listener's, in either table. A table left out is one the kernel hides.
- * `unreadable` when a table isn't in the kernel's layout. `unknown` whenever
- * the tables don't prove an owner: no such row, rows that disagree, an
- * address that isn't IPv4, or the overflow uid, which stands for an owner the
- * kernel couldn't map into this user namespace, unless `uidMap` maps every uid.
+ * The request's socket as each table prints it: in /proc/net/tcp and, for an
+ * IPv6 socket opened to IPv4-mapped 127.0.0.1, in /proc/net/tcp6. Its row's
+ * local end is the peer's address and port, its remote end the listener's.
+ * Null for an address that isn't IPv4.
  */
-export function findLoopbackPeerOwner(
-	tables: { tcp?: string; tcp6?: string },
+function targetsFor(
 	connection: LoopbackConnection,
-	ownUid: number,
-	{
-		littleEndian = endianness() === 'LE',
-		overflowUid = DEFAULT_OVERFLOW_UID,
-		uidMap,
-	}: { littleEndian?: boolean; overflowUid?: number; uidMap?: string } = {}
-): LoopbackPeerOwner {
-	const tcpRows = tables.tcp === undefined ? [] : parseTable( tables.tcp, TCP_HEADER, 8 );
-	const tcp6Rows = tables.tcp6 === undefined ? [] : parseTable( tables.tcp6, TCP6_HEADER, 32 );
-	if ( ! tcpRows || ! tcp6Rows ) {
-		return 'unreadable';
-	}
+	littleEndian: boolean
+): [ TableTarget, TableTarget ] | null {
 	const peer = ipv4Bytes( connection.remoteAddress );
 	const listener = ipv4Bytes( connection.localAddress );
 	if ( ! peer || ! listener ) {
-		return 'unknown';
+		return null;
 	}
 	const mapped = ( bytes: number[] ) =>
 		`${ word( [ 0, 0, 0, 0 ], littleEndian ) }${ word( [ 0, 0, 0, 0 ], littleEndian ) }${ word(
 			[ 0, 0, 0xff, 0xff ],
 			littleEndian
 		) }${ word( bytes, littleEndian ) }`;
-	const candidates = [
+	return [
 		{
-			rows: tcpRows,
+			header: TCP_HEADER,
+			endpoint: /^[0-9A-F]{8}:[0-9A-F]{4}$/i,
 			local: `${ word( peer, littleEndian ) }:${ port( connection.remotePort ) }`,
 			remote: `${ word( listener, littleEndian ) }:${ port( connection.localPort ) }`,
 		},
 		{
-			rows: tcp6Rows,
+			header: TCP6_HEADER,
+			endpoint: /^[0-9A-F]{32}:[0-9A-F]{4}$/i,
 			local: `${ mapped( peer ) }:${ port( connection.remotePort ) }`,
 			remote: `${ mapped( listener ) }:${ port( connection.localPort ) }`,
 		},
 	];
-	const owners = new Set(
-		candidates.flatMap( ( { rows, local, remote } ) =>
-			rows
-				.filter(
-					( row ) => row.local === local && row.remote === remote && row.timer !== TIME_WAIT_TIMER
-				)
-				.map( ( row ) => row.uid )
-		)
-	);
+}
+
+// From the uids each table lists for the request; null for a table that isn't the kernel's.
+function decide(
+	found: Array< number[] | null >,
+	ownUid: number,
+	overflowUid: number,
+	uidMap: string | undefined
+): LoopbackPeerOwner {
+	const owners = new Set< number >();
+	for ( const uids of found ) {
+		if ( ! uids ) {
+			return 'unreadable';
+		}
+		uids.forEach( ( uid ) => owners.add( uid ) );
+	}
 	if ( owners.size !== 1 ) {
 		return 'unknown';
 	}
@@ -208,6 +241,41 @@ export function findLoopbackPeerOwner(
 		return 'unknown';
 	}
 	return uid === 0 ? 'root' : 'other-user';
+}
+
+/**
+ * Whose socket the peer's end of `connection` is, from the tables' text: its
+ * row is the one whose local end is the peer's address and port and whose
+ * remote end is the listener's, in either table. A table left out is one the
+ * kernel hides. `unreadable` when a table's header isn't the kernel's, or a
+ * row for the request has a field that doesn't parse. `unknown` whenever the
+ * tables don't prove an owner: no such row, rows that disagree, an address
+ * that isn't IPv4, or the overflow uid, which stands for an owner the kernel
+ * couldn't map into this user namespace, unless `uidMap` maps every uid.
+ */
+export function findLoopbackPeerOwner(
+	tables: { tcp?: string; tcp6?: string },
+	connection: LoopbackConnection,
+	ownUid: number,
+	{
+		littleEndian = endianness() === 'LE',
+		overflowUid = DEFAULT_OVERFLOW_UID,
+		uidMap,
+	}: { littleEndian?: boolean; overflowUid?: number; uidMap?: string } = {}
+): LoopbackPeerOwner {
+	const targets = targetsFor( connection, littleEndian );
+	if ( ! targets ) {
+		return 'unknown';
+	}
+	const found = [ tables.tcp, tables.tcp6 ].map( ( text, index ) => {
+		if ( text === undefined ) {
+			return [];
+		}
+		const scan = scanTable( targets[ index ] );
+		scan.push( text );
+		return scan.end();
+	} );
+	return decide( found, ownUid, overflowUid, uidMap );
 }
 
 /** A file under /proc, kept open and read again from its start whenever asked. */
@@ -244,30 +312,29 @@ async function openProcFile( file: string ): Promise< ProcFile > {
 	};
 }
 
-// The whole file, from its start. The kernel's seq_file, behind every file
-// read here, supports pread and starts over when read at offset 0
-// (fs/seq_file.c), so a file kept open reads afresh each time.
-async function readFromStart( file: ProcFile, limit: number ): Promise< string > {
-	const chunks: Buffer[] = [];
-	let length = 0;
-	for (;;) {
-		const chunk = Buffer.alloc( READ_CHUNK_BYTES );
-		const read = await file.read( chunk, length );
-		if ( read === 0 ) {
-			return Buffer.concat( chunks, length ).toString( 'utf8' );
-		}
-		length += read;
-		if ( length > limit ) {
+// A small file whole, from its start, through one buffer of `limit` bytes.
+async function readSmallFile( file: ProcFile, limit: number ): Promise< string > {
+	const buffer = Buffer.allocUnsafe( limit );
+	for ( let length = 0; ;  ) {
+		if ( length === limit ) {
 			throw new RangeError( 'The file is larger than Studio reads.' );
 		}
-		chunks.push( chunk.subarray( 0, read ) );
+		const read = await file.read( buffer.subarray( length ), length );
+		if ( read === 0 ) {
+			return buffer.toString( 'latin1', 0, length );
+		}
+		length += read;
 	}
 }
 
-function within< T >( work: Promise< T >, ms: number ): Promise< T > {
+// Rejects once `ms` have passed, after calling `onLate`.
+function within< T >( work: Promise< T >, ms: number, onLate: () => void ): Promise< T > {
 	let timer: ReturnType< typeof setTimeout > | undefined;
 	const late = new Promise< never >( ( _resolve, reject ) => {
-		timer = setTimeout( () => reject( new Error( 'The lookup took too long.' ) ), ms );
+		timer = setTimeout( () => {
+			onLate();
+			reject( new Error( 'The lookup took too long.' ) );
+		}, ms );
 		timer.unref?.();
 	} );
 	return Promise.race( [ work, late ] ).finally( () => clearTimeout( timer ) );
@@ -277,11 +344,13 @@ type Table = { file: ProcFile } | 'hidden' | 'unopened';
 
 /**
  * Opens the socket tables now, for a listener to ask about each request it
- * gets: each lookup reads them again through the same open files, so nothing
- * is opened per request. A table the kernel hides (ENOENT, EACCES, EPERM)
- * counts as no table; any other failure to read or parse one, a table larger
- * than 4 MiB or a lookup slower than 2 seconds makes the answer `unreadable`.
- * A table that failed to open is opened again at the next lookup. Lookups run
+ * gets: each lookup scans them again through the same open files, so nothing
+ * is opened per request, and through one buffer each, keeping only the
+ * request's rows, so its memory doesn't grow with a table. A table the kernel
+ * hides (ENOENT, EACCES, EPERM) counts as no table; any other failure to read
+ * one, a header that isn't the kernel's, a row for the request that doesn't
+ * parse, or a lookup slower than 2 seconds makes the answer `unreadable`. A
+ * table that failed to open is opened again at the next lookup. Lookups run
  * one at a time. The overflow uid and the uid map are read once, as it opens;
  * when either can't be read, the overflow uid stays an unproven owner.
  */
@@ -313,7 +382,7 @@ export function openLoopbackPeerLookup( system: LoopbackPeerSystem = {} ): Loopb
 		let file: ProcFile | undefined;
 		try {
 			file = await openFile( name );
-			return await readFromStart( file, MAX_SETTING_BYTES );
+			return await readSmallFile( file, MAX_SETTING_BYTES );
 		} catch {
 			return undefined;
 		} finally {
@@ -321,20 +390,44 @@ export function openLoopbackPeerLookup( system: LoopbackPeerSystem = {} ): Loopb
 		}
 	}
 
-	// Undefined for a table the kernel hides.
-	async function readTable( index: number ): Promise< string | undefined > {
+	/**
+	 * The uids a table lists for the request: none for a table the kernel
+	 * hides, null for one that isn't the kernel's. Read from offset 0 in
+	 * contiguous positions through one buffer: the kernel's seq_file, behind
+	 * these files, supports pread and starts over at offset 0 (fs/seq_file.c),
+	 * so a file kept open reads afresh each time. Stops at the next read once
+	 * the lookup is past its time.
+	 */
+	async function scanFile(
+		index: number,
+		target: TableTarget,
+		late: () => boolean
+	): Promise< number[] | null > {
 		if ( tables[ index ] === 'unopened' ) {
 			await openTable( index );
 		}
 		const table = tables[ index ];
 		if ( table === 'hidden' || table === 'unopened' ) {
-			return undefined;
+			return [];
 		}
+		const scan = scanTable( target );
+		const buffer = Buffer.allocUnsafe( READ_CHUNK_BYTES );
+		let position = 0;
 		try {
-			return await readFromStart( table.file, MAX_TABLE_BYTES );
+			for (;;) {
+				if ( late() ) {
+					throw new Error( 'The lookup took too long.' );
+				}
+				const read = await table.file.read( buffer, position );
+				if ( read === 0 ) {
+					return scan.end();
+				}
+				scan.push( buffer.toString( 'latin1', 0, read ) );
+				position += read;
+			}
 		} catch ( error ) {
 			if ( isHidden( error ) ) {
-				return undefined;
+				return [];
 			}
 			throw error;
 		}
@@ -348,30 +441,34 @@ export function openLoopbackPeerLookup( system: LoopbackPeerSystem = {} ): Loopb
 
 	async function lookUp(
 		connection: LoopbackConnection,
-		ownUid: number
+		ownUid: number,
+		late: () => boolean
 	): Promise< LoopbackPeerOwner > {
 		if ( closed ) {
 			return 'unreadable';
 		}
+		const targets = targetsFor( connection, littleEndian );
+		if ( ! targets ) {
+			return 'unknown';
+		}
 		// One after the other: a lookup that fails has no read left running.
-		const tcp = await readTable( 0 );
-		const tcp6 = await readTable( 1 );
+		const tcp = await scanFile( 0, targets[ 0 ], late );
+		const tcp6 = await scanFile( 1, targets[ 1 ], late );
 		const [ overflow, uidMap ] = await settings;
 		const overflowUid = /^\d+$/.test( overflow?.trim() ?? '' )
 			? Number( overflow?.trim() )
 			: DEFAULT_OVERFLOW_UID;
-		return findLoopbackPeerOwner( { tcp, tcp6 }, connection, ownUid, {
-			littleEndian,
-			overflowUid,
-			uidMap,
-		} );
+		return decide( [ tcp, tcp6 ], ownUid, overflowUid, uidMap );
 	}
 
 	return {
 		ownerOf( connection ) {
-			const lookup = queue.then( () => lookUp( connection, uid ) );
+			let isLate = false;
+			const lookup = queue.then( () => lookUp( connection, uid, () => isLate ) );
 			queue = lookup.catch( () => undefined );
-			return within( lookup, timeoutMs ).catch( () => 'unreadable' as const );
+			return within( lookup, timeoutMs, () => ( isLate = true ) ).catch(
+				() => 'unreadable' as const
+			);
 		},
 		async close() {
 			closed = true;
