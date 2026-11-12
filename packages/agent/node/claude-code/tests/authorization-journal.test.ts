@@ -8,10 +8,30 @@ import {
 	CLAUDE_STUDIO_TOOL_RULES,
 	HOST_OPERATION_CLASSES,
 } from '../execution-rules';
+import { createNativeSessionStore } from '../sessions';
 import { createPolicyFixture, guarded, targetOrigin } from './fixtures/execution-policy';
 import type { StudioAgentHost } from '../../host';
 import type { ClaudeOperationClass } from '@studio/agent/protocol/claude-code';
 import type { Mock } from 'vitest';
+
+// The file seam: every file synced through a handle, in order, and a sync
+// that fails on demand, as a disk that cannot flush does.
+const disk = vi.hoisted( () => ( { synced: [] as string[], failSync: false } ) );
+vi.mock( 'fs/promises', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('fs/promises') >();
+	const open = async ( ...args: Parameters< typeof actual.open > ) => {
+		const handle = await actual.open( ...args );
+		const file = String( args[ 0 ] );
+		const sync = handle.sync.bind( handle );
+		handle.sync = async () => {
+			if ( disk.failSync ) throw Object.assign( new Error( 'i/o error, fsync' ), { code: 'EIO' } );
+			await sync();
+			disk.synced.push( file );
+		};
+		return handle;
+	};
+	return { ...actual, default: { ...actual, open }, open };
+} );
 
 // Every rule an operation can run under, enabled whether or not it is
 // qualified, as `unqualified-tool-rules.test.ts` does: what is checked here is
@@ -30,6 +50,8 @@ vi.mock( '../execution-rules', async ( importOriginal ) => {
 
 const cleanups: Array< () => Promise< void > > = [];
 afterEach( async () => {
+	disk.synced = [];
+	disk.failSync = false;
 	await Promise.all( cleanups.splice( 0 ).map( ( cleanup ) => cleanup() ) );
 } );
 
@@ -436,5 +458,78 @@ describe( 'what the policy journals before an operation that does more than read
 			} )
 		).toBe( false );
 		expect( journal ).toEqual( [] );
+	} );
+} );
+
+describe( 'the journal entry that lets an operation run, on disk', () => {
+	const draft = [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ];
+	const ids = { runId: 'run', turnId: 'turn' };
+	const syncedJournals = () => disk.synced.filter( ( file ) => file.endsWith( '.journal.jsonl' ) );
+
+	// A policy that journals into the turn's real journal file, which already
+	// holds the turn's prompt, as it does by the time any tool runs.
+	async function journaled() {
+		let turn!: ReturnType< ReturnType< typeof createNativeSessionStore >[ 'journal' ] >;
+		const fixture = await setup( ( paths ) => {
+			turn = createNativeSessionStore( path.join( paths.parent, 'store' ) ).journal(
+				'chat',
+				'turn'
+			);
+			return {
+				enabledTools: { native: [ 'Write' ], studio: [ 'wp_cli' ] },
+				recordOperation: ( event ) => turn.append( event ),
+			};
+		} );
+		await turn.append( { type: 'turn.prompt', ...ids, text: 'Write a draft' } );
+		return { ...fixture, turn };
+	}
+
+	it( 'is synced to disk before the operation runs, and no other entry is', async () => {
+		const { policy, host, turn } = await journaled();
+		let syncedWhenRun: string[] = [];
+		vi.mocked( host.sites.wpCli ).mockImplementation( async () => {
+			syncedWhenRun = syncedJournals();
+			return { exitCode: 0, stdout: '', stderr: '' };
+		} );
+		await policy.guardHost( host, 'call' ).sites.wpCli( site, draft );
+		expect( host.sites.wpCli ).toHaveBeenCalledOnce();
+		expect( syncedWhenRun ).toEqual( [
+			expect.stringMatching( /-[0-9a-f]{64}\.journal\.jsonl$/ ),
+		] );
+		await turn.append( { type: 'tool.result', ...ids, toolCallId: 'call', isError: false } );
+		expect( ( await turn.read() ).map( ( event ) => event.type ) ).toEqual( [
+			'turn.prompt',
+			'operation.authorized',
+			'tool.result',
+		] );
+		expect( syncedJournals() ).toEqual( syncedWhenRun );
+	} );
+
+	it( 'lets nothing run when its entry cannot be synced', async () => {
+		const { policy, host } = await journaled();
+		disk.failSync = true;
+		await expect( policy.guardHost( host, 'call' ).sites.wpCli( site, draft ) ).rejects.toThrow(
+			'Denied'
+		);
+		expect( host.sites.wpCli ).not.toHaveBeenCalled();
+		disk.failSync = false;
+		const native = await journaled();
+		disk.failSync = true;
+		expect(
+			await native.policy.authorizeToolUse( {
+				toolName: 'Write',
+				input: { file_path: path.join( native.site, 'readme.txt' ) },
+				toolUseId: 'write',
+			} )
+		).toBe( false );
+		disk.failSync = false;
+		const synced = await journaled();
+		expect(
+			await synced.policy.authorizeToolUse( {
+				toolName: 'Write',
+				input: { file_path: path.join( synced.site, 'readme.txt' ) },
+				toolUseId: 'write',
+			} )
+		).toBe( true );
 	} );
 } );

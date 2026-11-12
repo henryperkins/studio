@@ -167,7 +167,7 @@ export interface ClaudeRecoveryJournalEvent extends BackendTurnIds {
 }
 
 /**
- * On disk before Studio lets an operation that does more than read run,
+ * Synced to disk before Studio lets an operation that does more than read run,
  * whether it was approved, needed no approval, or is approved at the host
  * operation it reaches, so a recovery can name it if the turn ends before its
  * result is recorded. Journal-only and display-safe: the tool, its class, the

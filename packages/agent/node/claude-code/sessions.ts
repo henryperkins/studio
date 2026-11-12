@@ -4,6 +4,7 @@ import {
 	appendFile,
 	lstat,
 	mkdir,
+	open,
 	readFile,
 	readdir,
 	realpath,
@@ -56,6 +57,17 @@ function readJournalEvent( line: string ): ClaudeJournalEvent {
 		description: typeof description === 'string' ? description : '',
 		...( draft ? { draft } : {} ),
 	};
+}
+
+// Appends `line` and syncs the file to disk through the same handle.
+async function appendSynced( file: string, line: string ): Promise< void > {
+	const handle = await open( file, 'a', 0o600 );
+	try {
+		await handle.appendFile( line );
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
 }
 
 async function readJournalFile( file: string ): Promise< ClaudeJournalEvent[] > {
@@ -251,6 +263,10 @@ export function createNativeSessionStore( root: string ) {
 			let pending = Promise.resolve();
 			let indexed = false;
 			return {
+				/**
+				 * Appends `event`. The entry that lets an operation run is synced to
+				 * disk before this settles, so it survives a power loss too.
+				 */
 				append( event: ClaudeTurnJournalEvent ) {
 					if ( event.turnId !== turnId ) throw new Error( 'Turn mismatch' );
 					pending = pending.then( async () => {
@@ -258,7 +274,9 @@ export function createNativeSessionStore( root: string ) {
 							await index( conversationId, path.basename( journalPath ) );
 							indexed = true;
 						}
-						await appendFile( journalPath, JSON.stringify( event ) + '\n', { mode: 0o600 } );
+						const line = JSON.stringify( event ) + '\n';
+						if ( event.type === 'operation.authorized' ) await appendSynced( journalPath, line );
+						else await appendFile( journalPath, line, { mode: 0o600 } );
 					} );
 					return pending;
 				},
