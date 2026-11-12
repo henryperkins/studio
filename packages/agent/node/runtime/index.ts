@@ -87,6 +87,7 @@ import { findLastAssistant, isEmptyStop } from '@studio/agent/protocol/session-e
 import {
 	buildChatGptModel,
 	createChatGptProviderConfig,
+	recordsBareChatGptSlug,
 	sendsChatGptToolImages,
 	type ChatGptTurnSnapshot,
 } from './chatgpt-transport';
@@ -374,6 +375,8 @@ type TurnRouting =
 			kind: 'chatgpt';
 			turn: ChatGptTurnHandle;
 			model: Model< 'openai-responses' >;
+			/** The route's name for the model, which pi's id only contains. */
+			slug: string;
 			reasoningEffort: OpenAiReasoningEffort;
 	  };
 
@@ -461,7 +464,9 @@ async function resolveChatGptRouting(
 	}
 	let model: Model< 'openai-responses' >;
 	try {
-		model = buildChatGptModel( selection.model, config.chatGpt?.label );
+		model = buildChatGptModel( selection.model, config.chatGpt?.label, {
+			bareSlugId: recordsBareChatGptSlug( config.session.getEntries(), selection.model.modelId ),
+		} );
 	} catch ( error ) {
 		return { ok: false, reason: error instanceof Error ? error.message : String( error ) };
 	}
@@ -498,7 +503,13 @@ async function resolveChatGptRouting(
 	}
 	return {
 		ok: true,
-		routing: { kind: 'chatgpt', turn, model, reasoningEffort: reasoning.effort },
+		routing: {
+			kind: 'chatgpt',
+			turn,
+			model,
+			slug: selection.model.modelId,
+			reasoningEffort: reasoning.effort,
+		},
 	};
 }
 
@@ -660,7 +671,7 @@ async function createStudioAgentSession(
 	// qualified apart from the images a user attaches.
 	const visionEnabled =
 		routing.kind === 'chatgpt'
-			? sendsChatGptToolImages( routing.model.id )
+			? sendsChatGptToolImages( routing.slug )
 			: aiModelSupportsImages( config.model );
 	const [ userInstructions, imageGenerationEnabled ] = await Promise.all( [
 		readGlobalInstructions(),

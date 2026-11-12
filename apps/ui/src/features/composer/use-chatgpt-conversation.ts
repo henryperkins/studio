@@ -1,4 +1,7 @@
-import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
+import {
+	readChatGptSessionSelection,
+	toChatGptSessionContext,
+} from '@studio/agent/protocol/chatgpt';
 import {
 	describeChatGptReasoningProblem,
 	getChatGptModelCapabilities,
@@ -27,7 +30,7 @@ export function createChatGptSelectionEntry( selection: ChatGptSessionSelection 
 		parentId: null,
 		timestamp: new Date().toISOString(),
 		customType: 'studio.session_context',
-		data: { provider: 'chatgpt-oauth', ...selection },
+		data: toChatGptSessionContext( selection ),
 	};
 }
 

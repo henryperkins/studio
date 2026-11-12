@@ -38,7 +38,7 @@ import {
 	type OpenAiReasoningEffort,
 } from '@studio/agent/protocol/openai-models';
 import { CHATGPT_PI_PROVIDER } from '@studio/agent/protocol/providers';
-import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import type { ModelRuntime, SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { ProviderModelRef } from '@studio/agent/protocol/connections';
 
 /*
@@ -394,10 +394,45 @@ function withoutToolResultImages< T extends { messages: Message[] } >( context: 
 	};
 }
 
+// pi records its model's id in the session (`model_change` entries, each
+// reply). A slug alone there would read, to a Studio that doesn't know
+// ChatGPT, as the OpenAI API model of the same name, so the chat would go on
+// there with its history. Only requests carry the bare slug.
+const PI_MODEL_ID_PREFIX = `${ CHATGPT_PI_PROVIDER }:`;
+
+/** The id a ChatGPT-route model has in pi and in session records: never a bare slug. */
+export function chatGptPiModelId( slug: string ): string {
+	return `${ PI_MODEL_ID_PREFIX }${ slug }`;
+}
+
+// The route's slug for a pi model id, or the id itself for one without the prefix.
+const chatGptSlugOf = ( piModelId: string ) =>
+	piModelId.startsWith( PI_MODEL_ID_PREFIX )
+		? piModelId.slice( PI_MODEL_ID_PREFIX.length )
+		: piModelId;
+
+/**
+ * Whether a session's ChatGPT replies were recorded under the bare slug, as
+ * this branch recorded them before: such a session keeps that id, so pi
+ * replays its history as the same model's, unchanged.
+ */
+export function recordsBareChatGptSlug( entries: SessionEntry[], slug: string ): boolean {
+	return entries.some( ( entry ) => {
+		if ( entry.type === 'model_change' ) {
+			return entry.provider === CHATGPT_PI_PROVIDER && entry.modelId === slug;
+		}
+		if ( entry.type !== 'message' || entry.message.role !== 'assistant' ) {
+			return false;
+		}
+		return entry.message.provider === CHATGPT_PI_PROVIDER && entry.message.model === slug;
+	} );
+}
+
 /** The pi model of one ChatGPT-route model, by the slug the route lists it under. */
 export function buildChatGptModel(
 	model: ProviderModelRef,
-	label?: string
+	label?: string,
+	{ bareSlugId = false }: { bareSlugId?: boolean } = {}
 ): Model< 'openai-responses' > {
 	if ( model.providerId !== 'chatgpt-oauth' ) {
 		throw new Error( `${ model.modelId } isn’t a ChatGPT model.` );
@@ -409,7 +444,7 @@ export function buildChatGptModel(
 		);
 	}
 	return {
-		id: model.modelId,
+		id: bareSlugId ? model.modelId : chatGptPiModelId( model.modelId ),
 		name: label ?? model.modelId,
 		api: 'openai-responses',
 		provider: CHATGPT_PI_PROVIDER,
@@ -773,12 +808,17 @@ export function createChatGptProviderConfig(
 	if ( model.provider !== CHATGPT_PI_PROVIDER ) {
 		throw new Error( `${ model.id } isn’t a ChatGPT model.` );
 	}
-	const reasoning = resolveChatGptReasoning( model.id, turnSnapshot.reasoningEffort );
+	const slug = chatGptSlugOf( model.id );
+	const reasoning = resolveChatGptReasoning( slug, turnSnapshot.reasoningEffort );
 	if ( ! reasoning.ok ) {
 		throw new Error( describeChatGptReasoningProblem( reasoning.problem ) );
 	}
-	const target = { model: model.id, reasoningEffort: reasoning.effort };
-	const toolImages = sendsChatGptToolImages( model.id );
+	const target = { model: slug, reasoningEffort: reasoning.effort };
+	const toolImages = sendsChatGptToolImages( slug );
+	// pi names this turn's model by its pi id; the request names it by the
+	// route's slug. Any other model stays as pi named it, for the serializer to refuse.
+	const forRoute = ( params: unknown ) =>
+		isRecord( params ) && params.model === model.id ? { ...params, model: slug } : params;
 	return {
 		baseUrl: OPENAI_API_BASE_URL,
 		apiKey: TOKEN_FROM_TURN,
@@ -802,7 +842,7 @@ export function createChatGptProviderConfig(
 					fetch: exchange.fetch,
 					onPayload: async ( params: unknown, payloadModel ) => {
 						const next = ( await options?.onPayload?.( params, payloadModel ) ) ?? params;
-						return exchange.serialize( next );
+						return exchange.serialize( forRoute( next ) );
 					},
 				} ),
 				exchange,

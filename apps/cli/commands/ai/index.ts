@@ -23,7 +23,10 @@ import {
 	type StudioChatFileAttachment,
 } from '@studio/agent/protocol/chat-files';
 import { type StudioChatImage } from '@studio/agent/protocol/chat-images';
-import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
+import {
+	readChatGptSessionSelection,
+	toChatGptSessionContext,
+} from '@studio/agent/protocol/chatgpt';
 import {
 	describeChatGptReasoningProblem,
 	getDefaultChatGptReasoningEffort,
@@ -478,13 +481,16 @@ export async function runCommand( options: {
 		reasoningEffort: OpenAiReasoningEffort
 	): Promise< void > {
 		await append( ( sm ) =>
-			appendStudioEntry( sm, 'studio.session_context', {
-				provider: 'chatgpt-oauth',
-				connectionId: selection.connectionId,
-				revision: selection.revision,
-				model: selection.model.modelId,
-				reasoningEffort,
-			} )
+			appendStudioEntry(
+				sm,
+				'studio.session_context',
+				toChatGptSessionContext( {
+					connectionId: selection.connectionId,
+					revision: selection.revision,
+					model: selection.model.modelId,
+					reasoningEffort,
+				} )
+			)
 		);
 	}
 
@@ -509,10 +515,7 @@ export async function runCommand( options: {
 				: undefined;
 		session = await agent.sessions.create();
 		if ( chatGpt ) {
-			appendStudioEntry( session, 'studio.session_context', {
-				provider: 'chatgpt-oauth',
-				...chatGpt,
-			} );
+			appendStudioEntry( session, 'studio.session_context', toChatGptSessionContext( chatGpt ) );
 		} else if ( preserveConnection ) {
 			await persistSessionContext();
 		}
@@ -1140,7 +1143,7 @@ export async function runCommand( options: {
 					current?.connectionId === selected.connectionId &&
 					current.revision === selected.revision;
 				const next = sameConnection ? previous : await agent.sessions.create();
-				const context = { provider: 'chatgpt-oauth' as const, ...selected };
+				const context = toChatGptSessionContext( selected );
 				assertSessionSelection( next.getEntries(), context );
 				appendStudioEntry( next, 'studio.session_context', context );
 				if ( ! sameConnection && ui.activeSite ) {

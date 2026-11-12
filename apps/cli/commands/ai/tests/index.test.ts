@@ -922,12 +922,13 @@ describe( 'AI runCommand — OpenAI conversations', () => {
 			chatGpt: { reasoningEffort: 'low' },
 		} );
 		expect( turnConfig()?.openAi ).toBeUndefined();
+		// Read from a record written before; recorded with the model and effort
+		// where only the ChatGPT reader looks.
 		expect( appendCustomEntry ).toHaveBeenCalledWith( 'studio.session_context', {
 			provider: 'chatgpt-oauth',
 			connectionId: 'conn-1',
 			revision: 1,
-			model: 'gpt-6-luna',
-			reasoningEffort: 'low',
+			chatGpt: { model: 'gpt-6-luna', reasoningEffort: 'low' },
 		} );
 	} );
 

@@ -15,7 +15,10 @@
  * and written there, in place.
  */
 import { createHash } from 'node:crypto';
-import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
+import {
+	readChatGptSessionSelection,
+	toChatGptSessionContext,
+} from '@studio/agent/protocol/chatgpt';
 import {
 	CHATGPT_MODEL_CAPABILITIES,
 	describeChatGptReasoningProblem,
@@ -392,13 +395,12 @@ async function planChatGpt(
 			'That ChatGPT connection is not signed in to the dedicated profile. Sign in again with secure storage: a session-only sign-in lives only in the app that holds it.'
 		);
 	}
-	const sessionContext: StudioSessionContextData = {
-		provider: 'chatgpt-oauth',
+	const sessionContext: StudioSessionContextData = toChatGptSessionContext( {
 		connectionId,
 		revision: entry.revision,
 		model,
 		reasoningEffort: reasoning.effort,
-	};
+	} );
 	const { subject } = entry.identity;
 	return {
 		ok: true,

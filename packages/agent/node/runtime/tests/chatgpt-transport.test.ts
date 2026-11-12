@@ -789,10 +789,20 @@ describe( 'the ChatGPT transport', () => {
 			expect( () =>
 				buildChatGptModel( { providerId: 'openai-api-key', modelId: 'gpt-6.1-sol' } )
 			).toThrow( /isn’t a ChatGPT model/ );
+			// pi and the session know it by an id no catalog reader takes for a model;
+			// a session that recorded the bare slug before keeps it.
+			expect( buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' } ).id ).toBe(
+				'studio-chatgpt:gpt-6-luna'
+			);
+			expect(
+				buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' }, undefined, {
+					bareSlugId: true,
+				} ).id
+			).toBe( 'gpt-6-luna' );
 			expect(
 				buildChatGptModel( { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' }, 'GPT-6 Luna' )
 			).toMatchObject( {
-				id: 'gpt-6-luna',
+				id: 'studio-chatgpt:gpt-6-luna',
 				name: 'GPT-6 Luna',
 				api: 'openai-responses',
 				provider: CHATGPT_PI_PROVIDER,

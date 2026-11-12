@@ -89,6 +89,51 @@ describe( 'ChatGPT session selection', () => {
 		}
 	);
 
+	it( 'records the model and effort only where the ChatGPT reader looks, and still reads a record written before', async () => {
+		const { id } = await createAiSession( root );
+		await setSessionChatGptSelection( root, id, selection );
+
+		const records = ( await loadAiSession( root, id ) ).entries.flatMap( ( entry ) =>
+			entry.type === 'custom' && entry.customType === 'studio.session_context'
+				? [ entry.data as Record< string, unknown > ]
+				: []
+		);
+		expect( records ).toEqual( [
+			{
+				provider: 'chatgpt-oauth',
+				connectionId: A,
+				revision: 1,
+				chatGpt: { model: 'gpt-6-luna', reasoningEffort: 'medium' },
+			},
+		] );
+
+		// As this branch wrote it before: the model and effort in the shared fields.
+		const earlier = await createAiSession( root );
+		await appendStudioEntry( root, earlier.id, 'studio.session_context', {
+			provider: 'chatgpt-oauth',
+			...selection,
+			reasoningEffort: 'low',
+		} );
+		const { entries } = await loadAiSession( root, earlier.id );
+		expect( readChatGptSessionSelection( entries ) ).toEqual( {
+			...selection,
+			reasoningEffort: 'low',
+		} );
+		expect(
+			resolveConnectionSelection( entries, {
+				connections: await listChatGptConnections(),
+				settings: null,
+			} )
+		).toMatchObject( {
+			ok: true,
+			selection: { model: { providerId: 'chatgpt-oauth', modelId: 'gpt-6-luna' } },
+		} );
+		await setSessionChatGptSelection( root, earlier.id, selection );
+		expect(
+			readChatGptSessionSelection( ( await loadAiSession( root, earlier.id ) ).entries )
+		).toEqual( selection );
+	} );
+
 	it( 'does not repin API history to ChatGPT, even for the same model slug', async () => {
 		const { id } = await createAiSession( root );
 		await setSessionProvider( root, id, 'openai-api-key', 'gpt-6-luna' );

@@ -1,4 +1,5 @@
 import { __, sprintf } from '@wordpress/i18n';
+import { readChatGptContextChoice } from '@studio/agent/protocol/chatgpt';
 import { readLatestRecordedModelId } from '@studio/agent/protocol/models';
 import {
 	AI_PROVIDER_LABELS,
@@ -163,7 +164,7 @@ function resolveChatGptConnection(
 	const providerId = 'chatgpt-oauth';
 	const connectionId = record?.provider === providerId ? record.connectionId : undefined;
 	const revision = record?.revision;
-	const modelId = record?.model;
+	const modelId = readChatGptContextChoice( record ).model;
 	if ( typeof connectionId !== 'string' || ! connectionId ) {
 		return { ok: false, error: { code: 'unsupported', providerId } };
 	}

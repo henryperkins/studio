@@ -7,12 +7,23 @@ import { createAgent } from '@studio/agent/node/agent';
 import { ChatGptConnectionError } from '@studio/agent/node/chatgpt/account-store';
 import { setChatGptToolImagesForLiveCheck } from '@studio/agent/node/chatgpt/tool-images';
 import { buildAttachedFilesPromptBlock } from '@studio/agent/protocol/chat-files';
+import {
+	readChatGptSessionSelection,
+	toChatGptSessionContext,
+} from '@studio/agent/protocol/chatgpt';
 import { getToolResultImageService } from '@studio/agent/protocol/image-service';
+import { getAiModelFamily, isAiModelId } from '@studio/agent/protocol/models';
 import { OPENAI_MODEL_CAPABILITIES } from '@studio/agent/protocol/openai-models';
-import { readLastReplyProvider } from '@studio/agent/protocol/providers';
+import {
+	getAiModelFamilyProvider,
+	readLastReplyProvider,
+	resolveSessionProvider,
+	type AiProviderId,
+} from '@studio/agent/protocol/providers';
 import { formatVisualAnnotationsPrompt } from '@studio/agent/protocol/visual-annotations';
 import { createFakeHost, fakeSite } from '../../tests/fake-host';
-import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
+import { chatGptPiModelId } from '../chatgpt-transport';
+import type { AgentSessionEvent, SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { ChatGptTurnHandle } from '@studio/agent/node/chatgpt/credential-broker';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 import type { StudioAgentTurnConfig, StudioAgentTurnHandle } from '@studio/agent/node/runtime';
@@ -529,12 +540,15 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 	// one before its first turn.
 	function newChatGptSession( selection: ConnectionSelection ): SessionManager {
 		const session = SessionManager.create( sitesRoot, sessionDir );
-		session.appendCustomEntry( 'studio.session_context', {
-			provider: 'chatgpt-oauth',
-			connectionId: selection.connectionId,
-			revision: selection.revision,
-			model: selection.model.modelId,
-		} );
+		session.appendCustomEntry(
+			'studio.session_context',
+			toChatGptSessionContext( {
+				connectionId: selection.connectionId,
+				revision: selection.revision,
+				model: selection.model.modelId,
+				reasoningEffort: 'medium',
+			} )
+		);
 		return session;
 	}
 
@@ -599,6 +613,175 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 
 	const itemsOfType = ( request: CapturedRequest, type: string ) =>
 		request.body.input.filter( ( item ) => item.type === type );
+
+	// How this fork's trunk before ChatGPT (merge base 8672a64e7) chose a
+	// conversation's provider from its records: a pin it knows, the latest model
+	// a `model_change` or `studio.session_context` names (verbatim), the OpenAI
+	// effort and mode any context record carries, and the latest reply's pi
+	// provider, any it doesn't know read as WordPress.com.
+	function readAsMergeBase( entries: SessionEntry[], globalProvider?: AiProviderId ) {
+		const known: string[] = [ 'wpcom', 'anthropic-api-key', 'openai-api-key' ];
+		let pinnedProvider: AiProviderId | undefined;
+		let recordedModelId: string | undefined;
+		let lastReplyProvider: AiProviderId | undefined;
+		const efforts: unknown[] = [];
+		for ( const entry of [ ...entries ].reverse() ) {
+			if ( entry.type === 'model_change' ) {
+				recordedModelId ??= entry.modelId;
+			}
+			if ( entry.type === 'custom' && entry.customType === 'studio.session_context' ) {
+				const data = entry.data as Record< string, unknown >;
+				if ( typeof data.model === 'string' ) {
+					recordedModelId ??= data.model;
+				}
+				if ( typeof data.provider === 'string' && known.includes( data.provider ) ) {
+					pinnedProvider ??= data.provider as AiProviderId;
+				}
+				efforts.push( ...[ data.reasoningEffort, data.reasoningMode ].filter( Boolean ) );
+			}
+			if ( entry.type === 'message' && entry.message.role === 'assistant' ) {
+				const provider = ( entry.message as { provider?: string } ).provider;
+				lastReplyProvider ??=
+					provider === 'studio-openai'
+						? 'openai-api-key'
+						: provider === 'anthropic'
+						? 'anthropic-api-key'
+						: 'wpcom';
+			}
+		}
+		const recordedModel =
+			recordedModelId && isAiModelId( recordedModelId ) ? recordedModelId : undefined;
+		const recordedProvider = recordedModel
+			? getAiModelFamilyProvider( getAiModelFamily( recordedModel ) )
+			: undefined;
+		let provider: AiProviderId;
+		if ( pinnedProvider === 'openai-api-key' ) {
+			provider = pinnedProvider;
+		} else if (
+			! pinnedProvider &&
+			( recordedProvider === 'openai-api-key' || lastReplyProvider === 'openai-api-key' )
+		) {
+			provider = 'openai-api-key';
+		} else if ( ! pinnedProvider && globalProvider === 'openai-api-key' ) {
+			provider = recordedProvider ?? lastReplyProvider ?? globalProvider;
+		} else {
+			provider = pinnedProvider ?? globalProvider ?? 'wpcom';
+		}
+		return { pinnedProvider, recordedModelId, recordedModel, efforts, provider };
+	}
+
+	it( 'leaves nothing in its session file an older Studio would take as an OpenAI or other model, provider or effort', async () => {
+		const selection = selectionFor();
+		replies.push( toolCallReply, () => textReply( 'DB_NAME is studio.' ) );
+		const turn = await runChatGptTurn(
+			newChatGptSession( selection ),
+			'What is the database name?',
+			selection,
+			'medium'
+		);
+		expect( turn.error ).toBeUndefined();
+		const entries = reopen( turn.sessionFile ).getEntries();
+		expect( entries.some( ( entry ) => entry.type === 'model_change' ) ).toBe( true );
+
+		for ( const globalProvider of [
+			'openai-api-key',
+			'anthropic-api-key',
+			'wpcom',
+			undefined,
+		] as const ) {
+			const older = readAsMergeBase( entries, globalProvider );
+			expect( older.pinnedProvider ).toBeUndefined();
+			expect( older.recordedModel ).toBeUndefined();
+			expect( older.recordedModelId ).not.toBe( 'gpt-6-luna' );
+			expect( older.efforts ).toEqual( [] );
+			// It falls to that build's own choice for a chat it can't place, never to OpenAI's API.
+			expect( older.provider ).not.toBe( 'openai-api-key' );
+			expect( older.provider ).toBe(
+				globalProvider === 'openai-api-key' ? 'wpcom' : globalProvider ?? 'wpcom'
+			);
+		}
+		// This build still reads it as the ChatGPT chat it is.
+		expect( resolveSessionProvider( entries ) ).toBe( 'chatgpt-oauth' );
+		expect( readChatGptSessionSelection( entries ) ).toEqual( {
+			connectionId: selection.connectionId,
+			revision: selection.revision,
+			model: 'gpt-6-luna',
+			reasoningEffort: 'medium',
+		} );
+	} );
+
+	it( 'continues a session written before the model and effort moved out of the shared fields', async () => {
+		const selection = selectionFor();
+		replies.push( toolCallReply, () => textReply( 'DB_NAME is studio.' ) );
+		const first = await runChatGptTurn(
+			newChatGptSession( selection ),
+			'What is the database name?',
+			selection,
+			'medium'
+		);
+		// As this branch wrote it before: the record's model and effort in the
+		// shared fields, and pi's records under the bare slug.
+		const lines = fs
+			.readFileSync( first.sessionFile, 'utf8' )
+			.split( '\n' )
+			.filter( Boolean )
+			.map( ( line ) => JSON.parse( line ) );
+		const rewritten = lines.map( ( line ) => {
+			if ( line.type === 'custom' && line.customType === 'studio.session_context' ) {
+				return {
+					...line,
+					data: {
+						provider: 'chatgpt-oauth',
+						connectionId: selection.connectionId,
+						revision: selection.revision,
+						model: 'gpt-6-luna',
+						reasoningEffort: 'medium',
+					},
+				};
+			}
+			return JSON.parse(
+				JSON.stringify( line )
+					.split( `"${ chatGptPiModelId( 'gpt-6-luna' ) }"` )
+					.join( '"gpt-6-luna"' )
+			);
+		} );
+		fs.writeFileSync(
+			first.sessionFile,
+			rewritten.map( ( line ) => JSON.stringify( line ) ).join( '\n' ) + '\n'
+		);
+		expect( fs.readFileSync( first.sessionFile, 'utf8' ) ).not.toContain(
+			chatGptPiModelId( 'gpt-6-luna' )
+		);
+		requests.length = 0;
+		replies.push( () => textReply( 'Still studio.' ) );
+
+		const next = await runChatGptTurn(
+			reopen( first.sessionFile ),
+			'And the prefix?',
+			selection,
+			'low'
+		);
+
+		expect( next.error ).toBeUndefined();
+		expect( next.text ).toContain( 'Still studio.' );
+		expect( requests ).toHaveLength( 1 );
+		expectPinned( 'low' );
+		// Its history goes out as before: the same call ids, the reasoning replayed.
+		const [ output ] = itemsOfType( requests[ 0 ], 'function_call_output' );
+		expect( output.call_id ).toBe( READ_CALL.call_id );
+		expect( itemsOfType( requests[ 0 ], 'reasoning' ) ).toEqual( [
+			expect.objectContaining( { id: REASONING.id } ),
+		] );
+		expect( fs.readFileSync( first.sessionFile, 'utf8' ) ).not.toContain(
+			chatGptPiModelId( 'gpt-6-luna' )
+		);
+		expect( readChatGptSessionSelection( reopen( first.sessionFile ).getEntries() ) ).toEqual( {
+			connectionId: selection.connectionId,
+			revision: selection.revision,
+			model: 'gpt-6-luna',
+			reasoningEffort: 'medium',
+		} );
+	} );
 
 	it( 'keeps reasoning, tool calls and effort straight across tool use, reopened sessions and compaction', async () => {
 		const selection = selectionFor();
