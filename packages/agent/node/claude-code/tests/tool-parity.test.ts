@@ -39,8 +39,9 @@ type ClaudeStatus =
 	| { status: 'bridged' }
 	// Claude Code's own tool of that name stands for it, and the policy enables it.
 	| { status: 'native'; native: string }
-	// Neither route registers it when the host lacks `capability`. Where the host
-	// has it, Claude lists it exactly where Pi does, once the policy qualifies it.
+	// Bridged and qualified like `bridged`, but registered only for a host with
+	// `capability`: neither route lists it without it, and Claude lists it in
+	// exactly the scenarios where Pi does.
 	| { status: 'absent'; capability: Capability }
 	// Not enabled yet: why, and the step that qualifies it. `native` names the
 	// Claude Code tool that would stand for it.
@@ -340,6 +341,9 @@ afterAll( async () => {
 
 const registered = () => [ ...new Set( [ ...piTools.values() ].flat() ) ].sort();
 const statuses = () => Object.entries( CLAUDE_TOOL_STATUS );
+// Qualified and run through the bridge, wherever its host registers it.
+const isBridged = ( status: ClaudeStatus ) =>
+	status.status === 'bridged' || status.status === 'absent';
 const enabledStudio = () =>
 	claudeStudioTools( CLAUDE_ENABLED_TOOLS, CLAUDE_NAVIGATION_CONFINEMENT, targetOrigin );
 const enabledNative = () =>
@@ -385,17 +389,13 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 			const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
 			switch ( status.status ) {
 				case 'bridged':
+				case 'absent':
 					expect( studio, name ).toContain( name );
 					expect( isQualifiedStudioRule( rule ), name ).toBe( true );
 					break;
 				case 'native':
 					expect( CLAUDE_NATIVE_TOOL_RULES.has( status.native ), name ).toBe( true );
 					expect( native, name ).toContain( status.native );
-					break;
-				case 'absent':
-					// Its capability decides where it is registered; the policy may
-					// enable it only once its rule is qualified.
-					if ( studio.includes( name ) ) expect( isQualifiedStudioRule( rule ), name ).toBe( true );
 					break;
 				default:
 					expect( studio, name ).not.toContain( name );
@@ -406,13 +406,10 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 					}
 			}
 		}
-		// Whatever the policy enables, the table marks as qualified, or as absent
+		// Whatever the policy enables, the table marks as bridged, or as absent
 		// without a host capability, which then decides where it is listed.
 		const bridged = statuses()
-			.filter(
-				( [ name, status ] ) =>
-					status.status === 'bridged' || ( status.status === 'absent' && studio.includes( name ) )
-			)
+			.filter( ( [ , status ] ) => isBridged( status ) )
 			.map( ( [ name ] ) => name );
 		const mapped = statuses().flatMap( ( [ , status ] ) =>
 			status.status === 'native' ? [ status.native ] : []
@@ -426,25 +423,28 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 		( scenario ) => {
 			const pi = piTools.get( scenario )!;
 			const claude = claudeTools.get( scenario )!;
-			const expected = pi.filter( ( name ) => CLAUDE_TOOL_STATUS[ name ]?.status === 'bridged' );
+			const expected = pi.filter(
+				( name ) => !! CLAUDE_TOOL_STATUS[ name ] && isBridged( CLAUDE_TOOL_STATUS[ name ] )
+			);
 			expect( claude ).toEqual( expected );
 			// A tool Pi leaves out for the host's capabilities is left out here too.
 			for ( const name of claude ) expect( pi, name ).toContain( name );
 		}
 	);
 
-	it( 'keeps every tool marked absent out of both routes without its capability, and lists it on Claude exactly where Pi does once qualified', () => {
-		const studio = enabledStudio();
+	it( 'keeps every tool marked absent out of both routes without its capability, and lists it on Claude exactly where Pi does', () => {
 		for ( const [ name, status ] of statuses() ) {
 			if ( status.status !== 'absent' ) continue;
+			let listedWithCapability = false;
 			for ( const scenario of SCENARIOS ) {
 				const where = `${ name } (${ label( scenario ) })`;
 				const onPi = piTools.get( label( scenario ) )!.includes( name );
 				if ( ! scenario[ status.capability ] ) expect( onPi, where ).toBe( false );
-				expect( claudeTools.get( label( scenario ) )!.includes( name ), where ).toBe(
-					onPi && studio.includes( name )
-				);
+				else listedWithCapability ||= onPi;
+				expect( claudeTools.get( label( scenario ) )!.includes( name ), where ).toBe( onPi );
 			}
+			// The capability is what decides, so a host that has it gets the tool.
+			expect( listedWithCapability, name ).toBe( true );
 		}
 	} );
 
