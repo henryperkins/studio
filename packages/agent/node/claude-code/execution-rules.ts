@@ -55,6 +55,8 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		startSiteTool.name,
 		stopSiteTool.name,
 		deleteSiteTool.name,
+		importSiteTool.name,
+		exportSiteTool.name,
 	] ),
 } );
 
@@ -762,8 +764,24 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	],
 	[ pushSiteTool.name, unqualified( onSite( 'remote-overwrite', { approval: 'host' } ) ) ],
 	[ pullSiteTool.name, unqualified( onSite( 'remote-overwrite', { approval: 'host' } ) ) ],
-	[ importSiteTool.name, unqualified( onSite( 'local-overwrite', { approval: 'host' } ) ) ],
-	[ exportSiteTool.name, unqualified( onSite( 'local-overwrite', { approval: 'host' } ) ) ],
+	// The CLI's import reads, and its export writes, the file the call names.
+	// The host binds that file to the conversation's own folders, resolved
+	// through links and short names, when it prepares the operation and again
+	// immediately before the command starts; the approval shows it.
+	[
+		importSiteTool.name,
+		qualified(
+			onSite( 'local-overwrite', { approval: 'host' } ),
+			using( LOCAL_SITE_HOST_CHANNELS )
+		),
+	],
+	[
+		exportSiteTool.name,
+		qualified(
+			onSite( 'local-overwrite', { approval: 'host' } ),
+			using( LOCAL_SITE_HOST_CHANNELS )
+		),
+	],
 	[
 		openAnnotationBrowserTool.name,
 		unqualified( studioRule( 'local-change', { urls: pageUrls, navigates: true } ) ),

@@ -63,8 +63,8 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_start: { status: 'bridged' },
 	site_stop: { status: 'bridged' },
 	site_delete: { status: 'bridged' },
-	site_import: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
-	site_export: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
+	site_import: { status: 'bridged' },
+	site_export: { status: 'bridged' },
 	scaffold_theme: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
 	install_taxonomy_scripts: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
 	refresh_browser: {

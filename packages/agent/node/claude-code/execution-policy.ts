@@ -23,7 +23,7 @@ import {
 	requiresClaudeApproval,
 	studioToolName,
 } from './execution-rules';
-import { isAllowedNativePath, isInsideCanonicalRoot } from './local-paths';
+import { isAllowedNativePath, isAllowedNewPath, isInsideCanonicalRoot } from './local-paths';
 import { classifyWpCliArgs, hasWpCliOverrides, wpCliOption } from './wp-cli-rules';
 import type {
 	ClaudeEnabledTools,
@@ -214,6 +214,8 @@ export interface ClaudeExecutionPolicy {
 const REFUSALS = {
 	wpCli: 'This WP-CLI command is outside what Studio runs on the Claude route.',
 	notApproved: 'The user did not approve this operation, or did not answer in time.',
+	outsideFolders:
+		'A file Studio reads or writes for this operation must be an absolute path inside the site’s folder or this conversation’s workspace, and not one that holds credentials.',
 } as const;
 
 function deepFreeze< T >( value: T ): T {
@@ -234,18 +236,26 @@ function canonicalJson( value: unknown ): string {
 	);
 }
 
+/** A file a host operation reads, when it must exist, or writes. */
+interface HostFile {
+	path: unknown;
+	existing: boolean;
+}
+
 interface HostRequest {
 	name: HostOperationName;
 	site?: HostSite;
 	args: unknown[];
 	localPaths?: string[];
 	remote?: string;
+	file?: HostFile;
 }
 
 interface PreparedHostOperation {
 	operation: ClaudeOperation;
 	grant?: ClaudeApprovalGrant;
 	site?: HostSite;
+	file?: HostFile;
 }
 
 const WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
@@ -759,6 +769,10 @@ export function createClaudeExecutionPolicy(
 		} else if ( context.target.environment === 'global' ) {
 			return;
 		}
+		if ( request.file && ! ( await isConversationFile( request.file ) ) ) {
+			refuse( toolCallId, REFUSALS.outsideFolders );
+			return;
+		}
 		if ( ! ( await checkpoint( callSignal ) ) ) return;
 		// The only WP-CLI command this build runs with approval is the bounded draft.
 		const draftTitle =
@@ -786,9 +800,21 @@ export function createClaudeExecutionPolicy(
 				  }
 				: {} ),
 		};
-		if ( ! asksFirst( operationClass ) ) return { operation, site };
+		const { file } = request;
+		if ( ! asksFirst( operationClass ) ) return { operation, site, file };
 		const grant = await requestApproval( operation, toolCallId, callSignal );
-		return grant ? { operation, grant, site } : undefined;
+		return grant ? { operation, grant, site, file } : undefined;
+	}
+
+	// Whether a file a host operation reads (`existing`) or writes lies in the
+	// conversation's own folders once links and short names are resolved,
+	// outside the native configuration and clear of credential files.
+	async function isConversationFile( { path: file, existing }: HostFile ): Promise< boolean > {
+		if ( typeof file !== 'string' ) return false;
+		const { localRoots, workspace } = context;
+		return existing
+			? isAllowedNativePath( file, localRoots, workspace.configDirectory )
+			: isAllowedNewPath( file, localRoots, workspace.configDirectory );
 	}
 
 	async function fence(
@@ -799,6 +825,8 @@ export function createClaudeExecutionPolicy(
 		try {
 			if ( prepared.site && ( await realpath( prepared.site.path ) ) !== context.targetSite?.path )
 				return false;
+			// The file is checked again, since a link can have moved under it.
+			if ( prepared.file && ! ( await isConversationFile( prepared.file ) ) ) return false;
 			if (
 				prepared.operation.tool === 'sites.wpCli' &&
 				( ! context.targetSite || ( await hasWpCliOverrides( context.targetSite.path ) ) )
@@ -935,12 +963,24 @@ export function createClaudeExecutionPolicy(
 					),
 				import: ( site, file, onProgress ) =>
 					run(
-						{ name: 'sites.import', site, args: [ file ], localPaths: [ file ] },
+						{
+							name: 'sites.import',
+							site,
+							args: [ file ],
+							localPaths: [ file ],
+							file: { path: file, existing: true },
+						},
 						( current, options ) => host.sites.import( current!, file, onProgress, options )
 					),
 				export: ( site, file, mode, onProgress ) =>
 					run(
-						{ name: 'sites.export', site, args: [ file, mode ], localPaths: [ file ] },
+						{
+							name: 'sites.export',
+							site,
+							args: [ file, mode ],
+							localPaths: [ file ],
+							file: { path: file, existing: false },
+						},
 						( current, options ) => host.sites.export( current!, file, mode, onProgress, options )
 					),
 				wpCli: ( site, args ) =>

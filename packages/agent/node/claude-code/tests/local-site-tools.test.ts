@@ -1,3 +1,5 @@
+import { mkdir, rename, symlink, writeFile } from 'fs/promises';
+import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fakeSite } from '../../tests/fake-host';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
@@ -192,5 +194,129 @@ describe( 'site_delete on the Claude route', () => {
 		);
 		expect( context.approve ).not.toHaveBeenCalled();
 		expect( host.sites.delete ).not.toHaveBeenCalled();
+	} );
+} );
+
+const PATH_REFUSAL = 'inside the site’s folder or this conversation’s workspace';
+
+describe( 'site_import on the Claude route', () => {
+	it( 'imports a backup from the conversation’s folders once the user approves the operation that names it', async () => {
+		const { bridge, host, context, journal, site } = await setup();
+		const backup = path.join( site, 'backup.zip' );
+		await writeFile( backup, 'zip' );
+		expect( bridge.tools ).toContain( 'site_import' );
+		const result = await bridge.invoke( 'site_import', { nameOrPath: 'site', importFile: backup } );
+		expect( result.isError ).toBe( false );
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		expect( request.operation ).toMatchObject( {
+			tool: 'sites.import',
+			operationClass: 'local-overwrite',
+			localPaths: [ site, backup ],
+		} );
+		expect( host.sites.import ).toHaveBeenCalledWith(
+			expect.objectContaining( { id: fakeSite.id } ),
+			backup,
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( journaled( journal ) ).toEqual( [
+			[ 'site_import', 'local-overwrite' ],
+			[ 'sites.import', 'local-overwrite' ],
+		] );
+	} );
+
+	it( 'reads no file outside the conversation’s folders, by any path, nor one that holds credentials, and says why without the path', async () => {
+		const { bridge, host, context, site, parent } = await setup();
+		await writeFile( path.join( parent, 'elsewhere.zip' ), 'zip' );
+		await writeFile( path.join( site, 'credentials.zip' ), 'zip' );
+		await mkdir( path.join( parent, 'outside' ) );
+		await writeFile( path.join( parent, 'outside', 'backup.zip' ), 'zip' );
+		await symlink( path.join( parent, 'outside' ), path.join( site, 'linked' ), 'junction' );
+		for ( const importFile of [
+			path.join( parent, 'elsewhere.zip' ),
+			path.join( site, '..', 'elsewhere.zip' ),
+			path.join( site, 'linked', 'backup.zip' ),
+			path.join( site, 'credentials.zip' ),
+			path.join( site, 'missing.zip' ),
+			'backup.zip',
+		] ) {
+			const result = await bridge.invoke( 'site_import', { nameOrPath: 'site', importFile } );
+			expect( result.isError, importFile ).toBe( true );
+			expect( text( result ), importFile ).toContain( PATH_REFUSAL );
+			expect( text( result ), importFile ).not.toContain( parent );
+		}
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect( host.sites.import ).not.toHaveBeenCalled();
+	} );
+} );
+
+describe( 'site_export on the Claude route', () => {
+	it( 'writes a backup in the conversation’s folders once the user approves the operation that names it', async () => {
+		const { bridge, host, context, journal, site } = await setup();
+		const exportFile = path.join( site, 'exports', 'backup.zip' );
+		expect( bridge.tools ).toContain( 'site_export' );
+		const result = await bridge.invoke( 'site_export', { nameOrPath: 'site', exportFile } );
+		expect( result.isError ).toBe( false );
+		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation ).toMatchObject( {
+			tool: 'sites.export',
+			operationClass: 'local-overwrite',
+			args: [ exportFile, 'full' ],
+			localPaths: [ site, exportFile ],
+		} );
+		expect( host.sites.export ).toHaveBeenCalledWith(
+			expect.objectContaining( { id: fakeSite.id } ),
+			exportFile,
+			'full',
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( journaled( journal ) ).toEqual( [
+			[ 'site_export', 'local-overwrite' ],
+			[ 'sites.export', 'local-overwrite' ],
+		] );
+	} );
+
+	it( 'writes nowhere outside the conversation’s folders, by any path, and says why without the path', async () => {
+		const { bridge, host, context, site, parent } = await setup();
+		await mkdir( path.join( parent, 'outside' ) );
+		await symlink( path.join( parent, 'outside' ), path.join( site, 'linked' ), 'junction' );
+		for ( const exportFile of [
+			path.join( parent, 'backup.zip' ),
+			path.join( site, '..', 'backup.zip' ),
+			path.join( site, 'linked', 'backup.zip' ),
+			path.join( site, 'linked', 'new', 'backup.zip' ),
+			path.join( site, 'secret-backup.zip' ),
+			'backup.zip',
+			// Without a file the tool writes to the working folder of Studio's own
+			// process, which is none of the conversation's.
+			undefined,
+		] ) {
+			const result = await bridge.invoke( 'site_export', { nameOrPath: 'site', exportFile } );
+			expect( result.isError, String( exportFile ) ).toBe( true );
+			expect( text( result ), String( exportFile ) ).toContain( PATH_REFUSAL );
+			expect( text( result ), String( exportFile ) ).not.toContain( parent );
+		}
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect( host.sites.export ).not.toHaveBeenCalled();
+	} );
+
+	it( 'checks the file again immediately before the command starts, so an approved path that now leads elsewhere writes nothing', async () => {
+		const { bridge, host, context, site, parent } = await setup();
+		await mkdir( path.join( site, 'exports' ) );
+		await mkdir( path.join( parent, 'outside' ) );
+		vi.mocked( context.approve ).mockImplementationOnce( async () => {
+			await rename( path.join( site, 'exports' ), path.join( site, 'moved' ) );
+			await symlink( path.join( parent, 'outside' ), path.join( site, 'exports' ), 'junction' );
+			return 'allow';
+		} );
+		host.sites.export = vi.fn( async ( _site, _file, _mode, _progress, options ) => {
+			await options?.beforeSpawn?.();
+		} );
+		const result = await bridge.invoke( 'site_export', {
+			nameOrPath: 'site',
+			exportFile: path.join( site, 'exports', 'backup.zip' ),
+		} );
+		expect( result.isError ).toBe( true );
+		expect( host.sites.export ).not.toHaveBeenCalled();
 	} );
 } );

@@ -90,8 +90,12 @@ const STUDIO_CALLS: Record< string, { args: ( paths: Paths ) => unknown; live?: 
 	wpcom_request: { args: () => ( { siteId: 42, method: 'POST', path: '/posts' } ), live: true },
 	site_push: { args: () => ( { nameOrPath: 'site' } ) },
 	site_pull: { args: () => ( { nameOrPath: 'site' } ) },
-	site_import: { args: () => ( { nameOrPath: 'site' } ) },
-	site_export: { args: () => ( { nameOrPath: 'site' } ) },
+	site_import: {
+		args: ( paths ) => ( { nameOrPath: 'site', importFile: path.join( paths.site, 'a.zip' ) } ),
+	},
+	site_export: {
+		args: ( paths ) => ( { nameOrPath: 'site', exportFile: path.join( paths.site, 'a.zip' ) } ),
+	},
 	open_annotation_browser: { args: () => ( { url: fakeSite.url } ) },
 	send_feedback: { args: () => ( {} ) },
 	present_design_options: { args: () => ( {} ) },
@@ -129,7 +133,9 @@ const HOST_CALLS: Record<
 	'sites.stop': { call: ( host ) => host.sites.stop( site, () => {} ) },
 	'sites.delete': { call: ( host ) => host.sites.delete( site, false, () => {} ) },
 	'sites.import': {
-		call: ( host, paths ) => host.sites.import( site, path.join( paths.site, 'a.zip' ), () => {} ),
+		// The backup it reads must exist in the conversation's folders.
+		call: ( host, paths ) =>
+			host.sites.import( site, path.join( paths.site, 'readme.txt' ), () => {} ),
 	},
 	'sites.export': {
 		call: ( host, paths ) =>

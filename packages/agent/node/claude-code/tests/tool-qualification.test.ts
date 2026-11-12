@@ -78,6 +78,8 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 	site_start: throughHost,
 	site_stop: throughHost,
 	site_delete: throughHost,
+	site_import: throughHost,
+	site_export: throughHost,
 };
 const isQualifiedName = ( name: string ) => Object.prototype.hasOwnProperty.call( QUALIFIED, name );
 // In the order the rule table, and so every enabled list, names them.

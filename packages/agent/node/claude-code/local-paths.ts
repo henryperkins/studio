@@ -48,23 +48,52 @@ export async function isAllowedNativePath(
 	}
 }
 
-/**
- * Whether a path, which may not exist yet, lies in a canonical root once its
- * deepest existing folder is resolved.
- */
-export async function isInsideCanonicalRoot( root: string, file: string ): Promise< boolean > {
-	if ( ! path.isAbsolute( file ) ) return false;
+// Where a path, which may not exist yet, leads once its deepest existing part
+// is resolved through every link, junction and short name; undefined when that
+// part cannot be read.
+async function resolveDeepest( file: string ): Promise< string | undefined > {
+	if ( ! path.isAbsolute( file ) ) return;
 	const missing: string[] = [];
 	for ( let current = path.resolve( file ); ; current = path.dirname( current ) ) {
 		try {
-			return isInside( root, path.join( await realpath( current ), ...missing ) );
+			return path.join( await realpath( current ), ...missing );
 		} catch ( error ) {
 			if (
 				( error as NodeJS.ErrnoException ).code !== 'ENOENT' ||
 				path.dirname( current ) === current
 			)
-				return false;
+				return;
 			missing.unshift( path.basename( current ) );
 		}
 	}
+}
+
+/**
+ * Whether a path, which may not exist yet, lies in a canonical root once its
+ * deepest existing folder is resolved.
+ */
+export async function isInsideCanonicalRoot( root: string, file: string ): Promise< boolean > {
+	const resolved = await resolveDeepest( file );
+	return resolved !== undefined && isInside( root, resolved );
+}
+
+/**
+ * Whether a host operation may write a file, which may not exist yet: once its
+ * deepest existing folder is resolved, inside one of the canonical roots but
+ * not a root itself, outside the native configuration, and clear of names
+ * that commonly hold credentials.
+ */
+export async function isAllowedNewPath(
+	file: string,
+	roots: readonly string[],
+	configDirectory: string
+): Promise< boolean > {
+	const resolved = await resolveDeepest( file );
+	return (
+		resolved !== undefined &&
+		roots.some( ( root ) => isInside( root, resolved ) && resolved !== root ) &&
+		! isInside( configDirectory, resolved ) &&
+		! isSensitivePath( file ) &&
+		! isSensitivePath( resolved )
+	);
 }
