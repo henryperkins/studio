@@ -19,6 +19,7 @@ import {
 } from '@studio/common/lib/tests/fixtures/owned-process-seams';
 import { describe, expect, it, vi } from 'vitest';
 import { discoverClaudeModels, qualifyClaudeStartup } from '../runtime';
+import { reportedStudioServer } from './fixtures/studio-server';
 import type { OwnershipFailure, ProcessOwner } from '@studio/common/lib/owned-process';
 
 const fakeIdentity = {
@@ -240,8 +241,8 @@ describe( 'Claude SDK startup (mock control responses)', () => {
 				input = request.prompt[ Symbol.asyncIterator ]().next();
 				return {
 					...good(),
-					mcpServerStatus: () =>
-						inventoryRequests++ === 0 ? Promise.resolve( [] ) : good().mcpServerStatus(),
+					mcpServerStatus: async () =>
+						inventoryRequests++ === 0 ? [] : [ reportedStudioServer( request.options ) ],
 					close: () => {
 						closed = true;
 					},
@@ -504,9 +505,7 @@ it( 'resumes the exact native session after restart with the next model and effo
 						subscriptionType: 'max',
 						apiProvider: 'firstParty',
 					} ),
-					mcpServerStatus: async () => [
-						{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-					],
+					mcpServerStatus: async () => [ reportedStudioServer( input.options ) ],
 					supportedModels: async () => [
 						{ value: 'model-a', displayName: 'Model A', supportedEffortLevels: [ 'medium' ] },
 						{ value: 'model-b', displayName: 'Model B', supportedEffortLevels: [ 'high' ] },
@@ -640,9 +639,7 @@ it( 'releases no prompt and reports startup failure even if closing the SDK thro
 				subscriptionType: 'Max',
 				apiProvider: 'firstParty',
 			} ),
-			mcpServerStatus: async () => [
-				{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-			],
+			mcpServerStatus: async () => [ reportedStudioServer( input.options ) ],
 			supportedModels: async () => [
 				{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
 			],
@@ -770,9 +767,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 						subscriptionType: 'Max',
 						apiProvider: 'firstParty',
 					} ),
-					mcpServerStatus: async () => [
-						{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-					],
+					mcpServerStatus: async () => [ reportedStudioServer( input.options ) ],
 					supportedModels: async () => [
 						{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
 					],
@@ -949,9 +944,7 @@ it( 'denies native tools until system init has been verified (mock SDK)', async 
 					subscriptionType: 'Max',
 					apiProvider: 'firstParty',
 				} ),
-				mcpServerStatus: async () => [
-					{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-				],
+				mcpServerStatus: async () => [ reportedStudioServer( input.options ) ],
 				supportedModels: async () => [
 					{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
 				],
@@ -1185,9 +1178,7 @@ function fakeNativeTurn(
 					hook_on_failure_supported: true,
 				} ),
 				accountInfo: async () => account(),
-				mcpServerStatus: async () => [
-					{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-				],
+				mcpServerStatus: async () => [ reportedStudioServer( input.options ) ],
 				supportedModels: async () => [
 					{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
 				],
@@ -1991,9 +1982,7 @@ function spawningNativeTurn(
 					hook_on_failure_supported: true,
 				} ),
 				accountInfo: async () => nativeAccount( 'user@example.com' ),
-				mcpServerStatus: async () => [
-					{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-				],
+				mcpServerStatus: async () => [ reportedStudioServer( input.options ) ],
 				supportedModels: async () => [
 					{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
 				],

@@ -12,7 +12,11 @@ import {
 } from '../../tools/define-tool';
 import { runWpCliTool } from '../../tools/wp-cli';
 import { claudeRouteNote } from '../execution-rules';
-import { createStudioClaudeDiscoveryServer, createStudioClaudeToolBridge } from '../tool-bridge';
+import {
+	claudeStudioToolCandidates,
+	createStudioClaudeDiscoveryServer,
+	createStudioClaudeToolBridge,
+} from '../tool-bridge';
 import { wpCliRouteCommands } from '../wp-cli-rules';
 import { createPolicyFixture } from './fixtures/execution-policy';
 import type { StudioAgentHost } from '../../host';
@@ -301,7 +305,8 @@ it( 'exposes the canonical schema through the actual in-process SDK MCP server',
 	] );
 	try {
 		const tools = await client.listTools();
-		expect( tools.tools.map( ( item ) => item.name ) ).toEqual( [ 'wp_cli' ] );
+		expect( tools.tools.map( ( item ) => item.name ) ).toEqual( bridge.tools );
+		expect( bridge.tools ).toContain( 'wp_cli' );
 		const result = await client.callTool( {
 			name: 'wp_cli',
 			arguments: { nameOrPath: 'site', command: 'option get blogname' },
@@ -358,20 +363,31 @@ async function listedTools( bridge: ReturnType< typeof createStudioClaudeToolBri
 
 describe( 'the Claude bridge built from the Studio registry', () => {
 	it( 'lists each tool the policy enables as the registry defines it: its name, description and canonical schema', async () => {
-		const { bridge } = await setup();
+		const { bridge, policy } = await setup();
 		const tools = await listedTools( bridge );
-		expect( tools.map( ( item ) => item.name ) ).toEqual( [ 'wp_cli' ] );
-		// The canonical description, and after it what this route runs of what it offers.
+		const registry = claudeStudioToolCandidates( {} );
+		expect( tools.map( ( item ) => item.name ) ).toEqual(
+			registry
+				.map( ( definition ) => definition.name )
+				.filter( ( name ) => policy.studioTools.includes( name ) )
+		);
+		for ( const listed of tools ) {
+			const definition = registry.find( ( candidate ) => candidate.name === listed.name )!;
+			// The canonical description, and after it what this route runs of what it offers.
+			const note = claudeRouteNote( listed.name );
+			expect( listed.description, listed.name ).toBe(
+				note ? `${ definition.description }\n\n${ note }` : definition.description
+			);
+			expect( Object.keys( listed.inputSchema.properties ?? {} ).sort(), listed.name ).toEqual(
+				Object.keys( definition.parameters.properties ).sort()
+			);
+			expect( [ ...( listed.inputSchema.required ?? [] ) ].sort(), listed.name ).toEqual(
+				[ ...( definition.parameters.required ?? [] ) ].sort()
+			);
+		}
 		const note = claudeRouteNote( 'wp_cli' )!;
-		expect( tools[ 0 ].description ).toBe( `${ runWpCliTool.description }\n\n${ note }` );
 		for ( const { usage } of wpCliRouteCommands() ) expect( note ).toContain( usage );
 		expect( runWpCliTool.description ).not.toContain( note );
-		expect( Object.keys( tools[ 0 ].inputSchema.properties ?? {} ).sort() ).toEqual(
-			Object.keys( runWpCliTool.parameters.properties ).sort()
-		);
-		expect( [ ...( tools[ 0 ].inputSchema.required ?? [] ) ].sort() ).toEqual(
-			[ ...( runWpCliTool.parameters.required ?? [] ) ].sort()
-		);
 		await bridge.dispose();
 	} );
 
@@ -390,7 +406,9 @@ describe( 'the Claude bridge built from the Studio registry', () => {
 			{ runId: 'run', turnId: 'turn', policy: fixture.policy },
 			() => {}
 		);
-		expect( ( await listedTools( bridge ) ).map( ( item ) => item.name ) ).toEqual( [ 'wp_cli' ] );
+		const names = ( await listedTools( bridge ) ).map( ( item ) => item.name );
+		expect( names ).not.toContain( 'contract_offered' );
+		expect( names ).toEqual( bridge.tools );
 		expect( ( await bridge.invoke( 'contract_offered', {} ) ).isError ).toBe( true );
 		expect( handler ).not.toHaveBeenCalled();
 		await bridge.dispose();

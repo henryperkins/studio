@@ -834,9 +834,28 @@ export function createClaudeExecutionPolicy(
 				prepared.operation
 			);
 		};
+		// A read a tool makes of a site: of a site it may reach, under the turn's
+		// authority, while the call lives.
+		const reading = async < T >( site: HostSite, read: () => Promise< T > ): Promise< T > => {
+			if (
+				operationSignal.aborted ||
+				! ( await isReachableSite( site ) ) ||
+				! ( await checkpoint( callSignal ) )
+			)
+				throw denied();
+			operationSignal.throwIfAborted();
+			return read();
+		};
+		// What no qualified tool needs is refused: every site's details, and the
+		// members that reach WordPress.com or send analytics.
+		const refused = async (): Promise< never > => {
+			throw denied();
+		};
 		const { ui } = host;
 		return {
 			...host,
+			wpcom: { sites: refused },
+			tracks: { record: refused },
 			// What a call shows in the conversation is written to the chat's record,
 			// so it stops with the call's authority. An artifact the run manager
 			// would bind the chat to a site with is refused, like `selectSite`.
@@ -861,6 +880,10 @@ export function createClaudeExecutionPolicy(
 					if ( site && ! ( await isReachableSite( site ) ) ) throw denied();
 					return site;
 				},
+				all: refused,
+				list: refused,
+				status: ( site ) => reading( site, () => host.sites.status( site ) ),
+				isRunning: ( site ) => reading( site, () => host.sites.isRunning( site ) ),
 				create: ( name, sitePath, onProgress ) =>
 					run(
 						{ name: 'sites.create', args: [ name, sitePath ], localPaths: [ sitePath ] },

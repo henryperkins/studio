@@ -59,7 +59,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 		step: 'C2a-2',
 		reason: `${ LOCAL }; it changes the conversation's site (selectSite and its site preview), which nothing journals yet, so the guarded host refuses both (carry item 7)`,
 	},
-	site_info: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
+	site_info: { status: 'bridged' },
 	site_start: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
 	site_stop: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
 	site_delete: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },

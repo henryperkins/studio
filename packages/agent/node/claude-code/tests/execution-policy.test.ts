@@ -116,8 +116,9 @@ describe( 'Claude operation classes', () => {
 		expect( CLAUDE_STUDIO_TOOL_RULES.get( 'site_push' )?.operationClass ).toBe(
 			'remote-overwrite'
 		);
-		// This build runs only what the proof of concept ran.
-		expect( CLAUDE_ENABLED_TOOLS ).toEqual( { native: [ 'Read' ], studio: [ 'wp_cli' ] } );
+		// Native tools are those the proof of concept ran; Studio tools are enabled
+		// as `tool-qualification.test.ts` qualifies them.
+		expect( CLAUDE_ENABLED_TOOLS.native ).toEqual( [ 'Read' ] );
 	} );
 
 	it( 'classifies a WordPress.com request by its method, never by its annotation alone', () => {
@@ -691,7 +692,9 @@ describe( 'Claude Studio tools that act outside the host', () => {
 
 	it( 'names the Studio tools the turn may run, as its selection enables them', async () => {
 		const { policy } = await setup();
-		expect( policy.studioTools ).toEqual( [ 'wp_cli' ] );
+		expect( policy.studioTools ).toEqual( [ ...CLAUDE_ENABLED_TOOLS.studio ] );
+		const only = await setup( () => ( { enabledTools: { native: [], studio: [ 'wp_cli' ] } } ) );
+		expect( only.policy.studioTools ).toEqual( [ 'wp_cli' ] );
 		const disabled = await setup( () => ( { enabledTools: { native: [ 'Read' ], studio: [] } } ) );
 		expect( disabled.policy.studioTools ).toEqual( [] );
 	} );

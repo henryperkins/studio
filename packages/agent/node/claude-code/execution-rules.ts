@@ -49,7 +49,7 @@ export interface ClaudeEnabledTools {
  */
 export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 	native: Object.freeze( [ 'Read' ] ),
-	studio: Object.freeze( [ runWpCliTool.name ] ),
+	studio: Object.freeze( [ runWpCliTool.name, getSiteInfoTool.name ] ),
 } );
 
 /** How long the user has to answer an approval. */
@@ -385,6 +385,28 @@ function qualified(
 	return { ...rule, qualification: { qualified: true, channels } };
 }
 
+// What a tool that acts on the site it names only through the host uses: host
+// operations, WP-CLI among them, bound to the target site by the host guard.
+const LOCAL_SITE_HOST_CHANNELS: Partial< ClaudeToolChannelDeclaration > = {
+	runsWpCli: [ 'site', 'host' ],
+	callsHostOperation: [ 'site', 'host' ],
+};
+
+// A declaration that marks every channel it does not name as unused.
+function using( used: Partial< ClaudeToolChannelDeclaration > ): ClaudeToolChannelDeclaration {
+	return {
+		readsLocalFiles: false,
+		writesLocalFiles: false,
+		drivesBrowser: false,
+		requestsNetwork: false,
+		spawnsProcess: false,
+		runsWpCli: false,
+		callsHostOperation: false,
+		reachesWpcom: false,
+		...used,
+	};
+}
+
 function frozen< Value >( value: Value ): Value {
 	if ( value && typeof value === 'object' && ! Object.isFrozen( value ) ) {
 		Object.freeze( value );
@@ -596,7 +618,14 @@ function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefined {
 export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule > = ruleTable( [
 	[ createSiteTool.name, unqualified( studioRule( 'local-change', { approval: 'host' } ) ) ],
 	[ listSitesTool.name, unqualified( studioRule( 'remote-read' ) ) ],
-	[ getSiteInfoTool.name, unqualified( onSite( 'read' ) ) ],
+	[
+		getSiteInfoTool.name,
+		// It resolves the site it names and reads that site's status from the
+		// host, which the guarded host allows for the target site only. Like
+		// every site tool, its module links `tools/utils.ts`, whose `runWpCli`
+		// can reach WP-CLI only through the guarded host.
+		qualified( onSite( 'read' ), using( LOCAL_SITE_HOST_CHANNELS ) ),
+	],
 	[ startSiteTool.name, unqualified( onSite( 'local-change', { approval: 'host' } ) ) ],
 	[ stopSiteTool.name, unqualified( onSite( 'local-change', { approval: 'host' } ) ) ],
 	[ deleteSiteTool.name, unqualified( onSite( 'local-overwrite', { approval: 'host' } ) ) ],

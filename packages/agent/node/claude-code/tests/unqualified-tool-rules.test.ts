@@ -40,13 +40,7 @@ async function setup( ...args: Parameters< typeof createPolicyFixture > ) {
 }
 
 const studioServer = { name: 'studio', source: 'sdk' };
-const offHostTools = [
-	'scaffold_theme',
-	'validate_blocks',
-	'generate_images',
-	'site_info',
-	'take_screenshot',
-];
+const offHostTools = [ 'scaffold_theme', 'validate_blocks', 'generate_images', 'take_screenshot' ];
 const pageTools = [ 'take_screenshot', 'inspect_design', 'open_annotation_browser' ];
 const auditTools = [ 'need_for_speed', 'rank_me_up' ];
 const browserTools = [ ...pageTools, ...auditTools ];
@@ -76,7 +70,6 @@ describe( 'Rules for Claude Studio tools that act outside the host', () => {
 		expect( await call( 'scaffold_theme', { nameOrPath: 'site', name: 'Theme' } ) ).toBe( true );
 		expect( await call( 'scaffold_theme', { nameOrPath: 'other', name: 'Theme' } ) ).toBe( false );
 		expect( await call( 'scaffold_theme', { name: 'Theme' } ) ).toBe( false );
-		expect( await call( 'site_info', { nameOrPath: other } ) ).toBe( false );
 		expect( context.approve ).not.toHaveBeenCalled();
 		expect(
 			await call( 'validate_blocks', { nameOrPath: 'site', filePath: 'templates/index.html' } )

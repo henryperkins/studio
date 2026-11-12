@@ -7,6 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { prepareProcessOwner } from '@studio/common/lib/owned-process';
 import { runClaudeTurn } from '../../runtime';
+import { reportedStudioServer } from './studio-server';
 import type { StudioAgentHost } from '../../../host';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 import type { ChildProcess, ChildProcessWithoutNullStreams } from 'child_process';
@@ -172,9 +173,7 @@ async function main() {
 						subscriptionType: 'max',
 						apiProvider: 'firstParty',
 					} ),
-					mcpServerStatus: async () => [
-						{ name: 'studio', source: 'sdk', status: 'connected', tools: [ { name: 'wp_cli' } ] },
-					],
+					mcpServerStatus: async () => [ reportedStudioServer( options ) ],
 					supportedModels: async () => [
 						{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
 					],
