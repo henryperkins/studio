@@ -19,7 +19,7 @@ Wait first for the reasons that can resolve on their own, then try `recover` aga
 - `owner-alive`, `native-alive`, `guardian-alive`, `descendants-alive`: a process of the last turn is still running. Wait for the turn to end, or quit the Studio app that ran it.
 - `recovery-in-progress`: another Studio app is recovering the chat, or may be.
 - `deletion-pending`, `lock-not-a-run`: Studio is deleting the chat, or was.
-- `owner-unverifiable`, `native-unverifiable`, `guardian-unverifiable`, `descendants-unverifiable`, `lock-unreadable`, `recovery-failed`: Studio could not read something it needs. This is often momentary.
+- `owner-unverifiable`, `native-unverifiable`, `guardian-unverifiable`, `descendants-unverifiable`, `lock-unreadable`, `recovery-failed`, `journal-unreadable`: Studio could not read something it needs. This is often momentary.
 
 Follow this procedure when one of these does not go away once every Studio app is closed, or for these reasons:
 
@@ -36,6 +36,7 @@ Follow this procedure when one of these does not go away once every Studio app i
 | `deletion-pending` | Deleting the chat again reports that it is locked. |
 | `recovery-claim-unreadable` | A claim on the chat's recovery is empty or names no process. An interrupted claim creation on a filesystem without hard links leaves it so (see [Leftover files](#leftover-files)). |
 | `recovery-failed` | Recording the recovery or releasing the lock keeps failing. A recovery that recorded the interrupted turn before failing records nothing more when it is tried again. |
+| `workspace-missing`, `native-session-missing`, `native-history-missing`, `journal-unreadable` | The chat cannot be resumed: its workspace or Claude configuration folder is gone, its Claude Code session or history cannot be found or verified, or its journal keeps failing to read. Start a new chat. This chat keeps its lock, so it cannot be deleted until you clear it: see [Clearing the lock of a chat that cannot be resumed](#clearing-the-lock-of-a-chat-that-cannot-be-resumed). |
 
 ## 1. Find the chat's files
 
@@ -115,29 +116,32 @@ A process the lock records is still that process only when its start time equals
 
 ### Windows
 
-PowerShell 7 shows each process's parent, exact start time and command line:
+These commands work the same in PowerShell 7 and Windows PowerShell 5.1. Find every process naming this chat's native session with CIM, which reads all command lines at once (in PowerShell 7, reading `CommandLine` through `Get-Process` asks for each process separately and can take minutes). `CreationDate` is precise to the microsecond, so compare every digit of the lock's `start` except the last:
 
 ```powershell
 $session = '<native session id>'
-# Every process naming this chat's native session.
-Get-Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains( $session ) } |
-	Select-Object Id, @{ n = 'ParentId'; e = { $_.Parent.Id } }, @{ n = 'Start'; e = { $_.StartTime.ToFileTimeUtc() } }, CommandLine
-
-# A process the lock records: the same process only when Start equals its "start".
-Get-Process -Id <pid> | Select-Object Id, @{ n = 'ParentId'; e = { $_.Parent.Id } }, @{ n = 'Start'; e = { $_.StartTime.ToFileTimeUtc() } }, CommandLine
-
-# The children of a process, started after it.
-$parent = Get-Process -Id <pid>
-Get-Process | Where-Object { $_.Parent.Id -eq $parent.Id -and $_.StartTime -gt $parent.StartTime } |
-	Select-Object Id, @{ n = 'Start'; e = { $_.StartTime.ToFileTimeUtc() } }, CommandLine
-```
-
-In Windows PowerShell 5.1, use CIM instead. `CreationDate` is precise to the microsecond, so compare every digit of the lock's `start` except the last:
-
-```powershell
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains( $session ) } |
 	Select-Object ProcessId, ParentProcessId, @{ n = 'Start'; e = { $_.CreationDate.ToFileTimeUtc() } }, CommandLine
 ```
+
+`Get-Process` reads a process's start to the full precision the lock records:
+
+```powershell
+# A process the lock records: the same process only when Start equals its "start".
+# If no process has that ID, it has ended.
+Get-Process -Id <pid> | Select-Object Id, @{ n = 'Start'; e = { $_.StartTime.ToFileTimeUtc() } }
+```
+
+To list the children of a process the lock records, whether or not it still runs, ask CIM, as Studio does. `<start>` is the lock's `start` for that process. CIM keeps a child's parent ID after the parent has exited, and reads creation times to the microsecond, so the recorded start is rounded down to the microsecond before it is compared. A process that names the same parent ID but started earlier is a child of an earlier process with that ID, and is left out:
+
+```powershell
+$after = [long]'<start>' - [long]'<start>' % 10
+Get-CimInstance Win32_Process -Filter "ParentProcessId = <pid>" |
+	Where-Object { $_.CreationDate.ToFileTimeUtc() -ge $after } |
+	Select-Object ProcessId, @{ n = 'Start'; e = { $_.CreationDate.ToFileTimeUtc() } }, CommandLine
+```
+
+Run it again for each process it lists, with that process's `ProcessId` and `Start`, to find its children in turn. Do not use `Get-Process` for this: `Get-Process -Id` fails once the process has exited, and PowerShell 7 shows no `Parent` for a process whose parent has exited, which is when the list matters.
 
 PowerShell does not show another process's working directory or environment. The session ID in the command line is enough to identify the Claude Code process. To check its working directory and `CLAUDE_CONFIG_DIR` as well, use Sysinternals Process Explorer: the process's properties show its current directory on the Image tab and its environment on the Environment tab.
 
@@ -146,6 +150,8 @@ PowerShell does not show another process's working directory or environment. The
 When CIM (WMI) is turned off or broken, Studio cannot list the children of the turn's Claude Code process, so recovery reports `descendants-unverifiable` until CIM works again. `Get-Process` still shows start times and, in PowerShell 7, parents, but its `CommandLine` comes from CIM and stays empty. Read command lines in Task Manager instead: on the Details tab, right-click a column heading, choose Select columns and add Command line. Process Explorer shows them too.
 
 ### Linux
+
+These commands have not yet been checked on a Linux host.
 
 ```sh
 session='<native session id>'
@@ -163,17 +169,23 @@ ps -eo pid,ppid,pgid,lstart,args | awk -v group=<pgid> '$3 == group'
 
 ### macOS
 
+These commands have not yet been checked on a macOS host.
+
 ```sh
 session='<native session id>'
 ps -eo pid,ppid,pgid,lstart,command | grep -F -- "$session" | grep -v grep
-# Its working directory and environment (for your own processes).
+# Its working directory (for your own processes).
 lsof -a -p <pid> -d cwd -Fn
-ps -E -p <pid> -o command= | tr ' ' '\n' | grep '^CLAUDE_CONFIG_DIR='
-# A recorded process is the same one only when its start equals "ps:<this output>".
-TZ=UTC LC_ALL=C ps -o lstart= -p <pid>
+# Its CLAUDE_CONFIG_DIR, spaces included: what follows "CLAUDE_CONFIG_DIR=" up to
+# the next variable. A folder whose name contains " NAME=" would be cut short there.
+ps -E -ww -p <pid> -o command= | sed -n 's/.* CLAUDE_CONFIG_DIR=//p' | sed -E 's/ [A-Za-z_][A-Za-z0-9_]*=.*$//'
+# A recorded process is the same one only when its start equals this output exactly.
+TZ=UTC LC_ALL=C ps -o lstart= -p <pid> | awk '{ $1 = $1; print "ps:" $0 }'
 # Everything still in the group the turn's Claude Code process led.
 ps -eo pid,ppid,pgid,lstart,command | awk -v group=<pgid> '$3 == group'
 ```
+
+`ps` pads a day of the month before the 10th with a second space (`Nov  3`), while Studio records the start with single spaces (`ps:Tue Nov 3 09:15:02 2026`); the `awk` above collapses the spaces, so its output compares equal to the lock's `start`.
 
 ## 5. End the processes you identified
 
@@ -217,3 +229,13 @@ For an interrupted deletion (`lock-not-a-run`, or `deletion-pending` with the ch
 3. Send the chat's next message (`studio code sessions resume <chat id> <message>`). Studio checks the chat's workspace and native history before it sends anything; if they cannot be verified, it says to start a new chat.
 
 A lock set aside by hand records no outcome for the interrupted turn and no list of operations that may or may not have taken effect, and Claude is not told that its previous turn was interrupted. Check the state of the site yourself before you ask Claude to repeat anything from that turn, and tell Claude that its previous turn was interrupted.
+
+## Clearing the lock of a chat that cannot be resumed
+
+With `workspace-missing`, `native-session-missing`, `native-history-missing`, or a `journal-unreadable` that does not go away, the chat cannot be resumed. Start a new chat to continue. For `workspace-missing`, restoring the folder where it was and running `recover` again is better, if you can.
+
+The old chat keeps its lock, and Studio does not delete a locked chat: deleting it fails while the lock is there. Studio never clears that lock without proof that the turn has ended, so clear it by hand, then delete the chat:
+
+1. Follow steps 1 to 5: find the chat's files, quit Studio, copy the lock and the journals as evidence, and prove with step 4 that the lock's `owner` and every process of the turn have ended: its Claude Code process, the helper that guarded it, and every process that descends from them. End only processes you identified (step 5). If you cannot prove that they have ended, stop: keep the lock, and leave the chat as it is.
+2. Set the lock aside as in step 6, by renaming it to `.manual-<date>`. Do not delete it.
+3. Delete the chat in the app, or with `studio code sessions delete <chat id>`. The deletion takes the lock itself and removes the chat's files. It keeps the `.manual-…` file, and your copy stays where you put it.

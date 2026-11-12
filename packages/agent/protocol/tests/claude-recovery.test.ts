@@ -29,7 +29,23 @@ const BY_HAND: ClaudeRecoveryBlockedReason[] = [
 	'native-session-mismatch',
 	'recovery-claim-unreadable',
 	'recovery-failed',
+	...( [
+		'workspace-missing',
+		'native-session-missing',
+		'native-history-missing',
+		'journal-unreadable',
+	] as const ),
 ];
+
+// Reasons that leave a chat that cannot be resumed with its lock, so that it
+// cannot be deleted either until the lock is cleared by hand.
+const NOT_RESUMABLE: ClaudeRecoveryBlockedReason[] = [
+	'workspace-missing',
+	'native-session-missing',
+	'native-history-missing',
+	'journal-unreadable',
+];
+const CLEARING_SECTION = '## Clearing the lock of a chat that cannot be resumed';
 
 // Reasons that can resolve by waiting for, or closing, another Studio app or process.
 const BY_WAITING: ClaudeRecoveryBlockedReason[] = [
@@ -78,4 +94,22 @@ describe( 'why Studio did not recover a Claude chat, and what to do next', () =>
 		expect( document ).toMatch( /\.manual-/ );
 		expect( document ).toContain( 'studio code claude recover --session' );
 	} );
+
+	it.each( NOT_RESUMABLE )(
+		'says for %s that the chat keeps its lock until it is cleared by hand, and has a section that clears it so the chat can be deleted',
+		( reason ) => {
+			expect( getClaudeRecoveryBlockedMessage( reason ) ).toMatch( /lock/i );
+			expect( getClaudeRecoveryBlockedMessage( reason ) ).toMatch( /delete/i );
+			const document = readFileSync( path.resolve( CLAUDE_RECOVERY_PROCEDURE_DOCUMENT ), 'utf8' );
+			const start = document.indexOf( CLEARING_SECTION );
+			expect( start ).toBeGreaterThan( -1 );
+			const end = document.indexOf( '\n## ', start + CLEARING_SECTION.length );
+			const section = document.slice( start, end === -1 ? undefined : end );
+			expect( section ).toContain( `\`${ reason }\`` );
+			// The same proof first, the lock kept as evidence, then a normal deletion.
+			expect( section ).toMatch( /step 4/i );
+			expect( section ).toMatch( /\.manual-|set .* aside/i );
+			expect( section ).toContain( 'studio code sessions delete' );
+		}
+	);
 } );

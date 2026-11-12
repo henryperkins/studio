@@ -261,17 +261,29 @@ export function getClaudeRecoveryBlockedMessage( reason: ClaudeRecoveryBlockedRe
 				CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
 			);
 		case 'workspace-missing':
-			return __(
-				'This chat’s workspace or Claude configuration folder is no longer available. Restore it where it was and try again, or start a new Claude chat.'
+			return sprintf(
+				/* translators: %s: a documentation file in the Studio repository. */
+				__(
+					'This chat’s workspace or Claude configuration folder is no longer available. Restore it where it was and try again, or start a new Claude chat. Until then this chat keeps its lock and cannot be deleted; to clear the lock by hand so you can delete it, follow the procedure in %s.'
+				),
+				CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
 			);
 		case 'native-session-missing':
 		case 'native-history-missing':
-			return __(
-				'This chat’s Claude Code history could not be found or verified. To continue, start a new Claude chat; this chat’s history stays available.'
+			return sprintf(
+				/* translators: %s: a documentation file in the Studio repository. */
+				__(
+					'This chat’s Claude Code history could not be found or verified. To continue, start a new Claude chat; this chat’s history stays available. This chat keeps its lock and cannot be deleted; to clear the lock by hand so you can delete it, follow the procedure in %s.'
+				),
+				CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
 			);
 		case 'journal-unreadable':
-			return __(
-				'Studio could not read this chat’s journal. Try again in a moment. If this keeps happening, start a new Claude chat.'
+			return sprintf(
+				/* translators: %s: a documentation file in the Studio repository. */
+				__(
+					'Studio could not read this chat’s journal. Try again in a moment. If this keeps happening, start a new Claude chat. This chat keeps its lock and cannot be deleted; to clear the lock by hand so you can delete it, follow the procedure in %s.'
+				),
+				CLAUDE_RECOVERY_PROCEDURE_DOCUMENT
 			);
 		case 'lock-changed':
 			return __(
