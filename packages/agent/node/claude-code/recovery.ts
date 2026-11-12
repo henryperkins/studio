@@ -11,7 +11,11 @@ import {
 	isClaudeReadOnlyClass,
 } from '@studio/agent/protocol/claude-code';
 import { claudeLockDigest } from './sessions';
-import type { ClaudeRunLockRecord, createNativeSessionStore } from './sessions';
+import type {
+	ClaudeRecoveryClaim,
+	ClaudeRunLockRecord,
+	createNativeSessionStore,
+} from './sessions';
 import type {
 	BackendTurnEvent,
 	ClaudeJournalEvent,
@@ -255,12 +259,13 @@ async function planRecovery(
 /**
  * Recovers a conversation whose run lock outlived the run that took it, in
  * the same native conversation, replaying nothing. It proceeds only when all
- * of these hold, and otherwise leaves the lock, the journal and the native
- * history exactly as they were:
+ * of these hold, and otherwise blocks as `ClaudeRecoveryBlockedReason`
+ * describes:
  * - the lock is a run lock this build wrote, for this conversation, on this OS,
  *   with the conversation's own connection and workspace binding;
- * - its owner is provably gone, and either no native process could have
- *   started (`locked`) or the tree Studio owned is provably ended (`owned`);
+ * - its owner is provably gone, and either the SDK was never asked to start
+ *   the turn's native process (`locked`) or the tree Studio owned is provably
+ *   ended (`owned`);
  * - the workspace and configuration still exist, and the native session is the
  *   conversation's own with its history in place;
  * - this recovery holds the only claim on that exact lock, which is still on
@@ -318,7 +323,7 @@ export async function recoverClaudeRun(
 
 	const claimant = await seams.self().catch( () => undefined );
 	if ( ! claimant ) return blocked( 'recovery-failed' );
-	let claim: Awaited< ReturnType< NativeSessionStore[ 'claimRecovery' ] > >;
+	let claim: ClaudeRecoveryClaim;
 	try {
 		claim = await store.claimRecovery(
 			conversationId,
@@ -329,9 +334,16 @@ export async function recoverClaudeRun(
 	} catch {
 		return blocked( 'recovery-failed' );
 	}
-	if ( ! claim ) return blocked( 'recovery-in-progress' );
+	if ( claim.state === 'held' ) return blocked( 'recovery-in-progress' );
+	if ( claim.state === 'unreadable' ) return blocked( 'recovery-claim-unreadable' );
 	try {
-		if ( ! ( await store.holdsLock( conversationId, raw ) ) ) return blocked( 'lock-changed' );
+		let held: boolean;
+		try {
+			held = await store.holdsLock( conversationId, raw );
+		} catch {
+			return blocked( 'lock-unreadable' );
+		}
+		if ( ! held ) return blocked( 'lock-changed' );
 		let journals: ClaudeJournalEvent[][];
 		try {
 			journals = await store.readJournals( conversationId );

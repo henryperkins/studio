@@ -41,8 +41,16 @@ export function isClaudeReadOnlyClass( operationClass: unknown ): boolean {
 }
 
 /**
- * Why Studio did not recover a locked Claude conversation. Every reason leaves
- * the run lock, the journal and the native history exactly as they were.
+ * Why Studio did not recover a locked Claude conversation. A blocked recovery
+ * leaves the run lock on disk and the native history exactly as they were. It
+ * leaves nothing of its own either, except a claim file it could not remove.
+ * The journal's entries are unchanged too, with one exception:
+ * `recovery-failed` or `lock-changed` returned when releasing the lock failed
+ * or found it replaced, after the recovery's record was written. The journal
+ * then holds that record once and whole: the dead turn's pending approvals
+ * resolved, its interrupted outcome (unless the turn recorded its own) and its
+ * `turn.recovered` entry. A later recovery of the same lock adds nothing and
+ * only releases it; a lock that replaced it is never touched.
  */
 export const CLAUDE_RECOVERY_BLOCKED_REASONS = [
 	/** The Claude Code experiment is off. */
@@ -92,8 +100,10 @@ export const CLAUDE_RECOVERY_BLOCKED_REASONS = [
 	'journal-unreadable',
 	/** The lock changed after it was inspected. */
 	'lock-changed',
-	/** Another recovery of this lock is under way. */
+	/** Another recovery of this lock is under way, or its claimant cannot be checked. */
 	'recovery-in-progress',
+	/** A claim on this lock's recovery is empty or names no process, as an interrupted creation leaves it. */
+	'recovery-claim-unreadable',
 	/** Recording the recovery failed; the lock was kept. */
 	'recovery-failed',
 ] as const;
@@ -270,6 +280,12 @@ export function getClaudeRecoveryBlockedMessage( reason: ClaudeRecoveryBlockedRe
 		case 'recovery-in-progress':
 			return __(
 				'Another Studio app is recovering this chat, or may be. Wait for it to finish, or quit the other Studio apps, then try again.'
+			);
+		case 'recovery-claim-unreadable':
+			return retryThenByHand(
+				__(
+					'A claim on recovering this chat cannot be read. A recovery that was interrupted while it created the claim leaves it so.'
+				)
 			);
 		case 'recovery-failed':
 			return retryThenByHand(

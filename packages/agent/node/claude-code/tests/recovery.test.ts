@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -169,7 +169,7 @@ async function recoveryFixture() {
 			await lock.update( { stage: 'owned', processes: { native, guardian } } );
 		const turn = store.journal( 'chat', 'turn' );
 		for ( const event of journal ) await turn.append( event );
-		return { nativeSessionId, raw: await readFile( lockFile, 'utf8' ) };
+		return { nativeSessionId, lock, raw: await readFile( lockFile, 'utf8' ) };
 	}
 
 	const recover = ( overrides: Partial< typeof binding > = {}, using = store ) =>
@@ -609,7 +609,7 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 		const other = { pid: 6666, start: 'other-recovery' };
 		expect(
 			await fixture.store.claimRecovery( 'chat', token, other, async () => 'gone' )
-		).toBeDefined();
+		).toMatchObject( { state: 'claimed' } );
 		fixture.states.set( `${ other.pid }:${ other.start }`, 'alive' );
 		expect( await fixture.recover() ).toEqual( {
 			status: 'blocked',
@@ -670,5 +670,176 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 			...ids,
 		} );
 		expect( await readFile( fixture.lockFile, 'utf8' ) ).toBe( raw );
+	} );
+
+	const claimsIn = async ( fixture: Awaited< ReturnType< typeof recoveryFixture > > ) =>
+		( await readdir( path.dirname( fixture.lockFile ) ) ).filter( ( name ) =>
+			name.includes( '.claim-' )
+		);
+
+	it( 'gives an empty or unreadable claim its own reason, and leaves it and the lock as they are', async () => {
+		const fixture = await recoveryFixture();
+		const { raw } = await fixture.deadTurn();
+		const claim = `${ fixture.lockFile }.${ claudeLockDigest( JSON.parse( raw ).token ).slice(
+			0,
+			32
+		) }.claim-0`;
+		for ( const content of [ '', '{"version":1', JSON.stringify( { version: 1 } ) ] ) {
+			await writeFile( claim, content );
+			expect( await fixture.recover() ).toEqual( {
+				status: 'blocked',
+				reason: 'recovery-claim-unreadable',
+				...ids,
+			} );
+			expect( await readFile( claim, 'utf8' ) ).toBe( content );
+			expect( await readFile( fixture.lockFile, 'utf8' ) ).toBe( raw );
+		}
+	} );
+
+	it( 'returns a typed result, and gives up its claim, when the lock cannot be read again at takeover', async () => {
+		const fixture = await recoveryFixture();
+		const { raw } = await fixture.deadTurn();
+		const unreadable = {
+			...fixture.store,
+			holdsLock: async () => {
+				throw Object.assign( new Error( 'access denied' ), { code: 'EACCES' } );
+			},
+		};
+		expect( await fixture.recover( {}, unreadable ) ).toEqual( {
+			status: 'blocked',
+			reason: 'lock-unreadable',
+			...ids,
+		} );
+		expect( await readFile( fixture.lockFile, 'utf8' ) ).toBe( raw );
+		expect( await claimsIn( fixture ) ).toEqual( [] );
+		expect( await fixture.store.readJournals( 'chat' ) ).toEqual( [] );
+	} );
+
+	it( 'removes its own claim once it has recovered', async () => {
+		const fixture = await recoveryFixture();
+		const { raw } = await fixture.deadTurn();
+		const token = JSON.parse( raw ).token as string;
+		// A claim left by an earlier recovery whose process has ended.
+		const gone = { pid: 7777, start: 'ended-recovery' };
+		expect(
+			await fixture.store.claimRecovery( 'chat', token, gone, async () => 'gone' )
+		).toMatchObject( { state: 'claimed' } );
+		expect( await fixture.recover() ).toMatchObject( { status: 'recovered' } );
+		expect( await claimsIn( fixture ) ).toEqual( [] );
+	} );
+
+	it( 'recovers once when two recoveries run at the same time', async () => {
+		const fixture = await recoveryFixture();
+		await fixture.deadTurn( { journal: await pendingDraft() } );
+		// Each recovery's claim names this live process.
+		fixture.states.set( `${ self.pid }:${ self.start }`, 'alive' );
+		const results = await Promise.all( [ fixture.recover(), fixture.recover() ] );
+		expect( results.filter( ( result ) => result.status === 'recovered' ) ).toHaveLength( 1 );
+		expect( results.find( ( result ) => result.status === 'blocked' ) ).toMatchObject( {
+			reason: expect.stringMatching( /^(recovery-in-progress|lock-changed|not-locked)$/ ),
+		} );
+		const events = ( await fixture.store.readJournals( 'chat' ) ).flat();
+		expect( events.filter( ( event ) => event.type === 'turn.recovered' ) ).toHaveLength( 1 );
+		expect( events.filter( ( event ) => event.type === 'turn.terminal' ) ).toHaveLength( 1 );
+		expect( events.filter( ( event ) => event.type === 'approval.resolved' ) ).toHaveLength( 1 );
+		expect( await fixture.store.inspectLock( 'chat' ) ).toEqual( { state: 'none' } );
+		expect( await claimsIn( fixture ) ).toEqual( [] );
+	} );
+
+	it( 'leaves a lock that replaced the recovered one between the record and the release, with the record kept once', async () => {
+		const fixture = await recoveryFixture();
+		const { raw } = await fixture.deadTurn();
+		let replacement: string | undefined;
+		const replacing = {
+			...fixture.store,
+			recordRecovery: async ( ...args: Parameters< typeof fixture.store.recordRecovery > ) => {
+				const recorded = await fixture.store.recordRecovery( ...args );
+				// Something else takes the conversation once the record is on disk.
+				await rm( fixture.lockFile );
+				await fixture.store.lockRun( 'chat', {
+					owner: { pid: 5555, start: 'live-owner' },
+					runId: 'next-run',
+					turnId: 'next-turn',
+					connection: { id: 'connection', revision: 1 },
+					workspace: {
+						siteId: 'site',
+						workingDirectory: fixture.site,
+						configDirectory: fixture.config,
+					},
+				} );
+				replacement = await readFile( fixture.lockFile, 'utf8' );
+				return recorded;
+			},
+		};
+		expect( await fixture.recover( {}, replacing ) ).toEqual( {
+			status: 'blocked',
+			reason: 'lock-changed',
+			...ids,
+		} );
+		expect( replacement ).not.toBe( raw );
+		expect( await readFile( fixture.lockFile, 'utf8' ) ).toBe( replacement );
+		const events = ( await fixture.store.readJournals( 'chat' ) ).flat();
+		expect( events.filter( ( event ) => event.type === 'turn.recovered' ) ).toEqual( [
+			expect.objectContaining( { lock: claudeLockDigest( JSON.parse( raw ).token ) } ),
+		] );
+		expect( await claimsIn( fixture ) ).toEqual( [] );
+	} );
+
+	it( 'takes over nothing when the owner moved its lock to a later stage after it was inspected', async () => {
+		const fixture = await recoveryFixture();
+		const { lock } = await fixture.deadTurn( { stage: 'locked' } );
+		let advanced: string | undefined;
+		fixture.seams.checkIdentity.mockImplementationOnce( async () => {
+			// The owner, still running with the same token, starts its native process.
+			await lock.update( {
+				stage: 'starting',
+				session: { nativeSessionId: randomUUID(), resume: false },
+			} );
+			advanced = await readFile( fixture.lockFile, 'utf8' );
+			return 'gone';
+		} );
+		expect( await fixture.recover() ).toEqual( {
+			status: 'blocked',
+			reason: 'lock-changed',
+			...ids,
+		} );
+		expect( await readFile( fixture.lockFile, 'utf8' ) ).toBe( advanced );
+		expect( await fixture.store.readJournals( 'chat' ) ).toEqual( [] );
+		expect( await claimsIn( fixture ) ).toEqual( [] );
+	} );
+} );
+
+describe( 'deleting a conversation', () => {
+	it( 'removes its leftover lock and claim files, but no claim whose process may still run, and nothing of another conversation', async () => {
+		const fixture = await recoveryFixture();
+		const { raw } = await fixture.deadTurn();
+		const directory = path.dirname( fixture.lockFile );
+		const lockName = path.basename( fixture.lockFile );
+		const digest = claudeLockDigest( JSON.parse( raw ).token ).slice( 0, 32 );
+		const claim = ( generation: number ) => `${ lockName }.${ digest }.claim-${ generation }`;
+		const other = `${ lockName.replace(
+			/^[0-9a-f]{64}/,
+			'f'.repeat( 64 )
+		) }.${ randomUUID() }.tmp`;
+		const files: Record< string, string > = {
+			[ `${ lockName }.${ randomUUID() }.tmp` ]: '{"version":2',
+			[ claim( 0 ) ]: JSON.stringify( { version: 1, claimant: { pid: 1, start: 'ended' } } ),
+			[ claim( 1 ) ]: JSON.stringify( { version: 1, claimant: { pid: 2, start: 'running' } } ),
+			[ claim( 2 ) ]: '',
+			[ other ]: 'another conversation',
+		};
+		await rm( fixture.lockFile );
+		for ( const [ name, content ] of Object.entries( files ) )
+			await writeFile( path.join( directory, name ), content );
+		const release = await fixture.store.lockTurn( 'chat' );
+		await fixture.store.clearConversation(
+			'chat',
+			async () => {},
+			async ( identity ) => ( identity.start === 'ended' ? 'gone' : 'alive' )
+		);
+		await release();
+		expect( ( await readdir( directory ) ).sort() ).toEqual(
+			[ claim( 1 ), claim( 2 ), other ].sort()
+		);
 	} );
 } );

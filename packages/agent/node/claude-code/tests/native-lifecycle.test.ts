@@ -16,6 +16,7 @@ import { inspectClaudeExecutable, trustedPowerShellPath } from '../discovery';
 import { recoverClaudeRun } from '../recovery';
 import { createNativeSessionStore } from '../sessions';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
+import type { ClaudeRecoveryBlockedReason } from '@studio/agent/protocol/claude-code';
 import type { ProcessIdentity } from '@studio/common/lib/owned-process';
 
 const executable = process.env.STUDIO_TEST_NATIVE_CLAUDE_LIFECYCLE_EXE;
@@ -277,22 +278,22 @@ function lines( stream: NodeJS.ReadableStream ): () => Promise< string > {
 		} );
 }
 
-// Recovery with the real OS checks, through the same calls Studio makes. It
-// is retried while a process it waits for may still be ending, such as a
-// console host that outlives its last client by moments; a blocked recovery
-// changes nothing.
+// Recovery with the real OS checks, through the same calls Studio makes. It is
+// retried only while it reports one of `waitingFor`, the processes the test
+// waits to see end, such as a console host that outlives its last client by
+// moments. Any other reason, an unverifiable listing included, is returned at
+// once rather than retried away. A blocked recovery changes nothing.
 async function recoverWithin(
 	store: ReturnType< typeof createNativeSessionStore >,
 	binding: Parameters< typeof recoverClaudeRun >[ 1 ],
-	ms: number
+	ms: number,
+	waitingFor: readonly ClaudeRecoveryBlockedReason[]
 ) {
 	const deadline = Date.now() + ms;
 	let result = await recoverClaudeRun( store, binding );
 	while (
 		result.status === 'blocked' &&
-		[ 'native-alive', 'guardian-alive', 'descendants-alive', 'descendants-unverifiable' ].includes(
-			result.reason
-		) &&
+		waitingFor.includes( result.reason ) &&
 		Date.now() < deadline
 	) {
 		await new Promise( ( resolve ) => setTimeout( resolve, 500 ) );
@@ -414,7 +415,13 @@ describe( 'recovery once the owner is gone (Node test processes)', () => {
 			runner.kill( 'SIGKILL' );
 			await exited;
 			expect( await goneWithin( descendants, 20_000 ) ).toEqual( [] );
-			expect( await recoverWithin( store, binding, 15_000 ) ).toEqual( {
+			expect(
+				await recoverWithin( store, binding, 15_000, [
+					'native-alive',
+					'guardian-alive',
+					'descendants-alive',
+				] )
+			).toEqual( {
 				status: 'recovered',
 				runId: 'run',
 				turnId: 'turn',
@@ -509,9 +516,12 @@ describe( 'recovery once the owner is gone (Node test processes)', () => {
 			} );
 			await held.update( { stage: 'owned', processes: { native, guardian: deadGuardian } } );
 			const locked = await store.inspectLock( 'chat' );
+			// What a live descendant of a dead native process is reported as here.
+			const live: ClaudeRecoveryBlockedReason =
+				process.platform === 'win32' ? 'descendants-alive' : 'descendants-unverifiable';
 			expect( await recoverClaudeRun( store, binding ) ).toEqual( {
 				status: 'blocked',
-				reason: process.platform === 'win32' ? 'descendants-alive' : 'descendants-unverifiable',
+				reason: live,
 				runId: 'run',
 				turnId: 'turn',
 			} );
@@ -520,7 +530,7 @@ describe( 'recovery once the owner is gone (Node test processes)', () => {
 			shutDown = true;
 			expect( await owned.shutdown( { graceMs: 0 } ) ).toBe( true );
 			expect( await goneWithin( [ late ], 10_000 ) ).toEqual( [] );
-			expect( await recoverWithin( store, binding, 15_000 ) ).toMatchObject( {
+			expect( await recoverWithin( store, binding, 15_000, [ live ] ) ).toMatchObject( {
 				status: 'recovered',
 			} );
 			expect( await checkProcessIdentity( sentinelIdentity ) ).toBe( 'alive' );

@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { mkdtemp, readFile, realpath, rm } from 'fs/promises';
+import { mkdtemp, readFile, readdir, realpath, rm } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +13,11 @@ const gates = vi.hoisted( () => ( {
 	rewriteStarted: undefined as undefined | ( () => void ),
 	// While set, a rewrite waits for this before writing.
 	rewrite: undefined as undefined | Promise< unknown >,
+	// While set, the filesystem refuses hard links, as FAT, exFAT and some shares do.
+	linkless: false,
+	// Every file opened exclusively, and every one synced through its handle.
+	exclusive: [] as string[],
+	synced: [] as string[],
 } ) );
 
 vi.mock( 'atomically', async ( importOriginal ) => {
@@ -39,7 +44,23 @@ vi.mock( 'fs/promises', async ( importOriginal ) => {
 			} );
 		return actual.unlink( file );
 	};
-	return { ...actual, default: { ...actual, unlink }, unlink };
+	const link = async ( ...args: Parameters< typeof actual.link > ) => {
+		if ( gates.linkless )
+			throw Object.assign( new Error( 'operation not permitted, link' ), { code: 'EPERM' } );
+		return actual.link( ...args );
+	};
+	const open = async ( ...args: Parameters< typeof actual.open > ) => {
+		const handle = await actual.open( ...args );
+		const file = String( args[ 0 ] );
+		if ( args[ 1 ] === 'wx' ) gates.exclusive.push( file );
+		const sync = handle.sync.bind( handle );
+		handle.sync = async () => {
+			gates.synced.push( file );
+			return sync();
+		};
+		return handle;
+	};
+	return { ...actual, default: { ...actual, unlink, link, open }, unlink, link, open };
 } );
 
 const dirs: string[] = [];
@@ -47,6 +68,9 @@ afterEach( async () => {
 	gates.unlink = false;
 	gates.rewrite = undefined;
 	gates.rewriteStarted = undefined;
+	gates.linkless = false;
+	gates.exclusive = [];
+	gates.synced = [];
 	await Promise.all(
 		dirs.splice( 0 ).map( ( dir ) => rm( dir, { recursive: true, force: true } ) )
 	);
@@ -143,5 +167,42 @@ describe( 'a run lock’s updates and its release', () => {
 		await expect( updated ).resolves.toBeUndefined();
 		await expect( released ).resolves.toBeUndefined();
 		expect( await store.inspectLock( 'chat' ) ).toEqual( { state: 'none' } );
+	} );
+} );
+
+describe( 'a lock and a claim on a filesystem without hard links', () => {
+	it( 'creates the lock exclusively, then writes and syncs it through that same handle', async () => {
+		const { dir, file, store } = await fixture();
+		gates.linkless = true;
+		const lock = await store.lockRun( 'chat', run( dir ) );
+		expect( JSON.parse( await readFile( file, 'utf8' ) ) ).toMatchObject( {
+			purpose: 'run',
+			stage: 'locked',
+		} );
+		expect( gates.exclusive ).toContain( file );
+		expect( gates.synced ).toContain( file );
+		expect( await readdir( dir ) ).toEqual( [ path.basename( file ) ] );
+		await expect( store.lockRun( 'chat', run( dir ) ) ).rejects.toMatchObject( {
+			code: 'EEXIST',
+		} );
+		await lock.release();
+	} );
+
+	it( 'creates a recovery claim the same way', async () => {
+		const { dir, file, store } = await fixture();
+		const lock = await store.lockRun( 'chat', run( dir ) );
+		const { token } = JSON.parse( await readFile( file, 'utf8' ) ) as { token: string };
+		gates.linkless = true;
+		const claimant = { pid: 77, start: 'claimant' };
+		expect(
+			await store.claimRecovery( 'chat', token, claimant, async () => 'gone' )
+		).toMatchObject( { state: 'claimed' } );
+		const [ claim ] = ( await readdir( dir ) ).filter( ( name ) => name.includes( '.claim-' ) );
+		expect( JSON.parse( await readFile( path.join( dir, claim ), 'utf8' ) ) ).toEqual( {
+			version: 1,
+			claimant,
+		} );
+		expect( gates.synced ).toContain( path.join( dir, claim ) );
+		await lock.release();
 	} );
 } );

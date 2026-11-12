@@ -27,6 +27,7 @@ const BY_HAND: ClaudeRecoveryBlockedReason[] = [
 	'descendants-unverifiable',
 	'binding-mismatch',
 	'native-session-mismatch',
+	'recovery-claim-unreadable',
 	'recovery-failed',
 ];
 

@@ -34,6 +34,7 @@ Follow this procedure when one of these does not go away once every Studio app i
 | `binding-mismatch`, `native-session-mismatch` | The lock does not match the chat's connection, workspace or Claude Code session. The chat cannot continue; start a new chat, and unlock this one only to clear it. |
 | `lock-not-a-run` | A deletion holds the lock, and no Studio app is deleting the chat: the deletion was interrupted. A deletion lock records no process. |
 | `deletion-pending` | Deleting the chat again reports that it is locked. |
+| `recovery-claim-unreadable` | A claim on the chat's recovery is empty or names no process. An interrupted claim creation on a filesystem without hard links leaves it so (see [Leftover files](#leftover-files)). |
 | `recovery-failed` | Recording the recovery or releasing the lock keeps failing. A recovery that recorded the interrupted turn before failing records nothing more when it is tried again. |
 
 ## 1. Find the chat's files
@@ -206,8 +207,8 @@ For an interrupted deletion (`lock-not-a-run`, or `deletion-pending` with the ch
 ## Leftover files
 
 - **`.tmp` files.** An interrupted lock or claim creation leaves `<hash>.json.lock.<random>.tmp`, or a claim's own `.tmp` file. Nothing reads them. Once every Studio app is closed you can delete them; deleting the chat removes them too.
-- **Claim files.** A recovery claims the lock it is recovering with `<hash>.json.lock.<32 hex>.claim-<n>`, which names the recovering process. A claim is live while that process runs: `recovery-in-progress` until it ends. A completed recovery removes its claim, and a later recovery takes over a claim whose process has provably ended. Studio never removes a claim whose process is running or cannot be checked. Once every Studio app is closed, move a stale claim aside as you did the lock, or delete the chat, which removes claims whose process has ended.
-- **Filesystems without hard links** (FAT and exFAT, some network shares). There Studio creates the lock and its claims with an exclusive create and then writes and syncs the content through the same handle. A crash between the create and the write leaves an empty lock, reported as `lock-unreadable`, or an empty claim. Follow this procedure for an empty lock; move an empty claim aside once every Studio app is closed. On other filesystems the content is written and synced under a temporary name and linked into place, so a crash leaves only a `.tmp` file.
+- **Claim files.** A recovery claims the lock it is recovering with `<hash>.json.lock.<32 hex>.claim-<n>`, which names the recovering process. A claim is live while that process runs: `recovery-in-progress` until it ends. A completed recovery removes its claim. A claim whose process has provably ended needs nothing from you: the next recovery takes it over, and deleting the chat removes it. Studio never removes a claim whose process is running or cannot be checked.
+- **Filesystems without hard links** (FAT and exFAT, some network shares). There Studio creates the lock and its claims with an exclusive create and then writes and syncs the content through the same handle. A crash between the create and the write leaves an empty lock, reported as `lock-unreadable`, or an empty claim, reported as `recovery-claim-unreadable`. Follow this procedure for an empty lock. Move an empty claim aside once every Studio app is closed, then run `recover` again; deleting the chat leaves an unreadable claim in place, since Studio cannot tell whose it is. On other filesystems the content is written and synced under a temporary name and linked into place, so a crash leaves only a `.tmp` file.
 
 ## 7. Confirm
 

@@ -16,6 +16,7 @@ import {
 } from 'fs/promises';
 import path from 'path';
 import { createInterface } from 'readline';
+import { checkProcessIdentity } from '@studio/common/lib/owned-process';
 import { writeFile as atomicWriteFile } from 'atomically';
 import { resolveClaudeResume } from '../backends/resume';
 import type { ClaudeTranscriptCandidate } from '../backends/resume';
@@ -59,9 +60,14 @@ export interface ClaudeRunLockRecord {
 	/** The conversation's native workspace binding the turn ran with. */
 	workspace: { siteId: string | null; workingDirectory: string; configDirectory: string };
 	/**
-	 * `locked`: no native process can have started. `starting`, written before
-	 * the SDK starts: one may have, for `session`. `owned`, written once Studio
-	 * confirmed owning its tree and before any prompt: `processes`.
+	 * `locked`: Studio has not asked the SDK to start the turn's native process,
+	 * so no process has the conversation's session or a prompt. Studio may
+	 * already have run the native executable, outside any job, to read its
+	 * version and sign-in status: a command that reads and exits, bounded by a
+	 * timeout its caller enforces, which can outlive an owner that dies while it
+	 * runs. `starting`, written before the SDK starts: the turn's native process
+	 * may have started, for `session`. `owned`, written once Studio confirmed
+	 * owning its tree and before any prompt: `processes`.
 	 */
 	stage: 'locked' | 'starting' | 'owned';
 	session?: { nativeSessionId: string; resume: boolean };
@@ -200,31 +206,57 @@ export function claudeLockDigest( token: string ): string {
 	return createHash( 'sha256' ).update( token ).digest( 'hex' );
 }
 
+/** The outcome of claiming a lock's recovery. */
+export type ClaudeRecoveryClaim =
+	| { state: 'claimed'; release(): Promise< void > }
+	| { state: 'held' }
+	| { state: 'unreadable' };
+
+// The process a recovery claim names; `released` when the claim is no longer
+// there; `unreadable` for a claim that is empty, cannot be read or names none.
+async function readClaimant(
+	file: string
+): Promise< ProcessIdentity | 'released' | 'unreadable' > {
+	let held: unknown;
+	try {
+		held = JSON.parse( await readFile( file, 'utf8' ) );
+	} catch ( error ) {
+		return ( error as NodeJS.ErrnoException ).code === 'ENOENT' ? 'released' : 'unreadable';
+	}
+	return ( isRecord( held ) && identityOf( held.claimant ) ) || 'unreadable';
+}
+
 // Filesystems without hard links refuse `link` with one of these.
 const LINKLESS = new Set( [ 'EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EISDIR', 'EINVAL' ] );
 
-/**
- * Creates `file` with `content` only if it does not exist, and complete or not
- * at all: the content is written and synced under a unique name, then linked
- * into place, which fails if the file exists. A crash leaves at most that
- * unique file behind. Where hard links are unavailable it falls back to an
- * exclusive create, after which a crash can leave the file empty, which
- * nothing reads as a lock record.
- */
-async function createExclusive( file: string, content: string ): Promise< void > {
-	const temporary = `${ file }.${ randomUUID() }.tmp`;
-	const handle = await open( temporary, 'wx', 0o600 );
+// Creates `file` exclusively and writes and syncs `content` through that handle.
+async function writeExclusive( file: string, content: string ): Promise< void > {
+	const handle = await open( file, 'wx', 0o600 );
 	try {
 		await handle.writeFile( content );
 		await handle.sync();
 	} finally {
 		await handle.close();
 	}
+}
+
+/**
+ * Creates `file` with `content` only if it does not exist, and complete or not
+ * at all: the content is written and synced under a unique name, then linked
+ * into place, which fails if the file exists. A crash leaves at most that
+ * unique `.tmp` file behind. Where hard links are unavailable it falls back to
+ * an exclusive create, written and synced through the same handle, after which
+ * a crash can leave the file empty: an unreadable lock or claim, which nothing
+ * takes for one anyone holds.
+ */
+async function createExclusive( file: string, content: string ): Promise< void > {
+	const temporary = `${ file }.${ randomUUID() }.tmp`;
+	await writeExclusive( temporary, content );
 	try {
 		await link( temporary, file );
 	} catch ( error ) {
 		if ( ! LINKLESS.has( ( error as NodeJS.ErrnoException ).code ?? '' ) ) throw error;
-		await writeFile( file, content, { flag: 'wx', mode: 0o600 } );
+		await writeExclusive( file, content );
 	} finally {
 		await unlink( temporary ).catch( () => {} );
 	}
@@ -422,9 +454,19 @@ export function createNativeSessionStore( root: string ) {
 				return ( error as NodeJS.ErrnoException ).code !== 'ENOENT';
 			}
 		},
+		/**
+		 * Removes the conversation's files while its deletion holds the lock: its
+		 * native session record, its journals, and what interrupted lock and
+		 * claim creations left. A recovery claim goes only once the process it
+		 * names is provably gone; one that may still run, or cannot be read,
+		 * stays. A lock set aside by hand (`.manual-…`) stays too.
+		 */
 		async clearConversation(
 			conversationId: string,
-			removeSession: () => Promise< void >
+			removeSession: () => Promise< void >,
+			checkClaimant: (
+				identity: ProcessIdentity
+			) => Promise< ProcessIdentityCheck > = checkProcessIdentity
 		): Promise< void > {
 			const marker = deletionPath( conversationId );
 			await writeFile( marker, '', { flag: 'a', mode: 0o600 } );
@@ -435,6 +477,27 @@ export function createNativeSessionStore( root: string ) {
 					orderPath( conversationId ),
 					...names.map( ( name ) => path.join( root, name ) ),
 				].map( ( file ) => rm( file, { force: true } ) )
+			);
+			const lockName = path.basename( lockPath( conversationId ) );
+			const leftovers = ( await readdir( root ) ).filter( ( name ) =>
+				name.startsWith( `${ lockName }.` )
+			);
+			const UUID_TMP = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.tmp';
+			const created = new RegExp( `^(?:[0-9a-f]{32}\\.claim-\\d{1,6}\\.)?${ UUID_TMP }$`, 'i' );
+			const claim = /^[0-9a-f]{32}\.claim-\d{1,6}$/;
+			await Promise.all(
+				leftovers.map( async ( name ) => {
+					const rest = name.slice( lockName.length + 1 );
+					const file = path.join( root, name );
+					if ( created.test( rest ) ) return rm( file, { force: true } );
+					if ( ! claim.test( rest ) ) return;
+					const claimant = await readClaimant( file );
+					if (
+						typeof claimant === 'object' &&
+						( await checkClaimant( claimant ).catch( () => 'unknown' ) ) === 'gone'
+					)
+						await rm( file, { force: true } );
+				} )
 			);
 			await removeSession();
 			await rm( marker, { force: true } );
@@ -656,15 +719,17 @@ export function createNativeSessionStore( root: string ) {
 		/**
 		 * Claims the recovery of the lock with `token`, for `claimant`. One claim
 		 * per generation is created exclusively; a later generation is taken only
-		 * when the claimant of the latest one is gone. Undefined when another
-		 * claim is held, or its claimant is alive or cannot be read.
+		 * when the claimant of the latest one is gone. `held` when another claim
+		 * is held, or its claimant is alive or cannot be checked; `unreadable`
+		 * when the latest claim is empty or names no claimant, as one whose
+		 * creation was interrupted on a filesystem without hard links does.
 		 */
 		async claimRecovery(
 			conversationId: string,
 			token: string,
 			claimant: ProcessIdentity,
 			check: ( identity: ProcessIdentity ) => Promise< ProcessIdentityCheck >
-		): Promise< { release(): Promise< void > } | undefined > {
+		): Promise< ClaudeRecoveryClaim > {
 			const prefix = claimPrefix( conversationId, token );
 			const generations = ( await readdir( root ) ).flatMap( ( name ) => {
 				const generation = name.startsWith( prefix ) ? name.slice( prefix.length ) : '';
@@ -673,14 +738,11 @@ export function createNativeSessionStore( root: string ) {
 			let next = 0;
 			if ( generations.length ) {
 				const latest = Math.max( ...generations );
-				let held: unknown;
-				try {
-					held = JSON.parse( await readFile( path.join( root, prefix + latest ), 'utf8' ) );
-				} catch {
-					return undefined;
-				}
-				const holder = isRecord( held ) ? identityOf( held.claimant ) : undefined;
-				if ( ! holder || ( await check( holder ) ) !== 'gone' ) return undefined;
+				const holder = await readClaimant( path.join( root, prefix + latest ) );
+				if ( holder === 'unreadable' ) return { state: 'unreadable' };
+				// A claim released since it was listed: its recovery has just ended.
+				if ( holder === 'released' || ( await check( holder ) ) !== 'gone' )
+					return { state: 'held' };
 				next = latest + 1;
 			}
 			try {
@@ -689,10 +751,11 @@ export function createNativeSessionStore( root: string ) {
 					JSON.stringify( { version: 1, claimant } )
 				);
 			} catch ( error ) {
-				if ( ( error as NodeJS.ErrnoException ).code === 'EEXIST' ) return undefined;
+				if ( ( error as NodeJS.ErrnoException ).code === 'EEXIST' ) return { state: 'held' };
 				throw error;
 			}
 			return {
+				state: 'claimed',
 				async release() {
 					await Promise.all(
 						[ ...generations, next ].map( ( generation ) =>
