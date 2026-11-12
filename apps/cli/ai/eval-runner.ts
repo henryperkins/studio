@@ -46,6 +46,7 @@ import { addConnectedWpcomSite } from '@studio/common/lib/connected-sites';
 import { portFinder } from '@studio/common/lib/port-finder';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { SITE_FILE_ACCESS_SITE_DIRECTORY } from '@studio/common/lib/site-file-access';
+import { fetchSyncableSites } from '@studio/common/lib/sync/sync-api';
 import { getConfigDirectory, getSharedConfigPath } from '@studio/common/lib/well-known-paths';
 import {
 	resolveAiEnvironment,
@@ -557,6 +558,7 @@ interface EvalRefusal {
 
 type EvalSetupRefusalCode =
 	| 'staging-not-designated'
+	| 'staging-not-confirmed'
 	| 'staging-needs-active-site'
 	| 'history-needs-provider'
 	| 'fixture-missing'
@@ -588,26 +590,60 @@ const STAGING_SITE_ID_ENV = 'STUDIO_EVAL_STAGING_SITE_ID';
 const STAGING_SITE_URL_ENV = 'STUDIO_EVAL_STAGING_SITE_URL';
 
 /**
- * The WordPress.com site a `remote: staging` case may change: one the person
- * running the eval designated as disposable staging, never one a config names.
+ * The WordPress.com site the person running the eval named for this run as the
+ * disposable staging site a `remote: staging` case may change, never one a
+ * config names. It says which site, not that the site is staging.
  */
-function designatedStagingSite(): Omit< SyncSite, 'localSiteId' > | null {
+function designatedStagingSite(): { id: number; url: string } | null {
 	const id = Number( process.env[ STAGING_SITE_ID_ENV ] );
 	const url = process.env[ STAGING_SITE_URL_ENV ]?.trim();
 	if ( ! Number.isSafeInteger( id ) || id <= 0 || ! url || ! /^https:\/\//.test( url ) ) {
 		return null;
 	}
-	return {
-		id,
-		name: 'Designated staging site',
-		url,
-		isStaging: true,
-		isPressable: false,
-		environmentType: 'staging',
-		syncSupport: 'already-connected',
-		lastPullTimestamp: null,
-		lastPushTimestamp: null,
-	};
+	return { id, url };
+}
+
+const comparableSiteUrl = ( url: string ) => {
+	try {
+		const parsed = new URL( url );
+		return `${ parsed.origin }${ parsed.pathname.replace( /\/+$/, '' ) }`.toLowerCase();
+	} catch {
+		return null;
+	}
+};
+
+/**
+ * The designated site as WordPress.com lists it among the account's sites,
+ * when it lists it at that address and as a staging site: whether the site is
+ * staging comes from WordPress.com, never from the environment. A read only.
+ */
+async function confirmStagingSite( designated: {
+	id: number;
+	url: string;
+} ): Promise< { site: Omit< SyncSite, 'localSiteId' > } | { problem: string } > {
+	const login = await readAuthToken();
+	if ( ! login ) {
+		return { problem: 'no WordPress.com login to ask WordPress.com with' };
+	}
+	let sites: SyncSite[];
+	try {
+		sites = await fetchSyncableSites( login.accessToken );
+	} catch {
+		return { problem: 'WordPress.com could not list the account’s sites' };
+	}
+	const listed = sites.find( ( site ) => site.id === designated.id );
+	if ( ! listed ) {
+		return { problem: 'the account has no site with that id' };
+	}
+	if ( ! listed.isStaging ) {
+		return { problem: 'WordPress.com does not list that site as a staging site' };
+	}
+	const address = comparableSiteUrl( designated.url );
+	if ( ! address || comparableSiteUrl( listed.url ) !== address ) {
+		return { problem: 'WordPress.com lists that site at another address' };
+	}
+	const { localSiteId: _unused, ...site } = listed;
+	return { site: { ...site, syncSupport: 'already-connected' } };
 }
 
 interface UiEvents {
@@ -662,13 +698,21 @@ export async function runEval( input: EvalRunnerInput ) {
 
 	let seed = input.seed;
 	if ( input.remote === 'staging' ) {
-		const staging = designatedStagingSite();
-		if ( ! staging ) {
+		const designated = designatedStagingSite();
+		if ( ! designated ) {
 			return providerRefusal( {
 				code: 'staging-not-designated',
-				message: `A remote: staging case changes a real WordPress.com site, so it runs only against a disposable staging site you designate: set ${ STAGING_SITE_ID_ENV } and ${ STAGING_SITE_URL_ENV } (https).`,
+				message: `A remote: staging case changes a real WordPress.com site, so it runs only against a disposable staging site you name for this run: set ${ STAGING_SITE_ID_ENV } and ${ STAGING_SITE_URL_ENV } (https) on the command that runs it.`,
 			} );
 		}
+		const confirmed = await confirmStagingSite( designated );
+		if ( 'problem' in confirmed ) {
+			return providerRefusal( {
+				code: 'staging-not-confirmed',
+				message: `The designated staging site was not confirmed by WordPress.com: ${ confirmed.problem }.`,
+			} );
+		}
+		const staging = confirmed.site;
 		if ( ! seed?.activeSite ) {
 			return providerRefusal( {
 				code: 'staging-needs-active-site',
@@ -1068,7 +1112,7 @@ export async function runEval( input: EvalRunnerInput ) {
 
 		return {
 			...( providerRoute ? { providerRoute } : {} ),
-			...( remote ? { remoteCalls } : {} ),
+			...( remote === 'mock' ? { remoteCalls } : {} ),
 			...( wpcomGuard
 				? {
 						remoteGuard: {

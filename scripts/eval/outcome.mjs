@@ -846,12 +846,13 @@ const REMOTE_TOOL = {
 	'preview-delete': 'preview_delete',
 };
 
-// The remote operation `vars.operation` ran, against `vars.target` when set:
-// recorded by the mock (`remote: mock`), or, on a designated staging site,
-// judged on the tool's own result.
+// The remote operation `vars.operation` ran, against `vars.target` when set,
+// judged by the mode the case declares: under `remote: mock`, recorded by the
+// mock; under `remote: staging`, on a designated staging site, by the tool's
+// own result.
 export const remoteOperationRan = check( ( d, vars ) => {
-	if ( Array.isArray( d.remoteCalls ) ) {
-		const matching = d.remoteCalls.filter(
+	if ( vars.remote === 'mock' ) {
+		const matching = ( d.remoteCalls || [] ).filter(
 			( c ) =>
 				c.operation === vars.operation &&
 				( ! vars.target || ( c.target || '' ).includes( vars.target ) )
@@ -864,6 +865,8 @@ export const remoteOperationRan = check( ( d, vars ) => {
 					}: ${ JSON.stringify( d.remoteCalls ) }`
 			  );
 	}
+	if ( vars.remote !== 'staging' )
+		return fail( 'the case declares no remote mode: it needs remote: mock or remote: staging' );
 	const ran = ( d.toolResults || [] ).filter(
 		( r ) => r.toolName === REMOTE_TOOL[ vars.operation ] && ! r.isError
 	);
@@ -873,8 +876,8 @@ export const remoteOperationRan = check( ( d, vars ) => {
 } );
 
 // Under `remote: mock`, no remote operation was even attempted.
-export const noRemoteOperation = check( ( d ) => {
-	if ( ! Array.isArray( d.remoteCalls ) )
+export const noRemoteOperation = check( ( d, vars ) => {
+	if ( vars.remote !== 'mock' || ! Array.isArray( d.remoteCalls ) )
 		return fail( 'the case did not run with remote: mock, so nothing records remote operations' );
 	return d.remoteCalls.length
 		? fail( `remote operations ran: ${ JSON.stringify( d.remoteCalls ) }` )

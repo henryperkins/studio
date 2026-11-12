@@ -16,7 +16,14 @@ import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections
 // Test values only; nothing here reaches a model provider or a site.
 const CONNECTION_ID = '7c1e8a41-6d3b-4c55-9b8e-3f2d7c1eb2f0';
 const API_KEY = 'sk-proj-TESTONLY_eval_runner_bbbbbbbbbbbbbbbbbbbbbb';
-const WPCOM_LOGIN = { accessToken: 'test-wpcom-token', id: 1, displayName: 'Test', email: '' };
+const WPCOM_LOGIN = {
+	accessToken: 'test-wpcom-token',
+	expiresIn: 3600,
+	expirationTime: Date.now() + 3_600_000,
+	id: 1,
+	displayName: 'Test',
+	email: '',
+};
 
 const paths = vi.hoisted( () => ( { root: '' } ) );
 
@@ -46,6 +53,26 @@ const sites = vi.hoisted( () => ( {
 } ) );
 vi.mock( 'cli/commands/site/create', () => ( { runCommand: sites.create } ) );
 vi.mock( 'cli/commands/site/delete', () => ( { runCommand: sites.remove } ) );
+// The account's WordPress.com sites as the sites endpoint lists them, and the
+// connections a case seeds: nothing here reaches WordPress.com.
+const wpcom = vi.hoisted( () => ( {
+	sites: vi.fn(),
+	connected: [] as Array< { localSiteId: string; site: Record< string, unknown > } >,
+} ) );
+vi.mock( '@studio/common/lib/sync/sync-api', async ( importOriginal ) => ( {
+	...( await importOriginal< typeof import('@studio/common/lib/sync/sync-api') >() ),
+	fetchSyncableSites: wpcom.sites,
+} ) );
+vi.mock( '@studio/common/lib/connected-sites', () => ( {
+	addConnectedWpcomSite: async ( localSiteId: string, site: Record< string, unknown > ) => {
+		wpcom.connected.push( { localSiteId, site } );
+		return [];
+	},
+} ) );
+vi.mock( 'cli/lib/cli-config/sites', () => ( {
+	getSiteByFolder: async ( folder: string ) => ( { id: 'seeded-site', path: folder } ),
+} ) );
+
 vi.mock( 'cli/lib/cli-config/core', () => ( {
 	readCliConfig: async () => ( { sites: [], snapshots: [] } ),
 	saveCliConfig: async () => undefined,
@@ -260,6 +287,8 @@ describe( 'eval runner provider selection', () => {
 		agent.created = 0;
 		imageService.configured = false;
 		sites.create.mockReset().mockImplementation( async () => undefined );
+		wpcom.sites.mockReset().mockResolvedValue( [] );
+		wpcom.connected = [];
 		sites.remove.mockReset().mockImplementation( async () => undefined );
 		// The global provider is OpenAI with a saved key.
 		legacy.resolveInitialAiProvider.mockResolvedValue( 'openai-api-key' );
@@ -688,6 +717,75 @@ describe( 'eval runner provider selection', () => {
 			} );
 			expect( agent.turns ).toEqual( [] );
 			expect( sites.create ).not.toHaveBeenCalled();
+			expect( wpcom.sites ).not.toHaveBeenCalled();
+		} );
+
+		describe( 'a designated staging site', () => {
+			const designated = {
+				STUDIO_EVAL_STAGING_SITE_ID: '4242',
+				STUDIO_EVAL_STAGING_SITE_URL: 'https://staging-4242.wpcomstaging.com',
+			};
+			const listed = ( overrides: Record< string, unknown > = {} ) => ( {
+				id: 4242,
+				localSiteId: '',
+				name: 'Parity staging',
+				url: 'https://staging-4242.wpcomstaging.com/',
+				isStaging: true,
+				isPressable: false,
+				environmentType: 'staging',
+				syncSupport: 'syncable',
+				lastPullTimestamp: null,
+				lastPushTimestamp: null,
+				...overrides,
+			} );
+			const stagingCase = () =>
+				input( { remote: 'staging', seed: { activeSite: { name: 'Parity Staging Source' } } } );
+
+			it.each( [
+				[ 'is not among the account’s sites', [ listed( { id: 9 } ) ] ],
+				[ 'WordPress.com does not list as a staging site', [ listed( { isStaging: false } ) ] ],
+				[ 'has another address', [ listed( { url: 'https://myprod.wordpress.com' } ) ] ],
+			] )( 'is refused when the site %s, before any site or turn', async ( _name, sitesList ) => {
+				Object.assign( process.env, designated );
+				wpcom.sites.mockResolvedValue( sitesList );
+				expect( await runEval( stagingCase() ) ).toMatchObject( {
+					success: false,
+					refusal: { code: 'staging-not-confirmed' },
+				} );
+				expect( wpcom.sites ).toHaveBeenCalledWith( 'test-wpcom-token' );
+				expect( agent.turns ).toEqual( [] );
+				expect( sites.create ).not.toHaveBeenCalled();
+			} );
+
+			it( 'is refused when WordPress.com can’t be asked', async () => {
+				Object.assign( process.env, designated );
+				wpcom.sites.mockRejectedValue( new Error( 'offline' ) );
+				expect( await runEval( stagingCase() ) ).toMatchObject( {
+					refusal: { code: 'staging-not-confirmed' },
+				} );
+				expect( agent.turns ).toEqual( [] );
+			} );
+
+			it( 'runs connected to the site as WordPress.com lists it, with no record of mocked calls', async () => {
+				Object.assign( process.env, designated );
+				wpcom.sites.mockResolvedValue( [ listed() ] );
+				agent.behavior = { replyProvider: 'studio-wpcom' };
+				const result = await runEval( stagingCase() );
+				expect( result.success ).toBe( true );
+				expect( result ).not.toHaveProperty( 'remoteCalls' );
+				expect( result ).not.toHaveProperty( 'remoteGuard' );
+				expect( wpcom.connected ).toEqual( [
+					{
+						localSiteId: 'seeded-site',
+						site: expect.objectContaining( {
+							id: 4242,
+							isStaging: true,
+							url: 'https://staging-4242.wpcomstaging.com/',
+							syncSupport: 'already-connected',
+						} ),
+					},
+				] );
+			} );
 		} );
 
 		it( 'refuses imageService: required while the image service is off', async () => {

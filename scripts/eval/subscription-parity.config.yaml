@@ -599,8 +599,11 @@ tests:
 
   # --- staging: a designated disposable staging site only --------------------
   # Refused (staging-not-designated) unless STUDIO_EVAL_STAGING_SITE_ID and
-  # STUDIO_EVAL_STAGING_SITE_URL name a WordPress.com staging site you have set
-  # aside to be overwritten. Leave these out of automatic runs:
+  # STUDIO_EVAL_STAGING_SITE_URL, set on the command that runs it, name a
+  # WordPress.com staging site you have set aside to be overwritten, and
+  # refused (staging-not-confirmed) unless WordPress.com lists that site, at
+  # that address, as a staging site of your account. Leave these out of
+  # automatic runs:
   #   npm run eval:parity -- --filter-pattern "^parity"
 
   - description: "staging: pushes the active site to the designated disposable staging site"

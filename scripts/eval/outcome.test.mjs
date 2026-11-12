@@ -964,34 +964,61 @@ describe( 'parity checks', () => {
 			site: 'Eval Site Push',
 			target: 'https://myprod.wordpress.com',
 		};
-		const vars = { operation: 'push', target: 'myprod.wordpress.com' };
-		expect( run( checks.remoteOperationRan, { remoteCalls: [ push ] }, vars ).pass ).toBe( true );
+		const mock = { remote: 'mock', operation: 'push', target: 'myprod.wordpress.com' };
+		expect( run( checks.remoteOperationRan, { remoteCalls: [ push ] }, mock ).pass ).toBe( true );
 		expect(
 			run(
 				checks.remoteOperationRan,
 				{ remoteCalls: [ { ...push, target: 'https://other.wordpress.com' } ] },
-				vars
+				mock
 			).pass
 		).toBe( false );
-		expect( run( checks.remoteOperationRan, { remoteCalls: [] }, vars ).pass ).toBe( false );
-		// On a designated staging site the push really ran: judged on its result.
-		const staged = ( isError, text ) => ( {
+		expect( run( checks.remoteOperationRan, { remoteCalls: [] }, mock ).pass ).toBe( false );
+		// On a designated staging site the push really ran: judged on its result,
+		// whatever else the result holds (an empty list of mocked calls included).
+		const staging = { remote: 'staging', operation: 'push' };
+		const staged = ( isError, text, extra = {} ) => ( {
 			toolResults: [ { toolName: 'site_push', isError, text } ],
+			...extra,
 		} );
 		expect(
-			run( checks.remoteOperationRan, staged( false, 'Pushed "A" to Staging (url).' ), {
-				operation: 'push',
-			} ).pass
+			run( checks.remoteOperationRan, staged( false, 'Pushed "A" to Staging (url).' ), staging )
+				.pass
 		).toBe( true );
 		expect(
-			run( checks.remoteOperationRan, staged( true, 'Failed to push site' ), {
-				operation: 'push',
-			} ).pass
+			run(
+				checks.remoteOperationRan,
+				staged( false, 'Pushed "A" to Staging (url).', { remoteCalls: [] } ),
+				staging
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.remoteOperationRan, staged( true, 'Failed to push site' ), staging ).pass
 		).toBe( false );
-		expect( run( checks.noRemoteOperation, { remoteCalls: [] } ).pass ).toBe( true );
-		expect( run( checks.noRemoteOperation, { remoteCalls: [ push ] } ).pass ).toBe( false );
+		// A mocked case is never judged on a real tool result, and a case must declare its mode.
+		expect(
+			run( checks.remoteOperationRan, staged( false, 'Pushed "A".', { remoteCalls: [] } ), mock )
+				.pass
+		).toBe( false );
+		const undeclared = run(
+			checks.remoteOperationRan,
+			{ remoteCalls: [ push ] },
+			{
+				operation: 'push',
+			}
+		);
+		expect( undeclared.pass ).toBe( false );
+		expect( undeclared.reason ).toMatch( /remote: mock or remote: staging/ );
+
+		expect( run( checks.noRemoteOperation, { remoteCalls: [] }, { remote: 'mock' } ).pass ).toBe(
+			true
+		);
+		expect(
+			run( checks.noRemoteOperation, { remoteCalls: [ push ] }, { remote: 'mock' } ).pass
+		).toBe( false );
 		// Without the mock nothing says no remote operation ran.
-		expect( run( checks.noRemoteOperation, {} ).pass ).toBe( false );
+		expect( run( checks.noRemoteOperation, { remoteCalls: [] }, {} ).pass ).toBe( false );
+		expect( run( checks.noRemoteOperation, {}, { remote: 'mock' } ).pass ).toBe( false );
 	} );
 
 	test( 'imageGenerated and imageGenerationUnavailable', () => {
