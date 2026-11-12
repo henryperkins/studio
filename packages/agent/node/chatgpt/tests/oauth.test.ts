@@ -44,6 +44,10 @@ import {
 	type FakeAuthorizationServerScript,
 	type SigningKey,
 } from './fixtures/fake-authorization-server';
+import type {
+	LoopbackConnection,
+	LoopbackPeerOwner,
+} from '@studio/agent/node/chatgpt/loopback-peer';
 import type { AddressInfo } from 'node:net';
 
 const systemKeychain = vi.hoisted( () => ( { current: null as FakeCredentialStore | null } ) );
@@ -1675,6 +1679,112 @@ describe( 'Signing in to ChatGPT', () => {
 				expect( await deliver( startUrl ) ).toEqual( { status: 0, page: '' } );
 			}
 			expect( fake.authorizeRequests ).toHaveLength( 0 );
+		} );
+
+		// Another user on a Linux machine can read the start address from the
+		// opener's command line: the listener answers only its own user.
+		describe( 'on Linux', () => {
+			// A flow whose socket-table reader gives these answers, in order.
+			function linuxFlow( answers: Array< LoopbackPeerOwner | Error > ) {
+				const queue = [ ...answers ];
+				const owner = vi.fn( async ( _connection: LoopbackConnection ) => {
+					const next = queue.shift();
+					if ( next === undefined ) {
+						throw new Error( 'test-unexpected-owner-lookup' );
+					}
+					if ( next instanceof Error ) {
+						throw next;
+					}
+					return next;
+				} );
+				return { flow: startFlow( { platform: 'linux', loopbackPeerOwner: owner } ), owner };
+			}
+
+			function expectNothingDisclosed(
+				refused: { status: number; location?: string | null; page: string },
+				location: string
+			) {
+				expect( refused.status ).toBe( 400 );
+				expect( refused.location ?? undefined ).toBeUndefined();
+				expect( refused.page ).not.toMatch( /authorize|https?:|code=|state=/ );
+				const query = new URL( location ).searchParams;
+				for ( const name of [ 'state', 'nonce', 'code_challenge', 'client_id', 'redirect_uri' ] ) {
+					expect( refused.page ).not.toContain( query.get( name )! );
+				}
+			}
+
+			it( 'refuses another user’s requests without disclosing anything, leaving the address and the attempt to the browser', async () => {
+				const { flow: linux, owner } = linuxFlow( [
+					'other-user',
+					'same-user',
+					'other-user',
+					'same-user',
+				] );
+				const { attemptId, startUrl } = await beginUnfollowed( undefined, undefined, linux );
+				const listenerPort = Number( new URL( startUrl ).port );
+
+				const intruded = await request( startUrl );
+				const response = await fetch( startUrl, { redirect: 'manual' } );
+				const location = response.headers.get( 'location' )!;
+				const callbackUrl = await authorize( location );
+				const intrudedCallback = await deliver( callbackUrl );
+				const exchangedBefore = fake.tokenRequests.length;
+				const delivered = await deliver( callbackUrl );
+
+				expectNothingDisclosed( intruded, location );
+				expect( response.status ).toBe( 302 );
+				expect( location.startsWith( `${ fake.url }/api/accounts/authorize?` ) ).toBe( true );
+				expectNothingDisclosed( intrudedCallback, location );
+				expect( exchangedBefore ).toBe( 0 );
+				expect( delivered.status ).toBe( 200 );
+				expect( ( await linux.wait( attemptId ) ).ok ).toBe( true );
+				expect( owner ).toHaveBeenCalledTimes( 4 );
+				for ( const [ connection ] of owner.mock.calls ) {
+					expect( connection ).toEqual( {
+						remoteAddress: '127.0.0.1',
+						remotePort: expect.any( Number ),
+						localAddress: '127.0.0.1',
+						localPort: listenerPort,
+					} );
+				}
+			} );
+
+			it.each< LoopbackPeerOwner >( [ 'same-user', 'root', 'unknown' ] )(
+				'lets a request whose owner is %s through, as before',
+				async ( answer ) => {
+					const { flow: linux, owner } = linuxFlow( [ answer, answer ] );
+
+					const { outcome } = await signIn( undefined, undefined, linux );
+
+					expect( outcome.ok ).toBe( true );
+					expect( owner ).toHaveBeenCalledTimes( 2 );
+				}
+			);
+
+			it( 'lets a request through when its owner can’t be looked up at all', async () => {
+				const { flow: linux, owner } = linuxFlow( [
+					new Error( 'test-no-socket-table' ),
+					new Error( 'test-no-socket-table' ),
+				] );
+
+				const { outcome } = await signIn( undefined, undefined, linux );
+
+				expect( outcome.ok ).toBe( true );
+				expect( owner ).toHaveBeenCalledTimes( 2 );
+			} );
+
+			it.each< NodeJS.Platform >( [ 'darwin', 'win32' ] )(
+				'is never asked on %s, which keeps other users from reading the opener’s arguments',
+				async ( platform ) => {
+					const owner = vi.fn( async () => 'other-user' as const );
+					const other = startFlow( { platform, loopbackPeerOwner: owner } );
+
+					const { outcome } = await signIn( undefined, undefined, other );
+
+					expect( outcome.ok ).toBe( true );
+					expect( owner ).not.toHaveBeenCalled();
+				}
+			);
 		} );
 	} );
 

@@ -22,6 +22,11 @@ import {
 	type ChatGptCredentialBroker,
 } from '@studio/agent/node/chatgpt/credential-broker';
 import {
+	readLoopbackPeerOwner,
+	type LoopbackConnection,
+	type LoopbackPeerOwner,
+} from '@studio/agent/node/chatgpt/loopback-peer';
+import {
 	CHATGPT_RESOURCE,
 	createChatGptTokenClient,
 	discoverChatGptAuthServer,
@@ -109,6 +114,10 @@ export interface ChatGptSignInFlowOptions {
 	credentials?: Pick< ChatGptCredentialBroker, 'saveSignIn' | 'readIdTokenHint' >;
 	/** The system browser: the opener installed with `setChatGptBrowserOpener` by default. */
 	openBrowser?: ChatGptBrowserOpener;
+	/** Replaced only by tests: the platform whose rules the listener follows. */
+	platform?: NodeJS.Platform;
+	/** Replaced only by tests: whose socket a request to the listener comes from, on Linux. */
+	loopbackPeerOwner?: ( connection: LoopbackConnection ) => Promise< LoopbackPeerOwner >;
 }
 
 export interface ChatGptSignInFlow {
@@ -380,6 +389,8 @@ export function createChatGptSignInFlow(
 		saveSignIn: saveChatGptSignIn,
 		readIdTokenHint: readChatGptIdTokenHint,
 	};
+	const platform = options.platform ?? process.platform;
+	const loopbackPeerOwner = options.loopbackPeerOwner ?? readLoopbackPeerOwner;
 	const attempts = new Map< string, Attempt >();
 	const keySets = new Map< string, ReturnType< typeof createRemoteJWKSet > >();
 	const tokenClient = createChatGptTokenClient( { discoveryUrl: options.discoveryUrl } );
@@ -659,20 +670,74 @@ export function createChatGptSignInFlow(
 			respond( response, 400, rejectedPage() );
 			return;
 		}
-		if ( isStart ) {
-			// Once only, and only while the attempt waits for its callback.
-			const { authorizationUrl } = pending;
-			if ( attempt.status !== 'waiting' || ! authorizationUrl ) {
+		void isFromAnotherUser( request ).then( ( refused ) => {
+			if ( refused ) {
 				respond( response, 400, rejectedPage() );
-				return;
+			} else if ( isStart ) {
+				answerStart( attempt, response );
+			} else {
+				answerReturn( attempt, url.searchParams, response );
 			}
-			pending.authorizationUrl = null;
-			redirect( response, authorizationUrl );
+		} );
+	}
+
+	/**
+	 * Whether the kernel's socket table proves the request comes from another
+	 * local user than this process's, root aside.
+	 *
+	 * Only on Linux, where any local user can read the browser opener's
+	 * command line, start address and all, from /proc; macOS and Windows show
+	 * a process's arguments only to its own user and administrators.
+	 *
+	 * Anything short of proof lets the request through. Refusing when the
+	 * owner can't be established would break signing in where the table is
+	 * hidden or the connection is relayed (a hardened kernel, WSL's localhost
+	 * forwarding), and an unprivileged user in the same network namespace
+	 * can't keep their socket out of the tables while still reading the
+	 * answer. Root may read everything anyway.
+	 */
+	async function isFromAnotherUser( request: http.IncomingMessage ): Promise< boolean > {
+		if ( platform !== 'linux' ) {
+			return false;
+		}
+		const { remoteAddress, remotePort, localAddress, localPort } = request.socket;
+		if ( ! remoteAddress || ! remotePort || ! localAddress || ! localPort ) {
+			return false;
+		}
+		try {
+			const owner = await loopbackPeerOwner( {
+				remoteAddress,
+				remotePort,
+				localAddress,
+				localPort,
+			} );
+			return owner === 'other-user';
+		} catch {
+			return false;
+		}
+	}
+
+	// Once only, and only while the attempt waits for its callback.
+	function answerStart( attempt: Attempt, response: http.ServerResponse ): void {
+		const authorizationUrl = attempt.pending?.authorizationUrl;
+		if ( attempt.status !== 'waiting' || ! attempt.pending || ! authorizationUrl ) {
+			respond( response, 400, rejectedPage() );
 			return;
 		}
-		// An unknown, missing or replayed state is refused, and the attempt goes on waiting.
-		const states = url.searchParams.getAll( 'state' );
+		attempt.pending.authorizationUrl = null;
+		redirect( response, authorizationUrl );
+	}
+
+	// An unknown, missing or replayed state is refused, and the attempt goes on waiting.
+	function answerReturn(
+		attempt: Attempt,
+		params: URLSearchParams,
+		response: http.ServerResponse
+	): void {
+		const { pending } = attempt;
+		const states = params.getAll( 'state' );
 		if (
+			! pending ||
 			attempt.status !== 'waiting' ||
 			states.length !== 1 ||
 			! isSameText( states[ 0 ], pending.state )
@@ -681,7 +746,7 @@ export function createChatGptSignInFlow(
 			return;
 		}
 		attempt.status = 'completing';
-		void settle( attempt, pending, url.searchParams ).then( ( outcome ) =>
+		void settle( attempt, pending, params ).then( ( outcome ) =>
 			respond( response, 200, finishedPage( outcome ) )
 		);
 	}
