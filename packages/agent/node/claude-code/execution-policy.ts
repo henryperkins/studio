@@ -12,6 +12,7 @@ import {
 	CLAUDE_STUDIO_TOOL_RULES,
 	HOST_OPERATION_CLASSES,
 	claudeNativeTools,
+	claudeRouteNote,
 	claudeStudioTools,
 	claudeTargetOrigin,
 	describeClaudeOperation,
@@ -705,7 +706,8 @@ export function createClaudeExecutionPolicy(
 				? classifyWpCliArgs( request.args )
 				: HOST_OPERATION_CLASSES[ request.name ];
 		if ( ! operationClass ) {
-			if ( request.name === 'sites.wpCli' ) refuse( toolCallId, REFUSALS.wpCli );
+			if ( request.name === 'sites.wpCli' )
+				refuse( toolCallId, `${ REFUSALS.wpCli } ${ claudeRouteNote( 'wp_cli' ) }` );
 			return;
 		}
 		let site: HostSite | undefined;

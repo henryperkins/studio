@@ -11,7 +11,9 @@ import {
 	type ToolContext,
 } from '../../tools/define-tool';
 import { runWpCliTool } from '../../tools/wp-cli';
+import { claudeRouteNote } from '../execution-rules';
 import { createStudioClaudeDiscoveryServer, createStudioClaudeToolBridge } from '../tool-bridge';
+import { wpCliRouteCommands } from '../wp-cli-rules';
 import { createPolicyFixture } from './fixtures/execution-policy';
 import type { StudioAgentHost } from '../../host';
 import type { ClaudeApprover, ClaudeExecutionPolicy } from '../execution-policy';
@@ -126,6 +128,8 @@ describe( 'what the model hears of a call Studio did not run', () => {
 		expect( text( result ) ).toContain(
 			'This WP-CLI command is outside what Studio runs on the Claude route.'
 		);
+		// It names what the route does run, as the tool's description there does.
+		expect( text( result ) ).toContain( claudeRouteNote( 'wp_cli' ) );
 		expect( text( result ) ).not.toContain( 'secret-plugin' );
 		expect( host.sites.wpCli ).not.toHaveBeenCalled();
 	} );
@@ -357,7 +361,11 @@ describe( 'the Claude bridge built from the Studio registry', () => {
 		const { bridge } = await setup();
 		const tools = await listedTools( bridge );
 		expect( tools.map( ( item ) => item.name ) ).toEqual( [ 'wp_cli' ] );
-		expect( tools[ 0 ].description ).toBe( runWpCliTool.description );
+		// The canonical description, and after it what this route runs of what it offers.
+		const note = claudeRouteNote( 'wp_cli' )!;
+		expect( tools[ 0 ].description ).toBe( `${ runWpCliTool.description }\n\n${ note }` );
+		for ( const { usage } of wpCliRouteCommands() ) expect( note ).toContain( usage );
+		expect( runWpCliTool.description ).not.toContain( note );
 		expect( Object.keys( tools[ 0 ].inputSchema.properties ?? {} ).sort() ).toEqual(
 			Object.keys( runWpCliTool.parameters.properties ).sort()
 		);

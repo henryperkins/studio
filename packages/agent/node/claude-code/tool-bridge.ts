@@ -7,6 +7,7 @@ import { runStudioTool } from '../tools/execution';
 import {
 	CLAUDE_ENABLED_TOOLS,
 	CLAUDE_NAVIGATION_CONFINEMENT,
+	claudeRouteNote,
 	claudeStudioTools,
 	isRecord,
 } from './execution-rules';
@@ -42,6 +43,8 @@ export function claudeStudioToolCandidates(
 /**
  * Studio's tools as an in-process MCP server: each one under its canonical
  * name and description, with its canonical schema in the shape the SDK takes.
+ * Where the description offers more than this route runs, the policy's own
+ * note on what it runs follows it.
  */
 export function createStudioClaudeMcpServer(
 	tools: readonly Pick< StudioToolDefinition, 'name' | 'description' | 'parameters' >[],
@@ -54,8 +57,12 @@ export function createStudioClaudeMcpServer(
 				definition.parameters as unknown as Parameters< typeof z.fromJSONSchema >[ 0 ]
 			);
 			if ( ! ( schema instanceof z.ZodObject ) ) throw new Error( 'Unsupported tool schema' );
-			return tool( definition.name, definition.description, schema.shape, ( args, extra ) =>
-				invoke( definition.name, args, extra )
+			const note = claudeRouteNote( definition.name );
+			return tool(
+				definition.name,
+				note ? `${ definition.description }\n\n${ note }` : definition.description,
+				schema.shape,
+				( args, extra ) => invoke( definition.name, args, extra )
 			);
 		} ),
 	} );

@@ -30,7 +30,7 @@ import { runWpCliTool, splitCommandArgs } from '../tools/wp-cli';
 import { wpcomRequestTool } from '../tools/wpcom-request';
 import { isInside } from './local-paths';
 import { hasOnlyKeys, hasOwn, plainData, plainList, plainStrings } from './plain-data';
-import { classifyWpCliArgs } from './wp-cli-rules';
+import { classifyWpCliArgs, wpCliRouteCommands } from './wp-cli-rules';
 import type { SandboxSettings } from '@anthropic-ai/claude-agent-sdk/core';
 import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
@@ -1099,6 +1099,23 @@ export function claudeToolInventory(
 		...claudeNativeTools( enabled, confinement, workspace ),
 		...claudeStudioTools( enabled, navigation, targetOrigin ).map( studioMcpToolName ),
 	];
+}
+
+/**
+ * What this route runs of what a tool's canonical description offers, written
+ * from the rules that decide it; undefined for a tool whose description holds
+ * as it is. The canonical description, which every route shares, is unchanged.
+ */
+export function claudeRouteNote( name: string ): string | undefined {
+	if ( name !== runWpCliTool.name ) return;
+	const commands = wpCliRouteCommands().map( ( { usage, operationClass } ) =>
+		requiresClaudeApproval( operationClass )
+			? `\`${ usage }\` (once the user approves it)`
+			: `\`${ usage }\``
+	);
+	return `On this route Studio runs only these WP-CLI commands, in exactly these forms: ${ commands.join(
+		'; '
+	) }. It refuses every other command and option.`;
 }
 
 /** The name the native runtime knows a Studio tool by. */
