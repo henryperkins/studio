@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	createOsCredentialStore,
+	credentialStoreKindFor,
 	SecureStorageError,
 	type CommandResult,
 	type CommandRunner,
@@ -282,5 +283,25 @@ describe( 'an unavailable system keychain', () => {
 		await expect( store.set( 'openai-api-key', SECRET ) ).rejects.toBeInstanceOf(
 			SecureStorageError
 		);
+	} );
+} );
+
+describe( 'the system keychain each platform uses', () => {
+	it.each( [
+		[ 'win32', 'password-vault', 'powershell.exe' ],
+		[ 'darwin', 'keychain', '/usr/bin/security' ],
+		[ 'linux', 'secret-service', 'secret-tool' ],
+		[ 'freebsd', null, null ],
+	] as const )( 'on %s is %s, reached through its own tool', async ( platform, kind, tool ) => {
+		const commands: string[] = [];
+		const run: CommandRunner = async ( command ) => {
+			commands.push( command );
+			return ok();
+		};
+
+		await createOsCredentialStore( { platform, run } ).check();
+
+		expect( credentialStoreKindFor( platform ) ).toBe( kind );
+		expect( commands ).toEqual( tool ? [ tool ] : [] );
 	} );
 } );

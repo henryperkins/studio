@@ -36,9 +36,13 @@ export interface OsCredentialStore {
 
 /** The keychain can't be used, or refused an operation. */
 export class SecureStorageError extends Error {
-	constructor( message: string ) {
+	/** Its tool didn't answer in time, and was stopped. */
+	readonly timedOut: boolean;
+
+	constructor( message: string, { timedOut = false }: { timedOut?: boolean } = {} ) {
 		super( message );
 		this.name = 'SecureStorageError';
+		this.timedOut = timedOut;
 	}
 }
 
@@ -49,6 +53,25 @@ export interface CommandResult {
 	stderr: string;
 	/** Set when the command couldn't be started (e.g. `ENOENT`). */
 	spawnError?: NodeJS.ErrnoException;
+	/** Set when the command ran past its time and was killed. */
+	timedOut?: true;
+}
+
+/** The system keychain Studio uses on a platform. */
+export type CredentialStoreKind = 'password-vault' | 'keychain' | 'secret-service';
+
+/** The system keychain `createOsCredentialStore` uses on a platform, or null where it has none. */
+export function credentialStoreKindFor( platform: NodeJS.Platform ): CredentialStoreKind | null {
+	switch ( platform ) {
+		case 'win32':
+			return 'password-vault';
+		case 'darwin':
+			return 'keychain';
+		case 'linux':
+			return 'secret-service';
+		default:
+			return null;
+	}
 }
 
 export type CommandRunner = (
@@ -66,17 +89,22 @@ export const runCommand: CommandRunner = ( command, args, { input, timeoutMs } )
 		let stdout = '';
 		let stderr = '';
 		let settled = false;
-		const finish = ( result: CommandResult ) => {
-			if ( ! settled ) {
-				settled = true;
-				resolve( result );
-			}
-		};
 		const child = spawn( command, [ ...args ], {
 			stdio: [ 'pipe', 'pipe', 'pipe' ],
 			windowsHide: true,
-			timeout: timeoutMs,
 		} );
+		const finish = ( result: CommandResult ) => {
+			if ( ! settled ) {
+				settled = true;
+				clearTimeout( timer );
+				resolve( result );
+			}
+		};
+		// Settles at once, rather than wait for a killed tool's output to close.
+		const timer = setTimeout( () => {
+			child.kill();
+			finish( { code: null, stdout, stderr, timedOut: true } );
+		}, timeoutMs );
 		child.stdout.setEncoding( 'utf8' );
 		child.stderr.setEncoding( 'utf8' );
 		child.stdout.on( 'data', ( chunk: string ) => ( stdout += chunk ) );
@@ -100,6 +128,14 @@ function assertItemName( value: string ): void {
 // Error text from a tool must never echo a secret back; tools that read the
 // secret from stdin don't, but strip it anyway.
 function toolError( action: string, result: CommandResult, secret?: string ): SecureStorageError {
+	if ( result.timedOut ) {
+		return new SecureStorageError(
+			`Couldn't ${ action } the system keychain: its tool didn't answer within ${
+				COMMAND_TIMEOUT_MS / 1000
+			} seconds.`,
+			{ timedOut: true }
+		);
+	}
 	const raw = ( result.spawnError?.message ?? result.stderr ).trim();
 	const text = secret ? raw.split( secret ).join( '[redacted]' ) : raw;
 	return new SecureStorageError(
@@ -356,12 +392,13 @@ export function createOsCredentialStore( {
 	run?: CommandRunner;
 } = {} ): OsCredentialStore {
 	assertItemName( service );
+	const kind = credentialStoreKindFor( platform );
 	const adapter =
-		platform === 'darwin'
+		kind === 'keychain'
 			? createMacAdapter( run, service )
-			: platform === 'linux'
+			: kind === 'secret-service'
 			? createLinuxAdapter( run, service )
-			: platform === 'win32'
+			: kind === 'password-vault'
 			? createWindowsAdapter( run, service )
 			: createUnsupportedAdapter( platform );
 

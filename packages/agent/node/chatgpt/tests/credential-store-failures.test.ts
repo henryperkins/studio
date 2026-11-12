@@ -76,7 +76,7 @@ const missing = ( command: string ): CommandResult => ( {
 	stderr: '',
 	spawnError: Object.assign( new Error( `spawn ${ command } ENOENT` ), { code: 'ENOENT' } ),
 } );
-const timedOut: CommandResult = { code: null, stdout: '', stderr: '' };
+const timedOut: CommandResult = { code: null, stdout: '', stderr: '', timedOut: true };
 
 interface Failure {
 	name: string;

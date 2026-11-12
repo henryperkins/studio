@@ -46,7 +46,11 @@ import {
 	type ChatGptModelAvailability,
 } from '@studio/agent/protocol/connections';
 import { getAgentEndFailure, type JsonEvent } from '@studio/agent/protocol/json-events';
-import { createOsCredentialStore } from '@studio/common/lib/os-credential-store';
+import {
+	createOsCredentialStore,
+	credentialStoreKindFor,
+	type CredentialStoreKind,
+} from '@studio/common/lib/os-credential-store';
 import { getConfigDirectory, getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { __, _n, sprintf } from '@wordpress/i18n';
 import {
@@ -1380,22 +1384,6 @@ async function waitUntil(
 			return false;
 		}
 		await clock.sleep( POLL_MS, ctx.signal );
-	}
-}
-
-export type CredentialStoreKind = 'password-vault' | 'keychain' | 'secret-service';
-
-/** The system keychain `createOsCredentialStore` uses on a platform, or null where it has none. */
-export function credentialStoreKindFor( platform: NodeJS.Platform ): CredentialStoreKind | null {
-	switch ( platform ) {
-		case 'win32':
-			return 'password-vault';
-		case 'darwin':
-			return 'keychain';
-		case 'linux':
-			return 'secret-service';
-		default:
-			return null;
 	}
 }
 

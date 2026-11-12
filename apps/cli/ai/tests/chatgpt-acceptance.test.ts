@@ -24,6 +24,7 @@ import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-clien
 import { createFakeCredentialStore } from '@studio/agent/node/tests/fake-credential-store';
 import { CHATGPT_MODEL_CAPABILITIES } from '@studio/agent/protocol/chatgpt-models';
 import { describeConnectionSelectionError } from '@studio/agent/protocol/connections';
+import { credentialStoreKindFor } from '@studio/common/lib/os-credential-store';
 import { getConfigDirectory } from '@studio/common/lib/well-known-paths';
 import nock from 'nock';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -35,7 +36,6 @@ import {
 	classifyToolCall,
 	classifyTurnFailure,
 	createAcceptanceTokenService,
-	credentialStoreKindFor,
 	digestTurnEvents,
 	isToolResultPersisted,
 	isWpCliReadCommand,

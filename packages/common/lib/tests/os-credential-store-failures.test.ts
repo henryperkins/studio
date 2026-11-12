@@ -90,7 +90,7 @@ const missing = ( command: string ): CommandResult => ( {
 	} ),
 } );
 // What `runCommand` reports once it has killed a tool that ran past its time.
-const timedOut: CommandResult = { code: null, stdout: '', stderr: '' };
+const timedOut: CommandResult = { code: null, stdout: '', stderr: '', timedOut: true };
 
 // macOS `security`, its interactive mode included (SecurityTool/macOS/security.c,
 // sharedTool/readline.c, keychain_add.c).
@@ -451,6 +451,34 @@ describe.each( PLATFORMS )( 'the %s keychain when it fails', ( platform ) => {
 		} );
 	} );
 
+	it( 'says its tool ran past its time, as a typed error, and no other failure as one', async () => {
+		const store = createOsCredentialStore( { platform, run: failingTool( timedOut ).run } );
+
+		const status = await store.check();
+		const failures = [
+			await failureOf( store.get( ACCOUNT ) ),
+			await failureOf( store.set( ACCOUNT, SECRET ) ),
+			await failureOf( store.delete( ACCOUNT ) ),
+		];
+
+		expect( status ).toEqual( {
+			available: false,
+			reason: "Couldn't open the system keychain: its tool didn't answer within 15 seconds.",
+		} );
+		for ( const failure of failures ) {
+			expect( failure ).toBeInstanceOf( SecureStorageError );
+			expect( failure ).toMatchObject( { timedOut: true } );
+			expect( ( failure as Error ).message ).toMatch(
+				/^Couldn't (read from|save to|remove from) the system keychain: its tool didn't answer within 15 seconds\.$/
+			);
+		}
+		const denied = createOsCredentialStore( {
+			platform,
+			run: failingTool( FAILURES[ platform ][ 0 ].result ).run,
+		} );
+		expect( await failureOf( denied.get( ACCOUNT ) ) ).toMatchObject( { timedOut: false } );
+	} );
+
 	it( 'reports a save the tool said succeeded but didn’t keep, without the secret', async () => {
 		const tool = createTool( platform );
 		const store = createOsCredentialStore( { platform, run: tool.run } );
@@ -640,7 +668,7 @@ describe( 'running a keychain tool', () => {
 		expectNoSecretIn( args.join( ' ' ), OTHER_SECRET );
 	} );
 
-	it( 'stops a tool that runs past its time, reporting no exit code', async () => {
+	it( 'stops a tool that runs past its time, reporting no exit code and that it timed out', async () => {
 		const started = Date.now();
 
 		const result = await runCommand( node, [ '-e', 'setTimeout(() => {}, 60000)' ], {
@@ -649,7 +677,15 @@ describe( 'running a keychain tool', () => {
 
 		expect( result.code ).toBeNull();
 		expect( result.spawnError ).toBeUndefined();
+		expect( result.timedOut ).toBe( true );
 		expect( Date.now() - started ).toBeLessThan( 15_000 );
+	} );
+
+	it( 'says nothing timed out when a tool exits on its own', async () => {
+		const result = await runCommand( node, [ '-e', 'process.exit(1)' ], { timeoutMs: 20_000 } );
+
+		expect( result ).toEqual( { code: 1, stdout: '', stderr: '' } );
+		expect( result ).not.toHaveProperty( 'timedOut' );
 	} );
 
 	it( 'reports a tool that isn’t installed', async () => {
