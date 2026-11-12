@@ -520,7 +520,11 @@ export interface Connector {
 	refreshOpenAiModels(): Promise< AiSettings >;
 	setOpenAiDefaults( update: OpenAiDefaultsUpdate ): Promise< AiSettings >;
 
+	// Polled: the host answers whether secure storage is available as it last
+	// checked. The recheck has it check the system keychain again first, which
+	// may run the keychain's tool, so only an explicit user action asks for one.
 	getChatGptSettings(): Promise< ChatGptSettings >;
+	recheckChatGptSettings(): Promise< ChatGptSettings >;
 	beginChatGptSignIn(
 		registrationId?: string,
 		options?: ChatGptSignInOptions

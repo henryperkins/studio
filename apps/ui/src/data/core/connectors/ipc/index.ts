@@ -712,6 +712,9 @@ export function createIpcConnector(): Connector {
 		async getChatGptSettings() {
 			return unwrapIpcError( ipcApi.getChatGptSettings() );
 		},
+		async recheckChatGptSettings() {
+			return unwrapIpcError( ipcApi.recheckChatGptSettings() );
+		},
 		async beginChatGptSignIn( registrationId, options ) {
 			return unwrapIpcError( ipcApi.beginChatGptSignIn( registrationId, options ) );
 		},

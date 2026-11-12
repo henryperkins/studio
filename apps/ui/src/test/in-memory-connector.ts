@@ -354,6 +354,7 @@ export function createInMemoryConnector(
 			...openAi,
 		} ),
 		getChatGptSettings: async () => structuredClone( state.chatGpt ),
+		recheckChatGptSettings: async () => structuredClone( state.chatGpt ),
 		beginChatGptSignIn: async () => ( { attemptId: 'test-sign-in-attempt' } ),
 		waitForChatGptSignIn: async () => ( {
 			ok: false,

@@ -17,9 +17,20 @@ import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { startLocalServer, type LocalServer } from '../index';
 
+// Each call stands for one run of the system keychain's tool.
+const { keychainChecks } = vi.hoisted( () => ( { keychainChecks: vi.fn() } ) );
 vi.mock( '@studio/common/lib/os-credential-store', async ( original ) => ( {
 	...( await original< typeof import('@studio/common/lib/os-credential-store') >() ),
-	createOsCredentialStore: () => createFakeCredentialStore().store,
+	createOsCredentialStore: () => {
+		const { store } = createFakeCredentialStore();
+		return {
+			...store,
+			check: () => {
+				keychainChecks();
+				return store.check();
+			},
+		};
+	},
 } ) );
 vi.mock( '@studio/agent/node/chatgpt/oauth', async ( original ) => ( {
 	...( await original< object >() ),
@@ -97,6 +108,26 @@ describe( 'ChatGPT HTTP boundary', () => {
 		] );
 		expect( text ).not.toContain( 'test-private-subject' );
 		expect( text ).not.toContain( 'subject' );
+	} );
+
+	it( 'answers repeated reads without the keychain’s tool, and runs it again on a recheck', async () => {
+		await request( '/chatgpt/recheck', {} );
+		keychainChecks.mockClear();
+
+		for ( let poll = 0; poll < 3; poll++ ) {
+			expect( ( await request( '/chatgpt', undefined, 'GET' ) ).status ).toBe( 200 );
+		}
+		expect( keychainChecks ).not.toHaveBeenCalled();
+		const rechecked = await request( '/chatgpt/recheck', {} );
+
+		expect( rechecked.status ).toBe( 200 );
+		expect( await rechecked.json() ).toEqual( {
+			enabled: true,
+			signInSupported: true,
+			secureStorage: 'available',
+			accounts: [],
+		} );
+		expect( keychainChecks ).toHaveBeenCalledTimes( 1 );
 	} );
 
 	it( 'rejects a global ChatGPT default with a settings error and preserves the saved provider', async () => {
@@ -210,6 +241,11 @@ describe( 'ChatGPT HTTP boundary', () => {
 			secureStorage: 'unavailable',
 			accounts: [],
 		} );
+		keychainChecks.mockClear();
+		expect( await ( await request( '/chatgpt/recheck', {} ) ).json() ).toEqual(
+			await ( await request( '/chatgpt', undefined, 'GET' ) ).json()
+		);
+		expect( keychainChecks ).not.toHaveBeenCalled();
 		expect( ( await request( '/chatgpt/sign-in', {} ) ).status ).toBe( 400 );
 		expect( beginChatGptSignIn ).not.toHaveBeenCalled();
 		const { id } = await createAiSession( root );

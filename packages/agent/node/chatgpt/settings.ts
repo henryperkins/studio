@@ -68,50 +68,109 @@ export async function chatGptSettingsAction< T >( action: () => Promise< T > ): 
 	}
 }
 
+type SecureStorage = ChatGptSettings[ 'secureStorage' ];
+
+/**
+ * Whether the system keychain can keep sign-ins, as last checked. A check runs
+ * the keychain's tool, which a Secret Service may answer with a prompt, so the
+ * settings, read every few seconds, never check: the first read that needs the
+ * answer does, and after that only an explicit recheck.
+ */
+const secureStorage: {
+	known?: SecureStorage;
+	checking?: Promise< SecureStorage >;
+	checks: number;
+} = { checks: 0 };
+
+function checkSecureStorage(): Promise< SecureStorage > {
+	const check = ++secureStorage.checks;
+	const checking = createOsCredentialStore()
+		.check()
+		.then(
+			( status ): SecureStorage => ( status.available ? 'available' : 'unavailable' ),
+			(): SecureStorage => 'unavailable'
+		)
+		.then( ( answer ) => {
+			// A later check's answer stands over an earlier one that finished after it.
+			if ( check === secureStorage.checks ) {
+				secureStorage.known = answer;
+				secureStorage.checking = undefined;
+			}
+			return answer;
+		} );
+	secureStorage.checking = checking;
+	return checking;
+}
+
+function knownSecureStorage(): Promise< SecureStorage > {
+	return secureStorage.known
+		? Promise.resolve( secureStorage.known )
+		: secureStorage.checking ?? checkSecureStorage();
+}
+
+const disabledSettings = (): ChatGptSettings => ( {
+	enabled: false,
+	signInSupported: false,
+	secureStorage: 'unavailable',
+	accounts: [],
+} );
+
 export function readChatGptSettings( signInSupported = true ): Promise< ChatGptSettings > {
-	return chatGptSettingsAction( async () => {
-		const enabled = isChatGptEnabled();
-		if ( ! enabled ) {
-			return { enabled, signInSupported: false, secureStorage: 'unavailable', accounts: [] };
-		}
-		const accounts = await readChatGptAccounts();
-		const [ connections, secureStorage ] = await Promise.all( [
-			listChatGptConnections(),
-			createOsCredentialStore()
-				.check()
-				.catch( () => ( { available: false } ) ),
-		] );
-		return {
-			enabled,
-			signInSupported,
-			secureStorage: secureStorage.available ? 'available' : 'unavailable',
-			accounts: accounts.map( ( account ) => ( {
-				connectionId: account.registrationId,
-				providerId: 'chatgpt-oauth',
-				backend: 'pi',
-				revision: account.revision,
-				// The subject stays in the backend: a renderer only needs to know there is one.
-				identity: {
-					verified: true,
-					...( account.email ? { email: account.email } : {} ),
-				},
-				authStatus:
-					account.state === 'signed-in' &&
-					connections.some(
-						( connection ) =>
-							connection.connectionId === account.registrationId &&
-							connection.revision === account.revision &&
-							connection.authStatus === 'connected'
-					)
-						? 'connected'
-						: 'disconnected',
-				label: account.label,
-				email: account.email,
-				storage: account.storage,
-				state: account.state,
-			} ) ),
-		};
-	} );
+	return chatGptSettingsAction( async () =>
+		isChatGptEnabled()
+			? readEnabledSettings( signInSupported, knownSecureStorage() )
+			: disabledSettings()
+	);
+}
+
+/**
+ * The settings, after checking the system keychain again: for when the user
+ * opens the ChatGPT settings or asks to retry, never for a polled read.
+ */
+export function recheckChatGptSettings( signInSupported = true ): Promise< ChatGptSettings > {
+	return chatGptSettingsAction( async () =>
+		isChatGptEnabled()
+			? readEnabledSettings( signInSupported, checkSecureStorage() )
+			: disabledSettings()
+	);
+}
+
+async function readEnabledSettings(
+	signInSupported: boolean,
+	storage: Promise< SecureStorage >
+): Promise< ChatGptSettings > {
+	const accounts = await readChatGptAccounts();
+	const [ connections, available ] = await Promise.all( [ listChatGptConnections(), storage ] );
+	return {
+		enabled: true,
+		signInSupported,
+		secureStorage: available,
+		accounts: accounts.map( ( account ) => ( {
+			connectionId: account.registrationId,
+			providerId: 'chatgpt-oauth',
+			backend: 'pi',
+			revision: account.revision,
+			// The subject stays in the backend: a renderer only needs to know there is one.
+			identity: {
+				verified: true,
+				...( account.email ? { email: account.email } : {} ),
+			},
+			authStatus:
+				account.state === 'signed-in' &&
+				connections.some(
+					( connection ) =>
+						connection.connectionId === account.registrationId &&
+						connection.revision === account.revision &&
+						connection.authStatus === 'connected'
+				)
+					? 'connected'
+					: 'disconnected',
+			label: account.label,
+			email: account.email,
+			storage: account.storage,
+			state: account.state,
+		} ) ),
+	};
 }
 
 function requireRegistration( value: unknown ): asserts value is string {
@@ -148,6 +207,8 @@ export function startChatGptSignIn(
 		) {
 			throw new ChatGptSettingsError( __( 'Choose how to keep the ChatGPT sign-in.' ) );
 		}
+		// For the settings read after it; the sign-in itself checks what it saves to.
+		void checkSecureStorage();
 		const { attemptId } = await beginChatGptSignIn(
 			registrationId,
 			options as ChatGptSignInOptions

@@ -876,6 +876,10 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			const settings = await api< ChatGptSettings >( '/chatgpt' );
 			return { ...settings, signInSupported: settings.signInSupported && chatGptSignInSupported };
 		},
+		async recheckChatGptSettings() {
+			const settings = await api< ChatGptSettings >( '/chatgpt/recheck', { method: 'POST' } );
+			return { ...settings, signInSupported: settings.signInSupported && chatGptSignInSupported };
+		},
 		async beginChatGptSignIn( registrationId, options ) {
 			if ( ! chatGptSignInSupported ) {
 				throw new Error( __( 'Open Studio on localhost to sign in to ChatGPT on this computer.' ) );

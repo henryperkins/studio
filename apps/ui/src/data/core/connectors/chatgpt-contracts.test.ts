@@ -27,6 +27,7 @@ describe( 'ChatGPT connector contracts', () => {
 	it( 'passes named settings and selection operations through Desktop IPC', async () => {
 		const api = {
 			getChatGptSettings: vi.fn( async () => SETTINGS ),
+			recheckChatGptSettings: vi.fn( async () => SETTINGS ),
 			beginChatGptSignIn: vi.fn( async () => ( { attemptId: ATTEMPT } ) ),
 			waitForChatGptSignIn: vi.fn(),
 			cancelChatGptSignIn: vi.fn(),
@@ -37,6 +38,9 @@ describe( 'ChatGPT connector contracts', () => {
 		vi.stubGlobal( 'ipcApi', api );
 		const connector = createIpcConnector();
 		await expect( connector.getChatGptSettings() ).resolves.toEqual( SETTINGS );
+		await expect( connector.recheckChatGptSettings() ).resolves.toEqual( SETTINGS );
+		expect( api.getChatGptSettings ).toHaveBeenCalledExactlyOnceWith();
+		expect( api.recheckChatGptSettings ).toHaveBeenCalledExactlyOnceWith();
 		await expect( connector.beginChatGptSignIn( ID, { storage: 'session' } ) ).resolves.toEqual( {
 			attemptId: ATTEMPT,
 		} );
@@ -54,9 +58,21 @@ describe( 'ChatGPT connector contracts', () => {
 	} );
 
 	it( 'uses the matching HTTP methods and request bodies in studio ui', async () => {
-		const fetch = vi.fn( async () => new Response( '{}' ) );
+		const fetch = vi.fn( async () => new Response( JSON.stringify( SETTINGS ) ) );
 		vi.stubGlobal( 'fetch', fetch );
 		const connector = createLocalConnector( { apiBaseUrl: 'http://localhost:8081' } );
+		await expect( connector.getChatGptSettings() ).resolves.toEqual( SETTINGS );
+		await expect( connector.recheckChatGptSettings() ).resolves.toEqual( SETTINGS );
+		expect( fetch ).toHaveBeenNthCalledWith(
+			1,
+			'http://localhost:8081/api/chatgpt',
+			expect.not.objectContaining( { method: expect.anything() } )
+		);
+		expect( fetch ).toHaveBeenNthCalledWith(
+			2,
+			'http://localhost:8081/api/chatgpt/recheck',
+			expect.objectContaining( { method: 'POST' } )
+		);
 		await connector.beginChatGptSignIn( ID, { storage: 'session' } );
 		await connector.waitForChatGptSignIn( ATTEMPT );
 		await connector.cancelChatGptSignIn( ATTEMPT );

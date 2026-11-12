@@ -7,6 +7,7 @@ import {
 	refreshChatGptSettings,
 	useChatGptModels,
 	useChatGptSettings,
+	useRecheckChatGptSettings,
 } from '@/data/queries/use-chatgpt-settings';
 import { useOffline } from '@/lib/hooks';
 import { Badge, Button } from '@/lib/ui';
@@ -39,6 +40,17 @@ export function ChatGptSettingsGroup() {
 		? accounts.find( ( item ) => item.connectionId === selectedId )
 		: accounts[ 0 ];
 	const models = useChatGptModels( account, false );
+	const { mutate: recheck } = useRecheckChatGptSettings();
+	const enabled = !! settings.data?.enabled;
+	const rechecked = useRef( false );
+
+	// Once the provider is known to be on: polled reads don't check the keychain.
+	useEffect( () => {
+		if ( enabled && ! rechecked.current ) {
+			rechecked.current = true;
+			recheck();
+		}
+	}, [ enabled, recheck ] );
 
 	useEffect( () => {
 		mounted.current = true;

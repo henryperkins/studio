@@ -16,14 +16,26 @@ import {
 	beginChatGptSignIn,
 	cancelChatGptSignIn,
 	getChatGptSettings,
+	recheckChatGptSettings,
 	setAiProvider,
 	waitForChatGptSignIn,
 } from 'src/modules/user-settings/lib/ipc-handlers';
 import type { IpcMainInvokeEvent } from 'electron';
 
+// Each call stands for one run of the system keychain's tool.
+const { keychainChecks } = vi.hoisted( () => ( { keychainChecks: vi.fn() } ) );
 vi.mock( '@studio/common/lib/os-credential-store', async ( original ) => ( {
 	...( await original< typeof import('@studio/common/lib/os-credential-store') >() ),
-	createOsCredentialStore: () => createFakeCredentialStore().store,
+	createOsCredentialStore: () => {
+		const { store } = createFakeCredentialStore();
+		return {
+			...store,
+			check: () => {
+				keychainChecks();
+				return store.check();
+			},
+		};
+	},
 } ) );
 vi.mock( '@studio/agent/node/chatgpt/oauth', async ( original ) => ( {
 	...( await original< object >() ),
@@ -84,6 +96,25 @@ describe( 'ChatGPT desktop IPC boundary', () => {
 		] );
 		expect( JSON.stringify( settings ) ).not.toContain( 'test-private-subject' );
 		expect( JSON.stringify( settings ) ).not.toContain( 'subject' );
+	} );
+
+	it( 'answers repeated reads without the keychain’s tool, and runs it again on a recheck', async () => {
+		vi.mocked( readChatGptAccounts ).mockResolvedValue( [] );
+		await recheckChatGptSettings();
+		keychainChecks.mockClear();
+
+		for ( let poll = 0; poll < 3; poll++ ) {
+			await getChatGptSettings();
+		}
+		expect( keychainChecks ).not.toHaveBeenCalled();
+
+		await expect( recheckChatGptSettings() ).resolves.toEqual( {
+			enabled: true,
+			signInSupported: true,
+			secureStorage: 'available',
+			accounts: [],
+		} );
+		expect( keychainChecks ).toHaveBeenCalledTimes( 1 );
 	} );
 
 	it( 'rejects ChatGPT as a global default before writing settings', async () => {

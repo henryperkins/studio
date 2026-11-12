@@ -21,15 +21,21 @@ import {
 	readChatGptModels,
 	readChatGptSettings,
 	readSavedChatGptSignIns,
+	recheckChatGptSettings,
 	startChatGptSignIn,
 	stopChatGptSignIn,
 	validateChatGptSelection,
 } from '@studio/agent/node/chatgpt/settings';
 import type { ChatGptAccount } from '@studio/agent/node/chatgpt/account-store';
 import type { ChatGptTurnHandle } from '@studio/agent/node/chatgpt/credential-broker';
+import type { CredentialStoreStatus } from '@studio/common/lib/os-credential-store';
 
+// Each call stands for one run of the system keychain's tool.
+const { keychainCheck } = vi.hoisted( () => ( {
+	keychainCheck: vi.fn< () => Promise< CredentialStoreStatus > >(),
+} ) );
 vi.mock( '@studio/common/lib/os-credential-store', () => ( {
-	createOsCredentialStore: () => ( { check: async () => ( { available: true } ) } ),
+	createOsCredentialStore: () => ( { check: keychainCheck } ),
 } ) );
 vi.mock( '@studio/agent/node/chatgpt/account-store', async ( original ) => ( {
 	...( await original< object >() ),
@@ -71,6 +77,7 @@ let turn: ChatGptTurnHandle;
 
 beforeEach( () => {
 	vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' );
+	keychainCheck.mockResolvedValue( { available: true } );
 	vi.mocked( readChatGptAccounts ).mockResolvedValue( [ ACCOUNT ] );
 	vi.mocked( listChatGptConnections ).mockResolvedValue( [
 		{
@@ -131,6 +138,77 @@ describe( 'ChatGPT application settings facade', () => {
 		expect( JSON.stringify( settings ) ).not.toContain( ACCOUNT.clientId );
 		expect( JSON.stringify( settings ) ).not.toContain( ACCOUNT.subject );
 		expect( JSON.stringify( settings ) ).not.toContain( 'subject' );
+	} );
+
+	it( 'runs the keychain’s tool once, on the first read, however often the settings are read', async () => {
+		vi.resetModules();
+		const accounts = await import( '@studio/agent/node/chatgpt/account-store' );
+		const broker = await import( '@studio/agent/node/chatgpt/credential-broker' );
+		vi.mocked( accounts.readChatGptAccounts ).mockResolvedValue( [ ACCOUNT ] );
+		vi.mocked( broker.listChatGptConnections ).mockResolvedValue( await listChatGptConnections() );
+		const fresh = await import( '@studio/agent/node/chatgpt/settings' );
+		keychainCheck.mockClear();
+
+		const reads = await Promise.all( [ 1, 2, 3 ].map( () => fresh.readChatGptSettings() ) );
+		for ( let poll = 0; poll < 5; poll++ ) {
+			reads.push( await fresh.readChatGptSettings() );
+		}
+
+		expect( keychainCheck ).toHaveBeenCalledTimes( 1 );
+		expect( reads.map( ( settings ) => settings.secureStorage ) ).toEqual(
+			Array( 8 ).fill( 'available' )
+		);
+	} );
+
+	it( 'reads the last known answer between rechecks, and a recheck’s answer from then on', async () => {
+		await recheckChatGptSettings();
+		keychainCheck.mockClear();
+		keychainCheck.mockResolvedValue( { available: false, reason: 'The keychain is locked.' } );
+
+		for ( let poll = 0; poll < 5; poll++ ) {
+			await expect( readChatGptSettings() ).resolves.toMatchObject( {
+				secureStorage: 'available',
+			} );
+		}
+		expect( keychainCheck ).not.toHaveBeenCalled();
+
+		await expect( recheckChatGptSettings() ).resolves.toMatchObject( {
+			enabled: true,
+			signInSupported: true,
+			secureStorage: 'unavailable',
+			accounts: [ expect.objectContaining( { connectionId: ID, authStatus: 'connected' } ) ],
+		} );
+		await expect( readChatGptSettings() ).resolves.toMatchObject( {
+			secureStorage: 'unavailable',
+		} );
+		expect( keychainCheck ).toHaveBeenCalledTimes( 1 );
+		await expect( recheckChatGptSettings( false ) ).resolves.toMatchObject( {
+			signInSupported: false,
+		} );
+	} );
+
+	it( 'checks the keychain again when a sign-in starts', async () => {
+		await recheckChatGptSettings();
+		keychainCheck.mockClear();
+		vi.mocked( beginChatGptSignIn ).mockResolvedValue( { attemptId: ATTEMPT } as never );
+
+		await startChatGptSignIn( undefined, { storage: 'vault' } );
+
+		await vi.waitFor( () => expect( keychainCheck ).toHaveBeenCalledTimes( 1 ) );
+	} );
+
+	it( 'answers a recheck with ChatGPT turned off without running the keychain’s tool', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+		keychainCheck.mockClear();
+
+		await expect( recheckChatGptSettings() ).resolves.toEqual( {
+			enabled: false,
+			signInSupported: false,
+			secureStorage: 'unavailable',
+			accounts: [],
+		} );
+		expect( keychainCheck ).not.toHaveBeenCalled();
+		expect( readChatGptAccounts ).not.toHaveBeenCalled();
 	} );
 
 	it( 'returns only an attempt id for a returning sign-in', async () => {

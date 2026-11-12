@@ -1,5 +1,5 @@
-import { useQuery, type QueryClient } from '@tanstack/react-query';
-import { useConnector } from '@/data/core';
+import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { useConnector, type Connector } from '@/data/core';
 import type { ChatGptAccountView, ChatGptSettings } from '@studio/agent/protocol/chatgpt';
 
 export const CHATGPT_SETTINGS_QUERY_KEY = [ 'chatgpt-settings' ] as const;
@@ -14,6 +14,32 @@ export function useChatGptSettings() {
 		retry: false,
 		meta: { persist: false },
 	} );
+}
+
+/**
+ * Has the host check the system keychain again, which a polled read never
+ * does, and shows what it found. When that fails, a read says why.
+ */
+async function recheckChatGptSettings(
+	queryClient: QueryClient,
+	connector: Connector
+): Promise< void > {
+	await queryClient.cancelQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } );
+	try {
+		queryClient.setQueryData< ChatGptSettings >(
+			CHATGPT_SETTINGS_QUERY_KEY,
+			await connector.recheckChatGptSettings()
+		);
+	} catch {
+		await queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } );
+	}
+}
+
+/** For a user's action only: opening the ChatGPT settings, or asking to retry. */
+export function useRecheckChatGptSettings() {
+	const connector = useConnector();
+	const queryClient = useQueryClient();
+	return useMutation( { mutationFn: () => recheckChatGptSettings( queryClient, connector ) } );
 }
 
 export function useChatGptModels( account: ChatGptAccountView | undefined, enabled = true ) {

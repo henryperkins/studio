@@ -1,5 +1,6 @@
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { CHATGPT_SETTINGS_QUERY_KEY } from '@/data/queries/use-chatgpt-settings';
 import { createFakeConnector, makeSite } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { Connector } from '@/data/core';
@@ -50,6 +51,7 @@ async function openSettings(
 		{ sites: [ makeSite( { id: 'one' } ) ], user: null },
 		{
 			getChatGptSettings: async () => structuredClone( settings ),
+			recheckChatGptSettings: async () => structuredClone( settings ),
 			beginChatGptSignIn: async () => ( { attemptId: ATTEMPT } ),
 			waitForChatGptSignIn: () => outcome.promise,
 			cancelChatGptSignIn: async () => {
@@ -176,6 +178,36 @@ describe( 'ChatGPT account settings', () => {
 		expect( connector.signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( ACCOUNT_A );
 	} );
 
+	it( 'checks secure storage again when the ChatGPT settings open, never on a polled read, and shows what it found', async () => {
+		const host = { secureStorage: 'unavailable' as ChatGptSettings[ 'secureStorage' ] };
+		const read = (): ChatGptSettings => ( {
+			enabled: true,
+			signInSupported: true,
+			secureStorage: host.secureStorage,
+			accounts: [],
+		} );
+		const { connector, queryClient } = await openSettings(
+			{ secureStorage: 'unavailable' },
+			{
+				getChatGptSettings: async () => read(),
+				recheckChatGptSettings: async () => {
+					host.secureStorage = 'available';
+					return read();
+				},
+			}
+		);
+
+		expect(
+			await screen.findByText( /Secure storage keeps your sign-in across restarts/ )
+		).toBeVisible();
+		expect( screen.getByRole( 'button', { name: 'Start sign-in' } ) ).toBeEnabled();
+		for ( let poll = 0; poll < 3; poll++ ) {
+			await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+		}
+		expect( connector.recheckChatGptSettings ).toHaveBeenCalledTimes( 1 );
+		expect( connector.getChatGptSettings.mock.calls.length ).toBeGreaterThan( 3 );
+	} );
+
 	it( 'explains callback-host restrictions and keeps sign-in unavailable', async () => {
 		const { connector } = await openSettings( { signInSupported: false } );
 		expect( await screen.findByText( /Open Studio on localhost/ ) ).toBeVisible();
@@ -295,6 +327,7 @@ describe( 'ChatGPT account settings', () => {
 		await waitFor( () => expect( connector.getChatGptSettings ).toHaveBeenCalled() );
 		expect( screen.queryByText( 'Image generation' ) ).not.toBeInTheDocument();
 		expect( connector.getImageServiceState ).not.toHaveBeenCalled();
+		expect( connector.recheckChatGptSettings ).not.toHaveBeenCalled();
 	} );
 
 	it( 'cancels an attempt that finishes starting after Settings closes', async () => {
