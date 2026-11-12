@@ -1158,6 +1158,79 @@ describe( 'Signing in to ChatGPT', () => {
 			expect( await flow.wait( 'test-unknown-attempt' ) ).toEqual( failed( 'unknown-attempt' ) );
 			expect( flow.cancel( 'test-unknown-attempt' ) ).toBe( false );
 		} );
+
+		it( 'keeps a second sign-in apart from one still pending: neither’s callback completes the other, and cancelling one leaves the other', async () => {
+			const existing = await signInExisting();
+			const first = await begin( existing.registrationId );
+			const second = await begin( existing.registrationId );
+			const firstCallback = new URL( await authorize( first.url ) );
+			const secondCallback = new URL( await authorize( second.url ) );
+			expect( firstCallback.port ).not.toBe( secondCallback.port );
+
+			// Each listener refuses the other attempt's answer, and both go on waiting.
+			for ( const [ answer, port ] of [
+				[ firstCallback, secondCallback.port ],
+				[ secondCallback, firstCallback.port ],
+			] as const ) {
+				const misdelivered = new URL( answer );
+				misdelivered.port = port;
+				const delivery = await deliver( misdelivered.toString() );
+				expect( delivery.status ).toBe( 400 );
+				expectNoSecrets( delivery.page );
+			}
+			expect( fake.tokenRequests ).toHaveLength( 1 );
+
+			expect( flow.cancel( first.attemptId ) ).toBe( true );
+			expect( await flow.wait( first.attemptId ) ).toEqual( failed( 'cancelled' ) );
+			expect( await deliver( firstCallback.toString() ) ).toEqual( { status: 0, page: '' } );
+			await expectUntouched( existing );
+
+			expect( ( await deliver( secondCallback.toString() ) ).status ).toBe( 200 );
+			expect( await flow.wait( second.attemptId ) ).toMatchObject( {
+				ok: true,
+				registrationId: existing.registrationId,
+			} );
+			expect( fake.tokenRequests ).toHaveLength( 2 );
+			await expect( broker.getAccessToken( existing.registrationId ) ).resolves.toBe(
+				fake.issued[ 1 ].accessToken
+			);
+		} );
+
+		it( 'names only its own 127.0.0.1 listener as the callback, whatever is chosen or set in the environment', async () => {
+			const previousHost = process.env.HOST;
+			process.env.HOST = '0.0.0.0';
+			try {
+				const registrationId = registrationOf( ( await signIn() ).outcome );
+				await signIn( undefined, { storage: 'session' } );
+				await signIn( registrationId, { storage: 'session' } );
+				await signIn( registrationId, { storage: 'vault', reconsent: true } );
+				await broker.signOut( registrationId );
+				await signIn( registrationId );
+			} finally {
+				if ( previousHost === undefined ) {
+					delete process.env.HOST;
+				} else {
+					process.env.HOST = previousHost;
+				}
+			}
+
+			expect( fake.authorizeRequests ).toHaveLength( 5 );
+			const advertised = fake.authorizeRequests.map(
+				( query ) => query.get( 'redirect_uri' ) ?? ''
+			);
+			for ( const redirectUri of advertised ) {
+				expect( redirectUri ).toMatch( CALLBACK );
+			}
+			// The token exchange names the same callback the browser was sent to.
+			expect( fake.tokenRequests.map( ( form ) => form.get( 'redirect_uri' ) ) ).toEqual(
+				advertised
+			);
+			// Each was a listener of its own, closed with its attempt.
+			expect( new Set( advertised ).size ).toBe( advertised.length );
+			for ( const redirectUri of advertised ) {
+				expect( await deliver( redirectUri ) ).toEqual( { status: 0, page: '' } );
+			}
+		} );
 	} );
 
 	describe( 'the tokens a failed sign-in was issued', () => {
