@@ -21,7 +21,11 @@ import {
 } from '../execution-rules';
 import { createStudioClaudeMcpServer, createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture, targetOrigin } from './fixtures/execution-policy';
-import type { AgentSessionEvent, CreateAgentSessionOptions } from '@earendil-works/pi-coding-agent';
+import type {
+	AgentSessionEvent,
+	CreateAgentSessionOptions,
+	ToolDefinition,
+} from '@earendil-works/pi-coding-agent';
 
 // The contract between the Pi route's tools and the Claude route's. The Pi
 // route's registry is read from what real Pi turns register, under every host
@@ -35,7 +39,8 @@ type ClaudeStatus =
 	| { status: 'bridged' }
 	// Claude Code's own tool of that name stands for it, and the policy enables it.
 	| { status: 'native'; native: string }
-	// Neither route registers it when the host lacks `capability`.
+	// Neither route registers it when the host lacks `capability`. Where the host
+	// has it, Claude lists it exactly where Pi does, once the policy qualifies it.
 	| { status: 'absent'; capability: Capability }
 	// Not enabled yet: why, and the step that qualifies it. `native` names the
 	// Claude Code tool that would stand for it.
@@ -51,7 +56,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_create: {
 		status: 'unqualified',
 		step: 'C2a-2',
-		reason: `${ LOCAL }; selectSite must update the persisted target first (carry item 7)`,
+		reason: `${ LOCAL }; it changes the conversation's site (selectSite and its site preview), which nothing journals yet, so the guarded host refuses both (carry item 7)`,
 	},
 	site_info: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
 	site_start: { status: 'unqualified', step: 'C2a-2', reason: LOCAL },
@@ -180,6 +185,38 @@ vi.mock( '@studio/agent/node/global-instructions', async ( importOriginal ) => (
 	readGlobalInstructions: async () => undefined,
 } ) );
 
+// Records each call the shared execution runs; stubbed, it runs no tool, and a
+// bound tool's own `execute`, which skips it, refuses to run.
+const execution = vi.hoisted( () => ( { stub: false, runs: [] as string[] } ) );
+vi.mock( '../../tools/execution', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('../../tools/execution') >();
+	return {
+		...actual,
+		runStudioTool: async ( ...args: Parameters< typeof actual.runStudioTool > ) => {
+			execution.runs.push( args[ 0 ].name );
+			return execution.stub
+				? { status: 'completed' as const, result: { content: [] } }
+				: actual.runStudioTool( ...args );
+		},
+	};
+} );
+vi.mock( '../../tools/define-tool', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('../../tools/define-tool') >();
+	return {
+		...actual,
+		bindTool: ( ...args: Parameters< typeof actual.bindTool > ) => {
+			const bound = actual.bindTool( ...args );
+			return {
+				...bound,
+				execute: ( ...call: Parameters< typeof bound.execute > ) =>
+					execution.stub
+						? Promise.reject( new Error( `${ bound.name } ran outside the shared execution` ) )
+						: bound.execute( ...call ),
+			};
+		},
+	};
+} );
+
 const reply = {
 	role: 'assistant',
 	content: [ { type: 'text', text: 'Done.' } ],
@@ -218,11 +255,12 @@ class FakeSession {
 }
 
 let root: string;
+const piRegistered = new Map< string, ToolDefinition[] >();
 const piTools = new Map< string, string[] >();
 const claudeTools = new Map< string, string[] >();
 
 // The tools a real Pi turn registers for a host with these capabilities.
-async function piToolNames( scenario: Scenario ): Promise< string[] > {
+async function piToolsRegistered( scenario: Scenario ): Promise< ToolDefinition[] > {
 	const host = createFakeHost( path.join( root, 'sites' ) );
 	if ( scenario.ui ) host.ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
 	mocks.imageService = scenario.imageService;
@@ -236,7 +274,7 @@ async function piToolNames( scenario: Scenario ): Promise< string[] > {
 		onEvent: () => {},
 	} ).result;
 	const options = mocks.createAgentSession.mock.calls[ 0 ][ 0 ] as CreateAgentSessionOptions;
-	return ( options.customTools ?? [] ).map( ( tool ) => tool.name );
+	return options.customTools ?? [];
 }
 
 async function listed( server: ReturnType< typeof createStudioClaudeMcpServer > ) {
@@ -286,7 +324,12 @@ beforeAll( async () => {
 		extensionsResult: { extensions: [], errors: [], runtime: {} },
 	} ) );
 	for ( const scenario of SCENARIOS ) {
-		piTools.set( label( scenario ), await piToolNames( scenario ) );
+		const registered = await piToolsRegistered( scenario );
+		piRegistered.set( label( scenario ), registered );
+		piTools.set(
+			label( scenario ),
+			registered.map( ( tool ) => tool.name )
+		);
 		claudeTools.set( label( scenario ), await claudeToolNames( scenario ) );
 	}
 }, 60_000 );
@@ -349,6 +392,11 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 					expect( CLAUDE_NATIVE_TOOL_RULES.has( status.native ), name ).toBe( true );
 					expect( native, name ).toContain( status.native );
 					break;
+				case 'absent':
+					// Its capability decides where it is registered; the policy may
+					// enable it only once its rule is qualified.
+					if ( studio.includes( name ) ) expect( isQualifiedStudioRule( rule ), name ).toBe( true );
+					break;
 				default:
 					expect( studio, name ).not.toContain( name );
 					if ( rule ) expect( isQualifiedStudioRule( rule ), name ).toBe( false );
@@ -358,9 +406,13 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 					}
 			}
 		}
-		// Whatever the policy enables, the table marks as qualified.
+		// Whatever the policy enables, the table marks as qualified, or as absent
+		// without a host capability, which then decides where it is listed.
 		const bridged = statuses()
-			.filter( ( [ , status ] ) => status.status === 'bridged' )
+			.filter(
+				( [ name, status ] ) =>
+					status.status === 'bridged' || ( status.status === 'absent' && studio.includes( name ) )
+			)
 			.map( ( [ name ] ) => name );
 		const mapped = statuses().flatMap( ( [ , status ] ) =>
 			status.status === 'native' ? [ status.native ] : []
@@ -381,14 +433,58 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 		}
 	);
 
-	it( 'keeps every tool marked absent out of both routes for that capability', () => {
+	it( 'keeps every tool marked absent out of both routes without its capability, and lists it on Claude exactly where Pi does once qualified', () => {
+		const studio = enabledStudio();
 		for ( const [ name, status ] of statuses() ) {
 			if ( status.status !== 'absent' ) continue;
 			for ( const scenario of SCENARIOS ) {
-				expect( claudeTools.get( label( scenario ) ), name ).not.toContain( name );
-				if ( ! scenario[ status.capability ] )
-					expect( piTools.get( label( scenario ) ), name ).not.toContain( name );
+				const where = `${ name } (${ label( scenario ) })`;
+				const onPi = piTools.get( label( scenario ) )!.includes( name );
+				if ( ! scenario[ status.capability ] ) expect( onPi, where ).toBe( false );
+				expect( claudeTools.get( label( scenario ) )!.includes( name ), where ).toBe(
+					onPi && studio.includes( name )
+				);
 			}
+		}
+	} );
+
+	it( 'runs every Studio-defined tool a real Pi turn registers through the shared execution', async () => {
+		const studioDefined = new Set( [
+			...studioToolDefinitions.map( ( definition ) => definition.name ),
+			createAskUserQuestionTool( async () => ( {} ) ).name,
+			createPresentDesignOptionsTool().name,
+			createSkillTool()!.name,
+		] );
+		// Anything else a Pi turn registers is one of pi's own file tools.
+		const piFileTools = statuses().flatMap( ( [ name, status ] ) =>
+			'native' in status && status.native ? [ name ] : []
+		);
+		expect( registered().filter( ( name ) => ! studioDefined.has( name ) ) ).toEqual(
+			piFileTools.sort()
+		);
+		execution.stub = true;
+		try {
+			const ran = new Set< string >();
+			for ( const scenario of SCENARIOS )
+				for ( const tool of piRegistered.get( label( scenario ) )! ) {
+					if ( ! studioDefined.has( tool.name ) ) continue;
+					execution.runs.length = 0;
+					await tool.execute(
+						`call-${ tool.name }`,
+						{} as never,
+						undefined,
+						undefined,
+						{} as never
+					);
+					expect( execution.runs, `${ tool.name } (${ label( scenario ) })` ).toEqual( [
+						tool.name,
+					] );
+					ran.add( tool.name );
+				}
+			expect( [ ...ran ].sort() ).toEqual( [ ...studioDefined ].sort() );
+		} finally {
+			execution.stub = false;
+			execution.runs.length = 0;
 		}
 	} );
 

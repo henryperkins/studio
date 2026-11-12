@@ -3,7 +3,9 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DESIGN_SYSTEM_PREVIEW_PATH } from '@studio/agent/protocol/chat-artifacts';
 import { resolveClaudeSession } from '@studio/agent/protocol/claude-code';
+import { getCreatedSiteFromArtifact } from '../../sessions/placement';
 import { fakeSite } from '../../tests/fake-host';
 import { studioToolDefinitions } from '../../tools';
 import { createAskUserQuestionTool } from '../../tools/ask-user-question';
@@ -520,7 +522,7 @@ describe( 'Claude targets', () => {
 		await expect( store.readJournals( 'legacy' ) ).resolves.toEqual( [ [ prompt ] ] );
 	} );
 
-	it( 'creates sites only from a global conversation and records the new site for the next turn', async () => {
+	it( 'creates sites only from a global conversation, and keeps the conversation’s site until a site creation is journaled', async () => {
 		const workspace = { siteId: null, workingDirectory: '', configDirectory: '' };
 		const { policy, host, context, parent, localSite } = await setup( ( paths ) => ( {
 			target: { environment: 'global' },
@@ -548,13 +550,14 @@ describe( 'Claude targets', () => {
 				running: true,
 			} )
 		).rejects.toThrow();
-		await guarded.selectSite!( { id: 'new', name: 'New site', path: created, running: true } );
-		expect( selectSite ).toHaveBeenCalledOnce();
+		// Selecting even the site this turn created changes the conversation's
+		// site, which nothing journals yet, so it is refused.
+		await expect(
+			guarded.selectSite!( { id: 'new', name: 'New site', path: created, running: true } )
+		).rejects.toThrow( 'Denied' );
+		expect( selectSite ).not.toHaveBeenCalled();
 		await guarded.sites.create( 'Another', path.join( parent, 'another' ), () => {} );
-		expect( context.verifyTarget ).toHaveBeenLastCalledWith( {
-			environment: 'local',
-			siteId: 'new',
-		} );
+		expect( context.verifyTarget ).toHaveBeenLastCalledWith( { environment: 'global' } );
 		await expect(
 			guarded.sites.create( 'Nested', path.join( parent, 'nested', 'site' ), () => {} )
 		).rejects.toThrow();
@@ -614,7 +617,9 @@ describe( 'Claude Studio tools that act outside the host', () => {
 		).resolves.toBeUndefined();
 	} );
 
-	it( 'shows nothing in the conversation for a call or turn that has ended', async () => {
+	// The end of a call that settles normally is the bridge's to signal; its tests
+	// show a host kept past any call refusing everything.
+	it( 'shows nothing in the conversation once the signal it was guarded with aborts, as when the SDK cancels the call, or once the turn has ended', async () => {
 		const { policy, host, controller } = await setup();
 		const ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
 		host.ui = ui;
@@ -640,6 +645,48 @@ describe( 'Claude Studio tools that act outside the host', () => {
 		// Without an app showing the conversation there is nothing to fence.
 		host.ui = undefined;
 		expect( policy.guardHost( host, 'none' ).ui ).toBeUndefined();
+	} );
+
+	it( 'refuses to show anything that would bind the conversation to a site, until a site creation is journaled', async () => {
+		const { policy, host, site } = await setup();
+		const ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
+		host.ui = ui;
+		const fenced = policy.guardHost( host, 'call', new AbortController().signal );
+		const artifact = ( ...widgets: Array< { type: string; widgetProps: object } > ) =>
+			( { version: 1, id: randomUUID(), widgets } ) as never;
+		const sitePreview = ( widgetProps: object ) => ( { type: 'site-preview', widgetProps } );
+		const media = { type: 'media', widgetProps: { mediaKind: 'image' } };
+		const binding = [
+			artifact(
+				sitePreview( {
+					path: '/',
+					siteId: 'new',
+					siteName: 'New site',
+					sitePath: path.join( site, '..', 'new-site' ),
+					url: 'http://localhost:8890',
+				} )
+			),
+			artifact(
+				media,
+				sitePreview( { path: '/', siteId: fakeSite.id, siteName: fakeSite.name, sitePath: site } )
+			),
+		];
+		const unbinding = [
+			artifact( media ),
+			artifact( sitePreview( { path: DESIGN_SYSTEM_PREVIEW_PATH } ) ),
+			artifact( sitePreview( { path: '/', siteId: fakeSite.id } ) ),
+		];
+		// What the run manager would bind the conversation to is exactly what is refused.
+		for ( const item of binding ) {
+			expect( getCreatedSiteFromArtifact( item ) ).toBeDefined();
+			await expect( fenced.ui!.showArtifact( item ) ).rejects.toThrow( 'Denied' );
+		}
+		expect( ui.showArtifact ).not.toHaveBeenCalled();
+		for ( const item of unbinding ) {
+			expect( getCreatedSiteFromArtifact( item ) ).toBeUndefined();
+			await fenced.ui!.showArtifact( item );
+		}
+		expect( ui.showArtifact ).toHaveBeenCalledTimes( unbinding.length );
 	} );
 
 	it( 'names the Studio tools the turn may run, as its selection enables them', async () => {

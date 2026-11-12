@@ -5,6 +5,7 @@ import {
 	escapeClaudeApprovalText,
 	isClaudeReadOnlyClass,
 } from '@studio/agent/protocol/claude-code';
+import { getCreatedSiteFromArtifact } from '../sessions/placement';
 import {
 	CLAUDE_ACCOUNT_RECHECK_MS,
 	CLAUDE_NATIVE_TOOL_RULES,
@@ -168,8 +169,11 @@ export interface ClaudeExecutionPolicy {
 	authorizeStudioCall( call: ClaudeStudioCall ): Promise< boolean >;
 	/**
 	 * The host a Studio tool call runs against: every operation with an effect is
-	 * fenced, and the app showing the conversation hears nothing from a call or
-	 * turn that has ended.
+	 * fenced. Once `signal` or the turn aborts, it refuses every host operation
+	 * and the app showing the conversation hears nothing from it. The caller
+	 * aborts `signal` when the call settles, however it ended, since the SDK
+	 * aborts a call's own signal only when it cancels the call. It never changes
+	 * the conversation's site: nothing journals that yet.
 	 */
 	guardHost( host: StudioAgentHost, toolCallId: string, signal?: AbortSignal ): StudioAgentHost;
 	requestApproval(
@@ -251,9 +255,6 @@ export function createClaudeExecutionPolicy(
 	const studioTools = new Set(
 		claudeStudioTools( context.enabledTools, context.navigationConfinement, targetOrigin )
 	);
-	// The target the conversation should still have: the one sent, or the site
-	// this turn created, which it recorded for the next turn.
-	let persisted: ClaudeStudioTarget = context.target;
 	signal.addEventListener( 'abort', () => grants.clear(), { once: true } );
 
 	let accountVerifiedAt = context.accountVerifiedAt;
@@ -292,7 +293,7 @@ export function createClaudeExecutionPolicy(
 			return false;
 		const [ connected, targeted ] = await Promise.all( [
 			context.stillConnected().catch( () => false ),
-			context.verifyTarget( persisted ).catch( () => false ),
+			context.verifyTarget( context.target ).catch( () => false ),
 		] );
 		if ( ! connected || ! targeted ) {
 			controller.abort();
@@ -806,15 +807,15 @@ export function createClaudeExecutionPolicy(
 				prepared.operation
 			);
 		};
-		const selectSite = host.selectSite;
 		const { ui } = host;
 		return {
 			...host,
-			// What a call shows in the conversation is written to the chat's record
-			// and can bind the chat to a site, so it stops with the call's authority.
+			// What a call shows in the conversation is written to the chat's record,
+			// so it stops with the call's authority. An artifact the run manager
+			// would bind the chat to a site with is refused, like `selectSite`.
 			ui: ui && {
 				showArtifact: async ( artifact ) => {
-					if ( operationSignal.aborted ) throw denied();
+					if ( operationSignal.aborted || getCreatedSiteFromArtifact( artifact ) ) throw denied();
 					await ui.showArtifact( artifact );
 				},
 				reloadPreview: () => {
@@ -904,20 +905,11 @@ export function createClaudeExecutionPolicy(
 							host.sync.pull( current!, options, remoteSite, onProgress, fenceOptions )
 					),
 			},
-			// A site this turn created becomes the conversation's target for the next
-			// turn; this turn keeps the target it was sent with.
-			selectSite: selectSite
-				? async ( site ) => {
-						if (
-							context.workspace.siteId !== null ||
-							typeof site.id !== 'string' ||
-							! site.id ||
-							! createdSites.has( path.resolve( site.path ) ) ||
-							! ( await checkpoint( callSignal ) )
-						)
-							throw denied();
-						await selectSite( site );
-						persisted = { environment: 'local', siteId: site.id };
+			// Changing the conversation's site is refused until the step that
+			// qualifies site creation journals it (carry item 7).
+			selectSite: host.selectSite
+				? async () => {
+						throw denied();
 				  }
 				: undefined,
 		};

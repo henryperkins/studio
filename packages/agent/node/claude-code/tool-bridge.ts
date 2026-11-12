@@ -73,7 +73,11 @@ export function createStudioClaudeDiscoveryServer() {
 }
 
 export interface ClaudeStudioToolBridgeOptions {
-	/** The tools a call can name before the policy selects; by default the host's candidates. */
+	/**
+	 * Narrows the tools a call can name before the policy selects; by default the
+	 * host's candidates. Only those candidates' own definitions count: the policy
+	 * authorizes a call by its tool's name, so any other definition is dropped.
+	 */
 	candidates?: readonly StudioToolDefinition[];
 }
 
@@ -91,8 +95,9 @@ export function createStudioClaudeToolBridge(
 ) {
 	const { runId, turnId, policy } = turn;
 	const enabled = new Set( policy.studioTools );
-	const tools = ( options.candidates ?? claudeStudioToolCandidates( host ) ).filter(
-		( definition ) => enabled.has( definition.name )
+	const registry = claudeStudioToolCandidates( host );
+	const tools = ( options.candidates ?? registry ).filter(
+		( definition ) => registry.includes( definition ) && enabled.has( definition.name )
 	);
 	const active = new Set< Promise< unknown > >();
 	async function execute(
@@ -105,9 +110,18 @@ export function createStudioClaudeToolBridge(
 		const definition = tools.find( ( candidate ) => candidate.name === name );
 		let run: Awaited< ReturnType< typeof runStudioTool > > | undefined;
 		if ( definition ) {
+			// The SDK aborts a call's own signal only when it cancels the call, so
+			// the host lives exactly as long as this call: once the call has
+			// settled, however it ended, a tool that kept the host can do nothing
+			// with it.
+			const call = new AbortController();
 			try {
 				// The tool reaches the host only as the policy guards it for this call.
-				const guarded = policy.guardHost( host, toolCallId, signal );
+				const guarded = policy.guardHost(
+					host,
+					toolCallId,
+					signal ? AbortSignal.any( [ signal, call.signal ] ) : call.signal
+				);
 				run = await runStudioTool( bindTool( definition, guarded ), args, {
 					signal: signal ? AbortSignal.any( [ policy.signal, signal ] ) : policy.signal,
 					authorize: () => policy.authorizeStudioCall( { host, name, args, toolCallId, signal } ),
@@ -118,6 +132,8 @@ export function createStudioClaudeToolBridge(
 				} );
 			} catch {
 				run = undefined;
+			} finally {
+				call.abort();
 			}
 		}
 		if ( run?.status !== 'completed' ) {
