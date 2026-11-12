@@ -190,8 +190,20 @@ export interface ClaudeExecutionPolicy {
 	 * A different or unreadable account ends the turn's authority.
 	 */
 	refreshAccount(): Promise< boolean >;
+	/**
+	 * Why the policy refused something a call asked for, in words the model may
+	 * hear: fixed sentences, never an argument, a path or a value. Reading them
+	 * forgets them.
+	 */
+	takeRefusals( toolCallId: string ): readonly string[];
 	dispose(): void;
 }
+
+/** The fixed sentences `takeRefusals` gives. */
+const REFUSALS = {
+	wpCli: 'This WP-CLI command is outside what Studio runs on the Claude route.',
+	notApproved: 'The user did not approve this operation, or did not answer in time.',
+} as const;
 
 function deepFreeze< T >( value: T ): T {
 	if ( value && typeof value === 'object' && ! Object.isFrozen( value ) ) {
@@ -238,6 +250,11 @@ export function createClaudeExecutionPolicy(
 	const signal = AbortSignal.any( [ context.signal, controller.signal ] );
 	const grants = new Map< string, string >();
 	const createdSites = new Set< string >();
+	const refusals = new Map< string, Set< string > >();
+	const refuse = ( toolCallId: string, reason: string ) => {
+		if ( ! refusals.has( toolCallId ) ) refusals.set( toolCallId, new Set() );
+		refusals.get( toolCallId )!.add( reason );
+	};
 	// A tool use is asked about at most once, whether by the hook or by the
 	// permission request, so a hook that times out cannot be answered later.
 	const askedToolUses = new Set< string >();
@@ -252,7 +269,14 @@ export function createClaudeExecutionPolicy(
 	const studioTools = new Set(
 		claudeStudioTools( context.enabledTools, context.navigationConfinement, targetOrigin )
 	);
-	signal.addEventListener( 'abort', () => grants.clear(), { once: true } );
+	signal.addEventListener(
+		'abort',
+		() => {
+			grants.clear();
+			refusals.clear();
+		},
+		{ once: true }
+	);
 
 	let accountVerifiedAt = context.accountVerifiedAt;
 	let accountRead: Promise< boolean > | undefined;
@@ -412,6 +436,7 @@ export function createClaudeExecutionPolicy(
 		} );
 		const allowed = await awaitAnswer( request, callSignal );
 		context.onEvent( { type: 'approval.resolved', ...ids } );
+		if ( ! allowed ) refuse( toolCallId, REFUSALS.notApproved );
 		if ( ! allowed || ! ( await accountCheckpoint( callSignal ) ) ) return;
 		grants.set( request.requestId, fingerprint( operation, toolCallId ) );
 		return { requestId: request.requestId };
@@ -679,7 +704,10 @@ export function createClaudeExecutionPolicy(
 			request.name === 'sites.wpCli'
 				? classifyWpCliArgs( request.args )
 				: HOST_OPERATION_CLASSES[ request.name ];
-		if ( ! operationClass ) return;
+		if ( ! operationClass ) {
+			if ( request.name === 'sites.wpCli' ) refuse( toolCallId, REFUSALS.wpCli );
+			return;
+		}
 		let site: HostSite | undefined;
 		const localPaths = [ ...( request.localPaths ?? [] ) ];
 		if ( request.site ) {
@@ -921,6 +949,11 @@ export function createClaudeExecutionPolicy(
 		requestApproval,
 		authorizeExecution,
 		refreshAccount: () => accountIsCurrent( false ),
+		takeRefusals: ( toolCallId ) => {
+			const reasons = [ ...( refusals.get( toolCallId ) ?? [] ) ];
+			refusals.delete( toolCallId );
+			return reasons;
+		},
 		dispose: () => controller.abort(),
 	};
 }

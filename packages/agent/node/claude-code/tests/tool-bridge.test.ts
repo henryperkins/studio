@@ -103,6 +103,58 @@ describe( 'Claude Studio tool boundary (mock host)', () => {
 	} );
 } );
 
+describe( 'what the model hears of a call Studio did not run', () => {
+	const text = ( result: { content: Array< { type: string; text?: string } > } ) =>
+		result.content.map( ( part ) => part.text ?? '' ).join( '\n' );
+
+	it( 'names the invalid arguments, without their values, so the model can correct the call', async () => {
+		const { bridge, host } = await setup();
+		const result = await bridge.invoke( 'wp_cli', { nameOrPath: 'secret-site', command: 7 } );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toMatch( /^Invalid arguments for wp_cli: \/command .+\.$/ );
+		expect( text( result ) ).not.toMatch( /secret-site|7/ );
+		expect( host.sites.wpCli ).not.toHaveBeenCalled();
+	} );
+
+	it( 'says that a WP-CLI command is outside what this route runs, without repeating it', async () => {
+		const { bridge, host } = await setup();
+		const result = await bridge.invoke( 'wp_cli', {
+			nameOrPath: 'site',
+			command: 'plugin install secret-plugin',
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain(
+			'This WP-CLI command is outside what Studio runs on the Claude route.'
+		);
+		expect( text( result ) ).not.toContain( 'secret-plugin' );
+		expect( host.sites.wpCli ).not.toHaveBeenCalled();
+	} );
+
+	it( 'says that the user did not approve an operation', async () => {
+		const { bridge, host } = await setup( vi.fn( async () => 'deny' as const ) );
+		const result = await bridge.invoke( 'wp_cli', {
+			nameOrPath: 'site',
+			command: 'post create --post_status=draft --post_title=Hello',
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( 'The user did not approve this operation' );
+		expect( host.sites.wpCli ).not.toHaveBeenCalled();
+	} );
+
+	it( 'keeps the fixed sentence for a failure that is not a refusal, whose text can hold anything', async () => {
+		const { bridge, host } = await setup();
+		host.sites.wpCli = vi.fn( async () => {
+			throw new Error( 'secret diagnostic' );
+		} );
+		expect(
+			await bridge.invoke( 'wp_cli', { nameOrPath: 'site', command: 'option get blogname' } )
+		).toEqual( {
+			isError: true,
+			content: [ { type: 'text', text: 'Studio operation denied or failed.' } ],
+		} );
+	} );
+} );
+
 it( 'blocks a local operation when an ancestor WP-CLI config can redirect it', async () => {
 	const { host, bridge, parent } = await setup();
 	await writeFile( path.join( parent, 'wp-cli.local.yml' ), 'ssh: remote.example.invalid\n' );
@@ -424,6 +476,7 @@ function permissivePolicy( names: string[] ) {
 		requestApproval: vi.fn( async () => undefined ),
 		authorizeExecution: vi.fn( async () => false ),
 		refreshAccount: vi.fn( async () => true ),
+		takeRefusals: () => [],
 		dispose: () => controller.abort(),
 	};
 	return { policy, guarded, controller };

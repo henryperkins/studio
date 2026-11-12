@@ -14,6 +14,7 @@ import type { ClaudeExecutionPolicy } from './execution-policy';
 import type { StudioAgentHost } from '../host';
 import type { StudioToolsOptions } from '../tools';
 import type { StudioToolDefinition, ToolResult } from '../tools/define-tool';
+import type { StudioToolRun } from '../tools/execution';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 
 type BridgeResult = { content: ToolResult[ 'content' ]; isError: boolean };
@@ -80,6 +81,21 @@ export function createStudioClaudeDiscoveryServer() {
 	};
 }
 
+// What Claude hears of a call that did not complete: which arguments the
+// canonical schema refuses, so it can correct them; why the policy refused,
+// in the policy's own fixed words; or else one fixed sentence, since a
+// failure's own text can hold anything.
+function describeNotRun(
+	name: string,
+	run: StudioToolRun | undefined,
+	refused: readonly string[]
+): string {
+	if ( run?.status === 'invalid-arguments' )
+		return `Invalid arguments for ${ name }: ${ run.problems.join( '; ' ) }.`;
+	if ( refused.length ) return `Studio did not run this. ${ refused.join( ' ' ) }`;
+	return 'Studio operation denied or failed.';
+}
+
 export interface ClaudeStudioToolBridgeOptions {
 	/**
 	 * Narrows the tools a call can name before the policy selects; by default the
@@ -116,7 +132,7 @@ export function createStudioClaudeToolBridge(
 		const toolCallId = randomUUID();
 		onEvent( { type: 'tool.started', runId, turnId, toolCallId, name } );
 		const definition = tools.find( ( candidate ) => candidate.name === name );
-		let run: Awaited< ReturnType< typeof runStudioTool > > | undefined;
+		let run: StudioToolRun | undefined;
 		if ( definition ) {
 			// The SDK aborts a call's own signal only when it cancels the call, so
 			// the host lives exactly as long as this call: once the call has
@@ -144,15 +160,21 @@ export function createStudioClaudeToolBridge(
 				call.abort();
 			}
 		}
+		const refused = policy.takeRefusals( toolCallId );
 		if ( run?.status !== 'completed' ) {
 			onEvent( { type: 'tool.result', runId, turnId, toolCallId, isError: true } );
 			return {
 				isError: true,
-				content: [ { type: 'text', text: 'Studio operation denied or failed.' } ],
+				content: [ { type: 'text', text: describeNotRun( name, run, refused ) } ],
 			};
 		}
 		onEvent( { type: 'tool.result', runId, turnId, toolCallId, isError: false } );
-		return { isError: false, content: run.result.content };
+		return {
+			isError: false,
+			content: refused.length
+				? [ ...run.result.content, { type: 'text', text: `Studio note: ${ refused.join( ' ' ) }` } ]
+				: run.result.content,
+		};
 	}
 	// `signal` is the MCP call's own: the SDK aborts it when the native runtime
 	// gives up on the call, which cancels its approval and anything not yet started.
