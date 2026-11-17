@@ -81,7 +81,7 @@ function decodedKey( key: string ): string {
  * outright. Stricter than the server, as the eval harness's checklist is: a
  * read refused here costs the model one retry.
  */
-export function isRefusedWpcomQueryKey( key: string ): boolean {
+function isRefusedWpcomQueryKey( key: string ): boolean {
 	const decoded = decodedKey( key );
 	if ( hasControlCharacter( key ) || hasControlCharacter( decoded ) ) return true;
 	const stripped = decoded.replace( /^\s+/, '' );
