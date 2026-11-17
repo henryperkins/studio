@@ -569,6 +569,9 @@ export function createClaudeExecutionPolicy(
 	// has settled, and the call that is creating a site, if any: one at a time.
 	const callSignals = new Map< string, AbortSignal >();
 	let creatingCall: string | undefined;
+	// The Studio tool each call the policy admitted is a call of, until the
+	// call settles: what a guarded host gives can depend on the tool it serves.
+	const admittedCalls = new Map< string, string >();
 	const refusals = new Map< string, Set< string > >();
 	const refuse = ( toolCallId: string, reason: string ) => {
 		if ( ! refusals.has( toolCallId ) ) refusals.set( toolCallId, new Set() );
@@ -611,6 +614,7 @@ export function createClaudeExecutionPolicy(
 		() => {
 			grants.clear();
 			refusals.clear();
+			admittedCalls.clear();
 		},
 		{ once: true }
 	);
@@ -1205,7 +1209,10 @@ export function createClaudeExecutionPolicy(
 		// is not followed. The login too, which the tool reads itself once this
 		// returns. Like the fence before a command starts, this comes after the
 		// call is journaled.
-		return authorized && ( await filesHold() ) && ( await loginHolds() );
+		const admitted = authorized && ( await filesHold() ) && ( await loginHolds() );
+		if ( admitted && ! signal.aborted && ! callSignal?.aborted )
+			admittedCalls.set( toolCallId, name );
+		return admitted;
 	}
 
 	async function prepare(
@@ -1677,7 +1684,10 @@ export function createClaudeExecutionPolicy(
 			operationSignal.addEventListener(
 				'abort',
 				() => {
-					if ( callSignals.get( toolCallId ) === operationSignal ) callSignals.delete( toolCallId );
+					if ( callSignals.get( toolCallId ) === operationSignal ) {
+						callSignals.delete( toolCallId );
+						admittedCalls.delete( toolCallId );
+					}
 				},
 				{ once: true }
 			);
@@ -1736,10 +1746,18 @@ export function createClaudeExecutionPolicy(
 			return read();
 		};
 		// A listing of every local site, or of the WordPress.com sites the stored
-		// login reaches: only in a conversation without a site, which works on
-		// none yet, under the turn's authority, while the call lives.
+		// login reaches: only inside a call the policy admitted of a tool whose
+		// rule lists them, in a conversation without a site, which works on none
+		// yet, under the turn's authority, while the call lives.
 		const listing = async < T >( list: () => Promise< T > ): Promise< T > => {
-			if ( operationSignal.aborted || hasSite() || ! ( await checkpoint( callSignal ) ) )
+			const tool = admittedCalls.get( toolCallId );
+			if (
+				operationSignal.aborted ||
+				! tool ||
+				CLAUDE_STUDIO_TOOL_RULES.get( tool )?.lists !== true ||
+				hasSite() ||
+				! ( await checkpoint( callSignal ) )
+			)
 				throw denied();
 			operationSignal.throwIfAborted();
 			if ( hasSite() ) throw denied();

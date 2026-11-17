@@ -415,6 +415,12 @@ export interface ClaudeStudioToolRule {
 	 */
 	readonly createsSite?: true;
 	/**
+	 * Lists every local site and the WordPress.com sites the stored login
+	 * reaches, through the guarded host, which gives those listings only inside
+	 * a call of a tool whose rule says so, in a conversation without a site.
+	 */
+	readonly lists?: true;
+	/**
 	 * Drives a browser, whether it opens a URL from its arguments, a page of the
 	 * named site or a document it wrote itself; it can be enabled only under a
 	 * verified navigation guard.
@@ -671,14 +677,15 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	[
 		listSitesTool.name,
 		// It lists the local sites and the WordPress.com sites the stored login
-		// reaches, both through the guarded host, which gives them only in a
-		// conversation without a site, while the call lives, and of each local
-		// site only the fields every site has. A conversation that has its site
-		// works on that one, so there the call is refused. The tool reads the
-		// stored login itself and hands it to the host. Its module links
-		// `tools/utils.ts`, whose `runWpCli` runs only through the host.
+		// reaches, both through the guarded host, which gives them only inside a
+		// call of this tool, in a conversation without a site, while the call
+		// lives, and of each local site only the fields every site has. A
+		// conversation that has its site works on that one, so there the call is
+		// refused. The tool reads the stored login itself and hands it to the
+		// host. Its module links `tools/utils.ts`, whose `runWpCli` runs only
+		// through the host.
 		qualified(
-			studioRule( 'remote-read', { withoutSite: true, config: storedLogin } ),
+			studioRule( 'remote-read', { withoutSite: true, lists: true, config: storedLogin } ),
 			using( {
 				readsLocalFiles: [ 'config' ],
 				runsWpCli: [ 'host' ],
@@ -1277,6 +1284,7 @@ const RULE_ELEMENTS: Readonly<
 	navigates: 'mark',
 	withoutSite: 'mark',
 	createsSite: 'mark',
+	lists: 'mark',
 	note: 'text',
 };
 
@@ -1380,6 +1388,9 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 		// with them and where.
 		( elements.operationClass !== 'external-message' || typeof elements.note === 'string' ) &&
 		( elements.createsSite !== true || elements.withoutSite === true ) &&
+		// The listings are host operations, one of which reaches WordPress.com.
+		( elements.lists !== true ||
+			( used.has( 'callsHostOperation' ) && used.has( 'reachesWpcom' ) ) ) &&
 		( ! used.has( 'runsWpCli' ) || used.has( 'callsHostOperation' ) ) &&
 		// A rule approved at its host operations is admitted without an approval
 		// of its own, so files it wrote itself would be written without an

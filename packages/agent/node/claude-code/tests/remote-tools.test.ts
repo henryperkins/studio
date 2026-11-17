@@ -242,10 +242,23 @@ describe( 'site_list on the Claude route', () => {
 } );
 
 describe( 'the listings the guarded host gives', () => {
+	// The call a guarded host serves, admitted as a call of `name`.
+	const admitted = async ( fixture: Awaited< ReturnType< typeof setup > >, name: string ) =>
+		expect(
+			await fixture.policy.authorizeStudioCall( {
+				host: fixture.host,
+				name,
+				args: {},
+				toolCallId: 'call',
+			} )
+		).toBe( true );
+
 	it( 'lists every site and the account’s WordPress.com sites only in a conversation without a site, while the call lives', async () => {
-		const { policy, host } = await setup( global );
+		const fixture = await setup( global );
+		const { policy, host } = fixture;
 		const call = new AbortController();
 		const guarded = policy.guardHost( host, 'call', call.signal );
+		await admitted( fixture, 'site_list' );
 		await expect( guarded.sites.list() ).resolves.toEqual( [] );
 		await expect( guarded.wpcom.sites( LOGIN.accessToken ) ).resolves.toEqual( [] );
 		call.abort();
@@ -261,8 +274,9 @@ describe( 'the listings the guarded host gives', () => {
 		await expect( guarded.sites.list() ).rejects.toThrow( 'Denied' );
 		await expect( guarded.wpcom.sites( LOGIN.accessToken ) ).rejects.toThrow( 'Denied' );
 		const moved = await setup( global );
-		vi.mocked( moved.context.verifyTarget ).mockResolvedValue( false );
 		const stale = moved.policy.guardHost( moved.host, 'call' );
+		await admitted( moved, 'site_list' );
+		vi.mocked( moved.context.verifyTarget ).mockResolvedValue( false );
 		await expect( stale.sites.list() ).rejects.toThrow( 'Denied' );
 		await expect( stale.wpcom.sites( LOGIN.accessToken ) ).rejects.toThrow( 'Denied' );
 		const unbound = await setup( global );
@@ -273,6 +287,24 @@ describe( 'the listings the guarded host gives', () => {
 			expect( host.sites.list ).not.toHaveBeenCalled();
 			expect( host.wpcom.sites ).not.toHaveBeenCalled();
 			expect( host.sites.all ).not.toHaveBeenCalled();
+		}
+	} );
+
+	it( 'lists nothing inside a call of another tool, or of no admitted tool, even in a conversation without a site', async () => {
+		// Another qualified tool a conversation without a site runs.
+		const other = await setup( global );
+		const otherHost = other.policy.guardHost( other.host, 'call' );
+		await admitted( other, 'site_create' );
+		// A call the policy never admitted.
+		const unadmitted = await setup( global );
+		const unadmittedHost = unadmitted.policy.guardHost( unadmitted.host, 'call' );
+		for ( const guarded of [ otherHost, unadmittedHost ] ) {
+			await expect( guarded.sites.list() ).rejects.toThrow( 'Denied' );
+			await expect( guarded.wpcom.sites( LOGIN.accessToken ) ).rejects.toThrow( 'Denied' );
+		}
+		for ( const { host } of [ other, unadmitted ] ) {
+			expect( host.sites.list ).not.toHaveBeenCalled();
+			expect( host.wpcom.sites ).not.toHaveBeenCalled();
 		}
 	} );
 } );

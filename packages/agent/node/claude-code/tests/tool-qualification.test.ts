@@ -635,6 +635,16 @@ describe( 'Claude Studio tool qualification', () => {
 				'host approval without the host channel',
 				qualifiedRule( { approval: 'host', operationClass: 'command' }, noChannels ),
 			],
+			// The listings are host operations, and one reaches WordPress.com.
+			[ 'listings without the host channel', qualifiedRule( { lists: true }, noChannels ) ],
+			[
+				'listings without the WordPress.com channel',
+				qualifiedRule(
+					{ lists: true },
+					{ ...noChannels, runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] }
+				),
+			],
+			[ 'a listings mark that is not true', qualifiedRule( { lists: 'yes' }, noChannels ) ],
 			// A rule approved at its host operation is admitted without an approval of
 			// its own, so files it wrote itself would be written without one that
 			// shows them, whatever its class.
