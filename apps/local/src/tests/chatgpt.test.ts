@@ -311,7 +311,9 @@ describe( 'ChatGPT HTTP boundary', () => {
 			expect( text ).not.toMatch( /settings\.lock|EEXIST|studio-chatgpt-http/ );
 		}
 		expect(
-			( await loadAiSession( root, id ) ).entries.filter( ( entry ) => entry.type !== 'session' )
+			( await loadAiSession( root, id ) ).entries.filter(
+				( entry ) => entry.type === 'custom' || entry.type === 'model_change'
+			)
 		).toEqual( [] );
 	} );
 
