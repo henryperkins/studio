@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'crypto';
-import { realpath } from 'fs/promises';
+import { realpath, stat } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
@@ -38,6 +38,7 @@ import {
 import {
 	isAllowedNativePath,
 	isBundledFolder,
+	isInside,
 	isInsideCanonicalRoot,
 	isJudgeable,
 	isOutsideReach,
@@ -282,7 +283,7 @@ const REFUSALS = {
 	siteFiles:
 		'A file this tool writes must be an absolute path inside the folder of this conversation’s site, through every link it passes.',
 	mediaUploads:
-		'Studio adds an image to a site’s media library only while WordPress keeps that site’s uploads inside the site’s own folder, and this site’s uploads folder lies outside it.',
+		'Studio adds an image to a site’s media library only when the file it writes for it lies, through every link, inside the site’s own folder and in the folder WordPress made for this month’s uploads; here it does not, since this site keeps its uploads outside its folder. Studio deleted the attachments it had reserved and generated nothing; WordPress may have left an empty folder for this month’s uploads where the site keeps them.',
 } as const;
 
 // What a push or pull with each option overwrites on the side it copies to:
@@ -506,6 +507,17 @@ function insertedFor( reserved: unknown, names: readonly string[] ): number[] {
 		if ( named && stems.includes( named.toLowerCase() ) ) ids.add( entry.id );
 	}
 	return [ ...ids ];
+}
+
+// Whether a folder exists as a folder and resolves, through every link, inside
+// `root`.
+async function isMadeFolderInside( root: string, folder: string ): Promise< boolean > {
+	try {
+		const resolved = await realpath( folder );
+		return ( await stat( resolved ) ).isDirectory() && isInside( root, resolved );
+	} catch {
+		return false;
+	}
 }
 
 // What the journal entry of a settling says it settles, by count only.
@@ -2205,19 +2217,24 @@ export function createClaudeExecutionPolicy(
 								await rollBack( insertedFor( reserved, requested ) );
 								throw denied();
 							}
+							// The reservation names each file by what follows the site's
+							// path in the uploads folder's path, which says nothing of where
+							// that folder is: the file the tool writes must lie inside the
+							// site, and in the folder WordPress has just made for this
+							// month's uploads, which is where those uploads are.
 							const targetSite = actingSite;
-							for ( const { file } of reserved )
+							for ( const { file } of reserved ) {
+								const written = path.join( current!.path, file );
 								if (
 									! targetSite ||
-									! ( await isInsideCanonicalRoot(
-										targetSite.path,
-										path.join( current!.path, file )
-									) )
+									! ( await isInsideCanonicalRoot( targetSite.path, written ) ) ||
+									! ( await isMadeFolderInside( targetSite.path, path.dirname( written ) ) )
 								) {
 									await rollBack( reserved.map( ( { id } ) => id ) );
 									refuse( toolCallId, REFUSALS.mediaUploads );
 									throw denied();
 								}
+							}
 							for ( const { id } of reserved ) reservedAttachments.add( id );
 							return reserved;
 						}

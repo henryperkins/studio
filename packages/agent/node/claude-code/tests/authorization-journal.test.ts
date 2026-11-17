@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { writeFile } from 'fs/promises';
+import { mkdir, writeFile } from 'fs/promises';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fakePreview, fakeRemoteSite, fakeSite } from '../../tests/fake-host';
@@ -171,15 +171,21 @@ const creatingSite = ( host: StudioAgentHost, paths: Paths ) =>
 const listingPreview = ( host: StudioAgentHost ) => {
 	host.previews.list = vi.fn( async () => [ fakePreview ] );
 };
-// WordPress reserving an attachment in the target site's uploads folder.
+// WordPress reserving an attachment in the target site's uploads folder, which
+// it makes for this month first.
 const reservingAttachments = ( host: StudioAgentHost ) => {
-	host.sites.wpCli = vi.fn( async () => ( {
-		exitCode: 0,
-		stdout: JSON.stringify( [
-			{ id: 7, file: 'wp-content/uploads/2026/11/hero.png', url: 'http://localhost/hero.png' },
-		] ),
-		stderr: '',
-	} ) );
+	host.sites.wpCli = vi.fn( async ( site ) => {
+		await mkdir( path.join( site.path, 'wp-content', 'uploads', '2026', '11' ), {
+			recursive: true,
+		} );
+		return {
+			exitCode: 0,
+			stdout: JSON.stringify( [
+				{ id: 7, file: 'wp-content/uploads/2026/11/hero.png', url: 'http://localhost/hero.png' },
+			] ),
+			stderr: '',
+		};
+	} );
 };
 
 // A call of each host operation that does more than read. `before` runs first,
