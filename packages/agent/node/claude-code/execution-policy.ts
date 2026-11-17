@@ -227,6 +227,8 @@ const REFUSALS = {
 		'A conversation works on one site, and this conversation already has its site. Ask the user to start a new conversation to create another one.',
 	siteBinding:
 		'Studio did not make that site this conversation’s site: only a site this turn created, in a conversation without a site, can become it.',
+	siteFolderMissing:
+		'The new site is now this conversation’s site, but Studio could not find its folder, so this turn acts on no site.',
 } as const;
 
 function deepFreeze< T >( value: T ): T {
@@ -306,9 +308,13 @@ export function createClaudeExecutionPolicy(
 	// that site, for the rest of the turn. Site-bound calls resolve against it.
 	let actingTarget: ClaudeStudioTarget = context.target;
 	let actingSite: { id: string; path: string } | undefined = context.targetSite;
-	// Whether the conversation has its site: it was started on one, or it acts
-	// on one. A conversation works on one site.
-	const hasSite = () => context.workspace.siteId !== null || actingTarget.environment !== 'global';
+	// Whether this turn has changed the conversation's site, from the moment
+	// that change is made, whether or not the turn then found the site's folder.
+	let siteChanged = false;
+	// Whether the conversation has its site: it was started on one, it acts on
+	// one, or this turn changed it. A conversation works on one site.
+	const hasSite = () =>
+		context.workspace.siteId !== null || actingTarget.environment !== 'global' || siteChanged;
 	const refusals = new Map< string, Set< string > >();
 	const refuse = ( toolCallId: string, reason: string ) => {
 		if ( ! refusals.has( toolCallId ) ) refusals.set( toolCallId, new Set() );
@@ -1107,6 +1113,7 @@ export function createClaudeExecutionPolicy(
 			if ( ! ( await admit( operation, toolCallId, callSignal, grant?.requestId ) ) )
 				throw denied();
 			operationSignal.throwIfAborted();
+			siteChanged = true;
 			await make( siteId );
 		};
 		const { ui } = host;
@@ -1241,9 +1248,12 @@ export function createClaudeExecutionPolicy(
 								const target: ClaudeStudioTarget = { environment: 'local', siteId };
 								await writeTarget( target, () => selectSite( site ) );
 								// A folder that cannot be resolved binds nothing: calls on
-								// the site are then refused, as before the change.
+								// the site are then refused, and the turn acts on no site.
 								const folder = await realpath( site.path ).catch( () => undefined );
-								if ( ! folder ) return;
+								if ( ! folder ) {
+									refuse( toolCallId, REFUSALS.siteFolderMissing );
+									return;
+								}
 								actingTarget = target;
 								actingSite = { id: siteId, path: folder };
 							}

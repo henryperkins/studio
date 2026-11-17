@@ -742,8 +742,11 @@ describe( 'site_create on the Claude route', () => {
 			order.push( `journal ${ event.operation.tool }` );
 			await record( event );
 		};
-		vi.mocked( host.sites.create ).mockImplementation( async () => {
+		const create = vi.mocked( host.sites.create );
+		const creating = create.getMockImplementation()!;
+		create.mockImplementation( async ( ...args ) => {
 			order.push( 'host sites.create' );
+			await creating( ...args );
 		} );
 		const select = vi.mocked( host.selectSite! );
 		const selecting = select.getMockImplementation()!;
@@ -1059,6 +1062,28 @@ describe( 'site_create on the Claude route', () => {
 		expect( ( await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } ) ).isError ).toBe(
 			false
 		);
+		const before = journal.length;
+		const second = await bridge.invoke( 'site_create', { name: 'Another Shop' } );
+		expect( second.isError ).toBe( true );
+		expect( text( second ) ).toContain( ONE_SITE );
+		expect( host.sites.create ).toHaveBeenCalledOnce();
+		expect( journal ).toHaveLength( before );
+	} );
+
+	it( 'has its site once the selection has landed, even when that site’s folder cannot be found, and then says the turn acts on no site', async () => {
+		const { bridge, host, journal, site } = await setupGlobal();
+		// The host creates nothing on disk, so the selected site's folder cannot be resolved.
+		vi.mocked( host.sites.create ).mockImplementation( async () => {} );
+		const result = await bridge.invoke( 'site_create', { name: site.name } );
+		expect( result.isError ).toBe( false );
+		expect( host.selectSite ).toHaveBeenCalledOnce();
+		const note = result.content.at( -1 )?.text ?? '';
+		expect( note ).toContain( 'Studio could not find its folder, so this turn acts on no site' );
+		expect( note ).not.toContain( site.path );
+		expect( ( await bridge.invoke( 'site_info', { nameOrPath: site.name } ) ).isError ).toBe(
+			true
+		);
+		expect( host.sites.status ).not.toHaveBeenCalled();
 		const before = journal.length;
 		const second = await bridge.invoke( 'site_create', { name: 'Another Shop' } );
 		expect( second.isError ).toBe( true );
