@@ -70,7 +70,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	},
 	install_taxonomy_scripts: { status: 'bridged' },
 	refresh_browser: { status: 'absent', capability: 'ui' },
-	site_list: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
+	site_list: { status: 'bridged' },
 	site_connected_remote_sites: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
 	wpcom_request: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
 	preview_create: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },

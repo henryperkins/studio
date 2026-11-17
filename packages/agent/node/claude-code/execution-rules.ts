@@ -1,5 +1,6 @@
 import { readdirSync } from 'fs';
 import path from 'path';
+import { getSharedConfigPath } from '@studio/common/lib/well-known-paths';
 import { getSkillPath } from '../skills';
 import { createPreviewTool } from '../tools/create-preview';
 import { createSiteTool } from '../tools/create-site';
@@ -54,6 +55,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 	studio: Object.freeze( [
 		runWpCliTool.name,
 		getSiteInfoTool.name,
+		listSitesTool.name,
 		startSiteTool.name,
 		stopSiteTool.name,
 		deleteSiteTool.name,
@@ -375,6 +377,11 @@ export interface ClaudeStudioToolRule {
 	 */
 	readonly withoutSite?: true;
 	/**
+	 * Creates the site the conversation then works on, so a turn runs one such
+	 * call at a time. Only a rule that runs `withoutSite` can create a site.
+	 */
+	readonly createsSite?: true;
+	/**
 	 * Drives a browser, whether it opens a URL from its arguments, a page of the
 	 * named site or a document it wrote itself; it can be enabled only under a
 	 * verified navigation guard.
@@ -430,6 +437,10 @@ const LOCAL_SITE_HOST_CHANNELS: Partial< ClaudeToolChannelDeclaration > = {
 };
 
 const taxonomistScripts = () => getSkillPath( 'taxonomist', 'scripts' );
+
+// Where `readAuthToken` reads the stored WordPress.com login: Studio's shared
+// configuration.
+const storedLogin = () => [ getSharedConfigPath() ];
 
 // Where `install_taxonomy_scripts` writes in a site: its folder and a copy of
 // every file the bundled folder holds. Undefined, which denies the call, when
@@ -678,11 +689,29 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		// them for any other site. Its module links `tools/utils.ts`, whose
 		// `runWpCli` runs only through the host.
 		qualified(
-			studioRule( 'local-change', { approval: 'host', withoutSite: true } ),
+			studioRule( 'local-change', { approval: 'host', withoutSite: true, createsSite: true } ),
 			using( { runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] } )
 		),
 	],
-	[ listSitesTool.name, unqualified( studioRule( 'remote-read' ) ) ],
+	[
+		listSitesTool.name,
+		// It lists the local sites and the WordPress.com sites the stored login
+		// reaches, both through the guarded host, which gives them only in a
+		// conversation without a site, while the call lives, and of each local
+		// site only the fields every site has. A conversation that has its site
+		// works on that one, so there the call is refused. The tool reads the
+		// stored login itself and hands it to the host. Its module links
+		// `tools/utils.ts`, whose `runWpCli` runs only through the host.
+		qualified(
+			studioRule( 'remote-read', { withoutSite: true, config: storedLogin } ),
+			using( {
+				readsLocalFiles: [ 'config' ],
+				runsWpCli: [ 'host' ],
+				callsHostOperation: [ 'host' ],
+				reachesWpcom: [ 'host' ],
+			} )
+		),
+	],
 	[
 		getSiteInfoTool.name,
 		// It resolves the site it names and reads that site's status from the
@@ -1124,6 +1153,7 @@ const RULE_ELEMENTS: Readonly<
 	urlsOnSite: 'mark',
 	navigates: 'mark',
 	withoutSite: 'mark',
+	createsSite: 'mark',
 };
 
 function isRuleElement( [ key, value ]: [ string, unknown ] ): boolean {
@@ -1218,6 +1248,7 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 			used.has( 'drivesBrowser' ) ||
 			used.has( 'requestsNetwork' ) ) &&
 		( elements.approval !== 'host' || used.has( 'callsHostOperation' ) ) &&
+		( elements.createsSite !== true || elements.withoutSite === true ) &&
 		( ! used.has( 'runsWpCli' ) || used.has( 'callsHostOperation' ) ) &&
 		// A rule approved at its host operations is admitted without an approval
 		// of its own, so files it wrote itself would be written without an

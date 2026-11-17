@@ -226,6 +226,8 @@ const REFUSALS = {
 		'A file Studio reads or writes for this operation must be an absolute path inside the site’s folder or this conversation’s workspace, and not one that holds credentials.',
 	createInSite:
 		'A conversation works on one site, and this conversation already has its site. Ask the user to start a new conversation to create another one.',
+	withoutSite:
+		'A conversation works on one site, and this conversation already has its site, so Studio runs this tool only in a conversation without a site.',
 	siteBinding:
 		'Studio did not make that site this conversation’s site: only a site this turn created, in a conversation without a site, can become it.',
 	siteFolderMissing:
@@ -281,6 +283,16 @@ interface PreparedHostOperation {
 }
 
 const WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
+
+type ListedSite = Awaited< ReturnType< StudioAgentHost[ 'sites' ][ 'list' ] > >[ number ];
+
+// What a conversation without a site learns of each local site: the fields
+// every site has, which name it, say where it is and whether it runs; nothing
+// of its admin account, mail folder, custom domain, settings or operations.
+function listedSite( site: ListedSite ): ListedSite {
+	const { id, name, path: folder, port, url, phpVersion, running } = site;
+	return { id, name, path: folder, port, url, phpVersion, running };
+}
 
 function denied(): Error {
 	return new Error( 'Denied' );
@@ -787,11 +799,11 @@ export function createClaudeExecutionPolicy(
 		if ( callSignal?.aborted ) return false;
 		const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
 		if ( ! rule || ! studioTools.has( name ) ) return false;
-		if ( rule.withoutSite ) {
-			if ( hasSite() ) {
-				refuse( toolCallId, REFUSALS.createInSite );
-				return false;
-			}
+		if ( rule.withoutSite && hasSite() ) {
+			refuse( toolCallId, rule.createsSite ? REFUSALS.createInSite : REFUSALS.withoutSite );
+			return false;
+		}
+		if ( rule.createsSite ) {
 			if ( creatingCall !== undefined ) {
 				refuse( toolCallId, REFUSALS.createInFlight );
 				return false;
@@ -1117,8 +1129,18 @@ export function createClaudeExecutionPolicy(
 			operationSignal.throwIfAborted();
 			return read();
 		};
-		// What no qualified tool needs is refused: every site's details, and the
-		// members that reach WordPress.com or send analytics.
+		// A listing of every local site, or of the WordPress.com sites the stored
+		// login reaches: only in a conversation without a site, which works on
+		// none yet, under the turn's authority, while the call lives.
+		const listing = async < T >( list: () => Promise< T > ): Promise< T > => {
+			if ( operationSignal.aborted || hasSite() || ! ( await checkpoint( callSignal ) ) )
+				throw denied();
+			operationSignal.throwIfAborted();
+			if ( hasSite() ) throw denied();
+			return list();
+		};
+		// What no qualified tool needs is refused: every site's full details, and
+		// analytics.
 		const refused = async (): Promise< never > => {
 			throw denied();
 		};
@@ -1166,7 +1188,7 @@ export function createClaudeExecutionPolicy(
 		const { ui } = host;
 		return {
 			...host,
-			wpcom: { sites: refused },
+			wpcom: { sites: ( accessToken ) => listing( () => host.wpcom.sites( accessToken ) ) },
 			tracks: { record: refused },
 			// What a call shows in the conversation is written to the chat's record,
 			// so it stops with the call's authority. An artifact the run manager
@@ -1204,7 +1226,7 @@ export function createClaudeExecutionPolicy(
 					return site;
 				},
 				all: refused,
-				list: refused,
+				list: () => listing( async () => ( await host.sites.list() ).map( listedSite ) ),
 				status: ( site ) => reading( site, () => host.sites.status( site ) ),
 				isRunning: ( site ) => reading( site, () => host.sites.isRunning( site ) ),
 				create: ( name, sitePath, onProgress ) =>

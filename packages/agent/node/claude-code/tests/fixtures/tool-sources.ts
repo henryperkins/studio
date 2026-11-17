@@ -160,11 +160,31 @@ const CHANNEL_EVIDENCE: ReadonlyArray< {
 	{ channels: [ 'runsWpCli' ], sources: /\b(?:wpCli|runWpCli)\s*\(/ },
 ];
 
-/** For each thing the module's code shows, the channels that would explain it. */
-export function channelEvidence( module: StudioToolModule ): string[][] {
+function evidenceIn( loaded: readonly string[], text: string ): string[][] {
 	return CHANNEL_EVIDENCE.filter(
 		( { packages, sources } ) =>
-			( packages && module.packages.some( ( name ) => packages.test( name ) ) ) ||
-			( sources && sources.test( module.sources ) )
+			( packages && loaded.some( ( name ) => packages.test( name ) ) ) ||
+			( sources && sources.test( text ) )
 	).map( ( { channels } ) => [ ...channels ] );
+}
+
+/** For each thing the module's code shows, the channels that would explain it. */
+export function channelEvidence( module: StudioToolModule ): string[][] {
+	return evidenceIn( module.packages, module.sources );
+}
+
+/**
+ * The files of a module whose own imports or text show the channels `channels`
+ * explains, in the order the module links them.
+ */
+export function evidenceFiles( module: StudioToolModule, channels: readonly string[] ): string[] {
+	return module.files.filter( ( file ) => {
+		const absolute = path.join( agentRoot, file );
+		const loaded = scan( absolute ).imports.filter(
+			( specifier ) => resolveLocal( absolute, specifier ) === undefined
+		);
+		return evidenceIn( loaded, readFileSync( absolute, 'utf8' ) ).some(
+			( group ) => group.join() === channels.join()
+		);
+	} );
 }

@@ -85,7 +85,7 @@ describe( 'the host members a qualified tool reads through', () => {
 		expect( host.sites.status ).not.toHaveBeenCalled();
 	} );
 
-	it( 'refuses every member no qualified tool needs: every site, WordPress.com and analytics', async () => {
+	it( 'refuses, in a conversation that has its site, every listing of sites, every site’s details, WordPress.com and analytics', async () => {
 		const { policy, host } = await setup();
 		const guarded = policy.guardHost( host, 'call' );
 		await expect( guarded.sites.all() ).rejects.toThrow( 'Denied' );

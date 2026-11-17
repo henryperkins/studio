@@ -31,6 +31,7 @@ import {
 import {
 	browserLayer,
 	channelEvidence,
+	evidenceFiles,
 	linksBrowser,
 	studioToolModules,
 } from './fixtures/tool-sources';
@@ -87,6 +88,30 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 	},
 	refresh_browser: { ...noChannels, runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] },
 	site_create: { ...noChannels, runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] },
+	site_list: {
+		...noChannels,
+		readsLocalFiles: [ 'config' ],
+		runsWpCli: [ 'host' ],
+		callsHostOperation: [ 'host' ],
+		reachesWpcom: [ 'host' ],
+	},
+};
+
+// Code a qualified tool's module links but the tool never runs. The scan reads
+// whole files, so a helper the tool does not call shows a channel the tool does
+// not use. Each entry names the channels, the only files that show them, and
+// why the tool never runs that code; it holds only while those files are the
+// only ones that show them and the tool declares those channels unused.
+const SHARED_CONFIG_SAVE = {
+	channels: [ 'spawnsProcess' ],
+	files: [ '../common/lib/hide-dir-windows.ts' ],
+	why: 'shared-config runs `attrib` only when it saves into a folder it has just created; the tool only reads the stored login (`readAuthToken`)',
+};
+const UNREACHED: Record<
+	string,
+	ReadonlyArray< { channels: string[]; files: string[]; why: string } >
+> = {
+	site_list: [ SHARED_CONFIG_SAVE ],
 };
 const isQualifiedName = ( name: string ) => Object.prototype.hasOwnProperty.call( QUALIFIED, name );
 // In the order the rule table, and so every enabled list, names them.
@@ -790,13 +815,37 @@ describe( 'Claude Studio tools that drive a browser', () => {
 				if ( ! isQualifiedStudioRule( rule ) ) continue;
 				checked++;
 				const { channels } = rule.qualification as { channels: Record< string, unknown > };
-				for ( const explained of channelEvidence( module ) )
+				const shown = channelEvidence( module );
+				for ( const explained of shown ) {
+					const used = explained.some( ( channel ) => channels[ channel ] !== false );
+					const unreached = UNREACHED[ name ]?.find(
+						( entry ) => entry.channels.join() === explained.join()
+					);
+					if ( unreached && ! used ) {
+						expect( evidenceFiles( module, explained ), `${ name }: ${ unreached.why }` ).toEqual(
+							unreached.files
+						);
+						continue;
+					}
+					expect( used, `${ name } shows ${ explained.join( ' or ' ) }` ).toBe( true );
+				}
+				// An entry for code the tool no longer links, or for a channel it
+				// declares, is out of date.
+				for ( const entry of UNREACHED[ name ] ?? [] ) {
 					expect(
-						explained.some( ( channel ) => channels[ channel ] !== false ),
-						`${ name } shows ${ explained.join( ' or ' ) }`
+						shown.map( ( group ) => group.join() ),
+						`${ name }: ${ entry.why }`
+					).toContain( entry.channels.join() );
+					expect(
+						entry.channels.every( ( channel ) => channels[ channel ] === false ),
+						`${ name }: ${ entry.why }`
 					).toBe( true );
+				}
 			}
 		expect( checked ).toBe( CLAUDE_ENABLED_TOOLS.studio.length );
+		expect( Object.keys( UNREACHED ).filter( ( name ) => ! isQualifiedName( name ) ) ).toEqual(
+			[]
+		);
 		const wpCli = modules.find( ( module ) => module.names.includes( 'wp_cli' ) )!;
 		expect( wpCli.files ).toEqual( [
 			'node/tools/wp-cli.ts',
