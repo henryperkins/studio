@@ -22,6 +22,17 @@ function isSensitivePath( candidate: string ): boolean {
 		);
 }
 
+// Whether a path is one these checks judge: absolute, and on Windows with no
+// colon but the drive's. A colon anywhere else names an NTFS stream or a
+// device: `link:s.zip` opens a stream of whatever `link` leads to, though
+// neither `realpath` nor `lstat` of that name finds anything to resolve.
+function isJudgeable( file: string ): boolean {
+	return (
+		path.isAbsolute( file ) &&
+		( process.platform !== 'win32' || ! file.replace( /^[a-z]:(?=[\\/])/i, '' ).includes( ':' ) )
+	);
+}
+
 /**
  * Whether a native file tool may reach an existing path: inside one of the
  * canonical roots, outside the native configuration and clear of files that
@@ -33,7 +44,7 @@ export async function isAllowedNativePath(
 	configDirectory: string,
 	allowRoot = false
 ): Promise< boolean > {
-	if ( ! path.isAbsolute( file ) ) return false;
+	if ( ! isJudgeable( file ) ) return false;
 	try {
 		const canonical = await realpath( file );
 		return (
@@ -56,7 +67,7 @@ const isMissing = ( error: unknown ) => ( error as NodeJS.ErrnoException )?.code
 // part cannot be read. A link whose target does not exist is there, not
 // missing: a write would follow it wherever it points, so it is refused.
 async function resolveDeepest( file: string ): Promise< string | undefined > {
-	if ( ! path.isAbsolute( file ) ) return;
+	if ( ! isJudgeable( file ) ) return;
 	const missing: string[] = [];
 	for ( let current = path.resolve( file ); ; current = path.dirname( current ) ) {
 		try {

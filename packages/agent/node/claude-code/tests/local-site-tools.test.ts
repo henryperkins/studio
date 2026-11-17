@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { existsSync, readdirSync } from 'fs';
-import { mkdir, rename, symlink, writeFile } from 'fs/promises';
+import { lstat, mkdir, readFile, rename, symlink, writeFile } from 'fs/promises';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isSameClaudeTarget } from '@studio/agent/protocol/claude-code';
@@ -386,32 +386,35 @@ describe( 'install_taxonomy_scripts on the Claude route', () => {
 	} );
 } );
 
-describe( 'a link whose target does not exist, in a path Studio writes', () => {
-	// A link planted in the conversation's site that points out of it, at
-	// nothing yet. A write that followed it would create its target outside the
-	// site's folder, though in this test's own scratch folder. A file link
-	// needs a privilege Windows may not grant; where it does not, that case is
-	// skipped and the junction cases still run.
-	async function fileLink(
-		context: { skip: () => void },
-		target: string,
-		link: string
-	): Promise< void > {
-		try {
-			await symlink( target, link, 'file' );
-		} catch ( error ) {
-			if ( process.platform === 'win32' && ( error as NodeJS.ErrnoException ).code === 'EPERM' )
-				context.skip();
-			throw error;
-		}
+// A file link, planted in the conversation's site, that points out of it,
+// though into this test's own scratch folder. A file link needs a privilege
+// Windows may not grant; where it does not, the case is skipped.
+async function fileLink(
+	context: { skip: () => void },
+	target: string,
+	link: string
+): Promise< void > {
+	try {
+		await symlink( target, link, 'file' );
+	} catch ( error ) {
+		if ( process.platform === 'win32' && ( error as NodeJS.ErrnoException ).code === 'EPERM' )
+			context.skip();
+		throw error;
 	}
-	// An export that writes its file as the CLI would, once its fence passes.
-	const writingExports = ( host: Awaited< ReturnType< typeof setup > >[ 'host' ] ) => {
-		host.sites.export = vi.fn( async ( _site, file, _mode, _progress, options ) => {
-			await options?.beforeSpawn?.();
-			await writeFile( file, 'zip' );
-		} );
-	};
+}
+
+// An export that writes its file as the CLI would, once its fence passes.
+const writingExports = ( host: Awaited< ReturnType< typeof setup > >[ 'host' ] ) => {
+	host.sites.export = vi.fn( async ( _site, file, _mode, _progress, options ) => {
+		await options?.beforeSpawn?.();
+		await writeFile( file, 'zip' );
+	} );
+};
+
+describe( 'a link whose target does not exist, in a path Studio writes', () => {
+	// A link that points out of the site at nothing yet: a write that followed
+	// it would create its target outside the site's folder. Where a file link
+	// cannot be made, the junction cases still run.
 
 	it( 'refuses an export file that is a link to nothing, and writes nothing where it points', async ( context ) => {
 		const { bridge, host, site, parent } = await setup();
@@ -499,6 +502,57 @@ describe( 'a link whose target does not exist, in a path Studio writes', () => {
 		expect( result.isError ).toBe( true );
 		expect( existsSync( escaped ) ).toBe( false );
 		expect( journal ).toEqual( [] );
+	} );
+} );
+
+describe.runIf( process.platform === 'win32' )( 'a path that names an NTFS stream', () => {
+	// `link:s.zip` opens the stream `s.zip` of whatever `link` leads to, and
+	// neither `realpath` nor `lstat` finds that stream to resolve.
+	const exists = ( file: string ) => lstat( file ).then( Boolean, () => false );
+
+	it( 'refuses an export file named as a stream of a link to nothing, and creates nothing where it points', async ( context ) => {
+		const { bridge, host, site, parent } = await setup();
+		writingExports( host );
+		await mkdir( path.join( parent, 'outside' ) );
+		const escaped = path.join( parent, 'outside', 'escaped' );
+		await fileLink( context, escaped, path.join( site, 'link' ) );
+		const result = await bridge.invoke( 'site_export', {
+			nameOrPath: 'site',
+			exportFile: `${ path.join( site, 'link' ) }:s.zip`,
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( PATH_REFUSAL );
+		expect( host.sites.export ).not.toHaveBeenCalled();
+		expect( await exists( escaped ) ).toBe( false );
+		expect( await exists( `${ escaped }:s.zip` ) ).toBe( false );
+	} );
+
+	it( 'refuses an export file named as a stream of a link to a file outside the site, and leaves that file as it was', async ( context ) => {
+		const { bridge, host, site, parent } = await setup();
+		writingExports( host );
+		await mkdir( path.join( parent, 'outside' ) );
+		const existing = path.join( parent, 'outside', 'existing.txt' );
+		await writeFile( existing, 'outside' );
+		await fileLink( context, existing, path.join( site, 'linked' ) );
+		const result = await bridge.invoke( 'site_export', {
+			nameOrPath: 'site',
+			exportFile: `${ path.join( site, 'linked' ) }:s.zip`,
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( PATH_REFUSAL );
+		expect( host.sites.export ).not.toHaveBeenCalled();
+		expect( await exists( `${ existing }:s.zip` ) ).toBe( false );
+		expect( await readFile( existing, 'utf8' ) ).toBe( 'outside' );
+	} );
+
+	it( 'still writes an export file at a plain drive path', async () => {
+		const { bridge, host, site } = await setup();
+		writingExports( host );
+		expect( site ).toMatch( /^[a-z]:\\/i );
+		const exportFile = path.join( site, 'backup.zip' );
+		const result = await bridge.invoke( 'site_export', { nameOrPath: 'site', exportFile } );
+		expect( result.isError ).toBe( false );
+		expect( await readFile( exportFile, 'utf8' ) ).toBe( 'zip' );
 	} );
 } );
 
