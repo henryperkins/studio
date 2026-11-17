@@ -76,6 +76,165 @@ test( 'a missing result file fails instead of throwing', () => {
 	expect( checks.siteWorks( 'no marker here', { vars: {} } ).pass ).toBe( false );
 } );
 
+// A provider-qualified case's reasons hold no account, address, site id or
+// path, whatever the run produced: every check of every parity case, run on a
+// result whose every free-text field carries them.
+describe( 'reasons of a provider-qualified case', () => {
+	const NAME = 'Jordan Q. Example';
+	const EMAIL = 'jordan.example@example.org';
+	const SITE_URL = 'https://jordans-site.wordpress.com';
+	const SITE_ID = '987654';
+	const HOME = 'C:\\Users\\jordan\\Studio\\parity';
+	const POSIX_HOME = '/Users/jordan/Studio/parity';
+	const leak = `${ NAME } <${ EMAIL }> at ${ SITE_URL } (site ${ SITE_ID }) in ${ HOME } and ${ POSIX_HOME }`;
+	const seeded = {
+		providerRoute: {
+			requested: {
+				kind: 'chatgpt-oauth',
+				backend: 'chatgpt-route',
+				subscription: true,
+				connectionRef: 'conn-0123456789ab',
+				model: 'gpt-6-luna',
+				wireModel: 'gpt-6-luna',
+				effort: 'medium',
+			},
+			executed: {
+				kind: 'chatgpt-oauth',
+				backend: 'chatgpt-route',
+				connectionRef: 'conn-0123456789ab',
+				modelRequests: 2,
+				apiKeyBearers: 0,
+				imageServiceRequests: 1,
+				models: [ 'gpt-6-luna' ],
+				efforts: [ 'medium' ],
+				replyKinds: [ 'chatgpt-oauth' ],
+				replyModels: [ 'gpt-6-luna' ],
+				connectionMatchesBearer: true,
+				requests: [ { imageInputs: 1, turn: 0 } ],
+			},
+		},
+		success: false,
+		error: leak,
+		errorMessage: leak,
+		stopReason: 'error',
+		textSegments: [ leak, `${ leak }?` ],
+		questions: [ { question: leak, options: [ leak, 'Second' ], answer: leak } ],
+		toolCalls: [
+			{ id: 'c0', name: 'site_push', input: { remoteSite: SITE_URL } },
+			{ id: 'c1', name: 'Skill', input: { name: leak } },
+			{ id: 'c2', name: 'send_feedback', input: { message: leak } },
+		],
+		toolResults: [
+			{ toolUseId: 'c0', toolName: 'site_push', isError: false, text: leak },
+			{
+				toolUseId: 'c3',
+				toolName: 'generate_images',
+				isError: false,
+				details: {
+					studioService: {
+						service: 'wordpress-com',
+						credential: 'wordpress-com-login',
+						account: { displayName: NAME, email: EMAIL },
+					},
+				},
+			},
+		],
+		inspections: [ { args: [], exitCode: 0, stdout: leak } ],
+		remoteCalls: [ { operation: 'push', site: NAME, target: SITE_URL, options: 'all' } ],
+		remoteGuard: { code: null, blocked: [] },
+		uiEvents: { artifacts: [ { id: leak, widgets: [ 'gallery' ] } ], previewReloads: 0 },
+		imageService: { configured: true },
+		turns: [
+			{ reopened: false, toolCallsStart: 0, textSegmentsStart: 0, questionsStart: 0 },
+			{ reopened: true, toolCallsStart: 1, textSegmentsStart: 1, questionsStart: 1 },
+		],
+		stoppedAt: { toolName: 'wp_cli', index: 0 },
+		compactions: 0,
+		outcome: {
+			sites: [
+				{
+					name: NAME,
+					url: SITE_URL,
+					created: true,
+					theme: { stylesheet: leak },
+					themeFiles: { 'style.css': leak },
+					home: { status: 500, error: leak, phpErrors: [ leak ], navHrefs: [ SITE_URL ], ids: [] },
+					invalidBlocks: [ { type: 'page', slug: leak, blocks: [ leak ] } ],
+					designMd: leak,
+					palette: [],
+					content: [],
+				},
+			],
+			otherSitesChanged: [ NAME ],
+			otherSitesRemoved: [ SITE_URL ],
+			requestSiteChanged: true,
+		},
+	};
+	const parity = parse(
+		readFileSync( new URL( './subscription-parity.config.yaml', import.meta.url ), 'utf8' )
+	);
+	const named = ( assertions = [] ) =>
+		assertions.map( ( { value } ) => value.match( /^file:\/\/outcome\.mjs:(\w+)$/ )[ 1 ] );
+	const cases = parity.tests.map( ( test ) => ( {
+		vars: { ...parity.defaultTest.vars, ...test.vars },
+		names: [ ...named( parity.defaultTest.assert ), ...named( test.assert ) ],
+	} ) );
+	const leaked = ( reason ) =>
+		[ NAME, EMAIL, 'jordans-site', SITE_ID, 'jordan', 'Users', 'example.org' ].filter( ( value ) =>
+			reason.toLowerCase().includes( value.toLowerCase() )
+		);
+
+	test.each( cases.map( ( { vars, names } ) => [ vars.caseId, vars, names ] ) )(
+		'%s: no reason names the account, an address, a site id or a path',
+		( _caseId, vars, names ) => {
+			for ( const name of names ) {
+				for ( const variant of [
+					seeded,
+					{ ...seeded, success: true, outcome: { ...seeded.outcome, sites: [] } },
+				] ) {
+					const { reason } = run( checks[ name ], variant, vars );
+					expect( leaked( reason ), `${ name }: ${ reason }` ).toEqual( [] );
+				}
+			}
+		}
+	);
+
+	test( 'a run’s output is still quoted in the reasons of a case that selects no provider', () => {
+		const { reason } = run(
+			checks.replyIncludes,
+			{ ...seeded, providerRoute: undefined },
+			{ expectedText: 'X' }
+		);
+		expect( reason ).toContain( EMAIL );
+		expect( reason ).not.toMatch( /[]/ );
+	} );
+
+	test( 'a reason left with an address-shaped value keeps only its leading code', () => {
+		const verdict = run(
+			checks.ranOnRequestedRoute,
+			{ providerRoute: { requested: null, failure: { code: 'provider-unknown', message: leak } } },
+			{ requireProvider: true }
+		);
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( /^refused before any model request \(provider-unknown\)/ );
+		expect( leaked( verdict.reason ) ).toEqual( [] );
+		const missing = checks.siteWorks(
+			`EVAL_RUNNER_RESULT_FILE=${ path.join( dir, 'no-such-result.json' ) }`,
+			{ vars: { requireProvider: true } }
+		);
+		expect( missing.pass ).toBe( false );
+		expect( missing.reason ).toMatch( /reason withheld: it held what looked like a local path/ );
+	} );
+
+	test( 'imageGenerated names only the service and the credential kind, never the account', () => {
+		const verdict = run( checks.imageGenerated, { ...seeded, success: true } );
+		expect( verdict.pass ).toBe( true );
+		expect( verdict.reason ).toBe(
+			'generate_images ran 1 time(s) on the wordpress-com image service, signed in with its wordpress-com-login'
+		);
+	} );
+} );
+
 describe( 'shared checks', () => {
 	test( 'siteWorks', () => {
 		expect( run( checks.siteWorks, outcome( workingSite ) ).pass ).toBe( true );
@@ -1105,7 +1264,9 @@ describe( 'parity checks', () => {
 				{
 					toolName: 'generate_images',
 					isError: false,
-					details: { studioService: { service: 'images' } },
+					details: {
+						studioService: { service: 'wordpress-com', credential: 'environment-token' },
+					},
 				},
 			],
 			providerRoute: { executed: { imageServiceRequests: 1 } },

@@ -88,6 +88,11 @@ import {
 	type RequestedRoute,
 } from 'cli/ai/eval-provider';
 import { matchesStopRule } from 'cli/ai/eval-stop';
+import {
+	evalSummaryDirectory,
+	writeEvalCaseSummary,
+	type EvalSummarySource,
+} from 'cli/ai/eval-summary';
 import { summarizeTiming, type ModelRequestRecord } from 'cli/ai/eval-timing';
 import { cliAgentHost } from 'cli/ai/host';
 import { getAiProviderDefinition } from 'cli/ai/providers';
@@ -109,6 +114,7 @@ import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
 import type { StudioChatArtifactData } from '@studio/agent/protocol/chat-artifacts';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type { SyncSite } from '@studio/common/types/sync';
+import type { StageRecord } from 'cli/ai/acceptance-evidence';
 import type { AiProviderId } from 'cli/ai/providers';
 
 interface Inspection {
@@ -1218,6 +1224,31 @@ export async function runEval( input: EvalRunnerInput ) {
 	}
 }
 
+/**
+ * For a case that selects a provider (or must), its sanitized summary
+ * (`eval-summary.ts`): the one output of the case that may leave the machine.
+ * Never fails the case; the summary's own guard decides what it holds.
+ */
+export function writeCaseSummary(
+	input: EvalRunnerInput,
+	result: unknown,
+	env: NodeJS.ProcessEnv = process.env
+): StageRecord | null {
+	if ( ! input.provider ) {
+		return null;
+	}
+	try {
+		return writeEvalCaseSummary( ( result ?? {} ) as EvalSummarySource, {
+			caseId: input.caseId,
+			provider: input.provider.ok ? input.provider.request.provider : undefined,
+			directory: evalSummaryDirectory( env ),
+		} );
+	} catch ( error ) {
+		warnTeardown( 'could not write the case’s sanitized summary', error );
+		return null;
+	}
+}
+
 const RESULT_PREFIX = 'EVAL_RUNNER_RESULT_FILE=';
 
 // The folder the entry made for this case's sites, once nothing is left in it.
@@ -1260,11 +1291,18 @@ export async function main() {
 	};
 
 	let exitCode = 0;
+	let input: EvalRunnerInput | null = null;
+	let result: unknown;
 	try {
-		emit( await runEval( readEvalRunnerInput() ) );
+		input = readEvalRunnerInput();
+		result = await runEval( input );
 	} catch ( error ) {
-		emit( { success: false, error: error instanceof Error ? error.message : String( error ) } );
+		result = { success: false, error: error instanceof Error ? error.message : String( error ) };
 		exitCode = 1;
+	}
+	emit( result );
+	if ( input ) {
+		writeCaseSummary( input, result );
 	}
 	await stopCaseProcessManager( {
 		home: caseProcessManagerHome( process.env ),

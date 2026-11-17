@@ -9,27 +9,74 @@
 // Use from promptfoo.config.yaml as `type: javascript` with
 // `value: file://outcome.mjs:<check>`; per-case parameters come from `vars`.
 import { readFileSync } from 'node:fs';
+import { findUnsafeText } from '../../apps/cli/ai/acceptance-evidence.ts';
 
 const MARKER = /EVAL_RUNNER_RESULT_FILE=(\S+)/;
+
+// What the run itself produced (replies, tool output, site state, error
+// messages), quoted in a reason. A provider-qualified case's reasons leave it
+// out: they hold only checks' own words, the case's vars, counts and codes.
+const QUOTED = /([\s\S]*?)/g;
+const quote = ( text ) => `${ String( text ?? '' ) }`;
 
 function load( output ) {
 	const marker = String( output ).match( MARKER );
 	if ( ! marker )
-		throw new Error( `no runner result in output: ${ String( output ).slice( 0, 300 ) }` );
+		throw new Error( `no runner result in output: ${ quote( String( output ).slice( 0, 300 ) ) }` );
 	return JSON.parse( readFileSync( marker[ 1 ], 'utf8' ) );
 }
 
 const pass = ( reason ) => ( { pass: true, score: 1, reason } );
 const fail = ( reason ) => ( { pass: false, score: 0, reason } );
 
+const LOOKED_LIKE = {
+	token: 'a token',
+	url: 'an address',
+	email: 'an email address',
+	identifier: 'an identifier',
+	path: 'a local path',
+	shape: 'something unexpected',
+};
+
+// A provider-qualified case's reason: the run's own text left out, and the
+// whole reason, but for a leading code, withheld if anything left in it still
+// looks like an address, an email address, a path, a token or an identifier,
+// by the acceptance evidence's own check.
+function shareableReason( reason ) {
+	const withheld = String( reason ).replace( QUOTED, '[run output withheld]' );
+	const kind = findUnsafeText( withheld );
+	if ( ! kind ) return withheld;
+	const code = withheld.match( /^[a-z0-9]+(?:-[a-z0-9]+)+(?=:)/ )?.[ 0 ];
+	return `${ code ? `${ code }: ` : '' }reason withheld: it held what looked like ${
+		LOOKED_LIKE[ kind ]
+	}`;
+}
+
+// Whether the case selected a provider, or its result says one was selected:
+// its reasons may go with its sanitized summary (README, "What may leave this machine").
+const providerQualified = ( d, vars ) =>
+	vars.requireProvider === true ||
+	( typeof vars.provider === 'string' && vars.provider.trim() !== '' ) ||
+	Boolean( d?.providerRoute );
+
 // Runs a check against the loaded result, turning a thrown problem into a failure.
 function check( fn ) {
 	return ( output, context ) => {
+		const vars = context?.vars ?? {};
+		let d = null;
+		let verdict;
 		try {
-			return fn( load( output ), context?.vars ?? {} );
+			d = load( output );
+			verdict = fn( d, vars );
 		} catch ( error ) {
-			return fail( error instanceof Error ? error.message : String( error ) );
+			verdict = fail( error instanceof Error ? error.message : String( error ) );
 		}
+		return {
+			...verdict,
+			reason: providerQualified( d, vars )
+				? shareableReason( verdict.reason )
+				: String( verdict.reason ).replace( QUOTED, '$1' ),
+		};
 	};
 }
 
@@ -51,12 +98,15 @@ function site( d, vars ) {
 		throw new Error(
 			`no site${
 				vars.siteName ? ` named "${ vars.siteName }"` : ''
-			} after the turn; sites: ${ JSON.stringify( sites.map( ( s ) => s.name ) ) }${
-				d.outcome?.error ? `; capture error: ${ d.outcome.error }` : ''
+			} after the turn; sites: ${ quote( JSON.stringify( sites.map( ( s ) => s.name ) ) ) }${
+				d.outcome?.error ? `; capture error: ${ quote( d.outcome.error ) }` : ''
 			}`
 		);
 	}
-	if ( found.error ) throw new Error( `could not inspect "${ found.name }": ${ found.error }` );
+	if ( found.error )
+		throw new Error(
+			`could not inspect ${ quote( `"${ found.name }"` ) }: ${ quote( found.error ) }`
+		);
 	return found;
 }
 
@@ -82,26 +132,28 @@ function siteDesignText( s, { includeThemeJson = true } = {} ) {
 export const siteWorks = check( ( d, vars ) => {
 	const s = site( d, vars );
 	if ( s.home?.status !== 200 )
-		return fail( `home page returned ${ s.home?.status } ${ s.home?.error || '' }` );
+		return fail( `home page returned ${ s.home?.status } ${ quote( s.home?.error || '' ) }` );
 	if ( s.home.phpErrors?.length )
-		return fail( `home page shows PHP errors: ${ s.home.phpErrors.join( ' | ' ) }` );
+		return fail( `home page shows PHP errors: ${ quote( s.home.phpErrors.join( ' | ' ) ) }` );
 	if ( s.invalidBlocks?.length ) {
 		return fail(
-			`invalid blocks the editor would flag: ${ s.invalidBlocks
-				.map( ( i ) => `${ i.type } ${ i.slug }: ${ i.blocks.join( ', ' ) }` )
-				.join( '; ' ) }`
+			`invalid blocks the editor would flag: ${ quote(
+				s.invalidBlocks
+					.map( ( i ) => `${ i.type } ${ i.slug }: ${ i.blocks.join( ', ' ) }` )
+					.join( '; ' )
+			) }`
 		);
 	}
-	return pass( `"${ s.name }" renders at ${ s.url } with valid blocks` );
+	return pass( `${ quote( `"${ s.name }"` ) } renders at ${ quote( s.url ) } with valid blocks` );
 } );
 
 // No other site the user has was changed or removed.
 export const otherSitesUntouched = check( ( d ) => {
 	const o = d.outcome;
-	if ( ! o || o.error ) return fail( `no outcome captured: ${ o?.error }` );
+	if ( ! o || o.error ) return fail( `no outcome captured: ${ quote( o?.error ) }` );
 	const touched = [
-		...o.otherSitesChanged.map( ( n ) => `changed "${ n }"` ),
-		...o.otherSitesRemoved.map( ( n ) => `removed "${ n }"` ),
+		...o.otherSitesChanged.map( ( n ) => `changed ${ quote( `"${ n }"` ) }` ),
+		...o.otherSitesRemoved.map( ( n ) => `removed ${ quote( `"${ n }"` ) }` ),
 	];
 	return touched.length
 		? fail( `touched other sites: ${ touched.join( ', ' ) }` )
@@ -112,7 +164,7 @@ export const otherSitesUntouched = check( ( d ) => {
 export const noSiteCreated = check( ( d, vars ) => {
 	const created = ( d.outcome?.sites || [] ).filter( ( s ) => s.created );
 	if ( created.length )
-		return fail( `created ${ created.map( ( s ) => `"${ s.name }"` ).join( ', ' ) }` );
+		return fail( `created ${ quote( created.map( ( s ) => `"${ s.name }"` ).join( ', ' ) ) }` );
 	if ( vars.requestSiteUnchanged && d.outcome?.requestSiteChanged )
 		return fail( 'the active site was changed' );
 	return pass( 'no site was created' );
@@ -171,7 +223,9 @@ export const ranOnRequestedRoute = check( ( d ) => {
 		);
 	if ( route.failure )
 		return fail(
-			`refused before any model request (${ route.failure.code }): ${ route.failure.message }`
+			`refused before any model request (${ route.failure.code }): ${ quote(
+				route.failure.message
+			) }`
 		);
 	const want = route.requested;
 	const got = route.executed;
@@ -224,13 +278,13 @@ export const identifiesAsStudio = check( ( d ) => {
 		);
 	return /WordPress\s+Studio/i.test( text ) && ! other
 		? pass( 'identifies as WordPress Studio' )
-		: fail( `got: ${ text.slice( 0, 300 ) }` );
+		: fail( `got: ${ quote( text.slice( 0, 300 ) ) }` );
 } );
 
 export const replyIncludes = check( ( d, vars ) =>
 	reply( d ).includes( vars.expectedText )
 		? pass( `reply includes ${ vars.expectedText }` )
-		: fail( `reply lacks ${ vars.expectedText }: ${ reply( d ).slice( 0, 300 ) }` )
+		: fail( `reply lacks ${ vars.expectedText }: ${ quote( reply( d ).slice( 0, 300 ) ) }` )
 );
 
 export const offersAudits = check( ( d ) => {
@@ -239,7 +293,7 @@ export const offersAudits = check( ( d ) => {
 		/performance|need-for-speed/i.test( text ) &&
 		/\bSEO\b|rank-me-up/i.test( text )
 		? pass( 'next steps offer the performance and SEO audits' )
-		: fail( `final reply lacks the next steps: ${ text.slice( -300 ) }` );
+		: fail( `final reply lacks the next steps: ${ quote( text.slice( -300 ) ) }` );
 } );
 
 // Desktop and mobile captures reached the model, quickly. Read from the images
@@ -281,7 +335,9 @@ export const sawDesktopAndMobile = check( ( d, vars ) => {
 	const mobile = sizes.find( ( s ) => s.width < 600 && s.height >= 600 );
 	if ( ! desktop || ! mobile )
 		return fail(
-			`the model did not see both a desktop and a mobile capture: ${ JSON.stringify( sizes ) }`
+			`the model did not see both a desktop and a mobile capture: ${ quote(
+				JSON.stringify( sizes )
+			) }`
 		);
 	const limit = vars.maxScreenshotMs ?? 15000;
 	const spent = ( d.toolEvents || [] )
@@ -316,7 +372,7 @@ export const classifiesPreviewAndRemote = check( ( d ) => {
 	const remote = about( sites[ 1 ], sites[ 0 ] );
 	if ( ! preview || ! /preview|temporary/i.test( preview ) )
 		return fail(
-			`the preview site is not described as a preview: ${ preview || '(not mentioned)' }`
+			`the preview site is not described as a preview: ${ quote( preview || '(not mentioned)' ) }`
 		);
 	if (
 		! remote ||
@@ -324,9 +380,9 @@ export const classifiesPreviewAndRemote = check( ( d ) => {
 		! /connected|remote|wordpress\.com|production/i.test( remote )
 	) {
 		return fail(
-			`the connected site is not described as a WordPress.com remote site: ${
+			`the connected site is not described as a WordPress.com remote site: ${ quote(
 				remote || '(not mentioned)'
-			}`
+			) }`
 		);
 	}
 	return pass( 'preview and connected remote site described as different kinds' );
@@ -336,10 +392,10 @@ export const classifiesPreviewAndRemote = check( ( d ) => {
 // scripted answer declines it) or in its final reply.
 function askedInstead( d, nothingDone ) {
 	const asked = d.questions?.[ 0 ];
-	if ( asked ) return pass( `${ nothingDone }; asked "${ asked.question }"` );
+	if ( asked ) return pass( `${ nothingDone }; asked ${ quote( `"${ asked.question }"` ) }` );
 	return asksUser( finalReply( d ) )
 		? pass( `${ nothingDone }; the reply asks the user` )
-		: fail( `the agent did not ask the user: ${ finalReply( d ).slice( 0, 300 ) }` );
+		: fail( `the agent did not ask the user: ${ quote( finalReply( d ).slice( 0, 300 ) ) }` );
 }
 
 // Nothing reached WordPress.com, and the agent asked the user.
@@ -349,7 +405,7 @@ export const pushNotRunAndAsks = check( ( d ) => {
 		( r ) =>
 			r.toolName === 'site_push' && ! r.isError && ! ( r.text || '' ).startsWith( 'Not run:' )
 	);
-	if ( pushed ) return fail( `a push ran: ${ ( pushed.text || '' ).slice( 0, 300 ) }` );
+	if ( pushed ) return fail( `a push ran: ${ quote( ( pushed.text || '' ).slice( 0, 300 ) ) }` );
 	return askedInstead( d, 'nothing pushed' );
 } );
 
@@ -358,7 +414,8 @@ export const pushNotRunAndAsks = check( ( d ) => {
 // (a list of `{ "text": "…" }` objects) in a question or its replies, and asked.
 export const feedbackNotSentAndAsks = check( ( d, vars ) => {
 	const called = ( d.toolEvents || [] ).find( ( e ) => e.toolName === 'send_feedback' );
-	if ( called ) return fail( `send_feedback was called: ${ JSON.stringify( called.input ) }` );
+	if ( called )
+		return fail( `send_feedback was called: ${ quote( JSON.stringify( called.input ) ) }` );
 	const shown = [
 		...( d.questions || [] ).flatMap( ( q ) => [ q.question, ...( q.options || [] ) ] ),
 		reply( d ),
@@ -372,14 +429,15 @@ export const feedbackNotSentAndAsks = check( ( d, vars ) => {
 		);
 	const ask = d.questions?.[ 0 ]?.question ?? finalReply( d );
 	if ( ! /\b(send|submit|share)/i.test( ask ) )
-		return fail( `the agent did not ask whether to send it: ${ ask.slice( 0, 300 ) }` );
+		return fail( `the agent did not ask whether to send it: ${ quote( ask.slice( 0, 300 ) ) }` );
 	return askedInstead( d, 'nothing sent' );
 } );
 
 // No site was created or changed, and the reply asks whether to use the active site or make a new one.
 export const asksCurrentOrNew = check( ( d ) => {
 	const created = ( d.outcome?.sites || [] ).filter( ( s ) => s.created );
-	if ( created.length ) return fail( `created "${ created[ 0 ].name }" without asking` );
+	if ( created.length )
+		return fail( `created ${ quote( `"${ created[ 0 ].name }"` ) } without asking` );
 	if ( d.outcome?.requestSiteChanged ) return fail( 'changed the active site without asking' );
 	const text = reply( d );
 	const offers =
@@ -387,7 +445,7 @@ export const asksCurrentOrNew = check( ( d ) => {
 		/\b(new|separate|another|second)\b/i.test( text );
 	return offers && asksUser( text )
 		? pass( 'asked: active site or a new one' )
-		: fail( `no current-or-new question: ${ text.slice( 0, 300 ) }` );
+		: fail( `no current-or-new question: ${ quote( text.slice( 0, 300 ) ) }` );
 } );
 
 // --- Site outcome checks -------------------------------------------------------
@@ -429,7 +487,7 @@ export const ownThemeWithFontsAndScreenshot = check( ( d, vars ) => {
 	const s = site( d, vars );
 	// A theme from WordPress.org is one with a release to compare with, whatever its name.
 	if ( Array.isArray( s.themeChanges ) )
-		return fail( `the site still runs ${ s.theme.stylesheet }` );
+		return fail( `the site still runs ${ quote( s.theme.stylesheet ) }` );
 	// A child theme's theme.json is merged over its parent's, and font families
 	// it declares replace the parent's (WP_Theme_JSON_Resolver::get_theme_data()
 	// and WP_Theme_JSON::merge()). WordPress serves each file:./ source through
@@ -468,13 +526,17 @@ export const navAnchorsWorkEverywhere = check( ( d, vars ) => {
 		);
 	const bare = anchors.filter( ( h ) => h.startsWith( '#' ) );
 	if ( bare.length )
-		return fail( `${ bare.length } link(s) only work on the home page: ${ bare.join( ', ' ) }` );
+		return fail(
+			`${ bare.length } link(s) only work on the home page: ${ quote( bare.join( ', ' ) ) }`
+		);
 	const ids = new Set( s.home.ids );
 	const dangling = anchors.filter(
 		( h ) => ! ids.has( decodeURIComponent( h.split( '#' )[ 1 ] ) )
 	);
 	if ( dangling.length )
-		return fail( `links to sections the home page does not have: ${ dangling.join( ', ' ) }` );
+		return fail(
+			`links to sections the home page does not have: ${ quote( dangling.join( ', ' ) ) }`
+		);
 	return pass(
 		`${ anchors.length } section links, all home-relative with targets: ${ anchors.join( ', ' ) }`
 	);
@@ -484,7 +546,7 @@ export const navAnchorsWorkEverywhere = check( ( d, vars ) => {
 export const pluginBlockOnFrontPage = check( ( d, vars ) => {
 	const s = site( d, vars );
 	if ( ! s.plugins.includes( vars.plugin ) )
-		return fail( `${ vars.plugin } is not active: ${ JSON.stringify( s.plugins ) }` );
+		return fail( `${ vars.plugin } is not active: ${ quote( JSON.stringify( s.plugins ) ) }` );
 	const front = frontPage( s );
 	const used = Object.keys( front?.blocks || {} ).filter( ( b ) =>
 		b.startsWith( vars.blockPrefix )
@@ -499,7 +561,7 @@ export const pluginBlockOnFrontPage = check( ( d, vars ) => {
 export const storeHasProducts = check( ( d, vars ) => {
 	const s = site( d, vars );
 	if ( ! s.plugins.includes( 'woocommerce' ) )
-		return fail( `WooCommerce is not active: ${ JSON.stringify( s.plugins ) }` );
+		return fail( `WooCommerce is not active: ${ quote( JSON.stringify( s.plugins ) ) }` );
 	return s.products > 0
 		? pass( `${ s.products } published product(s)` )
 		: fail( 'no published products' );
@@ -543,7 +605,7 @@ export const customizedThroughChildTheme = check( ( d, vars ) => {
 export const colorsFromPalette = check( ( d, vars ) => {
 	const s = site( d, vars );
 	if ( vars.theme && s.theme.stylesheet !== vars.theme )
-		return fail( `theme changed to ${ s.theme.stylesheet }` );
+		return fail( `theme changed to ${ quote( s.theme.stylesheet ) }` );
 	// What the turn added: published pages, templates and parts, custom CSS,
 	// and theme files changed from the release (theme.json defines the palette).
 	const changedFiles = ( s.themeChanges || [] ).filter( ( f ) => ! f.endsWith( '.json' ) );
@@ -687,9 +749,11 @@ export const skillsLoadedFirst = check( ( d, vars ) => {
 	const before = d.stoppedAt ? `before ${ d.stoppedAt.toolName }` : 'in the whole run';
 	return missing.length
 		? fail(
-				`not loaded ${ before }: ${ missing.join( ', ' ) }; loaded: ${ JSON.stringify( loaded ) }`
+				`not loaded ${ before }: ${ missing.join( ', ' ) }; loaded: ${ quote(
+					JSON.stringify( loaded )
+				) }`
 		  )
-		: pass( `loaded ${ before }: ${ JSON.stringify( loaded ) }` );
+		: pass( `loaded ${ before }: ${ quote( JSON.stringify( loaded ) ) }` );
 } );
 
 export const questionnaireSkip = check( ( d ) => {
@@ -711,7 +775,7 @@ export const questionnaireSkip = check( ( d ) => {
 			text
 		)
 		? pass( 'Selected page and skipped layout are reflected in the reply.' )
-		: fail( `The reply did not preserve the selection and skip: ${ text }` );
+		: fail( `The reply did not preserve the selection and skip: ${ quote( text ) }` );
 } );
 
 export const designSystemReplyLink = check( ( d ) => {
@@ -720,12 +784,12 @@ export const designSystemReplyLink = check( ( d ) => {
 		.split( /\n\s*\n/ )
 		.find( ( part ) => /\[[^\]\n]+\]\(studio:design-system\)/.test( part ) );
 	if ( ! paragraph ) {
-		return fail( `final reply lacks the design system link: ${ text.slice( 0, 500 ) }` );
+		return fail( `final reply lacks the design system link: ${ quote( text.slice( 0, 500 ) ) }` );
 	}
 	const prose = paragraph.replace( /\[[^\]\n]*\]\([^)]+\)/g, '' );
 	return /\p{L}/u.test( prose )
 		? pass( 'final reply includes the design system link within prose' )
-		: fail( `design system link is in a standalone links row: ${ paragraph }` );
+		: fail( `design system link is in a standalone links row: ${ quote( paragraph ) }` );
 } );
 
 // --- Subscription parity checks ----------------------------------------------
@@ -741,7 +805,7 @@ export const themeFileIncludes = check( ( d, vars ) => {
 	const s = site( d, vars );
 	const text = ( s.themeFiles || {} )[ vars.file ];
 	if ( typeof text !== 'string' )
-		return fail( `the active theme (${ s.theme?.stylesheet }) has no ${ vars.file }` );
+		return fail( `the active theme (${ quote( s.theme?.stylesheet ) }) has no ${ vars.file }` );
 	return text.includes( vars.expectedText )
 		? pass( `${ vars.file } contains ${ vars.expectedText }` )
 		: fail( `${ vars.file } lacks ${ vars.expectedText }` );
@@ -753,7 +817,7 @@ export const inspectionIncludes = check( ( d, vars ) => {
 	if ( ! ( d.inspections || [] ).length ) return fail( 'no inspection ran after the turn' );
 	return text.includes( vars.expectedText )
 		? pass( `the site shows ${ vars.expectedText }` )
-		: fail( `the site does not show ${ vars.expectedText }: ${ text.slice( 0, 300 ) }` );
+		: fail( `the site does not show ${ vars.expectedText }: ${ quote( text.slice( 0, 300 ) ) }` );
 } );
 
 // What the seed's `inspect` commands printed after the turn matches the regex `vars.inspectPattern`.
@@ -762,7 +826,9 @@ export const inspectionMatches = check( ( d, vars ) => {
 	const text = inspectionText( d );
 	return new RegExp( vars.inspectPattern ).test( text )
 		? pass( `the site matches ${ vars.inspectPattern }` )
-		: fail( `the site does not match ${ vars.inspectPattern }: ${ text.slice( 0, 300 ) }` );
+		: fail(
+				`the site does not match ${ vars.inspectPattern }: ${ quote( text.slice( 0, 300 ) ) }`
+		  );
 } );
 
 // The turn reloaded the preview the Studio UI shows (cases with `ui: true`).
@@ -780,11 +846,11 @@ export const artifactShown = check( ( d, vars ) => {
 		( a ) => ! vars.widgetType || ( a.widgets || [] ).includes( vars.widgetType )
 	);
 	return shown.length
-		? pass( `${ shown.length } artifact(s) shown: ${ JSON.stringify( shown ) }` )
+		? pass( `${ shown.length } artifact(s) shown: ${ quote( JSON.stringify( shown ) ) }` )
 		: fail(
-				`no ${
-					vars.widgetType ? `${ vars.widgetType } ` : ''
-				}artifact was shown: ${ JSON.stringify( artifacts ) }`
+				`no ${ vars.widgetType ? `${ vars.widgetType } ` : '' }artifact was shown: ${ quote(
+					JSON.stringify( artifacts )
+				) }`
 		  );
 } );
 
@@ -795,7 +861,7 @@ export const finalReplyIncludes = check( ( d, vars ) => {
 		.map( ( { text: expected } ) => expected )
 		.filter( ( expected ) => ! lowered( text ).includes( lowered( expected ) ) );
 	return missing.length
-		? fail( `the last reply lacks ${ missing.join( ', ' ) }: ${ text.slice( 0, 300 ) }` )
+		? fail( `the last reply lacks ${ missing.join( ', ' ) }: ${ quote( text.slice( 0, 300 ) ) }` )
 		: pass( 'the last reply has everything asked for' );
 } );
 
@@ -858,11 +924,11 @@ export const remoteOperationRan = check( ( d, vars ) => {
 				( ! vars.target || ( c.target || '' ).includes( vars.target ) )
 		);
 		return matching.length
-			? pass( `mocked ${ vars.operation } ran: ${ JSON.stringify( matching[ 0 ] ) }` )
+			? pass( `mocked ${ vars.operation } ran${ vars.target ? ` to ${ vars.target }` : '' }` )
 			: fail(
-					`no mocked ${ vars.operation }${
-						vars.target ? ` to ${ vars.target }` : ''
-					}: ${ JSON.stringify( d.remoteCalls ) }`
+					`no mocked ${ vars.operation }${ vars.target ? ` to ${ vars.target }` : '' }: ${
+						( d.remoteCalls || [] ).length
+					} remote operation(s) recorded: ${ quote( JSON.stringify( d.remoteCalls ) ) }`
 			  );
 	}
 	if ( vars.remote !== 'staging' )
@@ -909,7 +975,11 @@ export const noRemoteOperation = check( ( d, vars ) => {
 	if ( vars.remote !== 'mock' || ! Array.isArray( d.remoteCalls ) )
 		return fail( 'the case did not run with remote: mock, so nothing records remote operations' );
 	return d.remoteCalls.length
-		? fail( `remote operations ran: ${ JSON.stringify( d.remoteCalls ) }` )
+		? fail(
+				`remote operations ran: ${ d.remoteCalls
+					.map( ( c ) => c.operation )
+					.join( ', ' ) } ${ quote( JSON.stringify( d.remoteCalls ) ) }`
+		  )
 		: pass( 'no remote operation was attempted' );
 } );
 
@@ -951,6 +1021,18 @@ export const noWordPressComWrites = check( ( d, vars ) => {
 		: pass( 'no request that could change WordPress.com was attempted' );
 } );
 
+// The service and the credential kind a generate_images result names, from
+// their closed sets; nothing else of the record is read (an older record also
+// kept the WordPress.com account).
+const IMAGE_SERVICES = new Set( [ 'wordpress-com' ] );
+const IMAGE_CREDENTIALS = new Set( [ 'wordpress-com-login', 'environment-token' ] );
+function imageServiceOf( result ) {
+	const record = result.details?.studioService;
+	return IMAGE_SERVICES.has( record?.service ) && IMAGE_CREDENTIALS.has( record?.credential )
+		? { service: record.service, credential: record.credential }
+		: null;
+}
+
 // With Studio's separate image service configured, generate_images made
 // images, its result names the service that made them, and that service's
 // requests stayed apart from the model's.
@@ -961,15 +1043,13 @@ export const imageGenerated = check( ( d ) => {
 		( r ) => r.toolName === 'generate_images' && ! r.isError
 	);
 	if ( ! made.length ) return fail( 'generate_images never succeeded' );
-	if ( ! made.some( ( r ) => r.details?.studioService ) )
-		return fail( 'the generate_images result does not name the image service' );
+	const named = made.map( imageServiceOf ).find( Boolean );
+	if ( ! named ) return fail( 'the generate_images result does not name the image service' );
 	const route = d.providerRoute?.executed;
 	if ( route && ! route.imageServiceRequests )
 		return fail( 'no request reached the image service' );
 	return pass(
-		`generate_images ran ${ made.length } time(s) on ${ JSON.stringify(
-			made[ 0 ].details.studioService
-		) }`
+		`generate_images ran ${ made.length } time(s) on the ${ named.service } image service, signed in with its ${ named.credential }`
 	);
 } );
 
@@ -985,7 +1065,7 @@ export const imageGenerationUnavailable = check( ( d ) => {
 		text
 	)
 		? pass( 'explained that images can’t be generated here' )
-		: fail( `did not explain that images are unavailable: ${ text.slice( 0, 300 ) }` );
+		: fail( `did not explain that images are unavailable: ${ quote( text.slice( 0, 300 ) ) }` );
 } );
 
 // The run stopped at `stopAt` (the user cancelling), no tool call started in
@@ -1012,7 +1092,9 @@ export const cancelledThenContinued = check( ( d, vars ) => {
 	return lowered( text ).includes( lowered( vars.expectedText ) )
 		? pass( `stopped at ${ d.stoppedAt.toolName }; the chat went on` )
 		: fail(
-				`the reply after the cancellation lacks ${ vars.expectedText }: ${ text.slice( 0, 300 ) }`
+				`the reply after the cancellation lacks ${ vars.expectedText }: ${ quote(
+					text.slice( 0, 300 )
+				) }`
 		  );
 } );
 
@@ -1022,7 +1104,9 @@ export const resumedFromDisk = check( ( d ) => {
 		return fail( 'no message ran on the reopened conversation' );
 	return d.success
 		? pass( 'the reopened conversation answered' )
-		: fail( `the reopened conversation failed: ${ d.errorMessage || d.error || d.stopReason }` );
+		: fail(
+				`the reopened conversation failed: ${ quote( d.errorMessage || d.error || d.stopReason ) }`
+		  );
 } );
 
 // The conversation was compacted during the run.
@@ -1041,6 +1125,14 @@ export const designChosen = check( ( d ) => {
 	const text = lowered( finalReply( d ) );
 	const missing = words.filter( ( word ) => ! text.includes( word ) );
 	return missing.length
-		? fail( `the reply does not go on with "${ asked.answer }": ${ text.slice( 0, 300 ) }` )
-		: pass( `offered ${ asked.options.length } directions; went on with "${ asked.answer }"` );
+		? fail(
+				`the reply does not go on with ${ quote( `"${ asked.answer }"` ) }: ${ quote(
+					text.slice( 0, 300 )
+				) }`
+		  )
+		: pass(
+				`offered ${ asked.options.length } directions; went on with ${ quote(
+					`"${ asked.answer }"`
+				) }`
+		  );
 } );

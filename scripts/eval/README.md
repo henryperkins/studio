@@ -129,6 +129,18 @@ What `connectionMatchesBearer: true` proves: every model request on the ChatGPT 
 
 `ranOnRequestedRoute` fails when no provider was selected, the run was refused, no model request ran, the executed kind, backend or connection differs from the requested one, a subscription run sent an API-key bearer, a request named another model or effort, the runtime recorded replies from another provider, or, for a subscription run, `connectionMatchesBearer` is `false` (`connection-mismatch`) or anything but `true` (`connection-unverified`).
 
+### What may leave this machine, and what stays private
+
+**Only the sanitized summary may be shared.** Each case that selects a provider (or must: `requireProvider`) appends one record to `eval-summary.ndjson` in `STUDIO_EVAL_SUMMARY_DIR`, or else in `studio-eval-summary` in the system temporary folder. The record has the acceptance runners' stage-record shape (`scenario` `eval-<provider>`, `stage` the case's `caseId`, `run` counting that case's records in the file, `status`, `code`, `durationS`, `observations`) and is written only once the acceptance evidence's record guard (`findUnsafeRecord`, `apps/cli/ai/acceptance-evidence.ts`) accepts it; one it refuses is written as `failed`, `unsafe-evidence`, with no observations, as the acceptance runners write theirs. `status` is `blocked` when the case was refused or blocked before it ran (its refusal code, or `tool-images-not-qualified`); `failed` when the guard refused a write (`wpcom-write-under-mock`, `wpcom-write-outside-staging`), the case timed out (`timed-out`), its route was not the one selected (`no-model-request`, `route-mismatch`, `api-key-bearer`, `connection-mismatch`, `connection-unverified`, `model-mismatch`, `effort-mismatch`, `reply-provider-mismatch`), or the run failed (`run-failed`); `passed` otherwise. So it says whether the case ran on its selected route with nothing refused; the case's own checks (its reply, its site) are judged in promptfoo's results. The observations are counts and booleans only: the executed route's model, API-key-bearer and image-service request counts, whether its kind, backend, connection and (for a subscription) bearer matched the selection, how many other models, efforts and reply providers it saw and whether the reply models are the requests' models; the guard's refused writes and, in a staging case, the writes it let through; the remote operations recorded and how many reached the designated staging site; turns, tool calls and compactions.
+
+The reasons a provider-qualified case's checks give hold no text the run produced: replies, tool output, site state and error messages read `[run output withheld]`, and a reason in which anything still looks like an address, an email address, a path, a token or an identifier (by the evidence's own check) keeps only its leading code. A case that selects no provider gives its reasons as before.
+
+**Everything else stays on this machine.** It can hold your WordPress.com display name and email, site addresses and ids, local paths with your user name, transcripts and tool outputs:
+
+- promptfoo's results (each case's output, vars and reasons, which `npm run eval:view` shows), kept in promptfoo's own store (by default under `~/.promptfoo`): remove an eval there with promptfoo itself, or delete the store;
+- the runner's result files (`studio-eval-<time>-<pid>.json`: the whole transcript, tool results and the outcome), the session files (`studio-eval-sessions`, or `STUDIO_EVAL_SESSION_DIR`) and the outcome folders (`studio-eval-outcome-*`), in the system temporary folder: delete them when you no longer need them (see "Temporary folders" below for the rest);
+- what the runner and the agent print while a case runs, which promptfoo may keep with the case.
+
 ### What `remote: mock` guarantees
 
 Every parity case runs with `remote: mock` (the `staging:` cases excepted), and so does any selected case that names no `remote`. Under it no state-changing request leaves the eval process itself, counting method overrides in the query and in the override headers (below).
@@ -185,6 +197,7 @@ The result's `remoteGuard` is `{ code, blocked }`, with `allowed` added in a sta
 
 These work in any config:
 
+- `caseId`: the case's kebab-case id, which names it in a provider-qualified case's sanitized summary (above).
 - `remote: mock` (above) or `remote: staging` (above). Without `remote`, an unselected case runs the real host, as before; a selected case runs as `remote: mock`. `remoteOperationRan` and `noRemoteOperation` read the mode the case declares, never the shape of the result.
 - `imageService: "off"`, `"required"` or `"unused"` (above; quote `"off"`, which some YAML parsers read as false).
 - `attachments` (a list of `{ "fixture": "<file in fixtures/>" }`): images are sent as image input with the first message, other files as absolute paths appended to it, as the composer and CLI attach them. `STUDIO_EVAL_FIXTURES_DIR` overrides the folder. The result's `attachments` lists what was attached.

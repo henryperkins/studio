@@ -76,6 +76,7 @@ const attachmentsSchema = z.array( z.object( { fixture: z.string() } ) );
 
 /** Every var the runner itself reads; the rest are the outcome checks' parameters. */
 export const EVAL_RUNNER_VARS = [
+	'caseId',
 	'prompt',
 	'ui',
 	'followUps',
@@ -95,6 +96,8 @@ export const EVAL_RUNNER_VARS = [
 
 export interface EvalRunnerVars {
 	ui: boolean;
+	// The case's id, which names it in a provider-qualified case's sanitized summary.
+	caseId?: string;
 	prompt?: string;
 	// Sent in order, each as a new user message in the same session once the
 	// previous one finishes, so a case can measure a multi-message conversation.
@@ -132,6 +135,7 @@ export interface EvalRunnerVars {
 export function parseEvalRunnerVars( vars: Record< string, unknown > ): EvalRunnerVars {
 	return {
 		ui: vars.ui === true,
+		...( typeof vars.caseId === 'string' ? { caseId: vars.caseId } : {} ),
 		...( vars.prompt !== undefined ? { prompt: vars.prompt as string } : {} ),
 		followUps: vars.followUps ? followUpsSchema.parse( vars.followUps ) : undefined,
 		answers: vars.answers ? answersSchema.parse( vars.answers ) : undefined,

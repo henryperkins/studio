@@ -6,8 +6,13 @@ import path from 'node:path';
 import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
 import { wpcomRequestTool } from '@studio/agent/node/tools/wpcom-request';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { findUnsafeRecord } from 'cli/ai/acceptance-evidence';
 import { evalConnectionRef } from 'cli/ai/eval-provider';
-import { readEvalRunnerInput, runEval as runEvalUntyped } from 'cli/ai/eval-runner';
+import {
+	readEvalRunnerInput,
+	runEval as runEvalUntyped,
+	writeCaseSummary,
+} from 'cli/ai/eval-runner';
 import { cliAgentHost } from 'cli/ai/host';
 import type { AgentSessionEvent, SessionManager } from '@earendil-works/pi-coding-agent';
 import type { StudioAgentHost } from '@studio/agent/node/host';
@@ -619,6 +624,43 @@ describe( 'eval runner provider selection', () => {
 				}
 			}
 		);
+
+		it( 'writes a provider-qualified case’s sanitized summary, and none for a case that selects no provider', async () => {
+			agent.behavior = {
+				request: {
+					url: 'https://api.openai.com/v1/responses',
+					authorization: `Bearer ${ fakeJwt( { sub: 'test-subject', ...claims } ) }`,
+					body: { model: 'gpt-6-luna', reasoning: { effort: 'medium' } },
+				},
+				replyProvider: 'studio-chatgpt',
+			};
+			const summaries = path.join( paths.root, 'summaries' );
+			const selected = input( { caseId: 'parity-identity' }, chatGptEnv() );
+			const record = writeCaseSummary( selected, await runEvalUntyped( selected ), {
+				STUDIO_EVAL_SUMMARY_DIR: summaries,
+			} );
+			expect( record ).toMatchObject( {
+				run: 1,
+				scenario: 'eval-chatgpt-oauth',
+				stage: 'parity-identity',
+				status: 'passed',
+				observations: { modelRequests: 1, bearerMatches: true, guardRefused: 0 },
+			} );
+			expect( findUnsafeRecord( record ) ).toBeNull();
+			const written = fs.readFileSync( path.join( summaries, 'eval-summary.ndjson' ), 'utf8' );
+			for ( const value of [ CONNECTION_ID, 'test-subject', 'eval-person', paths.root ] ) {
+				expect( written ).not.toContain( value );
+			}
+
+			const elsewhere = path.join( paths.root, 'no-summaries' );
+			const unselected = input( { caseId: 'identity' } );
+			expect(
+				writeCaseSummary( unselected, await runEvalUntyped( unselected ), {
+					STUDIO_EVAL_SUMMARY_DIR: elsewhere,
+				} )
+			).toBeNull();
+			expect( fs.existsSync( elsewhere ) ).toBe( false );
+		} );
 
 		it( 'restores fetch and removes its temporary folders when a run fails partway, at any stage', async () => {
 			agent.behavior = { replyProvider: 'studio-chatgpt' };
