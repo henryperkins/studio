@@ -375,6 +375,122 @@ describe( 'install_taxonomy_scripts on the Claude route', () => {
 	} );
 } );
 
+describe( 'a link whose target does not exist, in a path Studio writes', () => {
+	// A link planted in the conversation's site that points out of it, at
+	// nothing yet. A write that followed it would create its target outside the
+	// site's folder, though in this test's own scratch folder. A file link
+	// needs a privilege Windows may not grant; where it does not, that case is
+	// skipped and the junction cases still run.
+	async function fileLink(
+		context: { skip: () => void },
+		target: string,
+		link: string
+	): Promise< void > {
+		try {
+			await symlink( target, link, 'file' );
+		} catch ( error ) {
+			if ( process.platform === 'win32' && ( error as NodeJS.ErrnoException ).code === 'EPERM' )
+				context.skip();
+			throw error;
+		}
+	}
+	// An export that writes its file as the CLI would, once its fence passes.
+	const writingExports = ( host: Awaited< ReturnType< typeof setup > >[ 'host' ] ) => {
+		host.sites.export = vi.fn( async ( _site, file, _mode, _progress, options ) => {
+			await options?.beforeSpawn?.();
+			await writeFile( file, 'zip' );
+		} );
+	};
+
+	it( 'refuses an export file that is a link to nothing, and writes nothing where it points', async ( context ) => {
+		const { bridge, host, site, parent } = await setup();
+		writingExports( host );
+		await mkdir( path.join( parent, 'outside' ) );
+		const escaped = path.join( parent, 'outside', 'escaped.zip' );
+		await fileLink( context, escaped, path.join( site, 'backup.zip' ) );
+		const result = await bridge.invoke( 'site_export', {
+			nameOrPath: 'site',
+			exportFile: path.join( site, 'backup.zip' ),
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( PATH_REFUSAL );
+		expect( host.sites.export ).not.toHaveBeenCalled();
+		expect( existsSync( escaped ) ).toBe( false );
+	} );
+
+	it( 'refuses an export file under a folder link to nothing, and writes nothing where it points', async () => {
+		const { bridge, host, site, parent } = await setup();
+		writingExports( host );
+		await mkdir( path.join( parent, 'outside' ) );
+		const missing = path.join( parent, 'outside', 'missing' );
+		await symlink( missing, path.join( site, 'exports' ), 'junction' );
+		const result = await bridge.invoke( 'site_export', {
+			nameOrPath: 'site',
+			exportFile: path.join( site, 'exports', 'backup.zip' ),
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( PATH_REFUSAL );
+		expect( host.sites.export ).not.toHaveBeenCalled();
+		expect( existsSync( missing ) ).toBe( false );
+	} );
+
+	it( 'still writes an export file that does not exist yet in a folder that does', async () => {
+		const { bridge, host, site } = await setup();
+		writingExports( host );
+		const result = await bridge.invoke( 'site_export', {
+			nameOrPath: 'site',
+			exportFile: path.join( site, 'backup.zip' ),
+		} );
+		expect( result.isError ).toBe( false );
+		expect( existsSync( path.join( site, 'backup.zip' ) ) ).toBe( true );
+	} );
+
+	it( 'checks again immediately before the command starts, so a link to nothing planted while the user reads the approval writes nothing', async ( context ) => {
+		const { bridge, host, context: policyContext, site, parent } = await setup();
+		writingExports( host );
+		await mkdir( path.join( parent, 'outside' ) );
+		const escaped = path.join( parent, 'outside', 'later.zip' );
+		let planted: Promise< void > | undefined;
+		vi.mocked( policyContext.approve ).mockImplementationOnce( async () => {
+			planted = fileLink( context, escaped, path.join( site, 'later.zip' ) );
+			await planted;
+			return 'allow';
+		} );
+		const result = await bridge.invoke( 'site_export', {
+			nameOrPath: 'site',
+			exportFile: path.join( site, 'later.zip' ),
+		} );
+		await planted;
+		expect( result.isError ).toBe( true );
+		expect( host.sites.export ).not.toHaveBeenCalled();
+		expect( existsSync( escaped ) ).toBe( false );
+	} );
+
+	it( 'refuses to copy the Taxonomist scripts through a folder link to nothing', async () => {
+		const { bridge, site, parent, journal } = await setup();
+		await mkdir( path.join( parent, 'outside' ) );
+		const missing = path.join( parent, 'outside', 'missing' );
+		await symlink( missing, path.join( site, 'tmp' ), 'junction' );
+		const result = await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'site' } );
+		expect( result.isError ).toBe( true );
+		expect( existsSync( missing ) ).toBe( false );
+		expect( journal ).toEqual( [] );
+	} );
+
+	it( 'refuses to copy a Taxonomist script over a file link to nothing', async ( context ) => {
+		const { bridge, site, parent, journal } = await setup();
+		const [ script ] = readdirSync( getSkillPath( 'taxonomist', 'scripts' ) );
+		await mkdir( path.join( parent, 'outside' ) );
+		await mkdir( path.join( site, 'tmp', 'taxonomist' ), { recursive: true } );
+		const escaped = path.join( parent, 'outside', script );
+		await fileLink( context, escaped, path.join( site, 'tmp', 'taxonomist', script ) );
+		const result = await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'site' } );
+		expect( result.isError ).toBe( true );
+		expect( existsSync( escaped ) ).toBe( false );
+		expect( journal ).toEqual( [] );
+	} );
+} );
+
 describe( 'refresh_browser on the Claude route', () => {
 	it( 'reloads the preview of the app that shows the conversation, unprompted and unjournaled, only while the call lives', async () => {
 		const fixture = await createPolicyFixture();

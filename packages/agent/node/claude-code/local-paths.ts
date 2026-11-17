@@ -1,4 +1,4 @@
-import { realpath } from 'fs/promises';
+import { lstat, realpath } from 'fs/promises';
 import path from 'path';
 import { getSkillsRoot } from '../skills';
 
@@ -49,9 +49,12 @@ export async function isAllowedNativePath(
 	}
 }
 
+const isMissing = ( error: unknown ) => ( error as NodeJS.ErrnoException )?.code === 'ENOENT';
+
 // Where a path, which may not exist yet, leads once its deepest existing part
 // is resolved through every link, junction and short name; undefined when that
-// part cannot be read.
+// part cannot be read. A link whose target does not exist is there, not
+// missing: a write would follow it wherever it points, so it is refused.
 async function resolveDeepest( file: string ): Promise< string | undefined > {
 	if ( ! path.isAbsolute( file ) ) return;
 	const missing: string[] = [];
@@ -59,13 +62,15 @@ async function resolveDeepest( file: string ): Promise< string | undefined > {
 		try {
 			return path.join( await realpath( current ), ...missing );
 		} catch ( error ) {
-			if (
-				( error as NodeJS.ErrnoException ).code !== 'ENOENT' ||
-				path.dirname( current ) === current
-			)
-				return;
-			missing.unshift( path.basename( current ) );
+			if ( ! isMissing( error ) || path.dirname( current ) === current ) return;
 		}
+		try {
+			await lstat( current );
+			return;
+		} catch ( error ) {
+			if ( ! isMissing( error ) ) return;
+		}
+		missing.unshift( path.basename( current ) );
 	}
 }
 
