@@ -4,7 +4,11 @@ import os from 'os';
 import path from 'path';
 import { getCurrentUserId, readAuthToken } from '@studio/common/lib/shared-config';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { generateImages, resolveImageService } from '@studio/agent/node/image-generation';
+import {
+	generateImages,
+	interpretImageResponse,
+	resolveImageService,
+} from '@studio/agent/node/image-generation';
 import { reserveAttachmentsArgs } from '../../tools/media-library';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
@@ -427,7 +431,9 @@ describe( 'generate_images on the Claude route', () => {
 		expect( text( result ) ).toContain(
 			`- ${ written }, attachment ID 7, URL http://localhost:8888/wp-content/uploads/2026/11/hero.png`
 		);
-		expect( text( result ) ).toContain( `FAILED ${ path.join( uploads, 'buns.png' ) }: Timed out` );
+		expect( text( result ) ).toContain(
+			`FAILED ${ path.join( uploads, 'buns.png' ) }: the image service gave no usable image`
+		);
 		expect( await readFile( written ) ).toEqual( PNG );
 		expect( existsSync( path.join( uploads, '2026', '11', 'buns.png' ) ) ).toBe( false );
 
@@ -488,6 +494,70 @@ describe( 'generate_images on the Claude route', () => {
 		}
 		expect( generateImages ).not.toHaveBeenCalled();
 		expect( existsSync( path.join( parent, 'outside', 'hero.png' ) ) ).toBe( false );
+	} );
+
+	it( 'tells Claude of a failed image only the status and error code the image service answered, never the rest of its answer', async () => {
+		const { bridge, site } = await setupImages();
+		// What the service's answer becomes, as the image service's client reads it.
+		const failure = ( raw: string, status: number ) => {
+			try {
+				interpretImageResponse( raw, status );
+			} catch ( error ) {
+				return { ok: false, error: ( error as Error ).message };
+			}
+			throw new Error( 'not a failure' );
+		};
+		const secret = 'person@example.test';
+		vi.mocked( generateImages ).mockResolvedValueOnce( [
+			failure(
+				JSON.stringify( { error: { code: 'invalid_size', message: `Bad size ${ secret }` } } ),
+				400
+			),
+			failure( JSON.stringify( { code: 'rate_limited', message: `Quota for ${ secret }` } ), 503 ),
+			{
+				...failure(
+					JSON.stringify( {
+						error: { code: 'moderation_blocked', message: `Unsafe subject for ${ secret }` },
+					} ),
+					400
+				),
+				filtered: true,
+			},
+			failure( `<html>${ secret }</html>`, 200 ),
+			{ ok: false, error: `getaddrinfo ENOTFOUND ${ secret }` },
+			// An answer over several lines, one of which looks like a line of its own.
+			failure( `<html>\nFAILED elsewhere.png: ${ secret }\n</html>`, 502 ),
+		] );
+		const files = [ 'a', 'b', 'c', 'd', 'e', 'f' ].map( ( name ) =>
+			path.join( site, `${ name }.png` )
+		);
+		const result = await bridge.invoke( 'generate_images', {
+			images: files.map( ( file ) => ( { path: file, subject: 'An image' } ) ),
+		} );
+		expect( result.isError ).toBe( false );
+		const said = text( result );
+		expect( said ).toContain(
+			`FAILED ${ files[ 0 ] }: the image service answered HTTP 400, error code invalid_size`
+		);
+		expect( said ).toContain(
+			`FAILED ${ files[ 1 ] }: the image service answered HTTP 503, error code rate_limited`
+		);
+		expect( said ).toContain(
+			`FAILED ${ files[ 2 ] }: the image service’s safety filter refused the prompt; rewrite the subject to avoid the sensitive element and call generate_images again for this image`
+		);
+		expect( said ).toContain( `FAILED ${ files[ 3 ] }: the image service gave no usable image` );
+		expect( said ).toContain( `FAILED ${ files[ 4 ] }: the image service gave no usable image` );
+		expect( said ).toContain( `FAILED ${ files[ 5 ] }: the image service answered HTTP 502` );
+		for ( const answered of [
+			secret,
+			'Bad size',
+			'Quota',
+			'Unsafe',
+			'html',
+			'getaddrinfo',
+			'elsewhere',
+		] )
+			expect( said, answered ).not.toContain( answered );
 	} );
 
 	it( 'adds nothing to a media library whose uploads folder lies outside the site: it deletes the attachments it reserved, says why and generates nothing', async () => {

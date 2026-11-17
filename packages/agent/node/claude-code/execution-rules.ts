@@ -1,6 +1,7 @@
 import { readdirSync } from 'fs';
 import path from 'path';
 import { getSharedConfigPath } from '@studio/common/lib/well-known-paths';
+import { IMAGE_NOT_GENERATED_CANCELLED } from '../image-generation';
 import { getSkillPath } from '../skills';
 import { createPreviewTool } from '../tools/create-preview';
 import { createSiteTool } from '../tools/create-site';
@@ -1470,6 +1471,66 @@ export function claudeRouteNote( name: string ): string | undefined {
 	return `On this route Studio runs only these WP-CLI commands, in exactly these forms: ${ commands.join(
 		'; '
 	) }. It refuses every other command and option.`;
+}
+
+// Why an image failed, as this route tells Claude: of the image service's
+// answer only its HTTP status and error code, and Studio's own reasons as they
+// are; never the rest of what the service or the network said.
+function imageFailureReason( error: string ): string {
+	if ( error === IMAGE_NOT_GENERATED_CANCELLED ) return error;
+	if ( error.startsWith( 'Image safety filter rejected the prompt' ) )
+		return 'the image service’s safety filter refused the prompt; rewrite the subject to avoid the sensitive element and call generate_images again for this image';
+	const status = /^(?:Image proxy )?HTTP (\d{3}):/.exec( error )?.[ 1 ];
+	if ( ! status ) return 'the image service gave no usable image';
+	const code =
+		/"code"\s*:\s*"([A-Za-z0-9_.-]{1,64})"/.exec( error )?.[ 1 ] ??
+		/"error"\s*:\s*"([A-Za-z0-9_.-]{1,64})"/.exec( error )?.[ 1 ];
+	return `the image service answered HTTP ${ status }${ code ? `, error code ${ code }` : '' }`;
+}
+
+/**
+ * What this route passes to Claude of a completed result's text. For
+ * `generate_images`, each failed image's line keeps the image's path as the
+ * call named it and gives its reason as `imageFailureReason` words it: a
+ * service's answer can run over several lines, so each failure runs from its
+ * `FAILED <path>: ` to the next one. Any other text is unchanged, and so is the
+ * canonical tool's result on every other route.
+ */
+export function claudeResultText( name: string, args: unknown, text: string ): string {
+	if ( name !== generateImagesTool.name || ! text.includes( 'FAILED ' ) ) return text;
+	const images = isRecord( args ) && Array.isArray( args.images ) ? args.images : [];
+	const paths = images
+		.map( ( image ) => ( isRecord( image ) ? image.path : undefined ) )
+		.filter( ( named ): named is string => typeof named === 'string' && named.length > 0 )
+		// The longest first, so a path that starts another is not taken for it.
+		.sort( ( a, b ) => b.length - a.length );
+	const starts: Array< { at: number; named: string } > = [];
+	for ( const named of paths )
+		for (
+			let at = text.indexOf( `FAILED ${ named }: ` );
+			at >= 0;
+			at = text.indexOf( `FAILED ${ named }: `, at + 1 )
+		)
+			if (
+				( at === 0 || text[ at - 1 ] === '\n' ) &&
+				! starts.some( ( start ) => start.at === at )
+			)
+				starts.push( { at, named } );
+	starts.sort( ( a, b ) => a.at - b.at );
+	const head = text.slice( 0, starts[ 0 ]?.at ?? text.length );
+	// A failure line for no image this call named says nothing of its own.
+	if ( /(?:^|\n)FAILED /.test( head ) )
+		return 'Studio could not tell which images of this call failed.';
+	return (
+		head +
+		starts
+			.map( ( { at, named }, index ) => {
+				const end = starts[ index + 1 ]?.at ?? text.length;
+				const said = text.slice( at + `FAILED ${ named }: `.length, end ).replace( /\n$/, '' );
+				return `FAILED ${ named }: ${ imageFailureReason( said ) }`;
+			} )
+			.join( '\n' )
+	);
 }
 
 /** The name the native runtime knows a Studio tool by. */

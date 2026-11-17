@@ -7,6 +7,7 @@ import { runStudioTool } from '../tools/execution';
 import {
 	CLAUDE_ENABLED_TOOLS,
 	CLAUDE_NAVIGATION_CONFINEMENT,
+	claudeResultText,
 	claudeRouteNote,
 	claudeStudioTools,
 	isRecord,
@@ -195,11 +196,14 @@ export function createStudioClaudeToolBridge(
 			};
 		}
 		onEvent( { type: 'tool.result', runId, turnId, toolCallId, isError: false } );
+		const content = run.result.content.map( ( part ) =>
+			part.type === 'text' ? { ...part, text: claudeResultText( name, args, part.text ) } : part
+		);
 		return {
 			isError: false,
 			content: refused.length
-				? [ ...run.result.content, { type: 'text', text: `Studio note: ${ refused.join( ' ' ) }` } ]
-				: run.result.content,
+				? [ ...content, { type: 'text', text: `Studio note: ${ refused.join( ' ' ) }` } ]
+				: content,
 		};
 	}
 	// `signal` is the MCP call's own: the SDK aborts it when the native runtime
