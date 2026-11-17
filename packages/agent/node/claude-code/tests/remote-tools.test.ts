@@ -1424,6 +1424,39 @@ describe( 'wpcom_request on the Claude route', () => {
 			expect( wpcom.received ).toHaveLength( 1 );
 		} );
 
+		it( 'refuses the account profile through the site in every supported namespace', async () => {
+			const { bridge, context, journal } = await setup( live );
+			for ( const apiNamespace of [ undefined, '', 'wp/v2', 'wpcom/v2' ] ) {
+				for ( const path of [
+					'/users/me',
+					'users/me/',
+					'!/sites/42/users/me',
+					'/users/ME/settings',
+					'/users/%6De',
+				] ) {
+					const result = await bridge.invoke( 'wpcom_request', {
+						siteId: 42,
+						method: 'GET',
+						path,
+						apiNamespace,
+						query: { context: 'edit' },
+					} );
+					expect( result.isError, path ).toBe( true );
+					expect( text( result ), path ).toContain( PROFILE_REFUSAL );
+				}
+			}
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( journal ).toEqual( [] );
+			expect( wpcom.received ).toEqual( [] );
+			const listed = await bridge.invoke( 'wpcom_request', {
+				siteId: 42,
+				method: 'GET',
+				path: '/users/12',
+			} );
+			expect( listed.isError ).toBe( false );
+			expect( sent() ).toEqual( [ 'GET /wp/v2/sites/42/users/12' ] );
+		} );
+
 		it( 'reads no other site, and no site from a conversation without one on WordPress.com, says why and sends nothing', async () => {
 			const onLive = await setup( live );
 			const onLocal = await setup();

@@ -172,6 +172,9 @@ export function wpcomScope( args: unknown ): WpcomScope | undefined {
 	if ( site ) {
 		const id = Number( site[ 1 ] );
 		if ( ! Number.isSafeInteger( id ) || ( ! absolute && id !== siteId ) ) return;
+		// The site's users/me route names the signed-in account, just like !/me.
+		const sitePath = decodeURIComponent( route.slice( site[ 0 ].length ) );
+		if ( /^\/*users\/+me(?:\/|$)/i.test( sitePath ) ) return;
 		// A change reaches something in the site: a first segment after it.
 		if (
 			! reads &&
