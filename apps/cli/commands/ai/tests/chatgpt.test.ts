@@ -572,7 +572,11 @@ describe( 'ChatGPT interactive CLI', () => {
 		} );
 		vi.mocked( cancelChatGptSignIn ).mockReturnValueOnce( true );
 		await runCommand( { adapter: ui, resumeSession: resume( await previousChat() ) } );
-		expect( beginChatGptSignIn ).toHaveBeenCalledWith( A, { storage: 'session' } );
+		expect( beginChatGptSignIn ).toHaveBeenCalledWith(
+			A,
+			{ storage: 'session' },
+			{ storageChosen: expect.any( Function ) }
+		);
 		expect( cancelChatGptSignIn ).toHaveBeenCalledWith( ATTEMPT );
 		expect( ui.showInfo ).toHaveBeenCalledWith( 'Signing in to ChatGPT was cancelled.' );
 		expect( JSON.stringify( [ ui.showInfo.mock.calls, ui.showError.mock.calls ] ) ).not.toContain(
