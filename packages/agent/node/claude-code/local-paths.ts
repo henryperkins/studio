@@ -22,42 +22,58 @@ function isSensitivePath( candidate: string ): boolean {
 		);
 }
 
-// Whether a path is one these checks judge: absolute, and on Windows with no
-// colon but the drive's. A colon anywhere else names an NTFS stream or a
-// device: `link:s.zip` opens a stream of whatever `link` leads to, though
-// neither `realpath` nor `lstat` of that name finds anything to resolve.
+// Whether a path is one these checks judge: absolute, with no `..` segment by
+// either separator, and on Windows with no colon but the drive's. A check
+// collapses `..` before it resolves anything, while macOS and Linux resolve it
+// after following the link before it, so a path judged inside could lead out.
+// On Windows a colon anywhere but the drive names an NTFS stream or a device:
+// `link:s.zip` opens a stream of whatever `link` leads to, though neither
+// `realpath` nor `lstat` of that name finds anything to resolve.
 function isJudgeable( file: string ): boolean {
 	return (
 		path.isAbsolute( file ) &&
+		! file.split( /[\\/]/ ).includes( '..' ) &&
 		( process.platform !== 'win32' || ! file.replace( /^[a-z]:(?=[\\/])/i, '' ).includes( ':' ) )
 	);
 }
 
 /**
- * Whether a native file tool may reach an existing path: inside one of the
- * canonical roots, outside the native configuration and clear of files that
- * commonly hold credentials.
+ * The path an existing file resolves to through every link, junction and short
+ * name, when a native file tool or a host operation may reach it: inside one of
+ * the canonical roots, outside the native configuration and clear of files
+ * that commonly hold credentials. Undefined otherwise.
  */
+export async function resolveAllowedPath(
+	file: string,
+	roots: readonly string[],
+	configDirectory: string,
+	allowRoot = false
+): Promise< string | undefined > {
+	if ( ! isJudgeable( file ) ) return;
+	let canonical: string;
+	try {
+		canonical = await realpath( file );
+	} catch {
+		return;
+	}
+	return roots.some(
+		( root ) => isInside( root, canonical ) && ( allowRoot || canonical !== root )
+	) &&
+		! isInside( configDirectory, canonical ) &&
+		! isSensitivePath( file ) &&
+		! isSensitivePath( canonical )
+		? canonical
+		: undefined;
+}
+
+/** Whether a native file tool may reach an existing path (`resolveAllowedPath`). */
 export async function isAllowedNativePath(
 	file: string,
 	roots: readonly string[],
 	configDirectory: string,
 	allowRoot = false
 ): Promise< boolean > {
-	if ( ! isJudgeable( file ) ) return false;
-	try {
-		const canonical = await realpath( file );
-		return (
-			roots.some(
-				( root ) => isInside( root, canonical ) && ( allowRoot || canonical !== root )
-			) &&
-			! isInside( configDirectory, canonical ) &&
-			! isSensitivePath( file ) &&
-			! isSensitivePath( canonical )
-		);
-	} catch {
-		return false;
-	}
+	return ( await resolveAllowedPath( file, roots, configDirectory, allowRoot ) ) !== undefined;
 }
 
 const isMissing = ( error: unknown ) => ( error as NodeJS.ErrnoException )?.code === 'ENOENT';
@@ -95,24 +111,25 @@ export async function isInsideCanonicalRoot( root: string, file: string ): Promi
 }
 
 /**
- * Whether a host operation may write a file, which may not exist yet: once its
- * deepest existing folder is resolved, inside one of the canonical roots but
- * not a root itself, outside the native configuration, and clear of names
- * that commonly hold credentials.
+ * The path a file, which may not exist yet, resolves to once its deepest
+ * existing folder is resolved, when a host operation may write it: inside one
+ * of the canonical roots but not a root itself, outside the native
+ * configuration, and clear of names that commonly hold credentials. Undefined
+ * otherwise.
  */
-export async function isAllowedNewPath(
+export async function resolveAllowedNewPath(
 	file: string,
 	roots: readonly string[],
 	configDirectory: string
-): Promise< boolean > {
+): Promise< string | undefined > {
 	const resolved = await resolveDeepest( file );
-	return (
-		resolved !== undefined &&
+	return resolved !== undefined &&
 		roots.some( ( root ) => isInside( root, resolved ) && resolved !== root ) &&
 		! isInside( configDirectory, resolved ) &&
 		! isSensitivePath( file ) &&
 		! isSensitivePath( resolved )
-	);
+		? resolved
+		: undefined;
 }
 
 /**

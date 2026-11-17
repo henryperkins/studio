@@ -556,6 +556,71 @@ describe.runIf( process.platform === 'win32' )( 'a path that names an NTFS strea
 	} );
 } );
 
+describe( 'the file a host operation reads or writes', () => {
+	it( 'is handed to the operation, and shown in its approval, as the path the check judged, never as the caller’s own string', async () => {
+		const { bridge, host, context, site } = await setup();
+		// A folder link inside the site, to another folder inside it.
+		await mkdir( path.join( site, 'real' ) );
+		await symlink( path.join( site, 'real' ), path.join( site, 'alias' ), 'junction' );
+		await writeFile( path.join( site, 'real', 'backup.zip' ), 'zip' );
+
+		const exported = await bridge.invoke( 'site_export', {
+			nameOrPath: 'site',
+			exportFile: path.join( site, 'alias', 'new.zip' ),
+		} );
+		expect( exported.isError ).toBe( false );
+		const written = path.join( site, 'real', 'new.zip' );
+		expect( host.sites.export ).toHaveBeenCalledWith(
+			expect.objectContaining( { id: fakeSite.id } ),
+			written,
+			'full',
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation ).toMatchObject( {
+			args: [ written, 'full' ],
+			localPaths: [ site, written ],
+		} );
+
+		const imported = await bridge.invoke( 'site_import', {
+			nameOrPath: 'site',
+			importFile: path.join( site, 'alias', 'backup.zip' ),
+		} );
+		expect( imported.isError ).toBe( false );
+		const read = path.join( site, 'real', 'backup.zip' );
+		expect( host.sites.import ).toHaveBeenCalledWith(
+			expect.objectContaining( { id: fakeSite.id } ),
+			read,
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( vi.mocked( context.approve ).mock.calls[ 1 ][ 0 ].operation ).toMatchObject( {
+			args: [ read ],
+			localPaths: [ site, read ],
+		} );
+	} );
+
+	// Where the system resolves `..` after following a link, `link/..` is the
+	// folder the link leads into, not the one the link is in.
+	it.runIf( process.platform === 'darwin' || process.platform === 'linux' )(
+		'refuses a path with `..` after a link, which leads out of the site there',
+		async () => {
+			const { bridge, host, site, parent } = await setup();
+			writingExports( host );
+			await mkdir( path.join( parent, 'outside', 'deep' ), { recursive: true } );
+			await symlink( path.join( parent, 'outside', 'deep' ), path.join( site, 'link' ), 'dir' );
+			const result = await bridge.invoke( 'site_export', {
+				nameOrPath: 'site',
+				exportFile: `${ path.join( site, 'link' ) }/../escaped.zip`,
+			} );
+			expect( result.isError ).toBe( true );
+			expect( text( result ) ).toContain( PATH_REFUSAL );
+			expect( host.sites.export ).not.toHaveBeenCalled();
+			expect( existsSync( path.join( parent, 'outside', 'escaped.zip' ) ) ).toBe( false );
+		}
+	);
+} );
+
 describe( 'refresh_browser on the Claude route', () => {
 	it( 'reloads the preview of the app that shows the conversation, unprompted and unjournaled, only while the call lives', async () => {
 		const fixture = await createPolicyFixture();
