@@ -162,7 +162,7 @@ async function setup(
 }
 type StartStep = 'createSession' | 'setSessionChatGptSelection' | 'setSessionEnvironment';
 // Holds the connector's next call of `step` open until the test settles it.
-function holdNext( connector: FakeConnector, step: StartStep ) {
+function holdNext( connector: FakeConnector, step: StartStep | 'setSessionProvider' ) {
 	const gate = deferred< void >();
 	const mock = connector[ step ] as unknown as Mock< ( ...args: unknown[] ) => Promise< unknown > >;
 	const run = mock.getMockImplementation()!;
@@ -1296,5 +1296,76 @@ describe( 'Starting the site’s new chat on ChatGPT', () => {
 				connector.state.sessions.find( ( session ) => session.summary.id === id )!.entries
 			)?.connectionId
 		).toBe( B );
+	} );
+
+	it.each( [ 'createSession', 'setSessionProvider' ] as const )(
+		'starts nothing on ChatGPT while a send from the new chat waits on %s, and the message runs where it was sent',
+		async ( step ) => {
+			const { connector, runs, history } = await setup( [], false, TEST_USER, '/sites/one/new' );
+			fireEvent.change( input(), { target: { value: 'Sent idea' } } );
+			// The picker is open when Send is pressed, so the pick lands during the send.
+			fireEvent.click( modelButton() );
+			const group = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ WORK }` } );
+			const luna = await within( group ).findByRole( 'option', { name: /GPT-6 Luna/ } );
+			const gate = holdNext( connector, step );
+			fireEvent.keyDown( input(), { key: 'Enter' } );
+			await waitFor( () => expect( connector[ step ] ).toHaveBeenCalled() );
+			expect( modelButton() ).toHaveAttribute( 'aria-busy', 'true' );
+
+			fireEvent.click( luna );
+			await act( async () => {} );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+
+			await act( async () => gate.resolve() );
+			await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+			const { id } = await connector.createSession.mock.results[ 0 ].value;
+			await waitFor( () => expect( history.location.pathname ).toBe( `/sessions/${ id }` ) );
+			expect( runs[ 0 ] ).toMatchObject( { id, prompt: 'Sent idea' } );
+			expect( runs[ 0 ].selection ).toBeUndefined();
+			expect( connector.setSessionProvider ).toHaveBeenCalledWith( id, 'wpcom', expect.anything() );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+			expect( screen.queryByText( `ChatGPT plan · ${ WORK }` ) ).not.toBeInTheDocument();
+		}
+	);
+
+	it( 'keeps the Model control busy while a send from the new chat is pending', async () => {
+		const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		const gate = holdNext( connector, 'createSession' );
+		send( 'Sent idea' );
+		await waitFor( () => expect( connector.createSession ).toHaveBeenCalled() );
+
+		expect( modelButton() ).toHaveAttribute( 'aria-busy', 'true' );
+		fireEvent.click( modelButton() );
+		await act( async () => {} );
+		expect( screen.queryByRole( 'listbox', { name: 'Choose a model' } ) ).not.toBeInTheDocument();
+
+		await act( async () => gate.resolve() );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+		expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+	} );
+
+	it( 'leaves the Model control as it was during a send from the new chat with ChatGPT plans off', async () => {
+		const { connector, queryClient, runs } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		connector.state.chatGpt = {
+			enabled: false,
+			signInSupported: false,
+			secureStorage: 'unavailable',
+			accounts: [],
+		};
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+		const gate = holdNext( connector, 'createSession' );
+		send( 'Sent idea' );
+		await waitFor( () => expect( connector.createSession ).toHaveBeenCalled() );
+
+		expect( modelButton() ).not.toHaveAttribute( 'aria-busy' );
+		expect( modelButton() ).toBeEnabled();
+		fireEvent.click( modelButton() );
+		expect( await screen.findByRole( 'listbox', { name: 'Choose a model' } ) ).toBeVisible();
+
+		await act( async () => gate.resolve() );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
 	} );
 } );

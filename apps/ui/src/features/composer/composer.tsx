@@ -228,6 +228,11 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 	// Until the site's new chat is on the chosen ChatGPT account, nothing is sent
 	// and no other model is chosen: the composer still shows the previous one.
 	const startingChat = ! sessionId && ! isField && connectionSwitch.starting;
+	// Nor while a send from it is on its way, where a ChatGPT account can be chosen:
+	// the message leaves on the model shown, and the chat it opens is that message's.
+	const modelBusy =
+		startingChat ||
+		( ! sessionId && ! isField && chatGptAccounts.length > 0 && connectionSwitch.sendingDraft );
 	const chatGptModel = chatGpt?.selection?.model;
 	const chatGptModelLabel = chatGpt
 		? chatGptModel && isAiModelId( chatGptModel )
@@ -276,7 +281,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 			canChangeEnvironment: !! onEnvironmentChange,
 		} ),
 		isDisabled: ( name ) =>
-			( name === 'model' && startingChat ) ||
+			( name === 'model' && modelBusy ) ||
 			( name === siteCommand && siteActionDisabled ) ||
 			( name === 'auto-start' && ( ! preferences || savePreferences.isPending ) ) ||
 			( ( name === 'live' || name === 'local' ) && busy ),
@@ -383,7 +388,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		attachments,
 	} );
 	const changeModel = ( nextProvider: AiProviderId, nextModel: AiModelId ) => {
-		if ( startingChat ) {
+		if ( modelBusy ) {
 			return;
 		}
 		if ( chatGpt && nextProvider !== 'chatgpt-oauth' ) {
@@ -393,7 +398,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		}
 	};
 	const changeChatGptModel = ( account: ChatGptAccountView, nextModel: string ) => {
-		if ( startingChat ) {
+		if ( modelBusy ) {
 			return;
 		}
 		const current = chatGpt?.selection;
@@ -715,7 +720,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 									sessionProvider={ sessionProvider }
 									getModelLockReason={ getModelLockReason }
 									disabled={ busy && ! chatGpt }
-									busy={ startingChat }
+									busy={ modelBusy }
 									anchor={ rootNode }
 									onChange={ changeModel }
 									onAddCredits={ openAddCredits }

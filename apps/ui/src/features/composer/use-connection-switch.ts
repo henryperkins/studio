@@ -27,7 +27,7 @@ export function useConnectionSwitch(
 	const [ target, setTarget ] = useState< ConnectionTarget | null >( null );
 	const [ inFlight, setInFlight ] = useState( false );
 	// Whether the site's new chat is being started on a ChatGPT account, kept with
-	// its draft, where every send from it looks.
+	// its draft, where every send from it looks; and whether a send from it is on its way.
 	const siteDraft = useSiteChatDraft( ownerSiteId );
 	const [ error, setError ] = useState( '' );
 	const saving = useRef( false );
@@ -111,7 +111,11 @@ export function useConnectionSwitch(
 			} );
 			return;
 		}
-		if ( ! onSwitchSession || saving.current || siteDraft.current().startingChatGpt ) return;
+		const site = siteDraft.current();
+		// A send from the new chat still on its way leaves on the model it was sent with,
+		// and opens its own chat: no start begins under it.
+		const held = site.startingChatGpt || site.pendingPrompt !== undefined;
+		if ( ! onSwitchSession || saving.current || held ) return;
 		saving.current = true;
 		const { update: updateSiteDraft } = siteDraft;
 		updateSiteDraft( { startingChatGpt: true } );
@@ -166,6 +170,7 @@ export function useConnectionSwitch(
 		startInPlace,
 		inFlight,
 		starting: !! siteDraft.draft.startingChatGpt,
+		sendingDraft: siteDraft.draft.pendingPrompt !== undefined,
 		error,
 		cancel: () => {
 			if ( ! saving.current ) setTarget( null );
