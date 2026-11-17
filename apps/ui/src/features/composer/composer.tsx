@@ -1,3 +1,4 @@
+import { canPinChatGptInPlace } from '@studio/agent/protocol/chatgpt';
 import { getDefaultChatGptReasoningEffort } from '@studio/agent/protocol/chatgpt-models';
 import { aiModelSupportsImages, getAiModelLabel, isAiModelId } from '@studio/agent/protocol/models';
 import { isOpenAiReasoningEffort } from '@studio/agent/protocol/openai-models';
@@ -405,6 +406,23 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		};
 		if ( sameConnection && chatGpt ) {
 			chatGpt.changeSelection( selection );
+		} else if ( ! chatGpt && canPinChatGptInPlace( entries ?? [] ) ) {
+			connectionSwitch
+				.startInPlace( selection, sessionId, {
+					key: draftKey,
+					text: value,
+					attachments,
+					environment,
+				} )
+				.catch( ( error: unknown ) =>
+					toast.error(
+						sprintf(
+							/* translators: %s: why the choice could not be saved. */
+							__( 'The ChatGPT model or reasoning change wasn’t saved. %s' ),
+							error instanceof Error ? error.message : __( 'Try again.' )
+						)
+					)
+				);
 		} else {
 			connectionSwitch.request( {
 				provider: 'chatgpt-oauth',

@@ -8,6 +8,7 @@ import {
 	loadAiSession,
 	readPiFileEntries,
 } from '@studio/agent/node/sessions/store';
+import { canPinChatGptInPlace } from '@studio/agent/protocol/chatgpt';
 import { isAiModelId } from '@studio/agent/protocol/models';
 import {
 	getEffectiveSessionProvider,
@@ -15,7 +16,6 @@ import {
 	providerServesModel,
 	readSessionPin,
 } from '@studio/agent/protocol/providers';
-import { isStudioCustomEntryOfType } from '@studio/agent/protocol/sessions/entry-types';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
 
@@ -72,18 +72,7 @@ export function assertSessionSelection(
 		) {
 			needsNewChat();
 		}
-	} else if (
-		selection.provider === 'chatgpt-oauth' &&
-		entries.some(
-			( entry ) =>
-				entry.type === 'message' ||
-				entry.type === 'model_change' ||
-				entry.type === 'compaction' ||
-				entry.type === 'branch_summary' ||
-				isStudioCustomEntryOfType( entry, 'studio.user_prompt' ) ||
-				isStudioCustomEntryOfType( entry, 'studio.session_context' )
-		)
-	) {
+	} else if ( selection.provider === 'chatgpt-oauth' && ! canPinChatGptInPlace( entries ) ) {
 		needsNewChat();
 	}
 }

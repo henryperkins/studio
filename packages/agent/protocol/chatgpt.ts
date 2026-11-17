@@ -1,5 +1,6 @@
 import { getDefaultChatGptReasoningEffort } from './chatgpt-models';
 import { readSessionPin } from './providers';
+import { isStudioCustomEntryOfType } from './sessions/entry-types';
 import type { ConnectionRegistryEntry } from './connections';
 import type { OpenAiReasoningEffort } from './openai-models';
 import type { StudioSessionContextData } from './sessions/entry-types';
@@ -63,6 +64,23 @@ export function readChatGptContextChoice( record: StudioSessionContextData | und
 		model: asString( chatGpt?.model ) ?? asString( record?.model ),
 		reasoningEffort: asString( chatGpt?.reasoningEffort ) ?? asString( record?.reasoningEffort ),
 	};
+}
+
+/**
+ * Whether a chat that isn't on ChatGPT can be put on it where it is, rather
+ * than in a new chat: only while nothing in it could move between billing
+ * routes, so no turn, model change, summary or provider pin yet.
+ */
+export function canPinChatGptInPlace( entries: SessionEntry[] ): boolean {
+	return ! entries.some(
+		( entry ) =>
+			entry.type === 'message' ||
+			entry.type === 'model_change' ||
+			entry.type === 'compaction' ||
+			entry.type === 'branch_summary' ||
+			isStudioCustomEntryOfType( entry, 'studio.user_prompt' ) ||
+			isStudioCustomEntryOfType( entry, 'studio.session_context' )
+	);
 }
 
 /** Keeps an unsupported stored effort visible until the user changes it. */

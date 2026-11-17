@@ -6,9 +6,11 @@ import { __, sprintf } from '@wordpress/i18n';
 import { useEffect, useRef, useState } from 'react';
 import { useConnector } from '@/data/core';
 import { primeSessionQueryData, SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
+import { saveSessionSettingChange } from '@/data/session-setting-changes';
 import { saveComposerDraft } from './draft-store';
 import { createChatGptSelectionEntry } from './use-chatgpt-conversation';
 import type { AiModelId, AiSessionSummary, SessionEntry } from '@/data/core';
+import type { ComposerAttachment } from '@/data/use-composer-attachments';
 import type { ChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
 
@@ -80,9 +82,53 @@ export function useConnectionSwitch(
 			if ( mounted.current ) setInFlight( false );
 		}
 	};
+	/**
+	 * Puts a chat with nothing in it yet on a ChatGPT account where it is, as the
+	 * backend allows and a model switch without turns does, with no new chat to
+	 * confirm: a chat with a session is pinned in place; the site's new chat
+	 * becomes one on the account, taking what was typed with it.
+	 */
+	const startInPlace = async (
+		selection: ChatGptSessionSelection,
+		sessionId: string | undefined,
+		draft: {
+			key?: string;
+			text: string;
+			attachments: ComposerAttachment[];
+			environment: 'local' | 'live';
+		}
+	): Promise< void > => {
+		const entry = createChatGptSelectionEntry( selection );
+		if ( sessionId ) {
+			await saveSessionSettingChange( {
+				queryClient,
+				sessionId,
+				entry,
+				write: () => connector.setSessionChatGptSelection( sessionId, selection ),
+			} );
+			return;
+		}
+		if ( ! onSwitchSession || saving.current ) return;
+		saving.current = true;
+		try {
+			const summary = await connector.createSession( ownerSiteId );
+			await connector.setSessionChatGptSelection( summary.id, selection );
+			if ( draft.environment === 'live' ) {
+				await connector.setSessionEnvironment( summary.id, 'live' );
+			}
+			primeSessionQueryData( queryClient, summary, [ entry ] );
+			saveComposerDraft( summary.id, { text: draft.text, attachments: draft.attachments } );
+			saveComposerDraft( draft.key, { text: '', attachments: [] } );
+			void queryClient.invalidateQueries( { queryKey: SESSIONS_QUERY_KEY, exact: true } );
+			if ( mounted.current ) onSwitchSession( summary.id );
+		} finally {
+			saving.current = false;
+		}
+	};
 	return {
 		request,
 		confirm,
+		startInPlace,
 		inFlight,
 		error,
 		cancel: () => {

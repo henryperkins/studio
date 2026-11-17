@@ -12,7 +12,7 @@ import {
 	createAiSession,
 	loadAiSession,
 } from '@studio/agent/node/sessions/store';
-import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
+import { canPinChatGptInPlace, readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { resolveConnectionSelection } from '@studio/agent/protocol/connections';
 
 vi.mock( '@studio/agent/node/chatgpt/credential-broker', async ( original ) => ( {
@@ -314,6 +314,20 @@ describe( 'ChatGPT session selection', () => {
 		],
 	] )( 'refuses %s with a known message', async ( _name, write, message ) => {
 		await expect( write() ).rejects.toMatchObject( { name: 'ChatGptSettingsError', message } );
+	} );
+
+	it( 'pins a chat on its site to ChatGPT where it is while nothing has happened in it, as the apps start one', async () => {
+		const { id } = await createAiSession( root, {
+			site: { id: 'one', name: 'Example', path: root },
+		} );
+		const before = ( await loadAiSession( root, id ) ).entries;
+		expect( canPinChatGptInPlace( before ) ).toBe( true );
+
+		await setSessionChatGptSelection( root, id, selection );
+
+		expect( readChatGptSessionSelection( ( await loadAiSession( root, id ) ).entries ) ).toEqual(
+			selection
+		);
 	} );
 
 	it( 'releases the session lock after an invalid selection and preserves site placement', async () => {
