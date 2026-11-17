@@ -9,7 +9,11 @@
 // Use from promptfoo.config.yaml as `type: javascript` with
 // `value: file://outcome.mjs:<check>`; per-case parameters come from `vars`.
 import { readFileSync } from 'node:fs';
-import { findUnsafeText } from '../../apps/cli/ai/acceptance-evidence.ts';
+import {
+	findUnsafeText,
+	openAcceptanceEvidence,
+	UnsafeEvidenceError,
+} from '../../apps/cli/ai/acceptance-evidence.ts';
 
 const MARKER = /EVAL_RUNNER_RESULT_FILE=(\S+)/;
 
@@ -71,8 +75,47 @@ const blocked = ( block ) => {
 	);
 };
 
+// A check's fixed name as its summary record carries it: `ranOnRequestedRoute`
+// is `ran-on-requested-route`.
+const kebabName = ( name ) => name.replace( /[A-Z]/g, ( letter ) => `-${ letter.toLowerCase() }` );
+
+// A provider-qualified case's check verdict, appended through the evidence
+// writer's guard to the run the runner started in the case's sanitized summary,
+// whose location its result carries: the case, the check's fixed name and the
+// verdict (`blocked` for a case refused or blocked before it ran), nothing
+// else. A record the guard refuses is written as `unsafe-evidence` of an
+// unnamed case. Never changes the verdict.
+function recordCheck( d, name, verdict ) {
+	const location = d?.evalSummary;
+	if ( typeof location?.directory !== 'string' || ! Number.isSafeInteger( location.run ) ) return;
+	const record = {
+		run: location.run,
+		scenario: `eval-check-${ kebabName( name ) }`,
+		stage: location.stage,
+		status: d.refusal || d.blocked ? 'blocked' : verdict.pass ? 'passed' : 'failed',
+		durationS: 0,
+		observations: {},
+	};
+	try {
+		const evidence = openAcceptanceEvidence( location.directory, 'eval' );
+		try {
+			evidence.record( record );
+		} catch ( error ) {
+			if ( ! ( error instanceof UnsafeEvidenceError ) ) throw error;
+			evidence.record( {
+				...record,
+				stage: 'unnamed-case',
+				status: 'failed',
+				code: 'unsafe-evidence',
+			} );
+		}
+	} catch {
+		process.stderr.write( `studio-eval warning: could not add ${ name } to the case’s summary\n` );
+	}
+}
+
 // Runs a check against the loaded result, turning a thrown problem into a failure.
-function check( fn ) {
+function check( name, fn ) {
 	return ( output, context ) => {
 		const vars = context?.vars ?? {};
 		let d = null;
@@ -83,6 +126,7 @@ function check( fn ) {
 		} catch ( error ) {
 			verdict = fail( error instanceof Error ? error.message : String( error ) );
 		}
+		if ( providerQualified( d, vars ) ) recordCheck( d, name, verdict );
 		return {
 			...verdict,
 			reason: providerQualified( d, vars )
@@ -141,7 +185,7 @@ function siteDesignText( s, { includeThemeJson = true } = {} ) {
 
 // The site the case is about exists, renders, and every published page,
 // template and part is valid in the site's own block editor.
-export const siteWorks = check( ( d, vars ) => {
+export const siteWorks = check( 'siteWorks', ( d, vars ) => {
 	const s = site( d, vars );
 	if ( s.home?.status !== 200 )
 		return fail( `home page returned ${ s.home?.status } ${ quote( s.home?.error || '' ) }` );
@@ -160,7 +204,7 @@ export const siteWorks = check( ( d, vars ) => {
 } );
 
 // No other site the user has was changed or removed.
-export const otherSitesUntouched = check( ( d ) => {
+export const otherSitesUntouched = check( 'otherSitesUntouched', ( d ) => {
 	const o = d.outcome;
 	if ( ! o || o.error ) return fail( `no outcome captured: ${ quote( o?.error ) }` );
 	const touched = [
@@ -173,7 +217,7 @@ export const otherSitesUntouched = check( ( d ) => {
 } );
 
 // The turn created no site, and (with vars.requestSiteUnchanged) left the active site as it was.
-export const noSiteCreated = check( ( d, vars ) => {
+export const noSiteCreated = check( 'noSiteCreated', ( d, vars ) => {
 	const created = ( d.outcome?.sites || [] ).filter( ( s ) => s.created );
 	if ( created.length )
 		return fail( `created ${ quote( created.map( ( s ) => `"${ s.name }"` ).join( ', ' ) ) }` );
@@ -183,7 +227,7 @@ export const noSiteCreated = check( ( d, vars ) => {
 } );
 
 // No turn took longer than vars.maxTurnMs (default 60s), so the UI never stalls.
-export const turnsAreResponsive = check( ( d, vars ) => {
+export const turnsAreResponsive = check( 'turnsAreResponsive', ( d, vars ) => {
 	const limit = vars.maxTurnMs ?? 60000;
 	const durations = d.turnDurationsMs ?? [];
 	if ( ! durations.length ) return fail( 'no turns recorded' );
@@ -201,7 +245,7 @@ export const turnsAreResponsive = check( ( d, vars ) => {
 // tool calls and vars.maxTokens tokens, summed over all its turns. A run that gets the
 // right result by looping through dozens of calls costs the user credits, so a
 // pass that blows the budget counts as a regression.
-export const withinBudget = check( ( d, vars ) => {
+export const withinBudget = check( 'withinBudget', ( d, vars ) => {
 	if ( vars.maxToolCalls === undefined && vars.maxTokens === undefined )
 		throw new Error( 'the case sets neither maxToolCalls nor maxTokens' );
 	const calls = ( d.toolCalls || [] ).length;
@@ -227,7 +271,7 @@ export const withinBudget = check( ( d, vars ) => {
 // request observer: only the answer is in the result). A run with no
 // selection is a legacy-provider run: regression evidence only, never
 // evidence for a provider route.
-export const ranOnRequestedRoute = check( ( d ) => {
+export const ranOnRequestedRoute = check( 'ranOnRequestedRoute', ( d ) => {
 	const route = d.providerRoute;
 	if ( ! route )
 		return fail(
@@ -282,7 +326,7 @@ export const ranOnRequestedRoute = check( ( d ) => {
 
 // --- Reply checks ---------------------------------------------------------
 
-export const identifiesAsStudio = check( ( d ) => {
+export const identifiesAsStudio = check( 'identifiesAsStudio', ( d ) => {
 	const text = reply( d );
 	const other =
 		/\bI\s+am\s+(Claude|ChatGPT|a large language model|an AI (model|assistant) (made|built|developed) by Anthropic)\b/i.test(
@@ -293,13 +337,13 @@ export const identifiesAsStudio = check( ( d ) => {
 		: fail( `got: ${ quote( text.slice( 0, 300 ) ) }` );
 } );
 
-export const replyIncludes = check( ( d, vars ) =>
+export const replyIncludes = check( 'replyIncludes', ( d, vars ) =>
 	reply( d ).includes( vars.expectedText )
 		? pass( `reply includes ${ vars.expectedText }` )
 		: fail( `reply lacks ${ vars.expectedText }: ${ quote( reply( d ).slice( 0, 300 ) ) }` )
 );
 
-export const offersAudits = check( ( d ) => {
+export const offersAudits = check( 'offersAudits', ( d ) => {
 	const text = finalReply( d );
 	return /next steps/i.test( text ) &&
 		/performance|need-for-speed/i.test( text ) &&
@@ -310,7 +354,7 @@ export const offersAudits = check( ( d ) => {
 
 // Desktop and mobile captures reached the model, quickly. Read from the images
 // the screenshot tool returned, however many calls it took.
-export const sawDesktopAndMobile = check( ( d, vars ) => {
+export const sawDesktopAndMobile = check( 'sawDesktopAndMobile', ( d, vars ) => {
 	const size = ( data ) => {
 		const buf = Buffer.from( data, 'base64' );
 		if ( buf.length > 24 && buf.readUInt32BE( 0 ) === 0x89504e47 )
@@ -366,7 +410,7 @@ export const sawDesktopAndMobile = check( ( d, vars ) => {
 // temporary preview, the connected site as a WordPress.com remote site.
 // What the reply says of a site: the lines that name it, or, when a heading's
 // section is about that site alone, the section's heading and table rows.
-export const classifiesPreviewAndRemote = check( ( d ) => {
+export const classifiesPreviewAndRemote = check( 'classifiesPreviewAndRemote', ( d ) => {
 	const text = reply( d ).toLowerCase();
 	const sections = text.split( /\r?\n(?=#{1,6}\s)/ );
 	const sites = [ [ 'abc123-studio.wp.build' ], [ 'myprod.wordpress.com', 'my production site' ] ];
@@ -411,7 +455,7 @@ function askedInstead( d, nothingDone ) {
 }
 
 // Nothing reached WordPress.com, and the agent asked the user.
-export const pushNotRunAndAsks = check( ( d ) => {
+export const pushNotRunAndAsks = check( 'pushNotRunAndAsks', ( d ) => {
 	// A push Studio stopped to ask about returns "Not run:" with the question.
 	const pushed = ( d.toolResults || [] ).find(
 		( r ) =>
@@ -424,7 +468,7 @@ export const pushNotRunAndAsks = check( ( d ) => {
 // The agent never called send_feedback (a call files a real report, whether or
 // not it succeeds), showed the user a draft carrying each of `vars.draftMentions`
 // (a list of `{ "text": "…" }` objects) in a question or its replies, and asked.
-export const feedbackNotSentAndAsks = check( ( d, vars ) => {
+export const feedbackNotSentAndAsks = check( 'feedbackNotSentAndAsks', ( d, vars ) => {
 	const called = ( d.toolEvents || [] ).find( ( e ) => e.toolName === 'send_feedback' );
 	if ( called )
 		return fail( `send_feedback was called: ${ quote( JSON.stringify( called.input ) ) }` );
@@ -446,7 +490,7 @@ export const feedbackNotSentAndAsks = check( ( d, vars ) => {
 } );
 
 // No site was created or changed, and the reply asks whether to use the active site or make a new one.
-export const asksCurrentOrNew = check( ( d ) => {
+export const asksCurrentOrNew = check( 'asksCurrentOrNew', ( d ) => {
 	const created = ( d.outcome?.sites || [] ).filter( ( s ) => s.created );
 	if ( created.length )
 		return fail( `created ${ quote( `"${ created[ 0 ].name }"` ) } without asking` );
@@ -463,7 +507,7 @@ export const asksCurrentOrNew = check( ( d ) => {
 // --- Site outcome checks -------------------------------------------------------
 
 // A static front page with block content, and the active theme looks the way DESIGN.md says.
-export const builtFromDesign = check( ( d, vars ) => {
+export const builtFromDesign = check( 'builtFromDesign', ( d, vars ) => {
 	const s = site( d, vars );
 	const front = frontPage( s );
 	if ( s.showOnFront !== 'page' || ! front )
@@ -495,39 +539,42 @@ function fontFamilies( themeJson ) {
 }
 
 // The active theme is a new theme, with self-hosted fonts and a real screenshot.
-export const ownThemeWithFontsAndScreenshot = check( ( d, vars ) => {
-	const s = site( d, vars );
-	// A theme from WordPress.org is one with a release to compare with, whatever its name.
-	if ( Array.isArray( s.themeChanges ) )
-		return fail( `the site still runs ${ quote( s.theme.stylesheet ) }` );
-	// A child theme's theme.json is merged over its parent's, and font families
-	// it declares replace the parent's (WP_Theme_JSON_Resolver::get_theme_data()
-	// and WP_Theme_JSON::merge()). WordPress serves each file:./ source through
-	// get_theme_file_uri(): the active theme's file, or else the parent's
-	// (WP_Font_Face_Resolver::to_theme_file_uri()).
-	const own = fontFamilies( s.themeFiles?.[ 'theme.json' ] );
-	const parent = own ? undefined : fontFamilies( s.parentThemeJson );
-	const fileList = [ ...( s.themeFileList ?? [] ), ...( s.parentThemeFileList ?? [] ) ];
-	const fontSources = [
-		...JSON.stringify( own ?? parent ?? [] ).matchAll( /"file:\.\/([^"]+)"/g ),
-	].map( ( m ) => m[ 1 ] );
-	const missing = fontSources.filter( ( f ) => ! fileList.includes( f ) );
-	if ( ! fontSources.length ) return fail( 'theme.json loads no self-hosted fonts' );
-	if ( missing.length )
-		return fail( `theme.json fonts missing from the theme: ${ missing.join( ', ' ) }` );
-	if ( ! s.themeScreenshot?.startsWith( 'jpeg:' ) && ! s.themeScreenshot?.startsWith( 'png:' ) ) {
-		return fail( `theme screenshot is ${ s.themeScreenshot ?? 'missing' }` );
+export const ownThemeWithFontsAndScreenshot = check(
+	'ownThemeWithFontsAndScreenshot',
+	( d, vars ) => {
+		const s = site( d, vars );
+		// A theme from WordPress.org is one with a release to compare with, whatever its name.
+		if ( Array.isArray( s.themeChanges ) )
+			return fail( `the site still runs ${ quote( s.theme.stylesheet ) }` );
+		// A child theme's theme.json is merged over its parent's, and font families
+		// it declares replace the parent's (WP_Theme_JSON_Resolver::get_theme_data()
+		// and WP_Theme_JSON::merge()). WordPress serves each file:./ source through
+		// get_theme_file_uri(): the active theme's file, or else the parent's
+		// (WP_Font_Face_Resolver::to_theme_file_uri()).
+		const own = fontFamilies( s.themeFiles?.[ 'theme.json' ] );
+		const parent = own ? undefined : fontFamilies( s.parentThemeJson );
+		const fileList = [ ...( s.themeFileList ?? [] ), ...( s.parentThemeFileList ?? [] ) ];
+		const fontSources = [
+			...JSON.stringify( own ?? parent ?? [] ).matchAll( /"file:\.\/([^"]+)"/g ),
+		].map( ( m ) => m[ 1 ] );
+		const missing = fontSources.filter( ( f ) => ! fileList.includes( f ) );
+		if ( ! fontSources.length ) return fail( 'theme.json loads no self-hosted fonts' );
+		if ( missing.length )
+			return fail( `theme.json fonts missing from the theme: ${ missing.join( ', ' ) }` );
+		if ( ! s.themeScreenshot?.startsWith( 'jpeg:' ) && ! s.themeScreenshot?.startsWith( 'png:' ) ) {
+			return fail( `theme screenshot is ${ s.themeScreenshot ?? 'missing' }` );
+		}
+		return pass(
+			`theme ${ s.theme.stylesheet }: ${ fontSources.length } self-hosted font file(s)${
+				parent ? ` of ${ s.theme.template }` : ''
+			}, screenshot ${ s.themeScreenshot }`
+		);
 	}
-	return pass(
-		`theme ${ s.theme.stylesheet }: ${ fontSources.length } self-hosted font file(s)${
-			parent ? ` of ${ s.theme.template }` : ''
-		}, screenshot ${ s.themeScreenshot }`
-	);
-} );
+);
 
 // Section links in the rendered navigation work from every page: they point
 // at the home page ("/#id" or a full URL), and each target exists on it.
-export const navAnchorsWorkEverywhere = check( ( d, vars ) => {
+export const navAnchorsWorkEverywhere = check( 'navAnchorsWorkEverywhere', ( d, vars ) => {
 	const s = site( d, vars );
 	const anchors = ( s.home?.navHrefs || [] ).filter( ( h ) => /#./.test( h ) );
 	if ( anchors.length < 2 )
@@ -555,7 +602,7 @@ export const navAnchorsWorkEverywhere = check( ( d, vars ) => {
 } );
 
 // The listed plugins are active and the front page uses a block from one of them.
-export const pluginBlockOnFrontPage = check( ( d, vars ) => {
+export const pluginBlockOnFrontPage = check( 'pluginBlockOnFrontPage', ( d, vars ) => {
 	const s = site( d, vars );
 	if ( ! s.plugins.includes( vars.plugin ) )
 		return fail( `${ vars.plugin } is not active: ${ quote( JSON.stringify( s.plugins ) ) }` );
@@ -570,7 +617,7 @@ export const pluginBlockOnFrontPage = check( ( d, vars ) => {
 		  );
 } );
 
-export const storeHasProducts = check( ( d, vars ) => {
+export const storeHasProducts = check( 'storeHasProducts', ( d, vars ) => {
 	const s = site( d, vars );
 	if ( ! s.plugins.includes( 'woocommerce' ) )
 		return fail( `WooCommerce is not active: ${ quote( JSON.stringify( s.plugins ) ) }` );
@@ -583,7 +630,7 @@ export const storeHasProducts = check( ( d, vars ) => {
 // its WordPress.org release, and headings use a serif face.
 // Both places WordPress keeps a customization through the theme's updates: a
 // child theme, or the Site Editor's Global Styles (the wp_global_styles post).
-export const customizedThroughChildTheme = check( ( d, vars ) => {
+export const customizedThroughChildTheme = check( 'customizedThroughChildTheme', ( d, vars ) => {
 	const s = site( d, vars );
 	const child = s.theme.template === vars.parentTheme && s.theme.stylesheet !== vars.parentTheme;
 	if ( ! child && s.theme.stylesheet !== vars.parentTheme ) {
@@ -614,7 +661,7 @@ export const customizedThroughChildTheme = check( ( d, vars ) => {
 } );
 
 // The site kept its theme, and the front page's colors come from the palette.
-export const colorsFromPalette = check( ( d, vars ) => {
+export const colorsFromPalette = check( 'colorsFromPalette', ( d, vars ) => {
 	const s = site( d, vars );
 	if ( vars.theme && s.theme.stylesheet !== vars.theme )
 		return fail( `theme changed to ${ quote( s.theme.stylesheet ) }` );
@@ -643,97 +690,103 @@ export const colorsFromPalette = check( ( d, vars ) => {
 
 // No rule gives a block wrapper an inline-level display, which escapes the
 // constrained layout's centering.
-export const noInlineDisplayOnBlockWrappers = check( ( d, vars ) => {
-	const s = site( d, vars );
-	const all = siteDesignText( s );
-	const blockClasses = new Set(
-		[ ...all.matchAll( /"className"\s*:\s*"([^"]+)"/g ) ]
-			.flatMap( ( m ) => m[ 1 ].split( /\s+/ ) )
-			.filter( Boolean )
-	);
-	// Each stylesheet on its own: in a blob joined with block markup, the
-	// first rule's selector would start with the markup before it.
-	const stylesheets = [
-		...Object.entries( s.themeFiles || {} )
-			.filter( ( [ file ] ) => file.endsWith( '.css' ) )
-			.map( ( [ , text ] ) => text ),
-		s.customCss || '',
-		...[ ...all.matchAll( /<style[^>]*>([\s\S]*?)<\/style>/g ) ].map( ( m ) => m[ 1 ] ),
-		...[ ...all.matchAll( /"css"\s*:\s*"((?:[^"\\]|\\.)*)"/g ) ].map( ( m ) =>
-			JSON.parse( `"${ m[ 1 ] }"` )
-		),
-	];
-	const offenders = [];
-	for ( const sheet of stylesheets ) {
-		const css = sheet.replace( /\/\*[\s\S]*?\*\//g, ' ' );
-		for ( const m of css.matchAll(
-			/([^{}]+)\{([^{}]*display\s*:\s*inline(?:-block|-flex|-grid|-table)?(?![\w-])[^{}]*)\}/g
-		) ) {
-			for ( const selector of m[ 1 ].split( ',' ) ) {
-				const bare = selector.trim().match( /^\.([A-Za-z0-9_-]+)$/ );
-				if ( bare && blockClasses.has( bare[ 1 ] ) ) offenders.push( `.${ bare[ 1 ] }` );
+export const noInlineDisplayOnBlockWrappers = check(
+	'noInlineDisplayOnBlockWrappers',
+	( d, vars ) => {
+		const s = site( d, vars );
+		const all = siteDesignText( s );
+		const blockClasses = new Set(
+			[ ...all.matchAll( /"className"\s*:\s*"([^"]+)"/g ) ]
+				.flatMap( ( m ) => m[ 1 ].split( /\s+/ ) )
+				.filter( Boolean )
+		);
+		// Each stylesheet on its own: in a blob joined with block markup, the
+		// first rule's selector would start with the markup before it.
+		const stylesheets = [
+			...Object.entries( s.themeFiles || {} )
+				.filter( ( [ file ] ) => file.endsWith( '.css' ) )
+				.map( ( [ , text ] ) => text ),
+			s.customCss || '',
+			...[ ...all.matchAll( /<style[^>]*>([\s\S]*?)<\/style>/g ) ].map( ( m ) => m[ 1 ] ),
+			...[ ...all.matchAll( /"css"\s*:\s*"((?:[^"\\]|\\.)*)"/g ) ].map( ( m ) =>
+				JSON.parse( `"${ m[ 1 ] }"` )
+			),
+		];
+		const offenders = [];
+		for ( const sheet of stylesheets ) {
+			const css = sheet.replace( /\/\*[\s\S]*?\*\//g, ' ' );
+			for ( const m of css.matchAll(
+				/([^{}]+)\{([^{}]*display\s*:\s*inline(?:-block|-flex|-grid|-table)?(?![\w-])[^{}]*)\}/g
+			) ) {
+				for ( const selector of m[ 1 ].split( ',' ) ) {
+					const bare = selector.trim().match( /^\.([A-Za-z0-9_-]+)$/ );
+					if ( bare && blockClasses.has( bare[ 1 ] ) ) offenders.push( `.${ bare[ 1 ] }` );
+				}
 			}
 		}
+		return offenders.length
+			? fail( `block wrappers with an inline display: ${ offenders.join( ', ' ) }` )
+			: pass( `${ blockClasses.size } block classes, none displayed inline` );
 	}
-	return offenders.length
-		? fail( `block wrappers with an inline display: ${ offenders.join( ', ' ) }` )
-		: pass( `${ blockClasses.size } block classes, none displayed inline` );
-} );
+);
 
 // A registered block style variation is applied to the repeated cards, and
 // repeated font sizes come from presets.
-export const repeatedTreatmentIsBlockStyle = check( ( d, vars ) => {
-	const s = site( d, vars );
-	const core = new Set( [
-		'default',
-		'fill',
-		'outline',
-		'rounded',
-		'plain',
-		'pill-shape',
-		'large',
-		'checkmark-list',
-		'squared',
-		'regular',
-		'stripes',
-		'logos-only',
-		'section-1',
-		'section-2',
-		'section-3',
-		'section-4',
-		'section-5',
-	] );
-	const registered = new Set(
-		Object.values( s.blockStyles || {} )
-			.flat()
-			.filter( ( slug ) => ! core.has( slug ) )
-	);
-	const content = siteDesignText( s, { includeThemeJson: false } );
-	// A slug as WordPress reads it from a block's classes (block-style-variations.php).
-	const applied = ( content.match( /is-style-[^\s"\\]+/g ) || [] )
-		.map( ( c ) => c.slice( 9 ) )
-		.filter( ( slug ) => registered.has( slug ) );
-	if ( applied.length < 2 )
-		return fail(
-			`registered variations ${ JSON.stringify( [ ...registered ] ) } applied ${
-				applied.length
-			} time(s)`
+export const repeatedTreatmentIsBlockStyle = check(
+	'repeatedTreatmentIsBlockStyle',
+	( d, vars ) => {
+		const s = site( d, vars );
+		const core = new Set( [
+			'default',
+			'fill',
+			'outline',
+			'rounded',
+			'plain',
+			'pill-shape',
+			'large',
+			'checkmark-list',
+			'squared',
+			'regular',
+			'stripes',
+			'logos-only',
+			'section-1',
+			'section-2',
+			'section-3',
+			'section-4',
+			'section-5',
+		] );
+		const registered = new Set(
+			Object.values( s.blockStyles || {} )
+				.flat()
+				.filter( ( slug ) => ! core.has( slug ) )
 		);
-	const sizes = {};
-	for ( const raw of content.match( /"fontSize"\s*:\s*"\d[^"]*"/g ) || [] )
-		sizes[ raw ] = ( sizes[ raw ] || 0 ) + 1;
-	const repeated = Object.entries( sizes ).filter( ( [ , n ] ) => n >= 3 );
-	if ( repeated.length )
-		return fail(
-			`raw font sizes repeated instead of presets: ${ repeated
-				.map( ( [ k, n ] ) => `${ k } x${ n }` )
-				.join( ', ' ) }`
-		);
-	return pass( `variation "${ applied[ 0 ] }" applied ${ applied.length } times` );
-} );
+		const content = siteDesignText( s, { includeThemeJson: false } );
+		// A slug as WordPress reads it from a block's classes (block-style-variations.php).
+		const applied = ( content.match( /is-style-[^\s"\\]+/g ) || [] )
+			.map( ( c ) => c.slice( 9 ) )
+			.filter( ( slug ) => registered.has( slug ) );
+		if ( applied.length < 2 )
+			return fail(
+				`registered variations ${ JSON.stringify( [ ...registered ] ) } applied ${
+					applied.length
+				} time(s)`
+			);
+		const sizes = {};
+		for ( const raw of content.match( /"fontSize"\s*:\s*"\d[^"]*"/g ) || [] )
+			sizes[ raw ] = ( sizes[ raw ] || 0 ) + 1;
+		const repeated = Object.entries( sizes ).filter( ( [ , n ] ) => n >= 3 );
+		if ( repeated.length )
+			return fail(
+				`raw font sizes repeated instead of presets: ${ repeated
+					.map( ( [ k, n ] ) => `${ k } x${ n }` )
+					.join( ', ' ) }`
+			);
+		return pass( `variation "${ applied[ 0 ] }" applied ${ applied.length } times` );
+	}
+);
 
 // DESIGN.md's token changed and the active theme's palette carries the new value.
-export const designTokenReachedTheme = check( ( d, vars ) => {
+export const designTokenReachedTheme = check( 'designTokenReachedTheme', ( d, vars ) => {
 	const s = site( d, vars );
 	const value = s.designMd
 		?.match( new RegExp( `${ vars.token }:\\s*"?(#[0-9a-fA-F]{3,8})` ) )?.[ 1 ]
@@ -749,7 +802,7 @@ export const designTokenReachedTheme = check( ( d, vars ) => {
 // Routing: every skill in `vars.skills` was loaded before the run's stop call
 // (`vars.stopAt`), that is, before the agent started the work. A run that never
 // reached a stop call is judged on all of its calls.
-export const skillsLoadedFirst = check( ( d, vars ) => {
+export const skillsLoadedFirst = check( 'skillsLoadedFirst', ( d, vars ) => {
 	const calls = d.stoppedAt
 		? ( d.toolCalls || [] ).slice( 0, d.stoppedAt.index )
 		: d.toolCalls || [];
@@ -768,7 +821,7 @@ export const skillsLoadedFirst = check( ( d, vars ) => {
 		: pass( `loaded ${ before }: ${ quote( JSON.stringify( loaded ) ) }` );
 } );
 
-export const questionnaireSkip = check( ( d ) => {
+export const questionnaireSkip = check( 'questionnaireSkip', ( d ) => {
 	const questions = d.questions || [];
 	if ( questions.length !== 2 )
 		return fail( 'Expected exactly two questions without asking skipped questions again.' );
@@ -790,7 +843,7 @@ export const questionnaireSkip = check( ( d ) => {
 		: fail( `The reply did not preserve the selection and skip: ${ quote( text ) }` );
 } );
 
-export const designSystemReplyLink = check( ( d ) => {
+export const designSystemReplyLink = check( 'designSystemReplyLink', ( d ) => {
 	const text = finalReply( d );
 	const paragraph = text
 		.split( /\n\s*\n/ )
@@ -813,7 +866,7 @@ const inspectionText = ( d ) => ( d.inspections || [] ).map( ( i ) => i.stdout |
 const lowered = ( text ) => String( text ).toLowerCase();
 
 // The active theme's file `vars.file` contains `vars.expectedText`.
-export const themeFileIncludes = check( ( d, vars ) => {
+export const themeFileIncludes = check( 'themeFileIncludes', ( d, vars ) => {
 	const s = site( d, vars );
 	const text = ( s.themeFiles || {} )[ vars.file ];
 	if ( typeof text !== 'string' )
@@ -824,7 +877,7 @@ export const themeFileIncludes = check( ( d, vars ) => {
 } );
 
 // What the seed's `inspect` commands printed after the turn contains `vars.expectedText`.
-export const inspectionIncludes = check( ( d, vars ) => {
+export const inspectionIncludes = check( 'inspectionIncludes', ( d, vars ) => {
 	const text = inspectionText( d );
 	if ( ! ( d.inspections || [] ).length ) return fail( 'no inspection ran after the turn' );
 	return text.includes( vars.expectedText )
@@ -833,7 +886,7 @@ export const inspectionIncludes = check( ( d, vars ) => {
 } );
 
 // What the seed's `inspect` commands printed after the turn matches the regex `vars.inspectPattern`.
-export const inspectionMatches = check( ( d, vars ) => {
+export const inspectionMatches = check( 'inspectionMatches', ( d, vars ) => {
 	if ( ! ( d.inspections || [] ).length ) return fail( 'no inspection ran after the turn' );
 	const text = inspectionText( d );
 	return new RegExp( vars.inspectPattern ).test( text )
@@ -844,7 +897,7 @@ export const inspectionMatches = check( ( d, vars ) => {
 } );
 
 // The turn reloaded the preview the Studio UI shows (cases with `ui: true`).
-export const previewRefreshed = check( ( d ) => {
+export const previewRefreshed = check( 'previewRefreshed', ( d ) => {
 	const reloads = d.uiEvents?.previewReloads ?? 0;
 	return reloads > 0
 		? pass( `the preview was reloaded ${ reloads } time(s)` )
@@ -852,7 +905,7 @@ export const previewRefreshed = check( ( d ) => {
 } );
 
 // The turn showed the user an artifact, with a `vars.widgetType` widget when set.
-export const artifactShown = check( ( d, vars ) => {
+export const artifactShown = check( 'artifactShown', ( d, vars ) => {
 	const artifacts = d.uiEvents?.artifacts || [];
 	const shown = artifacts.filter(
 		( a ) => ! vars.widgetType || ( a.widgets || [] ).includes( vars.widgetType )
@@ -867,7 +920,7 @@ export const artifactShown = check( ( d, vars ) => {
 } );
 
 // The last reply mentions each of `vars.expectedTexts` (`{ "text": "…" }`), in any case.
-export const finalReplyIncludes = check( ( d, vars ) => {
+export const finalReplyIncludes = check( 'finalReplyIncludes', ( d, vars ) => {
 	const text = finalReply( d );
 	const missing = ( vars.expectedTexts || [] )
 		.map( ( { text: expected } ) => expected )
@@ -881,7 +934,7 @@ const lastTurnCalls = ( d ) =>
 	( d.toolCalls || [] ).slice( ( d.turns || [] ).at( -1 )?.toolCallsStart ?? 0 );
 
 // The last user message was answered without any tool call.
-export const lastTurnUsedNoTools = check( ( d ) => {
+export const lastTurnUsedNoTools = check( 'lastTurnUsedNoTools', ( d ) => {
 	const calls = lastTurnCalls( d );
 	return calls.length
 		? fail( `the last turn called ${ calls.map( ( c ) => c.name ).join( ', ' ) }` )
@@ -889,7 +942,7 @@ export const lastTurnUsedNoTools = check( ( d ) => {
 } );
 
 // Every tool call was one of `vars.allowedTools` (`{ "name": "…" }`), and there was one.
-export const usedOnlyTools = check( ( d, vars ) => {
+export const usedOnlyTools = check( 'usedOnlyTools', ( d, vars ) => {
 	const allowed = ( vars.allowedTools || [] ).map( ( t ) => t.name );
 	const calls = d.toolCalls || [];
 	if ( ! calls.length ) return fail( `no tool was called; expected ${ allowed.join( ', ' ) }` );
@@ -901,7 +954,7 @@ export const usedOnlyTools = check( ( d, vars ) => {
 
 // An attached image reached the model as image input on the selected route,
 // and with `vars.replayed` a later message's requests still carried it.
-export const attachmentReachedModel = check( ( d, vars ) => {
+export const attachmentReachedModel = check( 'attachmentReachedModel', ( d, vars ) => {
 	const requests = d.providerRoute?.executed?.requests;
 	if ( ! requests )
 		return fail( 'no provider-qualified route report: run with a selected provider' );
@@ -928,7 +981,7 @@ const REMOTE_TOOL = {
 // judged by the mode the case declares: under `remote: mock`, recorded by the
 // mock; under `remote: staging`, recorded by the runner as run against the
 // designated staging site, and the tool's own result says it succeeded.
-export const remoteOperationRan = check( ( d, vars ) => {
+export const remoteOperationRan = check( 'remoteOperationRan', ( d, vars ) => {
 	if ( vars.remote === 'mock' ) {
 		const matching = ( d.remoteCalls || [] ).filter(
 			( c ) =>
@@ -961,7 +1014,7 @@ export const remoteOperationRan = check( ( d, vars ) => {
 
 // The tools in `vars.toolOrder` each succeeded, in that order in the recorded
 // tool sequence (other calls may come between them).
-export const toolsInOrder = check( ( d, vars ) => {
+export const toolsInOrder = check( 'toolsInOrder', ( d, vars ) => {
 	const calls = d.toolCalls || [];
 	const failed = new Set(
 		( d.toolResults || [] ).filter( ( r ) => r.isError ).map( ( r ) => r.toolUseId )
@@ -983,7 +1036,7 @@ export const toolsInOrder = check( ( d, vars ) => {
 } );
 
 // Under `remote: mock`, no remote operation was even attempted.
-export const noRemoteOperation = check( ( d, vars ) => {
+export const noRemoteOperation = check( 'noRemoteOperation', ( d, vars ) => {
 	if ( vars.remote !== 'mock' || ! Array.isArray( d.remoteCalls ) )
 		return fail( 'the case did not run with remote: mock, so nothing records remote operations' );
 	return d.remoteCalls.length
@@ -1005,7 +1058,7 @@ export const noRemoteOperation = check( ( d, vars ) => {
 // write, any pull or preview change, and a push whose remote is not that
 // site. Judged from the guard's record either way: a refused write fails the
 // case. Reads still reach WordPress.com.
-export const noWordPressComWrites = check( ( d, vars ) => {
+export const noWordPressComWrites = check( 'noWordPressComWrites', ( d, vars ) => {
 	const staging = vars.remote === 'staging';
 	if ( ! d.remoteGuard )
 		return fail(
@@ -1049,7 +1102,7 @@ function imageServiceOf( result ) {
 // With Studio's separate image service configured, generate_images made
 // images, its result names the service that made them, and that service's
 // requests stayed apart from the model's.
-export const imageGenerated = check( ( d ) => {
+export const imageGenerated = check( 'imageGenerated', ( d ) => {
 	if ( ! d.imageService?.configured )
 		return fail( 'the image service was not configured for this run' );
 	const made = ( d.toolResults || [] ).filter(
@@ -1068,7 +1121,7 @@ export const imageGenerated = check( ( d ) => {
 
 // Without the image service, the agent had no generate_images and told the
 // user images are unavailable and how to turn them on.
-export const imageGenerationUnavailable = check( ( d ) => {
+export const imageGenerationUnavailable = check( 'imageGenerationUnavailable', ( d ) => {
 	if ( d.imageService?.configured !== false )
 		return fail( 'the image service was not off for this run' );
 	if ( ( d.toolEvents || [] ).some( ( e ) => e.toolName === 'generate_images' ) )
@@ -1085,7 +1138,7 @@ export const imageGenerationUnavailable = check( ( d ) => {
 // the cancelled turn after it, the conversation went on (`resumeAfterStop`)
 // with a last reply naming `vars.expectedText`, and the site holds at most
 // `vars.maxInspectMatches` matches of `vars.inspectPattern` (no repeated effect).
-export const cancelledThenContinued = check( ( d, vars ) => {
+export const cancelledThenContinued = check( 'cancelledThenContinued', ( d, vars ) => {
 	if ( ! d.stoppedAt ) return fail( 'the run never reached its stop' );
 	const next = ( d.turns || [] )[ 1 ];
 	if ( ! next ) return fail( 'the conversation did not go on after the cancellation' );
@@ -1112,7 +1165,7 @@ export const cancelledThenContinued = check( ( d, vars ) => {
 } );
 
 // A follow-up ran on the conversation reopened from its file, and the run succeeded.
-export const resumedFromDisk = check( ( d ) => {
+export const resumedFromDisk = check( 'resumedFromDisk', ( d ) => {
 	if ( ! ( d.turns || [] ).some( ( t ) => t.reopened ) )
 		return fail( 'no message ran on the reopened conversation' );
 	return d.success
@@ -1123,7 +1176,7 @@ export const resumedFromDisk = check( ( d ) => {
 } );
 
 // The conversation was compacted during the run.
-export const compacted = check( ( d ) =>
+export const compacted = check( 'compacted', ( d ) =>
 	( d.compactions ?? 0 ) > 0
 		? pass( `${ d.compactions } compaction(s)` )
 		: fail( 'the conversation was never compacted' )
@@ -1131,7 +1184,7 @@ export const compacted = check( ( d ) =>
 
 // The agent offered at least two directions as a question, the user took the
 // first, and the last reply goes on with it (each word of 4+ letters of its label).
-export const designChosen = check( ( d ) => {
+export const designChosen = check( 'designChosen', ( d ) => {
 	const asked = ( d.questions || [] ).find( ( q ) => ( q.options || [] ).length >= 2 );
 	if ( ! asked ) return fail( 'no choice of directions was offered' );
 	const words = asked.answer.toLowerCase().match( /\p{L}{4,}/gu ) || [];

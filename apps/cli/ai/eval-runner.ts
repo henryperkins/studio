@@ -94,10 +94,13 @@ import {
 	type ExecutedRoute,
 	type RequestedRoute,
 } from 'cli/ai/eval-provider';
+import { liveEvalRunFacts } from 'cli/ai/eval-run-facts';
 import { matchesStopRule } from 'cli/ai/eval-stop';
 import {
 	evalSummaryDirectory,
 	writeEvalCaseSummary,
+	type EvalRunFacts,
+	type EvalSummaryLocation,
 	type EvalSummarySource,
 } from 'cli/ai/eval-summary';
 import { summarizeTiming, type ModelRequestRecord } from 'cli/ai/eval-timing';
@@ -1277,14 +1280,19 @@ async function runCase( input: EvalRunnerInput, own: CaseProfile ) {
 
 /**
  * For a case that selects a provider (or must), its sanitized summary
- * (`eval-summary.ts`): the one output of the case that may leave the machine.
- * Never fails the case; the summary's own guard decides what it holds.
+ * (`eval-summary.ts`): the one output of the case that may leave the machine,
+ * a new run with the case's route record, which its checks then append to.
+ * Never fails the case; the evidence writer's guards decide what it holds.
  */
 export function writeCaseSummary(
 	input: EvalRunnerInput,
 	result: unknown,
-	env: NodeJS.ProcessEnv = process.env
-): StageRecord | null {
+	{
+		env = process.env,
+		threw = false,
+		facts = liveEvalRunFacts,
+	}: { env?: NodeJS.ProcessEnv; threw?: boolean; facts?: () => EvalRunFacts } = {}
+): { location: EvalSummaryLocation; record: StageRecord } | null {
 	if ( ! input.provider ) {
 		return null;
 	}
@@ -1293,6 +1301,9 @@ export function writeCaseSummary(
 			caseId: input.caseId,
 			provider: input.provider.ok ? input.provider.request.provider : undefined,
 			directory: evalSummaryDirectory( env ),
+			threw,
+			selection: input.provider.ok ? input.provider.request : undefined,
+			facts: facts(),
 		} );
 	} catch ( error ) {
 		warnTeardown( 'could not write the case’s sanitized summary', error );
@@ -1353,10 +1364,9 @@ export async function main() {
 	}
 	// Also when the case never started: its input was unreadable.
 	removeCaseProfile( warnTeardown );
-	emit( result );
-	if ( input ) {
-		writeCaseSummary( input, result );
-	}
+	// Its location goes with the result, as the result's own goes on stdout, for the checks' records.
+	const summary = input ? writeCaseSummary( input, result, { threw: exitCode !== 0 } ) : null;
+	emit( summary ? { ...( result as object ), evalSummary: summary.location } : result );
 	await stopCaseProcessManager( {
 		home: caseProcessManagerHome( process.env ),
 		processManagerHome: PROCESS_MANAGER_HOME,

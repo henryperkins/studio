@@ -3,8 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import {
 	ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
-	findUnsafeRecord,
 	findUnsafeText,
+	openAcceptanceEvidence,
+	UnsafeEvidenceError,
+	type ManifestRun,
 	type Observations,
 	type StageRecord,
 } from './acceptance-evidence';
@@ -12,16 +14,23 @@ import type { ExecutedRoute, RequestedRoute } from './eval-provider';
 
 /**
  * The one output of a provider-qualified eval case that may leave the machine:
- * a record in the acceptance runners' stage-record shape, checked with their
- * record guard before it is written. It holds the case id, whether the case
- * ran on its selected route with nothing refused, typed codes, and counts and
- * booleans read from the run, never a transcript, a tool's output, an address,
- * an account, an identifier or a path. Development only, for the eval runner.
+ * a run directory in the acceptance runners' evidence format for each provider
+ * and case, `<summary folder>/<provider>/<case id>/`, written through their
+ * evidence writer and its guards. Its `manifest.json` has one entry per run of
+ * the case on that provider: the model, the reasoning effort, the source
+ * revision and the platform it ran with. Its `evidence.ndjson` has, for each
+ * run, the route record the runner writes (whether the case ran on its
+ * selected route with nothing refused, which judges none of the case's own
+ * checks) and one record per outcome check, which the checks append. Never a
+ * transcript, a tool's output, an address, an account, an identifier or a
+ * path. Development only, for the eval runner.
  */
 
-const SUMMARY_FILE = 'eval-summary.ndjson';
 const UNNAMED_CASE = 'unnamed-case';
+const UNSELECTED = 'unselected';
 const KEBAB = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+// As the manifest takes a model or an effort.
+const SLUG = /^[a-z0-9][a-z0-9.+-]{0,63}$/;
 
 /** The parts of a runner result the summary reads. */
 export interface EvalSummarySource {
@@ -51,6 +60,9 @@ const safeName = ( value: unknown ): string | undefined => {
 	const name = kebab( value );
 	return name && name.length <= 64 && ! findUnsafeText( name ) ? name : undefined;
 };
+
+const slug = ( value: unknown ): string | undefined =>
+	typeof value === 'string' && SLUG.test( value ) && ! findUnsafeText( value ) ? value : undefined;
 
 const count = ( value: unknown ): number =>
 	typeof value === 'number' && Number.isFinite( value ) ? value : 0;
@@ -124,26 +136,39 @@ function routeObservations(
 	};
 }
 
+/** The provider and case a summary is filed under, as the names it may carry. */
+function summaryNames( caseId: unknown, provider: unknown ) {
+	return {
+		provider: safeName( provider ) ?? UNSELECTED,
+		stage: safeName( caseId ) ?? UNNAMED_CASE,
+	};
+}
+
 /**
- * A provider-qualified case's result as a stage record without its run
- * number: `blocked` when it was refused or blocked before it ran (with that
- * code), `failed` when the guard refused a write, it timed out, its route was
- * not the one selected or the run failed (each with a typed code), `passed`
- * otherwise. The case's own outcome checks are judged in promptfoo; this says
- * whether it ran on its selected route with nothing refused.
+ * A provider-qualified case's route record without its run number, named
+ * `eval-route-<provider>` for what it judges: `blocked` when the case was
+ * refused or blocked before it ran (with that code), `failed` when the run
+ * threw (`run-failed`), the guard refused a write, it timed out, its route
+ * was not the one selected or the run failed otherwise (each with a typed
+ * code), `passed` otherwise. Its `judgesCaseChecks: false` observation says
+ * that none of the case's own checks is judged by it: each check appends a
+ * record of its own.
  */
 export function evalCaseSummary(
 	result: EvalSummarySource,
-	{ caseId, provider }: { caseId: unknown; provider: unknown }
+	{ caseId, provider, threw = false }: { caseId: unknown; provider: unknown; threw?: boolean }
 ): Omit< StageRecord, 'run' > {
+	const names = summaryNames( caseId, provider );
 	const route = result.providerRoute ?? undefined;
 	const blockedCode =
 		kebab( result.refusal?.code ) ?? kebab( route?.failure?.code ) ?? kebab( result.blocked?.code );
 	const guardCode = kebab( result.remoteGuard?.code );
-	const routeProblem = evalRouteProblem( route?.requested, route?.executed );
 	let status: StageRecord[ 'status' ] = 'passed';
 	let code: string | undefined;
-	if ( result.refusal || route?.failure || result.blocked ) {
+	if ( threw ) {
+		status = 'failed';
+		code = 'run-failed';
+	} else if ( result.refusal || route?.failure || result.blocked ) {
 		status = 'blocked';
 		code = blockedCode ?? 'refused';
 	} else if ( guardCode ) {
@@ -152,23 +177,27 @@ export function evalCaseSummary(
 	} else if ( result.timedOut === true ) {
 		status = 'failed';
 		code = 'timed-out';
-	} else if ( routeProblem ) {
-		status = 'failed';
-		code = routeProblem;
-	} else if ( result.success !== true ) {
-		status = 'failed';
-		code = 'run-failed';
+	} else {
+		const routeProblem = evalRouteProblem( route?.requested, route?.executed );
+		if ( routeProblem ) {
+			status = 'failed';
+			code = routeProblem;
+		} else if ( result.success !== true ) {
+			status = 'failed';
+			code = 'run-failed';
+		}
 	}
 	const calls = result.remoteCalls ?? [];
 	const totalMs = count( result.phaseTimingsMs?.total_eval_ms );
 	return {
 		schemaVersion: ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
-		scenario: safeName( `eval-${ kebab( provider ) ?? 'unselected' }` ) ?? 'eval-unselected',
-		stage: safeName( caseId ) ?? UNNAMED_CASE,
+		scenario: safeName( `eval-route-${ names.provider }` ) ?? `eval-route-${ UNSELECTED }`,
+		stage: names.stage,
 		status,
 		...( code ? { code } : {} ),
 		durationS: Math.round( totalMs / 100 ) / 10,
 		observations: {
+			judgesCaseChecks: false,
 			success: result.success === true,
 			timedOut: result.timedOut === true,
 			...routeObservations( route?.requested, route?.executed ),
@@ -198,60 +227,81 @@ export function evalSummaryDirectory( env: NodeJS.ProcessEnv = process.env ): st
 	return env.STUDIO_EVAL_SUMMARY_DIR?.trim() || path.join( os.tmpdir(), 'studio-eval-summary' );
 }
 
-function earlierRuns( file: string, stage: string ): number {
-	let text: string;
-	try {
-		text = fs.readFileSync( file, 'utf8' );
-	} catch {
-		return 0;
-	}
-	return text
-		.split( /\r?\n/ )
-		.filter( Boolean )
-		.filter( ( line ) => {
-			try {
-				return ( JSON.parse( line ) as { stage?: unknown } ).stage === stage;
-			} catch {
-				return false;
-			}
-		} ).length;
+/** What a run's manifest entry says about the source, the platform, the runtime and the build. */
+export type EvalRunFacts = Pick< ManifestRun, 'source' | 'platform' | 'runtime' | 'build' >;
+
+export interface EvalSummaryOptions {
+	caseId: unknown;
+	provider: unknown;
+	/** The summary folder: `evalSummaryDirectory()`. */
+	directory: string;
+	/** The run threw instead of returning a result. */
+	threw?: boolean;
+	/** What the case selected, for a run refused before its route was resolved. */
+	selection?: { model?: unknown; effort?: unknown };
+	facts: EvalRunFacts;
+	/** The day the run started, `YYYY-MM-DD`. */
+	createdOn?: string;
+}
+
+/** Where a case's summary is, so its checks can append their records to the same run. */
+export interface EvalSummaryLocation {
+	/** The case's run directory in the summary folder. */
+	directory: string;
+	run: number;
+	stage: string;
 }
 
 /**
- * Appends the case's summary to `eval-summary.ndjson` in `directory`, its run
- * number counting that case's earlier records there. A record the guard
- * refuses is written instead as the acceptance runners write one: `failed`,
- * `unsafe-evidence`, no observations.
+ * Starts a run in the case's run directory (`<directory>/<provider>/<case id>/`),
+ * its manifest entry naming the model, the effort, the source revision and
+ * the platform, numbered after that case's earlier runs on that provider, and
+ * appends its route record. A record the guard refuses is written instead as
+ * the acceptance runners write one: `failed`, `unsafe-evidence`, no
+ * observations.
  */
 export function writeEvalCaseSummary(
 	result: EvalSummarySource,
-	options: { caseId: unknown; provider: unknown; directory: string }
-): StageRecord {
-	fs.mkdirSync( options.directory, { recursive: true } );
-	const file = path.join( options.directory, SUMMARY_FILE );
+	options: EvalSummaryOptions
+): { location: EvalSummaryLocation; record: StageRecord } {
+	const names = summaryNames( options.caseId, options.provider );
 	const summary = evalCaseSummary( result, options );
-	const run = earlierRuns( file, summary.stage ) + 1;
-	let record: StageRecord = { ...summary, run };
-	if ( findUnsafeRecord( record ) ) {
-		record = {
-			schemaVersion: ACCEPTANCE_EVIDENCE_SCHEMA_VERSION,
+	const requested = result.providerRoute?.requested ?? null;
+	const directory = path.join( options.directory, names.provider, names.stage );
+	fs.mkdirSync( directory, { recursive: true } );
+	const evidence = openAcceptanceEvidence( directory, names.provider );
+	const run = evidence.startRun( {
+		scenario: `eval-${ names.provider }`,
+		createdOn: options.createdOn ?? new Date().toISOString().slice( 0, 10 ),
+		...options.facts,
+		model: slug( requested?.model ) ?? slug( options.selection?.model ) ?? 'unresolved',
+		effort:
+			slug( requested?.effort ) ??
+			slug( options.selection?.effort ) ??
+			( requested ? 'none' : 'unresolved' ),
+		gates: [],
+	} );
+	const { schemaVersion: _version, ...fields } = summary;
+	let record: StageRecord;
+	try {
+		record = evidence.record( { ...fields, run } );
+	} catch ( error ) {
+		if ( ! ( error instanceof UnsafeEvidenceError ) ) {
+			throw error;
+		}
+		const fallback = {
 			run,
 			scenario: summary.scenario,
 			stage: summary.stage,
-			status: 'failed',
+			status: 'failed' as const,
 			code: 'unsafe-evidence',
-			durationS: summary.durationS,
 			observations: {},
 		};
-		if ( findUnsafeRecord( record ) ) {
-			record = {
-				...record,
-				scenario: 'eval-unselected',
-				stage: UNNAMED_CASE,
-				durationS: 0,
-			};
+		try {
+			record = evidence.record( { ...fallback, durationS: summary.durationS } );
+		} catch {
+			record = evidence.record( { ...fallback, durationS: 0 } );
 		}
 	}
-	fs.appendFileSync( file, JSON.stringify( record ) + '\n', { encoding: 'utf8', mode: 0o600 } );
-	return record;
+	return { location: { directory, run, stage: names.stage }, record };
 }

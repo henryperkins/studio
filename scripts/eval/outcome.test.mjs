@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, test } from 'vitest';
 import { parse } from 'yaml';
+import { findUnsafeRecord, openAcceptanceEvidence } from '../../apps/cli/ai/acceptance-evidence.ts';
+import { writeEvalCaseSummary } from '../../apps/cli/ai/eval-summary.ts';
 import * as checks from './outcome.mjs';
 
 // Each check reads the runner's result file named on stdout, as promptfoo
@@ -252,6 +254,169 @@ describe( 'reasons of a provider-qualified case', () => {
 		expect( verdict.reason ).toBe(
 			'generate_images ran 1 time(s) on the wordpress-com image service, signed in with its wordpress-com-login'
 		);
+	} );
+} );
+
+describe( 'the records a provider-qualified case’s checks add to its summary', () => {
+	const FACTS = {
+		source: { sha: '0123456789abcdef0123456789abcdef01234567', dirty: false },
+		platform: { os: 'linux', release: null, arch: 'x64' },
+		runtime: { node: '24.22.1', npm: null },
+		build: { cliVersion: '0.0.0', buildId: null },
+	};
+	const route = {
+		requested: {
+			kind: 'chatgpt-oauth',
+			backend: 'chatgpt-route',
+			subscription: true,
+			connectionRef: 'conn-0123456789ab',
+			model: 'gpt-6-luna',
+			wireModel: 'gpt-6-luna',
+			effort: 'medium',
+		},
+		executed: {
+			kind: 'chatgpt-oauth',
+			backend: 'chatgpt-route',
+			connectionRef: 'conn-0123456789ab',
+			modelRequests: 2,
+			apiKeyBearers: 0,
+			imageServiceRequests: 0,
+			models: [ 'gpt-6-luna' ],
+			efforts: [ 'medium' ],
+			replyKinds: [ 'chatgpt-oauth' ],
+			replyModels: [ 'gpt-6-luna' ],
+			connectionMatchesBearer: true,
+			requests: [],
+		},
+	};
+	const vars = { caseId: 'parity-identity', requireProvider: true, expectedText: 'READY' };
+	const summaryOf = ( summaries ) => {
+		const runDirectory = path.join( summaries, 'chatgpt-oauth', 'parity-identity' );
+		return {
+			records: openAcceptanceEvidence( runDirectory, 'chatgpt-oauth' ).readRecords(),
+			text: readFileSync( path.join( runDirectory, 'evidence.ndjson' ), 'utf8' ),
+		};
+	};
+	const startRun = ( summaries, result ) =>
+		writeEvalCaseSummary( result, {
+			caseId: 'parity-identity',
+			provider: 'chatgpt-oauth',
+			directory: summaries,
+			facts: FACTS,
+		} ).location;
+
+	test( 'a case whose route passed and whose checks failed: the summary shows both, and nothing in it reads as the case passing', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const result = {
+			success: true,
+			providerRoute: route,
+			textSegments: [ 'I am Claude, a large language model.' ],
+		};
+		const evalSummary = startRun( summaries, result );
+		const routeVerdict = run( checks.ranOnRequestedRoute, { ...result, evalSummary }, vars );
+		const identity = run( checks.identifiesAsStudio, { ...result, evalSummary }, vars );
+		const replied = run( checks.replyIncludes, { ...result, evalSummary }, vars );
+		expect( [ routeVerdict.pass, identity.pass, replied.pass ] ).toEqual( [ true, false, false ] );
+
+		const { records } = summaryOf( summaries );
+		expect( records.map( ( r ) => [ r.scenario, r.stage, r.run, r.status ] ) ).toEqual( [
+			[ 'eval-route-chatgpt-oauth', 'parity-identity', 1, 'passed' ],
+			[ 'eval-check-ran-on-requested-route', 'parity-identity', 1, 'passed' ],
+			[ 'eval-check-identifies-as-studio', 'parity-identity', 1, 'failed' ],
+			[ 'eval-check-reply-includes', 'parity-identity', 1, 'failed' ],
+		] );
+		for ( const record of records ) {
+			expect( findUnsafeRecord( record ) ).toBeNull();
+			// Every record names what it judges: the route, or one check.
+			expect( record.scenario ).toMatch( /^eval-(route-chatgpt-oauth|check-[a-z-]+)$/ );
+		}
+		expect( records[ 0 ].observations.judgesCaseChecks ).toBe( false );
+		// A check record holds the case, the check and its verdict, nothing else.
+		for ( const record of records.slice( 1 ) ) {
+			expect( record ).toEqual( {
+				schemaVersion: 1,
+				run: 1,
+				scenario: record.scenario,
+				stage: 'parity-identity',
+				status: record.status,
+				durationS: 0,
+				observations: {},
+			} );
+		}
+	} );
+
+	test( 'a case refused or blocked before it ran: each check is recorded as blocked', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const result = {
+			success: false,
+			blocked: { code: 'tool-images-not-qualified', message: 'x' },
+			providerRoute: { requested: route.requested, blocked: { code: 'tool-images-not-qualified' } },
+		};
+		const evalSummary = startRun( summaries, result );
+		run( checks.sawDesktopAndMobile, { ...result, evalSummary }, vars );
+		expect(
+			summaryOf( summaries ).records.map( ( r ) => [ r.scenario, r.status, r.code ] )
+		).toEqual( [
+			[ 'eval-route-chatgpt-oauth', 'blocked', 'tool-images-not-qualified' ],
+			[ 'eval-check-saw-desktop-and-mobile', 'blocked', undefined ],
+		] );
+	} );
+
+	test.each( [
+		[ 'a name', 'Jordan Q. Example' ],
+		[ 'an email address', 'jordan.example@example.org' ],
+		[ 'an address', 'https://jordans-site.wordpress.com' ],
+		[ 'an identifier', '7c1e8a41-6d3b-4c55-9b8e-3f2d7c1eb2f0' ],
+		[ 'a Windows path', 'C:\\Users\\jordan\\Studio' ],
+		[ 'a POSIX path', '/Users/jordan/Studio' ],
+	] )(
+		'the guard refuses %s seeded into a check record, which is written as unsafe evidence',
+		( _kind, value ) => {
+			const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+			const result = { success: true, providerRoute: route, textSegments: [ 'WordPress Studio' ] };
+			const evalSummary = { ...startRun( summaries, result ), stage: value };
+			const verdict = run( checks.identifiesAsStudio, { ...result, evalSummary }, vars );
+			expect( verdict.pass ).toBe( true );
+			const { records, text } = summaryOf( summaries );
+			expect( records.at( -1 ) ).toEqual( {
+				schemaVersion: 1,
+				run: 1,
+				scenario: 'eval-check-identifies-as-studio',
+				stage: 'unnamed-case',
+				status: 'failed',
+				code: 'unsafe-evidence',
+				durationS: 0,
+				observations: {},
+			} );
+			expect( text ).not.toContain( value );
+			expect( text.toLowerCase() ).not.toMatch( /jordan|example/ );
+		}
+	);
+
+	test( 'every check records itself under its own fixed name', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const result = { success: true, providerRoute: route };
+		const evalSummary = startRun( summaries, result );
+		const names = Object.keys( checks ).filter( ( name ) => name !== 'default' );
+		expect( names.length ).toBeGreaterThan( 40 );
+		for ( const name of names ) {
+			run( checks[ name ], { ...result, evalSummary }, vars );
+		}
+		const scenarios = summaryOf( summaries )
+			.records.slice( 1 )
+			.map( ( r ) => r.scenario );
+		expect( scenarios ).toEqual(
+			names.map(
+				( name ) => `eval-check-${ name.replace( /[A-Z]/g, ( c ) => `-${ c.toLowerCase() }` ) }`
+			)
+		);
+	} );
+
+	test( 'a case that selects no provider adds nothing', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const evalSummary = startRun( summaries, { success: true, providerRoute: route } );
+		run( checks.identifiesAsStudio, { success: true, textSegments: [ 'x' ], evalSummary }, {} );
+		expect( summaryOf( summaries ).records ).toHaveLength( 1 );
 	} );
 } );
 

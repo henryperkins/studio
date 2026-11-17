@@ -6,7 +6,7 @@ import path from 'node:path';
 import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
 import { wpcomRequestTool } from '@studio/agent/node/tools/wpcom-request';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { findUnsafeRecord } from 'cli/ai/acceptance-evidence';
+import { findUnsafeRecord, openAcceptanceEvidence } from 'cli/ai/acceptance-evidence';
 import { isolateCaseProfile } from 'cli/ai/eval-case-profile';
 import { evalConnectionRef } from 'cli/ai/eval-provider';
 import { readEvalRunnerInput, runEval as runCase, writeCaseSummary } from 'cli/ai/eval-runner';
@@ -706,28 +706,61 @@ describe( 'eval runner provider selection', () => {
 				replyProvider: 'studio-chatgpt',
 			};
 			const summaries = path.join( paths.root, 'summaries' );
-			const selected = input( { caseId: 'parity-identity' }, chatGptEnv() );
-			const record = writeCaseSummary( selected, await runEvalUntyped( selected ), {
-				STUDIO_EVAL_SUMMARY_DIR: summaries,
+			const facts = () => ( {
+				source: { sha: '0123456789abcdef0123456789abcdef01234567', dirty: false },
+				platform: { os: 'linux', release: null, arch: 'x64' },
+				runtime: { node: '24.22.1', npm: null },
+				build: { cliVersion: '0.0.0', buildId: null },
 			} );
-			expect( record ).toMatchObject( {
+			const selected = input( { caseId: 'parity-identity' }, chatGptEnv() );
+			const written = writeCaseSummary( selected, await runEvalUntyped( selected ), {
+				env: { STUDIO_EVAL_SUMMARY_DIR: summaries },
+				facts,
+			} );
+			const runDirectory = path.join( summaries, 'chatgpt-oauth', 'parity-identity' );
+			expect( written?.location ).toEqual( {
+				directory: runDirectory,
 				run: 1,
-				scenario: 'eval-chatgpt-oauth',
+				stage: 'parity-identity',
+			} );
+			expect( written?.record ).toMatchObject( {
+				run: 1,
+				scenario: 'eval-route-chatgpt-oauth',
 				stage: 'parity-identity',
 				status: 'passed',
-				observations: { modelRequests: 1, bearerMatches: true, guardRefused: 0 },
+				observations: {
+					judgesCaseChecks: false,
+					modelRequests: 1,
+					bearerMatches: true,
+					guardRefused: 0,
+				},
 			} );
-			expect( findUnsafeRecord( record ) ).toBeNull();
-			const written = fs.readFileSync( path.join( summaries, 'eval-summary.ndjson' ), 'utf8' );
-			for ( const value of [ CONNECTION_ID, 'test-subject', 'eval-person', paths.root ] ) {
-				expect( written ).not.toContain( value );
+			expect( findUnsafeRecord( written?.record ) ).toBeNull();
+			expect(
+				openAcceptanceEvidence( runDirectory, 'chatgpt-oauth' ).readManifest()?.runs[ 0 ]
+			).toMatchObject( { model: 'gpt-6-luna', effort: 'medium', source: facts().source } );
+			for ( const file of fs.readdirSync( runDirectory ) ) {
+				const text = fs.readFileSync( path.join( runDirectory, file ), 'utf8' );
+				for ( const value of [ CONNECTION_ID, 'test-subject', 'eval-person', paths.root ] ) {
+					expect( text ).not.toContain( value );
+				}
 			}
+
+			// A run that threw: the runner's main writes it with what it caught.
+			expect(
+				writeCaseSummary(
+					selected,
+					{ success: false, error: 'it threw' },
+					{ env: { STUDIO_EVAL_SUMMARY_DIR: summaries }, threw: true, facts }
+				)?.record
+			).toMatchObject( { run: 2, status: 'failed', code: 'run-failed' } );
 
 			const elsewhere = path.join( paths.root, 'no-summaries' );
 			const unselected = input( { caseId: 'identity' } );
 			expect(
 				writeCaseSummary( unselected, await runEvalUntyped( unselected ), {
-					STUDIO_EVAL_SUMMARY_DIR: elsewhere,
+					env: { STUDIO_EVAL_SUMMARY_DIR: elsewhere },
+					facts,
 				} )
 			).toBeNull();
 			expect( fs.existsSync( elsewhere ) ).toBe( false );
