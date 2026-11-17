@@ -19,7 +19,10 @@ import {
 	type ChatGptSignIn,
 	type ChatGptTokenClient,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { sendChatGptRequest, type ChatGptRouteError } from '@studio/agent/node/chatgpt/route';
+import { chatGptSettingsAction } from '@studio/agent/node/chatgpt/settings';
 import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
+import { describeChatGptError } from '@studio/agent/protocol/chatgpt-errors';
 import { answer, scriptedKeychain } from './fixtures/scripted-keychain';
 
 // Every store here runs over a scripted tool; the real keychain is never reached.
@@ -274,6 +277,72 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 			expect( await readChatGptAccounts() ).toEqual( [] );
 			expect( vaultFiles() ).toEqual( [] );
 			expectNoToken( readAllFiles() );
+		}
+	);
+
+	// The tool's own words reach the user, untranslated: settings rebuild the
+	// message from them, and a turn's transcript and session file keep it.
+	it.each( [ 'darwin', 'linux', 'win32' ] as const )(
+		'on %s, passes on only one bounded line of what the keychain tool said, without the home directory or control characters, to settings and the transcript',
+		async ( platform ) => {
+			const home = os.homedir();
+			// On Windows a tool may write the home directory with forward slashes.
+			const homeWithSlashes = home.split( path.sep ).join( '/' );
+			const said = [
+				`\u001b[31mcan’t open\u001b[0m\t${ path.join(
+					home,
+					'keychains',
+					'login.db'
+				) }\u0007 (${ homeWithSlashes }) ${ 'x'.repeat( 1_000 ) }`,
+				`second line naming ${ home }`,
+			].join( '\r\n' );
+			const saved = await createChatGptCredentialBroker( {
+				tokenClient: unreachableTokenService,
+				credentialStore: scriptedKeychain( platform ).store,
+			} ).saveSignIn( signIn( 'vault' ) );
+			const app = createChatGptCredentialBroker( {
+				tokenClient: unreachableTokenService,
+				credentialStore: failingKeychain( platform, answer( 1, said ) ).store,
+			} );
+
+			const failedSave = await app
+				.saveSignIn( signIn( 'vault', 2 ) )
+				.catch( ( error: unknown ) => error );
+			const failedRead = await app
+				.getAccessToken( saved.registrationId )
+				.catch( ( error: unknown ) => error );
+			const settingsMessage = await chatGptSettingsAction( () =>
+				Promise.reject( failedSave )
+			).catch( ( error: Error ) => error.message );
+			const routeFailure = await sendChatGptRequest( {
+				endpoint: 'models',
+				getAccessToken: () => app.getAccessToken( saved.registrationId ),
+			} ).catch( ( error: ChatGptRouteError ) => error );
+			const transcript = describeChatGptError( ( routeFailure as ChatGptRouteError ).summary );
+
+			for ( const failed of [ failedSave, failedRead ] ) {
+				expect( failed ).toMatchObject( { code: 'vault-unavailable' } );
+				const { detail, message } = failed as ChatGptConnectionError;
+				expect( detail ).toMatch( /^Couldn't read from the system keychain: can’t open ~/ );
+				expect( detail ).toMatch( /…$/ );
+				expect( detail!.length ).toBeLessThanOrEqual( 200 );
+				expect( message ).toContain( `(${ detail })` );
+			}
+			for ( const text of [ settingsMessage, transcript ] ) {
+				expect( text ).toContain( ( failedSave as ChatGptConnectionError ).detail );
+			}
+			for ( const text of [
+				( failedSave as Error ).message,
+				( failedRead as Error ).message,
+				settingsMessage,
+				transcript,
+			] ) {
+				expect( text ).not.toContain( home );
+				expect( text ).not.toContain( homeWithSlashes );
+				expect( text ).not.toContain( 'second line' );
+				expect( text ).not.toMatch( /\p{Cc}/u );
+				expect( text.length ).toBeLessThan( 500 );
+			}
 		}
 	);
 

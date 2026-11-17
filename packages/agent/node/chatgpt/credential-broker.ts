@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { isErrnoException } from '@studio/common/lib/is-errno-exception';
 import {
@@ -96,6 +97,8 @@ const SESSION_OFFER_ENV = 'STUDIO_CHATGPT_SESSIONS_OFFERED';
 const SESSION_TOKEN_REQUEST = 'studio.chatgpt-session-token.request';
 const SESSION_TOKEN_REPLY = 'studio.chatgpt-session-token';
 const SESSION_TOKEN_INVALIDATE = 'studio.chatgpt-session-token.invalidate';
+// The longest a keychain tool's own words run in a message for the user.
+const KEYCHAIN_DETAIL_MAX_LENGTH = 200;
 
 export interface ChatGptBrokerTiming {
 	/** How long a sign-out waits for this process's turns on the account to settle. */
@@ -308,6 +311,35 @@ const signInOf = ( account: ChatGptAccount ) => ( {
 // used again, nor the cause of a "needs sign-in".
 const isSuperseded = ( held: SessionCredentials, account: ChatGptAccount ) =>
 	held.signInGeneration < ( account.signInGeneration ?? 0 );
+
+const escapeRegExp = ( text: string ) => text.replace( /[.*+?^${}()|[\]\\]/g, '\\$&' );
+
+/**
+ * What a keychain tool said, as the user, the transcript and a session file
+ * may see it: its first line, without terminal escapes or other control
+ * characters, the home directory (which names the user) written `~`, and no
+ * longer than `KEYCHAIN_DETAIL_MAX_LENGTH`. Undefined when nothing is left.
+ */
+function cleanKeychainDetail( text: string ): string | undefined {
+	let line = text
+		.split( /\r\n|[\n\r\u0085\p{Zl}\p{Zp}]/u )[ 0 ]
+		// eslint-disable-next-line no-control-regex
+		.replace( /\u001b\[[0-?]*[ -/]*[@-~]/g, '' )
+		.replace( /\t/g, ' ' )
+		.replace( /\p{Cc}/gu, '' );
+	const home = os.homedir();
+	if ( home && home !== path.parse( home ).root ) {
+		const windows = process.platform === 'win32';
+		for ( const form of new Set( [ home, windows ? home.replace( /\\/g, '/' ) : home ] ) ) {
+			line = line.replace( new RegExp( escapeRegExp( form ), windows ? 'gi' : 'g' ), '~' );
+		}
+	}
+	line = line.trim();
+	if ( line.length > KEYCHAIN_DETAIL_MAX_LENGTH ) {
+		line = `${ line.slice( 0, KEYCHAIN_DETAIL_MAX_LENGTH - 1 ).trimEnd() }…`;
+	}
+	return line || undefined;
+}
 
 const splitScopes = ( scope: string ) => scope.split( /\s+/ ).filter( Boolean );
 
@@ -606,11 +638,13 @@ export function createChatGptCredentialBroker(
 	const credentialsDirectory = () => path.join( getChatGptStateDirectory(), CREDENTIALS_DIRECTORY );
 	const recordFile = ( registrationId: string ) => `${ registrationId }.vault`;
 
+	// The one place a keychain tool's words become a detail: cleaned here, every
+	// message built from it, in settings, the transcript or a session file, is too.
 	function vaultUnavailable( error: unknown, secret?: string ): ChatGptConnectionError {
 		const reason = error instanceof Error ? error.message : String( error );
 		return new ChatGptConnectionError(
 			'vault-unavailable',
-			secret ? reason.split( secret ).join( '[redacted]' ) : reason
+			cleanKeychainDetail( secret ? reason.split( secret ).join( '[redacted]' ) : reason )
 		);
 	}
 
