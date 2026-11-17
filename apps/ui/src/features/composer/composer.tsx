@@ -227,7 +227,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 	const connectionSwitch = useConnectionSwitch( ownerSiteId, onSwitchSession );
 	// Until the site's new chat is on the chosen ChatGPT account, nothing is sent
 	// and no other model is chosen: the composer still shows the previous one.
-	const startingChat = connectionSwitch.starting;
+	const startingChat = ! sessionId && ! isField && connectionSwitch.starting;
 	const chatGptModel = chatGpt?.selection?.model;
 	const chatGptModelLabel = chatGpt
 		? chatGptModel && isAiModelId( chatGptModel )

@@ -6,6 +6,7 @@ import { __, sprintf } from '@wordpress/i18n';
 import { useEffect, useRef, useState } from 'react';
 import { useConnector } from '@/data/core';
 import { primeSessionQueryData, SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
+import { useSiteChatDraft } from '@/data/queries/use-site-chat-draft';
 import { saveSessionSettingChange } from '@/data/session-setting-changes';
 import { getComposerDraft, saveComposerDraft } from './draft-store';
 import { createChatGptSelectionEntry } from './use-chatgpt-conversation';
@@ -25,8 +26,9 @@ export function useConnectionSwitch(
 	const queryClient = useQueryClient();
 	const [ target, setTarget ] = useState< ConnectionTarget | null >( null );
 	const [ inFlight, setInFlight ] = useState( false );
-	// The site's new chat is being started on a ChatGPT account.
-	const [ starting, setStarting ] = useState( false );
+	// Whether the site's new chat is being started on a ChatGPT account, kept with
+	// its draft, where every send from it looks.
+	const siteDraft = useSiteChatDraft( ownerSiteId );
 	const [ error, setError ] = useState( '' );
 	const saving = useRef( false );
 	const created = useRef< AiSessionSummary | null >( null );
@@ -109,9 +111,10 @@ export function useConnectionSwitch(
 			} );
 			return;
 		}
-		if ( ! onSwitchSession || saving.current ) return;
+		if ( ! onSwitchSession || saving.current || siteDraft.current().startingChatGpt ) return;
 		saving.current = true;
-		setStarting( true );
+		const { update: updateSiteDraft } = siteDraft;
+		updateSiteDraft( { startingChatGpt: true } );
 		const pin = async ( start: NonNullable< typeof started.current > ) => {
 			await connector.setSessionChatGptSelection( start.summary.id, selection );
 			start.pinned = selection;
@@ -154,7 +157,7 @@ export function useConnectionSwitch(
 			onSwitchSession( summary.id );
 		} finally {
 			saving.current = false;
-			if ( mounted.current ) setStarting( false );
+			updateSiteDraft( { startingChatGpt: false } );
 		}
 	};
 	return {
@@ -162,7 +165,7 @@ export function useConnectionSwitch(
 		confirm,
 		startInPlace,
 		inFlight,
-		starting,
+		starting: !! siteDraft.draft.startingChatGpt,
 		error,
 		cancel: () => {
 			if ( ! saving.current ) setTarget( null );

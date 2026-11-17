@@ -1,13 +1,20 @@
 import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { getVisibleToasts } from '@/data/app-messages';
 import { ChatGptSettingsError, type AuthUser, type SessionEntry } from '@/data/core';
 import {
 	CHATGPT_MODELS_QUERY_KEY,
 	CHATGPT_SETTINGS_QUERY_KEY,
 } from '@/data/queries/use-chatgpt-settings';
+import {
+	changeAnnotation,
+	getSiteAnnotations,
+	pickAnnotation,
+	removeAnnotations,
+	requestAnnotationSend,
+} from '@/features/annotations';
 import { clearComposerDrafts } from '@/features/composer';
 import {
 	createFakeConnector,
@@ -973,6 +980,22 @@ describe( 'ChatGPT chats', () => {
 
 describe( 'Starting the site’s new chat on ChatGPT', () => {
 	beforeEach( () => clearComposerDrafts() );
+	afterEach( () =>
+		removeAnnotations(
+			'one',
+			getSiteAnnotations( 'one' ).notes.map( ( note ) => note.id )
+		)
+	);
+	const NOT_SENT =
+		'This wasn’t sent while the chat starts on ChatGPT. Send it again once it has started.';
+	// A note on the site's preview, then sent from there on its own (not with the draft).
+	function addNote() {
+		const id = pickAnnotation( 'one', { tag: 'h1', selector: 'h1', path: '/' } )!;
+		changeAnnotation( 'one', id, { comment: 'Make the heading shorter' } );
+		return id;
+	}
+	const sendNote = ( id: string ) =>
+		act( () => requestAnnotationSend( { siteId: 'one', noteIds: [ id ] } ) );
 	const STEPS: StartStep[] = [
 		'createSession',
 		'setSessionChatGptSelection',
@@ -1077,6 +1100,8 @@ describe( 'Starting the site’s new chat on ChatGPT', () => {
 
 		act( () => history.push( '/sessions/chat' ) );
 		await waitFor( () => expect( input() ).toHaveValue( '' ) );
+		// Another chat of the site isn't held by the new chat's start.
+		expect( modelButton() ).not.toHaveAttribute( 'aria-busy' );
 		await act( async () => gate.resolve() );
 		await act( async () => {} );
 		expect( history.location.pathname ).toBe( '/sessions/chat' );
@@ -1182,6 +1207,70 @@ describe( 'Starting the site’s new chat on ChatGPT', () => {
 		expect( connector.createSession ).toHaveBeenCalledTimes( 2 );
 		const { id: second } = await connector.createSession.mock.results[ 1 ].value;
 		expect( pinnedTo( connector, second ) ).toBe( A );
+	} );
+
+	it.each( [ 'createSession', 'setSessionChatGptSelection' ] as const )(
+		'sends no preview note on its own while %s is pending, keeping it, then sends it to the ChatGPT chat',
+		async ( step ) => {
+			const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new' );
+			const gate = holdNext( connector, step );
+			await chooseChatGpt( WORK );
+			await waitFor( () => expect( connector[ step ] ).toHaveBeenCalled() );
+			const id = addNote();
+
+			sendNote( id );
+			await act( async () => {} );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+			await toastSays( NOT_SENT );
+			expect( runs ).toHaveLength( 0 );
+			expect( getSiteAnnotations( 'one' ).notes.map( ( note ) => note.id ) ).toEqual( [ id ] );
+
+			await act( async () => gate.resolve() );
+			expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+			const { id: started } = await connector.createSession.mock.results[ 0 ].value;
+			sendNote( id );
+			await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+			expect( runs[ 0 ] ).toMatchObject( {
+				id: started,
+				selection: { ...INITIAL, connectionId: B },
+			} );
+			expect( runs[ 0 ].options?.visualAnnotations ).toEqual( [
+				expect.objectContaining( { comment: 'Make the heading shorter' } ),
+			] );
+			await waitFor( () => expect( getSiteAnnotations( 'one' ).notes ).toHaveLength( 0 ) );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+		}
+	);
+
+	it( 'sends a preview note held back by a start that then fails where the composer shows', async () => {
+		const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		const gate = holdNext( connector, 'setSessionChatGptSelection' );
+		const previous = modelButton().textContent;
+		await chooseChatGpt( WORK );
+		await waitFor( () => expect( connector.setSessionChatGptSelection ).toHaveBeenCalled() );
+		const id = addNote();
+		sendNote( id );
+		await toastSays( NOT_SENT );
+		expect( runs ).toHaveLength( 0 );
+
+		await act( async () =>
+			gate.reject( new Error( 'Studio couldn’t save the model for this chat. Try again.' ) )
+		);
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+		expect( modelButton() ).toHaveTextContent( previous! );
+		sendNote( id );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 2 );
+		const { id: sent } = await connector.createSession.mock.results[ 1 ].value;
+		expect( runs[ 0 ].id ).toBe( sent );
+		expect( runs[ 0 ].selection ).toBeUndefined();
+		expect( connector.setSessionProvider ).toHaveBeenCalledWith( sent, 'wpcom', expect.anything() );
+		expect( runs[ 0 ].options?.visualAnnotations ).toEqual( [
+			expect.objectContaining( { comment: 'Make the heading shorter' } ),
+		] );
+		await waitFor( () => expect( getSiteAnnotations( 'one' ).notes ).toHaveLength( 0 ) );
 	} );
 
 	it( 'keeps the Model control busy while the start is pending, so the account it shows is the one pinned', async () => {
