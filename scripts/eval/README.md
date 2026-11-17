@@ -173,8 +173,8 @@ The result's `remoteGuard` is `{ code, blocked }`, with `allowed` added in a sta
 | `parity-import-export` | `inspectionIncludes` (the title the export kept is back), `otherSitesUntouched` | automatic |
 | `parity-question` | `questionnaireSkip` | automatic |
 | `parity-design-choice` | `designChosen`, `noSiteCreated` | automatic |
-| `parity-screenshot-desktop-mobile` | `sawDesktopAndMobile`, `otherSitesUntouched` | automatic |
-| `parity-screenshot-interpretation` | `replyIncludes` (the title read from the image), `usedOnlyTools` | automatic |
+| `parity-screenshot-desktop-mobile` | `sawDesktopAndMobile`, `otherSitesUntouched` | automatic; blocked on the ChatGPT route until gate T1 (`needsToolImages`) |
+| `parity-screenshot-interpretation` | `replyIncludes` (the title read from the image), `usedOnlyTools` | automatic; blocked on the ChatGPT route until gate T1 (`needsToolImages`) |
 | `parity-preview-refresh` | `previewRefreshed`, `inspectionIncludes` | automatic |
 | `parity-preview-create` | `remoteOperationRan` | automatic (mocked remote) |
 | `parity-annotation` | `designTokenReachedTheme`, `designSystemReplyLink`, `otherSitesUntouched` | automatic |
@@ -201,6 +201,7 @@ These work in any config:
 - `caseId`: the case's kebab-case id, which names it in a provider-qualified case's sanitized summary (above).
 - `remote: mock` (above) or `remote: staging` (above). Without `remote`, an unselected case runs the real host, as before; a selected case runs as `remote: mock`. `remoteOperationRan` and `noRemoteOperation` read the mode the case declares, never the shape of the result.
 - `imageService: "off"`, `"required"` or `"unused"` (above; quote `"off"`, which some YAML parsers read as false).
+- `needsToolImages: true`: the case is judged on images a tool returns to the model (screenshots). On a route whose capability table leaves them off for the selected model (the ChatGPT route: `toolImageInput: false` for `gpt-6-luna` in `packages/agent/protocol/chatgpt-models.ts`, until gate T1) the case is blocked before any site, turn or model request: the result has `success: false`, `blocked: { code: "tool-images-not-qualified", message }` and `providerRoute.blocked`, every check fails with a reason starting `BLOCKED (tool-images-not-qualified)` (promptfoo has no blocked state, so it lists the case among its failures), and the case's sanitized summary records it as `blocked`. It is decided from the table alone, never by the development-only override, so the case runs by itself once the table qualifies the model. Other providers run it as before.
 - `attachments` (a list of `{ "fixture": "<file in fixtures/>" }`): images are sent as image input with the first message, other files as absolute paths appended to it, as the composer and CLI attach them. `STUDIO_EVAL_FIXTURES_DIR` overrides the folder. The result's `attachments` lists what was attached.
 - `followUps[].reopen: true`: the conversation is reopened from its session file in a fresh agent before that message, as a resumed chat is.
 - `resumeAfterStop: true`: the follow-ups still run after a `stopAt` interrupt, as a user who cancelled a turn and went on.

@@ -62,6 +62,24 @@ describe( 'subscription parity config', () => {
 		expect( pending.description ).not.toMatch( /settles/ );
 	} );
 
+	test( 'a case judged on images a tool returns to the model says so, so a route not qualified for them blocks it', () => {
+		const judgedOnToolImages = cases.filter(
+			( { vars, checks: names } ) =>
+				names.includes( 'sawDesktopAndMobile' ) ||
+				vars.caseId === 'parity-screenshot-interpretation'
+		);
+		expect( judgedOnToolImages.map( ( { vars } ) => vars.caseId ).sort() ).toEqual( [
+			'parity-screenshot-desktop-mobile',
+			'parity-screenshot-interpretation',
+		] );
+		for ( const { vars } of judgedOnToolImages ) {
+			expect( vars.needsToolImages, vars.caseId ).toBe( true );
+		}
+		expect(
+			cases.filter( ( { vars } ) => vars.needsToolImages ).map( ( { vars } ) => vars.caseId )
+		).toHaveLength( 2 );
+	} );
+
 	test( 'every case has a unique id, a description and checks outcome.mjs exports', () => {
 		const ids = cases.map( ( { vars } ) => vars.caseId );
 		expect( new Set( ids ).size ).toBe( ids.length );

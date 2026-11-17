@@ -76,6 +76,26 @@ test( 'a missing result file fails instead of throwing', () => {
 	expect( checks.siteWorks( 'no marker here', { vars: {} } ).pass ).toBe( false );
 } );
 
+test( 'every check reports a case the runner blocked as BLOCKED with its code, never as passed', () => {
+	const blocked = {
+		success: false,
+		error: 'not run',
+		blocked: { code: 'tool-images-not-qualified', message: 'not run' },
+		providerRoute: {
+			requested: { kind: 'chatgpt-oauth' },
+			blocked: { code: 'tool-images-not-qualified', message: 'not run' },
+		},
+	};
+	const names = Object.keys( checks ).filter( ( name ) => typeof checks[ name ] === 'function' );
+	expect( names.length ).toBeGreaterThan( 20 );
+	for ( const name of names ) {
+		expect( run( checks[ name ], blocked, { requireProvider: true } ), name ).toMatchObject( {
+			pass: false,
+			reason: expect.stringMatching( /^BLOCKED \(tool-images-not-qualified\): / ),
+		} );
+	}
+} );
+
 // A provider-qualified case's reasons hold no account, address, site id or
 // path, whatever the run produced: every check of every parity case, run on a
 // result whose every free-text field carries them.

@@ -40,6 +40,7 @@ import { setChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-direc
 import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { writeGlobalInstructions } from '@studio/agent/node/global-instructions';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
+import { getChatGptModelCapabilities } from '@studio/agent/protocol/chatgpt-models';
 import { DEFAULT_MODEL, isAiModelId, type AiModelId } from '@studio/agent/protocol/models';
 import { findLastAssistant } from '@studio/agent/protocol/session-events';
 import { DEFAULT_PHP_VERSION } from '@studio/common/constants';
@@ -601,6 +602,25 @@ interface ProviderRouteReport {
 	requested: RequestedRoute | null;
 	executed?: ExecutedRoute;
 	failure?: EvalRefusal;
+	blocked?: EvalBlock;
+}
+
+/**
+ * A case that can't pass on the selected route yet, by what the route is
+ * qualified for: neither run nor failed, and never silently skipped.
+ */
+interface EvalBlock {
+	code: 'tool-images-not-qualified';
+	message: string;
+}
+
+function blockedRun( block: EvalBlock, requested: RequestedRoute ) {
+	return {
+		success: false,
+		error: block.message,
+		blocked: block,
+		providerRoute: { requested, blocked: block } satisfies ProviderRouteReport,
+	};
 }
 
 /**
@@ -727,6 +747,20 @@ export async function runEval( input: EvalRunnerInput ) {
 	const resolvedModel = plan ? plan.requested.model : input.model ?? DEFAULT_MODEL;
 	const providerRefusal = ( failure: EvalRefusal ) =>
 		refusedRun( failure, plan ? { requested: plan.requested } : undefined );
+	// Decided by the route's capability table alone, so the case runs as soon as the table qualifies it.
+	if (
+		input.needsToolImages &&
+		plan?.requested.kind === 'chatgpt-oauth' &&
+		getChatGptModelCapabilities( plan.requested.model )?.toolImageInput !== true
+	) {
+		return blockedRun(
+			{
+				code: 'tool-images-not-qualified',
+				message: `This case is judged on images a tool returns to the model, and the ChatGPT route isn't qualified for them on ${ plan.requested.model } yet (gate T1), so it was not run.`,
+			},
+			plan.requested
+		);
+	}
 
 	let seed = input.seed;
 	let stagingSite: StagingSite | null = null;

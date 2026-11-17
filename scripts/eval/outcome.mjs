@@ -59,6 +59,18 @@ const providerQualified = ( d, vars ) =>
 	( typeof vars.provider === 'string' && vars.provider.trim() !== '' ) ||
 	Boolean( d?.providerRoute );
 
+// A case the runner blocked before it ran, because the selected route isn't
+// qualified yet for what the case is judged on (`tool-images-not-qualified`):
+// every check says so with its code. promptfoo has no blocked state, so it
+// lists the case among its failures; the case's sanitized summary records it
+// as blocked.
+const blocked = ( block ) => {
+	const code = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test( block?.code ) ? block.code : 'blocked';
+	return fail(
+		`BLOCKED (${ code }): this case was not run, since the selected route isn't qualified yet for what it is judged on`
+	);
+};
+
 // Runs a check against the loaded result, turning a thrown problem into a failure.
 function check( fn ) {
 	return ( output, context ) => {
@@ -67,7 +79,7 @@ function check( fn ) {
 		let verdict;
 		try {
 			d = load( output );
-			verdict = fn( d, vars );
+			verdict = d.blocked ? blocked( d.blocked ) : fn( d, vars );
 		} catch ( error ) {
 			verdict = fail( error instanceof Error ? error.message : String( error ) );
 		}

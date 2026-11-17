@@ -129,6 +129,20 @@ vi.mock( 'cli/ai/host', async () => {
 	return { cliAgentHost: host };
 } );
 
+// The ChatGPT route's capability table, as a test sets it: whether its model
+// takes images in tool results.
+const table = vi.hoisted( () => ( { toolImages: false } ) );
+vi.mock( '@studio/agent/protocol/chatgpt-models', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('@studio/agent/protocol/chatgpt-models') >();
+	return {
+		...actual,
+		getChatGptModelCapabilities: ( slug: string ) => {
+			const capabilities = actual.getChatGptModelCapabilities( slug );
+			return capabilities && { ...capabilities, toolImageInput: table.toolImages };
+		},
+	};
+} );
+
 const broker = vi.hoisted( () => ( {
 	connections: [] as ConnectionRegistryEntry[],
 	setTokenClient: vi.fn(),
@@ -1033,6 +1047,53 @@ describe( 'eval runner provider selection', () => {
 				expect( passedOn ).toHaveBeenCalledTimes( 1 );
 				expect( cliAgentHost.sync.push ).toHaveBeenCalledTimes( 1 );
 				expect( sentToNetwork() ).toContain( `POST ${ designatedWrite }` );
+			} );
+		} );
+
+		describe( 'a case judged on images a tool returns to the model', () => {
+			afterEach( () => {
+				table.toolImages = false;
+			} );
+
+			it( 'is blocked on the ChatGPT route while its capability table leaves tool images off, before any site or turn', async () => {
+				agent.behavior = { replyProvider: 'studio-chatgpt' };
+				const result = ( await runEvalUntyped(
+					input( { needsToolImages: true }, chatGptEnv() )
+				) ) as RunReport & { blocked?: { code: string; message: string } };
+				expect( result ).toMatchObject( {
+					success: false,
+					blocked: { code: 'tool-images-not-qualified' },
+					providerRoute: {
+						requested: { kind: 'chatgpt-oauth', model: 'gpt-6-luna' },
+						blocked: { code: 'tool-images-not-qualified' },
+					},
+				} );
+				expect( result ).not.toHaveProperty( 'refusal' );
+				expect( agent.turns ).toEqual( [] );
+				expect( sites.create ).not.toHaveBeenCalled();
+				expect( fetchSpy ).not.toHaveBeenCalled();
+				expect( leftovers() ).toEqual( [] );
+			} );
+
+			it( 'runs on the ChatGPT route once the table says its model takes tool images', async () => {
+				table.toolImages = true;
+				agent.behavior = { replyProvider: 'studio-chatgpt' };
+				const result = ( await runEvalUntyped(
+					input( { needsToolImages: true }, chatGptEnv() )
+				) ) as RunReport & { blocked?: unknown };
+				expect( result.blocked ).toBeUndefined();
+				expect( result.success ).toBe( true );
+				expect( agent.turns ).toHaveLength( 1 );
+			} );
+
+			it( 'runs as before on a route the table does not cover, and without the var', async () => {
+				agent.behavior = { replyProvider: 'studio-wpcom' };
+				expect( await runEval( input( { needsToolImages: true } ) ) ).not.toHaveProperty(
+					'blocked'
+				);
+				agent.behavior = { replyProvider: 'studio-chatgpt' };
+				expect( await runEval( input( {}, chatGptEnv() ) ) ).not.toHaveProperty( 'blocked' );
+				expect( agent.turns ).toHaveLength( 2 );
 			} );
 		} );
 

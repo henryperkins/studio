@@ -92,6 +92,7 @@ export const EVAL_RUNNER_VARS = [
 	'imageService',
 	'attachments',
 	'resumeAfterStop',
+	'needsToolImages',
 ] as const;
 
 export interface EvalRunnerVars {
@@ -129,6 +130,10 @@ export interface EvalRunnerVars {
 	imageService?: 'off' | 'required' | 'unused';
 	// Files from scripts/eval/fixtures attached to the first message.
 	attachments?: Array< { fixture: string } >;
+	// The case is judged on images a tool returns to the model (screenshots),
+	// so on a route whose capability table doesn't qualify the model for them
+	// it is blocked before it runs.
+	needsToolImages: boolean;
 }
 
 /** Parses the vars the runner reads; zod errors name a malformed one. */
@@ -150,5 +155,6 @@ export function parseEvalRunnerVars( vars: Record< string, unknown > ): EvalRunn
 				? z.enum( [ 'off', 'required', 'unused' ] ).parse( vars.imageService )
 				: undefined,
 		attachments: vars.attachments ? attachmentsSchema.parse( vars.attachments ) : undefined,
+		needsToolImages: vars.needsToolImages === true,
 	};
 }

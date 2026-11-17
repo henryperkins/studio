@@ -40,7 +40,11 @@
 # cases), "off" (purely local: no WordPress.com login) or "unused" (keeps the
 # login for a connected site, push or preview; an image request fails the case).
 # `[fixture-forced compaction]` case starts from a seeded history whose last
-# reply reports a context at the compaction threshold.
+# reply reports a context at the compaction threshold. A case with
+# `needsToolImages` is judged on images a tool returns to the model: on a route
+# whose capability table doesn't qualify the model for them (ChatGPT until gate
+# T1) it is blocked before it runs (`tool-images-not-qualified`), and it runs by
+# itself once the table does.
 
 description: Studio Code subscription provider parity
 
@@ -236,6 +240,7 @@ tests:
     vars:
       imageService: "off"
       caseId: parity-screenshot-desktop-mobile
+      needsToolImages: true
       timeoutMs: 240000
       seed:
         activeSite:
@@ -252,6 +257,7 @@ tests:
     vars:
       imageService: "off"
       caseId: parity-screenshot-interpretation
+      needsToolImages: true
       expectedText: PARITY VISION 4402
       allowedTools: [{ name: take_screenshot }, { name: Skill }]
       timeoutMs: 240000
