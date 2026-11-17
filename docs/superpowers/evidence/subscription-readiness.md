@@ -314,6 +314,20 @@ The three Important findings and the small ones the two review seats raised agai
 - **Unverified here.** No eval, no promptfoo run and no live run (no consent to a live account). Unseen: whether a real push's chunk uploads go to addresses under its upload endpoint (a push that goes elsewhere fails closed); whether every module a live run loads fixes its paths after the entry (only the three known ones are checked, and the bundled runner's evaluation order was not run); how promptfoo shows the withheld reasons and records the check records in its own process; the source revision read by the bundled runner; a real site under a case's own process manager. The main suite's two inline JavaScript checks are not `outcome.mjs` checks: their reasons can quote the reply and they add no record to the summary.
 - **Status.** `offline-tested`. **Nothing is qualified and no live gate is passed by this record.**
 
+### F2b round 3 record: the eval harness's last small points (November 17, 2026)
+
+Six small points the review of round 2 left. Commits `78d4e1c72` (1), `c560965c1` (2), `5750fe808` (3), `4d3aec171` (4), `b61531912` (5), `92402e949` (6, the README), `e167c8ecf` (a test typing fix), and the commit that adds this record. No product code changed; one script in the root `package.json` (`eval:parity`) gained `--no-cache`.
+
+1. **The entry removes what it made when it cannot hand over.** If claiming a port range rejects or the runner fails to load, the entry removes the case's profile (with the copies of the login and key), its registry, its sites folder and its process manager home, prints a fixed message with no path and exits 1. Pinned with both failures: nothing is left in the scratch temporary folder.
+2. **A secret is copied only where used.** The Anthropic API key and the provider setting go into a case's profile only on the default path and for an `anthropic-api-key` selection; a `chatgpt-oauth`, `wpcom` or `openai-api-key` case's profile holds neither (also not from the legacy registry fields).
+3. **A write whose query carries `rest_route` is refused in staging,** on the site's own host and the API host, with the existing code; matched as a method override key is.
+4. **A cached `exec:` output.** promptfoo is not installed in this checkout (it runs through `npx promptfoo@0.121.4`) and nothing was fetched, so whether it serves a cached `exec:` output was not established. Treated as possible: `eval:parity` passes `--no-cache`, and a provider-qualified case's check that reads a result file written before its own promptfoo process started records nothing and fails with `result-not-from-this-run`.
+5. **The route record says whether every check writes a record** (`everyCheckRecorded`), true only where the configuration declares it (the parity defaults); false for the main suite, whose `github.mjs` check and two inline checks write none.
+6. **README:** the fail-closed check's reach (known load-time paths only), the default-path process manager's home inside `~/.studio`, the Anthropic key in the leftover profile, and the entry's failure path among the exits that clean up.
+
+- **Unverified here.** No eval, no promptfoo run, no live run. Whether promptfoo's cache serves `exec:` output remains unknown until its source is read; the check and the flag make it harmless either way. The main suite's `npm run eval` does not pass `--no-cache` (a provider-qualified run of it should).
+- **Status.** `offline-tested`. **Nothing is qualified and no live gate is passed by this record.**
+
 ### Loose-ends record: the fix rounds' last small points (November 17, 2026)
 
 Seven small points the reviews of rounds F3c, F1r2B and F2a round 2 left over. Commits `693efbb3b` (1), `501a3c617` (2), `1ac4ca6e1` (3), `d97810031` (4), `4a46e6290` (5), `cbe586027` (6), `9dc3b410c` (7), and the commit that adds this record. The flag stays off by default.
