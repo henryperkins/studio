@@ -303,6 +303,8 @@ describe( 'send_feedback on the Claude route', () => {
 		};
 		const { bridge } = await setup();
 		const result = await bridge.invoke( 'send_feedback', report );
+		// The report was sent, and it was the service that failed it.
+		expect( feedback.calls ).toEqual( [ sent ] );
 		expect( result.isError ).toBe( true );
 		expect( text( result ) ).toBe( 'Studio operation denied or failed.' );
 	} );
