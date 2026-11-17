@@ -139,6 +139,9 @@ export function ModelPicker( {
 					{
 						value: `disconnected:${ account.connectionId }`,
 						label: __( 'Sign in to this ChatGPT account in Settings' ),
+						// Why the account offers no models here, in Settings' words for it.
+						description:
+							account.state === 'signed-out' ? __( 'Signed out' ) : __( 'Needs sign-in' ),
 						disabled: true,
 						icon: PlugIcon,
 					},

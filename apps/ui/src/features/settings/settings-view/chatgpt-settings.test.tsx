@@ -94,15 +94,97 @@ afterEach( () => vi.restoreAllMocks() );
 describe( 'ChatGPT account settings', () => {
 	it( 'shows a pending sign-in and cancels it without connecting an account', async () => {
 		const { connector } = await openSettings();
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+		// Mounted, and empty, before there is anything to announce.
+		const status = within( group ).getByRole( 'status', { name: 'ChatGPT sign-in status' } );
+		expect( status ).toBeEmptyDOMElement();
 		fireEvent.click( await screen.findByRole( 'button', { name: 'Start sign-in' } ) );
-		expect(
-			await screen.findByRole( 'status', { name: 'ChatGPT sign-in status' } )
-		).toHaveTextContent( /Complete sign-in in your browser/ );
+		await waitFor( () => expect( status ).toHaveTextContent( /Complete sign-in in your browser/ ) );
+		expect( within( group ).getByRole( 'status', { name: 'ChatGPT sign-in status' } ) ).toBe(
+			status
+		);
 		fireEvent.click( screen.getByRole( 'button', { name: 'Cancel sign-in' } ) );
 		await waitFor( () => expect( connector.cancelChatGptSignIn ).toHaveBeenCalledWith( ATTEMPT ) );
-		expect( await screen.findByText( 'Signing in was cancelled.' ) ).toBeVisible();
+		expect( await within( group ).findByRole( 'alert' ) ).toHaveTextContent(
+			'Signing in was cancelled.'
+		);
+		expect( within( group ).getAllByText( 'Signing in was cancelled.' ) ).toHaveLength( 1 );
+		expect( status ).toBeEmptyDOMElement();
 		expect( screen.queryByText( 'Connected' ) ).not.toBeInTheDocument();
 		expect( connector.openExternalUrl ).not.toHaveBeenCalled();
+	} );
+
+	it.each( [
+		[ 'cancelled', 'Signing in to ChatGPT was cancelled.' ],
+		[ 'timed-out', 'Signing in to ChatGPT took too long, so Studio stopped waiting. Try again.' ],
+		[
+			'browser-unavailable',
+			'Studio couldn’t open your web browser to sign in to ChatGPT. Try again.',
+		],
+		[
+			'denied',
+			'You didn’t allow WordPress Studio to use your ChatGPT account, so nothing was saved.',
+		],
+	] as const )(
+		'says a sign-in that ended %s as an error, in the status region’s place for the next attempt',
+		async ( code, message ) => {
+			const { connector, outcome } = await openSettings();
+			const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+			const status = within( group ).getByRole( 'status', { name: 'ChatGPT sign-in status' } );
+			fireEvent.click( await screen.findByRole( 'button', { name: 'Start sign-in' } ) );
+			await waitFor( () => expect( connector.waitForChatGptSignIn ).toHaveBeenCalled() );
+			await act( async () => outcome.resolve( { ok: false, code, message } ) );
+
+			expect( await within( group ).findByRole( 'alert' ) ).toHaveTextContent( message );
+			expect( status ).toBeEmptyDOMElement();
+
+			connector.waitForChatGptSignIn.mockImplementationOnce( () => new Promise( () => {} ) );
+			fireEvent.click( screen.getByRole( 'button', { name: 'Start sign-in' } ) );
+			await waitFor( () =>
+				expect( status ).toHaveTextContent( /Complete sign-in in your browser/ )
+			);
+			expect( within( group ).getByRole( 'status', { name: 'ChatGPT sign-in status' } ) ).toBe(
+				status
+			);
+			expect( within( group ).queryByRole( 'alert' ) ).not.toBeInTheDocument();
+		}
+	);
+
+	it( 'says why cancelling failed, as an error, and keeps the attempt open', async () => {
+		const { connector } = await openSettings();
+		connector.cancelChatGptSignIn.mockRejectedValueOnce(
+			new Error( 'Studio couldn’t complete the ChatGPT action. Try again.' )
+		);
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+		fireEvent.click( await screen.findByRole( 'button', { name: 'Start sign-in' } ) );
+		await waitFor( () => expect( connector.waitForChatGptSignIn ).toHaveBeenCalled() );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Cancel sign-in' } ) );
+
+		expect( await within( group ).findByRole( 'alert' ) ).toHaveTextContent(
+			'Studio couldn’t complete the ChatGPT action. Try again.'
+		);
+		expect( within( group ).getByRole( 'button', { name: 'Cancel sign-in' } ) ).toBeEnabled();
+		expect(
+			within( group ).getByRole( 'status', { name: 'ChatGPT sign-in status' } )
+		).toHaveTextContent( /Complete sign-in in your browser/ );
+	} );
+
+	it( 'says a sign-out that couldn’t clear the sign-in as an error', async () => {
+		const { connector } = await openSettings( { accounts: [ account() ] } );
+		connector.signOutChatGpt.mockResolvedValueOnce( {
+			localCleared: false,
+			remoteRevocationConfirmed: false,
+		} );
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+		fireEvent.click( await within( group ).findByRole( 'button', { name: 'Sign out' } ) );
+
+		expect( await within( group ).findByRole( 'alert' ) ).toHaveTextContent(
+			'Studio couldn’t clear this sign-in. Try signing out again.'
+		);
+		expect(
+			within( group ).getByRole( 'status', { name: 'ChatGPT sign-in status' } )
+		).toBeEmptyDOMElement();
+		expect( connector.signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( ACCOUNT_A );
 	} );
 
 	it.each( [ 'denied', 'permission-missing' ] as const )(

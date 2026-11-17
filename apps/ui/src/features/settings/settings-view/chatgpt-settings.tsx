@@ -87,6 +87,7 @@ export function ChatGptSettingsGroup() {
 			active.id = started.attemptId;
 			if ( active.cancelled ) {
 				await connector.cancelChatGptSignIn( active.id );
+				if ( mounted.current ) setError( __( 'Signing in was cancelled.' ) );
 				return;
 			}
 			const outcome = await connector.waitForChatGptSignIn( active.id );
@@ -99,7 +100,8 @@ export function ChatGptSettingsGroup() {
 				setMessage( __( 'ChatGPT account connected.' ) );
 				setReconsent( false );
 			} else {
-				setMessage( outcome.message );
+				// Cancelled, timed out, denied…: said once, as the attempt's outcome.
+				setError( outcome.message );
 				setReconsent( outcome.code === 'permission-missing' );
 			}
 		} catch ( failure ) {
@@ -117,13 +119,14 @@ export function ChatGptSettingsGroup() {
 		}
 	};
 
+	// The attempt then ends as cancelled, which `signIn` says.
 	const cancel = async () => {
 		const active = attempt.current;
 		if ( ! active ) return;
 		active.cancelled = true;
+		if ( ! active.id ) return;
 		try {
-			if ( active.id ) await connector.cancelChatGptSignIn( active.id );
-			setMessage( __( 'Signing in was cancelled.' ) );
+			await connector.cancelChatGptSignIn( active.id );
 		} catch ( failure ) {
 			setError(
 				failure instanceof Error ? failure.message : __( 'Couldn’t cancel sign-in. Try again.' )
@@ -140,11 +143,11 @@ export function ChatGptSettingsGroup() {
 		try {
 			await holdChatGptConnection( queryClient, connectionId );
 			const result = await connector.signOutChatGpt( connectionId );
-			if ( mounted.current ) {
+			if ( mounted.current && ! result.localCleared ) {
+				setError( __( 'Studio couldn’t clear this sign-in. Try signing out again.' ) );
+			} else if ( mounted.current ) {
 				setMessage(
-					! result.localCleared
-						? __( 'Studio couldn’t clear this sign-in. Try signing out again.' )
-						: result.remoteRevocationConfirmed
+					result.remoteRevocationConfirmed
 						? __( 'Signed out locally. Remote revocation confirmed.' )
 						: __(
 								'Signed out locally. Remote revocation wasn’t confirmed; you can remove Studio in your ChatGPT account settings.'
@@ -311,54 +314,56 @@ export function ChatGptSettingsGroup() {
 				stacked
 				error={ error || undefined }
 				description={
-					! settings.data.signInSupported ? (
-						__( 'Open Studio on localhost to sign in to ChatGPT on this computer.' )
-					) : pending ? (
-						<span role="status" aria-label={ __( 'ChatGPT sign-in status' ) }>
-							{ __( 'Complete sign-in in your browser. You can cancel here.' ) }
-						</span>
-					) : message ? (
-						<span role="status" aria-label={ __( 'ChatGPT sign-in status' ) }>
-							{ message }
-						</span>
-					) : (
-						__(
-							'Sign-in opens in your system browser. Grant permission to use models with your ChatGPT plan.'
-						)
-					)
+					settings.data.signInSupported
+						? __(
+								'Sign-in opens in your system browser. Grant permission to use models with your ChatGPT plan.'
+						  )
+						: __( 'Open Studio on localhost to sign in to ChatGPT on this computer.' )
 				}
 			>
-				<div className={ styles.keyForm }>
-					{ pending ? (
-						<Button variant="outline" onClick={ () => void cancel() }>
-							{ __( 'Cancel sign-in' ) }
-						</Button>
-					) : (
-						<>
-							{ signInAgainFirst ? signInAgain : null }
-							<Button
-								variant={ signInAgainFirst ? 'outline' : 'accent' }
-								disabled={ ! canSignIn }
-								onClick={ () => void signIn() }
-							>
-								{ accounts.length ? __( 'Add account' ) : __( 'Start sign-in' ) }
+				<div className={ styles.signInControl }>
+					<div className={ styles.keyForm }>
+						{ pending ? (
+							<Button variant="outline" onClick={ () => void cancel() }>
+								{ __( 'Cancel sign-in' ) }
 							</Button>
-							{ account ? (
-								<>
-									{ signInAgainFirst ? null : signInAgain }
-									<Button
-										variant="outline"
-										disabled={ busy }
-										loading={ signingOut }
-										loadingAnnouncement={ __( 'Signing out' ) }
-										onClick={ () => void signOut() }
-									>
-										{ __( 'Sign out' ) }
-									</Button>
-								</>
-							) : null }
-						</>
-					) }
+						) : (
+							<>
+								{ signInAgainFirst ? signInAgain : null }
+								<Button
+									variant={ signInAgainFirst ? 'outline' : 'accent' }
+									disabled={ ! canSignIn }
+									onClick={ () => void signIn() }
+								>
+									{ accounts.length ? __( 'Add account' ) : __( 'Start sign-in' ) }
+								</Button>
+								{ account ? (
+									<>
+										{ signInAgainFirst ? null : signInAgain }
+										<Button
+											variant="outline"
+											disabled={ busy }
+											loading={ signingOut }
+											loadingAnnouncement={ __( 'Signing out' ) }
+											onClick={ () => void signOut() }
+										>
+											{ __( 'Sign out' ) }
+										</Button>
+									</>
+								) : null }
+							</>
+						) }
+					</div>
+					{ /* Mounted before it has anything to say, so its first message is announced. */ }
+					<p
+						role="status"
+						aria-label={ __( 'ChatGPT sign-in status' ) }
+						className={ styles.signInStatus }
+					>
+						{ pending
+							? __( 'Complete sign-in in your browser. You can cancel here.' )
+							: message || null }
+					</p>
 				</div>
 			</SettingsRow>
 			{ account ? (

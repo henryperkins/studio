@@ -278,6 +278,44 @@ describe( 'ChatGPT chats', () => {
 		expect( screen.queryByRole( 'group', { name: new RegExp( A ) } ) ).not.toBeInTheDocument();
 	} );
 
+	it.each( [
+		[ 'signed-out', 'Signed out' ],
+		[ 'needs-sign-in', 'Needs sign-in' ],
+	] as const )(
+		'says in the picker that another account is %s, offering none of its models to choose',
+		async ( state, badge ) => {
+			const { connector, queryClient, runs } = await setup();
+			connector.state.chatGpt.accounts[ 1 ] = {
+				...account( B, WORK ),
+				authStatus: 'disconnected',
+				state,
+			};
+			await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+			fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+
+			const work = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ WORK }` } );
+			const row = within( work ).getByRole( 'option' );
+			expect( within( work ).getAllByRole( 'option' ) ).toHaveLength( 1 );
+			expect( row ).toHaveTextContent( 'Sign in to this ChatGPT account in Settings' );
+			expect( row ).toHaveTextContent( badge );
+			expect( row ).toHaveAttribute( 'aria-disabled', 'true' );
+			fireEvent.click( row );
+			fireEvent.keyDown( screen.getByRole( 'listbox', { name: 'Choose a model' } ), {
+				key: 'End',
+			} );
+			expect( screen.getByRole( 'listbox', { name: 'Choose a model' } ) ).not.toHaveAttribute(
+				'aria-activedescendant',
+				row.id
+			);
+			expect(
+				screen.queryByRole( 'dialog', { name: 'Start a new chat?' } )
+			).not.toBeInTheDocument();
+			expect( connector.getChatGptModels ).not.toHaveBeenCalledWith( B, 1 );
+			expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+			expect( runs ).toHaveLength( 0 );
+		}
+	);
+
 	it( 'sends attached images and documents with the turn on the pinned ChatGPT selection', async () => {
 		const { runs } = await setup();
 		fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
@@ -463,9 +501,12 @@ describe( 'ChatGPT chats', () => {
 		fireEvent.change( input(), { target: { value: 'Private draft' } } );
 		await chooseChatGpt( WORK );
 		const dialog = await screen.findByRole( 'dialog', { name: 'Start a new chat?' } );
-		expect(
-			within( dialog ).getByText( `ChatGPT plan · ${ WORK } · GPT-6 Luna · Medium` )
-		).toBeVisible();
+		const target = `ChatGPT plan · ${ WORK } · GPT-6 Luna · Medium`;
+		expect( within( dialog ).getByText( target ) ).toBeVisible();
+		expect( dialog ).toHaveAccessibleDescription(
+			expect.stringMatching( /^Changing the account or billing connection starts a new chat\./ )
+		);
+		expect( dialog ).toHaveAccessibleDescription( expect.stringContaining( target ) );
 		fireEvent.change(
 			within( dialog ).getByRole( 'textbox', { name: 'Context summary (optional)' } ),
 			{ target: { value: 'Reviewed context' } }
