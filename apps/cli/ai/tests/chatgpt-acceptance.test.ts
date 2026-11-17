@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Writable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import {
 	ChatGptConnectionError,
@@ -40,6 +41,7 @@ import {
 	classifyToolCall,
 	classifyTurnFailure,
 	createAcceptanceTokenService,
+	createLiveChatGptAcceptanceDependencies,
 	digestTurnEvents,
 	isToolResultPersisted,
 	isWpCliReadCommand,
@@ -1613,6 +1615,139 @@ describe( 'ChatGPT acceptance runner', () => {
 			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readState() ).toMatchObject( {
 				registrationId: REGISTRATION,
 				storage: 'vault',
+			} );
+		} );
+
+		describe( 'a terminal that has gone away', () => {
+			const writeError = ( code: string ) =>
+				Object.assign( new Error( 'The write failed.' ), { code } );
+
+			/**
+			 * A stand-in for stdout or stderr whose every write fails with `code`:
+			 * reported as the stream's 'error', as a terminal or pipe reports it,
+			 * or thrown by `write` itself, as a stream onto a file does.
+			 */
+			function failingStream( code: string, how: 'reported' | 'thrown' ) {
+				const attempts: string[] = [];
+				const stream = new Writable( {
+					write( _chunk, _encoding, callback ) {
+						callback( writeError( code ) );
+					},
+				} );
+				const write = stream.write.bind( stream ) as ( chunk: unknown ) => boolean;
+				stream.write = ( ( chunk: unknown ) => {
+					attempts.push( String( chunk ) );
+					if ( how === 'thrown' ) {
+						throw writeError( code );
+					}
+					return write( chunk );
+				} ) as typeof stream.write;
+				return { stream, attempts };
+			}
+
+			function liveConsole( code: string, how: 'reported' | 'thrown' ) {
+				const stdout = failingStream( code, how );
+				const stderr = failingStream( code, how );
+				// A stand-in for the process's signals, so no real signal reaches the test worker.
+				const signals = new EventEmitter();
+				const exit = vi.fn();
+				const live = createLiveChatGptAcceptanceDependencies( {
+					stdout: stdout.stream,
+					stderr: stderr.stream,
+					signals: signals as unknown as Pick< NodeJS.Process, 'on' | 'off' >,
+					platform: 'linux',
+					exit,
+				} );
+				return { stdout, stderr, signals, exit, live };
+			}
+
+			it.each( [
+				[ 'EIO', 'reported' ],
+				[ 'EPIPE', 'reported' ],
+				[ 'EIO', 'thrown' ],
+				[ 'EPIPE', 'thrown' ],
+			] as const )(
+				'a first SIGHUP still runs cleanup to its end when every write fails with %s (%s)',
+				async ( code, how ) => {
+					const { stdout, signals, exit, live } = liveConsole( code, how );
+					const { services, calls } = scriptedServices(
+						{},
+						{
+							// A turn still running when the terminal goes away.
+							draft: () => ( {
+								firstRequest: async () => true,
+								result: deferred< TurnResult >().promise,
+								stop: async () => undefined,
+							} ),
+						}
+					);
+					services.processes.stopOwned = async () => {
+						calls.log.push( 'stop-owned' );
+						return { stopped: 1, failed: 0 };
+					};
+					const running = runChatGptAcceptance( savedArgs(), {
+						...dependencies( services ),
+						print: live.print,
+						onInterrupt: live.onInterrupt,
+					} );
+					await vi.waitFor( () =>
+						expect( stdout.attempts.join( '' ) ).toMatch( /Evidence goes to/ )
+					);
+					await vi.waitFor( () => expect( calls.log ).toContain( 'turn:draft' ) );
+
+					signals.emit( 'SIGHUP' );
+
+					expect( await running ).toBe( 130 );
+					expect( stdout.attempts.join( '' ) ).toMatch( /Interrupted/ );
+					expect( stageOf( 'draft-turn' )[ 0 ] ).toMatchObject( {
+						status: 'failed',
+						code: 'interrupted',
+					} );
+					// What the run started, the running turn's tree included, was stopped,
+					// and the sign-out and the key removal were attempted, in that order.
+					expect( calls.log ).toEqual(
+						expect.arrayContaining( [ 'stop-owned', 'sign-out', 'remove-vault-key' ] )
+					);
+					expect( calls.log.indexOf( 'stop-owned' ) ).toBeLessThan(
+						calls.log.indexOf( 'sign-out' )
+					);
+					expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+						calls.log.indexOf( 'remove-vault-key' )
+					);
+					expect( records().at( -1 ) ).toMatchObject( {
+						stage: 'cleanup',
+						observations: expect.objectContaining( {
+							processesStopped: 1,
+							testRegistrationSignedOut: true,
+							vaultKeyRemoved: true,
+						} ),
+					} );
+					expect( exit ).not.toHaveBeenCalled();
+				}
+			);
+
+			it( 'a second signal still exits when every write fails', () => {
+				const { signals, exit, live } = liveConsole( 'EIO', 'thrown' );
+				const stop = live.onInterrupt( vi.fn() );
+				signals.emit( 'SIGHUP' );
+				signals.emit( 'SIGHUP' );
+				expect( exit ).toHaveBeenCalledWith( 130 );
+				stop();
+			} );
+
+			it( 'lets any other write error surface, reported or thrown', () => {
+				const reported = liveConsole( 'ENOSPC', 'reported' );
+				expect( () => reported.stdout.stream.emit( 'error', writeError( 'ENOSPC' ) ) ).toThrow(
+					'The write failed.'
+				);
+				expect( () => reported.stderr.stream.emit( 'error', writeError( 'ENOSPC' ) ) ).toThrow(
+					'The write failed.'
+				);
+				expect( () => reported.stdout.stream.emit( 'error', writeError( 'EIO' ) ) ).not.toThrow();
+				expect( () => reported.stderr.stream.emit( 'error', writeError( 'EPIPE' ) ) ).not.toThrow();
+
+				const thrown = liveConsole( 'ENOSPC', 'thrown' );
+				expect( () => thrown.live.print( 'A line.' ) ).toThrow( 'The write failed.' );
 			} );
 		} );
 

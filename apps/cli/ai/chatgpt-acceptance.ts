@@ -2751,8 +2751,9 @@ export async function runChatGptAcceptance(
 	let interrupted = false;
 	const stopListening = deps.onInterrupt( () => {
 		interrupted = true;
-		print( __( 'Interrupted: stopping the current stage and cleaning up…' ) );
+		// Before any write: after a hang-up the terminal may take none.
 		controller.abort();
+		print( __( 'Interrupted: stopping the current stage and cleaning up…' ) );
 	} );
 	try {
 		const services = await deps.createServices( { paths, options, print } );
@@ -3416,36 +3417,79 @@ export function onAcceptanceSignals(
 	};
 }
 
+// A terminal that hung up (EIO) or a reader that went away (EPIPE).
+const isLostOutput = ( error: unknown ) => {
+	const code = ( error as NodeJS.ErrnoException | null )?.code;
+	return code === 'EIO' || code === 'EPIPE';
+};
+
+// A stream onto a file throws a failed write; a terminal or pipe reports it as 'error'.
+function writeLine( stream: NodeJS.WritableStream, line: string ): void {
+	try {
+		stream.write( `${ line }\n` );
+	} catch ( error ) {
+		if ( ! isLostOutput( error ) ) {
+			throw error;
+		}
+	}
+}
+
 /** The dependencies of a real run, from the built CLI's directory. */
-export function createLiveChatGptAcceptanceDependencies(): ChatGptAcceptanceDependencies {
+export function createLiveChatGptAcceptanceDependencies(
+	io: {
+		stdout: NodeJS.WritableStream;
+		stderr: NodeJS.WritableStream;
+		signals: Pick< NodeJS.Process, 'on' | 'off' >;
+		platform: NodeJS.Platform;
+		exit: ( code: number ) => void;
+	} = {
+		stdout: process.stdout,
+		stderr: process.stderr,
+		signals: process,
+		platform: process.platform,
+		exit: ( code ) => process.exit( code ),
+	}
+): ChatGptAcceptanceDependencies {
+	// For the life of the run, output that can no longer be written never ends
+	// it, so cleanup after a closed terminal runs to its end; any other write
+	// error surfaces as it would without this listener.
+	for ( const stream of [ io.stdout, io.stderr ] ) {
+		stream.on( 'error', ( error: unknown ) => {
+			if ( ! isLostOutput( error ) ) {
+				throw error;
+			}
+		} );
+	}
+	const print = ( line: string ) => writeLine( io.stdout, line );
 	return {
 		env: process.env,
 		home: os.homedir(),
-		print: ( line ) => process.stdout.write( `${ line }\n` ),
+		print,
 		collectFacts: collectLiveFacts,
 		configDirectory: getConfigDirectory,
 		processManagerHome: () => PROCESS_MANAGER_HOME,
 		onInterrupt: ( handler ) =>
 			onAcceptanceSignals( handler, {
-				target: process,
-				platform: process.platform,
+				target: io.signals,
+				platform: io.platform,
 				forceExit: () => {
 					let warned = false;
 					// Their own process groups keep the terminal's signal from them on POSIX.
 					endRunningAcceptanceChildren( () => {
 						if ( ! warned ) {
 							warned = true;
-							process.stdout.write( `${ describeDescendantsMayRemain() }\n` );
+							print( describeDescendantsMayRemain() );
 						}
 					} );
-					process.stdout.write(
-						`${ __(
+					print(
+						__(
 							'Stopped before cleanup finished. See scripts/chatgpt-acceptance/README.md to stop what this run started.'
-						) }\n`
+						)
 					);
-					process.exit( EXIT_INTERRUPTED );
+					io.exit( EXIT_INTERRUPTED );
 				},
 			} ),
-		createServices: ( { paths, print } ) => createLiveServices( { paths, print } ),
+		createServices: ( { paths, print: printLine } ) =>
+			createLiveServices( { paths, print: printLine } ),
 	};
 }
