@@ -305,6 +305,194 @@ describe( 'preview_list on the Claude route', () => {
 	} );
 } );
 
+describe( 'preview_update and preview_delete on the Claude route', () => {
+	const PREVIEW_REFUSAL = 'one of this conversation’s site’s own previews';
+	// A preview of the conversation's own site, as the host lists that site's previews.
+	const own = { ...fakePreview };
+	// The order of the journal entries and the host's commands.
+	const ordered = ( fixture: Awaited< ReturnType< typeof setup > > ) => {
+		const order: string[] = [];
+		const record = fixture.context.recordOperation;
+		fixture.context.recordOperation = async ( event ) => {
+			order.push( `journal ${ event.operation.tool }` );
+			await record( event );
+		};
+		vi.mocked( fixture.host.previews.update ).mockImplementation( async () => {
+			order.push( 'host previews.update' );
+			return own;
+		} );
+		vi.mocked( fixture.host.previews.delete ).mockImplementation( async () => {
+			order.push( 'host previews.delete' );
+		} );
+		return order;
+	};
+
+	it( 'updates a preview of the conversation’s own site once the user approves it, showing the preview, the site’s folder and that anyone with its address can see it, journaled before the command', async () => {
+		const fixture = await setup();
+		const { bridge, host, context, journal, site, localSite } = fixture;
+		vi.mocked( host.previews.list ).mockResolvedValue( [ own ] );
+		const order = ordered( fixture );
+		expect( bridge.tools ).toContain( 'preview_update' );
+		const result = await bridge.invoke( 'preview_update', {
+			nameOrPath: 'site',
+			host: 'https://Demo.wp.build/',
+		} );
+		expect( result.isError ).toBe( false );
+		expect( host.previews.update ).toHaveBeenCalledWith(
+			localSite,
+			own.url,
+			false,
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( context.approve ).toHaveBeenCalledOnce();
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		expect( request.operation ).toMatchObject( {
+			tool: 'previews.update',
+			operationClass: 'remote-overwrite',
+			args: [ own.url ],
+			localPaths: [ site ],
+			remote: own.url,
+		} );
+		expect( request.operation.description ).toContain( 'anyone with the preview’s public address' );
+		expect( order ).toEqual( [
+			'journal preview_update',
+			'journal previews.update',
+			'host previews.update',
+		] );
+		expect( journal[ 1 ] ).toMatchObject( { requestId: request.requestId } );
+	} );
+
+	it( 'deletes a preview of the conversation’s own site once the user approves it, showing the preview, journaled before the command', async () => {
+		const fixture = await setup();
+		const { bridge, host, context, journal } = fixture;
+		vi.mocked( host.previews.list ).mockResolvedValue( [ own ] );
+		const order = ordered( fixture );
+		expect( bridge.tools ).toContain( 'preview_delete' );
+		const result = await bridge.invoke( 'preview_delete', { host: own.url } );
+		expect( result.isError ).toBe( false );
+		expect( host.previews.delete ).toHaveBeenCalledWith(
+			own.url,
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		expect( request.operation ).toMatchObject( {
+			tool: 'previews.delete',
+			operationClass: 'remote-overwrite',
+			args: [ own.url ],
+			localPaths: [],
+			remote: own.url,
+		} );
+		expect( order ).toEqual( [
+			'journal preview_delete',
+			'journal previews.delete',
+			'host previews.delete',
+		] );
+		expect( journal[ 1 ] ).toMatchObject( { requestId: request.requestId } );
+	} );
+
+	it( 'updates or deletes no preview but the conversation’s site’s own, from no conversation without a site, and never from another site, says why and asks nothing', async () => {
+		const onSite = await setup();
+		const unbound = await setup( global );
+		// What the host lists for the conversation's site: its own preview, one
+		// whose record names another site, and two records of one address.
+		const foreign = { ...fakePreview, url: 'foreign.wp.build', localSiteId: 'other-site' };
+		const twice = { ...fakePreview, url: 'twice.wp.build', atomicSiteId: 1 };
+		for ( const { host } of [ onSite, unbound ] )
+			vi.mocked( host.previews.list ).mockResolvedValue( [
+				own,
+				foreign,
+				twice,
+				{ ...twice, atomicSiteId: 2 },
+			] );
+		const calls: Array< [ typeof onSite, string, Record< string, unknown > ] > = [
+			[ onSite, 'preview_delete', { host: 'elsewhere.wp.build' } ],
+			[ onSite, 'preview_delete', { host: foreign.url } ],
+			[ onSite, 'preview_delete', { host: twice.url } ],
+			[ onSite, 'preview_update', { nameOrPath: 'site', host: 'elsewhere.wp.build' } ],
+			[ onSite, 'preview_update', { nameOrPath: 'site', host: foreign.url } ],
+			[ unbound, 'preview_delete', { host: own.url } ],
+		];
+		for ( const [ fixture, name, args ] of calls ) {
+			const result = await fixture.bridge.invoke( name, args );
+			expect( result.isError, `${ name } ${ JSON.stringify( args ) }` ).toBe( true );
+			expect( text( result ), `${ name } ${ JSON.stringify( args ) }` ).toContain(
+				PREVIEW_REFUSAL
+			);
+		}
+		const overwrite = await onSite.bridge.invoke( 'preview_update', {
+			nameOrPath: 'site',
+			host: own.url,
+			overwrite: true,
+		} );
+		expect( overwrite.isError ).toBe( true );
+		expect( text( overwrite ) ).toContain( 'only from the site it was made from' );
+		expect(
+			( await onSite.bridge.invoke( 'preview_update', { nameOrPath: 'other', host: own.url } ) )
+				.isError
+		).toBe( true );
+		for ( const { host, context } of [ onSite, unbound ] ) {
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( host.previews.update ).not.toHaveBeenCalled();
+			expect( host.previews.delete ).not.toHaveBeenCalled();
+		}
+	} );
+
+	it( 'checks the preview again once the user has answered and immediately before the command starts, so a preview that changed meanwhile is left alone', async () => {
+		// Answered: the address now names another preview.
+		const answered = await setup();
+		vi.mocked( answered.host.previews.list ).mockResolvedValue( [ own ] );
+		vi.mocked( answered.context.approve ).mockImplementationOnce( async () => {
+			vi.mocked( answered.host.previews.list ).mockResolvedValue( [
+				{ ...own, atomicSiteId: 999 },
+			] );
+			return 'allow';
+		} );
+		const afterAnswer = await answered.bridge.invoke( 'preview_delete', { host: own.url } );
+		expect( afterAnswer.isError ).toBe( true );
+		expect( answered.host.previews.delete ).not.toHaveBeenCalled();
+		// Started: the preview is gone when the command's own fence runs.
+		const started = await setup();
+		vi.mocked( started.host.previews.list ).mockResolvedValue( [ own ] );
+		let ran = false;
+		vi.mocked( started.host.previews.update ).mockImplementation(
+			async ( _site, _hostname, _overwrite, _onProgress, options ) => {
+				vi.mocked( started.host.previews.list ).mockResolvedValue( [] );
+				await options?.beforeSpawn?.();
+				ran = true;
+				return own;
+			}
+		);
+		const beforeStart = await started.bridge.invoke( 'preview_update', {
+			nameOrPath: 'site',
+			host: own.url,
+		} );
+		expect( beforeStart.isError ).toBe( true );
+		expect( ran ).toBe( false );
+	} );
+
+	it( 'reaches, through the guarded host, only a preview of the target site, and only while the call lives', async () => {
+		const { policy, host, localSite, otherSite } = await setup();
+		vi.mocked( host.previews.list ).mockResolvedValue( [ own ] );
+		const call = new AbortController();
+		const guarded = policy.guardHost( host, 'call', call.signal );
+		await expect( guarded.previews.delete( 'elsewhere.wp.build', () => {} ) ).rejects.toThrow(
+			'Denied'
+		);
+		await expect( guarded.previews.update( otherSite, own.url, false, () => {} ) ).rejects.toThrow(
+			'Denied'
+		);
+		await expect( guarded.previews.delete( own.url, () => {} ) ).resolves.toBeUndefined();
+		call.abort();
+		await expect( guarded.previews.update( localSite, own.url, false, () => {} ) ).rejects.toThrow(
+			'Denied'
+		);
+		expect( host.previews.delete ).toHaveBeenCalledOnce();
+		expect( host.previews.update ).not.toHaveBeenCalled();
+	} );
+} );
+
 describe( 'site_connected_remote_sites on the Claude route', () => {
 	// The account's own listing of its sites, as WordPress.com answers it: the
 	// site connected to the conversation's site, and another one.

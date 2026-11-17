@@ -75,16 +75,8 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	wpcom_request: { status: 'bridged' },
 	preview_create: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
 	preview_list: { status: 'bridged' },
-	preview_update: {
-		status: 'unqualified',
-		step: 'C2a-3',
-		reason: `${ REMOTE }; preview hosts are not tied to the target (carry item 12)`,
-	},
-	preview_delete: {
-		status: 'unqualified',
-		step: 'C2a-3',
-		reason: `${ REMOTE }; preview hosts are not tied to the target (carry item 12)`,
-	},
+	preview_update: { status: 'bridged' },
+	preview_delete: { status: 'bridged' },
 	site_push: {
 		status: 'unqualified',
 		step: 'C2a-3',

@@ -240,6 +240,10 @@ const REFUSALS = {
 		'On this route Studio sends a WordPress.com request only with a plain path and no query key that changes its method, route, namespace or origin. It reads a site, or the account at !/me and !/plans/features; it changes something in a site only through that site’s WordPress REST API (wp/v2) with POST or PUT, both sent as a POST, and sends no DELETE, which Studio’s WordPress.com client would send as a POST that deletes nothing.',
 	wpcomSite:
 		'Studio sends a WordPress.com request for a site only to this conversation’s own WordPress.com site.',
+	preview:
+		'Studio updates or deletes a preview only when it is one of this conversation’s site’s own previews, named by the address preview_list gives for it.',
+	previewOverwrite:
+		'Studio updates a preview only from the site it was made from, so overwrite must be false or left out.',
 } as const;
 
 function deepFreeze< T >( value: T ): T {
@@ -278,6 +282,27 @@ interface HostRequest {
 	 * it is the operation's first argument, before `args`, and one of its paths.
 	 */
 	file?: HostFile;
+	/**
+	 * The preview the operation acts on, by the address the caller named. It
+	 * must be one of the previews of the site the turn acts on, and the
+	 * operation receives that preview's own address: the operation's first
+	 * argument, before `args`, and what it reaches.
+	 */
+	preview?: unknown;
+	/** What the approval and the journal say of the operation after its class and name: a fixed sentence. */
+	note?: string;
+}
+
+/** A preview of the site the turn acts on: its address, and the WordPress.com site that holds it. */
+interface TargetPreview {
+	url: string;
+	atomicSiteId: number;
+}
+
+/** What an operation receives in place of what its caller named: the values as checked. */
+interface CheckedHostValues {
+	file?: string;
+	preview?: string;
 }
 
 interface PreparedHostOperation {
@@ -286,6 +311,8 @@ interface PreparedHostOperation {
 	site?: HostSite;
 	/** The file as checked. */
 	file?: HostFile< string >;
+	/** The preview as checked. */
+	preview?: TargetPreview;
 }
 
 const WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
@@ -972,6 +999,7 @@ export function createClaudeExecutionPolicy(
 		} else if ( context.target.environment === 'global' ) {
 			// An operation bound to no site follows the target the turn was sent
 			// with: a site this turn created binds site-bound calls only.
+			if ( 'preview' in request ) refuse( toolCallId, REFUSALS.preview );
 			return;
 		}
 		let args = request.args;
@@ -986,23 +1014,38 @@ export function createClaudeExecutionPolicy(
 			args = [ checked, ...args ];
 			localPaths.push( checked );
 		}
+		let preview: TargetPreview | undefined;
+		let remote = request.remote;
+		if ( 'preview' in request ) {
+			preview = await targetPreview( host, request.preview );
+			if ( ! preview ) {
+				refuse( toolCallId, REFUSALS.preview );
+				return;
+			}
+			args = [ preview.url, ...args ];
+			remote = preview.url;
+		}
 		if ( ! ( await checkpoint( callSignal ) ) ) return;
 		// The only WP-CLI command this build runs with approval is the bounded draft.
 		const draftTitle =
 			request.name === 'sites.wpCli' && operationClass === 'command'
 				? wpCliOption( request.args, 'post_title' )
 				: undefined;
+		const described = describeClaudeOperation( operationClass, request.name );
 		const operation: ClaudeOperation = {
 			tool: request.name,
 			operationClass,
 			args,
 			siteId: site?.id,
 			localPaths,
-			remote: request.remote,
+			remote,
 			description:
 				draftTitle !== undefined && site
 					? 'Create a draft post on the current local site'
-					: describe( operationClass, request.name ),
+					: noticed(
+							operationClass,
+							request.note ? `${ described }. ${ request.note }` : described
+					  ),
 			...( draftTitle !== undefined && site
 				? {
 						draft: {
@@ -1013,9 +1056,38 @@ export function createClaudeExecutionPolicy(
 				  }
 				: {} ),
 		};
-		if ( ! asksFirst( operationClass ) ) return { operation, site, file };
+		if ( ! asksFirst( operationClass ) ) return { operation, site, file, preview };
 		const grant = await requestApproval( operation, toolCallId, callSignal );
-		return grant ? { operation, grant, site, file } : undefined;
+		return grant ? { operation, grant, site, file, preview } : undefined;
+	}
+
+	// The preview of the site the turn acts on that an address names: the one
+	// preview of that site the host lists at exactly that address, as the CLI
+	// finds a preview by its address. Undefined for anything else, or when the
+	// site or its previews cannot be read.
+	async function targetPreview(
+		host: StudioAgentHost,
+		named: unknown
+	): Promise< TargetPreview | undefined > {
+		const targetSite = actingSite;
+		if ( typeof named !== 'string' || actingTarget.environment === 'global' || ! targetSite )
+			return;
+		const site = await resolveTarget( host, targetSite.path );
+		if ( ! site ) return;
+		try {
+			const matching = ( await host.previews.list( site ) ).filter(
+				( listed ) => listed.url === named
+			);
+			if (
+				matching.length !== 1 ||
+				matching[ 0 ].localSiteId !== site.id ||
+				! Number.isSafeInteger( matching[ 0 ].atomicSiteId )
+			)
+				return;
+			return { url: matching[ 0 ].url, atomicSiteId: matching[ 0 ].atomicSiteId };
+		} catch {
+			return;
+		}
 	}
 
 	// The path a file a host operation reads (`existing`) or writes resolves to,
@@ -1052,6 +1124,7 @@ export function createClaudeExecutionPolicy(
 	}
 
 	async function fence(
+		host: StudioAgentHost,
 		prepared: PreparedHostOperation,
 		callSignal?: AbortSignal
 	): Promise< boolean > {
@@ -1063,6 +1136,14 @@ export function createClaudeExecutionPolicy(
 			// The file is checked again, since a link can have moved under it: the
 			// path the operation receives must still resolve to itself.
 			if ( prepared.file && ( await conversationFile( prepared.file ) ) !== prepared.file.path )
+				return false;
+			// The preview too: its address must still name the same preview of the
+			// site the turn acts on.
+			if (
+				prepared.preview &&
+				( await targetPreview( host, prepared.preview.url ) )?.atomicSiteId !==
+					prepared.preview.atomicSiteId
+			)
 				return false;
 			if (
 				prepared.operation.tool === 'sites.wpCli' &&
@@ -1137,11 +1218,11 @@ export function createClaudeExecutionPolicy(
 				site: HostSite | undefined,
 				options: HostOperationOptions,
 				operation: ClaudeOperation,
-				file: string | undefined
+				checked: CheckedHostValues
 			) => Promise< T >
 		): Promise< T > => {
 			const prepared = await prepare( host, request, toolCallId, callSignal );
-			if ( ! prepared || ! ( await fence( prepared, callSignal ) ) ) throw denied();
+			if ( ! prepared || ! ( await fence( host, prepared, callSignal ) ) ) throw denied();
 			if (
 				( prepared.grant &&
 					! ( await authorizeExecution(
@@ -1159,11 +1240,11 @@ export function createClaudeExecutionPolicy(
 				{
 					signal: operationSignal,
 					beforeSpawn: async () => {
-						if ( ! ( await fence( prepared, callSignal ) ) ) throw denied();
+						if ( ! ( await fence( host, prepared, callSignal ) ) ) throw denied();
 					},
 				},
 				prepared.operation,
-				prepared.file?.path
+				{ file: prepared.file?.path, preview: prepared.preview?.url }
 			);
 		};
 		// A read a tool makes of a site: of a site it may reach, under the turn's
@@ -1302,13 +1383,13 @@ export function createClaudeExecutionPolicy(
 					run(
 						{ name: 'sites.import', site, args: [], file: { path: file, existing: true } },
 						( current, options, _operation, checked ) =>
-							host.sites.import( current!, checked!, onProgress, options )
+							host.sites.import( current!, checked.file!, onProgress, options )
 					),
 				export: ( site, file, mode, onProgress ) =>
 					run(
 						{ name: 'sites.export', site, args: [ mode ], file: { path: file, existing: false } },
 						( current, options, _operation, checked ) =>
-							host.sites.export( current!, checked!, mode, onProgress, options )
+							host.sites.export( current!, checked.file!, mode, onProgress, options )
 					),
 				wpCli: ( site, args ) =>
 					run( { name: 'sites.wpCli', site, args: [ ...args ] }, ( current, options, operation ) =>
@@ -1326,16 +1407,37 @@ export function createClaudeExecutionPolicy(
 					run( { name: 'previews.create', site, args: [] }, ( current, options ) =>
 						host.previews.create( current!, onProgress, options )
 					),
-				update: ( site, hostname, overwrite, onProgress ) =>
-					run(
-						{ name: 'previews.update', site, args: [ hostname, overwrite ], remote: hostname },
-						( current, options ) =>
-							host.previews.update( current!, hostname, overwrite, onProgress, options )
-					),
+				// A preview of the site the turn acts on, by its address, as that site's
+				// own previews list it; checked again immediately before the command.
+				// An update comes only from the site the preview was made from, so the
+				// CLI's own check of that holds too.
+				update: async ( site, hostname, overwrite, onProgress ) => {
+					if ( overwrite !== false ) {
+						refuse( toolCallId, REFUSALS.previewOverwrite );
+						throw denied();
+					}
+					return run(
+						{
+							name: 'previews.update',
+							site,
+							args: [],
+							preview: hostname,
+							note: 'It replaces what a preview of this site on WordPress.com shows with the site’s current content, which anyone with the preview’s public address can see',
+						},
+						( current, options, _operation, checked ) =>
+							host.previews.update( current!, checked.preview!, false, onProgress, options )
+					);
+				},
 				delete: ( hostname, onProgress ) =>
 					run(
-						{ name: 'previews.delete', args: [ hostname ], remote: hostname },
-						( _site, options ) => host.previews.delete( hostname, onProgress, options )
+						{
+							name: 'previews.delete',
+							args: [],
+							preview: hostname,
+							note: 'It deletes a preview of this site from WordPress.com',
+						},
+						( _site, options, _operation, checked ) =>
+							host.previews.delete( checked.preview!, onProgress, options )
 					),
 			},
 			sync: {

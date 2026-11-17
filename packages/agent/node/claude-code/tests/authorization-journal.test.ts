@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { writeFile } from 'fs/promises';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fakeSite } from '../../tests/fake-host';
+import { fakePreview, fakeSite } from '../../tests/fake-host';
 import {
 	CLAUDE_NATIVE_TOOL_RULES,
 	CLAUDE_STUDIO_TOOL_RULES,
@@ -140,6 +140,9 @@ const knowingCreatedSite = ( host: StudioAgentHost, paths: Paths ) => {
 };
 const creatingSite = ( host: StudioAgentHost, paths: Paths ) =>
 	host.sites.create( 'New', createdSite( paths ).path, () => {} );
+const listingPreview = ( host: StudioAgentHost ) => {
+	host.previews.list = vi.fn( async () => [ fakePreview ] );
+};
 
 // A call of each host operation that does more than read. `before` runs first,
 // on the same guarded host, and what it journals is not this operation's.
@@ -208,10 +211,15 @@ const HOST_CALLS: Record<
 			host.sites.wpCli( site, [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ] ),
 	},
 	'previews.create': { call: ( host ) => host.previews.create( site, () => {} ) },
+	// A preview of the target site, which the host lists for it.
 	'previews.update': {
-		call: ( host ) => host.previews.update( site, 'demo.wp.build', false, () => {} ),
+		host: listingPreview,
+		call: ( host ) => host.previews.update( site, fakePreview.url, false, () => {} ),
 	},
-	'previews.delete': { call: ( host ) => host.previews.delete( 'demo.wp.build', () => {} ) },
+	'previews.delete': {
+		host: listingPreview,
+		call: ( host ) => host.previews.delete( fakePreview.url, () => {} ),
+	},
 	'sync.push': { call: ( host ) => host.sync.push( site, 'all', 'remote', () => {} ) },
 	'sync.pull': { call: ( host ) => host.sync.pull( site, 'all', 'remote', () => {} ) },
 };

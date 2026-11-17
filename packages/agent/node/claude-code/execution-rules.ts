@@ -58,6 +58,8 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		getSiteInfoTool.name,
 		listSitesTool.name,
 		listPreviewsTool.name,
+		updatePreviewTool.name,
+		deletePreviewTool.name,
 		listConnectedRemoteSitesTool.name,
 		wpcomRequestTool.name,
 		startSiteTool.name,
@@ -687,8 +689,28 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		// and asks WordPress.com nothing itself.
 		qualified( onSite( 'read' ), using( LOCAL_SITE_HOST_CHANNELS ) ),
 	],
-	[ updatePreviewTool.name, unqualified( onSite( 'remote-overwrite', { approval: 'host' } ) ) ],
-	[ deletePreviewTool.name, unqualified( studioRule( 'remote-overwrite', { approval: 'host' } ) ) ],
+	// These act on a preview by the address the call names, through the host,
+	// which runs the CLI's own `preview update` or `preview delete`. The guarded
+	// host binds the preview to the site the turn acts on: the one preview of
+	// that site the host lists at that address, checked again immediately
+	// before the command, which receives that preview's own address. The user
+	// approves each, seeing the preview, and it is journaled before it runs. An
+	// update comes only from the site the preview was made from. Their modules
+	// link `tools/utils.ts`, whose `runWpCli` runs only through the host.
+	[
+		updatePreviewTool.name,
+		qualified(
+			onSite( 'remote-overwrite', { approval: 'host' } ),
+			using( { ...LOCAL_SITE_HOST_CHANNELS, reachesWpcom: [ 'host' ] } )
+		),
+	],
+	[
+		deletePreviewTool.name,
+		qualified(
+			studioRule( 'remote-overwrite', { approval: 'host' } ),
+			using( { runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ], reachesWpcom: [ 'host' ] } )
+		),
+	],
 	[
 		runWpCliTool.name,
 		// The tool only resolves the site it names and hands the command to the

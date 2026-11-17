@@ -96,6 +96,13 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 		reachesWpcom: [ 'host' ],
 	},
 	preview_list: throughHost,
+	preview_update: { ...throughHost, reachesWpcom: [ 'host' ] },
+	preview_delete: {
+		...noChannels,
+		runsWpCli: [ 'host' ],
+		callsHostOperation: [ 'host' ],
+		reachesWpcom: [ 'host' ],
+	},
 	site_connected_remote_sites: {
 		...throughHost,
 		readsLocalFiles: [ 'config' ],
