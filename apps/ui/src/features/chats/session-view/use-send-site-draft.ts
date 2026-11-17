@@ -57,13 +57,13 @@ export function useSendSiteDraft( siteId: string | undefined ) {
 				}
 				const { id: sessionId } = session.summary;
 				await startRun( sessionId, prompt, options );
-				const current = queryClient.getQueryData< LoadedAiSession >( [
+				const cached = queryClient.getQueryData< LoadedAiSession >( [
 					...SESSIONS_QUERY_KEY,
 					sessionId,
 				] )?.summary;
 				primeSessionQueryData( queryClient, {
-					...( current ?? session.summary ),
-					firstPrompt: current?.firstPrompt || options?.displayMessage || prompt,
+					...( cached ?? session.summary ),
+					firstPrompt: cached?.firstPrompt || options?.displayMessage || prompt,
 					updatedAt: new Date().toISOString(),
 				} );
 				if ( router.state.location.pathname === pathname ) {
