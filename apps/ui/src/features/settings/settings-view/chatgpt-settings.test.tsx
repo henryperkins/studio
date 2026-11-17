@@ -1,6 +1,9 @@
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CHATGPT_SETTINGS_QUERY_KEY } from '@/data/queries/use-chatgpt-settings';
+import {
+	CHATGPT_MODELS_QUERY_KEY,
+	CHATGPT_SETTINGS_QUERY_KEY,
+} from '@/data/queries/use-chatgpt-settings';
 import { createFakeConnector, makeSite } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { Connector } from '@/data/core';
@@ -216,6 +219,66 @@ describe( 'ChatGPT account settings', () => {
 		expect( screen.getByRole( 'button', { name: 'Refresh models' } ) ).toBeDisabled();
 		expect( screen.queryByText( 'Connected' ) ).not.toBeInTheDocument();
 		expect( connector.signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( ACCOUNT_A );
+	} );
+
+	describe( 'model lists the open chats rely on', () => {
+		const ACCOUNT_C = '0b1f5f6e-1f43-4f5b-9b2b-5f0d8f1f2a3c';
+		const catalog = ( connectionId: string ) => [ ...CHATGPT_MODELS_QUERY_KEY, connectionId, 1 ];
+		async function withCatalogs() {
+			const view = await openSettings( { accounts: [ account(), account( ACCOUNT_B, SECOND ) ] } );
+			await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+			for ( const id of [ ACCOUNT_A, ACCOUNT_B ] ) {
+				view.queryClient.setQueryData( catalog( id ), {
+					connectionId: id,
+					revision: 1,
+					checkedAt: '2026-11-10T10:00:00Z',
+					models: [ { id: 'gpt-6-luna', label: 'GPT-6 Luna' } ],
+					lastError: null,
+				} );
+			}
+			return view;
+		}
+
+		it( 'drops only the signed-out account’s model list', async () => {
+			const { connector, queryClient } = await withCatalogs();
+			fireEvent.click( screen.getByRole( 'button', { name: 'Sign out' } ) );
+
+			await waitFor( () =>
+				expect( connector.signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( ACCOUNT_A )
+			);
+			await waitFor( () =>
+				expect( queryClient.getQueryData( catalog( ACCOUNT_A ) ) ).toBeUndefined()
+			);
+			expect( queryClient.getQueryData( catalog( ACCOUNT_B ) ) ).toBeDefined();
+		} );
+
+		it( 'drops only the model list of the account signed in to again', async () => {
+			const { connector, queryClient, outcome } = await withCatalogs();
+			fireEvent.click( screen.getByRole( 'button', { name: 'Sign in again' } ) );
+			await waitFor( () => expect( connector.waitForChatGptSignIn ).toHaveBeenCalled() );
+			await act( async () =>
+				outcome.resolve( { ok: true, registrationId: ACCOUNT_A, label: EMAIL, email: EMAIL } )
+			);
+
+			await waitFor( () =>
+				expect( queryClient.getQueryData( catalog( ACCOUNT_A ) ) ).toBeUndefined()
+			);
+			expect( queryClient.getQueryData( catalog( ACCOUNT_B ) ) ).toBeDefined();
+		} );
+
+		it( 'keeps every saved account’s model list when another account is added', async () => {
+			const { connector, queryClient, outcome } = await withCatalogs();
+			fireEvent.click( screen.getByRole( 'button', { name: 'Add account' } ) );
+			await waitFor( () => expect( connector.waitForChatGptSignIn ).toHaveBeenCalled() );
+			await act( async () =>
+				outcome.resolve( { ok: true, registrationId: ACCOUNT_C, label: EMAIL, email: EMAIL } )
+			);
+
+			await screen.findByText( 'ChatGPT account connected.' );
+			await waitFor( () => expect( queryClient.isFetching() ).toBe( 0 ) );
+			expect( queryClient.getQueryData( catalog( ACCOUNT_A ) ) ).toBeDefined();
+			expect( queryClient.getQueryData( catalog( ACCOUNT_B ) ) ).toBeDefined();
+		} );
 	} );
 
 	it( 'checks secure storage again when the ChatGPT settings open, never on a polled read, and shows what it found', async () => {

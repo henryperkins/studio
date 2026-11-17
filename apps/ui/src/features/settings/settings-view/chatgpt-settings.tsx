@@ -77,6 +77,8 @@ export function ChatGptSettingsGroup() {
 		setPending( true );
 		setMessage( '' );
 		setError( '' );
+		// The account whose model list the sign-in may change: none yet for a new one.
+		let signedIn = registrationId;
 		try {
 			const started = await connector.beginChatGptSignIn( registrationId, {
 				storage,
@@ -92,6 +94,7 @@ export function ChatGptSettingsGroup() {
 				return;
 			}
 			if ( outcome.ok ) {
+				signedIn = outcome.registrationId;
 				setSelectedId( outcome.registrationId );
 				setMessage( __( 'ChatGPT account connected.' ) );
 				setReconsent( false );
@@ -106,7 +109,7 @@ export function ChatGptSettingsGroup() {
 				);
 			}
 		} finally {
-			await refreshChatGptSettings( queryClient );
+			await refreshChatGptSettings( queryClient, signedIn );
 			if ( mounted.current && attempt.current === active ) {
 				attempt.current = null;
 				setPending( false );
@@ -130,12 +133,13 @@ export function ChatGptSettingsGroup() {
 
 	const signOut = async () => {
 		if ( ! account ) return;
+		const { connectionId } = account;
 		setSigningOut( true );
 		setError( '' );
 		setMessage( '' );
 		try {
-			await holdChatGptConnection( queryClient, account.connectionId );
-			const result = await connector.signOutChatGpt( account.connectionId );
+			await holdChatGptConnection( queryClient, connectionId );
+			const result = await connector.signOutChatGpt( connectionId );
 			if ( mounted.current ) {
 				setMessage(
 					! result.localCleared
@@ -153,7 +157,7 @@ export function ChatGptSettingsGroup() {
 					failure instanceof Error ? failure.message : __( 'Couldn’t sign out. Try again.' )
 				);
 		} finally {
-			await refreshChatGptSettings( queryClient );
+			await refreshChatGptSettings( queryClient, connectionId );
 			if ( mounted.current ) setSigningOut( false );
 		}
 	};

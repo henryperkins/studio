@@ -1,4 +1,10 @@
-import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import {
+	queryOptions,
+	useMutation,
+	useQuery,
+	useQueryClient,
+	type QueryClient,
+} from '@tanstack/react-query';
 import { __, sprintf } from '@wordpress/i18n';
 import { useCallback, useEffect, useState } from 'react';
 import { useConnector, type Connector } from '@/data/core';
@@ -104,9 +110,13 @@ export function useRecheckChatGptSettings() {
 	return useMutation( { mutationFn: () => recheckChatGptSettings( queryClient, connector ) } );
 }
 
-export function useChatGptModels( account: ChatGptAccountView | undefined, enabled = true ) {
-	const connector = useConnector();
-	return useQuery( {
+/** A saved account's model list, as its chats, the model picker and Settings read it. */
+export function chatGptModelsQuery(
+	connector: Connector,
+	account: ChatGptAccountView | undefined,
+	enabled = true
+) {
+	return queryOptions( {
 		queryKey: [ ...CHATGPT_MODELS_QUERY_KEY, account?.connectionId, account?.revision ],
 		queryFn: () => connector.getChatGptModels( account!.connectionId, account!.revision ),
 		enabled: enabled && account?.authStatus === 'connected',
@@ -116,13 +126,30 @@ export function useChatGptModels( account: ChatGptAccountView | undefined, enabl
 	} );
 }
 
-/** A pre-action read must not restore a connection or catalog after sign-out. */
-export async function refreshChatGptSettings( queryClient: QueryClient ): Promise< void > {
+export function useChatGptModels( account: ChatGptAccountView | undefined, enabled = true ) {
+	const connector = useConnector();
+	return useQuery( chatGptModelsQuery( connector, account, enabled ) );
+}
+
+/**
+ * Reads the accounts again after a sign-in or sign-out. The model list of the
+ * account it changed goes, so a read from before can't restore it; the other
+ * accounts' lists, which their open chats wait on, stay.
+ */
+export async function refreshChatGptSettings(
+	queryClient: QueryClient,
+	connectionId?: string
+): Promise< void > {
+	const models = connectionId
+		? { queryKey: [ ...CHATGPT_MODELS_QUERY_KEY, connectionId ] }
+		: undefined;
 	await Promise.all( [
 		queryClient.cancelQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ),
-		queryClient.cancelQueries( { queryKey: CHATGPT_MODELS_QUERY_KEY } ),
+		models ? queryClient.cancelQueries( models ) : undefined,
 	] );
-	queryClient.removeQueries( { queryKey: CHATGPT_MODELS_QUERY_KEY } );
+	if ( models ) {
+		queryClient.removeQueries( models );
+	}
 	await queryClient.invalidateQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } );
 }
 

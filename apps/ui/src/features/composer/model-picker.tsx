@@ -11,7 +11,7 @@ import { InfoIcon, PlugIcon, SparklesIcon } from 'lucide-react';
 import { useRef, useState, type RefObject, ComponentType } from 'react';
 import { useConnector } from '@/data/core';
 import { useStudioAssistantQuota } from '@/data/queries/use-assistant-quota';
-import { CHATGPT_MODELS_QUERY_KEY, nameChatGptAccount } from '@/data/queries/use-chatgpt-settings';
+import { chatGptModelsQuery, nameChatGptAccount } from '@/data/queries/use-chatgpt-settings';
 import { useUserPreferences } from '@/data/queries/use-user-preferences';
 import { useOpenSettings } from '@/data/use-open-settings';
 import { getCreditsLabel, getModelDescription } from '@/features/composer/model-options';
@@ -71,14 +71,7 @@ export function ModelPicker( {
 }: ModelPickerProps ) {
 	const connector = useConnector();
 	const catalogs = useQueries( {
-		queries: chatGptAccounts.map( ( account ) => ( {
-			queryKey: [ ...CHATGPT_MODELS_QUERY_KEY, account.connectionId, account.revision ],
-			queryFn: () => connector.getChatGptModels( account.connectionId, account.revision ),
-			enabled: open && account.authStatus === 'connected',
-			staleTime: 60_000,
-			retry: false,
-			meta: { persist: false },
-		} ) ),
+		queries: chatGptAccounts.map( ( account ) => chatGptModelsQuery( connector, account, open ) ),
 	} );
 	const [ highlight, setHighlight ] = useState< string >();
 	const listRef = useRef< HTMLDivElement | null >( null );
