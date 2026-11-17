@@ -11,7 +11,31 @@ import {
 	type ChatGptTokenClient,
 	type ChatGptTokenSet,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
 import { scriptedKeychain, type KeychainPlatform } from './fixtures/scripted-keychain';
+
+// What the file system answers when a real path is read: a test can make it
+// fail for some paths, with the error code it names.
+const realPaths = vi.hoisted( () => ( {
+	fail: null as ( ( target: string ) => string | undefined ) | null,
+} ) );
+
+vi.mock( 'node:fs', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('node:fs') >();
+	const native = ( ( target: string ) => {
+		const code = realPaths.fail?.( target );
+		if ( code ) {
+			throw Object.assign( new Error( `${ code }: scripted, realpath` ), { code } );
+		}
+		return actual.realpathSync.native( target );
+	} ) as unknown as typeof actual.realpathSync.native;
+	const realpathSync = Object.assign(
+		( ( ...args: Parameters< typeof actual.realpathSync > ) =>
+			actual.realpathSync( ...args ) ) as typeof actual.realpathSync,
+		{ native }
+	);
+	return { ...actual, default: { ...actual, realpathSync }, realpathSync };
+} );
 
 // Every store here runs over a scripted tool; the real keychain is never reached.
 vi.mock( '@studio/common/lib/os-credential-store', async ( importOriginal ) => {
@@ -110,9 +134,11 @@ describe( 'the ChatGPT vault key of each profile', () => {
 		previousConfigDir = process.env.DEV_CONFIG_DIR;
 		renewals = 0;
 		revocations = [];
+		realPaths.fail = null;
 	} );
 
 	afterEach( () => {
+		realPaths.fail = null;
 		vi.restoreAllMocks();
 		if ( previousConfigDir === undefined ) {
 			delete process.env.DEV_CONFIG_DIR;
@@ -343,4 +369,68 @@ describe( 'the ChatGPT vault key of each profile', () => {
 			);
 		}
 	);
+
+	describe( 'the real path the item is named from', () => {
+		const unnamed = { name: 'ChatGptStateDirectoryError', code: 'unresolved' };
+
+		// Only a part that doesn't exist is passed over on the way to the nearest
+		// existing folder: anything else could name the same profile another way.
+		it.each( [ 'EACCES', 'EIO', 'ENOTDIR' ] )(
+			'names no key while the profile’s real path can’t be read (%s), reading and writing no keychain item, and the same one as before once it can',
+			async ( code ) => {
+				const keychain = scriptedKeychain( 'linux' );
+				selectProfile( profileA );
+				const saved = await broker( keychain ).saveSignIn( signIn( 'vault', 1 ) );
+				const record = fs.readFileSync( recordPath( profileA, saved.registrationId ), 'utf8' );
+				const callsBefore = keychain.calls.length;
+				realPaths.fail = ( target ) => ( target === path.resolve( profileA ) ? code : undefined );
+
+				expect( () => getChatGptVaultKeyAccounts() ).toThrow( expect.objectContaining( unnamed ) );
+				const app = broker( keychain );
+				await expect( app.getAccessToken( saved.registrationId ) ).rejects.toMatchObject( unnamed );
+				await expect( app.checkVaultKey() ).rejects.toMatchObject( unnamed );
+				await expect( app.saveSignIn( signIn( 'vault', 2 ) ) ).rejects.toMatchObject( unnamed );
+				await expect( app.removeProfileVaultKey() ).rejects.toMatchObject( unnamed );
+
+				expect( keychain.calls.slice( callsBefore ) ).toEqual( [] );
+				expect( fs.readFileSync( recordPath( profileA, saved.registrationId ), 'utf8' ) ).toBe(
+					record
+				);
+				expect( await readChatGptAccount( saved.registrationId ) ).toMatchObject( {
+					state: 'signed-in',
+				} );
+
+				realPaths.fail = null;
+				await expect( app.getAccessToken( saved.registrationId ) ).resolves.toBe(
+					'test-access-token-1'
+				);
+				expect( [ ...keychain.items.keys() ] ).toEqual( [ scopedItem( profileA ) ] );
+			}
+		);
+
+		it( 'names a profile that doesn’t exist yet as it is named once it does', () => {
+			const later = path.join( base, 'not-yet', 'profile' );
+			selectProfile( later );
+			const before = getChatGptVaultKeyAccounts();
+
+			fs.mkdirSync( later, { recursive: true } );
+
+			expect( getChatGptVaultKeyAccounts() ).toEqual( before );
+			expect( `wordpress-studio/${ before.own }` ).toBe( scopedItem( later ) );
+		} );
+
+		it.runIf( process.platform === 'win32' )(
+			'on Windows, names a profile the same whatever the case of its drive letter, even where none of its path exists',
+			() => {
+				realPaths.fail = () => 'ENOENT';
+				const tail = path.join( 'studio-profile-on-a-missing-drive', 'profile' );
+
+				selectProfile( `q:\\${ tail }` );
+				const lower = getChatGptVaultKeyAccounts();
+				selectProfile( `Q:\\${ tail }` );
+
+				expect( getChatGptVaultKeyAccounts() ).toEqual( lower );
+			}
+		);
+	} );
 } );

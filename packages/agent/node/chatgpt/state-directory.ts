@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isErrnoException } from '@studio/common/lib/is-errno-exception';
 import { getConfigDirectory, getDefaultConfigDirectory } from '@studio/common/lib/well-known-paths';
 
 /**
@@ -9,13 +10,25 @@ import { getConfigDirectory, getDefaultConfigDirectory } from '@studio/common/li
  * set otherwise in this process.
  */
 
-export type ChatGptStateDirectoryProblem = 'not-absolute' | 'not-a-directory' | 'in-use';
+/**
+ * `unresolved`: its real path couldn't be read for a reason other than a part
+ * of it not existing yet, so the keychain item of its vault key can't be named.
+ */
+export type ChatGptStateDirectoryProblem =
+	| 'not-absolute'
+	| 'not-a-directory'
+	| 'in-use'
+	| 'unresolved';
 
 export class ChatGptStateDirectoryError extends Error {
 	readonly code: ChatGptStateDirectoryProblem;
 
-	constructor( code: ChatGptStateDirectoryProblem ) {
-		super( `The ChatGPT state directory was refused (${ code }).` );
+	constructor( code: ChatGptStateDirectoryProblem, reason?: string ) {
+		super(
+			code === 'unresolved'
+				? `The ChatGPT state directory's real path couldn't be read (${ reason ?? 'unknown' }).`
+				: `The ChatGPT state directory was refused (${ code }).`
+		);
 		this.name = 'ChatGptStateDirectoryError';
 		this.code = code;
 	}
@@ -58,20 +71,36 @@ export function setChatGptStateDirectory( directory: string | null ): void {
 const VAULT_KEY_ACCOUNT = 'chatgpt-vault-key';
 const VAULT_KEY_SUFFIX_DIGITS = 16;
 
-// The directory with every link resolved, as far as it exists; the rest as named.
+// One spelling of a Windows drive: `c:\…` and `C:\…` are the same directory.
+const withDriveLetterUpperCase = ( directory: string ) =>
+	process.platform === 'win32'
+		? directory.replace( /^[a-z](?=:)/, ( drive ) => drive.toUpperCase() )
+		: directory;
+
+/**
+ * The directory with every link resolved, as far as it exists; the rest as
+ * named. Only a part that doesn't exist yet is passed over: any other failure
+ * to read a real path throws, so one directory is never named two ways.
+ */
 function realDirectory( directory: string ): string {
 	const resolved = path.resolve( directory );
 	const missing: string[] = [];
-	let current = resolved;
-	while ( path.dirname( current ) !== current ) {
+	for ( let current = resolved; ; current = path.dirname( current ) ) {
 		try {
-			return path.join( fs.realpathSync.native( current ), ...missing );
-		} catch {
+			return withDriveLetterUpperCase( path.join( fs.realpathSync.native( current ), ...missing ) );
+		} catch ( error ) {
+			if ( ! isErrnoException( error ) || error.code !== 'ENOENT' ) {
+				throw new ChatGptStateDirectoryError(
+					'unresolved',
+					isErrnoException( error ) ? error.code : undefined
+				);
+			}
+			if ( path.dirname( current ) === current ) {
+				return withDriveLetterUpperCase( resolved );
+			}
 			missing.unshift( path.basename( current ) );
-			current = path.dirname( current );
 		}
 	}
-	return resolved;
 }
 
 /**
@@ -80,7 +109,9 @@ function realDirectory( directory: string ): string {
  * Every other directory's is that name and a hash of the directory's real
  * path, so one profile never replaces another's key; `shared` is then the
  * default profile's item, which records sealed before keys were kept per
- * profile may still need, to read and never to write.
+ * profile may still need, to read and never to write. Throws
+ * `ChatGptStateDirectoryError` (`unresolved`) when a real path can't be read,
+ * before any item is read or written.
  */
 export function getChatGptVaultKeyAccounts(): { own: string; shared: string | null } {
 	const directory = realDirectory( getChatGptStateDirectory() );
