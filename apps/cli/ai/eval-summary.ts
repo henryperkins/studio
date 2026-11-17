@@ -56,7 +56,7 @@ const count = ( value: unknown ): number =>
 	typeof value === 'number' && Number.isFinite( value ) ? value : 0;
 
 /** Why the route the run took is not the one it selected, as a typed code, or null. */
-export function evalRouteProblem(
+function evalRouteProblem(
 	requested: RequestedRoute | null | undefined,
 	executed: ExecutedRoute | undefined
 ): string | null {
