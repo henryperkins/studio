@@ -975,9 +975,10 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		// command takes. The user approves it, seeing the direction, the site and
 		// what it overwrites in the local site, and it is journaled before it
 		// runs. It changes local work, so its class is a local one. Only the
-		// CLI's default engine runs: the Reprint engine keeps its state outside
-		// Studio's configuration folder, so the host refuses it. Its module
-		// links `tools/utils.ts`, whose `runWpCli` runs only through the host.
+		// CLI's default engine runs: the Reprint engine keeps its state under the
+		// home folder whatever Studio's configuration folder is, so the host
+		// refuses it. Its module links `tools/utils.ts`, whose `runWpCli` runs
+		// only through the host.
 		qualified(
 			onSite( 'local-overwrite', { approval: 'host' } ),
 			using( { ...LOCAL_SITE_HOST_CHANNELS, reachesWpcom: [ 'host' ] } )

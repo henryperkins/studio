@@ -277,7 +277,7 @@ const REFUSALS = {
 	syncOptions:
 		'Studio pushes or pulls only with options from this list, each once, separated by commas: all (alone), sqls, uploads, plugins, themes, contents.',
 	reprintPull:
-		'On this route Studio pulls a site only with its default engine; the Reprint pull (STUDIO_ENABLE_PULL_REPRINT) keeps its state in a folder outside Studio’s configuration folder, which this route does not bind.',
+		'On this route Studio pulls a site only with its default engine; the Reprint pull (STUDIO_ENABLE_PULL_REPRINT) keeps its state in .studio/pulls under the home folder, whatever Studio’s configuration folder is, and this route does not bind that folder.',
 	siteFiles:
 		'A file this tool writes must be an absolute path inside the folder of this conversation’s site, through every link it passes.',
 	mediaUploads:

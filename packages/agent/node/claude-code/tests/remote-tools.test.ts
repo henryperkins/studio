@@ -979,7 +979,7 @@ describe( 'site_pull on the Claude route', () => {
 		expect( host.sync.pull ).not.toHaveBeenCalled();
 	} );
 
-	it( 'runs no Reprint pull, which keeps its state outside Studio’s configuration folder, checked again immediately before the command starts', async () => {
+	it( 'runs no Reprint pull, which keeps its state under the home folder whatever Studio’s configuration folder is, checked again immediately before the command starts', async () => {
 		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
 		vi.stubEnv( 'STUDIO_ENABLE_PULL_REPRINT', '1' );
 		const reprint = await setup();
@@ -989,6 +989,11 @@ describe( 'site_pull on the Claude route', () => {
 		} );
 		expect( refused.isError ).toBe( true );
 		expect( text( refused ) ).toContain( REPRINT_REFUSAL );
+		// Where that state is, whatever the configuration folder: in the default
+		// configuration it lies inside that folder, not outside it.
+		expect( text( refused ) ).toContain(
+			'keeps its state in .studio/pulls under the home folder, whatever Studio’s configuration folder is'
+		);
 		expect( reprint.context.approve ).not.toHaveBeenCalled();
 		expect( reprint.host.sync.pull ).not.toHaveBeenCalled();
 		vi.unstubAllEnvs();
