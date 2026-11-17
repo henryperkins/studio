@@ -154,27 +154,29 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 	}
 
 	// A ChatGPT settings read, as `api` makes it, except that it carries the shared
-	// module's own message only when the server answered with its `{ error }`. Any
-	// other failure (the server not answering, a proxy's page) is a plain error.
+	// module's own message only when the server answered with its `{ error }` at
+	// 400, the status it gives a known message. Any other failure (its catch-all's
+	// raw 500, the server not answering, a proxy's page) is a plain error, without
+	// the body.
 	async function readChatGptSettings( path: string, init?: RequestInit ) {
 		const response = await fetch( `${ base }${ path }`, {
 			...init,
 			headers: { 'Content-Type': 'application/json' },
 		} );
 		if ( ! response.ok ) {
-			const text = await response.text().catch( () => '' );
 			let reason: unknown;
-			try {
-				reason = ( JSON.parse( text ) as { error?: unknown } | null )?.error;
-			} catch {
-				// Not JSON: not the server's own answer.
+			if ( response.status === 400 ) {
+				const text = await response.text().catch( () => '' );
+				try {
+					reason = ( JSON.parse( text ) as { error?: unknown } | null )?.error;
+				} catch {
+					// Not JSON: not the server's own answer.
+				}
 			}
 			if ( typeof reason === 'string' ) {
 				throw new ChatGptSettingsError( stripCliErrorEnvelope( reason ) );
 			}
-			throw new Error(
-				`${ init?.method ?? 'GET' } ${ path } failed (${ response.status }): ${ text }`
-			);
+			throw new Error( `${ init?.method ?? 'GET' } ${ path } failed (${ response.status })` );
 		}
 		const settings = ( await response.json() ) as ChatGptSettings;
 		return { ...settings, signInSupported: settings.signInSupported && chatGptSignInSupported };

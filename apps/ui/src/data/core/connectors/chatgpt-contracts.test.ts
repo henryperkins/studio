@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { describeChatGptSettingsError } from '@/data/queries/use-chatgpt-settings';
 import { ChatGptSettingsError } from './chatgpt-settings-error';
 import { createIpcConnector } from './ipc';
 import { createLocalConnector } from './local';
@@ -230,6 +231,28 @@ describe( 'ChatGPT connector contracts', () => {
 				expect( failure ).toBeInstanceOf( Error );
 				expect( failure ).not.toBeInstanceOf( ChatGptSettingsError );
 			} );
+
+			// The server's catch-all answers an unexpected failure with its raw text.
+			it.each( [ 500, 409 ] )(
+				'says only the fixed sentence for a { error } at status %s',
+				async ( status ) => {
+					const raw =
+						"EACCES: permission denied, open 'C:\\Users\\someone\\.studio\\chatgpt\\accounts.json'";
+					vi.stubGlobal(
+						'fetch',
+						vi.fn( async () => new Response( JSON.stringify( { error: raw } ), { status } ) )
+					);
+					const failure = ( await createLocalConnector( { apiBaseUrl: 'http://localhost:8081' } )
+						[ read ]()
+						.catch( ( error: unknown ) => error ) ) as Error;
+
+					expect( failure ).not.toBeInstanceOf( ChatGptSettingsError );
+					expect( describeChatGptSettingsError( failure ) ).toBe(
+						'Couldn’t check your ChatGPT accounts. Try again.'
+					);
+					expect( failure.message ).not.toMatch( /EACCES|someone|accounts\.json/ );
+				}
+			);
 		} );
 	} );
 
