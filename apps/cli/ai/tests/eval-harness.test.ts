@@ -641,6 +641,80 @@ describe( 'eval harness', () => {
 				] );
 			} );
 
+			it.each( [
+				// WordPress prefers the query's rest_route to the route of the path.
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts', '?rest_route=/wpcom/v2/x', false ],
+				[
+					'staging-4242.wpcomstaging.com',
+					'/wp-json/wp/v2/posts',
+					'?rest_route=/wpcom/v2/x',
+					false,
+				],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?a=1&rest_route=', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?REST_ROUTE=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?%72est%5Froute=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?%20rest_route=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest.route=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest+route=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest_route[]=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest[route]=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest_route%00=/x', false ],
+				// Other queries are unaffected.
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts', '?context=edit&per_page=5', true ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?x=rest_route', true ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '', true ],
+			] )(
+				'decides whether %s%s%s may be written in the staging case: %s',
+				( hostname, pathname, search, expected ) => {
+					expect( writesToStagingSite( { hostname, pathname, search }, staging ) ).toBe( expected );
+				}
+			);
+
+			it( 'refuses a write whose query names a rest_route, on the site’s own host and on the API host, and lets the same write without it through', async () => {
+				const { reached, targets } = network();
+				const guard = installWpcomWriteGuard( { stagingSite: staging }, targets );
+				const api = 'https://public-api.wordpress.com';
+				const site = 'https://staging-4242.wpcomstaging.com';
+				for ( const write of [
+					`${ site }/wp-json/wp/v2/posts?rest_route=/wpcom/v2/sites/113/x`,
+					`${ site }/wp-json/wp/v2/posts?REST_ROUTE=/wpcom/v2/sites/113/x`,
+					`${ api }/wp/v2/sites/4242/posts?rest_route=/wpcom/v2/sites/113/x`,
+				] ) {
+					await expect( targets.global.fetch( write, { method: 'POST' } ) ).rejects.toThrow(
+						/wpcom-write-outside-staging/
+					);
+				}
+				targets.https.request( {
+					host: 'staging-4242.wpcomstaging.com',
+					method: 'POST',
+					path: '/wp-json/wp/v2/posts?rest.route=/wpcom/v2/sites/113/x',
+				} );
+				targets.https.request( {
+					host: 'public-api.wordpress.com',
+					method: 'POST',
+					path: '/wp/v2/sites/4242/posts?a=1&rest_route[]=/x',
+				} );
+				// The same writes without it, and a read with it, pass.
+				await targets.global.fetch( `${ site }/wp-json/wp/v2/posts?context=edit`, {
+					method: 'POST',
+				} );
+				await targets.global.fetch( `${ api }/wp/v2/sites/4242/posts`, { method: 'POST' } );
+				await targets.global.fetch( `${ site }/?rest_route=/wp/v2/posts` );
+				guard.uninstall();
+
+				expect( guard.attempts ).toHaveLength( 5 );
+				expect(
+					guard.attempts.every( ( attempt ) => attempt.code === 'wpcom-write-outside-staging' )
+				).toBe( true );
+				expect( reached ).toEqual( [
+					'https POST blocked-connection',
+					'https POST blocked-connection',
+					`fetch POST ${ site }/wp-json/wp/v2/posts?context=edit`,
+					`fetch POST ${ api }/wp/v2/sites/4242/posts`,
+					`fetch GET ${ site }/?rest_route=/wp/v2/posts`,
+				] );
+			} );
+
 			it( 'counts any *.wpcomstaging.com host, and a host written with a trailing dot, as WordPress.com', async () => {
 				const { reached, targets } = network();
 				const guard = installWpcomWriteGuard( {}, targets );

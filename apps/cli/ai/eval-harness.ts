@@ -225,6 +225,26 @@ export function couldBeMethodOverrideKey( rawKey: string ): boolean {
 	);
 }
 
+/**
+ * Whether a query key could become `rest_route` on the server, which prefers
+ * it to the route of the request's path, so a write to an allowed path could
+ * reach another namespace. Matched like a method override key: decoded,
+ * trimmed, in any case, with the spellings PHP folds into one.
+ */
+function couldBeRestRouteKey( rawKey: string ): boolean {
+	const key = decodeKey( rawKey );
+	if ( hasControlCharacter( rawKey ) || hasControlCharacter( key ) ) {
+		return true;
+	}
+	const stripped = key.replace( /^s+/, '' );
+	const bracket = stripped.indexOf( '[' );
+	const base = bracket > 0 ? stripped.slice( 0, bracket ) : stripped;
+	return (
+		base.replace( /[.s[]/g, '_' ).toLowerCase() === 'rest_route' ||
+		key.replace( /[^a-z0-9]/gi, '' ).toLowerCase() === 'restroute'
+	);
+}
+
 function queryOverrideValues( entries: Iterable< [ string, unknown ] > ): string[] {
 	const values: string[] = [];
 	for ( const [ key, value ] of entries ) {
@@ -478,12 +498,16 @@ function matchesShape(
  * `STAGING_WRITE_SHAPES`, on the API host with the designated site named by
  * id or by hostname, or at the site's own address. A path the server could
  * read as another one (a dot segment, an encoded slash, an empty segment, a
- * segment that doesn't decode) is not.
+ * segment that doesn't decode) is not, nor is a request whose query names a
+ * `rest_route`, which WordPress reads in place of the path's route.
  */
 export function writesToStagingSite(
-	target: { hostname: string; pathname: string },
+	target: { hostname: string; pathname: string; search?: string },
 	site: StagingSite
 ): boolean {
+	if ( [ ...new URLSearchParams( target.search ?? '' ).keys() ].some( couldBeRestRouteKey ) ) {
+		return false;
+	}
 	const host = normalizeHost( target.hostname );
 	const stagingHost = stagingHostname( site );
 	const [ root, ...raw ] = target.pathname.split( '/' );
