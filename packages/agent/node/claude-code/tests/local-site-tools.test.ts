@@ -546,6 +546,7 @@ describe( 'the folders Studio ships its read-only files in', () => {
 } );
 
 describe( 'site_create on the Claude route', () => {
+	const ONE_SITE = 'A conversation works on one site';
 	// A global conversation, on a host whose app shows the conversation and
 	// follows the site the agent creates.
 	async function setupGlobal( overrides: Partial< ClaudeExecutionContext > = {} ) {
@@ -565,10 +566,17 @@ describe( 'site_create on the Claude route', () => {
 			phpVersion: '8.4',
 			adminPassword: 'password',
 		};
-		fixture.host.sites.resolve = vi.fn( async () => site );
+		// The host knows the site this turn creates, and another site, `other`,
+		// that was there before.
+		fixture.host.sites.resolve = vi.fn( async ( reference: string ) =>
+			reference === 'other' ? fixture.otherSite : site
+		);
 		fixture.host.sites.findByFolder = vi.fn( async ( folder: string ) =>
 			path.resolve( folder ) === created ? site : undefined
 		);
+		fixture.host.sites.create = vi.fn( async ( _name: string, folder: string ) => {
+			await mkdir( folder, { recursive: true } );
+		} );
 		const ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
 		fixture.host.ui = ui;
 		// The conversation's stored target, as the turn's checks read it.
@@ -808,12 +816,103 @@ describe( 'site_create on the Claude route', () => {
 		expect( journaled( fixture.journal ) ).not.toContainEqual( [ 'selectSite', 'local-change' ] );
 	} );
 
-	it( 'creates nothing from a site conversation, and says why', async () => {
-		const { bridge, host } = await setup();
+	it( 'creates nothing from a site conversation, says why, and journals nothing', async () => {
+		const { bridge, host, journal } = await setup();
 		const result = await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
 		expect( result.isError ).toBe( true );
-		expect( text( result ) ).toContain( 'Only a conversation without a site creates sites' );
+		expect( text( result ) ).toContain( ONE_SITE );
 		expect( host.sites.create ).not.toHaveBeenCalled();
+		expect( journal ).toEqual( [] );
+	} );
+
+	it( 'works on the site it created once that site is the conversation’s site, each tool under its own class, and on no other site', async () => {
+		const { bridge, host, context, journal, site, created } = await setupGlobal();
+		const onCreated = { nameOrPath: site.name };
+		// Before the site exists, nothing acts on it.
+		expect( ( await bridge.invoke( 'site_info', onCreated ) ).isError ).toBe( true );
+		expect( ( await bridge.invoke( 'site_create', { name: site.name } ) ).isError ).toBe( false );
+		journal.length = 0;
+
+		const info = await bridge.invoke( 'site_info', onCreated );
+		expect( info.isError ).toBe( false );
+		expect( host.sites.status ).toHaveBeenCalledWith( site );
+		const read = await bridge.invoke( 'wp_cli', {
+			...onCreated,
+			command: 'option get blogname',
+		} );
+		expect( read.isError ).toBe( false );
+		expect( host.sites.wpCli ).toHaveBeenLastCalledWith(
+			site,
+			expect.arrayContaining( [ 'option', 'get', 'blogname' ] ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( ( await bridge.invoke( 'site_start', onCreated ) ).isError ).toBe( false );
+		expect( host.sites.start ).toHaveBeenCalledWith(
+			site,
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( context.approve ).not.toHaveBeenCalled();
+		// A command asks, as on the conversation's own site, and its approval
+		// names the site it now works on.
+		const draft = await bridge.invoke( 'wp_cli', {
+			...onCreated,
+			command: 'post create --post_status=draft --post_title=Hello',
+		} );
+		expect( draft.isError ).toBe( false );
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		expect( request.target ).toEqual( { environment: 'local', siteId: site.id } );
+		expect( request.operation.localPaths ).toEqual( [ created ] );
+		expect( journaled( journal ) ).toEqual( [
+			[ 'site_start', 'local-change' ],
+			[ 'sites.start', 'local-change' ],
+			[ 'wp_cli', 'command' ],
+			[ 'sites.wpCli', 'command' ],
+		] );
+
+		// Another site the host knows is still out of reach.
+		expect( ( await bridge.invoke( 'site_start', { nameOrPath: 'other' } ) ).isError ).toBe( true );
+		expect( ( await bridge.invoke( 'site_info', { nameOrPath: 'other' } ) ).isError ).toBe( true );
+		expect( host.sites.start ).toHaveBeenCalledOnce();
+		expect( host.sites.status ).toHaveBeenCalledOnce();
+	} );
+
+	it( 'acts on no site it created before that site’s selection has landed', async () => {
+		const { bridge, host, site } = await setupGlobal();
+		let land!: () => void;
+		const landing = new Promise< void >( ( resolve ) => {
+			land = resolve;
+		} );
+		const select = vi.mocked( host.selectSite! );
+		const selecting = select.getMockImplementation()!;
+		select.mockImplementation( async ( selected ) => {
+			await landing;
+			await selecting( selected );
+		} );
+		const creating = bridge.invoke( 'site_create', { name: site.name } );
+		await vi.waitFor( () => expect( host.selectSite ).toHaveBeenCalled() );
+		expect( ( await bridge.invoke( 'site_info', { nameOrPath: site.name } ) ).isError ).toBe(
+			true
+		);
+		expect( host.sites.status ).not.toHaveBeenCalled();
+		land();
+		expect( ( await creating ).isError ).toBe( false );
+		expect( ( await bridge.invoke( 'site_info', { nameOrPath: site.name } ) ).isError ).toBe(
+			false
+		);
+	} );
+
+	it( 'creates no second site in the turn that made one the conversation’s site, says why, and journals nothing for it', async () => {
+		const { bridge, host, journal } = await setupGlobal();
+		expect( ( await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } ) ).isError ).toBe(
+			false
+		);
+		const before = journal.length;
+		const second = await bridge.invoke( 'site_create', { name: 'Another Shop' } );
+		expect( second.isError ).toBe( true );
+		expect( text( second ) ).toContain( ONE_SITE );
+		expect( host.sites.create ).toHaveBeenCalledOnce();
+		expect( journal ).toHaveLength( before );
 	} );
 
 	it( 'makes no other site the conversation’s site', async () => {

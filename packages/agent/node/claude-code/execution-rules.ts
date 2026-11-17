@@ -359,6 +359,11 @@ export interface ClaudeStudioToolRule {
 	/** Every URL the call opens must be the named site's own origin. */
 	readonly urlsOnSite?: true;
 	/**
+	 * Runs only in a conversation that has no site yet: anywhere else the call
+	 * is refused before anything is journaled.
+	 */
+	readonly withoutSite?: true;
+	/**
 	 * Drives a browser, whether it opens a URL from its arguments, a page of the
 	 * named site or a document it wrote itself; it can be enabled only under a
 	 * verified navigation guard.
@@ -662,7 +667,7 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		// them for any other site. Its module links `tools/utils.ts`, whose
 		// `runWpCli` runs only through the host.
 		qualified(
-			studioRule( 'local-change', { approval: 'host' } ),
+			studioRule( 'local-change', { approval: 'host', withoutSite: true } ),
 			using( { runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] } )
 		),
 	],
@@ -1102,6 +1107,7 @@ const RULE_ELEMENTS: Readonly<
 	urls: 'function',
 	urlsOnSite: 'mark',
 	navigates: 'mark',
+	withoutSite: 'mark',
 };
 
 function isRuleElement( [ key, value ]: [ string, unknown ] ): boolean {

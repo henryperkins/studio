@@ -223,7 +223,7 @@ const REFUSALS = {
 	outsideFolders:
 		'A file Studio reads or writes for this operation must be an absolute path inside the site’s folder or this conversation’s workspace, and not one that holds credentials.',
 	createInSite:
-		'Only a conversation without a site creates sites: this conversation works on its own site. Ask the user to start a new conversation to create one.',
+		'A conversation works on one site, and this conversation already has its site. Ask the user to start a new conversation to create another one.',
 	siteBinding:
 		'Studio did not make that site this conversation’s site: only a site this turn created, in a conversation without a site, can become it.',
 } as const;
@@ -293,6 +293,15 @@ export function createClaudeExecutionPolicy(
 	const targetWrites = new Map< Promise< void >, ClaudeStudioTarget >();
 	let targetVersion = 0;
 	const acceptedTargets = () => [ ...settledTargets, ...targetWrites.values() ];
+	// The target the turn acts on, and its site's canonical folder: the ones it
+	// was sent with, until a site this turn created has become the
+	// conversation's site (its selection journaled and written); from then on
+	// that site, for the rest of the turn. Site-bound calls resolve against it.
+	let actingTarget: ClaudeStudioTarget = context.target;
+	let actingSite: { id: string; path: string } | undefined = context.targetSite;
+	// Whether the conversation has its site: it was started on one, or it acts
+	// on one. A conversation works on one site.
+	const hasSite = () => context.workspace.siteId !== null || actingTarget.environment !== 'global';
 	const refusals = new Map< string, Set< string > >();
 	const refuse = ( toolCallId: string, reason: string ) => {
 		if ( ! refusals.has( toolCallId ) ) refusals.set( toolCallId, new Set() );
@@ -443,7 +452,7 @@ export function createClaudeExecutionPolicy(
 					connectionId: context.connectionId,
 					connectionRevision: context.connectionRevision,
 					policyRevision: context.policyRevision,
-					target: context.target,
+					target: actingTarget,
 					operation,
 				} )
 			)
@@ -454,7 +463,7 @@ export function createClaudeExecutionPolicy(
 		return {
 			tool: escapeClaudeApprovalText( operation.tool ),
 			operationClass: operation.operationClass,
-			target: { ...context.target },
+			target: { ...actingTarget },
 			args: escapeClaudeApprovalText( JSON.stringify( operation.args, null, 2 ) ?? 'null' ),
 			localPaths: operation.localPaths.map( escapeClaudeApprovalText ),
 			...( operation.remote ? { remote: escapeClaudeApprovalText( operation.remote ) } : {} ),
@@ -510,9 +519,16 @@ export function createClaudeExecutionPolicy(
 			connectionId: context.connectionId,
 			connectionRevision: context.connectionRevision,
 			policyRevision: context.policyRevision,
-			target: { ...context.target },
+			target: { ...actingTarget },
 			operation,
 		} );
+		// The grant covers the target the user is shown.
+		let covered: string;
+		try {
+			covered = fingerprint( operation, toolCallId );
+		} catch {
+			return;
+		}
 		const ids = {
 			runId: context.runId,
 			turnId: context.turnId,
@@ -541,7 +557,7 @@ export function createClaudeExecutionPolicy(
 		context.onEvent( { type: 'approval.resolved', ...ids } );
 		if ( ! allowed ) refuse( toolCallId, REFUSALS.notApproved );
 		if ( ! allowed || ! ( await accountCheckpoint( callSignal ) ) ) return;
-		grants.set( request.requestId, fingerprint( operation, toolCallId ) );
+		grants.set( request.requestId, covered );
 		return { requestId: request.requestId };
 	}
 
@@ -585,7 +601,7 @@ export function createClaudeExecutionPolicy(
 				operation: {
 					tool: escapeClaudeApprovalText( operation.tool ),
 					operationClass: operation.operationClass,
-					target: { ...context.target },
+					target: { ...actingTarget },
 				},
 				description: escapeClaudeApprovalText( operation.description ),
 			} );
@@ -677,13 +693,15 @@ export function createClaudeExecutionPolicy(
 		host: StudioAgentHost,
 		reference: string
 	): Promise< HostSite | undefined > {
-		const target = context.target;
-		if ( target.environment === 'global' || ! context.targetSite ) return;
+		const target = actingTarget;
+		const targetSite = actingSite;
+		if ( target.environment === 'global' || ! targetSite ) return;
 		try {
 			const current = await host.sites.resolve( reference );
 			if (
 				current.id !== target.siteId ||
-				( await realpath( current.path ) ) !== context.targetSite.path
+				current.id !== targetSite.id ||
+				( await realpath( current.path ) ) !== targetSite.path
 			)
 				return;
 			return current;
@@ -734,6 +752,10 @@ export function createClaudeExecutionPolicy(
 		if ( callSignal?.aborted ) return false;
 		const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
 		if ( ! rule || ! studioTools.has( name ) ) return false;
+		if ( rule.withoutSite && hasSite() ) {
+			refuse( toolCallId, REFUSALS.createInSite );
+			return false;
+		}
 		const operationClass = rule.classify ? rule.classify( args ) : rule.operationClass;
 		if ( ! operationClass ) return false;
 		let site: HostSite | undefined;
@@ -747,7 +769,7 @@ export function createClaudeExecutionPolicy(
 			const paths = rule.paths( args, site?.path );
 			if ( ! paths ) return false;
 			if ( paths.length ) {
-				const folder = context.targetSite?.path;
+				const folder = actingSite?.path;
 				if ( ! folder ) return false;
 				for ( const file of paths )
 					if ( ! ( await isInsideCanonicalRoot( folder, file ) ) ) return false;
@@ -771,7 +793,7 @@ export function createClaudeExecutionPolicy(
 			const scope = rule.remote( args );
 			if ( ! scope ) return false;
 			if ( scope.wpcomSiteId !== undefined ) {
-				const target = context.target;
+				const target = actingTarget;
 				if ( target.environment !== 'live' || target.wpcomSiteId !== scope.wpcomSiteId )
 					return false;
 				remote = `WordPress.com site ${ scope.wpcomSiteId }`;
@@ -822,13 +844,14 @@ export function createClaudeExecutionPolicy(
 		const localPaths = [ ...( request.localPaths ?? [] ) ];
 		if ( request.site ) {
 			site = await resolveTarget( host, request.site.path );
-			if ( ! site || site.id !== request.site.id || ! context.targetSite ) return;
-			localPaths.unshift( context.targetSite.path );
+			const targetSite = actingSite;
+			if ( ! site || site.id !== request.site.id || ! targetSite ) return;
+			localPaths.unshift( targetSite.path );
 		} else if ( request.name === 'sites.create' ) {
-			// Only a global conversation creates sites; a site conversation works
-			// in its own site's folder and needs a new conversation for another.
+			// Only a conversation without a site creates one; a conversation works
+			// on one site and needs a new conversation for another.
 			const sitePath = request.args[ 1 ];
-			if ( context.workspace.siteId !== null ) {
+			if ( hasSite() ) {
 				refuse( toolCallId, REFUSALS.createInSite );
 				return;
 			}
@@ -839,6 +862,8 @@ export function createClaudeExecutionPolicy(
 			)
 				return;
 		} else if ( context.target.environment === 'global' ) {
+			// An operation bound to no site follows the target the turn was sent
+			// with: a site this turn created binds site-bound calls only.
 			return;
 		}
 		if ( request.file && ! ( await isConversationFile( request.file ) ) ) {
@@ -894,14 +919,15 @@ export function createClaudeExecutionPolicy(
 		callSignal?: AbortSignal
 	): Promise< boolean > {
 		if ( ! ( await checkpoint( callSignal ) ) ) return false;
+		const targetSite = actingSite;
 		try {
-			if ( prepared.site && ( await realpath( prepared.site.path ) ) !== context.targetSite?.path )
+			if ( prepared.site && ( await realpath( prepared.site.path ) ) !== targetSite?.path )
 				return false;
 			// The file is checked again, since a link can have moved under it.
 			if ( prepared.file && ! ( await isConversationFile( prepared.file ) ) ) return false;
 			if (
 				prepared.operation.tool === 'sites.wpCli' &&
-				( ! context.targetSite || ( await hasWpCliOverrides( context.targetSite.path ) ) )
+				( ! targetSite || ( await hasWpCliOverrides( targetSite.path ) ) )
 			)
 				return false;
 		} catch {
@@ -910,15 +936,17 @@ export function createClaudeExecutionPolicy(
 		return ! signal.aborted && ! callSignal?.aborted;
 	}
 
-	// Whether a site the host resolved may be handed to a tool: the target site,
-	// or a site this turn created, which the creating tool resolves to report it.
+	// Whether a site the host resolved may be handed to a tool: the site the
+	// turn acts on, or a site this turn created, which the creating tool
+	// resolves to report it.
 	async function isReachableSite( site: HostSite ): Promise< boolean > {
 		if ( createdSites.has( path.resolve( site.path ) ) ) return true;
-		const target = context.target;
-		if ( target.environment === 'global' || ! context.targetSite || site.id !== target.siteId )
+		const target = actingTarget;
+		const targetSite = actingSite;
+		if ( target.environment === 'global' || ! targetSite || site.id !== target.siteId )
 			return false;
 		try {
-			return ( await realpath( site.path ) ) === context.targetSite.path;
+			return ( await realpath( site.path ) ) === targetSite.path;
 		} catch {
 			return false;
 		}
@@ -926,7 +954,8 @@ export function createClaudeExecutionPolicy(
 
 	// Whether a site may become the conversation's site: one this turn created,
 	// from a conversation without a site, that the host still knows by that id
-	// at that folder.
+	// at that folder. Once one has become it, only that one: a conversation
+	// works on one site.
 	async function isCreatedSite(
 		host: StudioAgentHost,
 		site: { id?: unknown; path?: unknown }
@@ -936,7 +965,8 @@ export function createClaudeExecutionPolicy(
 			typeof site.id !== 'string' ||
 			! site.id ||
 			typeof site.path !== 'string' ||
-			! createdSites.has( path.resolve( site.path ) )
+			! createdSites.has( path.resolve( site.path ) ) ||
+			( actingTarget.environment !== 'global' && actingSite?.id !== site.id )
 		)
 			return false;
 		try {
@@ -1169,10 +1199,10 @@ export function createClaudeExecutionPolicy(
 							host.sync.pull( current!, options, remoteSite, onProgress, fenceOptions )
 					),
 			},
-			// Makes a site this turn created the conversation's site. The turn
-			// keeps acting under the target it was sent with; its checks accept the
-			// new one from before the change is written, and only it once written
-			// (carry item 7).
+			// Makes a site this turn created the conversation's site. The turn's
+			// checks accept the new target from before the change is written, and
+			// only it once written (carry item 7); from then on the turn acts on
+			// that site, at its canonical folder.
 			selectSite: host.selectSite
 				? async ( site ) => {
 						const selectSite = host.selectSite!;
@@ -1180,8 +1210,16 @@ export function createClaudeExecutionPolicy(
 							'selectSite',
 							site,
 							'Make a site this turn created the conversation’s site',
-							( siteId ) =>
-								writeTarget( { environment: 'local', siteId }, () => selectSite( site ) )
+							async ( siteId ) => {
+								const target: ClaudeStudioTarget = { environment: 'local', siteId };
+								await writeTarget( target, () => selectSite( site ) );
+								// A folder that cannot be resolved binds nothing: calls on
+								// the site are then refused, as before the change.
+								const folder = await realpath( site.path ).catch( () => undefined );
+								if ( ! folder ) return;
+								actingTarget = target;
+								actingSite = { id: siteId, path: folder };
+							}
 						);
 				  }
 				: undefined,

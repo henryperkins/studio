@@ -11,7 +11,7 @@ import {
 import { createNativeSessionStore } from '../sessions';
 import { createPolicyFixture, guarded, targetOrigin } from './fixtures/execution-policy';
 import type { StudioAgentHost } from '../../host';
-import type { ClaudeOperationClass } from '@studio/agent/protocol/claude-code';
+import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 import type { Mock } from 'vitest';
 
 // The file seam: every file synced through a handle, in order, and a sync
@@ -64,8 +64,12 @@ const site = { ...fakeSite };
 type Paths = { site: string; parent: string };
 
 // A call that passes the rule of each Studio tool whose class does more than read.
-const STUDIO_CALLS: Record< string, { args: ( paths: Paths ) => unknown; live?: true } > = {
-	site_create: { args: () => ( {} ) },
+const STUDIO_CALLS: Record<
+	string,
+	{ args: ( paths: Paths ) => unknown; live?: true; global?: true }
+> = {
+	// Only a conversation without a site creates one.
+	site_create: { args: () => ( {} ), global: true },
 	site_start: { args: () => ( { nameOrPath: 'site' } ) },
 	site_stop: { args: () => ( { nameOrPath: 'site' } ) },
 	site_delete: { args: () => ( { nameOrPath: 'site' } ) },
@@ -256,11 +260,23 @@ describe( 'what the policy journals before an operation that does more than read
 		'journals the Studio tool %s, its class and a safe description, before allowing it',
 		async ( name ) => {
 			const call = STUDIO_CALLS[ name ];
-			const target = call.live ? live : local;
-			const fixture = await setup( () => ( {
+			let target: ClaudeStudioTarget = local;
+			if ( call.live ) target = live;
+			if ( call.global ) target = { environment: 'global' };
+			const fixture = await setup( ( paths ) => ( {
 				enabledTools: { native: [], studio: [ name ] },
 				navigationConfinement: guarded( targetOrigin ),
 				target,
+				...( call.global
+					? {
+							targetSite: undefined,
+							workspace: {
+								siteId: null,
+								workingDirectory: paths.parent,
+								configDirectory: paths.config,
+							},
+					  }
+					: {} ),
 			} ) );
 			const args = call.args( fixture );
 			const toolCallId = randomUUID();
