@@ -128,6 +128,15 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 		requestsNetwork: [ 'class' ],
 		reachesWpcom: [ 'class' ],
 	},
+	generate_images: {
+		...noChannels,
+		readsLocalFiles: [ 'config' ],
+		writesLocalFiles: [ 'paths', 'class' ],
+		runsWpCli: [ 'host' ],
+		callsHostOperation: [ 'host' ],
+		requestsNetwork: [ 'class' ],
+		reachesWpcom: [ 'class' ],
+	},
 };
 
 // Code a qualified tool's module links but the tool never runs. The scan reads
@@ -148,6 +157,7 @@ const UNREACHED: Record<
 	site_connected_remote_sites: [ SHARED_CONFIG_SAVE ],
 	wpcom_request: [ SHARED_CONFIG_SAVE ],
 	send_feedback: [ SHARED_CONFIG_SAVE ],
+	generate_images: [ SHARED_CONFIG_SAVE ],
 	preview_list: [
 		{
 			channels: [ 'requestsNetwork', 'reachesWpcom' ],

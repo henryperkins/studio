@@ -23,6 +23,14 @@ import { reportedStudioServer } from './fixtures/studio-server';
 import type { ClaudeApprovalRequest } from '../execution-policy';
 import type { OwnershipFailure, ProcessOwner } from '@studio/common/lib/owned-process';
 
+// Whether Studio's image service is available, as a turn asks: off unless a
+// test says otherwise, so no turn here reads a stored login.
+const imageService = vi.hoisted( () => ( { available: false } ) );
+vi.mock( '@studio/agent/node/image-generation', async ( importOriginal ) => ( {
+	...( await importOriginal< object >() ),
+	isImageGenerationAvailable: async () => imageService.available,
+} ) );
+
 const fakeIdentity = {
 	path: 'fake',
 	size: 0,
@@ -614,6 +622,137 @@ it( 'resumes the exact native session after restart with the next model and effo
 		await fs.rm( root, { recursive: true, force: true } );
 	}
 } );
+
+it.each( [ true, false ] )(
+	'offers generate_images to a turn exactly when Studio’s image service is available (%s), and Studio’s instructions say nothing of images either way (mock SDK)',
+	async ( available ) => {
+		const { runClaudeTurn } = await import( '../runtime' );
+		const { createFakeHost } = await import( '../../tests/fake-host' );
+		const fs = await import( 'fs/promises' );
+		const root = await fs.realpath(
+			await fs.mkdtemp( path.join( os.tmpdir(), 'claude-images-' ) )
+		);
+		const projects = path.join( root, 'projects' );
+		imageService.available = available;
+		try {
+			await fs.mkdir( projects );
+			const native = await nativeExecutable( root );
+			const host = createFakeHost();
+			host.sites.all = async () => [
+				{ id: 'site', path: root, name: 'site', url: 'http://localhost', phpVersion: '8.4' },
+			];
+			let launched: Record< string, unknown > | undefined;
+			const query = vi.fn(
+				( input: { prompt: AsyncIterable< unknown >; options: Record< string, unknown > } ) => {
+					launched = input.options;
+					const sessionId = input.options.sessionId;
+					launchNative( input.options );
+					return {
+						initializationResult: async () => ( {
+							hooks_applied: true,
+							hook_on_failure_supported: true,
+						} ),
+						accountInfo: async () => ( {
+							email: 'user@example.com',
+							subscriptionType: 'max',
+							apiProvider: 'firstParty',
+						} ),
+						mcpServerStatus: async () => [ reportedStudioServer( input.options ) ],
+						supportedModels: async () => [
+							{ value: 'model-a', displayName: 'Model A', supportedEffortLevels: [ 'medium' ] },
+						],
+						close: () => {},
+						async *[ Symbol.asyncIterator ]() {
+							for await ( const _prompt of input.prompt ) {
+								await fs.appendFile(
+									path.join( projects, `${ sessionId }.jsonl` ),
+									JSON.stringify( { sessionId, cwd: root } ) + '\n'
+								);
+								yield {
+									type: 'system',
+									subtype: 'init',
+									session_id: sessionId,
+									permissionMode: 'default',
+									plugins: [],
+									tools: [ 'Read', 'mcp__studio__wp_cli' ],
+									cwd: root,
+									apiKeySource: 'none',
+									claude_code_version: '2.1.319',
+									model: 'model-a',
+									mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
+								};
+								yield {
+									type: 'result',
+									subtype: 'success',
+									is_error: false,
+									num_turns: 1,
+									session_id: sessionId,
+								};
+							}
+						},
+					};
+				}
+			);
+			const events: unknown[] = [];
+			await runClaudeTurn(
+				{
+					backend: 'claude-code',
+					runId: 'run',
+					turnId: 'turn',
+					effort: 'medium',
+					permissionPolicyRevision: 1,
+					target: { environment: 'local' as const, siteId: 'site' },
+					selection: {
+						connectionId: 'native',
+						model: { providerId: 'claude-code', modelId: 'model-a' },
+						revision: 1,
+					},
+					workspace: {
+						conversationId: 'chat',
+						siteId: 'site',
+						workingDirectory: root,
+						configDirectory: root,
+					},
+				},
+				host,
+				{
+					prompt: 'Make a hero image',
+					signal: new AbortController().signal,
+					onEvent: ( event ) => events.push( event ),
+				},
+				{
+					storeRoot: path.join( root, 'studio' ),
+					approve: async () => 'deny',
+					verifyTarget: async () => true,
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					prepareOwner: fakeProcessOwner().prepareOwner,
+					connection: async () => ( { id: 'native', executablePath: native.executablePath } ),
+					prepare: async () => ( {
+						ok: true,
+						...native,
+						cwd: root,
+						configDirectory: root,
+						projectsDirectory: projects,
+						env: {},
+						identity: { email: 'user@example.com', subscriptionType: 'max' },
+					} ),
+				}
+			);
+			expect( events.at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'success' },
+			} );
+			const registered = reportedStudioServer( launched ).tools.map( ( tool ) => tool.name );
+			expect( registered ).toContain( 'wp_cli' );
+			expect( registered.includes( 'generate_images' ) ).toBe( available );
+			const { append } = launched!.systemPrompt as { append: string };
+			expect( append ).not.toMatch( /image|imagery/i );
+		} finally {
+			imageService.available = false;
+			await fs.rm( root, { recursive: true, force: true } );
+		}
+	}
+);
 
 it( 'releases no prompt and reports startup failure even if closing the SDK throws', async () => {
 	const { runClaudeTurn } = await import( '../runtime' );

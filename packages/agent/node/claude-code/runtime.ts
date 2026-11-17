@@ -3,6 +3,7 @@ import { realpath } from 'fs/promises';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
 import { prepareProcessOwner, readOwnProcessIdentity } from '@studio/common/lib/owned-process';
 import { __ } from '@wordpress/i18n';
+import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
 import {
 	isClaudeEffort,
@@ -932,7 +933,12 @@ export async function runClaudeTurn(
 			uncertainAfterRecovery: note?.uncertain === true,
 		} );
 		const guard = policy;
-		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy: guard }, emit );
+		// Studio's image service decides whether the turn offers generate_images,
+		// as it decides it on the Pi route; no model provider's account does.
+		const imageGeneration = await isImageGenerationAvailable().catch( () => false );
+		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy: guard }, emit, {
+			imageGeneration,
+		} );
 		const watchConnection = async () => {
 			const unchanged = ( await verifyConnection() ) && ( await guard.refreshAccount() );
 			if ( controller.signal.aborted || ! unchanged ) return;

@@ -74,6 +74,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		refreshBrowserTool.name,
 		createSiteTool.name,
 		sendFeedbackTool.name,
+		generateImagesTool.name,
 	] ),
 } );
 
@@ -505,6 +506,21 @@ function taxonomistDestinations( siteFolder: string | undefined ): string[] | un
 const FEEDBACK_NOTE =
 	'It sends the type and message shown, with a line naming this Studio version and operating system, to the WordPress Studio team at Automattic through WordPress.com, signed in as the WordPress.com account Studio is logged in to';
 
+// What `generate_images` sends besides the specs an approval shows, where, and
+// where an image goes once it is made.
+const IMAGES_NOTE =
+	'It sends a prompt made from each image’s subject, page context and style, and the call’s site context and grade, to Studio’s image service on WordPress.com, signed in with that service’s own credential, and writes each image it gets back in this site at the path shown; an image under the site’s wp-content/uploads goes into its media library instead, in the uploads folder WordPress picks';
+
+// The files `generate_images` writes, as it resolves the paths the call names;
+// undefined, which denies the call, when one is not an absolute path.
+function imageFiles( args: unknown ): string[] | undefined {
+	const images = isRecord( args ) ? args.images : undefined;
+	if ( ! Array.isArray( images ) ) return;
+	const files = images.map( ( image ) => ( isRecord( image ) ? image.path : undefined ) );
+	if ( ! files.every( ( file ) => typeof file === 'string' && path.isAbsolute( file ) ) ) return;
+	return ( files as string[] ).map( ( file ) => path.resolve( file ) );
+}
+
 // A declaration that marks every channel it does not name as unused.
 function using( used: Partial< ClaudeToolChannelDeclaration > ): ClaudeToolChannelDeclaration {
 	return {
@@ -818,16 +834,34 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	],
 	[
 		generateImagesTool.name,
-		unqualified(
+		// It reads the image service's credential (`STUDIO_IMAGE_API_TOKEN`, or
+		// else the stored login) and sends one prompt per image, made from the
+		// call's specs, to Studio's image service on WordPress.com itself,
+		// outside the host, at an address its code fixes (or
+		// `WPCOM_AI_PROXY_BASE_URL`, which no call shapes). It writes each image
+		// it gets back itself: at the path the call names, which must lie in the
+		// site the turn acts on; or, for an image under `wp-content/uploads`, at
+		// the file of the attachment the guarded host's `media.reserve` gives,
+		// which the host requires to lie in that site too. Those media-library
+		// steps are host operations whose WP-CLI commands are Studio's own code,
+		// journaled before they run; `wp_cli` still refuses `eval`. Every call
+		// asks the user, whose approval shows the specs and paths and says what
+		// is sent where; never the credential. The registry offers it only to a
+		// turn that found the image service. Its module links `tools/utils.ts`,
+		// whose `runWpCli` runs only through the host.
+		qualified(
 			studioRule( 'remote-change', {
-				paths: ( args ) => {
-					const images = isRecord( args ) ? args.images : undefined;
-					if ( ! Array.isArray( images ) ) return;
-					const files = images.map( ( image ) => ( isRecord( image ) ? image.path : undefined ) );
-					if ( ! files.every( ( file ) => typeof file === 'string' && path.isAbsolute( file ) ) )
-						return;
-					return ( files as string[] ).map( ( file ) => path.resolve( file ) );
-				},
+				paths: imageFiles,
+				config: storedLogin,
+				note: IMAGES_NOTE,
+			} ),
+			using( {
+				readsLocalFiles: [ 'config' ],
+				writesLocalFiles: [ 'paths', 'class' ],
+				runsWpCli: [ 'host' ],
+				callsHostOperation: [ 'host' ],
+				requestsNetwork: [ 'class' ],
+				reachesWpcom: [ 'class' ],
 			} )
 		),
 	],
@@ -1449,6 +1483,9 @@ export type HostOperationName =
 	| 'previews.delete'
 	| 'sync.push'
 	| 'sync.pull'
+	// The media library's fixed WP-CLI commands, for `generate_images`.
+	| 'media.reserve'
+	| 'media.finalize'
 	// Changes of the conversation's site: making a site the turn created the
 	// conversation's site, and showing that site in the conversation, which the
 	// app then keeps the conversation with.
@@ -1469,6 +1506,11 @@ export const HOST_OPERATION_CLASSES: Readonly<
 	'previews.delete': 'remote-overwrite',
 	'sync.push': 'remote-overwrite',
 	'sync.pull': 'remote-overwrite',
+	// Attachments for images the same call writes, and their completion or
+	// removal; the guarded host lets a call complete or remove only those it
+	// reserved itself.
+	'media.reserve': 'local-change',
+	'media.finalize': 'local-change',
 	selectSite: 'local-change',
 	'ui.showArtifact': 'local-change',
 };

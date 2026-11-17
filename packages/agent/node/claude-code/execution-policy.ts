@@ -12,6 +12,11 @@ import {
 } from '@studio/agent/protocol/claude-code';
 import { getCreatedSiteFromArtifact } from '../sessions/placement';
 import {
+	finalizeAttachmentsArgs,
+	readReservedAttachments,
+	reserveAttachmentsArgs,
+} from '../tools/media-library';
+import {
 	CLAUDE_ACCOUNT_RECHECK_MS,
 	CLAUDE_NATIVE_TOOL_RULES,
 	CLAUDE_STUDIO_TOOL_RULES,
@@ -44,7 +49,7 @@ import type {
 	ClaudeShellConfinement,
 	HostOperationName,
 } from './execution-rules';
-import type { HostOperationOptions, HostSite, StudioAgentHost } from '../host';
+import type { HostOperationOptions, HostSite, MediaAttachment, StudioAgentHost } from '../host';
 import type {
 	BackendApprovalOperation,
 	BackendTurnEvent,
@@ -265,6 +270,10 @@ const REFUSALS = {
 		'Studio pushes or pulls only with options from this list, each once, separated by commas: all (alone), sqls, uploads, plugins, themes, contents.',
 	reprintPull:
 		'On this route Studio pulls a site only with its default engine; the Reprint pull (STUDIO_ENABLE_PULL_REPRINT) keeps its state in a folder outside Studio’s configuration folder, which this route does not bind.',
+	siteFiles:
+		'A file this tool writes must be an absolute path inside the folder of this conversation’s site, through every link it passes.',
+	mediaUploads:
+		'Studio adds an image to a site’s media library only while WordPress keeps that site’s uploads inside the site’s own folder, and this site’s uploads folder lies outside it.',
 } as const;
 
 // What a push or pull with each option overwrites on the side it copies to:
@@ -392,6 +401,50 @@ interface PreparedHostOperation {
 }
 
 const WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
+
+// The host operations that run a WP-CLI command on the site the turn acts on:
+// the model's own, classified, and the media library's, which are Studio's.
+const WP_CLI_OPERATIONS: ReadonlySet< string > = new Set( [
+	'sites.wpCli',
+	'media.reserve',
+	'media.finalize',
+] );
+
+// The most images a `generate_images` call takes, and so the most attachments
+// one reservation makes.
+const MAX_RESERVED_ATTACHMENTS = 20;
+
+// A file name a reservation takes: a plain name, in no folder, of a PNG image.
+function isImageFileName( name: unknown ): name is string {
+	return typeof name === 'string' && name.length <= 255 && /^[^\\/:\0]+\.png$/i.test( name );
+}
+
+function isAttachmentId( id: unknown ): id is number {
+	return Number.isSafeInteger( id ) && ( id as number ) > 0;
+}
+
+// Whether a reservation's output lists, for each name, one attachment of its
+// own: an ID, a PNG file relative to the site's folder, and a URL.
+function isReservation(
+	reserved: unknown,
+	names: readonly string[]
+): reserved is MediaAttachment[] {
+	if ( ! Array.isArray( reserved ) || reserved.length !== names.length ) return false;
+	const ids = new Set< number >();
+	for ( const entry of reserved ) {
+		if (
+			! isRecord( entry ) ||
+			! isAttachmentId( entry.id ) ||
+			ids.has( entry.id ) ||
+			typeof entry.file !== 'string' ||
+			! /\.png$/i.test( entry.file ) ||
+			typeof entry.url !== 'string'
+		)
+			return false;
+		ids.add( entry.id );
+	}
+	return true;
+}
 
 type ListedSite = Awaited< ReturnType< StudioAgentHost[ 'sites' ][ 'list' ] > >[ number ];
 
@@ -954,7 +1007,10 @@ export function createClaudeExecutionPolicy(
 		let localPaths: string[] = [];
 		if ( rule.paths ) {
 			const paths = rule.paths( args, site?.path );
-			if ( ! paths ) return false;
+			if ( ! paths ) {
+				refuse( toolCallId, REFUSALS.siteFiles );
+				return false;
+			}
 			localPaths = paths;
 		}
 		// The files the call names in Studio's payload folder, which the tool
@@ -972,12 +1028,17 @@ export function createClaudeExecutionPolicy(
 		// out of the conversation's reach, and the payload files it sends are in
 		// the payload folder.
 		const filesHold = async () => {
-			if ( localPaths.length ) {
-				const folder = actingSite?.path;
-				if ( ! folder ) return false;
-				for ( const file of localPaths )
-					if ( ! ( await isInsideCanonicalRoot( folder, file ) ) ) return false;
-			}
+			const folder = actingSite?.path;
+			for ( const file of localPaths )
+				if ( ! folder || ! ( await isInsideCanonicalRoot( folder, file ) ) ) {
+					refuse(
+						toolCallId,
+						path.isAbsolute( file ) && ! isJudgeable( file )
+							? REFUSALS.plainPath
+							: REFUSALS.siteFiles
+					);
+					return false;
+				}
 			if ( rule.bundled && ! ( await isBundledFolder( rule.bundled(), context.localRoots ) ) )
 				return false;
 			for ( const file of rule.config?.() ?? [] )
@@ -1346,7 +1407,7 @@ export function createClaudeExecutionPolicy(
 			)
 				return false;
 			if (
-				prepared.operation.tool === 'sites.wpCli' &&
+				WP_CLI_OPERATIONS.has( prepared.operation.tool ) &&
 				( ! targetSite || ( await hasWpCliOverrides( targetSite.path ) ) )
 			)
 				return false;
@@ -1478,6 +1539,24 @@ export function createClaudeExecutionPolicy(
 		// analytics.
 		const refused = async (): Promise< never > => {
 			throw denied();
+		};
+		// The attachments this call reserved in the media library of the site the
+		// turn acts on: only this call completes or deletes them, each once.
+		const reservedAttachments = new Set< number >();
+		// One of the media library's fixed WP-CLI commands, Studio's own code, run
+		// as the turn runs every WP-CLI command, without the site's own code.
+		const mediaCommand = async (
+			site: HostSite,
+			args: string[],
+			options: HostOperationOptions
+		): Promise< string > => {
+			const { exitCode, stdout } = await host.sites.wpCli(
+				site,
+				[ ...args, ...WP_CLI_ISOLATION ],
+				options
+			);
+			if ( exitCode !== 0 ) throw new Error( `WP-CLI exited with code ${ exitCode }` );
+			return stdout;
 		};
 		// A change of the conversation's site, to a site this turn created: asked
 		// about when the turn asks before every change, journaled, then made.
@@ -1703,6 +1782,109 @@ export function createClaudeExecutionPolicy(
 								fenceOptions
 							)
 					),
+			},
+			// The media library's fixed operations, for `generate_images`: in the
+			// site the turn acts on only, each WP-CLI command Studio's own code,
+			// journaled before it runs. `sites.wpCli` still refuses `eval`.
+			media: {
+				siteContaining: async ( files ) => {
+					const targetSite = actingSite;
+					if (
+						operationSignal.aborted ||
+						! targetSite ||
+						! Array.isArray( files ) ||
+						! files.length
+					)
+						throw denied();
+					for ( const file of files )
+						if (
+							typeof file !== 'string' ||
+							! ( await isInsideCanonicalRoot( targetSite.path, file ) )
+						)
+							throw denied();
+					const site = await resolveTarget( host, targetSite.path );
+					if ( ! site || ! ( await checkpoint( callSignal ) ) ) throw denied();
+					operationSignal.throwIfAborted();
+					return site;
+				},
+				// The tool writes each image itself, at its attachment's file, so
+				// every file must lie in the site the turn acts on; where WordPress
+				// keeps the uploads elsewhere, the attachments are deleted again.
+				reserve: async ( site, names ) => {
+					if (
+						! Array.isArray( names ) ||
+						! names.length ||
+						names.length > MAX_RESERVED_ATTACHMENTS ||
+						! names.every( isImageFileName )
+					)
+						throw denied();
+					const requested = [ ...names ];
+					return run(
+						{
+							name: 'media.reserve',
+							site,
+							args: [ requested ],
+							note: 'It adds an attachment for each image to this site’s media library, in the uploads folder WordPress picks, before the image is made',
+						},
+						async ( current, options ) => {
+							const reserved = readReservedAttachments(
+								await mediaCommand( current!, reserveAttachmentsArgs( requested ), options )
+							);
+							if ( ! isReservation( reserved, requested ) ) throw denied();
+							const targetSite = actingSite;
+							for ( const { file } of reserved )
+								if (
+									! targetSite ||
+									! ( await isInsideCanonicalRoot(
+										targetSite.path,
+										path.join( current!.path, file )
+									) )
+								) {
+									await mediaCommand(
+										current!,
+										finalizeAttachmentsArgs(
+											[],
+											reserved.map( ( { id } ) => id )
+										),
+										options
+									).catch( () => undefined );
+									refuse( toolCallId, REFUSALS.mediaUploads );
+									throw denied();
+								}
+							for ( const { id } of reserved ) reservedAttachments.add( id );
+							return reserved;
+						}
+					);
+				},
+				// Only attachments this call reserved, each once.
+				finalize: async ( site, ready, failed ) => {
+					const ids =
+						Array.isArray( ready ) && Array.isArray( failed ) ? [ ...ready, ...failed ] : [];
+					if (
+						! ids.length ||
+						new Set( ids ).size !== ids.length ||
+						! ids.every( ( id ) => reservedAttachments.has( id ) )
+					)
+						throw denied();
+					const completed = [ ...ready ];
+					const removed = [ ...failed ];
+					await run(
+						{
+							name: 'media.finalize',
+							site,
+							args: [ { ready: completed, failed: removed } ],
+							note: 'It completes the attachments of this site’s images that were made, with their smaller sizes, and deletes those of the images that failed',
+						},
+						async ( current, options ) => {
+							await mediaCommand(
+								current!,
+								finalizeAttachmentsArgs( completed, removed ),
+								options
+							);
+							for ( const id of ids ) reservedAttachments.delete( id );
+						}
+					);
+				},
 			},
 			// Makes a site this turn created the conversation's site. The turn's
 			// checks accept the new target from before the change is written, and

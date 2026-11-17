@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
 import { createAgent } from '../../agent';
 import { createFakeHost } from '../../tests/fake-host';
 import { studioToolDefinitions } from '../../tools';
@@ -34,7 +35,7 @@ import type {
 // actually enables and what the Claude bridge actually lists.
 
 // The steps that still qualify a tool, each named by at least one.
-const STEPS = [ 'C2a-3', 'C2b', 'C2c' ] as const;
+const STEPS = [ 'C2b', 'C2c' ] as const;
 type Step = ( typeof STEPS )[ number ];
 type ClaudeStatus =
 	// Bridged from the registry and qualified by the policy.
@@ -79,12 +80,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_push: { status: 'bridged' },
 	site_pull: { status: 'bridged' },
 	send_feedback: { status: 'bridged' },
-	generate_images: {
-		status: 'unqualified',
-		step: 'C2a-3',
-		reason:
-			'Needs the image service as its own capability in the Claude turn, which does not resolve it yet, and runs `wp eval`, which the policy refuses (carry item 11)',
-	},
+	generate_images: { status: 'absent', capability: 'imageService' },
 	take_screenshot: { status: 'unqualified', step: 'C2b', reason: BROWSER },
 	inspect_design: { status: 'unqualified', step: 'C2b', reason: BROWSER },
 	validate_blocks: { status: 'unqualified', step: 'C2b', reason: BROWSER },
@@ -278,15 +274,18 @@ async function listed( server: ReturnType< typeof createStudioClaudeMcpServer > 
 }
 
 // The Studio tools the Claude bridge lists for a turn on a host with these
-// capabilities, under this build's policy.
+// capabilities, under this build's policy. The image service is resolved as a
+// Claude turn resolves it, by the function the Pi route asks.
 async function claudeToolNames( scenario: Scenario ): Promise< string[] > {
 	const fixture = await createPolicyFixture();
 	try {
 		if ( scenario.ui ) fixture.host.ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
+		mocks.imageService = scenario.imageService;
 		const bridge = createStudioClaudeToolBridge(
 			fixture.host,
 			{ runId: 'run', turnId: 'turn', policy: fixture.policy },
-			() => {}
+			() => {},
+			{ imageGeneration: await isImageGenerationAvailable() }
 		);
 		try {
 			return await listed( bridge.server );

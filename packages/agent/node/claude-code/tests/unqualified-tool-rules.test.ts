@@ -40,7 +40,7 @@ async function setup( ...args: Parameters< typeof createPolicyFixture > ) {
 }
 
 const studioServer = { name: 'studio', source: 'sdk' };
-const offHostTools = [ 'scaffold_theme', 'validate_blocks', 'generate_images', 'take_screenshot' ];
+const offHostTools = [ 'scaffold_theme', 'validate_blocks', 'take_screenshot' ];
 const pageTools = [ 'take_screenshot', 'inspect_design', 'open_annotation_browser' ];
 const auditTools = [ 'need_for_speed', 'rank_me_up' ];
 const browserTools = [ ...pageTools, ...auditTools ];
@@ -82,12 +82,6 @@ describe( 'Rules for Claude Studio tools that act outside the host', () => {
 		expect(
 			await call( 'validate_blocks', { nameOrPath: 'site', filePath: '../other/index.html' } )
 		).toBe( false );
-		const image = ( file: string ) => ( { images: [ { path: file, subject: 'Hero' } ] } );
-		expect( await call( 'generate_images', image( path.join( site, 'hero.png' ) ) ) ).toBe( true );
-		expect( await call( 'generate_images', image( path.join( other, 'hero.png' ) ) ) ).toBe(
-			false
-		);
-		expect( await call( 'generate_images', image( 'hero.png' ) ) ).toBe( false );
 		expect(
 			await call( 'take_screenshot', {
 				url: 'http://localhost:8888',
@@ -95,15 +89,15 @@ describe( 'Rules for Claude Studio tools that act outside the host', () => {
 			} )
 		).toBe( false );
 		expect( await call( 'take_screenshot', { url: 'http://localhost:8888' } ) ).toBe( true );
-		expect( context.approve ).toHaveBeenCalledTimes( 2 );
+		expect( context.approve ).toHaveBeenCalledOnce();
 		// An approval of a rule that names files shows them, so a call whose rule
 		// names none at approval time is refused rather than asked about blind.
 		expect( await call( 'validate_blocks', { nameOrPath: 'site' } ) ).toBe( false );
-		expect( context.approve ).toHaveBeenCalledTimes( 2 );
+		expect( context.approve ).toHaveBeenCalledOnce();
 	} );
 
 	it( 'bind them to no site in a global conversation', async () => {
-		const { policy, host, site } = await setup( ( paths ) => ( {
+		const { policy, host } = await setup( ( paths ) => ( {
 			target: { environment: 'global' },
 			targetSite: undefined,
 			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
@@ -112,11 +106,6 @@ describe( 'Rules for Claude Studio tools that act outside the host', () => {
 		const call = ( name: string, args: Record< string, unknown > ) =>
 			policy.authorizeStudioCall( { host, name, args, toolCallId: randomUUID() } );
 		expect( await call( 'scaffold_theme', { nameOrPath: 'site', name: 'Theme' } ) ).toBe( false );
-		expect(
-			await call( 'generate_images', {
-				images: [ { path: path.join( site, 'a.png' ), subject: 'A' } ],
-			} )
-		).toBe( false );
 	} );
 } );
 

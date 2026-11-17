@@ -160,9 +160,20 @@ const creatingSite = ( host: StudioAgentHost, paths: Paths ) =>
 const listingPreview = ( host: StudioAgentHost ) => {
 	host.previews.list = vi.fn( async () => [ fakePreview ] );
 };
+// WordPress reserving an attachment in the target site's uploads folder.
+const reservingAttachments = ( host: StudioAgentHost ) => {
+	host.sites.wpCli = vi.fn( async () => ( {
+		exitCode: 0,
+		stdout: JSON.stringify( [
+			{ id: 7, file: 'wp-content/uploads/2026/11/hero.png', url: 'http://localhost/hero.png' },
+		] ),
+		stderr: '',
+	} ) );
+};
 
 // A call of each host operation that does more than read. `before` runs first,
 // on the same guarded host, and what it journals is not this operation's.
+// `runs` names the host member that carries an operation run through another.
 const HOST_CALLS: Record<
 	string,
 	{
@@ -170,6 +181,7 @@ const HOST_CALLS: Record<
 		host?: ( host: StudioAgentHost, paths: Paths ) => void;
 		before?: ( host: StudioAgentHost, paths: Paths ) => Promise< unknown >;
 		call: ( host: StudioAgentHost, paths: Paths ) => Promise< unknown >;
+		runs?: string;
 	}
 > = {
 	selectSite: {
@@ -243,6 +255,18 @@ const HOST_CALLS: Record<
 	},
 	'sync.pull': {
 		call: ( host ) => host.sync.pull( site, 'all', String( fakeRemoteSite.id ), () => {} ),
+	},
+	// The media library's fixed WP-CLI commands, which run through `sites.wpCli`.
+	'media.reserve': {
+		host: reservingAttachments,
+		runs: 'sites.wpCli',
+		call: ( host ) => host.media!.reserve( site, [ 'hero.png' ] ),
+	},
+	'media.finalize': {
+		host: reservingAttachments,
+		runs: 'sites.wpCli',
+		before: ( host ) => host.media!.reserve( site, [ 'hero.png' ] ),
+		call: ( host ) => host.media!.finalize( site, [ 7 ], [] ),
 	},
 };
 
@@ -399,7 +423,7 @@ describe( 'what the policy journals before an operation that does more than read
 				await record( event );
 			};
 			type Spy = Mock< ( ...args: unknown[] ) => Promise< unknown > >;
-			const [ group, method ] = name.split( '.' );
+			const [ group, method ] = ( HOST_CALLS[ name ].runs ?? name ).split( '.' );
 			const owner = ( fixture.host as unknown as Record< string, Record< string, Spy > | Spy > )[
 				group
 			];

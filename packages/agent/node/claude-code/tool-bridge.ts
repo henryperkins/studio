@@ -23,8 +23,8 @@ type BridgeResult = { content: ToolResult[ 'content' ]; isError: boolean };
 /**
  * What the Claude route offers the registry, as the Pi route passes a turn's
  * capabilities. Claude's models see images. Questions and design choices are
- * not bridged yet (C2c), and the turn does not resolve the image service yet,
- * so `generate_images` is left out (C2a-3).
+ * not bridged yet (C2c). `generate_images` is offered only to a turn that
+ * found Studio's image service (`ClaudeStudioToolCapabilities`).
  */
 const CLAUDE_STUDIO_TOOL_CAPABILITIES: StudioToolsOptions = Object.freeze( {
 	visionEnabled: true,
@@ -33,11 +33,21 @@ const CLAUDE_STUDIO_TOOL_CAPABILITIES: StudioToolsOptions = Object.freeze( {
 	wpcomRequest: true,
 } );
 
+/** What a turn found that changes the tools it offers. */
+export interface ClaudeStudioToolCapabilities {
+	/** Studio's image service is available (`isImageGenerationAvailable`), as the Pi route asks. */
+	imageGeneration?: boolean;
+}
+
 /** The Studio tools the Claude route can bridge for a host: the registry, resolved as on the Pi route. */
 export function claudeStudioToolCandidates(
-	host: Pick< StudioAgentHost, 'ui' >
+	host: Pick< StudioAgentHost, 'ui' >,
+	capabilities: ClaudeStudioToolCapabilities = {}
 ): StudioToolDefinition[] {
-	return resolveStudioToolDefinitions( host, CLAUDE_STUDIO_TOOL_CAPABILITIES );
+	return resolveStudioToolDefinitions( host, {
+		...CLAUDE_STUDIO_TOOL_CAPABILITIES,
+		imageGeneration: capabilities.imageGeneration === true,
+	} );
 }
 
 /**
@@ -70,8 +80,8 @@ export function createStudioClaudeMcpServer(
 
 /**
  * The server a native startup check lists, none of whose tools it can run.
- * Discovery has no host, so it lists what a turn of this build lists for a
- * host with no capabilities: every enabled tool no capability gates. Its
+ * Discovery has no host or turn, so it lists what a turn of this build lists
+ * for a host with no capabilities: every enabled tool no capability gates. Its
  * startup check, like a turn's, compares what the executable reports with
  * `tools`, the list its own server registered.
  */
@@ -103,7 +113,7 @@ function describeNotRun(
 	return 'Studio operation denied or failed.';
 }
 
-export interface ClaudeStudioToolBridgeOptions {
+export interface ClaudeStudioToolBridgeOptions extends ClaudeStudioToolCapabilities {
 	/**
 	 * Narrows the tools a call can name before the policy selects; by default the
 	 * host's candidates. Only those candidates' own definitions count: the policy
@@ -126,7 +136,7 @@ export function createStudioClaudeToolBridge(
 ) {
 	const { runId, turnId, policy } = turn;
 	const enabled = new Set( policy.studioTools );
-	const registry = claudeStudioToolCandidates( host );
+	const registry = claudeStudioToolCandidates( host, options );
 	const tools = ( options.candidates ?? registry ).filter(
 		( definition ) => registry.includes( definition ) && enabled.has( definition.name )
 	);
