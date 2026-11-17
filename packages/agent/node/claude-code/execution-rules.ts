@@ -303,6 +303,10 @@ export type ClaudeToolChannel = ( typeof CLAUDE_TOOL_CHANNELS )[ number ];
  * - `config`: the rule's `config` element, files of Studio's own configuration
  *   at locations Studio fixes, which the policy checks before every call. It
  *   bounds reading only.
+ * - `payloads`: the rule's `payloads` element, files a call names in Studio's
+ *   payload folder, which the policy checks before every call and again as the
+ *   last step before the tool runs, and which only an approval that shows them
+ *   lets the tool read. It bounds reading only.
  */
 export type ClaudeChannelBinding =
 	| 'site'
@@ -313,7 +317,8 @@ export type ClaudeChannelBinding =
 	| 'class'
 	| 'host'
 	| 'bundled'
-	| 'config';
+	| 'config'
+	| 'payloads';
 
 /** For every channel, `false` when the implementation does not use it, or what bounds it. */
 export type ClaudeToolChannelDeclaration = {
@@ -361,6 +366,16 @@ export interface ClaudeStudioToolRule {
 	 * nothing the conversation writes is read as Studio's own.
 	 */
 	readonly config?: () => readonly string[];
+	/**
+	 * The files a call names in a folder Studio keeps for staged request
+	 * payloads, as the tool resolves them, which the tool reads and sends. Each
+	 * must be an existing file in that folder through every link and short name,
+	 * and the call must be one the user approves, seeing them. Undefined denies
+	 * the call.
+	 */
+	readonly payloads?: (
+		args: unknown
+	) => { readonly folder: string; readonly files: readonly string[] } | undefined;
 	/**
 	 * The WordPress.com scope a call reaches directly: a site, which must be the
 	 * turn's live target, or the account. Undefined denies the call.
@@ -1064,8 +1079,8 @@ const CHANNEL_BOUNDS: Readonly<
 	>
 > = {
 	readsLocalFiles: {
-		admits: [ 'paths', 'class', 'bundled', 'config' ],
-		needs: [ 'paths', 'bundled', 'config' ],
+		admits: [ 'paths', 'class', 'bundled', 'config', 'payloads' ],
+		needs: [ 'paths', 'bundled', 'config', 'payloads' ],
 	},
 	writesLocalFiles: { admits: [ 'paths', 'class' ], needs: [ 'paths' ] },
 	drivesBrowser: { admits: [ 'navigates', 'urls', 'site' ], needs: [ 'navigates' ] },
@@ -1090,6 +1105,7 @@ const RULE_ELEMENTS: Readonly<
 	paths: 'function',
 	bundled: 'function',
 	config: 'function',
+	payloads: 'function',
 	remote: 'function',
 	urls: 'function',
 	urlsOnSite: 'mark',
@@ -1138,6 +1154,8 @@ function ruleHas( rule: Record< string, unknown >, binding: unknown ): boolean {
 			return typeof rule.bundled === 'function';
 		case 'config':
 			return typeof rule.config === 'function';
+		case 'payloads':
+			return typeof rule.payloads === 'function';
 		default:
 			return false;
 	}
@@ -1186,6 +1204,7 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 			used.has( 'writesLocalFiles' ) ) &&
 		( elements.bundled === undefined || used.has( 'readsLocalFiles' ) ) &&
 		( elements.config === undefined || used.has( 'readsLocalFiles' ) ) &&
+		( elements.payloads === undefined || used.has( 'readsLocalFiles' ) ) &&
 		( elements.urls === undefined ||
 			used.has( 'drivesBrowser' ) ||
 			used.has( 'requestsNetwork' ) ) &&

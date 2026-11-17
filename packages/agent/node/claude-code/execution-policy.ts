@@ -234,6 +234,8 @@ const REFUSALS = {
 		'The new site is now this conversation’s site, but Studio could not find its folder, so this turn acts on no site.',
 	createInFlight:
 		'Studio creates one site at a time, and this turn is already creating one. Wait for that call’s result.',
+	payloads:
+		'A file this operation sends must be an existing file in Studio’s payload folder, which the tool’s description names, and only a change the user approves sends one.',
 } as const;
 
 function deepFreeze< T >( value: T ): T {
@@ -832,9 +834,20 @@ export function createClaudeExecutionPolicy(
 			if ( ! paths ) return false;
 			localPaths = paths;
 		}
-		// The files the tool writes itself lie in the site the turn acts on, and
-		// what it reads of Studio's own files and configuration is still Studio's
-		// own, out of the conversation's reach.
+		// The files the call names in Studio's payload folder, which the tool
+		// reads and sends: only under an approval of the call that shows them.
+		const payload = rule.payloads ? rule.payloads( args ) : { folder: '', files: [] };
+		if (
+			! payload ||
+			( payload.files.length && ( rule.approval !== 'tool' || ! asksFirst( operationClass ) ) )
+		) {
+			refuse( toolCallId, REFUSALS.payloads );
+			return false;
+		}
+		// The files the tool writes itself lie in the site the turn acts on, what
+		// it reads of Studio's own files and configuration is still Studio's own,
+		// out of the conversation's reach, and the payload files it sends are in
+		// the payload folder.
 		const filesHold = async () => {
 			if ( localPaths.length ) {
 				const folder = actingSite?.path;
@@ -846,6 +859,10 @@ export function createClaudeExecutionPolicy(
 				return false;
 			for ( const file of rule.config?.() ?? [] )
 				if ( ! ( await isOutsideReach( file, context.localRoots ) ) ) return false;
+			if ( payload.files.length && ! ( await inPayloadFolder( payload ) ) ) {
+				refuse( toolCallId, REFUSALS.payloads );
+				return false;
+			}
 			return true;
 		};
 		if ( ! ( await filesHold() ) ) return false;
@@ -887,7 +904,7 @@ export function createClaudeExecutionPolicy(
 					operationClass,
 					args,
 					siteId: site?.id,
-					localPaths,
+					localPaths: [ ...localPaths, ...payload.files ],
 					remote,
 					description,
 				},
@@ -1000,6 +1017,24 @@ export function createClaudeExecutionPolicy(
 		return existing
 			? resolveAllowedPath( file, localRoots, workspace.configDirectory )
 			: resolveAllowedNewPath( file, localRoots, workspace.configDirectory );
+	}
+
+	// Whether every file a call names in the payload folder exists there once
+	// links and short names are resolved, outside the native configuration and
+	// clear of names that commonly hold credentials.
+	async function inPayloadFolder( {
+		folder,
+		files,
+	}: {
+		folder: string;
+		files: readonly string[];
+	} ): Promise< boolean > {
+		const root = await realpath( folder ).catch( () => undefined );
+		if ( ! root ) return false;
+		for ( const file of files )
+			if ( ! ( await isAllowedNativePath( file, [ root ], context.workspace.configDirectory ) ) )
+				return false;
+		return true;
 	}
 
 	async function fence(

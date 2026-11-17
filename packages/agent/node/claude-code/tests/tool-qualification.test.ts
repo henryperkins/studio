@@ -351,6 +351,13 @@ describe( 'Claude Studio tool qualification', () => {
 				),
 			],
 			[
+				'files read from Studio’s payload folder, which the rule names',
+				qualifiedRule(
+					{ payloads: () => ( { folder: 'payloads', files: [] } ) },
+					{ ...noChannels, readsLocalFiles: [ 'payloads' ] }
+				),
+			],
+			[
 				'a message by approval',
 				qualifiedRule(
 					{ operationClass: 'external-message' },
@@ -517,6 +524,28 @@ describe( 'Claude Studio tool qualification', () => {
 			[
 				'configuration that is not a function',
 				qualifiedRule( { config: [ 'shared.json' ] }, noChannels ),
+			],
+			// Files a tool sends from Studio's payload folder are bounded by the
+			// files the rule names there, which the policy checks and the approval
+			// shows; reading them binds no other channel.
+			[
+				'payload files the rule does not name',
+				qualifiedRule( {}, { ...noChannels, readsLocalFiles: [ 'payloads' ] } ),
+			],
+			[
+				'payload files written as if read',
+				qualifiedRule(
+					{ payloads: () => ( { folder: 'payloads', files: [] } ) },
+					{ ...noChannels, readsLocalFiles: [ 'payloads' ], writesLocalFiles: [ 'payloads' ] }
+				),
+			],
+			[
+				'payload files without the file channel',
+				qualifiedRule( { payloads: () => ( { folder: 'payloads', files: [] } ) }, noChannels ),
+			],
+			[
+				'payload files that are not a function',
+				qualifiedRule( { payloads: { folder: 'payloads', files: [] } }, noChannels ),
 			],
 			[
 				'a process bound by the host guard',
