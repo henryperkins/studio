@@ -498,6 +498,8 @@ describe( 'pi runtime', () => {
 		expect( takeScreenshot( 0 )?.description ).toContain( 'analyze visually' );
 		expect( takeScreenshot( 1 )?.description ).toContain( 'This model cannot view images' );
 		expect( takeScreenshot( 1 )?.description ).not.toContain( 'analyze visually' );
+		// Only the ChatGPT route says its connection doesn't take tool images yet.
+		expect( takeScreenshot( 1 )?.description ).not.toContain( 'this connection' );
 	} );
 
 	it( 'rejects oversized direct Write, Edit, and Bash payloads', async () => {

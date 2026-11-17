@@ -708,7 +708,11 @@ async function createStudioAgentSession(
 		isImageGenerationAvailable(),
 	] );
 
-	const tools = buildAgentTools( config, imageGenerationEnabled, visionEnabled );
+	const tools = buildAgentTools( config, imageGenerationEnabled, {
+		visionEnabled,
+		// The model sees attached images; only this connection's tool results go without.
+		toolImagesUnavailable: routing.kind === 'chatgpt' && ! visionEnabled,
+	} );
 	const systemPrompt = buildSystemPrompt( {
 		userInstructions,
 		tools: tools.map( toolPromptContribution ),
@@ -1119,7 +1123,10 @@ function toToolDefinition(
 function buildAgentTools(
 	config: ResolvedStudioAgentTurnConfig,
 	imageGenerationEnabled: boolean,
-	visionEnabled: boolean
+	{
+		visionEnabled,
+		toolImagesUnavailable,
+	}: { visionEnabled: boolean; toolImagesUnavailable: boolean }
 ): AgentToolAny[] {
 	const { host } = config;
 	const askUserTool: AgentToolAny[] = config.onAskUser
@@ -1159,6 +1166,7 @@ function buildAgentTools(
 	const studioTools = resolveStudioTools( host, {
 		imageGeneration: imageGenerationEnabled,
 		visionEnabled,
+		toolImagesUnavailable,
 		canAskUser: Boolean( config.onAskUser ),
 		tracks,
 	} ) as unknown as AgentToolAny[];

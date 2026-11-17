@@ -56,25 +56,32 @@ function getCaptureListLabel(
 
 const TEXT_ONLY_NOTE =
 	'This model cannot view images, so the capture is not shown to you: verify the rendered page with inspect_design.';
+const NO_TOOL_IMAGES_NOTE =
+	'Images in tool results are not available on this connection yet, so the capture is not shown to you: verify the rendered page with inspect_design.';
 
 // Text-only models still get the tool (it sets the theme screenshot) but no
 // image block, which they would otherwise describe without seeing.
 export function createTakeScreenshotTool( {
 	visionEnabled,
+	toolImagesUnavailable = false,
 	imageLink,
 	userSeesCapture = true,
 }: {
 	visionEnabled: boolean;
+	// Without vision: the model sees images a user attaches, but this
+	// connection doesn't take them in tool results yet.
+	toolImagesUnavailable?: boolean;
 	imageLink?: ( file: string ) => string;
 	// False in a terminal session: no UI shows the capture, only its file path.
 	userSeesCapture?: boolean;
 } ) {
+	const textOnlyNote = toolImagesUnavailable ? NO_TOOL_IMAGES_NOTE : TEXT_ONLY_NOTE;
 	return defineTool(
 		'take_screenshot',
 		'Takes a full-page screenshot of a URL. ' +
 			( visionEnabled
 				? 'Returns the screenshot as an image that you can analyze visually; tall pages are scaled down to 2000 pixels on their longest side, and the saved file keeps full resolution. '
-				: `${ TEXT_ONLY_NOTE } ` ) +
+				: `${ textOnlyNote } ` ) +
 			'Supports desktop and mobile viewports; pass `viewport: "all"` when you need both for design verification. ' +
 			'Pass `colorScheme: "light"`, `colorScheme: "dark"`, or `colorScheme: "all"` to verify pages that respond to prefers-color-scheme. ' +
 			'Long pages are clipped at 8000 vertical pixels; the response reports the document height and whether more remains, and you can call again with `offset` to fetch the next slice. ' +
@@ -209,7 +216,7 @@ export function createTakeScreenshotTool( {
 					);
 				}
 				if ( ! visionEnabled ) {
-					textLines.push( TEXT_ONLY_NOTE );
+					textLines.push( textOnlyNote );
 				}
 				if ( ! userSeesCapture ) {
 					textLines.push(
@@ -255,6 +262,8 @@ export function createTakeScreenshotTool( {
 			annotations: LOCAL_CHANGE,
 			promptSnippet: visionEnabled
 				? 'Take a full-page screenshot of a URL (supports desktop, mobile, or `viewport: "all"` for both). Use this to visually check the site after building it.'
+				: toolImagesUnavailable
+				? 'Save a full-page screenshot of a URL to a file (supports desktop, mobile, or `viewport: "all"` for both). Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot.'
 				: 'Save a full-page screenshot of a URL to a file (supports desktop, mobile, or `viewport: "all"` for both). You cannot view the image, but it still sets the theme screenshot.',
 		}
 	);

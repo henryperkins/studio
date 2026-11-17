@@ -76,6 +76,9 @@ export interface StudioToolsOptions {
 	imageGeneration?: boolean;
 	// False for models that cannot view images. Defaults to true.
 	visionEnabled?: boolean;
+	// With `visionEnabled` false, a connection that doesn't take images in tool
+	// results yet, for a model that views attached ones: the tools say so instead.
+	toolImagesUnavailable?: boolean;
 	// False leaves out wpcom_request, for hosts that don't accept a tool reaching any
 	// WordPress.com endpoint. Defaults to true.
 	wpcomRequest?: boolean;
@@ -109,6 +112,7 @@ export function resolveStudioTools(
 		if ( candidate.name === takeScreenshotTool.name ) {
 			tool = createTakeScreenshotTool( {
 				visionEnabled: options.visionEnabled !== false,
+				toolImagesUnavailable: options.toolImagesUnavailable,
 				imageLink: options.imageLink,
 				userSeesCapture: Boolean( host.ui ) || Boolean( options.imageLink ),
 			} );

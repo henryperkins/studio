@@ -1605,10 +1605,18 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				name: string;
 				description: string;
 			} >;
-			// As for any model that can't view images: the tool, without the image block.
-			expect( declared.find( ( tool ) => tool.name === 'take_screenshot' )?.description ).toContain(
-				'This model cannot view images'
+			// The tool without the image block, saying why without claiming the
+			// model can't view images: it does see the images a user attaches.
+			const description = declared.find( ( tool ) => tool.name === 'take_screenshot' )?.description;
+			expect( description ).toContain(
+				'Images in tool results are not available on this connection yet'
 			);
+			expect( description ).not.toMatch( /model cannot view|cannot view images/ );
+			const instructions = String( requests[ 0 ].body.instructions );
+			expect( instructions ).toContain(
+				'Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot.'
+			);
+			expect( instructions ).not.toContain( 'You cannot view the image' );
 			expect( seams.captureScreenshotBuffer ).toHaveBeenCalledWith(
 				'http://localhost:8881/',
 				expect.anything(),
@@ -1617,7 +1625,10 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			const output = outputFor( requests[ 1 ], shot.callIds[ 0 ] );
 			expect( imageCount( output ) ).toBe( 0 );
 			expect( JSON.stringify( output ) ).toContain( 'Screenshot captured' );
-			expect( JSON.stringify( output ) ).toContain( 'This model cannot view images' );
+			expect( JSON.stringify( output ) ).toContain(
+				'Images in tool results are not available on this connection yet'
+			);
+			expect( JSON.stringify( output ) ).not.toContain( 'cannot view images' );
 			expect( imageCount( requests[ 2 ].body.input ) ).toBe( 0 );
 			expect( ui.showArtifact ).toHaveBeenCalledTimes( 1 );
 			expect( ui.showArtifact.mock.calls[ 0 ][ 0 ].widgets ).toEqual( [
