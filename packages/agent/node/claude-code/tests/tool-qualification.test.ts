@@ -95,6 +95,7 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 		callsHostOperation: [ 'host' ],
 		reachesWpcom: [ 'host' ],
 	},
+	preview_list: throughHost,
 };
 
 // Code a qualified tool's module links but the tool never runs. The scan reads
@@ -112,6 +113,13 @@ const UNREACHED: Record<
 	ReadonlyArray< { channels: string[]; files: string[]; why: string } >
 > = {
 	site_list: [ SHARED_CONFIG_SAVE ],
+	preview_list: [
+		{
+			channels: [ 'requestsNetwork', 'reachesWpcom' ],
+			files: [ '../common/lib/snapshots.ts' ],
+			why: '`fetchSnapshotUsage` asks WordPress.com for the account’s preview count; the tool only formats the previews the host lists (`getSnapshotLink`, `isSnapshotExpired`)',
+		},
+	],
 };
 const isQualifiedName = ( name: string ) => Object.prototype.hasOwnProperty.call( QUALIFIED, name );
 // In the order the rule table, and so every enabled list, names them.

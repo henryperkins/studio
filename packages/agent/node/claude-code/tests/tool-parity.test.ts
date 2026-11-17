@@ -74,7 +74,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_connected_remote_sites: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
 	wpcom_request: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
 	preview_create: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
-	preview_list: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
+	preview_list: { status: 'bridged' },
 	preview_update: {
 		status: 'unqualified',
 		step: 'C2a-3',

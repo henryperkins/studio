@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { fakePreview } from '../../tests/fake-host';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
 
@@ -202,5 +203,49 @@ describe( 'the listings the guarded host gives', () => {
 			expect( host.wpcom.sites ).not.toHaveBeenCalled();
 			expect( host.sites.all ).not.toHaveBeenCalled();
 		}
+	} );
+} );
+
+describe( 'preview_list on the Claude route', () => {
+	it( 'lists the previews of the conversation’s own site, unprompted and unjournaled', async () => {
+		const { bridge, host, context, journal, localSite } = await setup();
+		vi.mocked( host.previews.list ).mockResolvedValue( [ fakePreview ] );
+		expect( bridge.tools ).toContain( 'preview_list' );
+		const result = await bridge.invoke( 'preview_list', { nameOrPath: 'site' } );
+		expect( result.isError ).toBe( false );
+		expect( JSON.parse( text( result ) ) ).toEqual( [
+			expect.objectContaining( { type: 'preview', url: `https://${ fakePreview.url }` } ),
+		] );
+		expect( host.previews.list ).toHaveBeenCalledWith( localSite );
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect( journal ).toEqual( [] );
+	} );
+
+	it( 'lists no other site’s previews, and none from a conversation without a site', async () => {
+		const onSite = await setup();
+		expect(
+			( await onSite.bridge.invoke( 'preview_list', { nameOrPath: 'other' } ) ).isError
+		).toBe( true );
+		const unbound = await setup( global );
+		expect(
+			( await unbound.bridge.invoke( 'preview_list', { nameOrPath: 'site' } ) ).isError
+		).toBe( true );
+		for ( const { host } of [ onSite, unbound ] )
+			expect( host.previews.list ).not.toHaveBeenCalled();
+	} );
+
+	it( 'reads, through the guarded host, the previews of the target site only, and none once the call has ended or the target moved', async () => {
+		const { policy, host, localSite, otherSite, context } = await setup();
+		const call = new AbortController();
+		const guarded = policy.guardHost( host, 'call', call.signal );
+		await expect( guarded.previews.list( localSite ) ).resolves.toEqual( [] );
+		await expect( guarded.previews.list( otherSite ) ).rejects.toThrow( 'Denied' );
+		call.abort();
+		await expect( guarded.previews.list( localSite ) ).rejects.toThrow( 'Denied' );
+		vi.mocked( context.verifyTarget ).mockResolvedValue( false );
+		await expect( policy.guardHost( host, 'later' ).previews.list( localSite ) ).rejects.toThrow(
+			'Denied'
+		);
+		expect( host.previews.list ).toHaveBeenCalledOnce();
 	} );
 } );

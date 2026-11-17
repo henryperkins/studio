@@ -1272,6 +1272,7 @@ export function createClaudeExecutionPolicy(
 			},
 			previews: {
 				...host.previews,
+				list: ( site ) => reading( site, () => host.previews.list( site ) ),
 				create: ( site, onProgress ) =>
 					run( { name: 'previews.create', site, args: [] }, ( current, options ) =>
 						host.previews.create( current!, onProgress, options )

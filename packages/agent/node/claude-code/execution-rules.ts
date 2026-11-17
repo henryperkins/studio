@@ -56,6 +56,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		runWpCliTool.name,
 		getSiteInfoTool.name,
 		listSitesTool.name,
+		listPreviewsTool.name,
 		startSiteTool.name,
 		stopSiteTool.name,
 		deleteSiteTool.name,
@@ -739,7 +740,14 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		),
 	],
 	[ createPreviewTool.name, unqualified( onSite( 'remote-change', { approval: 'host' } ) ) ],
-	[ listPreviewsTool.name, unqualified( onSite( 'read' ) ) ],
+	[
+		listPreviewsTool.name,
+		// It resolves the site it names and lists that site's previews from the
+		// host, which reads Studio's own record of them, and the guarded host
+		// allows that for the target site only. It formats what the host lists
+		// and asks WordPress.com nothing itself.
+		qualified( onSite( 'read' ), using( LOCAL_SITE_HOST_CHANNELS ) ),
+	],
 	[ updatePreviewTool.name, unqualified( onSite( 'remote-overwrite', { approval: 'host' } ) ) ],
 	[ deletePreviewTool.name, unqualified( studioRule( 'remote-overwrite', { approval: 'host' } ) ) ],
 	[
