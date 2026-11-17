@@ -16,6 +16,7 @@ import {
 	answerChatGptSessionTokenInvalidation,
 	answerChatGptSessionTokenRequest,
 	CHATGPT_TURN_WATCH_POLL_MS,
+	createChatGptCredentialBroker,
 	getChatGptAccessToken,
 	getChatGptSessionForkEnvironment,
 	invalidateChatGptAccessToken,
@@ -31,6 +32,7 @@ import {
 	createChatGptSignInFlow,
 } from '@studio/agent/node/chatgpt/oauth';
 import { ChatGptSettingsError, readChatGptModels } from '@studio/agent/node/chatgpt/settings';
+import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
 import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
 import { setSessionChatGptSelection } from '@studio/agent/node/sessions/chatgpt-selection';
@@ -254,6 +256,10 @@ interface AcceptanceBroker {
 	askSessionToken( connectionId: string, logoutGeneration: number ): Promise< boolean | null >;
 	readAccount( registrationId: string ): Promise< ChatGptAccount | null >;
 	vaultRecordExists( registrationId: string ): boolean;
+	/** The keychain item that holds this profile's vault key; throws when it can't be named. */
+	vaultKeyItem(): string;
+	/** Removes this profile's own vault key item, unless a saved sign-in still needs it. */
+	removeProfileVaultKey(): Promise< 'removed' | 'default-profile' | 'records-exist' >;
 	readModels( connectionId: string, revision: number ): Promise< ChatGptModelAvailability >;
 }
 
@@ -976,15 +982,22 @@ interface AcceptanceState {
 	marker?: string;
 	effort?: string;
 	offeredSessionId?: string;
+	/**
+	 * What follows `chatgpt-vault-key-` in the name of the run profile's own
+	 * keychain item, so an abandoned run's item can be removed by its exact
+	 * name. The whole name would read as an opaque token.
+	 */
+	vaultKeySuffix?: string;
 }
 
-type CleanupSlot = 'sign-in' | 'refresh' | 'processes' | 'site' | 'registration';
+type CleanupSlot = 'sign-in' | 'refresh' | 'processes' | 'site' | 'registration' | 'vault-key';
 const CLEANUP_ORDER: readonly CleanupSlot[] = [
 	'sign-in',
 	'refresh',
 	'processes',
 	'site',
 	'registration',
+	'vault-key',
 ];
 
 /** One cleanup step: records what it did in `report`; false or a throw is a failed step. */
@@ -1053,6 +1066,40 @@ function registerRegistrationCleanup( ctx: StageContext ): void {
 			report.signOutFailed = true;
 			return false;
 		}
+	} );
+}
+
+// The default profile's vault key item: the run's profile must never key its records under it.
+const UNSCOPED_VAULT_KEY_ITEM = 'chatgpt-vault-key';
+
+/** The run profile's own vault key item, or null when it would be the unscoped one or can't be named. */
+function scopedVaultKeyItem( ctx: StageContext ): string | null {
+	let item: string;
+	try {
+		item = ctx.services.broker.vaultKeyItem();
+	} catch {
+		return null;
+	}
+	return item !== UNSCOPED_VAULT_KEY_ITEM && item.startsWith( `${ UNSCOPED_VAULT_KEY_ITEM }-` )
+		? item
+		: null;
+}
+
+/** Whether the run profile's own vault key item is gone: never while a saved sign-in needs it. */
+async function removeRunVaultKey( ctx: StageContext ): Promise< boolean > {
+	try {
+		return ( await ctx.services.broker.removeProfileVaultKey() ) === 'removed';
+	} catch {
+		return false;
+	}
+}
+
+// Removes the run profile's own vault key item on the way out, after the
+// registration's sign-out, so a run leaves nothing of its own in the keychain.
+function registerVaultKeyCleanup( ctx: StageContext ): void {
+	ctx.cleanup.set( 'vault-key', async ( report ) => {
+		report.vaultKeyRemoved = await removeRunVaultKey( ctx );
+		return report.vaultKeyRemoved;
 	} );
 }
 
@@ -1408,6 +1455,17 @@ const prerequisitesStage: StageDefinition = {
 		if ( ! observations.buildPresent ) {
 			block( 'build-missing' );
 		}
+		// A saved sign-in creates its profile's vault key: never under the item
+		// the user's own profile keeps its key in, which it could replace.
+		if ( ctx.options.scenario === 'saved' || ctx.options.scenario === 'provision' ) {
+			const item = scopedVaultKeyItem( ctx );
+			observations.vaultKeyScoped = item !== null;
+			if ( item === null ) {
+				return block( 'vault-key-not-scoped' );
+			}
+			ctx.state.vaultKeySuffix = item.slice( UNSCOPED_VAULT_KEY_ITEM.length + 1 );
+			ctx.saveState();
+		}
 		// Which keychain, and whether it answered: a session-only run records it
 		// too, so a result on a machine without one is told apart.
 		const store = ctx.services.credentialStoreKind();
@@ -1428,6 +1486,7 @@ const SAVED_STAGES: StageDefinition[] = [
 		name: 'sign-in',
 		async run( ctx, observations ) {
 			registerRegistrationCleanup( ctx );
+			registerVaultKeyCleanup( ctx );
 			const outcome = await signInStage( ctx, observations, undefined, 'vault' );
 			const account = await ctx.services.broker.readAccount( outcome.registrationId );
 			observations.signedIn = account?.state === 'signed-in';
@@ -1951,26 +2010,31 @@ const PROVISION_STAGES: StageDefinition[] = [
 		name: 'profile-sign-in',
 		async run( ctx, observations ) {
 			registerRegistrationCleanup( ctx );
+			registerVaultKeyCleanup( ctx );
 			const outcome = await signInStage( ctx, observations, undefined, 'vault' );
 			const account = await ctx.services.broker.readAccount( outcome.registrationId );
 			observations.signedIn = account?.state === 'signed-in';
 			observations.storedInVault = ctx.services.broker.vaultRecordExists( outcome.registrationId );
 			check( observations.signedIn, 'not-signed-in' );
 			check( observations.storedInVault, 'vault-record-missing' );
-			// Ready for evals: only a failure before here signs it out again.
+			// Ready for evals: only a failure before here signs it out again, and
+			// its vault key item stays until `retire`.
 			ctx.cleanup.delete( 'registration' );
+			ctx.cleanup.delete( 'vault-key' );
 			observations.leftSignedIn = true;
 		},
 	},
 ];
 
-// Retires a dedicated eval profile: its registration signed out, locally and at ChatGPT.
+// Retires a dedicated eval profile: its registration signed out, locally and
+// at ChatGPT, then its own vault key item removed.
 const RETIRE_STAGES: StageDefinition[] = [
 	prerequisitesStage,
 	{
 		name: 'profile-sign-out',
 		async run( ctx, observations ) {
 			const id = requireRegistration( ctx );
+			registerVaultKeyCleanup( ctx );
 			const account = await ctx.services.broker.readAccount( id );
 			observations.wasSignedIn = account?.state === 'signed-in';
 			if ( ! observations.wasSignedIn ) {
@@ -1979,8 +2043,13 @@ const RETIRE_STAGES: StageDefinition[] = [
 			const result = await ctx.services.broker.signOut( id );
 			observations.localCleared = result.localCleared;
 			observations.remoteRevocationConfirmed = result.remoteRevocationConfirmed;
+			observations.vaultKeyRemoved = await removeRunVaultKey( ctx );
+			if ( observations.vaultKeyRemoved ) {
+				ctx.cleanup.delete( 'vault-key' );
+			}
 			check( result.localCleared, 'local-not-cleared' );
 			check( result.remoteRevocationConfirmed, 'remote-revocation-unconfirmed' );
+			check( observations.vaultKeyRemoved, 'vault-key-not-removed' );
 		},
 	},
 ];
@@ -3131,6 +3200,9 @@ async function createLiveServices( {
 	installAcceptanceObserver( path.join( paths.observerDir, '00-runner.ndjson' ) );
 	const tokens = createAcceptanceTokenService( createChatGptTokenClient() );
 	setChatGptTokenClient( tokens.client );
+	// The app's broker has no module-level call for removing the profile's vault
+	// key: a broker of the runner's own, on the same keychain, makes it.
+	const keyBroker = createChatGptCredentialBroker( { tokenClient: tokens.client } );
 	const flow = createChatGptSignInFlow( { openBrowser: ( url ) => openBrowser( url ) } );
 	return {
 		clock: { now: () => Date.now(), sleep },
@@ -3151,6 +3223,8 @@ async function createLiveServices( {
 			readAccount: readChatGptAccount,
 			vaultRecordExists: ( id ) =>
 				fs.existsSync( path.join( getConfigDirectory(), 'chatgpt-credentials', `${ id }.vault` ) ),
+			vaultKeyItem: () => getChatGptVaultKeyAccounts().own,
+			removeProfileVaultKey: () => keyBroker.removeProfileVaultKey(),
 			readModels: ( id, revision ) => readChatGptModels( id, revision ),
 		},
 		tokens,

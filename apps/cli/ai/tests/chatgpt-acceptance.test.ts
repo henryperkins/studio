@@ -14,6 +14,7 @@ import {
 } from '@studio/agent/node/chatgpt/credential-broker';
 import { createChatGptSignInFlow } from '@studio/agent/node/chatgpt/oauth';
 import { ChatGptSettingsError } from '@studio/agent/node/chatgpt/settings';
+import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
 import {
 	createSigningKey,
 	GRANTED_SCOPE,
@@ -59,6 +60,10 @@ import type { ObservedRequest } from 'cli/ai/chatgpt-acceptance-observer';
 
 const REGISTRATION = '0d6b5a8e-3c1f-4e2a-9b7d-5f4c3a2b1e0d';
 const SHA = '5c742434a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5';
+// The default profile's vault key item, and one of another profile's.
+const UNSCOPED_VAULT_KEY_ITEM = 'chatgpt-vault-key';
+const VAULT_KEY_SUFFIX = '0123456789abcdef';
+const SCOPED_VAULT_KEY_ITEM = `${ UNSCOPED_VAULT_KEY_ITEM }-${ VAULT_KEY_SUFFIX }`;
 const signedOutText = new ChatGptConnectionError( 'signed-out' ).message;
 const disconnectedText = describeConnectionSelectionError( {
 	code: 'disconnected',
@@ -362,6 +367,12 @@ function scriptedServices(
 			askSessionToken: async () => false,
 			readAccount: async () => account(),
 			vaultRecordExists: () => state === 'signed-in' && storage === 'vault',
+			vaultKeyItem: () => SCOPED_VAULT_KEY_ITEM,
+			// As the broker does: kept while a saved sign-in still needs it.
+			removeProfileVaultKey: async () => {
+				calls.log.push( 'remove-vault-key' );
+				return state === 'signed-in' && storage === 'vault' ? 'records-exist' : 'removed';
+			},
 			readModels: async ( connectionId, revision ) => ( {
 				connectionId,
 				revision,
@@ -821,6 +832,73 @@ describe( 'ChatGPT acceptance runner', () => {
 			expect( process.env.DEV_CONFIG_DIR ).toBe( acceptanceRunPaths( runDir ).profileDir );
 			expectNothingUnsafe( [ 'test-access-token' ] );
 		} );
+
+		it( 'removes the run profile’s own vault key item after the sign-out, and records that it did', async () => {
+			const { services, calls } = scriptedServices();
+			expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 0 );
+			expect( stageOf( 'prerequisites' )[ 0 ].observations ).toMatchObject( {
+				vaultKeyScoped: true,
+			} );
+			// Only the suffix: the full item name reads like an opaque token.
+			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readState() ).toMatchObject( {
+				vaultKeySuffix: VAULT_KEY_SUFFIX,
+			} );
+			expect( calls.log.filter( ( call ) => call === 'remove-vault-key' ) ).toHaveLength( 1 );
+			expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+				calls.log.indexOf( 'remove-vault-key' )
+			);
+			expect( records().at( -1 ) ).toMatchObject( {
+				stage: 'cleanup',
+				status: 'passed',
+				observations: expect.objectContaining( { vaultKeyRemoved: true } ),
+			} );
+		} );
+
+		it( 'fails cleanup, after its other steps, when the run profile’s vault key item stays', async () => {
+			const { services, calls } = scriptedServices();
+			services.broker.removeProfileVaultKey = async () => {
+				calls.log.push( 'remove-vault-key' );
+				throw new Error( 'The keychain went away.' );
+			};
+			expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 1 );
+			expect( records().at( -1 ) ).toMatchObject( {
+				stage: 'cleanup',
+				status: 'failed',
+				code: 'cleanup-failed',
+				observations: expect.objectContaining( { vaultKeyRemoved: false, stepFailures: 1 } ),
+			} );
+			expect( calls.log.indexOf( 'cli:daemon-stop' ) ).toBeLessThan(
+				calls.log.indexOf( 'remove-vault-key' )
+			);
+		} );
+
+		it.each( [
+			[ 'the unscoped item', () => UNSCOPED_VAULT_KEY_ITEM ],
+			[
+				'no item it can name',
+				(): string => {
+					throw new Error( 'unresolved' );
+				},
+			],
+		] )(
+			'blocks before any sign-in when the run profile would keep its vault key under %s',
+			async ( _label, vaultKeyItem ) => {
+				const { services, calls } = scriptedServices();
+				services.broker.vaultKeyItem = vaultKeyItem;
+				expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 1 );
+				expect(
+					records().map( ( record ) => [ record.stage, record.status, record.code ] )
+				).toEqual( [
+					[ 'prerequisites', 'blocked', 'vault-key-not-scoped' ],
+					[ 'cleanup', 'passed', undefined ],
+				] );
+				expect( stageOf( 'prerequisites' )[ 0 ].observations ).toMatchObject( {
+					vaultKeyScoped: false,
+				} );
+				expect( calls.log.some( ( call ) => call.startsWith( 'begin:' ) ) ).toBe( false );
+				expect( calls.log ).not.toContain( 'remove-vault-key' );
+			}
+		);
 
 		it( 'records an unexpected tool call, stops judging there, and still cleans up', async () => {
 			const { services } = scriptedServices(
@@ -1861,11 +1939,17 @@ describe( 'ChatGPT acceptance runner', () => {
 				'begin:vault',
 			] );
 			expect( calls.log ).not.toContain( 'sign-out' );
+			// The profile stays signed in for evals, so its vault key item stays too.
+			expect( calls.log ).not.toContain( 'remove-vault-key' );
+			expect( stageOf( 'prerequisites' )[ 0 ].observations ).toMatchObject( {
+				vaultKeyScoped: true,
+			} );
 			expect( calls.log.some( ( call ) => call.startsWith( 'turn:' ) ) ).toBe( false );
 			expect( calls.log.some( ( call ) => call.startsWith( 'cli:' ) ) ).toBe( false );
 			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readState() ).toMatchObject( {
 				registrationId: REGISTRATION,
 				storage: 'vault',
+				vaultKeySuffix: VAULT_KEY_SUFFIX,
 			} );
 			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readManifest()?.runs ).toEqual( [
 				expect.objectContaining( { run: 1, scenario: 'provision', gates: [] } ),
@@ -1884,9 +1968,26 @@ describe( 'ChatGPT acceptance runner', () => {
 				code: 'vault-record-missing',
 			} );
 			expect( calls.log.filter( ( call ) => call === 'sign-out' ) ).toHaveLength( 1 );
+			expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+				calls.log.indexOf( 'remove-vault-key' )
+			);
 			expect( stageOf( 'cleanup' )[ 0 ].observations ).toMatchObject( {
 				testRegistrationSignedOut: true,
+				vaultKeyRemoved: true,
 			} );
+		} );
+
+		it( 'blocks before the sign-in when the run profile would keep its vault key under the unscoped item', async () => {
+			const { services, calls } = scriptedServices();
+			services.broker.vaultKeyItem = () => UNSCOPED_VAULT_KEY_ITEM;
+			expect( await runChatGptAcceptance( provisionArgs(), dependencies( services ) ) ).toBe( 1 );
+			expect( stageOf( 'prerequisites' )[ 0 ] ).toMatchObject( {
+				status: 'blocked',
+				code: 'vault-key-not-scoped',
+			} );
+			expect( stageOf( 'profile-sign-in' ) ).toEqual( [] );
+			expect( calls.log.some( ( call ) => call.startsWith( 'begin:' ) ) ).toBe( false );
+			expect( calls.log ).not.toContain( 'remove-vault-key' );
 		} );
 
 		describe( 'retire', () => {
@@ -1934,6 +2035,10 @@ describe( 'ChatGPT acceptance runner', () => {
 						scripted.calls.log.push( 'sign-out' );
 						signedOut = true;
 						return { localCleared: true, remoteRevocationConfirmed: true };
+					},
+					removeProfileVaultKey: async () => {
+						scripted.calls.log.push( 'remove-vault-key' );
+						return signedOut ? 'removed' : 'records-exist';
 					},
 					...overrides,
 				};
@@ -1992,10 +2097,67 @@ describe( 'ChatGPT acceptance runner', () => {
 					wasSignedIn: true,
 					localCleared: true,
 					remoteRevocationConfirmed: true,
+					vaultKeyRemoved: true,
 				} );
 				expect( calls.log.filter( ( call ) => call === 'sign-out' ) ).toHaveLength( 1 );
+				// Removed once, by the stage, after its sign-out: cleanup has nothing left to remove.
+				expect( calls.log.filter( ( call ) => call === 'remove-vault-key' ) ).toHaveLength( 1 );
+				expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+					calls.log.indexOf( 'remove-vault-key' )
+				);
 				expect( calls.log.some( ( call ) => call.startsWith( 'begin:' ) ) ).toBe( false );
 				expectNothingUnsafe( [ 'test-access-token' ] );
+			} );
+
+			it( 'fails when the profile’s vault key item couldn’t be removed after the sign-out', async () => {
+				provisioned();
+				const kept = signedIn( { removeProfileVaultKey: async () => 'records-exist' } );
+				expect( await runChatGptAcceptance( retireArgs(), dependencies( kept.services ) ) ).toBe(
+					1
+				);
+				expect( stageOf( 'profile-sign-out' )[ 0 ] ).toMatchObject( {
+					status: 'failed',
+					code: 'vault-key-not-removed',
+					observations: expect.objectContaining( { localCleared: true, vaultKeyRemoved: false } ),
+				} );
+				expect( records().at( -1 ) ).toMatchObject( {
+					stage: 'cleanup',
+					status: 'failed',
+					observations: expect.objectContaining( { vaultKeyRemoved: false } ),
+				} );
+
+				const unreachable = signedIn( {
+					removeProfileVaultKey: async () => {
+						throw new Error( 'The keychain went away.' );
+					},
+				} );
+				expect(
+					await runChatGptAcceptance( retireArgs(), dependencies( unreachable.services ) )
+				).toBe( 1 );
+				expect( stageOf( 'profile-sign-out' )[ 1 ] ).toMatchObject( {
+					status: 'failed',
+					code: 'vault-key-not-removed',
+				} );
+			} );
+
+			it( 'still removes the vault key item of a profile already signed out', async () => {
+				provisioned();
+				// Nothing saved needs the key any more.
+				const { services, calls } = signedIn( {
+					readAccount: async () => null,
+					removeProfileVaultKey: async () => 'removed',
+				} );
+				expect( await runChatGptAcceptance( retireArgs(), dependencies( services ) ) ).toBe( 1 );
+				expect( stageOf( 'profile-sign-out' )[ 0 ] ).toMatchObject( {
+					status: 'blocked',
+					code: 'already-signed-out',
+				} );
+				expect( calls.log ).not.toContain( 'sign-out' );
+				expect( records().at( -1 ) ).toMatchObject( {
+					stage: 'cleanup',
+					status: 'passed',
+					observations: expect.objectContaining( { vaultKeyRemoved: true } ),
+				} );
 			} );
 
 			it( 'fails when the remote revocation is not confirmed, and blocks a profile already signed out', async () => {
@@ -2658,9 +2820,22 @@ describe( 'ChatGPT acceptance runner', () => {
 					readAccount: ( id: string ) => readChatGptAccount( id ),
 					vaultRecordExists: ( id: string ) =>
 						fs.existsSync( path.join( profileDir, 'chatgpt-credentials', `${ id }.vault` ) ),
+					vaultKeyItem: () => getChatGptVaultKeyAccounts().own,
+					removeProfileVaultKey: () => broker.removeProfileVaultKey(),
 				},
 				tokens,
 			} satisfies ChatGptAcceptanceServices;
+		}
+
+		// Every keychain item a run wrote, by name.
+		function recordKeychainWrites(): string[] {
+			const written: string[] = [];
+			const set = keychain.store.set;
+			keychain.store.set = async ( account, secret ) => {
+				written.push( account );
+				return set( account, secret );
+			};
+			return written;
 		}
 
 		// A turn the app forks: its own broker, asking the owner over an in-memory channel.
@@ -2752,6 +2927,7 @@ describe( 'ChatGPT acceptance runner', () => {
 
 		it( 'runs saved, then session in the same run directory, with real sign-ins, sign-outs and a refresh held across one', async () => {
 			const owner: { broker: ChatGptCredentialBroker | null } = { broker: null };
+			const written = recordKeychainWrites();
 			const saved = realServices( owner );
 			expect(
 				await runChatGptAcceptance(
@@ -2759,10 +2935,26 @@ describe( 'ChatGPT acceptance runner', () => {
 					dependencies( saved )
 				)
 			).toBe( 0 );
-			const { registrationId } = openAcceptanceEvidence( runDir, 'chatgpt' ).readState() as {
+			const { registrationId, vaultKeySuffix } = openAcceptanceEvidence(
+				runDir,
+				'chatgpt'
+			).readState() as {
 				registrationId: string;
+				vaultKeySuffix: string;
 			};
 			expect( ( await readChatGptAccount( registrationId ) )?.state ).toBe( 'signed-out' );
+			// The run's profile keyed its record under an item of its own, never the
+			// unscoped one, and removed that item again after its sign-out.
+			expect( new Set( written ) ).toEqual(
+				new Set( [ `${ UNSCOPED_VAULT_KEY_ITEM }-${ vaultKeySuffix }` ] )
+			);
+			expect( vaultKeySuffix ).toMatch( /^[0-9a-f]{16}$/ );
+			expect( [ ...keychain.items.keys() ] ).toEqual( [] );
+			expect( records().at( -1 ) ).toMatchObject( {
+				stage: 'cleanup',
+				status: 'passed',
+				observations: expect.objectContaining( { vaultKeyRemoved: true } ),
+			} );
 			expect( stageOf( 'remote-revocation' )[ 0 ] ).toMatchObject( {
 				status: 'passed',
 				observations: expect.objectContaining( {
@@ -2905,6 +3097,40 @@ describe( 'ChatGPT acceptance runner', () => {
 				status: 'passed',
 				observations: expect.objectContaining( { testRegistrationSignedOut: true } ),
 			} );
+		} );
+
+		it( 'keeps a provisioned profile’s own vault key item until retire removes it after the sign-out', async () => {
+			const owner: { broker: ChatGptCredentialBroker | null } = { broker: null };
+			const written = recordKeychainWrites();
+			expect(
+				await runChatGptAcceptance(
+					[ '--live', '--scenario', 'provision', '--run-dir', runDir ],
+					dependencies( realServices( owner ) )
+				)
+			).toBe( 0 );
+			const { registrationId, vaultKeySuffix } = openAcceptanceEvidence(
+				runDir,
+				'chatgpt'
+			).readState() as { registrationId: string; vaultKeySuffix: string };
+			const item = `${ UNSCOPED_VAULT_KEY_ITEM }-${ vaultKeySuffix }`;
+			expect( ( await readChatGptAccount( registrationId ) )?.state ).toBe( 'signed-in' );
+			expect( [ ...keychain.items.keys() ] ).toEqual( [ item ] );
+
+			printed = [];
+			expect(
+				await runChatGptAcceptance(
+					[ '--live', '--scenario', 'retire', '--run-dir', runDir ],
+					dependencies( realServices( owner ) )
+				)
+			).toBe( 0 );
+			expect( stageOf( 'profile-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'passed',
+				observations: expect.objectContaining( { localCleared: true, vaultKeyRemoved: true } ),
+			} );
+			expect( ( await readChatGptAccount( registrationId ) )?.state ).toBe( 'signed-out' );
+			expect( [ ...keychain.items.keys() ] ).toEqual( [] );
+			expect( new Set( written ) ).toEqual( new Set( [ item ] ) );
+			expectNothingUnsafe( [ ...fake.secrets(), ...issuedHere ], [ registrationId ] );
 		} );
 	} );
 } );
