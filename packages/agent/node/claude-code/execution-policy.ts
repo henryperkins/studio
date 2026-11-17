@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
 import { normalizeHostname as normalizeSiteAddress } from '@studio/common/lib/normalize-hostname';
+import { isReprintPullEnabled } from '@studio/common/lib/sync/reprint-pull';
 import { getSharedConfigPath } from '@studio/common/lib/well-known-paths';
 import {
 	escapeClaudeApprovalText,
@@ -254,6 +255,8 @@ const REFUSALS = {
 		'Studio pushes to or pulls from a WordPress.com site only when it is connected to this conversation’s site, as site_connected_remote_sites lists it, named by its numeric ID or its address; in a conversation on a live site, only that site.',
 	syncOptions:
 		'Studio pushes or pulls only with options from this list, each once, separated by commas: all (alone), sqls, uploads, plugins, themes, contents.',
+	reprintPull:
+		'On this route Studio pulls a site only with its default engine; the Reprint pull (STUDIO_ENABLE_PULL_REPRINT) keeps its state in a folder outside Studio’s configuration folder, which this route does not bind.',
 } as const;
 
 // What a push or pull with each option overwrites on the side it copies to:
@@ -341,6 +344,12 @@ interface HostRequest {
 	wpcomSite?: unknown;
 	/** The sync options as the caller named them; the operation receives them as checked. */
 	syncOptions?: unknown;
+	/**
+	 * A pull, which runs only with the CLI's default engine: the Reprint engine
+	 * keeps a site's pull state under the home folder, whatever Studio's
+	 * configuration folder is, and that state decides what later pulls do.
+	 */
+	defaultPull?: true;
 	/** What the approval and the journal say of the operation after its class and name: a fixed sentence. */
 	note?: string;
 }
@@ -371,6 +380,7 @@ interface PreparedHostOperation {
 	/** The WordPress.com site and the sync options as checked. */
 	wpcomSite?: number;
 	syncOptions?: string;
+	defaultPull?: true;
 }
 
 const WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
@@ -1112,6 +1122,10 @@ export function createClaudeExecutionPolicy(
 			refuse( toolCallId, REFUSALS.scratch );
 			return;
 		}
+		if ( request.defaultPull && isReprintPullEnabled() ) {
+			refuse( toolCallId, REFUSALS.reprintPull );
+			return;
+		}
 		if ( ! ( await checkpoint( callSignal ) ) ) return;
 		// The only WP-CLI command this build runs with approval is the bounded draft.
 		const draftTitle =
@@ -1151,6 +1165,7 @@ export function createClaudeExecutionPolicy(
 			scratch: request.scratch,
 			wpcomSite,
 			syncOptions: syncOptions?.join( ',' ),
+			defaultPull: request.defaultPull,
 		};
 		if ( ! asksFirst( operationClass ) ) return prepared;
 		const grant = await requestApproval( operation, toolCallId, callSignal );
@@ -1286,6 +1301,8 @@ export function createClaudeExecutionPolicy(
 			)
 				return false;
 			if ( prepared.scratch && ! ( await scratchOutsideReach() ) ) return false;
+			// The host chooses a pull's engine as its command starts.
+			if ( prepared.defaultPull && isReprintPullEnabled() ) return false;
 			// And the WordPress.com site: still connected to the site the turn acts on.
 			if (
 				prepared.wpcomSite !== undefined &&
@@ -1627,11 +1644,28 @@ export function createClaudeExecutionPolicy(
 								fenceOptions
 							)
 					),
+				// A WordPress.com site connected to the site the turn acts on, into that
+				// site, bound as a push is, by the CLI's default engine only.
 				pull: ( site, options, remoteSite, onProgress ) =>
 					run(
-						{ name: 'sync.pull', site, args: [ options, remoteSite ?? null ], remote: remoteSite },
-						( current, fenceOptions ) =>
-							host.sync.pull( current!, options, remoteSite, onProgress, fenceOptions )
+						{
+							name: 'sync.pull',
+							site,
+							args: [],
+							wpcomSite: remoteSite,
+							syncOptions: options,
+							scratch: true,
+							defaultPull: true,
+							note: 'It copies one of this site’s connected WordPress.com sites into this local site and replaces what overwrites names in this local site, stopping the site while it runs if it is running',
+						},
+						( current, fenceOptions, _operation, checked ) =>
+							host.sync.pull(
+								current!,
+								checked.syncOptions!,
+								checked.wpcomSite!,
+								onProgress,
+								fenceOptions
+							)
 					),
 			},
 			// Makes a site this turn created the conversation's site. The turn's

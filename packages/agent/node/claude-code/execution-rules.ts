@@ -63,6 +63,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		deletePreviewTool.name,
 		listConnectedRemoteSitesTool.name,
 		pushSiteTool.name,
+		pullSiteTool.name,
 		wpcomRequestTool.name,
 		startSiteTool.name,
 		stopSiteTool.name,
@@ -910,7 +911,23 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 			using( { ...LOCAL_SITE_HOST_CHANNELS, reachesWpcom: [ 'host' ] } )
 		),
 	],
-	[ pullSiteTool.name, unqualified( onSite( 'remote-overwrite', { approval: 'host' } ) ) ],
+	[
+		pullSiteTool.name,
+		// It resolves the site it names and pulls into it through the host, which
+		// runs the CLI's own `pull` for the site the turn acts on only, bound as
+		// `site_push` is: a WordPress.com site connected to it, by its numeric ID,
+		// checked again immediately before the command, with only the options the
+		// command takes. The user approves it, seeing the direction, the site and
+		// what it overwrites in the local site, and it is journaled before it
+		// runs. Only the CLI's default engine runs: the Reprint engine keeps its
+		// state outside Studio's configuration folder, so the host refuses it.
+		// Its module links `tools/utils.ts`, whose `runWpCli` runs only through
+		// the host.
+		qualified(
+			onSite( 'remote-overwrite', { approval: 'host' } ),
+			using( { ...LOCAL_SITE_HOST_CHANNELS, reachesWpcom: [ 'host' ] } )
+		),
+	],
 	// The CLI's import reads, and its export writes, the file the call names.
 	// The host binds that file to the conversation's own folders, resolved
 	// through links and short names, when it prepares the operation and again

@@ -241,7 +241,9 @@ const HOST_CALLS: Record<
 	'sync.push': {
 		call: ( host ) => host.sync.push( site, 'all', String( fakeRemoteSite.id ), () => {} ),
 	},
-	'sync.pull': { call: ( host ) => host.sync.pull( site, 'all', 'remote', () => {} ) },
+	'sync.pull': {
+		call: ( host ) => host.sync.pull( site, 'all', String( fakeRemoteSite.id ), () => {} ),
+	},
 };
 
 async function setup( ...args: Parameters< typeof createPolicyFixture > ) {

@@ -105,6 +105,7 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 		reachesWpcom: [ 'host' ],
 	},
 	site_push: { ...throughHost, reachesWpcom: [ 'host' ] },
+	site_pull: { ...throughHost, reachesWpcom: [ 'host' ] },
 	site_connected_remote_sites: {
 		...throughHost,
 		readsLocalFiles: [ 'config' ],

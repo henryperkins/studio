@@ -78,11 +78,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	preview_update: { status: 'bridged' },
 	preview_delete: { status: 'bridged' },
 	site_push: { status: 'bridged' },
-	site_pull: {
-		status: 'unqualified',
-		step: 'C2a-3',
-		reason: `${ REMOTE }; the remote is not matched to the live target (carry item 12)`,
-	},
+	site_pull: { status: 'bridged' },
 	send_feedback: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
 	generate_images: {
 		status: 'unqualified',

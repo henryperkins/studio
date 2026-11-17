@@ -776,6 +776,116 @@ describe( 'site_push on the Claude route', () => {
 	} );
 } );
 
+describe( 'site_pull on the Claude route', () => {
+	const REPRINT_REFUSAL = 'only with its default engine';
+	afterEach( () => {
+		vi.unstubAllEnvs();
+	} );
+
+	it( 'pulls one of the conversation’s site’s connected WordPress.com sites into it once the user approves it, showing the direction, the site and what it overwrites in the local site, journaled before the command', async () => {
+		const fixture = await setup();
+		const { bridge, host, context, journal, events, site, localSite } = fixture;
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		const order = journalOrder( fixture, { 'sync.pull': host.sync.pull } );
+		expect( bridge.tools ).toContain( 'site_pull' );
+		const result = await bridge.invoke( 'site_pull', {
+			nameOrPath: 'site',
+			remoteSite: 'myprod.wordpress.com',
+			options: 'uploads,themes',
+		} );
+		expect( result.isError ).toBe( false );
+		expect( host.sync.pull ).toHaveBeenCalledWith(
+			localSite,
+			'uploads,themes',
+			'111',
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		expect( request.operation ).toMatchObject( {
+			tool: 'sync.pull',
+			operationClass: 'remote-overwrite',
+			args: [ { direction: 'pull', remoteSite: 111, overwrites: [ 'the uploads', 'the themes' ] } ],
+			localPaths: [ site ],
+			remote: 'WordPress.com site 111',
+		} );
+		expect( request.operation.description ).toContain(
+			'replaces what overwrites names in this local site'
+		);
+		expect( order ).toEqual( [ 'journal site_pull', 'journal sync.pull', 'host sync.pull' ] );
+		expect( journal[ 1 ] ).toMatchObject( { requestId: request.requestId } );
+		expect( JSON.stringify( [ journal, events ] ) ).not.toContain( LOGIN.accessToken );
+	} );
+
+	it( 'pulls from no site but a connected one of the conversation’s site, with only the options the command takes, and with no remote left for it to pick, says why and asks nothing', async () => {
+		const { bridge, host, policy, localSite, context } = await setup();
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		for ( const remoteSite of [ '222', '333', 'https://other.example.test' ] ) {
+			const result = await bridge.invoke( 'site_pull', { nameOrPath: 'site', remoteSite } );
+			expect( result.isError, remoteSite ).toBe( true );
+			expect( text( result ), remoteSite ).toContain( REMOTE_REFUSAL );
+		}
+		for ( const options of [ 'paths', 'all,uploads', 'sqls,' ] ) {
+			const result = await bridge.invoke( 'site_pull', {
+				nameOrPath: 'site',
+				remoteSite: '111',
+				options,
+			} );
+			expect( result.isError, options ).toBe( true );
+			expect( text( result ), options ).toContain( OPTIONS_REFUSAL );
+		}
+		await expect(
+			policy.guardHost( host, 'picker' ).sync.pull( localSite, 'all', undefined, () => {} )
+		).rejects.toThrow( 'Denied' );
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect( host.sync.pull ).not.toHaveBeenCalled();
+	} );
+
+	it( 'runs no Reprint pull, which keeps its state outside Studio’s configuration folder, checked again immediately before the command starts', async () => {
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		vi.stubEnv( 'STUDIO_ENABLE_PULL_REPRINT', '1' );
+		const reprint = await setup();
+		const refused = await reprint.bridge.invoke( 'site_pull', {
+			nameOrPath: 'site',
+			remoteSite: '111',
+		} );
+		expect( refused.isError ).toBe( true );
+		expect( text( refused ) ).toContain( REPRINT_REFUSAL );
+		expect( reprint.context.approve ).not.toHaveBeenCalled();
+		expect( reprint.host.sync.pull ).not.toHaveBeenCalled();
+		vi.unstubAllEnvs();
+		// Turned on while the command is about to start.
+		const started = await setup();
+		let ran = false;
+		vi.mocked( started.host.sync.pull ).mockImplementation(
+			async ( _site, _options, _remote, _onProgress, fence ) => {
+				vi.stubEnv( 'STUDIO_ENABLE_PULL_REPRINT', '1' );
+				await fence?.beforeSpawn?.();
+				ran = true;
+				return fakeRemoteSite;
+			}
+		);
+		expect(
+			( await started.bridge.invoke( 'site_pull', { nameOrPath: 'site', remoteSite: '111' } ) )
+				.isError
+		).toBe( true );
+		expect( ran ).toBe( false );
+	} );
+
+	it( 'checks the connection again once the user has answered, so a site disconnected meanwhile is not pulled', async () => {
+		const { bridge, host, context } = await setup();
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		vi.mocked( context.approve ).mockImplementationOnce( async () => {
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( [] );
+			return 'allow';
+		} );
+		expect(
+			( await bridge.invoke( 'site_pull', { nameOrPath: 'site', remoteSite: '111' } ) ).isError
+		).toBe( true );
+		expect( host.sync.pull ).not.toHaveBeenCalled();
+	} );
+} );
+
 describe( 'site_connected_remote_sites on the Claude route', () => {
 	// The account's own listing of its sites, as WordPress.com answers it: the
 	// site connected to the conversation's site, and another one.
