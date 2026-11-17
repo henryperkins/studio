@@ -166,6 +166,11 @@ export interface StudioAgentHost {
 	// of its own, as the Claude route's guarded host does. Without it, the image
 	// tool runs them as WP-CLI `eval` commands through `sites.wpCli`.
 	media?: StudioAgentMediaLibrary;
+	// Set by a host made for one call, as the Claude route's guarded host is: it
+	// aborts once that call is cancelled or its turn ends. A tool that leaves
+	// work running starts nothing new after that, and still settles what it
+	// began. Without it a tool's work runs as it always has.
+	callSignal?: AbortSignal;
 	// Present when an app shows the conversation. Tools that only make sense
 	// there, and their mentions in the prompt, depend on it.
 	ui?: StudioAgentUi;

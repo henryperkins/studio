@@ -490,6 +490,13 @@ function isImageFileName( name: unknown ): name is string {
 	return typeof name === 'string' && name.length <= 255 && /^[^\\/:\0]+\.png$/i.test( name );
 }
 
+// What the journal entry of a settling says it settles, by count only.
+function settlingNote( completed: number, removed: number ): string {
+	return `It completes the ${ completed } attachment${
+		completed === 1 ? '' : 's'
+	} of this call whose image was written and deletes the ${ removed } whose image was not, since the call was cancelled; no further image is requested`;
+}
+
 function isAttachmentId( id: unknown ): id is number {
 	return Number.isSafeInteger( id ) && ( id as number ) > 0;
 }
@@ -1828,19 +1835,63 @@ export function createClaudeExecutionPolicy(
 		// turn acts on: only this call completes or deletes them, each once.
 		const reservedAttachments = new Set< number >();
 		// One of the media library's fixed WP-CLI commands, Studio's own code, run
-		// as the turn runs every WP-CLI command, without the site's own code.
+		// as the turn runs every WP-CLI command, without the site's own code. It
+		// is fenced before it starts, and once started runs to its end whatever
+		// the call's signal says: a reservation cut short would leave attachments
+		// no one knows of, a completion cut short would leave them half done.
 		const mediaCommand = async (
 			site: HostSite,
 			args: string[],
-			options: HostOperationOptions
+			{ beforeSpawn }: HostOperationOptions
 		): Promise< string > => {
-			const { exitCode, stdout } = await host.sites.wpCli(
-				site,
-				[ ...args, ...WP_CLI_ISOLATION ],
-				options
-			);
+			const { exitCode, stdout } = await host.sites.wpCli( site, [ ...args, ...WP_CLI_ISOLATION ], {
+				beforeSpawn,
+			} );
 			if ( exitCode !== 0 ) throw new Error( `WP-CLI exited with code ${ exitCode }` );
 			return stdout;
+		};
+		// The fence of a media command that settles this call's own attachments,
+		// which runs once the call has been cancelled too: only that no WP-CLI
+		// configuration of the site's own would change what it runs.
+		const settlingFence = ( folder: string ): HostOperationOptions => ( {
+			beforeSpawn: async () => {
+				if ( await hasWpCliOverrides( folder ).catch( () => true ) ) throw denied();
+			},
+		} );
+		// Settles this call's own reservations once the call was cancelled or its
+		// turn ended: the attachments whose images were written are completed, the
+		// others deleted. It belongs to the call the user approved and the journal
+		// admitted, and touches only attachments this call reserved, so neither
+		// signal refuses it and nothing asks. It is journaled first, saying what
+		// it settles, and runs only in the site the turn acts on, still at its
+		// folder.
+		const settle = async ( site: HostSite, completed: number[], removed: number[] ) => {
+			const targetSite = actingSite;
+			const current = targetSite ? await resolveTarget( host, site.path ) : undefined;
+			if ( ! targetSite || ! current || current.id !== site.id ) throw denied();
+			const operationClass = HOST_OPERATION_CLASSES[ 'media.finalize' ];
+			const description = `${ describeClaudeOperation(
+				operationClass,
+				'media.finalize'
+			) }. ${ settlingNote( completed.length, removed.length ) }`;
+			try {
+				await context.recordOperation( {
+					type: 'operation.authorized',
+					runId: context.runId,
+					turnId: context.turnId,
+					toolCallId,
+					operation: { tool: 'media.finalize', operationClass, target: { ...actingTarget } },
+					description: escapeClaudeApprovalText( description ),
+				} );
+			} catch {
+				throw denied();
+			}
+			await mediaCommand(
+				current,
+				finalizeAttachmentsArgs( completed, removed ),
+				settlingFence( targetSite.path )
+			);
+			for ( const id of [ ...completed, ...removed ] ) reservedAttachments.delete( id );
 		};
 		// A change of the conversation's site, to a site this turn created: asked
 		// about when the turn asks before every change, journaled, then made.
@@ -1886,6 +1937,8 @@ export function createClaudeExecutionPolicy(
 		const { ui } = host;
 		return {
 			...host,
+			// A tool that leaves work running stops starting it once this aborts.
+			callSignal: operationSignal,
 			wpcom: { sites: ( accessToken ) => listing( () => host.wpcom.sites( accessToken ) ) },
 			tracks: { record: refused },
 			// What a call shows in the conversation is written to the chat's record,
@@ -2128,7 +2181,7 @@ export function createClaudeExecutionPolicy(
 											[],
 											reserved.map( ( { id } ) => id )
 										),
-										options
+										settlingFence( current!.path )
 									).catch( () => undefined );
 									refuse( toolCallId, REFUSALS.mediaUploads );
 									throw denied();
@@ -2138,7 +2191,9 @@ export function createClaudeExecutionPolicy(
 						}
 					);
 				},
-				// Only attachments this call reserved, each once.
+				// Only attachments this call reserved, each once. Once the call has
+				// been cancelled, or is cancelled before the command starts, they are
+				// settled all the same (`settle`).
 				finalize: async ( site, ready, failed ) => {
 					const ids =
 						Array.isArray( ready ) && Array.isArray( failed ) ? [ ...ready, ...failed ] : [];
@@ -2150,22 +2205,30 @@ export function createClaudeExecutionPolicy(
 						throw denied();
 					const completed = [ ...ready ];
 					const removed = [ ...failed ];
-					await run(
-						{
-							name: 'media.finalize',
-							site,
-							args: [ { ready: completed, failed: removed } ],
-							note: 'It completes the attachments of this site’s images that were made, with their smaller sizes, and deletes those of the images that failed',
-						},
-						async ( current, options ) => {
-							await mediaCommand(
-								current!,
-								finalizeAttachmentsArgs( completed, removed ),
-								options
+					if ( ! operationSignal.aborted )
+						try {
+							await run(
+								{
+									name: 'media.finalize',
+									site,
+									args: [ { ready: completed, failed: removed } ],
+									note: 'It completes the attachments of this site’s images that were made, with their smaller sizes, and deletes those of the images that failed',
+								},
+								async ( current, options ) => {
+									await mediaCommand(
+										current!,
+										finalizeAttachmentsArgs( completed, removed ),
+										options
+									);
+									for ( const id of ids ) reservedAttachments.delete( id );
+								}
 							);
-							for ( const id of ids ) reservedAttachments.delete( id );
+							return;
+						} catch ( error ) {
+							if ( ! operationSignal.aborted ) throw error;
 						}
-					);
+					if ( ids.some( ( id ) => reservedAttachments.has( id ) ) )
+						await settle( site, completed, removed );
 				},
 			},
 			// Makes a site this turn created the conversation's site. The turn's

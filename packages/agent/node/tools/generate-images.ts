@@ -128,7 +128,13 @@ export const generateImagesTool = defineTool(
 			aspectRatio: image.aspectRatio,
 		} ) );
 
-		const generation = generateImages( host.userAgent, imageService.token, requests )
+		// A host made for one call stops the requests once that call is cancelled;
+		// what was reserved is still completed or deleted below.
+		const signal = host.callSignal;
+		const generating = signal
+			? generateImages( host.userAgent, imageService.token, requests, undefined, signal )
+			: generateImages( host.userAgent, imageService.token, requests );
+		const generation = generating
 			.catch( ( error ): GenerateImageResult[] =>
 				requests.map( () => ( { ok: false, error: String( error ) } ) )
 			)

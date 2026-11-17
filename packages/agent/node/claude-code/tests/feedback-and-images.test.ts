@@ -1,5 +1,5 @@
 import { existsSync } from 'fs';
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { getCurrentUserId, readAuthToken } from '@studio/common/lib/shared-config';
@@ -125,7 +125,7 @@ afterEach( async () => {
 } );
 
 async function setupWith(
-	capabilities: { imageGeneration?: boolean },
+	capabilities: Parameters< typeof createStudioClaudeToolBridge >[ 3 ],
 	...args: Parameters< typeof createPolicyFixture >
 ) {
 	const fixture = await createPolicyFixture( ...args );
@@ -374,10 +374,15 @@ describe( 'generate_images on the Claude route', () => {
 		expect( request.operation.description ).toContain( 'wp-content/uploads' );
 
 		// What leaves the machine: one prompt per image, made from its specs, to
-		// the image service, signed in with its own credential.
-		expect( generateImages ).toHaveBeenCalledWith( 'WordPressStudio/test', LOGIN.accessToken, [
-			{ prompt: expect.stringContaining( 'Pebbles on a beach' ), aspectRatio: undefined },
-		] );
+		// the image service, signed in with its own credential, requested only
+		// while the call lives.
+		expect( generateImages ).toHaveBeenCalledWith(
+			'WordPressStudio/test',
+			LOGIN.accessToken,
+			[ { prompt: expect.stringContaining( 'Pebbles on a beach' ), aspectRatio: undefined } ],
+			undefined,
+			expect.any( AbortSignal )
+		);
 		expect( journaled( journal ) ).toEqual( [ [ 'generate_images', 'remote-change' ] ] );
 		expect( journal[ 0 ].requestId ).toBe( request.requestId );
 
@@ -425,12 +430,9 @@ describe( 'generate_images on the Claude route', () => {
 			expect( called ).toEqual( localSite );
 			expect( args[ 0 ] ).toBe( 'eval' );
 			expect( args.slice( 2 ) ).toEqual( ISOLATION );
-			expect( options ).toEqual(
-				expect.objectContaining( {
-					signal: expect.any( AbortSignal ),
-					beforeSpawn: expect.any( Function ),
-				} )
-			);
+			// Fenced before it starts, and once started run to its end, whatever
+			// the call's signal says.
+			expect( options ).toEqual( { beforeSpawn: expect.any( Function ) } );
 		}
 		expect( calls[ 0 ][ 1 ][ 1 ] ).toContain( 'wp_insert_attachment' );
 		expect( decoded( calls[ 0 ][ 1 ][ 1 ] ) ).toEqual( [ 'hero.png', 'buns.png' ] );
@@ -611,5 +613,221 @@ describe( 'generate_images on the Claude route', () => {
 			expect( request.operation.description ).toContain( 'may already have taken effect' );
 			expect( request.operation.localPaths ).toEqual( [ site ] );
 		}
+	} );
+} );
+
+describe( 'generate_images when its call is cancelled', () => {
+	const MONTH = path.join( 'wp-content', 'uploads', '2026', '11' );
+	const decodedData = ( php: string ) =>
+		JSON.parse(
+			Buffer.from( /base64_decode\( '([^']+)' \)/.exec( php )![ 1 ], 'base64' ).toString()
+		);
+
+	// WordPress's media library in the conversation's site, as the fixed
+	// commands change it: a reservation inserts a row per name, in this month's
+	// uploads folder, which WordPress creates; a completion marks rows done, a
+	// deletion removes them. `onReserve` runs while the reservation runs.
+	function mediaLibrary( host: StudioAgentHost, site: string, onReserve?: () => void ) {
+		const rows = new Map< number, { file: string; done: boolean } >();
+		let next = 7;
+		host.sites.wpCli = vi.fn( async ( _site, args ) => {
+			const php = args[ 1 ] ?? '';
+			const data = decodedData( php );
+			if ( php.includes( 'wp_insert_attachment' ) ) {
+				await mkdir( path.join( site, MONTH ), { recursive: true } );
+				const reserved = ( data as string[] ).map( ( name ) => {
+					const id = next++;
+					rows.set( id, { file: path.join( site, MONTH, name ), done: false } );
+					return {
+						id,
+						file: `wp-content/uploads/2026/11/${ name }`,
+						url: `http://localhost:8888/wp-content/uploads/2026/11/${ name }`,
+					};
+				} );
+				onReserve?.();
+				return { exitCode: 0, stdout: JSON.stringify( reserved ), stderr: '' };
+			}
+			for ( const id of data.ready as number[] ) rows.get( id )!.done = true;
+			for ( const id of data.failed as number[] ) rows.delete( id );
+			return { exitCode: 0, stdout: '', stderr: '' };
+		} );
+		return {
+			rows,
+			// No attachment row without its file, and no file without its attachment completed.
+			async isSettled() {
+				for ( const [ id, row ] of rows ) {
+					expect( existsSync( row.file ), `row ${ id }` ).toBe( true );
+					expect( row.done, `row ${ id }` ).toBe( true );
+				}
+				const folder = path.join( site, MONTH );
+				const files = existsSync( folder ) ? await readdir( folder ) : [];
+				for ( const file of files )
+					expect(
+						[ ...rows.values() ].some(
+							( row ) => row.done && row.file === path.join( folder, file )
+						),
+						file
+					).toBe( true );
+			},
+		};
+	}
+
+	// The image service, answering each request when the test says, as `fetch`
+	// is called; an aborted request rejects as `fetch` rejects it. A request
+	// made without a signal cannot be aborted, so once the call is cancelled it
+	// is answered at once, and a call that keeps requesting still ends.
+	function imageService( cancel: AbortSignal ) {
+		const requests: Array< { answer: ( onRead?: () => void ) => void } > = [];
+		const unabortable: Array< () => void > = [];
+		cancel.addEventListener( 'abort', () => unabortable.forEach( ( answer ) => answer() ) );
+		const fetch = vi.fn(
+			( _url: string, init: { signal?: AbortSignal } ) =>
+				new Promise( ( resolve, reject ) => {
+					const abort = () =>
+						reject( new DOMException( 'This operation was aborted', 'AbortError' ) );
+					if ( init.signal?.aborted ) return abort();
+					init.signal?.addEventListener( 'abort', abort, { once: true } );
+					const answer = ( onRead?: () => void ) =>
+						resolve( {
+							status: 200,
+							text: async () => {
+								onRead?.();
+								return JSON.stringify( { data: [ { b64_json: PNG.toString( 'base64' ) } ] } );
+							},
+						} );
+					requests.push( { answer } );
+					if ( ! init.signal ) {
+						if ( cancel.aborted ) answer();
+						else unabortable.push( () => answer() );
+					}
+				} )
+		);
+		vi.stubGlobal( 'fetch', fetch );
+		return { fetch, requests };
+	}
+
+	const images = ( site: string, count: number ) => ( {
+		images: Array.from( { length: count }, ( _, index ) => ( {
+			path: path.join( site, 'wp-content', 'uploads', `image-${ index }.png` ),
+			subject: `Image ${ index }`,
+		} ) ),
+	} );
+	const settledEntry = ( journal: Array< { operation: { tool: string }; description: string } > ) =>
+		journal.filter( ( entry ) => entry.operation.tool === 'media.finalize' ).at( -1 );
+
+	beforeEach( async () => {
+		const actual = await vi.importActual< typeof import('@studio/agent/node/image-generation') >(
+			'@studio/agent/node/image-generation'
+		);
+		vi.mocked( generateImages ).mockImplementation( actual.generateImages );
+	} );
+	afterEach( () => {
+		vi.unstubAllGlobals();
+	} );
+
+	it( 'requests no image once the call is cancelled while its attachments are reserved, and deletes them all, journaled as settled', async () => {
+		const cancel = new AbortController();
+		const { bridge, host, journal, site } = await setupImages();
+		const library = mediaLibrary( host, site, () => cancel.abort() );
+		const { fetch } = imageService( cancel.signal );
+		await bridge.invoke( 'generate_images', images( site, 2 ), cancel.signal );
+		expect( fetch ).not.toHaveBeenCalled();
+		expect( library.rows.size ).toBe( 0 );
+		await library.isSettled();
+		expect( settledEntry( journal )?.description ).toContain(
+			'completes the 0 attachments of this call whose image was written and deletes the 2 whose image was not, since the call was cancelled'
+		);
+	} );
+
+	it( 'requests no further image once the call is cancelled between images, keeps the one that arrived, and deletes the rest, journaled as settled', async () => {
+		const cancel = new AbortController();
+		const { bridge, host, journal, site } = await setupImages();
+		const library = mediaLibrary( host, site );
+		const service = imageService( cancel.signal );
+		const call = bridge.invoke( 'generate_images', images( site, 6 ), cancel.signal );
+		// Five requests at a time: the sixth waits for one of them to finish.
+		await vi.waitFor( () => expect( service.requests ).toHaveLength( 5 ) );
+		service.requests[ 0 ].answer( () => cancel.abort() );
+		await call;
+		expect( service.fetch ).toHaveBeenCalledTimes( 5 );
+		expect( [ ...library.rows.values() ] ).toEqual( [
+			{ file: path.join( site, MONTH, 'image-0.png' ), done: true },
+		] );
+		expect( await readFile( path.join( site, MONTH, 'image-0.png' ) ) ).toEqual( PNG );
+		await library.isSettled();
+		expect( settledEntry( journal )?.description ).toContain(
+			'completes the 1 attachment of this call whose image was written and deletes the 5 whose image was not, since the call was cancelled'
+		);
+	} );
+
+	it( 'completes, once the call is cancelled after the last image was written, the attachments of the images written and deletes the others, journaled as settled', async () => {
+		const cancel = new AbortController();
+		const { bridge, host, policy, journal, site } = await setupImages();
+		const library = mediaLibrary( host, site );
+		vi.mocked( generateImages ).mockResolvedValueOnce( [
+			{ ok: true, bytes: PNG },
+			{ ok: false, error: 'Timed out' },
+		] );
+		// The call is cancelled as the tool, its images written, settles them.
+		const guardHost = policy.guardHost;
+		policy.guardHost = ( ...guarding ) => {
+			const guarded = guardHost( ...guarding );
+			const media = guarded.media!;
+			return {
+				...guarded,
+				media: {
+					...media,
+					finalize: async ( ...settling ) => {
+						cancel.abort();
+						return media.finalize( ...settling );
+					},
+				},
+			};
+		};
+		await bridge.invoke( 'generate_images', images( site, 2 ), cancel.signal );
+		expect( [ ...library.rows.values() ] ).toEqual( [
+			{ file: path.join( site, MONTH, 'image-0.png' ), done: true },
+		] );
+		await library.isSettled();
+		expect(
+			journal.map( ( entry ) => entry.operation.tool ),
+			'the settling is journaled before it runs'
+		).toEqual( [ 'generate_images', 'media.reserve', 'media.finalize' ] );
+		expect( settledEntry( journal )?.description ).toContain(
+			'completes the 1 attachment of this call whose image was written and deletes the 1 whose image was not, since the call was cancelled'
+		);
+	} );
+
+	it( 'keeps the turn up after Stop only for a bounded wait, whatever a call still settling does', async () => {
+		const cancel = new AbortController();
+		const { bridge, host, site } = await setupWith( {
+			imageGeneration: true,
+			settleWaitMs: 50,
+		} );
+		const library = mediaLibrary( host, site );
+		vi.mocked( generateImages ).mockResolvedValueOnce( [ { ok: true, bytes: PNG } ] );
+		// The settling command hangs until the test lets it end.
+		let release = () => {};
+		const reserve = vi.mocked( host.sites.wpCli ).getMockImplementation()!;
+		host.sites.wpCli = vi.fn( async ( ...args: Parameters< typeof reserve > ) => {
+			if ( ! args[ 1 ][ 1 ]?.includes( 'wp_insert_attachment' ) )
+				await new Promise< void >( ( resolve ) => ( release = resolve ) );
+			return reserve( ...args );
+		} );
+		let settled = false;
+		const call = bridge
+			.invoke( 'generate_images', images( site, 1 ), cancel.signal )
+			.finally( () => ( settled = true ) );
+		await vi.waitFor( () => expect( host.sites.wpCli ).toHaveBeenCalledTimes( 2 ) );
+		cancel.abort();
+		const disposed = await Promise.race( [
+			bridge.dispose().then( () => 'disposed' ),
+			new Promise( ( resolve ) => setTimeout( () => resolve( 'still waiting' ), 2000 ) ),
+		] );
+		expect( disposed ).toBe( 'disposed' );
+		expect( settled ).toBe( false );
+		release();
+		await call;
+		await library.isSettled();
 	} );
 } );
