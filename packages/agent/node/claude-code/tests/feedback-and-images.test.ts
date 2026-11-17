@@ -329,7 +329,10 @@ describe( 'generate_images on the Claude route', () => {
 			Buffer.from( /base64_decode\( '([^']+)' \)/.exec( php )![ 1 ], 'base64' ).toString()
 		);
 	const SITE_FILES = 'inside the folder of this conversation’s site';
-	const UPLOADS_OUTSIDE = 'this site keeps its uploads outside its folder';
+	// What the uploads check establishes, and only that: not where the uploads are.
+	const UPLOADS_OUTSIDE =
+		'here the folder for this month’s uploads is not an existing folder inside this site’s folder';
+	const UPLOADS_CAUSE = 'keeps its uploads outside';
 	const ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
 
 	// WordPress as a reservation finds it: it makes this month's uploads folder,
@@ -628,6 +631,22 @@ describe( 'generate_images on the Claude route', () => {
 		expect( decoded( calls[ 1 ][ 1 ][ 1 ] ) ).toEqual( { ready: [], failed: [ 7 ] } );
 		expect( existsSync( path.join( site, '2026' ) ) ).toBe( false );
 		expect( await readdir( month ) ).toEqual( [] );
+	} );
+
+	it( 'says only what it found, a month folder that is not an existing folder inside the site, when WordPress could not make that folder inside the site', async () => {
+		const { bridge, host, site, parent } = await setupImages();
+		// The uploads are configured inside the site, but this month's folder was
+		// not made there.
+		reserving( host, 'wp-content/uploads/2026/11', path.join( parent, 'elsewhere' ) );
+		const result = await bridge.invoke( 'generate_images', {
+			images: [ { path: path.join( site, 'wp-content', 'uploads', 'hero.png' ), subject: 'Hero' } ],
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( UPLOADS_OUTSIDE );
+		expect( text( result ) ).not.toContain( UPLOADS_CAUSE );
+		expect( generateImages ).not.toHaveBeenCalled();
+		const calls = vi.mocked( host.sites.wpCli ).mock.calls;
+		expect( decoded( calls[ 1 ][ 1 ][ 1 ] ) ).toEqual( { ready: [], failed: [ 7 ] } );
 	} );
 
 	it( 'deletes again what a reservation that does not have its shape inserted for the call’s images, and generates nothing', async () => {
