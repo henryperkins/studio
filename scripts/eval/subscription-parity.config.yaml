@@ -33,8 +33,9 @@
 # login and is not covered, as in the rest of the eval suite (README). The
 # `staging:` cases at the end belong alone in their run and are refused without
 # a staging site you designate for the run; the write guard stays on in them
-# and lets through only pushes, pulls and writes to that site, refusing any
-# other (`wpcom-write-outside-staging`; README, "Staging"). Cases marked `[image service]` need
+# and lets through only a push to that site and writes to its core REST API
+# (`wp/v2`), refusing any other write, pull or preview change
+# (`wpcom-write-outside-staging`; README, "Staging"). Cases marked `[image service]` need
 # Studio's separate WordPress.com image service and are refused without it; the
 # `imageService` states each case's mode: "required" (the `[image service]`
 # cases), "off" (purely local: no WordPress.com login) or "unused" (keeps the

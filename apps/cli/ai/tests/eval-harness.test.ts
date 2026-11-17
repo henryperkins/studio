@@ -20,6 +20,7 @@ import {
 	withStagingRemote,
 	writesToStagingSite,
 	type RemoteCall,
+	type WpcomWriteAttempt,
 } from 'cli/ai/eval-harness';
 
 // No WordPress.com login: a read the mock passes on never leaves the process.
@@ -511,21 +512,42 @@ describe( 'eval harness', () => {
 			const staging = { id: 4242, url: 'https://staging-4242.wpcomstaging.com/' };
 
 			it.each( [
-				[ 'public-api.wordpress.com', '/rest/v1.1/sites/4242/posts/new', true ],
-				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts', true ],
+				// The push's own two requests, as it sends them.
+				[ 'public-api.wordpress.com', '/rest/v1.1/studio-file-uploads/4242', true ],
+				[ 'public-api.wordpress.com', '/rest/v1.1/studio-file-uploads/4242/upload-1', true ],
 				[
 					'public-api.wordpress.com',
 					'/wpcom/v2/sites/4242/studio-app/sync/import/initiate',
 					true,
 				],
-				[ 'public-api.wordpress.com', '/wpcom/v2/sites/staging-4242.wpcomstaging.com/x', true ],
-				[ 'public-api.wordpress.com', '/wpcom/v2/sites/STAGING-4242.wpcomstaging.com/x', true ],
-				[ 'public-api.wordpress.com', '/rest/v1.1/studio-file-uploads/4242', true ],
-				[ 'public-api.wordpress.com', '/rest/v1.1/studio-file-uploads/4242/upload-1', true ],
+				// The designated site's core REST API, by id or by address.
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts', true ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts/7', true ],
 				[ 'public-api.wordpress.com', '/wp/v2/sites/%34%32%34%32/posts', true ],
-				[ 'public-api.wordpress.com', '/rest/v1.1/sites/113/posts/new', false ],
-				[ 'public-api.wordpress.com', '/rest/v1.1/sites/04242/posts/new', false ],
-				[ 'public-api.wordpress.com', '/rest/v1.1/sites/myprod.wordpress.com/posts/new', false ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/staging-4242.wpcomstaging.com/posts', true ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/STAGING-4242.wpcomstaging.com/posts', true ],
+				[ 'public-api.wordpress.com.', '/wp/v2/sites/4242/posts', true ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', true ],
+				[ 'staging-4242.wpcomstaging.com.', '/wp-json/wp/v2/posts/7', true ],
+				[ 'STAGING-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', true ],
+				// Addressed to the designated site, acting on another site or the account.
+				[ 'public-api.wordpress.com', '/rest/v1.1/sites/4242/posts/7/reblogs/new', false ],
+				[ 'public-api.wordpress.com', '/rest/v1.1/sites/4242/follows/new', false ],
+				[ 'public-api.wordpress.com', '/rest/v1.1/sites/4242/posts/7/likes/new', false ],
+				[ 'public-api.wordpress.com', '/rest/v1.2/sites/4242/posts/new', false ],
+				[ 'public-api.wordpress.com', '/rest/v1.1/sites/4242/posts/new', false ],
+				[ 'public-api.wordpress.com', '/wpcom/v2/sites/4242/studio-app/sync/backup', false ],
+				[ 'public-api.wordpress.com', '/wpcom/v2/sites/staging-4242.wpcomstaging.com/x', false ],
+				[ 'public-api.wordpress.com', '/rest/v1.2/studio-file-uploads/4242', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wpcom/v2/sites/113', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-admin/admin-ajax.php', false ],
+				[ 'staging-4242.wpcomstaging.com', '/', false ],
+				// Another site, or a path the server could read as one.
+				[ 'public-api.wordpress.com', '/wp/v2/sites/113/posts', false ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/04242/posts', false ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/myprod.wordpress.com/posts', false ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242', false ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts/', false ],
 				[ 'public-api.wordpress.com', '/rest/v1.1/me/settings', false ],
 				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/../../sites/113/posts', false ],
 				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/%2e%2e/%2E%2E/sites/113/posts', false ],
@@ -535,11 +557,14 @@ describe( 'eval harness', () => {
 				[ 'public-api.wordpress.com', '/rest/v1.1/studio-file-uploads/113', false ],
 				[ 'public-api.wordpress.com', '/wp/v2/sites/%E0%A4%A/posts', false ],
 				[ 'myprod.wordpress.com', '/wp-json/wp/v2/posts', false ],
-				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', true ],
+				[ 'other-1.wpcomstaging.com', '/wp-json/wp/v2/posts', false ],
 				[ 'wordpress.com', '/sites/4242', false ],
-			] )( 'decides whether %s%s is the designated site: %s', ( hostname, pathname, expected ) => {
-				expect( writesToStagingSite( { hostname, pathname }, staging ) ).toBe( expected );
-			} );
+			] )(
+				'decides whether %s%s may be written in the staging case: %s',
+				( hostname, pathname, expected ) => {
+					expect( writesToStagingSite( { hostname, pathname }, staging ) ).toBe( expected );
+				}
+			);
 
 			it.each( [
 				[ '4242', true ],
@@ -555,10 +580,89 @@ describe( 'eval harness', () => {
 				expect( remoteIsStagingSite( remote, staging ) ).toBe( expected );
 			} );
 
+			it( 'lets the push’s requests and the site’s core REST API through, and refuses any other write addressed to the site', async () => {
+				const { reached, targets } = network();
+				const guard = installWpcomWriteGuard( { stagingSite: staging }, targets );
+				const api = 'https://public-api.wordpress.com';
+				// The push: tus creates the upload, then sends a chunk as a POST overriding PATCH.
+				targets.https.request( {
+					host: 'public-api.wordpress.com',
+					method: 'POST',
+					path: '/rest/v1.1/studio-file-uploads/4242',
+				} );
+				targets.https.request( {
+					host: 'public-api.wordpress.com',
+					method: 'POST',
+					path: '/rest/v1.1/studio-file-uploads/4242/upload-1',
+					headers: { 'X-HTTP-Method-Override': 'PATCH' },
+				} );
+				await targets.global.fetch(
+					`${ api }/wpcom/v2/sites/4242/studio-app/sync/import/initiate`,
+					{
+						method: 'POST',
+					}
+				);
+				await targets.global.fetch( `${ api }/wp/v2/sites/4242/posts/7`, { method: 'POST' } );
+				await targets.global.fetch( 'https://staging-4242.wpcomstaging.com/wp-json/wp/v2/posts', {
+					method: 'POST',
+				} );
+				for ( const write of [
+					`${ api }/rest/v1.1/sites/4242/posts/7/reblogs/new?destination_site_id=113`,
+					`${ api }/rest/v1.1/sites/4242/follows/new`,
+					`${ api }/rest/v1.1/sites/4242/posts/7/likes/new`,
+					'https://other-1.wpcomstaging.com/wp-json/wp/v2/posts',
+					`${ api }./rest/v1.1/sites/113/posts/new`,
+				] ) {
+					await expect( targets.global.fetch( write, { method: 'POST' } ) ).rejects.toThrow(
+						/wpcom-write-outside-staging/
+					);
+				}
+				guard.uninstall();
+
+				expect( guard.allowed ).toEqual( [
+					{ method: 'POST', via: 'http' },
+					{ method: 'POST', via: 'http' },
+					{ method: 'POST', via: 'fetch' },
+					{ method: 'POST', via: 'fetch' },
+					{ method: 'POST', via: 'fetch' },
+				] );
+				expect( guard.attempts ).toHaveLength( 5 );
+				expect(
+					guard.attempts.every(
+						( attempt ) => attempt.code === 'wpcom-write-outside-staging' && attempt.via === 'fetch'
+					)
+				).toBe( true );
+				expect( reached ).toEqual( [
+					'https POST network',
+					'https POST network',
+					`fetch POST ${ api }/wpcom/v2/sites/4242/studio-app/sync/import/initiate`,
+					`fetch POST ${ api }/wp/v2/sites/4242/posts/7`,
+					'fetch POST https://staging-4242.wpcomstaging.com/wp-json/wp/v2/posts',
+				] );
+			} );
+
+			it( 'counts any *.wpcomstaging.com host, and a host written with a trailing dot, as WordPress.com', async () => {
+				const { reached, targets } = network();
+				const guard = installWpcomWriteGuard( {}, targets );
+				for ( const write of [
+					'https://staging-4242.wpcomstaging.com/wp-json/wp/v2/posts',
+					'https://public-api.wordpress.com./rest/v1.1/sites/113/posts/new',
+					'https://WordPress.com./wp-login.php',
+				] ) {
+					await expect( targets.global.fetch( write, { method: 'POST' } ) ).rejects.toThrow(
+						/wpcom-write-under-mock/
+					);
+				}
+				await targets.global.fetch( 'https://staging-4242.wpcomstaging.com/' );
+				guard.uninstall();
+				expect( guard.attempts ).toHaveLength( 3 );
+				expect( reached ).toEqual( [ 'fetch GET https://staging-4242.wpcomstaging.com/' ] );
+			} );
+
 			it( 'lets a write reach the designated site, records it, and refuses one to any other site', async () => {
 				const { reached, targets } = network();
 				const guard = installWpcomWriteGuard( { stagingSite: staging }, targets );
-				const designated = 'https://public-api.wordpress.com/rest/v1.1/sites/4242/posts/new';
+				const designated = 'https://public-api.wordpress.com/wp/v2/sites/4242/posts';
 				const other = 'https://public-api.wordpress.com/rest/v1.1/sites/113/posts/new';
 				await targets.global.fetch( designated, { method: 'POST' } );
 				await expect( targets.global.fetch( other, { method: 'POST' } ) ).rejects.toThrow(
@@ -621,88 +725,92 @@ describe( 'eval harness', () => {
 				);
 			} );
 
-			it( 'passes a wpcom_request write on to the designated site only, refusing any other', async () => {
+			it( 'records a wpcom_request write as designated only once the write guard let it through, and a refused one once, as refused', async () => {
+				const { reached, targets } = network();
 				const original = wpcomRequestTool.handler;
-				const passedOn = vi.fn( async ( _args: { siteId: number } ) => ( {
-					content: [ { type: 'text' as const, text: '{"ok":true}' } ],
-					details: {},
-				} ) );
+				// The tool's transport, sending to the address WordPress.com's client composes.
+				const passedOn = vi.fn(
+					async ( args: {
+						siteId: number;
+						method: string;
+						path: string;
+						apiNamespace?: string;
+					} ) => {
+						const namespace = args.apiNamespace ?? 'wp/v2';
+						await targets.global.fetch(
+							`https://public-api.wordpress.com/${ namespace || 'rest/v1.1' }/sites/${
+								args.siteId
+							}${ args.path }`,
+							{ method: args.method }
+						);
+						return { content: [ { type: 'text' as const, text: '{"ok":true}' } ], details: {} };
+					}
+				);
 				wpcomRequestTool.handler = passedOn as unknown as typeof wpcomRequestTool.handler;
 				const calls: RemoteCall[] = [];
-				const refused: Parameters< typeof withMockedWpcomRequest >[ 1 ] = {
-					site: staging,
-					refused: [],
-				};
-				const restore = withMockedWpcomRequest( calls, refused );
+				// One record of refusals, shared by the wrapper and the guard, as a case shares it.
+				const refused: WpcomWriteAttempt[] = [];
+				const restore = withMockedWpcomRequest( calls, { site: staging, refused } );
+				const guard = installWpcomWriteGuard(
+					{ stagingSite: staging, attempts: refused },
+					targets
+				);
 				try {
 					await wpcomRequestTool.handler(
-						{ siteId: 4242, method: 'POST', path: '/posts', body: { title: 'Hi' } },
+						{ siteId: 4242, method: 'POST', path: '/posts/7', body: { title: 'Hi' } },
 						context()
 					);
-					await expect(
-						wpcomRequestTool.handler(
-							{ siteId: 113, method: 'POST', path: '/posts', body: { title: 'Hi' } },
-							context()
-						)
-					).rejects.toThrow( /wpcom-write-outside-staging/ );
-					await expect(
-						wpcomRequestTool.handler(
-							{ siteId: 4242, method: 'POST', path: '!/me/settings', body: {} },
-							context()
-						)
-					).rejects.toThrow( /wpcom-write-outside-staging/ );
+					for ( const write of [
+						{
+							siteId: 4242,
+							method: 'POST' as const,
+							path: '/posts/7/reblogs/new',
+							apiNamespace: '',
+							body: { destination_site_id: 113 },
+						},
+						{ siteId: 4242, method: 'POST' as const, path: '/follows/new', apiNamespace: '' },
+						{ siteId: 4242, method: 'POST' as const, path: '/posts/7/likes/new', apiNamespace: '' },
+						{ siteId: 113, method: 'POST' as const, path: '/posts', body: { title: 'Hi' } },
+						{ siteId: 4242, method: 'POST' as const, path: '!/me/settings', body: {} },
+					] ) {
+						await expect( wpcomRequestTool.handler( write, context() ) ).rejects.toThrow(
+							/wpcom-write-outside-staging/
+						);
+					}
 					await wpcomRequestTool.handler(
 						{ siteId: 113, method: 'GET', path: '/posts' },
 						context()
 					);
 				} finally {
+					guard.uninstall();
 					restore();
 					wpcomRequestTool.handler = original;
 				}
-				expect( passedOn ).toHaveBeenCalledTimes( 2 );
-				expect( passedOn.mock.calls.map( ( [ args ] ) => args.siteId ) ).toEqual( [ 4242, 113 ] );
-				expect( calls ).toEqual( [
-					{
-						operation: 'wpcom-request',
-						method: 'POST',
-						site: '4242',
-						target: '/posts',
-						designated: true,
-					},
-					{
-						operation: 'wpcom-request',
-						method: 'POST',
-						site: '113',
-						target: '/posts',
-						designated: false,
-					},
-					{
-						operation: 'wpcom-request',
-						method: 'POST',
-						site: '4242',
-						target: '!/me/settings',
-						designated: false,
-					},
+				expect( calls.map( ( call ) => [ call.site, call.target, call.designated ] ) ).toEqual( [
+					[ '4242', '/posts/7', true ],
+					[ '4242', '/posts/7/reblogs/new', false ],
+					[ '4242', '/follows/new', false ],
+					[ '4242', '/posts/7/likes/new', false ],
+					[ '113', '/posts', false ],
+					[ '4242', '!/me/settings', false ],
 				] );
-				expect( refused.refused ).toEqual( [
-					{
-						code: 'wpcom-write-outside-staging',
-						method: 'POST',
-						host: 'wpcom',
-						endpoint: 'other',
-						via: 'wpcom-request',
-					},
-					{
-						code: 'wpcom-write-outside-staging',
-						method: 'POST',
-						host: 'wpcom',
-						endpoint: 'other',
-						via: 'wpcom-request',
-					},
+				// The guard refused what the tool sent; the wrapper what it never passed on.
+				expect( refused.map( ( attempt ) => [ attempt.code, attempt.via ] ) ).toEqual( [
+					[ 'wpcom-write-outside-staging', 'fetch' ],
+					[ 'wpcom-write-outside-staging', 'fetch' ],
+					[ 'wpcom-write-outside-staging', 'fetch' ],
+					[ 'wpcom-write-outside-staging', 'wpcom-request' ],
+					[ 'wpcom-write-outside-staging', 'wpcom-request' ],
+				] );
+				expect( guard.allowed ).toEqual( [ { method: 'POST', via: 'fetch' } ] );
+				expect( passedOn ).toHaveBeenCalledTimes( 5 );
+				expect( reached ).toEqual( [
+					'fetch POST https://public-api.wordpress.com/wp/v2/sites/4242/posts/7',
+					'fetch GET https://public-api.wordpress.com/wp/v2/sites/113/posts',
 				] );
 			} );
 
-			it( 'runs a push or pull only against the designated site, and no preview change', async () => {
+			it( 'runs a push only against the designated site, and no pull or preview change', async () => {
 				const host = createFakeHost( base );
 				const calls: RemoteCall[] = [];
 				const refused: Parameters< typeof withStagingRemote >[ 3 ] = [];
@@ -710,13 +818,15 @@ describe( 'eval harness', () => {
 				const onProgress = vi.fn();
 
 				await staged.sync.push( fakeSite, 'all', '4242', onProgress );
-				await staged.sync.pull(
-					fakeSite,
-					'sqls',
-					'https://staging-4242.wpcomstaging.com',
-					onProgress
-				);
 				for ( const attempt of [
+					// A pull keeps its files under the real home, whatever the profile.
+					() =>
+						staged.sync.pull(
+							fakeSite,
+							'sqls',
+							'https://staging-4242.wpcomstaging.com',
+							onProgress
+						),
 					() => staged.sync.push( fakeSite, 'all', 'https://myprod.wordpress.com', onProgress ),
 					() => staged.sync.push( fakeSite, 'all', undefined, onProgress ),
 					() => staged.sync.pull( fakeSite, 'all', '113', onProgress ),
@@ -729,17 +839,17 @@ describe( 'eval harness', () => {
 
 				expect( host.sync.push ).toHaveBeenCalledTimes( 1 );
 				expect( host.sync.push ).toHaveBeenCalledWith( fakeSite, 'all', '4242', onProgress );
-				expect( host.sync.pull ).toHaveBeenCalledTimes( 1 );
-				for ( const preview of [
+				for ( const notRun of [
+					host.sync.pull,
 					host.previews.create,
 					host.previews.update,
 					host.previews.delete,
 				] ) {
-					expect( preview ).not.toHaveBeenCalled();
+					expect( notRun ).not.toHaveBeenCalled();
 				}
 				expect( calls.map( ( call ) => [ call.operation, call.designated ] ) ).toEqual( [
 					[ 'push', true ],
-					[ 'pull', true ],
+					[ 'pull', false ],
 					[ 'push', false ],
 					[ 'push', false ],
 					[ 'pull', false ],
@@ -747,7 +857,7 @@ describe( 'eval harness', () => {
 					[ 'preview-update', false ],
 					[ 'preview-delete', false ],
 				] );
-				expect( refused ).toHaveLength( 6 );
+				expect( refused ).toHaveLength( 7 );
 				expect( new Set( refused.map( ( attempt ) => attempt.code ) ) ).toEqual(
 					new Set( [ 'wpcom-write-outside-staging' ] )
 				);

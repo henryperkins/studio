@@ -1062,46 +1062,118 @@ describe( 'eval runner provider selection', () => {
 				}
 			);
 
-			it( 'lets writes to the designated site through, by each channel, and records them', async () => {
-				Object.assign( process.env, designated );
-				wpcom.sites.mockResolvedValue( [ listed() ] );
-				vi.mocked( cliAgentHost.sync.push ).mockResolvedValueOnce( listed() as never );
+			const api = 'https://public-api.wordpress.com';
+			// The real tool's transport, sending to the address WordPress.com's client
+			// composes, through fetch: the spied fetch never sends anything.
+			const transport = vi.fn(
+				async ( args: { siteId: number; method: string; path: string; apiNamespace?: string } ) => {
+					const namespace = args.apiNamespace ?? 'wp/v2';
+					await fetch(
+						`${ api }/${ namespace || 'rest/v1.1' }/sites/${ args.siteId }${ args.path }`,
+						{
+							method: args.method,
+						}
+					);
+					return { content: [ { type: 'text' as const, text: '{}' } ], details: {} };
+				}
+			);
+			async function runWithTransport( act: FakeTurnBehavior[ 'act' ] ) {
 				const original = wpcomRequestTool.handler;
-				const passedOn = vi.fn( async () => ( {
-					content: [ { type: 'text' as const, text: '{}' } ],
-					details: {},
-				} ) );
-				wpcomRequestTool.handler = passedOn as unknown as typeof wpcomRequestTool.handler;
-				const designatedWrite =
-					'https://public-api.wordpress.com/wpcom/v2/sites/4242/studio-app/sync/import/initiate';
-				agent.behavior = {
-					replyProvider: 'studio-wpcom',
-					act: async ( { host } ) => {
-						await wpcomRequestTool.handler(
-							{ siteId: 4242, method: 'POST', path: '/posts', body: { title: 'Hi' } },
-							{ host, onProgress: () => undefined }
-						);
-						await fetch( designatedWrite, { method: 'POST' } );
-						await host.sync.push( pushSite, 'all', '4242', () => undefined );
-					},
-				};
-				let result: RunReport;
+				transport.mockClear();
+				wpcomRequestTool.handler = transport as unknown as typeof wpcomRequestTool.handler;
+				agent.behavior = { replyProvider: 'studio-wpcom', act };
 				try {
-					result = await runEval( stagingCase() );
+					return await runEval( stagingCase() );
 				} finally {
 					wpcomRequestTool.handler = original;
 				}
+			}
+
+			it.each( [
+				[
+					'a reblog onto another site',
+					{ path: '/posts/7/reblogs/new', apiNamespace: '', body: { destination_site_id: 113 } },
+				],
+				[ 'a follow', { path: '/follows/new', apiNamespace: '' } ],
+				[ 'a like', { path: '/posts/7/likes/new', apiNamespace: '' } ],
+			] )(
+				'refuses %s addressed through the staging site before it is sent, and fails the case',
+				async ( _name, request ) => {
+					Object.assign( process.env, designated );
+					wpcom.sites.mockResolvedValue( [ listed() ] );
+					const result = await runWithTransport( async ( { host } ) => {
+						await wpcomRequestTool
+							.handler(
+								{ siteId: 4242, method: 'POST', ...request },
+								{ host, onProgress: () => undefined }
+							)
+							.catch( () => undefined );
+						await fetch( `${ api }/rest/v1.1/sites/4242${ request.path }`, {
+							method: 'POST',
+						} ).catch( () => undefined );
+					} );
+					expect( result ).toMatchObject( {
+						success: false,
+						error: expect.stringMatching( /^wpcom-write-outside-staging/ ),
+						remoteGuard: {
+							code: 'wpcom-write-outside-staging',
+							blocked: [
+								expect.objectContaining( { via: 'fetch' } ),
+								expect.objectContaining( { via: 'fetch' } ),
+							],
+							allowed: [],
+						},
+					} );
+					expect( result.remoteCalls ).toEqual( [
+						expect.objectContaining( { operation: 'wpcom-request', designated: false } ),
+					] );
+					expect( transport ).toHaveBeenCalledTimes( 1 );
+					expect(
+						sentToNetwork().filter( ( sent: string ) => ! sent.startsWith( 'GET' ) )
+					).toEqual( [] );
+				}
+			);
+
+			it( 'lets the push’s two requests and a wp/v2 write to the designated site through, and records them', async () => {
+				Object.assign( process.env, designated );
+				wpcom.sites.mockResolvedValue( [ listed() ] );
+				const upload = `${ api }/rest/v1.1/studio-file-uploads/4242`;
+				const importArchive = `${ api }/wpcom/v2/sites/4242/studio-app/sync/import/initiate`;
+				vi.mocked( cliAgentHost.sync.push ).mockImplementationOnce( async () => {
+					// As the push sends them: the archive's upload, then its import.
+					await fetch( upload, { method: 'POST' } );
+					await fetch( importArchive, { method: 'POST' } );
+					return listed() as never;
+				} );
+				const result = await runWithTransport( async ( { host } ) => {
+					await wpcomRequestTool.handler(
+						{ siteId: 4242, method: 'POST', path: '/posts/7', body: { title: 'Hi' } },
+						{ host, onProgress: () => undefined }
+					);
+					await host.sync.push( pushSite, 'all', '4242', () => undefined );
+				} );
 				expect( result ).toMatchObject( {
 					success: true,
-					remoteGuard: { code: null, blocked: [], allowed: [ { method: 'POST', via: 'fetch' } ] },
+					remoteGuard: {
+						code: null,
+						blocked: [],
+						allowed: [
+							{ method: 'POST', via: 'fetch' },
+							{ method: 'POST', via: 'fetch' },
+							{ method: 'POST', via: 'fetch' },
+						],
+					},
 				} );
 				expect( result.remoteCalls ).toEqual( [
 					expect.objectContaining( { operation: 'wpcom-request', designated: true } ),
 					expect.objectContaining( { operation: 'push', designated: true } ),
 				] );
-				expect( passedOn ).toHaveBeenCalledTimes( 1 );
 				expect( cliAgentHost.sync.push ).toHaveBeenCalledTimes( 1 );
-				expect( sentToNetwork() ).toContain( `POST ${ designatedWrite }` );
+				expect( sentToNetwork() ).toEqual( [
+					`POST ${ api }/wp/v2/sites/4242/posts/7`,
+					`POST ${ upload }`,
+					`POST ${ importArchive }`,
+				] );
 			} );
 		} );
 

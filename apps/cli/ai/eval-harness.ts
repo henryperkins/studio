@@ -4,6 +4,7 @@
  * user attached, and history the conversation already has. Development only,
  * for the eval runner.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
@@ -129,11 +130,12 @@ export function remoteIsStagingSite( remote: string | undefined, site: StagingSi
 }
 
 /**
- * The host of a staging case: a push or pull runs for real only when its
- * remote is the designated staging site, and no preview is created, updated
- * or deleted. Each is recorded in `calls`, with whether it was the designated
- * site; anything else is refused before it starts, recorded in `refused`, and
- * fails the case.
+ * The host of a staging case: a push runs for real only when its remote is the
+ * designated staging site; no pull runs (it keeps its files under the real
+ * home directory, whatever the case's profile) and no preview is created,
+ * updated or deleted. Each is recorded in `calls`, with whether it was the
+ * designated site; anything else is refused before it starts, recorded in
+ * `refused`, and fails the case.
  */
 export function withStagingRemote(
 	host: StudioAgentHost,
@@ -177,19 +179,8 @@ export function withStagingRemote(
 				calls.push( { ...call, designated: true } );
 				return host.sync.push( localSite, options, remoteSite, onProgress );
 			},
-			pull: async ( localSite, options, remoteSite, onProgress ) => {
-				const call: RemoteCall = {
-					operation: 'pull',
-					site: localSite.name,
-					target: remoteSite,
-					options,
-				};
-				if ( ! remoteIsStagingSite( remoteSite, site ) ) {
-					return refuse( call );
-				}
-				calls.push( { ...call, designated: true } );
-				return host.sync.pull( localSite, options, remoteSite, onProgress );
-			},
+			pull: async ( localSite, options, remoteSite ) =>
+				refuse( { operation: 'pull', site: localSite.name, target: remoteSite, options } ),
 		},
 	};
 }
@@ -303,6 +294,10 @@ function pathQuery( requestPath: string ): string {
 	return start < 0 ? '' : beforeFragment.slice( start + 1 );
 }
 
+// What the write guard decided about the writes one `wpcom_request` call sent,
+// kept for that call alone, however many calls run at once.
+const wpcomRequestDecisions = new AsyncLocalStorage< { allowed: number; refused: number } >();
+
 /**
  * `wpcom_request` with every request whose effective method is not GET or HEAD
  * (declared, or named by a method override in its `query` or in a query written
@@ -310,10 +305,11 @@ function pathQuery( requestPath: string ): string {
  * each is answered by a fixture, as the mocked host does for pushes and
  * previews: a write the agent asks for never leaves the process. In a staging
  * case one to the designated staging site goes to the real tool, where the
- * write guard checks the address it composes; one to any other site, or to a
- * path outside a site, is refused before it is sent and recorded in
- * `staging.refused`. Reads stay the real tool's. The returned function puts the
- * real tool back.
+ * write guard checks the address it composes, and is recorded as designated
+ * only when the guard let what it sent through (a refused one is in the
+ * guard's record, once); one to any other site, or to a path outside a site,
+ * is refused before it is sent and recorded in `staging.refused`. Reads stay
+ * the real tool's. The returned function puts the real tool back.
  */
 export function withMockedWpcomRequest(
 	calls: RemoteCall[],
@@ -348,11 +344,15 @@ export function withMockedWpcomRequest(
 			return textResult( JSON.stringify( { eval_mock: true, method, path: args.path } ) );
 		}
 		// As the tool reads it: a path starting with `!` is not under the site.
-		const designated = args.siteId === staging.site.id && ! args.path.startsWith( '!' );
-		calls.push( { ...call, designated } );
-		if ( designated ) {
-			return passOn( args, context );
+		if ( args.siteId === staging.site.id && ! args.path.startsWith( '!' ) ) {
+			const decision = { allowed: 0, refused: 0 };
+			try {
+				return await wpcomRequestDecisions.run( decision, () => passOn( args, context ) );
+			} finally {
+				calls.push( { ...call, designated: decision.allowed > 0 && decision.refused === 0 } );
+			}
 		}
+		calls.push( { ...call, designated: false } );
 		staging.refused.push( {
 			code: STAGING_WRITE_CODE,
 			method: KNOWN_METHODS.has( method ) ? method : 'OTHER',
@@ -407,35 +407,99 @@ export interface WpcomWriteGuardOptions {
 
 const WPCOM_API_HOST = 'public-api.wordpress.com';
 
-const stagingHostname = ( site: StagingSite ) => normalizeHostname( site.url ).split( '/' )[ 0 ];
+// A host as it is classified: lower case, without the trailing dot of a fully
+// qualified name, which reaches the same host.
+const normalizeHost = ( hostname: string ) => hostname.toLowerCase().replace( /\.+$/, '' );
+
+// The domains of WordPress.com hosts, staging sites' own included. A site on a
+// custom domain can't be recognised as a WordPress.com host.
+const WPCOM_DOMAINS = [ 'wordpress.com', 'wp.com', 'wpcomstaging.com' ];
+const isWpcomHost = ( host: string ) =>
+	WPCOM_DOMAINS.some( ( domain ) => host === domain || host.endsWith( `.${ domain }` ) );
+
+const stagingHostname = ( site: StagingSite ) =>
+	normalizeHost( normalizeHostname( site.url ).split( '/' )[ 0 ] );
+
+// A path segment a shape matches: itself, the designated site (its id or its
+// address), or the rest of the path (`REST`, one segment or more, or
+// `REST_OR_NONE`).
+const SITE = Symbol( 'the designated site' );
+const REST = Symbol( 'one segment or more' );
+const REST_OR_NONE = Symbol( 'any segments' );
+type ShapeSegment = string | typeof SITE | typeof REST | typeof REST_OR_NONE;
 
 /**
- * Whether a write to a WordPress.com host addresses the designated staging
- * site, decided from the address the request sends: on the API host, the
- * site its path names after a two-part namespace (`/<namespace>/sites/<site>`,
- * or the push's upload endpoint `/rest/<version>/studio-file-uploads/<site>`),
- * by id or by hostname; on any other host, that host being the site's own. A
- * path the server could read as another site (a dot segment, an encoded
- * slash, an empty segment, a segment that doesn't decode) is not.
+ * The only requests a staging case may send that could change something on
+ * WordPress.com, each addressed to the designated staging site. A write
+ * addressed to the staging site can still act on another site or on the
+ * account (a reblog naming its `destination_site_id`, a follow, a like), so
+ * every other namespace and path, the legacy `/rest/v1.x` site API included,
+ * is refused before it is sent.
+ */
+const STAGING_WRITE_SHAPES: ReadonlyArray< { host: 'api' | 'site'; path: ShapeSegment[] } > = [
+	// The push's upload of the site's archive, as tus sends it: it creates the
+	// upload at the site's endpoint, then sends the chunks to the address the
+	// server answers with under it.
+	{ host: 'api', path: [ 'rest', 'v1.1', 'studio-file-uploads', SITE, REST_OR_NONE ] },
+	// The push's request that the site import the uploaded archive.
+	{
+		host: 'api',
+		path: [ 'wpcom', 'v2', 'sites', SITE, 'studio-app', 'sync', 'import', 'initiate' ],
+	},
+	// The site's own core REST API (`wp/v2`), as `wpcom_request` sends it: the
+	// site's posts, pages, templates, styles and other content.
+	{ host: 'api', path: [ 'wp', 'v2', 'sites', SITE, REST ] },
+	// The same API at the site's own address.
+	{ host: 'site', path: [ 'wp-json', 'wp', 'v2', REST ] },
+];
+
+function matchesShape(
+	segments: string[],
+	shape: ShapeSegment[],
+	isSite: ( segment: string ) => boolean
+): boolean {
+	for ( const [ index, expected ] of shape.entries() ) {
+		if ( expected === REST || expected === REST_OR_NONE ) {
+			return expected === REST_OR_NONE || segments.length > index;
+		}
+		const segment = segments[ index ];
+		if (
+			segment === undefined ||
+			! ( expected === SITE ? isSite( segment ) : segment === expected )
+		) {
+			return false;
+		}
+	}
+	return segments.length === shape.length;
+}
+
+/**
+ * Whether a staging case may send a write to this address: it is one of
+ * `STAGING_WRITE_SHAPES`, on the API host with the designated site named by
+ * id or by hostname, or at the site's own address. A path the server could
+ * read as another one (a dot segment, an encoded slash, an empty segment, a
+ * segment that doesn't decode) is not.
  */
 export function writesToStagingSite(
 	target: { hostname: string; pathname: string },
 	site: StagingSite
 ): boolean {
-	const host = target.hostname.toLowerCase();
+	const host = normalizeHost( target.hostname );
 	const stagingHost = stagingHostname( site );
-	if ( host !== WPCOM_API_HOST ) {
-		return host === stagingHost;
+	const [ root, ...raw ] = target.pathname.split( '/' );
+	if ( root !== '' ) {
+		return false;
 	}
 	const segments: string[] = [];
-	for ( const raw of target.pathname.split( '/' ) ) {
+	for ( const encoded of raw ) {
 		let segment: string;
 		try {
-			segment = decodeURIComponent( raw );
+			segment = decodeURIComponent( encoded );
 		} catch {
 			return false;
 		}
 		if (
+			segment === '' ||
 			segment === '.' ||
 			segment === '..' ||
 			/[\\/]/.test( segment ) ||
@@ -445,12 +509,12 @@ export function writesToStagingSite(
 		}
 		segments.push( segment );
 	}
-	const [ root, first, , kind, addressed ] = segments;
-	const siteScoped = kind === 'sites' || ( first === 'rest' && kind === 'studio-file-uploads' );
-	if ( root !== '' || ! siteScoped || ! addressed ) {
-		return false;
-	}
-	return addressed === String( site.id ) || addressed.toLowerCase() === stagingHost;
+	const hostKind = host === WPCOM_API_HOST ? 'api' : host === stagingHost ? 'site' : null;
+	const isSite = ( segment: string ) =>
+		segment === String( site.id ) || segment.toLowerCase() === stagingHost;
+	return STAGING_WRITE_SHAPES.some(
+		( shape ) => shape.host === hostKind && matchesShape( segments, shape.path, isSite )
+	);
 }
 
 interface RequestTarget {
@@ -473,13 +537,7 @@ function classifyWpcomWrite(
 		...headerOverrideValues( target.headers, OVERRIDE_HEADERS ),
 	];
 	const method = effectiveMethod( target.method, undefined, overrides );
-	const host = hostname.toLowerCase();
-	const wpcom =
-		host === 'wordpress.com' ||
-		host.endsWith( '.wordpress.com' ) ||
-		host === 'wp.com' ||
-		host.endsWith( '.wp.com' );
-	if ( ! wpcom || READ_METHODS.has( method ) ) {
+	if ( ! isWpcomHost( normalizeHost( hostname ) ) || READ_METHODS.has( method ) ) {
 		return null;
 	}
 	const proxy = pathname.startsWith( '/wpcom/v2/ai-api-proxy' );
@@ -598,6 +656,13 @@ export function installWpcomWriteGuard(
 ): WpcomWriteGuard {
 	const attempts: WpcomWriteAttempt[] = options.attempts ?? [];
 	const allowed: StagingWrite[] = [];
+	// For the `wpcom_request` call that sent the write, when one did.
+	const decided = ( decision: 'allowed' | 'refused' ) => {
+		const call = wpcomRequestDecisions.getStore();
+		if ( call ) {
+			call[ decision ] += 1;
+		}
+	};
 	const message = options.stagingSite ? stagingBlockedMessage() : blockedMessage();
 	const originalFetch = targets.global.fetch;
 	targets.global.fetch = ( async ( input: Parameters< typeof fetch >[ 0 ], init?: RequestInit ) => {
@@ -633,8 +698,10 @@ export function installWpcomWriteGuard(
 			: null;
 		if ( write && 'stagingWrite' in write ) {
 			allowed.push( { method: write.stagingWrite, via: 'fetch' } );
+			decided( 'allowed' );
 		} else if ( write ) {
 			attempts.push( { ...write, via: 'fetch' } );
+			decided( 'refused' );
 			throw new Error( message );
 		}
 		return originalFetch( input, init );
@@ -647,12 +714,14 @@ export function installWpcomWriteGuard(
 			const write = classifyWpcomWrite( target, options );
 			if ( write && 'stagingWrite' in write ) {
 				allowed.push( { method: write.stagingWrite, via: 'http' } );
+				decided( 'allowed' );
 				return original.apply( module, args );
 			}
 			if ( ! write ) {
 				return original.apply( module, args );
 			}
 			attempts.push( { ...write, via: 'http' } );
+			decided( 'refused' );
 			return original.apply( module, withBlockedConnection( args, message ) );
 		};
 		return original;

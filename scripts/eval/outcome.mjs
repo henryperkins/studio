@@ -999,9 +999,10 @@ export const noRemoteOperation = check( ( d, vars ) => {
 // runner refused, and recorded, every request that could change something on
 // WordPress.com: anything but GET or HEAD to a WordPress.com host, by `fetch`
 // or the `http` modules, except Studio's image service in a case labelled
-// `imageService: required`. Under `remote: staging` the same guard let writes
-// to the designated staging site through and refused, and recorded, any
-// other, as well as a push, pull or preview change whose remote is not that
+// `imageService: required`. Under `remote: staging` the same guard let through
+// only the push's own requests to the designated staging site and writes to
+// that site's core REST API (`wp/v2`), and refused, and recorded, any other
+// write, any pull or preview change, and a push whose remote is not that
 // site. Judged from the guard's record either way: a refused write fails the
 // case. Reads still reach WordPress.com.
 export const noWordPressComWrites = check( ( d, vars ) => {
