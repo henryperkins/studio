@@ -1,4 +1,5 @@
 // @vitest-environment node
+import assert from 'node:assert';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,6 +27,11 @@ vi.mock( '@studio/common/lib/shared-config', async ( original ) => ( {
 // Windows refuses to open a lockfile for a moment while another program
 // deletes it; a test makes the selection's lock refused that many times.
 const lockRace = vi.hoisted( () => ( { refusals: 0, held: false, failRelease: false } ) );
+// A file operation the system refused, as Node raises it: with its errno and system call.
+const systemError = vi.hoisted(
+	() => ( message: string, code: string, errno: number, syscall: string, file: string ) =>
+		Object.assign( new Error( message ), { code, errno, syscall, path: file } )
+);
 vi.mock( '@studio/common/lib/lockfile', async ( original ) => {
 	const actual = await original< typeof import('@studio/common/lib/lockfile') >();
 	return {
@@ -33,26 +39,35 @@ vi.mock( '@studio/common/lib/lockfile', async ( original ) => {
 		lockFileAsync: async ( ...args: Parameters< typeof actual.lockFileAsync > ) => {
 			if ( args[ 0 ].endsWith( '.settings.lock' ) && lockRace.refusals > 0 ) {
 				lockRace.refusals--;
-				throw Object.assign( new Error( 'EPERM: operation not permitted, open' ), {
-					code: 'EPERM',
-				} );
+				throw systemError(
+					`EPERM: operation not permitted, open '${ args[ 0 ] }'`,
+					'EPERM',
+					-4048,
+					'open',
+					args[ 0 ]
+				);
 			}
 			// As the lockfile package gives up once another process held the lock past the wait.
 			if ( args[ 0 ].endsWith( '.settings.lock' ) && lockRace.held ) {
-				throw Object.assign( new Error( `EEXIST: file already exists, open '${ args[ 0 ] }'` ), {
-					code: 'EEXIST',
-				} );
+				throw systemError(
+					`EEXIST: file already exists, open '${ args[ 0 ] }'`,
+					'EEXIST',
+					-4075,
+					'open',
+					args[ 0 ]
+				);
 			}
 			return actual.lockFileAsync( ...args );
 		},
 		unlockFileAsync: async ( lockPath: string ) => {
 			await actual.unlockFileAsync( lockPath );
 			if ( lockPath.endsWith( '.settings.lock' ) && lockRace.failRelease ) {
-				throw Object.assign(
-					new Error( `EPERM: operation not permitted, unlink '${ lockPath }'` ),
-					{
-						code: 'EPERM',
-					}
+				throw systemError(
+					`EPERM: operation not permitted, unlink '${ lockPath }'`,
+					'EPERM',
+					-4048,
+					'unlink',
+					lockPath
 				);
 			}
 		},
@@ -373,6 +388,55 @@ describe( 'ChatGPT session selection', () => {
 			expect( logged.warn ).not.toHaveBeenCalled();
 			// Nothing was written; the lock was let go.
 			await setSessionProvider( root, id, 'wpcom', 'balanced' );
+		}
+	);
+
+	// Node's own errors for a bad argument or a failed assertion carry a string code
+	// too, but they are defects, not a refusal by the system.
+	const raised = ( raise: () => unknown ): Error => {
+		try {
+			raise();
+		} catch ( error ) {
+			return error as Error;
+		}
+		throw new Error( 'Expected the call to throw.' );
+	};
+	it.each( [
+		[
+			'an argument of the wrong type',
+			() => raised( () => path.join( undefined as unknown as string ) ),
+			TypeError,
+			'ERR_INVALID_ARG_TYPE',
+		],
+		[
+			'a value out of range',
+			() => raised( () => Buffer.alloc( -1 ) ),
+			RangeError,
+			'ERR_OUT_OF_RANGE',
+		],
+		[ 'a failed assertion', () => raised( () => assert.ok( false ) ), Error, 'ERR_ASSERTION' ],
+	] )(
+		'records Node’s error for %s inside a selection as a defect, with its stack, once',
+		async ( _name, make, type, code ) => {
+			const { id } = await createAiSession( root );
+			const defect = make();
+			expect( defect ).toBeInstanceOf( type );
+			expect( defect ).toMatchObject( { code } );
+			writerFault.next = defect;
+
+			const failure = await setSessionProvider( root, id, 'wpcom', 'balanced' ).then(
+				() => undefined,
+				( error: unknown ) => error
+			);
+
+			expect( failure ).toMatchObject( {
+				name: 'ChatGptSettingsError',
+				message: 'Studio couldn’t save the model for this chat. Try again.',
+			} );
+			expect( ( failure as { cause?: unknown } ).cause ).toBe( defect );
+			expect( logged.error ).toHaveBeenCalledTimes( 1 );
+			expect( logged.error.mock.calls[ 0 ] ).toContain( defect );
+			expect( logged.warn ).not.toHaveBeenCalled();
 		}
 	);
 

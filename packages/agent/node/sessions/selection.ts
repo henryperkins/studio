@@ -1,5 +1,4 @@
 import { LOCKFILE_STALE_TIME, LOCKFILE_WAIT_TIME } from '@studio/common/constants';
-import { isErrnoException } from '@studio/common/lib/is-errno-exception';
 import { __ } from '@wordpress/i18n';
 import { lockChatGptFile } from '@studio/agent/node/chatgpt/account-store';
 import { ChatGptSettingsError } from '@studio/agent/node/chatgpt/settings';
@@ -59,18 +58,27 @@ export async function withSessionSelection< T >(
 }
 
 // Desktop writes the console to its log file; the studio ui server's console is
-// its terminal. A held lock, a file the system refused or a chat that's gone is
-// expected; anything else is a defect and is logged with its stack.
+// its terminal. A system error (a held lock, a file the system refused) or a chat
+// that's gone is expected; anything else is a defect and is logged with its stack,
+// Node's own argument and assertion errors among them, whose string code alone
+// doesn't make them a system error.
 function logSelectionFailure( context: string, error: unknown ): void {
 	if (
 		error instanceof Error &&
-		( ( isErrnoException( error ) && typeof error.code === 'string' ) ||
-			error.message.startsWith( 'Code session not found:' ) )
+		( isSystemError( error ) || error.message.startsWith( 'Code session not found:' ) )
 	) {
 		console.warn( `[session-selection] ${ context }`, error.message );
 		return;
 	}
 	console.error( `[session-selection] ${ context }`, error );
+}
+
+// As Node raises a call the system refused: with the errno and the system call.
+function isSystemError( error: Error ): boolean {
+	return (
+		( 'errno' in error && typeof error.errno === 'number' ) ||
+		( 'syscall' in error && typeof error.syscall === 'string' )
+	);
 }
 
 function needsNewChat(): never {
