@@ -318,10 +318,10 @@ describe( 'Studio tool results on the Pi route', () => {
 		expect( JSON.stringify( outcome.result.content ) ).not.toMatch(
 			/secret-meta|someone@example|captures/
 		);
-		// The session and the UI keep the artifacts and the service; MCP App data is dropped.
+		// The session and the UI keep the artifacts; MCP App data is dropped, and so
+		// is the service, which only the ChatGPT route keeps.
 		expect( outcome.result.details ).toEqual( {
 			studioArtifacts: [ artifactWidget ],
-			studioService: serviceAccount,
 		} );
 		expect( Object.keys( outcome.result.details as object ) ).not.toContain( '_meta' );
 		expect( JSON.stringify( outcome.result.details ) ).not.toContain( 'secret-meta' );
