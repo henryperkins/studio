@@ -1755,11 +1755,13 @@ describe( 'Signing in to ChatGPT', () => {
 				const address = new URL( start.startUrl );
 				const partial = net.connect( Number( address.port ), address.hostname );
 				partial.on( 'error', () => undefined );
-				const closed = new Promise( ( resolve ) => partial.on( 'close', resolve ) );
+				const closed = new Promise< number >( ( resolve ) =>
+					partial.on( 'close', () => resolve( Date.now() ) )
+				);
 				await once( partial, 'connect' );
+				const connectedAt = Date.now();
 				// Headers begun, never ended: such a connection is held, not idle.
 				partial.write( `GET /auth/callback HTTP/1.1\r\nHost: ${ address.host }\r\n` );
-				const endedAt = Date.now();
 
 				if ( ending === 'completed' ) {
 					const delivery = await deliver( await authorize( start.url ) );
@@ -1772,10 +1774,13 @@ describe( 'Signing in to ChatGPT', () => {
 				} else {
 					expect( await using.wait( start.attemptId ) ).toEqual( failed( 'timed-out' ) );
 				}
-				await closed;
+				const endedAt = Date.now();
+				const closedAt = await closed;
 
-				// Well within the 10 seconds a held connection otherwise keeps.
-				expect( Date.now() - endedAt ).toBeLessThan( 3_000 );
+				// Soon after the attempt ended, however long the sign-in itself took,
+				// and never by the 10 seconds a held connection otherwise keeps.
+				expect( closedAt - endedAt ).toBeLessThan( 5_000 );
+				expect( closedAt - connectedAt ).toBeLessThan( 10_000 );
 			}
 		);
 

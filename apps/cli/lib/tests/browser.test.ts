@@ -3,6 +3,11 @@ import { EventEmitter } from 'events';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { ChatGptSignInError, createChatGptSignInFlow } from '@studio/agent/node/chatgpt/oauth';
+import {
+	createSigningKey,
+	startFakeAuthorizationServer,
+} from '@studio/agent/node/chatgpt/tests/fixtures/fake-authorization-server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openBrowser } from 'cli/lib/browser';
 
@@ -53,6 +58,58 @@ describe( 'opening the system browser on a host without one', () => {
 
 		await expect( openBrowser( URL ) ).rejects.toThrow( 'Failed to open browser' );
 		expect( spawnMock ).toHaveBeenCalledWith( 'xdg-open', expect.any( Array ) );
+	} );
+
+	// osascript exits 1 when AppleScript fails, as when no application opens the address.
+	it( 'fails on macOS when osascript exits non-zero, and a ChatGPT sign-in then ends as browser-unavailable', async () => {
+		onPlatform( 'darwin' );
+		opener( ( child ) => child.emit( 'exit', 1 ) );
+
+		await expect( openBrowser( URL ) ).rejects.toThrow( 'Failed to open browser' );
+		expect( spawnMock ).toHaveBeenCalledWith(
+			'/usr/bin/osascript',
+			expect.any( Array ),
+			expect.anything()
+		);
+
+		// The sign-in start, with this opener as the CLI installs it, against a
+		// local stand-in for the authorization server.
+		const configDirectory = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-opener-sign-in-' ) );
+		vi.stubEnv( 'DEV_CONFIG_DIR', configDirectory );
+		const fake = await startFakeAuthorizationServer( await createSigningKey( 'test-key-1' ) );
+		try {
+			const flow = createChatGptSignInFlow( {
+				discoveryUrl: fake.discoveryUrl,
+				credentials: {
+					saveSignIn: async () => {
+						throw new Error( 'not reached' );
+					},
+					readIdTokenHint: async () => null,
+					checkVaultKey: async () => false,
+				},
+				openBrowser,
+				platform: 'linux',
+				loopbackPeers: () => ( { ownerOf: async () => 'same-user', close: async () => undefined } ),
+			} );
+
+			const error = await flow.begin( undefined, { storage: 'session' } ).catch( ( e ) => e );
+
+			expect( error ).toBeInstanceOf( ChatGptSignInError );
+			expect( error.code ).toBe( 'browser-unavailable' );
+			expect( spawnMock ).toHaveBeenLastCalledWith(
+				'/usr/bin/osascript',
+				expect.any( Array ),
+				expect.objectContaining( {
+					env: expect.objectContaining( {
+						STUDIO_OPEN_URL: expect.stringMatching( /^http:\/\/127\.0\.0\.1:\d+\// ),
+					} ),
+				} )
+			);
+		} finally {
+			await fake.close();
+			vi.unstubAllEnvs();
+			fs.rmSync( configDirectory, { recursive: true, force: true } );
+		}
 	} );
 
 	it( 'fails on a platform it has no opener for, starting nothing', async () => {

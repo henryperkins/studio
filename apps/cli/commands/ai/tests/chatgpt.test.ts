@@ -29,6 +29,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	resolveAiEnvironment,
 	resolveInitialAiProvider,
+	resolveUnavailableAiProvider,
 	saveSelectedAiProvider,
 } from 'cli/ai/auth';
 import { runsOnChatGpt } from 'cli/ai/chatgpt';
@@ -77,7 +78,7 @@ vi.mock( 'cli/lib/tracks', async ( original ) => ( {
 vi.mock( 'cli/ai/sessions/replay', () => ( { replaySessionHistory: vi.fn() } ) );
 vi.mock( 'cli/ai/auth', () => ( {
 	resolveInitialAiProvider: vi.fn( async () => 'openai-api-key' ),
-	resolveUnavailableAiProvider: async () => undefined,
+	resolveUnavailableAiProvider: vi.fn( async () => undefined ),
 	isAiProviderReady: async () => true,
 	getAvailableAiProviders: async () => [ 'wpcom', 'anthropic-api-key', 'openai-api-key' ],
 	prepareAiProvider: async () => {},
@@ -462,6 +463,54 @@ describe( 'ChatGPT interactive CLI', () => {
 		expect( runsOnChatGpt( 'wpcom', [ pin ] ) ).toBe( true );
 		expect( runsOnChatGpt( 'openai-api-key', [] ) ).toBe( false );
 	} );
+
+	it.each( [
+		[ 'pinned there', () => previousChat() ],
+		[
+			'only by its last reply',
+			async () => {
+				const session = await createStudioSession( root );
+				session.appendMessage( {
+					role: 'user',
+					content: 'Previous private conversation',
+					timestamp: Date.now(),
+				} );
+				session.appendMessage( {
+					role: 'assistant',
+					content: [ { type: 'text', text: 'From the plan.' } ],
+					provider: 'studio-chatgpt',
+					model: 'gpt-6-luna',
+					api: 'openai-responses',
+					stopReason: 'stop',
+					timestamp: Date.now(),
+				} as never );
+				return session;
+			},
+		],
+	] )(
+		'starts a new conversation when the CLI switches a chat that ran on ChatGPT, %s, to another provider',
+		async ( _how, start ) => {
+			const old = await start();
+			expect( getEffectiveSessionProvider( old.getEntries() ) ).toBe( 'chatgpt-oauth' );
+			const original = await fs.readFile( old.getSessionFile()!, 'utf8' );
+			// Switched before the turn, as when the provider it's on stops being available.
+			vi.mocked( resolveUnavailableAiProvider ).mockResolvedValueOnce( 'openai-api-key' );
+			const ui = terminal( [ 'New request' ], [] );
+
+			await runCommand( { adapter: ui, resumeSession: resume( old ) } );
+
+			expect( runs ).toHaveLength( 1 );
+			expect( runs[ 0 ].sessionId ).not.toBe( old.getSessionId() );
+			expect( runs[ 0 ].config.connection ).toBeUndefined();
+			expect( getEffectiveSessionProvider( runs[ 0 ].entries ) ).toBe( 'openai-api-key' );
+			expect( JSON.stringify( runs[ 0 ].entries ) ).not.toContain(
+				'Previous private conversation'
+			);
+			expect( ui.clearTranscript ).toHaveBeenCalledTimes( 1 );
+			// Nothing of the switch lands in the chat that ran on ChatGPT.
+			expect( await fs.readFile( old.getSessionFile()!, 'utf8' ) ).toBe( original );
+		}
+	);
 
 	it( 'with ChatGPT off, says so at /chatgpt and offers only signing out of the saved sign-ins', async () => {
 		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
