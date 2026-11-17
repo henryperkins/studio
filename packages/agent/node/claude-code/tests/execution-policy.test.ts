@@ -53,6 +53,11 @@ vi.mock( '@studio/common/lib/connected-sites', async () => {
 	const { fakeRemoteSite } = await import( '../../tests/fake-host' );
 	return { getConnectedWpcomSitesForLocalSite: vi.fn( async () => [ fakeRemoteSite ] ) };
 } );
+// The user id of the stored WordPress.com login those connections are kept under.
+vi.mock( '@studio/common/lib/shared-config', async ( importOriginal ) => ( {
+	...( await importOriginal< object >() ),
+	getCurrentUserId: vi.fn( async () => 7 ),
+} ) );
 vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('@studio/common/lib/well-known-paths') >();
 	const { default: nodePath } = await import( 'path' );

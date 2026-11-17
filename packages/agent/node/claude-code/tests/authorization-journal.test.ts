@@ -34,11 +34,21 @@ vi.mock( 'fs/promises', async ( importOriginal ) => {
 } );
 
 // The connections Studio keeps: the target site is connected to
-// `fakeRemoteSite`, in a store that lies outside every folder a turn reaches.
+// `fakeRemoteSite`, and to the live target's WordPress.com site 42, in a store
+// that lies outside every folder a turn reaches, under the stored login.
 vi.mock( '@studio/common/lib/connected-sites', async () => {
 	const { fakeRemoteSite } = await import( '../../tests/fake-host' );
-	return { getConnectedWpcomSitesForLocalSite: vi.fn( async () => [ fakeRemoteSite ] ) };
+	return {
+		getConnectedWpcomSitesForLocalSite: vi.fn( async () => [
+			fakeRemoteSite,
+			{ ...fakeRemoteSite, id: 42 },
+		] ),
+	};
 } );
+vi.mock( '@studio/common/lib/shared-config', async ( importOriginal ) => ( {
+	...( await importOriginal< object >() ),
+	getCurrentUserId: vi.fn( async () => 7 ),
+} ) );
 vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('@studio/common/lib/well-known-paths') >();
 	const { default: nodePath } = await import( 'path' );

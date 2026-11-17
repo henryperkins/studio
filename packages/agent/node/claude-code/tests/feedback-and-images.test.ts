@@ -2,7 +2,7 @@ import { existsSync } from 'fs';
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import { readAuthToken } from '@studio/common/lib/shared-config';
+import { getCurrentUserId, readAuthToken } from '@studio/common/lib/shared-config';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { generateImages, resolveImageService } from '@studio/agent/node/image-generation';
 import { reserveAttachmentsArgs } from '../../tools/media-library';
@@ -36,9 +36,11 @@ vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 	};
 } );
 
+// The stored login, and its user id read from it, as Studio reads both.
 vi.mock( '@studio/common/lib/shared-config', async ( importOriginal ) => ( {
 	...( await importOriginal< object >() ),
 	readAuthToken: vi.fn(),
+	getCurrentUserId: vi.fn(),
 } ) );
 
 vi.mock( '@studio/agent/node/image-generation', async ( importOriginal ) => ( {
@@ -97,6 +99,12 @@ beforeEach( () => {
 	vi.mocked( readAuthToken )
 		.mockReset()
 		.mockResolvedValue( LOGIN as never );
+	// Read from the same stored login, without counting as the tool's own read.
+	vi.mocked( getCurrentUserId )
+		.mockReset()
+		.mockImplementation(
+			async () => ( await vi.mocked( readAuthToken ).getMockImplementation()?.() )?.id ?? null
+		);
 	vi.mocked( resolveImageService ).mockReset().mockResolvedValue( IMAGE_SERVICE );
 	vi.mocked( generateImages )
 		.mockReset()
@@ -146,6 +154,15 @@ const global = ( paths: { parent: string; config: string } ) => ( {
 
 const text = ( result: { content: Array< { type: string; text?: string } > } ) =>
 	result.content.map( ( part ) => part.text ?? '' ).join( '\n' );
+
+// What Studio says when the WordPress.com login a call was approved under is
+// no longer the one Studio is signed in with.
+const LOGIN_REFUSAL = 'only under the login it was signed in with when the operation was prepared';
+// The user signs in to another WordPress.com account while reading the approval.
+const switchingLogin = async () => {
+	vi.mocked( readAuthToken ).mockResolvedValue( { ...LOGIN, id: 8 } as never );
+	return 'allow' as const;
+};
 
 describe( 'send_feedback on the Claude route', () => {
 	const report = { type: 'bug', message: 'The preview froze after the zebra theme loaded.' };
@@ -234,6 +251,16 @@ describe( 'send_feedback on the Claude route', () => {
 		expect( feedback.transports ).toEqual( [] );
 		expect( feedback.calls ).toEqual( [] );
 		expect( readAuthToken ).not.toHaveBeenCalled();
+		expect( journal ).toEqual( [] );
+	} );
+
+	it( 'sends nothing, and journals nothing, once the WordPress.com login has changed since the user was asked', async () => {
+		const { bridge, context, journal } = await setup();
+		vi.mocked( context.approve ).mockImplementationOnce( switchingLogin );
+		const result = await bridge.invoke( 'send_feedback', report );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( LOGIN_REFUSAL );
+		expect( feedback.calls ).toEqual( [] );
 		expect( journal ).toEqual( [] );
 	} );
 
@@ -531,6 +558,18 @@ describe( 'generate_images on the Claude route', () => {
 		expect( generateImages ).not.toHaveBeenCalled();
 		expect( resolveImageService ).not.toHaveBeenCalled();
 		expect( host.sites.wpCli ).not.toHaveBeenCalled();
+		expect( journal ).toEqual( [] );
+	} );
+
+	it( 'generates nothing, and journals nothing, once the WordPress.com login has changed since the user was asked', async () => {
+		const { bridge, context, journal, site } = await setupImages();
+		vi.mocked( context.approve ).mockImplementationOnce( switchingLogin );
+		const result = await bridge.invoke( 'generate_images', {
+			images: [ { path: path.join( site, 'hero.png' ), subject: 'Hero' } ],
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( LOGIN_REFUSAL );
+		expect( generateImages ).not.toHaveBeenCalled();
 		expect( journal ).toEqual( [] );
 	} );
 

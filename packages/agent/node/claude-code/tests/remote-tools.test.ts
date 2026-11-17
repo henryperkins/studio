@@ -3,7 +3,7 @@ import { createServer } from 'http';
 import os from 'os';
 import path from 'path';
 import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
-import { readAuthToken } from '@studio/common/lib/shared-config';
+import { getCurrentUserId, readAuthToken } from '@studio/common/lib/shared-config';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeRemoteSite, fakePreview } from '../../tests/fake-host';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
@@ -55,10 +55,14 @@ vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 } );
 
 const LOGIN = { accessToken: 'test-login-token', id: 7, expirationTime: Number.MAX_SAFE_INTEGER };
+// Another WordPress.com login, to which the user switches mid-conversation.
+const OTHER_LOGIN = { ...LOGIN, accessToken: 'other-login-token', id: 8 };
 
+// The stored login, and its user id read from it, as Studio reads both.
 vi.mock( '@studio/common/lib/shared-config', async ( importOriginal ) => ( {
 	...( await importOriginal< object >() ),
 	readAuthToken: vi.fn(),
+	getCurrentUserId: vi.fn(),
 } ) );
 
 let stopServer: () => Promise< void >;
@@ -97,6 +101,12 @@ beforeEach( () => {
 	vi.mocked( readAuthToken )
 		.mockReset()
 		.mockResolvedValue( LOGIN as never );
+	// Read from the same stored login, without counting as the tool's own read.
+	vi.mocked( getCurrentUserId )
+		.mockReset()
+		.mockImplementation(
+			async () => ( await vi.mocked( readAuthToken ).getMockImplementation()?.() )?.id ?? null
+		);
 	vi.mocked( getConnectedWpcomSitesForLocalSite ).mockReset().mockResolvedValue( [] );
 	wpcom.received.length = 0;
 	wpcom.respond = () => ( { status: 200, body: {} } );
@@ -129,6 +139,12 @@ const global = ( paths: { parent: string; config: string } ) => ( {
 
 const text = ( result: { content: Array< { type: string; text?: string } > } ) =>
 	result.content.map( ( part ) => part.text ?? '' ).join( '\n' );
+
+// What Studio says when the WordPress.com login an operation was prepared
+// under is no longer the one Studio is signed in with, or there is none.
+const LOGIN_REFUSAL = 'only under the login it was signed in with when the operation was prepared';
+// Switches the stored login to another account.
+const switchLogin = () => vi.mocked( readAuthToken ).mockResolvedValue( OTHER_LOGIN as never );
 
 describe( 'site_list on the Claude route', () => {
 	// What the CLI's `site list` gives of a site, admin account and mail folder included.
@@ -914,6 +930,65 @@ describe( 'the operations on a remote, after a recovery and when the account cha
 		}
 	} );
 
+	it( 'runs none under a WordPress.com login other than the one it was prepared under, even one that keeps the same connection and previews, whether the login changed while the user read the approval or as the command was about to start', async () => {
+		for ( const [ name, args ] of calls ) {
+			vi.mocked( readAuthToken ).mockResolvedValue( LOGIN as never );
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+			const answered = await setup();
+			vi.mocked( answered.host.previews.list ).mockResolvedValue( [ own ] );
+			vi.mocked( answered.context.approve ).mockImplementationOnce( async () => {
+				switchLogin();
+				return 'allow';
+			} );
+			const afterAnswer = await answered.bridge.invoke( name, args );
+			expect( afterAnswer.isError, name ).toBe( true );
+			expect( text( afterAnswer ), name ).toContain( LOGIN_REFUSAL );
+			expect( ran( answered ), name ).toBe( 0 );
+			// Only the tool's own entry: the host operation never got that far.
+			expect(
+				answered.journal.map( ( entry ) => entry.operation.tool ),
+				name
+			).toEqual( [ name ] );
+
+			vi.mocked( readAuthToken ).mockResolvedValue( LOGIN as never );
+			const started = await setup();
+			vi.mocked( started.host.previews.list ).mockResolvedValue( [ own ] );
+			let reached = false;
+			for ( const spy of [
+				started.host.previews.create,
+				started.host.previews.update,
+				started.host.previews.delete,
+				started.host.sync.push,
+				started.host.sync.pull,
+			] )
+				vi.mocked( spy ).mockImplementation( async ( ...received: unknown[] ) => {
+					switchLogin();
+					const fence = received.at( -1 ) as { beforeSpawn?: () => Promise< void > } | undefined;
+					await fence?.beforeSpawn?.();
+					reached = true;
+					return undefined as never;
+				} );
+			const beforeStart = await started.bridge.invoke( name, args );
+			expect( beforeStart.isError, name ).toBe( true );
+			expect( text( beforeStart ), name ).toContain( LOGIN_REFUSAL );
+			expect( reached, name ).toBe( false );
+		}
+	} );
+
+	it( 'runs none while Studio is signed in to no WordPress.com login, says why and asks nothing', async () => {
+		for ( const [ name, args ] of calls ) {
+			const fixture = await setup();
+			vi.mocked( fixture.host.previews.list ).mockResolvedValue( [ own ] );
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+			vi.mocked( readAuthToken ).mockResolvedValue( null );
+			const result = await fixture.bridge.invoke( name, args );
+			expect( result.isError, name ).toBe( true );
+			expect( text( result ), name ).toContain( LOGIN_REFUSAL );
+			expect( fixture.context.approve, name ).not.toHaveBeenCalled();
+			expect( ran( fixture ), name ).toBe( 0 );
+		}
+	} );
+
 	it( 'asks nothing and runs nothing once the native account has changed', async () => {
 		for ( const [ name, args ] of calls ) {
 			const fixture = await setup( () => ( {
@@ -1021,6 +1096,12 @@ describe( 'wpcom_request on the Claude route', () => {
 	const payloads = () => path.join( config.root, 'tmp', 'ai-payloads' );
 	const WPCOM_REFUSAL = 'no query key that changes its method, route, namespace or origin';
 	const SITE_REFUSAL = 'only to this conversation’s own WordPress.com site';
+	// The conversation's WordPress.com site is connected to its local site
+	// under the stored login, as Studio keeps it.
+	const connected = [ { ...fakeRemoteSite, id: 42 } ];
+	beforeEach( () => {
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connected );
+	} );
 	const PROFILE_REFUSAL = 'does not read the account’s profile (!/me) on this connection';
 	const PAYLOAD_REFUSAL = 'must be an existing file in Studio’s payload folder';
 
@@ -1124,6 +1205,10 @@ describe( 'wpcom_request on the Claude route', () => {
 	} );
 
 	describe( 'changes', () => {
+		const CONNECTION_REFUSAL =
+			'only while it is connected to this conversation’s site under the WordPress.com login Studio is signed in with';
+		const change = { siteId: 42, method: 'POST', path: '/posts', body: { title: 'x' } };
+
 		it( 'changes something in the conversation’s own site once the user approves the request, shown by the method sent, the site and the path and never its body, query or the stored login, journaled before it is sent', async () => {
 			const { bridge, context, journal } = await setup( live );
 			const sentWhenJournaled: number[] = [];
@@ -1174,6 +1259,58 @@ describe( 'wpcom_request on the Claude route', () => {
 				title: 'Hidden title',
 				content: 'hidden body',
 			} );
+			// The site is one Studio keeps as connected to the conversation's site.
+			expect( getConnectedWpcomSitesForLocalSite ).toHaveBeenCalledWith( 'site-123' );
+		} );
+
+		it( 'changes a site only while it is connected to the conversation’s site under the login Studio is signed in with, says why, and asks, journals and sends nothing', async () => {
+			const { bridge, context, journal } = await setup( live );
+			for ( const stored of [
+				[],
+				[ { ...fakeRemoteSite, id: 7 } ],
+				[ { ...fakeRemoteSite, id: 42, localSiteId: 'other-site' } ],
+			] ) {
+				vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( stored );
+				const result = await bridge.invoke( 'wpcom_request', change );
+				expect( result.isError, JSON.stringify( stored ) ).toBe( true );
+				expect( text( result ), JSON.stringify( stored ) ).toContain( CONNECTION_REFUSAL );
+			}
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connected );
+			vi.mocked( readAuthToken ).mockResolvedValue( null );
+			const signedOut = await bridge.invoke( 'wpcom_request', change );
+			expect( signedOut.isError ).toBe( true );
+			expect( text( signedOut ) ).toContain( LOGIN_REFUSAL );
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( journal ).toEqual( [] );
+			expect( wpcom.received ).toEqual( [] );
+		} );
+
+		it( 'sends no change, and journals none, once the login has changed since the user was asked, even to one that has the same site connected', async () => {
+			const { bridge, context, journal } = await setup( live );
+			vi.mocked( context.approve ).mockImplementationOnce( async () => {
+				switchLogin();
+				return 'allow';
+			} );
+			const result = await bridge.invoke( 'wpcom_request', change );
+			expect( result.isError ).toBe( true );
+			expect( text( result ) ).toContain( LOGIN_REFUSAL );
+			expect( context.approve ).toHaveBeenCalledOnce();
+			expect( journal ).toEqual( [] );
+			expect( wpcom.received ).toEqual( [] );
+		} );
+
+		it( 'checks the login again as the last step before the request is sent', async () => {
+			const { bridge, context, journal } = await setup( live );
+			const record = context.recordOperation;
+			context.recordOperation = async ( event ) => {
+				await record( event );
+				switchLogin();
+			};
+			const result = await bridge.invoke( 'wpcom_request', change );
+			expect( result.isError ).toBe( true );
+			expect( text( result ) ).toContain( LOGIN_REFUSAL );
+			expect( journal ).toHaveLength( 1 );
+			expect( wpcom.received ).toEqual( [] );
 		} );
 
 		it( 'shows a PUT as the POST the client sends', async () => {

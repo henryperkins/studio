@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
 import { normalizeHostname as normalizeSiteAddress } from '@studio/common/lib/normalize-hostname';
+import { getCurrentUserId } from '@studio/common/lib/shared-config';
 import { isReprintPullEnabled } from '@studio/common/lib/sync/reprint-pull';
 import { getSharedConfigPath } from '@studio/common/lib/well-known-paths';
 import {
@@ -56,6 +57,7 @@ import type {
 	ClaudeOperationJournalEvent,
 } from '@studio/agent/protocol/backend-events';
 import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
+import type { SyncSite } from '@studio/common/types/sync';
 
 /**
  * The single place that decides what a Claude turn may execute. The SDK
@@ -258,6 +260,10 @@ const REFUSALS = {
 		'On this route Studio sends a WordPress.com request only with a plain path and no query key that changes its method, route, namespace or origin. It reads a site, or WordPress.com’s plan features at !/plans/features, and does not read the account’s profile (!/me) on this connection, nor anything else of the account; it changes something in a site only through that site’s WordPress REST API (wp/v2) with POST or PUT, both sent as a POST, and sends no DELETE, which Studio’s WordPress.com client would send as a POST that deletes nothing.',
 	wpcomSite:
 		'Studio sends a WordPress.com request for a site only to this conversation’s own WordPress.com site.',
+	wpcomConnection:
+		'Studio changes a WordPress.com site only while it is connected to this conversation’s site under the WordPress.com login Studio is signed in with, as site_connected_remote_sites lists it.',
+	wpcomLogin:
+		'Studio acts on WordPress.com only while it is signed in to WordPress.com, and only under the login it was signed in with when the operation was prepared and the user was asked: an operation whose login changed before it started does not run.',
 	preview:
 		'Studio updates or deletes a preview only when it is one of this conversation’s site’s own previews, named by the address preview_list gives for it.',
 	previewOverwrite:
@@ -394,13 +400,26 @@ interface PreparedHostOperation {
 	/** The preview as checked. */
 	preview?: TargetPreview;
 	scratch?: true;
-	/** The WordPress.com site and the sync options as checked. */
-	wpcomSite?: number;
+	/** The WordPress.com site, as Studio keeps its connection, and the sync options as checked. */
+	wpcomSite?: SyncSite;
 	syncOptions?: string;
 	defaultPull?: true;
+	/** The user id of the WordPress.com login the operation was prepared under. */
+	login?: number;
 }
 
 const WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
+
+// The host operations that act on WordPress.com under the login Studio is
+// signed in with: the CLI's commands read that login as they start. Each runs
+// only under the login it was prepared under, which the user was asked under.
+const WPCOM_OPERATIONS: ReadonlySet< string > = new Set( [
+	'previews.create',
+	'previews.update',
+	'previews.delete',
+	'sync.push',
+	'sync.pull',
+] );
 
 // The host operations that run a WP-CLI command on the site the turn acts on:
 // the model's own, classified, and the media library's, which are Studio's.
@@ -836,15 +855,20 @@ export function createClaudeExecutionPolicy(
 		return ! signal.aborted && ! callSignal?.aborted;
 	}
 
+	// Asks once, spends the grant and journals the operation. `holds` is what
+	// must still be true once the user has answered, checked before anything
+	// is journaled.
 	async function approveOnce(
 		operation: ClaudeOperation,
 		toolCallId: string,
-		callSignal?: AbortSignal
+		callSignal?: AbortSignal,
+		holds: () => Promise< boolean > = async () => true
 	) {
 		const grant = await requestApproval( operation, toolCallId, callSignal );
 		return (
 			!! grant &&
 			( await authorizeExecution( grant, operation, toolCallId, callSignal ) ) &&
+			( await holds() ) &&
 			admit( operation, toolCallId, callSignal, grant.requestId )
 		);
 	}
@@ -1064,6 +1088,8 @@ export function createClaudeExecutionPolicy(
 		// reaches WordPress.com the request as it is sent, never its arguments,
 		// which can carry a body, query values or file contents.
 		let shown: unknown = args;
+		// The WordPress.com site a call changes, if it changes one.
+		let wpcomChange: number | undefined;
 		if ( rule.remote ) {
 			const scope = rule.remote( args );
 			if ( ! scope ) {
@@ -1077,9 +1103,32 @@ export function createClaudeExecutionPolicy(
 					return false;
 				}
 				remote = `WordPress.com site ${ scope.wpcomSiteId }`;
+				if ( ! isClaudeReadOnlyClass( operationClass ) ) wpcomChange = scope.wpcomSiteId;
 			}
 			shown = scope.request ?? {};
 		}
+		// The WordPress.com login the call acts under, by its user id: for a
+		// change to a WordPress.com site, the login that site is connected to the
+		// site the turn acts on under; for any other call the user approves that
+		// reads the stored login, the one in force, or none, when the user is
+		// asked. It must still be that login once the user has answered, before
+		// anything is journaled, and again as the last step before the tool runs.
+		const underLogin =
+			wpcomChange !== undefined ||
+			( rule.config !== undefined && rule.approval === 'tool' && asksFirst( operationClass ) );
+		let login: number | undefined;
+		if ( wpcomChange !== undefined ) {
+			login = await changeLogin( toolCallId, wpcomChange );
+			if ( login === undefined ) return false;
+		} else if ( underLogin ) login = await storedLogin();
+		const loginHolds = async () => {
+			if ( ! underLogin ) return true;
+			if ( wpcomChange !== undefined )
+				return ( await changeLogin( toolCallId, wpcomChange, login ) ) !== undefined;
+			if ( ( await storedLogin() ) === login ) return true;
+			refuse( toolCallId, REFUSALS.wpcomLogin );
+			return false;
+		};
 		const described = describeClaudeOperation( operationClass, name );
 		const description = noticed(
 			operationClass,
@@ -1091,6 +1140,7 @@ export function createClaudeExecutionPolicy(
 		if ( ! asksFirst( operationClass ) || rule.approval === 'host' )
 			authorized =
 				( await checkpoint( callSignal ) ) &&
+				( await loginHolds() ) &&
 				( await admit( { tool: name, operationClass, description }, toolCallId, callSignal ) );
 		else {
 			// An approval shows the files the rule names; one that names none for
@@ -1107,14 +1157,16 @@ export function createClaudeExecutionPolicy(
 					description,
 				},
 				toolCallId,
-				callSignal
+				callSignal,
+				loginHolds
 			);
 		}
 		// The tool writes its files itself once this returns, so they are checked
 		// again last: a link planted meanwhile, while the user read an approval,
-		// is not followed. Like the fence before a command starts, this comes
-		// after the call is journaled.
-		return authorized && ( await filesHold() );
+		// is not followed. The login too, which the tool reads itself once this
+		// returns. Like the fence before a command starts, this comes after the
+		// call is journaled.
+		return authorized && ( await filesHold() ) && ( await loginHolds() );
 	}
 
 	async function prepare(
@@ -1181,23 +1233,48 @@ export function createClaudeExecutionPolicy(
 		}
 		let preview: TargetPreview | undefined;
 		let remote = request.remote;
+		if ( request.scratch && ! ( await scratchOutsideReach() ) ) {
+			refuse( toolCallId, REFUSALS.scratch );
+			return;
+		}
+		// An operation on WordPress.com is prepared, and so asked about, under
+		// the login Studio is signed in with, and what binds it is read under
+		// that login.
+		let login: number | undefined;
+		if ( WPCOM_OPERATIONS.has( request.name ) ) {
+			login = await storedLogin();
+			if ( login === undefined ) {
+				refuse( toolCallId, REFUSALS.wpcomLogin );
+				return;
+			}
+		}
 		if ( 'preview' in request ) {
-			preview = await targetPreview( host, request.preview );
-			if ( ! preview ) {
+			const found = await targetPreview( host, request.preview );
+			if ( ! found ) {
 				refuse( toolCallId, REFUSALS.preview );
 				return;
 			}
+			if ( found.login !== login ) {
+				refuse( toolCallId, REFUSALS.wpcomLogin );
+				return;
+			}
+			preview = found.preview;
 			args = [ preview.url, ...args ];
 			remote = preview.url;
 		}
-		let wpcomSite: number | undefined;
+		let wpcomSite: SyncSite | undefined;
 		let syncOptions: string[] | undefined;
 		if ( 'wpcomSite' in request ) {
-			wpcomSite = await connectedRemote( request.wpcomSite );
-			if ( wpcomSite === undefined ) {
+			const connected = await connectedRemote( request.wpcomSite );
+			if ( ! connected ) {
 				refuse( toolCallId, REFUSALS.remoteSite );
 				return;
 			}
+			if ( connected.login !== login ) {
+				refuse( toolCallId, REFUSALS.wpcomLogin );
+				return;
+			}
+			wpcomSite = connected.site;
 			syncOptions = syncSelection( request.syncOptions );
 			if ( ! syncOptions ) {
 				refuse( toolCallId, REFUSALS.syncOptions );
@@ -1208,16 +1285,12 @@ export function createClaudeExecutionPolicy(
 			args = [
 				{
 					direction: request.name === 'sync.pull' ? 'pull' : 'push',
-					remoteSite: wpcomSite,
+					remoteSite: wpcomSite.id,
 					overwrites: syncOptions.map( ( option ) => SYNC_OVERWRITES[ option ] ),
 				},
 				...args,
 			];
-			remote = `WordPress.com site ${ wpcomSite }`;
-		}
-		if ( request.scratch && ! ( await scratchOutsideReach() ) ) {
-			refuse( toolCallId, REFUSALS.scratch );
-			return;
+			remote = `WordPress.com site ${ wpcomSite.id }`;
 		}
 		if ( request.defaultPull && isReprintPullEnabled() ) {
 			refuse( toolCallId, REFUSALS.reprintPull );
@@ -1263,44 +1336,115 @@ export function createClaudeExecutionPolicy(
 			wpcomSite,
 			syncOptions: syncOptions?.join( ',' ),
 			defaultPull: request.defaultPull,
+			login,
 		};
 		if ( ! asksFirst( operationClass ) ) return prepared;
 		const grant = await requestApproval( operation, toolCallId, callSignal );
 		return grant ? { ...prepared, grant } : undefined;
 	}
 
-	// The WordPress.com site a push or pull may sync with, by the numeric ID or
-	// address the caller named, decided as the CLI finds a site by either: one
-	// connected to the site the turn acts on, which in a conversation on a live
-	// site must be that site, read from the connections Studio keeps, which must
-	// lie out of the turn's reach. Its numeric ID, or undefined.
-	async function connectedRemote( named: unknown ): Promise< number | undefined > {
-		const target = actingTarget;
-		const targetSite = actingSite;
-		if ( typeof named !== 'string' || target.environment === 'global' || ! targetSite ) return;
+	// The WordPress.com login Studio is signed in with, by its user id, read
+	// from the login Studio stores in its shared configuration, which must lie
+	// out of the turn's reach; never its name or e-mail. Undefined when there
+	// is none, or it cannot be read.
+	async function storedLogin(): Promise< number | undefined > {
 		try {
 			if ( ! ( await isOutsideReach( getSharedConfigPath(), context.localRoots ) ) ) return;
+			const id = await getCurrentUserId();
+			return typeof id === 'number' && Number.isSafeInteger( id ) && id > 0 ? id : undefined;
+		} catch {
+			return;
+		}
+	}
+
+	// Reads what Studio keeps for the login it is signed in with, under that
+	// login: its user id is read before and after, and must be the same, so
+	// what was read is that login's. Undefined when Studio is signed in with no
+	// login, the login changed meanwhile, or the read fails.
+	async function readUnderLogin< T >(
+		read: () => Promise< T >
+	): Promise< { login: number; value: T } | undefined > {
+		const login = await storedLogin();
+		if ( login === undefined ) return;
+		try {
+			const value = await read();
+			return ( await storedLogin() ) === login ? { login, value } : undefined;
+		} catch {
+			return;
+		}
+	}
+
+	// The WordPress.com sites Studio keeps as connected to the site the turn
+	// acts on for the login it is signed in with, and that login.
+	async function loginConnections(): Promise<
+		{ login: number; connections: SyncSite[] } | undefined
+	> {
+		const targetSite = actingSite;
+		if ( actingTarget.environment === 'global' || ! targetSite ) return;
+		const read = await readUnderLogin( () => getConnectedWpcomSitesForLocalSite( targetSite.id ) );
+		return (
+			read && {
+				login: read.login,
+				connections: read.value.filter( ( connected ) => connected.localSiteId === targetSite.id ),
+			}
+		);
+	}
+
+	// The login a change to a WordPress.com site goes out under: the one Studio
+	// is signed in with, which must be `expected` when one is given, with that
+	// site connected to the site the turn acts on under it. Refused, saying
+	// why, otherwise.
+	async function changeLogin(
+		toolCallId: string,
+		wpcomSiteId: number,
+		expected?: number
+	): Promise< number | undefined > {
+		const login = await storedLogin();
+		if ( login === undefined || ( expected !== undefined && login !== expected ) ) {
+			refuse( toolCallId, REFUSALS.wpcomLogin );
+			return;
+		}
+		const connected = await loginConnections();
+		if ( connected && connected.login !== login ) {
+			refuse( toolCallId, REFUSALS.wpcomLogin );
+			return;
+		}
+		if ( ! connected?.connections.some( ( site ) => site.id === wpcomSiteId ) ) {
+			refuse( toolCallId, REFUSALS.wpcomConnection );
+			return;
+		}
+		return login;
+	}
+
+	// The WordPress.com site a push or pull may sync with, by the numeric ID or
+	// address the caller named, decided as the CLI finds a site by either: the
+	// one connection of the site the turn acts on that matches, which in a
+	// conversation on a live site must be that site, read from the connections
+	// Studio keeps for the login it is signed in with. That connection as
+	// Studio keeps it, and that login; or undefined.
+	async function connectedRemote(
+		named: unknown
+	): Promise< { login: number; site: SyncSite } | undefined > {
+		const target = actingTarget;
+		if ( typeof named !== 'string' ) return;
+		const connected = await loginConnections();
+		if ( ! connected ) return;
+		try {
 			const byId = /^[1-9][0-9]*$/.test( named );
-			const ids = new Set(
-				( await getConnectedWpcomSitesForLocalSite( targetSite.id ) )
-					.filter(
-						( connected ) =>
-							connected.localSiteId === targetSite.id &&
-							( byId
-								? connected.id === Number( named )
-								: normalizeSiteAddress( connected.url ) === normalizeSiteAddress( named ) )
-					)
-					.map( ( connected ) => connected.id )
+			const matching = connected.connections.filter( ( site ) =>
+				byId
+					? site.id === Number( named )
+					: normalizeSiteAddress( site.url ) === normalizeSiteAddress( named )
 			);
-			const [ id ] = ids;
+			const [ site ] = matching;
 			if (
-				ids.size !== 1 ||
-				! Number.isSafeInteger( id ) ||
-				id <= 0 ||
-				( target.environment === 'live' && target.wpcomSiteId !== id )
+				matching.length !== 1 ||
+				! Number.isSafeInteger( site.id ) ||
+				site.id <= 0 ||
+				( target.environment === 'live' && target.wpcomSiteId !== site.id )
 			)
 				return;
-			return id;
+			return { login: connected.login, site };
 		} catch {
 			return;
 		}
@@ -1315,31 +1459,32 @@ export function createClaudeExecutionPolicy(
 
 	// The preview of the site the turn acts on that an address names: the one
 	// preview of that site the host lists at exactly that address, as the CLI
-	// finds a preview by its address. Undefined for anything else, or when the
-	// site or its previews cannot be read.
+	// finds a preview by its address, read under the login Studio is signed in
+	// with, which the host lists that site's previews for; and that login.
+	// Undefined for anything else, or when the site or its previews cannot be
+	// read.
 	async function targetPreview(
 		host: StudioAgentHost,
 		named: unknown
-	): Promise< TargetPreview | undefined > {
+	): Promise< { login: number; preview: TargetPreview } | undefined > {
 		const targetSite = actingSite;
 		if ( typeof named !== 'string' || actingTarget.environment === 'global' || ! targetSite )
 			return;
 		const site = await resolveTarget( host, targetSite.path );
 		if ( ! site ) return;
-		try {
-			const matching = ( await host.previews.list( site ) ).filter(
-				( listed ) => listed.url === named
-			);
-			if (
-				matching.length !== 1 ||
-				matching[ 0 ].localSiteId !== site.id ||
-				! Number.isSafeInteger( matching[ 0 ].atomicSiteId )
-			)
-				return;
-			return { url: matching[ 0 ].url, atomicSiteId: matching[ 0 ].atomicSiteId };
-		} catch {
+		const listed = await readUnderLogin( () => host.previews.list( site ) );
+		if ( ! listed || ! Array.isArray( listed.value ) ) return;
+		const matching = listed.value.filter( ( preview ) => preview?.url === named );
+		if (
+			matching.length !== 1 ||
+			matching[ 0 ].localSiteId !== site.id ||
+			! Number.isSafeInteger( matching[ 0 ].atomicSiteId )
+		)
 			return;
-		}
+		return {
+			login: listed.login,
+			preview: { url: matching[ 0 ].url, atomicSiteId: matching[ 0 ].atomicSiteId },
+		};
 	}
 
 	// The path a file a host operation reads (`existing`) or writes resolves to,
@@ -1378,6 +1523,7 @@ export function createClaudeExecutionPolicy(
 	async function fence(
 		host: StudioAgentHost,
 		prepared: PreparedHostOperation,
+		toolCallId: string,
 		callSignal?: AbortSignal
 	): Promise< boolean > {
 		if ( ! ( await checkpoint( callSignal ) ) ) return false;
@@ -1389,23 +1535,32 @@ export function createClaudeExecutionPolicy(
 			// path the operation receives must still resolve to itself.
 			if ( prepared.file && ( await conversationFile( prepared.file ) ) !== prepared.file.path )
 				return false;
-			// The preview too: its address must still name the same preview of the
-			// site the turn acts on.
-			if (
-				prepared.preview &&
-				( await targetPreview( host, prepared.preview.url ) )?.atomicSiteId !==
-					prepared.preview.atomicSiteId
-			)
+			// An operation on WordPress.com runs only under the login it was
+			// prepared, and asked about, under.
+			if ( prepared.login !== undefined && ( await storedLogin() ) !== prepared.login ) {
+				refuse( toolCallId, REFUSALS.wpcomLogin );
 				return false;
+			}
+			// The preview too: its address must still name the same preview of the
+			// site the turn acts on, under that login.
+			if ( prepared.preview ) {
+				const current = await targetPreview( host, prepared.preview.url );
+				if (
+					current?.preview.atomicSiteId !== prepared.preview.atomicSiteId ||
+					current.login !== prepared.login
+				)
+					return false;
+			}
 			if ( prepared.scratch && ! ( await scratchOutsideReach() ) ) return false;
 			// The host chooses a pull's engine as its command starts.
 			if ( prepared.defaultPull && isReprintPullEnabled() ) return false;
-			// And the WordPress.com site: still connected to the site the turn acts on.
-			if (
-				prepared.wpcomSite !== undefined &&
-				( await connectedRemote( String( prepared.wpcomSite ) ) ) !== prepared.wpcomSite
-			)
-				return false;
+			// And the WordPress.com site: still connected to the site the turn acts
+			// on under that login.
+			if ( prepared.wpcomSite !== undefined ) {
+				const current = await connectedRemote( String( prepared.wpcomSite.id ) );
+				if ( current?.site.id !== prepared.wpcomSite.id || current.login !== prepared.login )
+					return false;
+			}
 			if (
 				WP_CLI_OPERATIONS.has( prepared.operation.tool ) &&
 				( ! targetSite || ( await hasWpCliOverrides( targetSite.path ) ) )
@@ -1483,7 +1638,8 @@ export function createClaudeExecutionPolicy(
 			) => Promise< T >
 		): Promise< T > => {
 			const prepared = await prepare( host, request, toolCallId, callSignal );
-			if ( ! prepared || ! ( await fence( host, prepared, callSignal ) ) ) throw denied();
+			if ( ! prepared || ! ( await fence( host, prepared, toolCallId, callSignal ) ) )
+				throw denied();
 			if (
 				( prepared.grant &&
 					! ( await authorizeExecution(
@@ -1501,14 +1657,14 @@ export function createClaudeExecutionPolicy(
 				{
 					signal: operationSignal,
 					beforeSpawn: async () => {
-						if ( ! ( await fence( host, prepared, callSignal ) ) ) throw denied();
+						if ( ! ( await fence( host, prepared, toolCallId, callSignal ) ) ) throw denied();
 					},
 				},
 				prepared.operation,
 				{
 					file: prepared.file?.path,
 					preview: prepared.preview?.url,
-					wpcomSite: prepared.wpcomSite === undefined ? undefined : String( prepared.wpcomSite ),
+					wpcomSite: prepared.wpcomSite === undefined ? undefined : String( prepared.wpcomSite.id ),
 					syncOptions: prepared.syncOptions,
 				}
 			);
