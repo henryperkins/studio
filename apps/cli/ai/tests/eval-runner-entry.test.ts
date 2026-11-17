@@ -117,4 +117,74 @@ describe( 'eval runner entry', () => {
 			fs.readdirSync( tmp ).filter( ( name ) => name.startsWith( 'studio-eval-daemon-' ) )
 		).toEqual( [] );
 	} );
+
+	describe( 'when it cannot hand over to the runner', () => {
+		const fixedMessage = 'The eval runner could not start; nothing of the case was kept.';
+		let source: string;
+		let exit: ReturnType< typeof vi.spyOn >;
+		let stderr: ReturnType< typeof vi.spyOn >;
+
+		beforeEach( () => {
+			// A source profile with a made-up login and key, in the scratch folder.
+			source = path.join( tmp, 'source-profile' );
+			fs.mkdirSync( source );
+			fs.writeFileSync(
+				path.join( source, 'shared.json' ),
+				JSON.stringify( {
+					version: 1,
+					authToken: { accessToken: 'made-up-login' },
+					aiProvider: 'anthropic-api-key',
+					anthropicApiKey: 'made-up-key',
+				} )
+			);
+			process.env.DEV_CONFIG_DIR = source;
+			process.env.STUDIO_EVAL_PROVIDER = 'anthropic-api-key';
+			process.argv = [
+				'node',
+				'eval-runner.mjs',
+				'Reply READY.',
+				'',
+				JSON.stringify( { vars: {} } ),
+			];
+			exit = vi.spyOn( process, 'exit' ).mockImplementation( ( () => undefined ) as never );
+			stderr = vi.spyOn( process.stderr, 'write' ).mockImplementation( () => true );
+		} );
+
+		afterEach( () => {
+			exit.mockRestore();
+			stderr.mockRestore();
+			vi.doUnmock( 'cli/ai/eval-port-range' );
+		} );
+
+		const left = () =>
+			fs.readdirSync( tmp ).filter( ( name ) => name.startsWith( 'studio-eval-' ) );
+
+		const expectNothingKept = async () => {
+			await import( 'cli/ai/eval-runner-entry' );
+			await vi.waitFor( () => expect( exit ).toHaveBeenCalled() );
+			expect( exit ).toHaveBeenCalledWith( 1 );
+			expect( left() ).toEqual( [] );
+			expect( stderr.mock.calls.map( ( [ text ] ) => String( text ) ).join( '' ) ).toBe(
+				`${ fixedMessage }\n`
+			);
+			expect( fs.readdirSync( source ) ).toEqual( [ 'shared.json' ] );
+		};
+
+		it( 'removes the profile, the registry, the sites folder and the process manager home when claiming a port range rejects', async () => {
+			delete process.env.STUDIO_BASE_PORT;
+			vi.doMock( 'cli/ai/eval-port-range', () => ( {
+				claimPortRange: async () => {
+					throw new Error( 'All 100 eval port ranges are held by running processes.' );
+				},
+			} ) );
+			await expectNothingKept();
+		} );
+
+		it( 'removes them when the runner cannot be imported', async () => {
+			vi.doMock( 'cli/ai/eval-runner', () => {
+				throw new Error( 'cannot load the runner' );
+			} );
+			await expectNothingKept();
+		} );
+	} );
 } );
