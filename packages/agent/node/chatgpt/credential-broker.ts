@@ -275,6 +275,8 @@ interface AccessToken {
 interface SessionCredentials {
 	record: CredentialRecord;
 	logoutGeneration: number;
+	/** The sign-in the record came from: any sign-in since supersedes it. */
+	signInGeneration: number;
 	tokenGeneration: string;
 }
 
@@ -300,6 +302,12 @@ const signInOf = ( account: ChatGptAccount ) => ( {
 	logoutGeneration: account.logoutGeneration,
 	signInGeneration: account.signInGeneration ?? 0,
 } );
+
+// A held session-only record belongs to the sign-in that made it alone: once
+// the registration is signed in again, here or in another app, it is never
+// used again, nor the cause of a "needs sign-in".
+const isSuperseded = ( held: SessionCredentials, account: ChatGptAccount ) =>
+	held.signInGeneration < ( account.signInGeneration ?? 0 );
 
 const splitScopes = ( scope: string ) => scope.split( /\s+/ ).filter( Boolean );
 
@@ -820,7 +828,10 @@ export function createChatGptCredentialBroker(
 		return account;
 	}
 
-	const isUnchanged = ( account: ChatGptAccount | null, logoutGeneration: number ) =>
+	const isUnchanged = (
+		account: ChatGptAccount | null,
+		logoutGeneration: number
+	): account is ChatGptAccount =>
 		account?.state === 'signed-in' && account.logoutGeneration === logoutGeneration;
 
 	// The registration as it is now, provided no sign-out happened since `logoutGeneration`.
@@ -1016,7 +1027,7 @@ export function createChatGptCredentialBroker(
 	// anywhere, so it stops holding and offering tokens nothing should use.
 	function holdSession(
 		registrationId: string,
-		session: { record: CredentialRecord; logoutGeneration: number }
+		session: Omit< SessionCredentials, 'tokenGeneration' >
 	): SessionCredentials {
 		const held = { ...session, tokenGeneration: randomUUID() };
 		sessions.set( registrationId, held );
@@ -1034,7 +1045,7 @@ export function createChatGptCredentialBroker(
 	}
 
 	// A held record goes once its registration was signed out, here or in
-	// another process, or keeps its tokens elsewhere now.
+	// another process, keeps its tokens elsewhere now, or was signed in again.
 	function pruneSession( registrationId: string ): Promise< void > {
 		return serializeSession( registrationId, async () => {
 			const held = sessions.get( registrationId );
@@ -1045,7 +1056,8 @@ export function createChatGptCredentialBroker(
 			if (
 				account?.state !== 'signed-in' ||
 				account.storage !== 'session' ||
-				account.logoutGeneration !== held.logoutGeneration
+				account.logoutGeneration !== held.logoutGeneration ||
+				isSuperseded( held, account )
 			) {
 				dropSession( registrationId );
 			}
@@ -1061,7 +1073,12 @@ export function createChatGptCredentialBroker(
 		return serializeSession( registrationId, async () => {
 			const current = await requireUnchanged( registrationId, logoutGeneration );
 			const held = sessions.get( registrationId );
-			if ( ! held || held.logoutGeneration !== logoutGeneration || current.storage !== 'session' ) {
+			if (
+				! held ||
+				held.logoutGeneration !== logoutGeneration ||
+				current.storage !== 'session' ||
+				isSuperseded( held, current )
+			) {
 				if ( held ) {
 					dropSession( registrationId );
 				}
@@ -1076,18 +1093,31 @@ export function createChatGptCredentialBroker(
 			}
 			if ( renewal.status === 'rejected' ) {
 				dropSession( registrationId );
-				// Only the sign-in whose token was refused: one made since stays.
-				await markChatGptSignInNeeded( registrationId, signInOf( current ) );
+				// Only the sign-in the refused token came from: one made since stays.
+				await markChatGptSignInNeeded( registrationId, {
+					logoutGeneration: held.logoutGeneration,
+					signInGeneration: held.signInGeneration,
+				} );
 				throw new ChatGptConnectionError( 'needs-sign-in' );
 			}
-			if ( ! isUnchanged( await readChatGptAccount( registrationId ), logoutGeneration ) ) {
+			const after = await readChatGptAccount( registrationId );
+			if ( ! isUnchanged( after, logoutGeneration ) ) {
 				if ( ! retainSessionRevocation( registrationId, logoutGeneration, renewal.record ) ) {
 					revokeQuietly( current.clientId, renewal.record.refreshToken );
 				}
 				throw new ChatGptConnectionError( 'signed-out' );
 			}
+			// Signed in again while the refresh was out: the renewal is the earlier sign-in's.
+			if ( isSuperseded( held, after ) ) {
+				dropSession( registrationId );
+				throw new ChatGptConnectionError( 'session-unavailable' );
+			}
 			return sessionAccessToken(
-				holdSession( registrationId, { record: renewal.record, logoutGeneration } )
+				holdSession( registrationId, {
+					record: renewal.record,
+					logoutGeneration,
+					signInGeneration: held.signInGeneration,
+				} )
 			);
 		} );
 	}
@@ -1215,7 +1245,8 @@ export function createChatGptCredentialBroker(
 			return null;
 		}
 		if ( account.storage === 'session' ) {
-			return sessions.get( connectionId )?.record.idToken ?? null;
+			const held = sessions.get( connectionId );
+			return held && ! isSuperseded( held, account ) ? held.record.idToken : null;
 		}
 		const key = await getWrappingKey().catch( () => null );
 		try {
@@ -1298,7 +1329,11 @@ export function createChatGptCredentialBroker(
 				if ( key ) {
 					dropSession( registrationId );
 				} else {
-					holdSession( registrationId, { record, logoutGeneration: account.logoutGeneration } );
+					holdSession( registrationId, {
+						record,
+						logoutGeneration: account.logoutGeneration,
+						signInGeneration: account.signInGeneration ?? 0,
+					} );
 				}
 			} );
 			parent?.tokens.delete( registrationId );
@@ -1478,7 +1513,7 @@ export function createChatGptCredentialBroker(
 		}
 		const held = sessions.get( account.registrationId );
 		return held
-			? held.logoutGeneration === account.logoutGeneration
+			? held.logoutGeneration === account.logoutGeneration && ! isSuperseded( held, account )
 			: Boolean( reachableParent()?.offered.has( account.registrationId ) );
 	}
 
