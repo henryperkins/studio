@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { splitCommandArgs } from '../../tools/wp-cli';
+import { claudeRouteNote } from '../execution-rules';
 import { classifyWpCliArgs, wpCliRouteCommands } from '../wp-cli-rules';
 
 const title200 = 'T'.repeat( 200 );
@@ -115,6 +116,35 @@ describe( 'the WP-CLI commands the Claude route runs', () => {
 			'post get <id of up to 10 digits>',
 			'post create --post_status=draft --post_title=<1 to 200 characters> [--post_content=<up to 10000 characters>]',
 		] );
+	} );
+
+	it( 'runs no command the route note does not describe, and describes each with the class it runs it under', () => {
+		const commands = wpCliRouteCommands();
+		const note = claudeRouteNote( 'wp_cli' )!;
+		for ( const command of commands ) expect( note ).toContain( command.usage );
+		// Every command shape these tests name, and many the route refuses.
+		const verbs = [ 'get', 'list', 'create', 'update', 'delete', 'install', 'activate', 'set' ];
+		const tails = [
+			[],
+			[ 'blogname' ],
+			[ '1' ],
+			[ '--post_status=draft', '--post_title=A' ],
+			[ '--format=json' ],
+		];
+		const corpus = [
+			...CLASSIFIED.map( ( [ args ] ) => args ),
+			...[ 'option', 'post', 'user', 'plugin', 'theme', 'site', 'db', 'term', 'menu' ].flatMap(
+				( noun ) => verbs.flatMap( ( verb ) => tails.map( ( tail ) => [ noun, verb, ...tail ] ) )
+			),
+		];
+		for ( const args of corpus ) {
+			const operationClass = classifyWpCliArgs( args );
+			const described = commands.filter( ( command ) => command.matches( args ) );
+			expect(
+				described.map( ( command ) => command.operationClass ),
+				JSON.stringify( args )
+			).toEqual( operationClass ? [ operationClass ] : [] );
+		}
 	} );
 
 	it( 'classifies a command as the tool splits it', () => {
