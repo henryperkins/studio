@@ -325,6 +325,7 @@ Six small points the review of round 2 left. Commits `78d4e1c72` (1), `c560965c1
 5. **The route record says whether every check writes a record** (`everyCheckRecorded`), true only where the configuration declares it (the parity defaults); false for the main suite, whose `github.mjs` check and two inline checks write none.
 6. **README:** the fail-closed check's reach (known load-time paths only), the default-path process manager's home inside `~/.studio`, the Anthropic key in the leftover profile, and the entry's failure path among the exits that clean up.
 
+- **Review follow-up** (`f3e64a949`, `38a19249b`, `7f518c52b`, `23cb3a8d3`). The `rest_route` matcher had lost the backslash in both regexes (so array keys and leading whitespace passed); restored and pinned with array-key and whitespace rows on both hosts. The stale-result refusal now applies to provider-qualified cases only. The entry removes only a process manager home it made and prints a second fixed sentence when a removal failed. README sentences corrected.
 - **Unverified here.** No eval, no promptfoo run, no live run. Whether promptfoo's cache serves `exec:` output remains unknown until its source is read; the check and the flag make it harmless either way. The main suite's `npm run eval` does not pass `--no-cache` (a provider-qualified run of it should).
 - **Status.** `offline-tested`. **Nothing is qualified and no live gate is passed by this record.**
 
