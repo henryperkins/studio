@@ -732,11 +732,10 @@ describe( 'Claude WordPress.com requests', () => {
 		const site = ( args: Record< string, unknown > ) => remote( args )?.wpcomSiteId;
 		expect( site( { siteId: 1, method: 'GET', path: '/posts' } ) ).toBe( 1 );
 		expect( site( { siteId: 1, method: 'GET', path: '!/sites/99/posts' } ) ).toBe( 99 );
-		for ( const path of [ '!/me', '!/plans/features' ] ) {
-			expect( remote( { siteId: 1, method: 'GET', path } ), path ).toBeDefined();
-			expect( site( { siteId: 1, method: 'GET', path } ), path ).toBeUndefined();
-		}
+		expect( remote( { siteId: 1, method: 'GET', path: '!/plans/features' } ) ).toBeDefined();
+		expect( site( { siteId: 1, method: 'GET', path: '!/plans/features' } ) ).toBeUndefined();
 		for ( const args of [
+			{ method: 'GET', path: '!/me' },
 			{ method: 'POST', path: '!/me' },
 			{ method: 'GET', path: '!/me/settings' },
 			{ method: 'GET', path: '!/read/following' },
@@ -1292,7 +1291,7 @@ describe( 'Claude WordPress.com request transport options', () => {
 			remote()( {
 				siteId: 1,
 				method: 'GET',
-				path: '!/me',
+				path: '!/plans/features',
 				apiNamespace: 'rest/v1.1/sites/7/posts#',
 			} )
 		).toBeUndefined();

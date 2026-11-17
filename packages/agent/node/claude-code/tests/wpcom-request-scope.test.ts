@@ -72,7 +72,10 @@ it( 'decides from the request the WordPress.com client actually sends', async ()
 			},
 			'/rest/v1.1/sites/42/settings?fields=title',
 		],
-		[ { siteId: 1, method: 'GET', path: '!/me', apiNamespace: '' }, '/rest/v1.1/me' ],
+		[
+			{ siteId: 1, method: 'GET', path: '!/plans/features', apiNamespace: 'wpcom/v2' },
+			'/wpcom/v2/plans/features',
+		],
 		[
 			{ siteId: 42, method: 'POST', path: '/posts', query: { context: 'edit' }, body: {} },
 			'/wp/v2/sites/42/posts?context=edit',
@@ -127,10 +130,28 @@ it( 'denies the requests that would reach another site or origin than they name'
 	for ( const args of [
 		toSiteSeven,
 		{ ...toSiteSeven, apiNamespace: 'wp/v2/sites/7/posts?x=' },
-		{ siteId: 1, method: 'GET', path: '!/me', apiNamespace: 'rest/v1.1/sites/7/posts#' },
+		{
+			siteId: 1,
+			method: 'GET',
+			path: '!/plans/features',
+			apiNamespace: 'rest/v1.1/sites/7/posts#',
+		},
 		{ siteId: 42, method: 'GET', path: '/posts', query: { proxyOrigin: 'http://127.0.0.1:9' } },
 	] )
 		expect( scope( args ), JSON.stringify( args ) ).toBeUndefined();
+} );
+
+it( 'reads no account profile: the client would send it, but it names the account and its primary site', async () => {
+	const scope = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+	for ( const apiNamespace of [ '', 'wpcom/v2', undefined ] )
+		for ( const path of [ '!/me', '!/me/', '!/me/sites', '!/ME' ] )
+			expect(
+				scope( { siteId: 1, method: 'GET', path, apiNamespace } ),
+				`${ path } ${ apiNamespace }`
+			).toBeUndefined();
+	expect( await send( { siteId: 1, method: 'GET', path: '!/me', apiNamespace: '' } ) ).toEqual( [
+		'/rest/v1.1/me',
+	] );
 } );
 
 // The site in a path the server received, or `null` for an account path.
@@ -139,7 +160,7 @@ function receivedScope( request: string ): { wpcomSiteId?: number } | null | und
 	if ( route === undefined ) return;
 	const site = /^\/sites\/(\d+)(?:\/|$)/.exec( route )?.[ 1 ];
 	if ( site !== undefined ) return { wpcomSiteId: Number( site ) };
-	return [ '/me', '/plans/features' ].includes( route ) ? null : undefined;
+	return route === '/plans/features' ? null : undefined;
 }
 
 it( 'denies paths the client would normalize onto another site, which it really does', async () => {
@@ -362,7 +383,13 @@ it( 'lets a request change a site only through that site’s WordPress REST API,
 		scope( { siteId: 42, method: 'GET', path: '/settings', apiNamespace: '' } )
 	).toMatchObject( { wpcomSiteId: 42 } );
 	expect( scope( { siteId: 42, method: 'GET', path: '/' } ) ).toMatchObject( { wpcomSiteId: 42 } );
-	const account = scope( { siteId: 1, method: 'GET', path: '!/me', apiNamespace: '' } );
+	const account = scope( {
+		siteId: 1,
+		method: 'GET',
+		path: '!/plans/features',
+		apiNamespace: 'wpcom/v2',
+	} );
 	expect( account ).toBeDefined();
 	expect( account?.wpcomSiteId ).toBeUndefined();
+	expect( scope( { siteId: 1, method: 'GET', path: '!/me', apiNamespace: '' } ) ).toBeUndefined();
 } );

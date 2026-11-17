@@ -25,8 +25,12 @@ const SENT_METHODS: Readonly< Record< string, 'GET' | 'POST' > > = Object.freeze
 	Object.assign( Object.create( null ), { GET: 'GET', POST: 'POST', PUT: 'POST' } )
 );
 
-// The only account endpoints a request may reach: reads the bundled skills use.
-const WPCOM_ACCOUNT_READS: ReadonlySet< string > = new Set( [ '/me', '/plans/features' ] );
+// The only endpoint outside a site a request may reach: WordPress.com's plan
+// features, which the hosting-plans skill reads, a public catalog that names
+// no account. The account's profile (`/me`) is not read: it holds the
+// account's name, e-mail and primary site, which in a conversation bound to
+// one site would hand the provider another site's identity.
+const WPCOM_ACCOUNT_READS: ReadonlySet< string > = new Set( [ '/plans/features' ] );
 
 // API namespaces a request may use. An absent namespace means the tool's own
 // default; an empty one means WordPress.com REST v1.1.
@@ -115,9 +119,9 @@ function isWpcomPath( value: string ): boolean {
 // grammar above; the URL is then composed exactly as the tool and client
 // compose it, parsed as the client parses it, and the scope is the site in
 // that parsed path, which for a relative path must be the site it names. A
-// read may use any allowed namespace and reach the account's own profile and
-// plan features; a change only goes through the site's WordPress REST API, to
-// something under the site. With the scope comes the request as it is sent,
+// read may use any allowed namespace and reach WordPress.com's plan features;
+// a change only goes through the site's WordPress REST API, to something
+// under the site. With the scope comes the request as it is sent,
 // its method and path, which is what an approval shows.
 export function wpcomScope( args: unknown ): WpcomScope | undefined {
 	if ( ! isRecord( args ) || typeof args.path !== 'string' ) return;

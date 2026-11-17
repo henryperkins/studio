@@ -255,7 +255,7 @@ const REFUSALS = {
 	payloads:
 		'A file this operation sends must be an existing file in Studio’s payload folder, which the tool’s description names, and only a change the user approves sends one.',
 	wpcomRequest:
-		'On this route Studio sends a WordPress.com request only with a plain path and no query key that changes its method, route, namespace or origin. It reads a site, or the account at !/me and !/plans/features; it changes something in a site only through that site’s WordPress REST API (wp/v2) with POST or PUT, both sent as a POST, and sends no DELETE, which Studio’s WordPress.com client would send as a POST that deletes nothing.',
+		'On this route Studio sends a WordPress.com request only with a plain path and no query key that changes its method, route, namespace or origin. It reads a site, or WordPress.com’s plan features at !/plans/features, and does not read the account’s profile (!/me) on this connection, nor anything else of the account; it changes something in a site only through that site’s WordPress REST API (wp/v2) with POST or PUT, both sent as a POST, and sends no DELETE, which Studio’s WordPress.com client would send as a POST that deletes nothing.',
 	wpcomSite:
 		'Studio sends a WordPress.com request for a site only to this conversation’s own WordPress.com site.',
 	preview:

@@ -1021,6 +1021,7 @@ describe( 'wpcom_request on the Claude route', () => {
 	const payloads = () => path.join( config.root, 'tmp', 'ai-payloads' );
 	const WPCOM_REFUSAL = 'no query key that changes its method, route, namespace or origin';
 	const SITE_REFUSAL = 'only to this conversation’s own WordPress.com site';
+	const PROFILE_REFUSAL = 'does not read the account’s profile (!/me) on this connection';
 	const PAYLOAD_REFUSAL = 'must be an existing file in Studio’s payload folder';
 
 	describe( 'reads', () => {
@@ -1047,7 +1048,7 @@ describe( 'wpcom_request on the Claude route', () => {
 			expect( journal ).toEqual( [] );
 		} );
 
-		it( 'reads the account’s profile and plan features from any conversation, and nothing else of the account', async () => {
+		it( 'reads WordPress.com’s plan features from any conversation, and not the account’s profile or anything else of the account, saying so', async () => {
 			const { bridge } = await setup( global );
 			const read = ( accountPath: string, apiNamespace: string ) =>
 				bridge.invoke( 'wpcom_request', {
@@ -1056,12 +1057,14 @@ describe( 'wpcom_request on the Claude route', () => {
 					path: accountPath,
 					apiNamespace,
 				} );
-			expect( ( await read( '!/me', '' ) ).isError ).toBe( false );
 			expect( ( await read( '!/plans/features', 'wpcom/v2' ) ).isError ).toBe( false );
-			expect( sent() ).toEqual( [ 'GET /rest/v1.1/me', 'GET /wpcom/v2/plans/features' ] );
-			for ( const accountPath of [ '!/me/sites', '!/me/settings', '!/read/following' ] )
-				expect( ( await read( accountPath, '' ) ).isError, accountPath ).toBe( true );
-			expect( wpcom.received ).toHaveLength( 2 );
+			expect( sent() ).toEqual( [ 'GET /wpcom/v2/plans/features' ] );
+			for ( const accountPath of [ '!/me', '!/me/sites', '!/me/settings', '!/read/following' ] ) {
+				const result = await read( accountPath, '' );
+				expect( result.isError, accountPath ).toBe( true );
+				expect( text( result ), accountPath ).toContain( PROFILE_REFUSAL );
+			}
+			expect( wpcom.received ).toHaveLength( 1 );
 		} );
 
 		it( 'reads no other site, and no site from a conversation without one on WordPress.com, says why and sends nothing', async () => {

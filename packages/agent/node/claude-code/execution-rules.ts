@@ -916,8 +916,8 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		// Studio's payload folder, and sends one request itself, outside the host,
 		// with Studio's WordPress.com client. The scope decides from that request
 		// as the tool composes it and the client parses it: a read of the
-		// conversation's own WordPress.com site, or of the account's profile or
-		// plan features, runs unprompted; a change of something in that site
+		// conversation's own WordPress.com site, or of WordPress.com's plan
+		// features, runs unprompted; a change of something in that site
 		// through its WordPress REST API runs once the user approves it, seeing
 		// the method sent, the site, the path and the body files, never the
 		// body, the query or the login. Its module links `tools/utils.ts`, whose
