@@ -58,6 +58,7 @@ import {
 	readObservedLines,
 	type ObservedRequest,
 } from 'cli/ai/chatgpt-acceptance-observer';
+import { caseProcessManagerHome, stopCaseProcessManager } from 'cli/ai/eval-case-daemon';
 import {
 	evalHistoryMessages,
 	findEvalFixturesDir,
@@ -95,6 +96,8 @@ import {
 	unlockCliConfig,
 } from 'cli/lib/cli-config/core';
 import { getSiteByFolder } from 'cli/lib/cli-config/sites';
+import { disconnectFromDaemon, killDaemonAndChildren } from 'cli/lib/daemon-client';
+import { PROCESS_MANAGER_HOME } from 'cli/lib/paths';
 import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
 import { STUDIO_SITES_ROOT } from 'cli/lib/site-paths';
 import { Logger } from 'cli/logger';
@@ -118,13 +121,6 @@ interface SeededFixtures {
 	activeSitePath?: string;
 }
 
-/**
- * Writes the requested fixtures into cli.json (local site + snapshots) and
- * shared.json (connected WordPress.com sites). Returns a cleanup function that
- * removes exactly what was added, so reruns start from a clean slate.
- * `globalInstructions` is the exception: it overwrites the user's real
- * instructions file, so cleanup restores the prior content instead.
- */
 // The folder site_create gives a site of this name.
 function siteSlug( name: string ): string {
 	return name
@@ -161,13 +157,17 @@ async function isolateSiteRegistry(): Promise< string > {
 }
 
 // What Studio downloads once per machine, which every eval reads as the user's
-// Studio does.
-const STUDIO_DOWNLOADS = [ 'server-files', 'php-bin', 'import-runtime', 'mu-plugins' ];
+// Studio does. Not `mu-plugins`: a site start writes there, so each case keeps
+// its own.
+const STUDIO_DOWNLOADS = [ 'server-files', 'php-bin', 'import-runtime' ];
 
 // Each eval runs against its own Studio config directory, signed in as the
 // user, so what a case seeds (global instructions, WordPress.com connections)
 // and what its turn changes stay in the case: concurrent cases and the user's
-// own Studio never see them.
+// own Studio never see them. The profile this process started with (from
+// `DEV_CONFIG_DIR`, or the default) is only read: the login copy and the links
+// to its downloads come from it. `DEV_CONFIG_DIR`, which every path helper
+// reads first, then names the case's profile until the case ends.
 function isolateStudioConfig( { withoutWpcomLogin = false } = {} ): string {
 	const userDir = getConfigDirectory();
 	const shared = JSON.parse( readFileSync( getSharedConfigPath(), 'utf8' ) ) as Record<
@@ -188,6 +188,7 @@ function isolateStudioConfig( { withoutWpcomLogin = false } = {} ): string {
 		JSON.stringify( { version, authToken, aiProvider } )
 	);
 	process.env.E2E_SHARED_CONFIG_PATH = dir;
+	process.env.DEV_CONFIG_DIR = dir;
 	return dir;
 }
 
@@ -217,7 +218,12 @@ function warnTeardown( what: string, error: unknown ): void {
 }
 
 // The environment a case points at its own folders, as it was before the case.
-const CASE_ENVIRONMENT = [ 'E2E', 'E2E_CLI_CONFIG_PATH', 'E2E_SHARED_CONFIG_PATH' ] as const;
+const CASE_ENVIRONMENT = [
+	'E2E',
+	'E2E_CLI_CONFIG_PATH',
+	'E2E_SHARED_CONFIG_PATH',
+	'DEV_CONFIG_DIR',
+] as const;
 
 function saveCaseEnvironment(): () => void {
 	const saved = CASE_ENVIRONMENT.map( ( name ) => [ name, process.env[ name ] ] as const );
@@ -271,6 +277,12 @@ async function deleteSites( sitePaths: string[] ): Promise< void > {
 	}
 }
 
+/**
+ * Writes the requested fixtures into the case's own profile: cli.json (local
+ * site and snapshots, in the case's registry), shared.json (connected
+ * WordPress.com sites) and the global instructions file, all removed with the
+ * case. Returns a cleanup function that deletes the seeded active site.
+ */
 async function seedFixtures( seed: EvalSeed ): Promise< SeededFixtures > {
 	const {
 		localSite,
@@ -1231,6 +1243,13 @@ export async function main() {
 		emit( { success: false, error: error instanceof Error ? error.message : String( error ) } );
 		exitCode = 1;
 	}
+	await stopCaseProcessManager( {
+		home: caseProcessManagerHome( process.env ),
+		processManagerHome: PROCESS_MANAGER_HOME,
+		kill: killDaemonAndChildren,
+		disconnect: disconnectFromDaemon,
+		warn: warnTeardown,
+	} );
 	removeEmptySitesRoot();
 	// The Agent SDK keeps internal handles open past conversation end; bail out
 	// rather than leaving promptfoo waiting on its exec child.

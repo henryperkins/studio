@@ -300,7 +300,7 @@ const PROFILE_PROBLEMS: Record< DedicatedProfileProblem, string > = {
 	'profile-not-found': `${ EVAL_CHATGPT_PROFILE_ENV } names no directory.`,
 	'profile-in-studio-profile': `${ EVAL_CHATGPT_PROFILE_ENV } is your own Studio profile, inside it, or resolves into it. Use a dedicated test profile.`,
 	'profile-is-config-directory':
-		'This process keeps its own Studio config in the dedicated test profile (DEV_CONFIG_DIR), so a case would seed it. Run the eval without pointing DEV_CONFIG_DIR there.',
+		'DEV_CONFIG_DIR points at the dedicated test profile, which the eval would then also read as your own Studio profile. Run the eval without pointing DEV_CONFIG_DIR there.',
 };
 
 const REPLY_API: Record< AiProviderId, string > = {
