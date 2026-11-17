@@ -16,6 +16,7 @@ import {
 	buildAttachedFilesPromptBlock,
 	type StudioChatFileAttachment,
 } from '@studio/agent/protocol/chat-files';
+import { normalizeHostname } from '@studio/common/lib/normalize-hostname';
 import type { SessionManager } from '@earendil-works/pi-coding-agent';
 import type { HostSite, StudioAgentHost } from '@studio/agent/node';
 import type { StudioChatImage, StudioChatImageMimeType } from '@studio/agent/protocol/chat-images';
@@ -36,6 +37,14 @@ export interface RemoteCall {
 	site?: string;
 	target?: string;
 	options?: string;
+	/** In a staging case: whether its target was the designated staging site, so it ran. */
+	designated?: boolean;
+}
+
+/** The WordPress.com staging site a `remote: staging` case may change, as WordPress.com lists it. */
+export interface StagingSite {
+	id: number;
+	url: string;
 }
 
 // Reserved for documentation (RFC 2606): nothing is ever reached there.
@@ -97,6 +106,89 @@ export function withMockedRemote( host: StudioAgentHost, calls: RemoteCall[] ): 
 			pull: async ( site, options, remoteSite ) => {
 				calls.push( { operation: 'pull', site: site.name, target: remoteSite, options } );
 				return mockRemoteSite( site, remoteSite );
+			},
+		},
+	};
+}
+
+/**
+ * Whether a push's or pull's remote names the designated staging site, read as
+ * the push and pull commands resolve it: digits alone are a site id, anything
+ * else is matched by its hostname. Anything that isn't plainly that site,
+ * including no remote at all, is not.
+ */
+export function remoteIsStagingSite( remote: string | undefined, site: StagingSite ): boolean {
+	const identifier = remote?.trim();
+	if ( ! identifier ) {
+		return false;
+	}
+	if ( /^\d+$/.test( identifier ) ) {
+		return Number( identifier ) === site.id;
+	}
+	return normalizeHostname( identifier ) === normalizeHostname( site.url );
+}
+
+/**
+ * The host of a staging case: a push or pull runs for real only when its
+ * remote is the designated staging site, and no preview is created, updated
+ * or deleted. Each is recorded in `calls`, with whether it was the designated
+ * site; anything else is refused before it starts, recorded in `refused`, and
+ * fails the case.
+ */
+export function withStagingRemote(
+	host: StudioAgentHost,
+	calls: RemoteCall[],
+	site: StagingSite,
+	refused: WpcomWriteAttempt[]
+): StudioAgentHost {
+	const refuse = ( call: RemoteCall ): never => {
+		calls.push( { ...call, designated: false } );
+		refused.push( {
+			code: STAGING_WRITE_CODE,
+			method: 'OTHER',
+			host: 'wpcom',
+			endpoint: 'other',
+			via: 'remote-operation',
+			operation: call.operation,
+		} );
+		throw new Error( stagingBlockedMessage() );
+	};
+	return {
+		...host,
+		previews: {
+			...host.previews,
+			create: async ( localSite ) =>
+				refuse( { operation: 'preview-create', site: localSite.name } ),
+			update: async ( localSite, hostname ) =>
+				refuse( { operation: 'preview-update', site: localSite.name, target: hostname } ),
+			delete: async ( hostname ) => refuse( { operation: 'preview-delete', target: hostname } ),
+		},
+		sync: {
+			push: async ( localSite, options, remoteSite, onProgress ) => {
+				const call: RemoteCall = {
+					operation: 'push',
+					site: localSite.name,
+					target: remoteSite,
+					options,
+				};
+				if ( ! remoteIsStagingSite( remoteSite, site ) ) {
+					return refuse( call );
+				}
+				calls.push( { ...call, designated: true } );
+				return host.sync.push( localSite, options, remoteSite, onProgress );
+			},
+			pull: async ( localSite, options, remoteSite, onProgress ) => {
+				const call: RemoteCall = {
+					operation: 'pull',
+					site: localSite.name,
+					target: remoteSite,
+					options,
+				};
+				if ( ! remoteIsStagingSite( remoteSite, site ) ) {
+					return refuse( call );
+				}
+				calls.push( { ...call, designated: true } );
+				return host.sync.pull( localSite, options, remoteSite, onProgress );
 			},
 		},
 	};
@@ -200,12 +292,19 @@ function pathQuery( requestPath: string ): string {
 /**
  * `wpcom_request` with every request whose effective method is not GET or HEAD
  * (declared, or named by a method override in its `query` or in a query written
- * into its `path`) answered by a fixture and recorded in `calls`, as the mocked
- * host does for pushes and previews: a write the agent asks for never leaves
- * the process. Reads stay the real tool's. The returned function puts the real
- * tool back.
+ * into its `path`) recorded in `calls`. Under `remote: mock` (no `staging`)
+ * each is answered by a fixture, as the mocked host does for pushes and
+ * previews: a write the agent asks for never leaves the process. In a staging
+ * case one to the designated staging site goes to the real tool, where the
+ * write guard checks the address it composes; one to any other site, or to a
+ * path outside a site, is refused before it is sent and recorded in
+ * `staging.refused`. Reads stay the real tool's. The returned function puts the
+ * real tool back.
  */
-export function withMockedWpcomRequest( calls: RemoteCall[] ): () => void {
+export function withMockedWpcomRequest(
+	calls: RemoteCall[],
+	staging?: { site: StagingSite; refused: WpcomWriteAttempt[] }
+): () => void {
 	const original = wpcomRequestTool.handler;
 	wpcomRequestTool.handler = async ( args, context ) => {
 		const method = effectiveMethod(
@@ -216,13 +315,30 @@ export function withMockedWpcomRequest( calls: RemoteCall[] ): () => void {
 		if ( READ_METHODS.has( method ) ) {
 			return original.call( wpcomRequestTool, args, context );
 		}
-		calls.push( {
+		const call: RemoteCall = {
 			operation: 'wpcom-request',
 			method,
 			site: String( args.siteId ),
 			target: args.path,
+		};
+		if ( ! staging ) {
+			calls.push( call );
+			return textResult( JSON.stringify( { eval_mock: true, method, path: args.path } ) );
+		}
+		// As the tool reads it: a path starting with `!` is not under the site.
+		const designated = args.siteId === staging.site.id && ! args.path.startsWith( '!' );
+		calls.push( { ...call, designated } );
+		if ( designated ) {
+			return original.call( wpcomRequestTool, args, context );
+		}
+		staging.refused.push( {
+			code: STAGING_WRITE_CODE,
+			method: KNOWN_METHODS.has( method ) ? method : 'OTHER',
+			host: 'wpcom',
+			endpoint: 'other',
+			via: 'wpcom-request',
 		} );
-		return textResult( JSON.stringify( { eval_mock: true, method, path: args.path } ) );
+		throw new Error( stagingBlockedMessage() );
 	};
 	return () => {
 		wpcomRequestTool.handler = original;
@@ -230,14 +346,26 @@ export function withMockedWpcomRequest( calls: RemoteCall[] ): () => void {
 }
 
 const WPCOM_WRITE_CODE = 'wpcom-write-under-mock';
+const STAGING_WRITE_CODE = 'wpcom-write-outside-staging';
 const KNOWN_METHODS = new Set( [ 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS' ] );
 
-/** A request a guarded case tried to send to WordPress.com that could change something there. */
-interface WpcomWriteAttempt {
-	code: typeof WPCOM_WRITE_CODE;
+/**
+ * A request a guarded case tried to send to WordPress.com that could change
+ * something there, which was refused. Never its address.
+ */
+export interface WpcomWriteAttempt {
+	code: typeof WPCOM_WRITE_CODE | typeof STAGING_WRITE_CODE;
 	method: string;
 	host: 'wpcom' | 'wpcom-ai-proxy';
 	endpoint: 'images' | 'other';
+	via: 'fetch' | 'http' | 'wpcom-request' | 'remote-operation';
+	/** For `remote-operation`: which one. */
+	operation?: RemoteCall[ 'operation' ];
+}
+
+/** A write a staging case sent to its designated staging site. Never its address. */
+interface StagingWrite {
+	method: string;
 	via: 'fetch' | 'http';
 }
 
@@ -246,6 +374,61 @@ export interface WpcomWriteGuardOptions {
 	allowImageService?: boolean;
 	/** The run's provider is WordPress.com, whose model requests go to the AI proxy. */
 	allowProxyInference?: boolean;
+	/**
+	 * A staging case's designated site: a write to it is let through and
+	 * recorded in `allowed`; any other write is refused as outside it.
+	 */
+	stagingSite?: StagingSite;
+	/** Where refused requests are recorded, shared with the case's other checks. */
+	attempts?: WpcomWriteAttempt[];
+}
+
+const WPCOM_API_HOST = 'public-api.wordpress.com';
+
+const stagingHostname = ( site: StagingSite ) => normalizeHostname( site.url ).split( '/' )[ 0 ];
+
+/**
+ * Whether a write to a WordPress.com host addresses the designated staging
+ * site, decided from the address the request sends: on the API host, the
+ * site its path names after a two-part namespace (`/<namespace>/sites/<site>`,
+ * or the push's upload endpoint `/rest/<version>/studio-file-uploads/<site>`),
+ * by id or by hostname; on any other host, that host being the site's own. A
+ * path the server could read as another site (a dot segment, an encoded
+ * slash, an empty segment, a segment that doesn't decode) is not.
+ */
+export function writesToStagingSite(
+	target: { hostname: string; pathname: string },
+	site: StagingSite
+): boolean {
+	const host = target.hostname.toLowerCase();
+	const stagingHost = stagingHostname( site );
+	if ( host !== WPCOM_API_HOST ) {
+		return host === stagingHost;
+	}
+	const segments: string[] = [];
+	for ( const raw of target.pathname.split( '/' ) ) {
+		let segment: string;
+		try {
+			segment = decodeURIComponent( raw );
+		} catch {
+			return false;
+		}
+		if (
+			segment === '.' ||
+			segment === '..' ||
+			/[\\/]/.test( segment ) ||
+			hasControlCharacter( segment )
+		) {
+			return false;
+		}
+		segments.push( segment );
+	}
+	const [ root, first, , kind, addressed ] = segments;
+	const siteScoped = kind === 'sites' || ( first === 'rest' && kind === 'studio-file-uploads' );
+	if ( root !== '' || ! siteScoped || ! addressed ) {
+		return false;
+	}
+	return addressed === String( site.id ) || addressed.toLowerCase() === stagingHost;
 }
 
 interface RequestTarget {
@@ -256,10 +439,12 @@ interface RequestTarget {
 	headers: Array< [ string, unknown ] >;
 }
 
+// What the guard does with a request: let it through (a read, a named
+// exception, or in a staging case a write to the designated site), or refuse it.
 function classifyWpcomWrite(
 	target: RequestTarget,
 	options: WpcomWriteGuardOptions
-): Omit< WpcomWriteAttempt, 'via' > | null {
+): Omit< WpcomWriteAttempt, 'via' > | { stagingWrite: string } | null {
 	const { hostname, pathname } = target;
 	const overrides = [
 		...queryOverrideValues( new URLSearchParams( target.search ).entries() ),
@@ -283,9 +468,13 @@ function classifyWpcomWrite(
 	if ( proxy && endpoint === 'other' && options.allowProxyInference ) {
 		return null;
 	}
+	const shownMethod = KNOWN_METHODS.has( method ) ? method : 'OTHER';
+	if ( options.stagingSite && writesToStagingSite( target, options.stagingSite ) ) {
+		return { stagingWrite: shownMethod };
+	}
 	return {
-		code: WPCOM_WRITE_CODE,
-		method: KNOWN_METHODS.has( method ) ? method : 'OTHER',
+		code: options.stagingSite ? STAGING_WRITE_CODE : WPCOM_WRITE_CODE,
+		method: shownMethod,
 		host: proxy ? 'wpcom-ai-proxy' : 'wpcom',
 		endpoint,
 	};
@@ -294,11 +483,14 @@ function classifyWpcomWrite(
 const blockedMessage = () =>
 	`${ WPCOM_WRITE_CODE }: this eval case may not change anything on WordPress.com, so the request was not sent.`;
 
+const stagingBlockedMessage = () =>
+	`${ STAGING_WRITE_CODE }: this staging case may change only its designated staging site on WordPress.com, so the request was not sent.`;
+
 /**
  * Options that give an `http` or `https` request a connection which fails at
  * once, before anything is written: the request is never sent anywhere.
  */
-export function blockedConnectionOptions(): {
+export function blockedConnectionOptions( message: string = blockedMessage() ): {
 	agent: undefined;
 	createConnection: () => net.Socket;
 } {
@@ -310,7 +502,7 @@ export function blockedConnectionOptions(): {
 			// Never connected: what the request writes waits for a connection that never comes.
 			( socket as { connecting: boolean } ).connecting = true;
 			// After the request has attached its listeners to the socket.
-			setImmediate( () => socket.destroy( new Error( blockedMessage() ) ) );
+			setImmediate( () => socket.destroy( new Error( message ) ) );
 			return socket;
 		},
 	};
@@ -338,16 +530,16 @@ function readHttpTarget( args: unknown[] ): RequestTarget {
 	return { hostname, pathname, method, search: query.join( '?' ), headers };
 }
 
-function withBlockedConnection( args: unknown[] ): unknown[] {
+function withBlockedConnection( args: unknown[], message: string ): unknown[] {
 	const [ first, second, third ] = args;
 	if ( typeof first === 'string' || first instanceof URL ) {
 		const options = typeof second === 'object' && second !== null ? second : {};
 		const callback = typeof second === 'function' ? second : third;
-		return [ first, { ...options, ...blockedConnectionOptions() }, callback ].filter(
+		return [ first, { ...options, ...blockedConnectionOptions( message ) }, callback ].filter(
 			( value ) => value !== undefined
 		);
 	}
-	return [ { ...( first as object ), ...blockedConnectionOptions() }, second ].filter(
+	return [ { ...( first as object ), ...blockedConnectionOptions( message ) }, second ].filter(
 		( value ) => value !== undefined
 	);
 }
@@ -355,6 +547,8 @@ function withBlockedConnection( args: unknown[] ): unknown[] {
 export interface WpcomWriteGuard {
 	/** Every request it refused, in order: what a guarded case was not allowed to send. */
 	attempts: WpcomWriteAttempt[];
+	/** In a staging case, every write it let through to the designated staging site. */
+	allowed: StagingWrite[];
 	/** Puts the process's own `fetch` and request functions back. */
 	uninstall(): void;
 }
@@ -364,8 +558,9 @@ export interface WpcomWriteGuard {
  * WordPress.com host with a method other than GET or HEAD, through `fetch` or
  * the `http` and `https` modules that `wpcom` requests go through. Reads pass.
  * The exceptions are named in `options`: Studio's image service in a case
- * labelled as needing it, and model requests to the AI proxy on a run whose
- * provider is WordPress.com.
+ * labelled as needing it, model requests to the AI proxy on a run whose
+ * provider is WordPress.com, and in a staging case writes to its designated
+ * staging site, which are recorded in `allowed`.
  */
 export function installWpcomWriteGuard(
 	options: WpcomWriteGuardOptions = {},
@@ -379,7 +574,9 @@ export function installWpcomWriteGuard(
 		https: https as unknown as { request: RequestFunction },
 	}
 ): WpcomWriteGuard {
-	const attempts: WpcomWriteAttempt[] = [];
+	const attempts: WpcomWriteAttempt[] = options.attempts ?? [];
+	const allowed: StagingWrite[] = [];
+	const message = options.stagingSite ? stagingBlockedMessage() : blockedMessage();
 	const originalFetch = targets.global.fetch;
 	targets.global.fetch = ( async ( input: Parameters< typeof fetch >[ 0 ], init?: RequestInit ) => {
 		let url: URL | null = null;
@@ -412,9 +609,11 @@ export function installWpcomWriteGuard(
 					options
 			  )
 			: null;
-		if ( write ) {
+		if ( write && 'stagingWrite' in write ) {
+			allowed.push( { method: write.stagingWrite, via: 'fetch' } );
+		} else if ( write ) {
 			attempts.push( { ...write, via: 'fetch' } );
-			throw new Error( blockedMessage() );
+			throw new Error( message );
 		}
 		return originalFetch( input, init );
 	} ) as typeof fetch;
@@ -424,16 +623,21 @@ export function installWpcomWriteGuard(
 		module.request = ( ...args: unknown[] ) => {
 			const target = readHttpTarget( args );
 			const write = classifyWpcomWrite( target, options );
+			if ( write && 'stagingWrite' in write ) {
+				allowed.push( { method: write.stagingWrite, via: 'http' } );
+				return original.apply( module, args );
+			}
 			if ( ! write ) {
 				return original.apply( module, args );
 			}
 			attempts.push( { ...write, via: 'http' } );
-			return original.apply( module, withBlockedConnection( args ) );
+			return original.apply( module, withBlockedConnection( args, message ) );
 		};
 		return original;
 	} );
 	return {
 		attempts,
+		allowed,
 		uninstall: () => {
 			targets.global.fetch = originalFetch;
 			modules.forEach( ( module, index ) => {

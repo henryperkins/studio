@@ -848,8 +848,8 @@ const REMOTE_TOOL = {
 
 // The remote operation `vars.operation` ran, against `vars.target` when set,
 // judged by the mode the case declares: under `remote: mock`, recorded by the
-// mock; under `remote: staging`, on a designated staging site, by the tool's
-// own result.
+// mock; under `remote: staging`, recorded by the runner as run against the
+// designated staging site, and the tool's own result says it succeeded.
 export const remoteOperationRan = check( ( d, vars ) => {
 	if ( vars.remote === 'mock' ) {
 		const matching = ( d.remoteCalls || [] ).filter(
@@ -867,12 +867,18 @@ export const remoteOperationRan = check( ( d, vars ) => {
 	}
 	if ( vars.remote !== 'staging' )
 		return fail( 'the case declares no remote mode: it needs remote: mock or remote: staging' );
-	const ran = ( d.toolResults || [] ).filter(
-		( r ) => r.toolName === REMOTE_TOOL[ vars.operation ] && ! r.isError
-	);
-	return ran.length
-		? pass( `${ REMOTE_TOOL[ vars.operation ] } ran: ${ ( ran[ 0 ].text || '' ).slice( 0, 200 ) }` )
-		: fail( `${ REMOTE_TOOL[ vars.operation ] } never succeeded` );
+	const tool = REMOTE_TOOL[ vars.operation ];
+	const calls = ( d.remoteCalls || [] ).filter( ( c ) => c.operation === vars.operation );
+	if ( ! calls.some( ( c ) => c.designated === true ) )
+		return fail(
+			calls.length
+				? `staging-target-not-designated: ${ tool } targeted a site other than the designated staging site, and was refused`
+				: `no ${ tool } against the designated staging site was recorded`
+		);
+	const succeeded = ( d.toolResults || [] ).some( ( r ) => r.toolName === tool && ! r.isError );
+	return succeeded
+		? pass( `${ tool } ran against the designated staging site` )
+		: fail( `${ tool } against the designated staging site never succeeded` );
 } );
 
 // The tools in `vars.toolOrder` each succeeded, in that order in the recorded
@@ -911,23 +917,36 @@ export const noRemoteOperation = check( ( d, vars ) => {
 // runner refused, and recorded, every request that could change something on
 // WordPress.com: anything but GET or HEAD to a WordPress.com host, by `fetch`
 // or the `http` modules, except Studio's image service in a case labelled
-// `imageService: required`. A refused write fails the case. Reads still reach
-// WordPress.com.
+// `imageService: required`. Under `remote: staging` the same guard let writes
+// to the designated staging site through and refused, and recorded, any
+// other, as well as a push, pull or preview change whose remote is not that
+// site. Judged from the guard's record either way: a refused write fails the
+// case. Reads still reach WordPress.com.
 export const noWordPressComWrites = check( ( d, vars ) => {
-	if ( vars.remote === 'staging' )
-		return pass( 'a staging case changes its designated staging site by design' );
+	const staging = vars.remote === 'staging';
 	if ( ! d.remoteGuard )
 		return fail(
 			'remote-guard-missing: the case ran without the guard that keeps writes from WordPress.com'
 		);
 	const blocked = d.remoteGuard.blocked || [];
-	return blocked.length
-		? fail(
-				`wpcom-write-under-mock: ${
-					blocked.length
-				} request(s) that could change WordPress.com were refused: ${ blocked
-					.map( ( b ) => `${ b.method } ${ b.host }${ b.endpoint === 'images' ? ' images' : '' }` )
-					.join( ', ' ) }`
+	if ( blocked.length )
+		return fail(
+			`${ staging ? 'wpcom-write-outside-staging' : 'wpcom-write-under-mock' }: ${
+				blocked.length
+			} request(s) that could change WordPress.com${
+				staging ? ' outside the designated staging site' : ''
+			} were refused: ${ blocked
+				.map(
+					( b ) =>
+						`${ b.operation ?? b.method } ${ b.host }${ b.endpoint === 'images' ? ' images' : '' }`
+				)
+				.join( ', ' ) }`
+		);
+	return staging
+		? pass(
+				`no write outside the designated staging site was attempted; ${
+					( d.remoteGuard.allowed || [] ).length
+				} write(s) to the designated staging site`
 		  )
 		: pass( 'no request that could change WordPress.com was attempted' );
 } );

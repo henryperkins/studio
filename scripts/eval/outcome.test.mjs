@@ -824,8 +824,45 @@ describe( 'WordPress.com writes under remote: mock', () => {
 		expect( verdict.reason ).toMatch( /^remote-guard-missing:/ );
 	} );
 
-	test( 'noWordPressComWrites leaves a staging case to its own checks', () => {
-		expect( run( checks.noWordPressComWrites, {}, { remote: 'staging' } ).pass ).toBe( true );
+	test( 'noWordPressComWrites judges a staging case on its guard’s record: no write outside the designated site', () => {
+		const staging = { remote: 'staging' };
+		const recorded = ( blocked, allowed ) => ( {
+			remoteGuard: {
+				code: blocked.length ? 'wpcom-write-outside-staging' : null,
+				blocked,
+				allowed,
+			},
+		} );
+		const passed = run(
+			checks.noWordPressComWrites,
+			recorded( [], [ { method: 'POST', via: 'http' } ] ),
+			staging
+		);
+		expect( passed.pass ).toBe( true );
+		expect( passed.reason ).toMatch( /1 write\(s\) to the designated staging site/ );
+		const refused = run(
+			checks.noWordPressComWrites,
+			recorded(
+				[
+					{
+						code: 'wpcom-write-outside-staging',
+						method: 'OTHER',
+						host: 'wpcom',
+						endpoint: 'other',
+						via: 'remote-operation',
+						operation: 'push',
+					},
+				],
+				[]
+			),
+			staging
+		);
+		expect( refused.pass ).toBe( false );
+		expect( refused.reason ).toMatch( /^wpcom-write-outside-staging:.*push/ );
+		// Never passed without the record.
+		const unguarded = run( checks.noWordPressComWrites, {}, staging );
+		expect( unguarded.pass ).toBe( false );
+		expect( unguarded.reason ).toMatch( /^remote-guard-missing:/ );
 	} );
 } );
 
@@ -975,32 +1012,42 @@ describe( 'parity checks', () => {
 			).pass
 		).toBe( false );
 		expect( run( checks.remoteOperationRan, { remoteCalls: [] }, mock ).pass ).toBe( false );
-		// On a designated staging site the push really ran: judged on its result,
-		// whatever else the result holds (an empty list of mocked calls included).
+		// On a designated staging site the push really ran: recorded against the
+		// designated site, and the tool's own result says it succeeded.
 		const staging = { remote: 'staging', operation: 'push' };
-		const staged = ( isError, text, extra = {} ) => ( {
+		const toDesignated = { operation: 'push', site: 'A', target: '4242', designated: true };
+		const staged = ( isError, text, remoteCalls = [ toDesignated ] ) => ( {
 			toolResults: [ { toolName: 'site_push', isError, text } ],
-			...extra,
+			remoteCalls,
 		} );
-		expect(
-			run( checks.remoteOperationRan, staged( false, 'Pushed "A" to Staging (url).' ), staging )
-				.pass
-		).toBe( true );
-		expect(
-			run(
-				checks.remoteOperationRan,
-				staged( false, 'Pushed "A" to Staging (url).', { remoteCalls: [] } ),
-				staging
-			).pass
-		).toBe( true );
+		const ran = run(
+			checks.remoteOperationRan,
+			staged( false, 'Pushed "A" to Staging (https://staging-4242.wpcomstaging.com).' ),
+			staging
+		);
+		expect( ran.pass ).toBe( true );
+		expect( ran.reason ).not.toMatch( /4242|https?:/ );
 		expect(
 			run( checks.remoteOperationRan, staged( true, 'Failed to push site' ), staging ).pass
 		).toBe( false );
-		// A mocked case is never judged on a real tool result, and a case must declare its mode.
+		// A push that succeeded somewhere the runner didn't record as the designated site fails.
+		const elsewhere = run(
+			checks.remoteOperationRan,
+			staged( false, 'Pushed "A" to My Production Site (https://myprod.wordpress.com).', [
+				{ ...toDesignated, target: 'https://myprod.wordpress.com', designated: false },
+			] ),
+			staging
+		);
+		expect( elsewhere.pass ).toBe( false );
+		expect( elsewhere.reason ).toMatch( /^staging-target-not-designated/ );
+		expect( elsewhere.reason ).not.toMatch( /myprod|https?:/ );
 		expect(
-			run( checks.remoteOperationRan, staged( false, 'Pushed "A".', { remoteCalls: [] } ), mock )
-				.pass
+			run( checks.remoteOperationRan, staged( false, 'Pushed "A".', [] ), staging ).pass
 		).toBe( false );
+		// A mocked case is never judged on a real tool result, and a case must declare its mode.
+		expect( run( checks.remoteOperationRan, staged( false, 'Pushed "A".', [] ), mock ).pass ).toBe(
+			false
+		);
 		const undeclared = run(
 			checks.remoteOperationRan,
 			{ remoteCalls: [ push ] },

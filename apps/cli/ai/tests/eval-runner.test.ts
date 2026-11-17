@@ -8,6 +8,7 @@ import { wpcomRequestTool } from '@studio/agent/node/tools/wpcom-request';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { evalConnectionRef } from 'cli/ai/eval-provider';
 import { readEvalRunnerInput, runEval as runEvalUntyped } from 'cli/ai/eval-runner';
+import { cliAgentHost } from 'cli/ai/host';
 import type { AgentSessionEvent, SessionManager } from '@earendil-works/pi-coding-agent';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 import type { StudioAgentTurnConfig } from '@studio/agent/node/runtime';
@@ -228,7 +229,7 @@ interface RunReport {
 	};
 	stoppedAt?: unknown;
 	remoteCalls?: unknown[];
-	remoteGuard?: { code: string | null; blocked: unknown[] };
+	remoteGuard?: { code: string | null; blocked: unknown[]; allowed?: unknown[] };
 	imageService?: { configured: boolean };
 	attachments?: unknown[];
 	turns?: Array< Record< string, unknown > >;
@@ -864,14 +865,14 @@ describe( 'eval runner provider selection', () => {
 				expect( agent.turns ).toEqual( [] );
 			} );
 
-			it( 'runs connected to the site as WordPress.com lists it, with no record of mocked calls', async () => {
+			it( 'runs connected to the site as WordPress.com lists it, with the write guard on', async () => {
 				Object.assign( process.env, designated );
 				wpcom.sites.mockResolvedValue( [ listed() ] );
 				agent.behavior = { replyProvider: 'studio-wpcom' };
 				const result = await runEval( stagingCase() );
 				expect( result.success ).toBe( true );
-				expect( result ).not.toHaveProperty( 'remoteCalls' );
-				expect( result ).not.toHaveProperty( 'remoteGuard' );
+				expect( result.remoteCalls ).toEqual( [] );
+				expect( result.remoteGuard ).toEqual( { code: null, blocked: [], allowed: [] } );
 				expect( wpcom.connected ).toEqual( [
 					{
 						localSiteId: 'seeded-site',
@@ -883,6 +884,113 @@ describe( 'eval runner provider selection', () => {
 						} ),
 					},
 				] );
+			} );
+
+			const pushSite = {
+				id: 'site-1',
+				name: 'Parity Staging Source',
+				path: '/sites/parity',
+				url: 'http://localhost:8881',
+				phpVersion: '8.3',
+			};
+			const sentToNetwork = () =>
+				fetchSpy.mock.calls.map(
+					( [ url, init ]: [ unknown, RequestInit | undefined ] ) =>
+						`${ init?.method ?? 'GET' } ${ String( url ) }`
+				);
+
+			it.each( [
+				[
+					'through wpcom_request',
+					async ( host: StudioAgentHost ) => {
+						await wpcomRequestTool
+							.handler(
+								{ siteId: 113, method: 'POST', path: '/posts', body: { title: 'Hi' } },
+								{ host, onProgress: () => undefined }
+							)
+							.catch( () => undefined );
+					},
+				],
+				[
+					'through a raw request',
+					async () => {
+						await fetch( 'https://public-api.wordpress.com/rest/v1.1/sites/113/posts/new', {
+							method: 'POST',
+						} ).catch( () => undefined );
+					},
+				],
+				[
+					'through a push with another remote',
+					async ( host: StudioAgentHost ) => {
+						await host.sync
+							.push( pushSite, 'all', 'https://myprod.wordpress.com', () => undefined )
+							.catch( () => undefined );
+					},
+				],
+			] )(
+				'refuses a write to another site of the account %s, and fails the case',
+				async ( _channel, write ) => {
+					Object.assign( process.env, designated );
+					wpcom.sites.mockResolvedValue( [ listed() ] );
+					agent.behavior = { replyProvider: 'studio-wpcom', act: ( { host } ) => write( host ) };
+					const result = await runEval( stagingCase() );
+					expect( result ).toMatchObject( {
+						success: false,
+						error: expect.stringMatching( /^wpcom-write-outside-staging/ ),
+						remoteGuard: {
+							code: 'wpcom-write-outside-staging',
+							blocked: [ expect.objectContaining( { code: 'wpcom-write-outside-staging' } ) ],
+							allowed: [],
+						},
+					} );
+					expect(
+						sentToNetwork().filter( ( sent: string ) => ! sent.startsWith( 'GET' ) )
+					).toEqual( [] );
+					expect( cliAgentHost.sync.push ).not.toHaveBeenCalled();
+					expect( JSON.stringify( result.remoteGuard ) ).not.toMatch( /113|myprod|public-api/ );
+				}
+			);
+
+			it( 'lets writes to the designated site through, by each channel, and records them', async () => {
+				Object.assign( process.env, designated );
+				wpcom.sites.mockResolvedValue( [ listed() ] );
+				vi.mocked( cliAgentHost.sync.push ).mockResolvedValueOnce( listed() as never );
+				const original = wpcomRequestTool.handler;
+				const passedOn = vi.fn( async () => ( {
+					content: [ { type: 'text' as const, text: '{}' } ],
+					details: {},
+				} ) );
+				wpcomRequestTool.handler = passedOn as unknown as typeof wpcomRequestTool.handler;
+				const designatedWrite =
+					'https://public-api.wordpress.com/wpcom/v2/sites/4242/studio-app/sync/import/initiate';
+				agent.behavior = {
+					replyProvider: 'studio-wpcom',
+					act: async ( { host } ) => {
+						await wpcomRequestTool.handler(
+							{ siteId: 4242, method: 'POST', path: '/posts', body: { title: 'Hi' } },
+							{ host, onProgress: () => undefined }
+						);
+						await fetch( designatedWrite, { method: 'POST' } );
+						await host.sync.push( pushSite, 'all', '4242', () => undefined );
+					},
+				};
+				let result: RunReport;
+				try {
+					result = await runEval( stagingCase() );
+				} finally {
+					wpcomRequestTool.handler = original;
+				}
+				expect( result ).toMatchObject( {
+					success: true,
+					remoteGuard: { code: null, blocked: [], allowed: [ { method: 'POST', via: 'fetch' } ] },
+				} );
+				expect( result.remoteCalls ).toEqual( [
+					expect.objectContaining( { operation: 'wpcom-request', designated: true } ),
+					expect.objectContaining( { operation: 'push', designated: true } ),
+				] );
+				expect( passedOn ).toHaveBeenCalledTimes( 1 );
+				expect( cliAgentHost.sync.push ).toHaveBeenCalledTimes( 1 );
+				expect( sentToNetwork() ).toContain( `POST ${ designatedWrite }` );
 			} );
 		} );
 

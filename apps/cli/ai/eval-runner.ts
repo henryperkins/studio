@@ -29,6 +29,7 @@ import {
 	createTokenUsage,
 	type AskUserHandler,
 	type SiteInfo,
+	type StudioAgentHost,
 } from '@studio/agent/node';
 import {
 	listChatGptConnections,
@@ -66,8 +67,11 @@ import {
 	loadEvalAttachments,
 	withMockedRemote,
 	withMockedWpcomRequest,
+	withStagingRemote,
 	type EvalAttachments,
 	type RemoteCall,
+	type StagingSite,
+	type WpcomWriteAttempt,
 	type WpcomWriteGuard,
 } from 'cli/ai/eval-harness';
 import { parseEvalRunnerVars, type EvalRunnerVars, type EvalSeed } from 'cli/ai/eval-input';
@@ -719,6 +723,7 @@ export async function runEval( input: EvalRunnerInput ) {
 		refusedRun( failure, plan ? { requested: plan.requested } : undefined );
 
 	let seed = input.seed;
+	let stagingSite: StagingSite | null = null;
 	if ( input.remote === 'staging' ) {
 		const designated = designatedStagingSite();
 		if ( ! designated ) {
@@ -735,6 +740,7 @@ export async function runEval( input: EvalRunnerInput ) {
 			} );
 		}
 		const staging = confirmed.site;
+		stagingSite = { id: staging.id, url: staging.url };
 		if ( ! seed?.activeSite ) {
 			return providerRefusal( {
 				code: 'staging-needs-active-site',
@@ -772,8 +778,16 @@ export async function runEval( input: EvalRunnerInput ) {
 	}
 
 	const remoteCalls: RemoteCall[] = [];
+	// Every request and remote operation the case's guards refused, in order.
+	const refusedWrites: WpcomWriteAttempt[] = [];
 	const uiEvents: UiEvents = { artifacts: [], previewReloads: 0 };
-	const baseHost = remote === 'mock' ? withMockedRemote( cliAgentHost, remoteCalls ) : cliAgentHost;
+	let baseHost: StudioAgentHost = cliAgentHost;
+	if ( remote === 'mock' ) {
+		baseHost = withMockedRemote( cliAgentHost, remoteCalls );
+	} else if ( stagingSite ) {
+		baseHost = withStagingRemote( cliAgentHost, remoteCalls, stagingSite, refusedWrites );
+	}
+	const guarded = remote === 'mock' || stagingSite !== null;
 	const host = input.ui
 		? {
 				...baseHost,
@@ -900,11 +914,18 @@ export async function runEval( input: EvalRunnerInput ) {
 				} )
 			);
 		}
-		if ( remote === 'mock' ) {
-			restorers.push( withMockedWpcomRequest( remoteCalls ) );
+		if ( guarded ) {
+			restorers.push(
+				withMockedWpcomRequest(
+					remoteCalls,
+					stagingSite ? { site: stagingSite, refused: refusedWrites } : undefined
+				)
+			);
 			wpcomGuard = installWpcomWriteGuard( {
 				allowImageService: input.imageService === 'required',
 				allowProxyInference: runProvider === 'wpcom',
+				...( stagingSite ? { stagingSite } : {} ),
+				attempts: refusedWrites,
 			} );
 			restorers.push( wpcomGuard.uninstall );
 		}
@@ -1108,13 +1129,14 @@ export async function runEval( input: EvalRunnerInput ) {
 		}
 		phaseTimingsMs.total_eval_ms = elapsed();
 		const blockedWrites = wpcomGuard?.attempts ?? [];
+		const guardCode = stagingSite ? 'wpcom-write-outside-staging' : 'wpcom-write-under-mock';
 		if ( blockedWrites.length ) {
 			success = false;
-			error = `wpcom-write-under-mock: the case tried ${
+			error = `${ guardCode }: the case tried ${
 				blockedWrites.length
-			} request(s) that could change WordPress.com under remote: mock; none was sent.${
-				error ? ` ${ error }` : ''
-			}`;
+			} request(s) that could change WordPress.com ${
+				stagingSite ? 'outside its designated staging site' : 'under remote: mock'
+			}; none was sent.${ error ? ` ${ error }` : '' }`;
 		}
 
 		const providerRoute: ProviderRouteReport | null =
@@ -1134,12 +1156,13 @@ export async function runEval( input: EvalRunnerInput ) {
 
 		return {
 			...( providerRoute ? { providerRoute } : {} ),
-			...( remote === 'mock' ? { remoteCalls } : {} ),
+			...( guarded ? { remoteCalls } : {} ),
 			...( wpcomGuard
 				? {
 						remoteGuard: {
-							code: blockedWrites.length ? 'wpcom-write-under-mock' : null,
+							code: blockedWrites.length ? guardCode : null,
 							blocked: blockedWrites,
+							...( stagingSite ? { allowed: wpcomGuard.allowed } : {} ),
 						},
 				  }
 				: {} ),
