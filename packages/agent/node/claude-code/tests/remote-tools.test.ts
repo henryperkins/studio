@@ -143,6 +143,9 @@ const global = ( paths: { parent: string; config: string } ) => ( {
 const text = ( result: { content: Array< { type: string; text?: string } > } ) =>
 	result.content.map( ( part ) => part.text ?? '' ).join( '\n' );
 
+// What Studio says when the system's temporary folder, where the commands
+// keep the archive they send or receive, lies where the conversation can write.
+const SCRATCH_REFUSAL = 'the system’s temporary folder';
 // What Studio says when a file it decides an operation on WordPress.com by
 // lies where the conversation can write.
 const STORES_REFUSAL =
@@ -441,7 +444,9 @@ describe( 'preview_create on the Claude route', () => {
 			expect( host.previews.create ).not.toHaveBeenCalled();
 	} );
 
-	it( 'writes the archive it sends only where the conversation cannot reach, checked again immediately before the command starts', async () => {
+	// Checked again immediately before the command starts: see the operations
+	// on a remote, below.
+	it( 'writes the archive it sends only where the conversation cannot reach, says why and asks nothing', async () => {
 		const temporary = await realpath( os.tmpdir() );
 		const reaching = await setup( ( paths ) => ( { localRoots: [ paths.site, temporary ] } ) );
 		vi.mocked( reaching.host.previews.list ).mockResolvedValue( [ own ] );
@@ -451,26 +456,11 @@ describe( 'preview_create on the Claude route', () => {
 		] as const ) {
 			const refused = await reaching.bridge.invoke( name, args );
 			expect( refused.isError, name ).toBe( true );
-			expect( text( refused ), name ).toContain( 'the system’s temporary folder' );
+			expect( text( refused ), name ).toContain( SCRATCH_REFUSAL );
 		}
 		expect( reaching.context.approve ).not.toHaveBeenCalled();
 		expect( reaching.host.previews.create ).not.toHaveBeenCalled();
 		expect( reaching.host.previews.update ).not.toHaveBeenCalled();
-		// The conversation's target moves while the command is about to start.
-		const moved = await setup();
-		let ran = false;
-		vi.mocked( moved.host.previews.create ).mockImplementation(
-			async ( _site, _onProgress, options ) => {
-				vi.mocked( moved.context.verifyTarget ).mockResolvedValue( false );
-				await options?.beforeSpawn?.();
-				ran = true;
-				return own;
-			}
-		);
-		expect(
-			( await moved.bridge.invoke( 'preview_create', { nameOrPath: 'site' } ) ).isError
-		).toBe( true );
-		expect( ran ).toBe( false );
 	} );
 } );
 
@@ -873,20 +863,27 @@ describe( 'site_push on the Claude route', () => {
 		expect( ran ).toBe( false );
 	} );
 
-	it( 'decides by no connection Studio keeps where the conversation can write, and keeps its archive out of the turn’s reach', async () => {
+	it( 'decides by no connection Studio keeps where the conversation can write, and keeps its archive out of the turn’s reach, saying which, for a push and a pull', async () => {
 		const temporary = await realpath( os.tmpdir() );
 		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
-		for ( const reach of [ config.root, temporary ] ) {
-			const { bridge, host, context } = await setup( ( paths ) => ( {
-				localRoots: [ paths.site, reach ],
-			} ) );
-			expect(
-				( await bridge.invoke( 'site_push', { nameOrPath: 'site', remoteSite: '111' } ) ).isError,
-				reach
-			).toBe( true );
-			expect( context.approve ).not.toHaveBeenCalled();
-			expect( host.sync.push ).not.toHaveBeenCalled();
-		}
+		// Studio's configuration folder lies under the temporary folder here, so
+		// the temporary folder is judged first, and its own sentence says so.
+		const cases = [
+			[ config.root, STORES_REFUSAL ],
+			[ temporary, SCRATCH_REFUSAL ],
+		] as const;
+		for ( const name of [ 'site_push', 'site_pull' ] )
+			for ( const [ reach, refusal ] of cases ) {
+				const { bridge, host, context } = await setup( ( paths ) => ( {
+					localRoots: [ paths.site, reach ],
+				} ) );
+				const refused = await bridge.invoke( name, { nameOrPath: 'site', remoteSite: '111' } );
+				expect( refused.isError, `${ name } ${ reach }` ).toBe( true );
+				expect( text( refused ), `${ name } ${ reach }` ).toContain( refusal );
+				expect( context.approve ).not.toHaveBeenCalled();
+				expect( host.sync.push ).not.toHaveBeenCalled();
+				expect( host.sync.pull ).not.toHaveBeenCalled();
+			}
 	} );
 } );
 
@@ -1146,6 +1143,39 @@ describe( 'the operations on a remote, after a recovery and when the account cha
 			const beforeStart = await started.bridge.invoke( name, args );
 			expect( beforeStart.isError, name ).toBe( true );
 			expect( text( beforeStart ), name ).toContain( LOGIN_REFUSAL );
+			expect( reached, name ).toBe( false );
+		}
+	} );
+
+	it( 'checks the temporary folder again immediately before the command starts, so one that came into the turn’s reach meanwhile is not written, and says why', async () => {
+		for ( const [ name, args ] of calls.filter( ( [ tool ] ) => tool !== 'preview_delete' ) ) {
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+			const started = await setup();
+			vi.mocked( started.host.previews.list ).mockResolvedValue( [ own ] );
+			let reached = false;
+			for ( const spy of [
+				started.host.previews.create,
+				started.host.previews.update,
+				started.host.sync.push,
+				started.host.sync.pull,
+			] )
+				vi.mocked( spy ).mockImplementation( async ( ...received: unknown[] ) => {
+					// The system's temporary folder is now one inside the site.
+					const moved = vi
+						.spyOn( os, 'tmpdir' )
+						.mockReturnValue( path.join( started.site, 'tmp' ) );
+					try {
+						const fence = received.at( -1 ) as { beforeSpawn?: () => Promise< void > } | undefined;
+						await fence?.beforeSpawn?.();
+					} finally {
+						moved.mockRestore();
+					}
+					reached = true;
+					return undefined as never;
+				} );
+			const result = await started.bridge.invoke( name, args );
+			expect( result.isError, name ).toBe( true );
+			expect( text( result ), name ).toContain( SCRATCH_REFUSAL );
 			expect( reached, name ).toBe( false );
 		}
 	} );

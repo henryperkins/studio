@@ -1647,7 +1647,10 @@ export function createClaudeExecutionPolicy(
 				)
 					return false;
 			}
-			if ( prepared.scratch && ! ( await scratchOutsideReach() ) ) return false;
+			if ( prepared.scratch && ! ( await scratchOutsideReach() ) ) {
+				refuse( toolCallId, REFUSALS.scratch );
+				return false;
+			}
 			// The host chooses a pull's engine as its command starts.
 			if ( prepared.defaultPull && isReprintPullEnabled() ) return false;
 			// And the WordPress.com site: still connected to the site the turn acts
