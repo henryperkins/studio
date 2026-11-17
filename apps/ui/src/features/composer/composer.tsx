@@ -225,6 +225,9 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		chatGptSettings?.enabled && onSwitchSession && ! isField ? chatGptSettings.accounts : [];
 	const canChooseModel = providers.length > 0 || chatGptAccounts.length > 0 || !! chatGpt;
 	const connectionSwitch = useConnectionSwitch( ownerSiteId, onSwitchSession );
+	// Until the site's new chat is on the chosen ChatGPT account, nothing is sent
+	// and no other model is chosen: the composer still shows the previous one.
+	const startingChat = connectionSwitch.starting;
 	const chatGptModel = chatGpt?.selection?.model;
 	const chatGptModelLabel = chatGpt
 		? chatGptModel && isAiModelId( chatGptModel )
@@ -273,6 +276,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 			canChangeEnvironment: !! onEnvironmentChange,
 		} ),
 		isDisabled: ( name ) =>
+			( name === 'model' && startingChat ) ||
 			( name === siteCommand && siteActionDisabled ) ||
 			( name === 'auto-start' && ( ! preferences || savePreferences.isPending ) ) ||
 			( ( name === 'live' || name === 'local' ) && busy ),
@@ -379,6 +383,9 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		attachments,
 	} );
 	const changeModel = ( nextProvider: AiProviderId, nextModel: AiModelId ) => {
+		if ( startingChat ) {
+			return;
+		}
 		if ( chatGpt && nextProvider !== 'chatgpt-oauth' ) {
 			connectionSwitch.request( { provider: nextProvider, model: nextModel } );
 		} else {
@@ -386,6 +393,9 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		}
 	};
 	const changeChatGptModel = ( account: ChatGptAccountView, nextModel: string ) => {
+		if ( startingChat ) {
+			return;
+		}
 		const current = chatGpt?.selection;
 		const sameConnection =
 			current?.connectionId === account.connectionId && current.revision === account.revision;
@@ -443,7 +453,11 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		const trimmed = value.trim();
 		// Read at send time: the preview may have staged notes a moment ago.
 		const sentNotes = busy ? [] : getStagedAnnotations( annotationSiteId );
-		if ( sending || ( ! trimmed && attachments.length === 0 && sentNotes.length === 0 ) ) {
+		if (
+			sending ||
+			startingChat ||
+			( ! trimmed && attachments.length === 0 && sentNotes.length === 0 )
+		) {
 			return;
 		}
 		if ( blockingNotice || isOutOfCredits ) {
@@ -513,6 +527,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		value,
 		draftKey,
 		sending,
+		startingChat,
 		attachments,
 		busy,
 		blockingNotice,
@@ -546,7 +561,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 
 	const showStop = ! isField && busy && ( sending || ! hasContent );
 	const showStart = ! busy && ! sending && ! hasContent && !! onStartSite;
-	const canSend = hasContent && ! sending;
+	const canSend = hasContent && ! sending && ! startingChat;
 	const placeholder = answerQuestion
 		? __( 'Your answer' )
 		: placeholderOverride ??
@@ -700,6 +715,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 									sessionProvider={ sessionProvider }
 									getModelLockReason={ getModelLockReason }
 									disabled={ busy && ! chatGpt }
+									busy={ startingChat }
 									anchor={ rootNode }
 									onChange={ changeModel }
 									onAddCredits={ openAddCredits }

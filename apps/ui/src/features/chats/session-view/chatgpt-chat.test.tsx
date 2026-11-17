@@ -1,14 +1,21 @@
 import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { getVisibleToasts } from '@/data/app-messages';
 import { ChatGptSettingsError, type AuthUser, type SessionEntry } from '@/data/core';
 import {
 	CHATGPT_MODELS_QUERY_KEY,
 	CHATGPT_SETTINGS_QUERY_KEY,
 } from '@/data/queries/use-chatgpt-settings';
-import { createFakeConnector, makeSession, makeSite, TEST_USER } from '@/test/fake-connector';
+import { clearComposerDrafts } from '@/features/composer';
+import {
+	createFakeConnector,
+	makeSession,
+	makeSite,
+	TEST_USER,
+	type FakeConnector,
+} from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { ChatGptAccountView, ChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
@@ -61,7 +68,9 @@ async function setup(
 	withApi = false,
 	user: AuthUser | null = null,
 	// The chat, or the site's new chat, which has no session until it starts.
-	path = '/sessions/chat'
+	path = '/sessions/chat',
+	// The site's new chat works on its live site, so starting it writes the environment too.
+	live = false
 ) {
 	const connector = createFakeConnector(
 		{
@@ -125,11 +134,45 @@ async function setup(
 		} );
 		return { runId: `run-${ runs.length }` };
 	} );
+	if ( live ) {
+		connector.getConnectedWpcomSites.mockResolvedValue( [
+			{ id: 42, localSiteId: 'one', name: 'Hosted example', url: 'https://example.com' },
+		] as never );
+	}
 	const view = renderApp( { connector, path } );
 	await screen.findByRole( 'combobox', { name: 'Message WordPress Studio' } );
 	await waitFor( () => expect( view.queryClient.isFetching() ).toBe( 0 ) );
+	if ( live ) {
+		await act( async () => {
+			view.queryClient.setQueryData( [ 'site-chat-draft', 'one' ], {
+				activeEnvironment: 'live',
+				lastSelectedWpcomSiteId: 42,
+			} );
+		} );
+		await screen.findByRole( 'button', { name: 'Remove Live' } );
+	}
 	return { ...view, connector, runs };
 }
+type StartStep = 'createSession' | 'setSessionChatGptSelection' | 'setSessionEnvironment';
+// Holds the connector's next call of `step` open until the test settles it.
+function holdNext( connector: FakeConnector, step: StartStep ) {
+	const gate = deferred< void >();
+	const mock = connector[ step ] as unknown as Mock< ( ...args: unknown[] ) => Promise< unknown > >;
+	const run = mock.getMockImplementation()!;
+	mock.mockImplementationOnce( async ( ...args ) => {
+		await gate.promise;
+		return run( ...args );
+	} );
+	return gate;
+}
+async function attachBrief() {
+	fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
+		target: { files: [ new File( [ '# Brief' ], 'brief.md', { type: 'text/markdown' } ) ] },
+	} );
+	await screen.findByRole( 'listitem', { name: /^brief\.md/ } );
+}
+const modelButton = () => screen.getByRole( 'button', { name: 'Model' } );
+const sendButton = () => screen.getByRole( 'button', { name: 'Send message' } );
 async function chooseEffort( label: string ) {
 	fireEvent.click( reasoning() );
 	fireEvent.click(
@@ -925,5 +968,127 @@ describe( 'ChatGPT chats', () => {
 		expect( screen.getByText( 'Queued private request' ) ).toBeVisible();
 		expect( runs ).toHaveLength( 1 );
 		expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+	} );
+} );
+
+describe( 'Starting the site’s new chat on ChatGPT', () => {
+	beforeEach( () => clearComposerDrafts() );
+	const STEPS: StartStep[] = [
+		'createSession',
+		'setSessionChatGptSelection',
+		'setSessionEnvironment',
+	];
+
+	it.each( STEPS )(
+		'takes no Send while %s is pending, then has the ChatGPT chat with the draft, unsent',
+		async ( step ) => {
+			const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new', true );
+			fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+			await attachBrief();
+			const gate = holdNext( connector, step );
+			await chooseChatGpt( WORK );
+			await waitFor( () => expect( connector[ step ] ).toHaveBeenCalled() );
+
+			expect( modelButton() ).toHaveAttribute( 'aria-busy', 'true' );
+			expect( sendButton() ).toHaveAttribute( 'aria-disabled', 'true' );
+			fireEvent.click( sendButton() );
+			fireEvent.keyDown( input(), { key: 'Enter' } );
+			await act( async () => {} );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+			expect( runs ).toHaveLength( 0 );
+
+			await act( async () => gate.resolve() );
+			expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+			await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+			expect( screen.getByRole( 'listitem', { name: /^brief\.md/ } ) ).toBeVisible();
+			expect( modelButton() ).not.toHaveAttribute( 'aria-busy' );
+			expect( runs ).toHaveLength( 0 );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+			const { id } = await connector.createSession.mock.results[ 0 ].value;
+			expect( connector.setSessionChatGptSelection ).toHaveBeenCalledExactlyOnceWith( id, {
+				...INITIAL,
+				connectionId: B,
+			} );
+			expect( connector.setSessionEnvironment ).toHaveBeenCalledExactlyOnceWith( id, 'live' );
+
+			fireEvent.keyDown( input(), { key: 'Enter' } );
+			await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+			expect( runs[ 0 ] ).toMatchObject( {
+				id,
+				prompt: 'Unsent idea',
+				selection: { ...INITIAL, connectionId: B },
+			} );
+			expect( runs[ 0 ].options?.files ).toEqual( [
+				expect.objectContaining( { name: 'brief.md' } ),
+			] );
+		}
+	);
+
+	it.each( STEPS )(
+		'sends nothing when %s fails, keeping the draft and the previous model on the new chat',
+		async ( step ) => {
+			const { connector, runs, history } = await setup(
+				[],
+				false,
+				TEST_USER,
+				'/sites/one/new',
+				true
+			);
+			fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+			await attachBrief();
+			const previous = modelButton().textContent;
+			const gate = holdNext( connector, step );
+			await chooseChatGpt( WORK );
+			await waitFor( () => expect( connector[ step ] ).toHaveBeenCalled() );
+			fireEvent.keyDown( input(), { key: 'Enter' } );
+			await act( async () => {} );
+
+			await act( async () =>
+				gate.reject( new Error( 'Studio couldn’t save the model for this chat. Try again.' ) )
+			);
+			await waitFor( () =>
+				expect(
+					getVisibleToasts().some( ( toast ) =>
+						toast.title.includes( 'Studio couldn’t save the model for this chat. Try again.' )
+					)
+				).toBe( true )
+			);
+			await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+			expect( history.location.pathname ).toBe( '/sites/one/new' );
+			expect( modelButton() ).toHaveTextContent( previous! );
+			expect( screen.queryByText( `ChatGPT plan · ${ WORK }` ) ).not.toBeInTheDocument();
+			expect( input() ).toHaveValue( 'Unsent idea' );
+			expect( screen.getByRole( 'listitem', { name: /^brief\.md/ } ) ).toBeVisible();
+			expect( runs ).toHaveLength( 0 );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+		}
+	);
+
+	it( 'keeps the Model control busy while the start is pending, so the account it shows is the one pinned', async () => {
+		const { connector } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		const gate = holdNext( connector, 'setSessionChatGptSelection' );
+		await chooseChatGpt( WORK );
+		await waitFor( () => expect( connector.setSessionChatGptSelection ).toHaveBeenCalled() );
+
+		expect( modelButton() ).toHaveAttribute( 'aria-busy', 'true' );
+		fireEvent.click( modelButton() );
+		await act( async () => {} );
+		expect( screen.queryByRole( 'listbox', { name: 'Choose a model' } ) ).not.toBeInTheDocument();
+
+		await act( async () => gate.resolve() );
+		expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+		const { id } = await connector.createSession.mock.results[ 0 ].value;
+		expect( connector.setSessionChatGptSelection ).toHaveBeenCalledExactlyOnceWith( id, {
+			...INITIAL,
+			connectionId: B,
+		} );
+		expect(
+			readChatGptSessionSelection(
+				connector.state.sessions.find( ( session ) => session.summary.id === id )!.entries
+			)?.connectionId
+		).toBe( B );
 	} );
 } );

@@ -25,6 +25,8 @@ export function useConnectionSwitch(
 	const queryClient = useQueryClient();
 	const [ target, setTarget ] = useState< ConnectionTarget | null >( null );
 	const [ inFlight, setInFlight ] = useState( false );
+	// The site's new chat is being started on a ChatGPT account.
+	const [ starting, setStarting ] = useState( false );
 	const [ error, setError ] = useState( '' );
 	const saving = useRef( false );
 	const created = useRef< AiSessionSummary | null >( null );
@@ -105,6 +107,7 @@ export function useConnectionSwitch(
 		}
 		if ( ! onSwitchSession || saving.current ) return;
 		saving.current = true;
+		setStarting( true );
 		try {
 			// One the last attempt made and couldn't put on the account, if any.
 			const summary = started.current ?? ( await connector.createSession( ownerSiteId ) );
@@ -122,6 +125,7 @@ export function useConnectionSwitch(
 			if ( mounted.current ) onSwitchSession( summary.id );
 		} finally {
 			saving.current = false;
+			if ( mounted.current ) setStarting( false );
 		}
 	};
 	return {
@@ -129,6 +133,7 @@ export function useConnectionSwitch(
 		confirm,
 		startInPlace,
 		inFlight,
+		starting,
 		error,
 		cancel: () => {
 			if ( ! saving.current ) setTarget( null );

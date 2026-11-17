@@ -39,6 +39,8 @@ interface ModelPickerProps {
 	sessionProvider: AiProviderId;
 	getModelLockReason: ( id: AiModelId ) => ModelLockReason | undefined;
 	disabled: boolean;
+	// A choice is being saved; no other can be made until it is.
+	busy?: boolean;
 	anchor: HTMLElement | null;
 	onChange: ( provider: AiProviderId, model: AiModelId ) => void;
 	onAddCredits: ( returnFocus: RefObject< HTMLElement | null > ) => void;
@@ -59,6 +61,7 @@ export function ModelPicker( {
 	sessionProvider,
 	getModelLockReason,
 	disabled,
+	busy = false,
 	anchor,
 	onChange,
 	onAddCredits,
@@ -270,6 +273,7 @@ export function ModelPicker( {
 						aria-description={ modelDetails.join( ' · ' ) }
 						title={ modelDetails.join( ' · ' ) }
 						disabled={ disabled }
+						loading={ busy }
 					/>
 				}
 			>
