@@ -225,4 +225,55 @@ describe( 'ChatGPT acceptance run directory', () => {
 		// The paths it hands on are the ones it was given.
 		expect( check.ok && check.paths.runDir ).toBe( path.join( linked, 'run' ) );
 	} );
+
+	describe( 'the folders of a run it continues', () => {
+		let runDir: string;
+		const continuing = () => checkAcceptanceRunDirectory( runDir, { mustBeNew: false, home } );
+		const refused = { ok: false, problem: 'run-dir-folder-outside' };
+
+		beforeEach( () => {
+			runDir = path.join( base, 'run' );
+			fs.mkdirSync( runDir, { recursive: true } );
+			fs.writeFileSync( path.join( runDir, 'manifest.json' ), '{}' );
+		} );
+
+		it( 'refuses a profile folder that a link puts in another profile', () => {
+			const otherProfile = path.join( base, 'other-profile' );
+			fs.mkdirSync( otherProfile );
+			link( otherProfile, path.join( runDir, 'profile' ) );
+			expect( continuing() ).toEqual( refused );
+		} );
+
+		it( 'refuses any other folder of the run that a link leads out of it, the process manager’s included', () => {
+			fs.mkdirSync( path.join( home, '.studio', 'daemon' ), { recursive: true } );
+			fs.mkdirSync( path.join( runDir, 'profile' ) );
+			link( path.join( home, '.studio', 'daemon' ), path.join( runDir, 'daemon' ) );
+			expect( continuing() ).toEqual( refused );
+		} );
+
+		it( 'refuses a link that leads nowhere', () => {
+			const gone = path.join( base, 'gone' );
+			fs.mkdirSync( gone );
+			link( gone, path.join( runDir, 'profile' ) );
+			fs.rmdirSync( gone );
+			expect( continuing() ).toEqual( refused );
+		} );
+
+		it( 'refuses a profile folder that is the run directory itself', () => {
+			link( runDir, path.join( runDir, 'profile' ) );
+			expect( continuing() ).toEqual( refused );
+		} );
+
+		it( 'accepts folders that resolve inside the run, through the run’s own link or one inside it', () => {
+			fs.mkdirSync( path.join( runDir, 'real-profile' ) );
+			link( path.join( runDir, 'real-profile' ), path.join( runDir, 'profile' ) );
+			fs.mkdirSync( path.join( runDir, 'daemon' ) );
+			expect( continuing() ).toMatchObject( { ok: true } );
+
+			const linkedRun = link( runDir, path.join( base, 'linked-run' ) );
+			expect( checkAcceptanceRunDirectory( linkedRun, { mustBeNew: false, home } ) ).toMatchObject(
+				{ ok: true }
+			);
+		} );
+	} );
 } );

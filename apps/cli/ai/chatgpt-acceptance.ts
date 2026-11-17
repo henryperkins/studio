@@ -2529,6 +2529,10 @@ function describeIsolationProblem( problem: AcceptanceIsolationProblem ): string
 			);
 		case 'run-dir-in-studio-profile':
 			return __( 'The run directory can’t be inside your Studio profile.' );
+		case 'run-dir-folder-outside':
+			return __(
+				'A folder of the run directory (its profile, process manager, sites or another) leads outside it through a link, so nothing was run.'
+			);
 	}
 }
 

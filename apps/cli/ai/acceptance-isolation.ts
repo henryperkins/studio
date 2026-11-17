@@ -29,7 +29,8 @@ export type AcceptanceIsolationProblem =
 	| 'run-dir-relative'
 	| 'run-dir-not-empty'
 	| 'run-dir-not-found'
-	| 'run-dir-in-studio-profile';
+	| 'run-dir-in-studio-profile'
+	| 'run-dir-folder-outside';
 
 export type AcceptanceRunDirectoryCheck =
 	| { ok: true; paths: AcceptanceRunPaths }
@@ -111,9 +112,31 @@ function isInStudioProfile( inner: string, home: string ): boolean {
 }
 
 /**
+ * Whether a folder of the run, where it exists at all, resolves strictly
+ * inside the run directory's real path: a link there could point the run, and
+ * the vault key item its profile names, at another profile or process manager.
+ */
+function staysInRun( folder: string, realRunDir: string ): boolean {
+	try {
+		fs.lstatSync( folder );
+	} catch ( error ) {
+		return ( error as NodeJS.ErrnoException ).code === 'ENOENT';
+	}
+	let real: string;
+	try {
+		real = fs.realpathSync.native( folder );
+	} catch {
+		// A link that leads nowhere.
+		return false;
+	}
+	return isWithin( real, realRunDir ) && comparable( real ) !== comparable( realRunDir );
+}
+
+/**
  * Checks a run directory without creating it: absolute, outside the user's
  * Studio profile (also once links resolve), and new or empty for a run that
- * starts one (`mustBeNew`), or existing for a run that continues one.
+ * starts one (`mustBeNew`), or existing for a run that continues one, with
+ * every folder of it that exists really inside it.
  */
 export function checkAcceptanceRunDirectory(
 	runDir: string | undefined,
@@ -143,7 +166,15 @@ export function checkAcceptanceRunDirectory(
 	if ( ! mustBeNew && ! entries ) {
 		return { ok: false, problem: 'run-dir-not-found' };
 	}
-	return { ok: true, paths: acceptanceRunPaths( runDir ) };
+	const paths = acceptanceRunPaths( runDir );
+	if ( entries && entries.length > 0 ) {
+		const realRunDir = fs.realpathSync.native( runDir );
+		const { runDir: _run, ...folders } = paths;
+		if ( ! Object.values( folders ).every( ( folder ) => staysInRun( folder, realRunDir ) ) ) {
+			return { ok: false, problem: 'run-dir-folder-outside' };
+		}
+	}
+	return { ok: true, paths };
 }
 
 /**

@@ -2374,6 +2374,38 @@ describe( 'ChatGPT acceptance runner', () => {
 				expect( create ).not.toHaveBeenCalled();
 			} );
 
+			it( 'refuses a provisioned run whose profile folder a link puts in another profile, before reading or writing anything', async () => {
+				provisioned();
+				const otherProfile = path.join( base, 'other-profile' );
+				fs.mkdirSync( otherProfile );
+				const profileLink = acceptanceRunPaths( runDir ).profileDir;
+				fs.symlinkSync(
+					otherProfile,
+					profileLink,
+					process.platform === 'win32' ? 'junction' : 'dir'
+				);
+				const statePath = path.join( runDir, 'state.json' );
+				const stateBefore = fs.readFileSync( statePath, 'utf8' );
+				const collectFacts = vi.fn();
+				const create = vi.fn();
+				try {
+					expect(
+						await runChatGptAcceptance(
+							retireArgs(),
+							dependencies( undefined, { createServices: create, collectFacts } )
+						)
+					).toBe( 2 );
+				} finally {
+					fs.unlinkSync( profileLink );
+				}
+				expect( printed.join( '\n' ) ).toMatch( /leads outside it/ );
+				expect( collectFacts ).not.toHaveBeenCalled();
+				expect( create ).not.toHaveBeenCalled();
+				expect( fs.readFileSync( statePath, 'utf8' ) ).toBe( stateBefore );
+				expect( fs.readdirSync( otherProfile ) ).toEqual( [] );
+				expectNothingUnsafe();
+			} );
+
 			it( 'signs the profile’s registration out, from any commit, and reports the remote revocation', async () => {
 				provisioned();
 				const { services, calls } = signedIn();
