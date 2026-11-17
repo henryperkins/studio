@@ -295,6 +295,9 @@ export type ClaudeToolChannel = ( typeof CLAUDE_TOOL_CHANNELS )[ number ];
  *   `guardHost`.
  * - `bundled`: the rule's `bundled` element, a folder of files Studio ships
  *   itself, which the policy checks before every call. It bounds reading only.
+ * - `config`: the rule's `config` element, files of Studio's own configuration
+ *   at locations Studio fixes, which the policy checks before every call. It
+ *   bounds reading only.
  */
 export type ClaudeChannelBinding =
 	| 'site'
@@ -304,7 +307,8 @@ export type ClaudeChannelBinding =
 	| 'scope'
 	| 'class'
 	| 'host'
-	| 'bundled';
+	| 'bundled'
+	| 'config';
 
 /** For every channel, `false` when the implementation does not use it, or what bounds it. */
 export type ClaudeToolChannelDeclaration = {
@@ -345,6 +349,13 @@ export interface ClaudeStudioToolRule {
 	 * Studio's own bundled skills, outside every folder the turn reaches.
 	 */
 	readonly bundled?: () => string;
+	/**
+	 * Files of Studio's own configuration the tool reads, at locations Studio
+	 * fixes and no argument names, such as the stored WordPress.com login in
+	 * `shared.json`. Each must lie outside every folder the turn reaches, so
+	 * nothing the conversation writes is read as Studio's own.
+	 */
+	readonly config?: () => readonly string[];
 	/**
 	 * The WordPress.com scope a call reaches directly: a site, which must be the
 	 * turn's live target, or the account. Undefined denies the call.
@@ -1068,9 +1079,10 @@ export function claudeNativeTools(
 // and WP-CLI and host operations only through the host guard. A file is bounded
 // by checked paths, not by naming a site, and never by an approval alone: an
 // approval shows the local paths the rule names, so one that names none would
-// ask about files without showing them. Files Studio ships itself bound
-// reading, never writing. A request Studio sends is bounded by a scope or an
-// approval, not by a URL check, which cannot see where a name resolves.
+// ask about files without showing them. Files Studio ships itself, and
+// Studio's own configuration, bound reading, never writing. A request Studio
+// sends is bounded by a scope or an approval, not by a URL check, which cannot
+// see where a name resolves.
 const CHANNEL_BOUNDS: Readonly<
 	Record<
 		ClaudeToolChannel,
@@ -1080,7 +1092,10 @@ const CHANNEL_BOUNDS: Readonly<
 		}
 	>
 > = {
-	readsLocalFiles: { admits: [ 'paths', 'class', 'bundled' ], needs: [ 'paths', 'bundled' ] },
+	readsLocalFiles: {
+		admits: [ 'paths', 'class', 'bundled', 'config' ],
+		needs: [ 'paths', 'bundled', 'config' ],
+	},
 	writesLocalFiles: { admits: [ 'paths', 'class' ], needs: [ 'paths' ] },
 	drivesBrowser: { admits: [ 'navigates', 'urls', 'site' ], needs: [ 'navigates' ] },
 	requestsNetwork: { admits: [ 'scope', 'class' ] },
@@ -1103,6 +1118,7 @@ const RULE_ELEMENTS: Readonly<
 	site: 'function',
 	paths: 'function',
 	bundled: 'function',
+	config: 'function',
 	remote: 'function',
 	urls: 'function',
 	urlsOnSite: 'mark',
@@ -1148,6 +1164,8 @@ function ruleHas( rule: Record< string, unknown >, binding: unknown ): boolean {
 			return true;
 		case 'bundled':
 			return typeof rule.bundled === 'function';
+		case 'config':
+			return typeof rule.config === 'function';
 		default:
 			return false;
 	}
@@ -1195,6 +1213,7 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 			used.has( 'readsLocalFiles' ) ||
 			used.has( 'writesLocalFiles' ) ) &&
 		( elements.bundled === undefined || used.has( 'readsLocalFiles' ) ) &&
+		( elements.config === undefined || used.has( 'readsLocalFiles' ) ) &&
 		( elements.urls === undefined ||
 			used.has( 'drivesBrowser' ) ||
 			used.has( 'requestsNetwork' ) ) &&

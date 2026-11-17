@@ -304,6 +304,13 @@ describe( 'Claude Studio tool qualification', () => {
 				),
 			],
 			[
+				'Studio’s own configuration, read from the files the rule names',
+				qualifiedRule(
+					{ config: () => [ 'shared.json' ] },
+					{ ...noChannels, readsLocalFiles: [ 'config' ] }
+				),
+			],
+			[
 				'a message by approval',
 				qualifiedRule(
 					{ operationClass: 'external-message' },
@@ -449,6 +456,27 @@ describe( 'Claude Studio tool qualification', () => {
 			[
 				'a bundled folder that is not a function',
 				qualifiedRule( { bundled: 'skills' }, noChannels ),
+			],
+			// Studio's own configuration is bounded by the files the rule names,
+			// which the policy checks; reading them binds no other channel.
+			[
+				'configuration the rule does not name',
+				qualifiedRule( {}, { ...noChannels, readsLocalFiles: [ 'config' ] } ),
+			],
+			[
+				'configuration written as if read',
+				qualifiedRule(
+					{ config: () => [ 'shared.json' ] },
+					{ ...noChannels, readsLocalFiles: [ 'config' ], writesLocalFiles: [ 'config' ] }
+				),
+			],
+			[
+				'configuration without the file channel',
+				qualifiedRule( { config: () => [ 'shared.json' ] }, noChannels ),
+			],
+			[
+				'configuration that is not a function',
+				qualifiedRule( { config: [ 'shared.json' ] }, noChannels ),
 			],
 			[
 				'a process bound by the host guard',

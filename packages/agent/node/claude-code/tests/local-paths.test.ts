@@ -1,10 +1,11 @@
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
 	isAllowedNativePath,
 	isInsideCanonicalRoot,
+	isOutsideReach,
 	resolveAllowedNewPath,
 	resolveAllowedPath,
 } from '../local-paths';
@@ -37,6 +38,31 @@ describe( 'a path in the conversation’s folder', () => {
 		const created = path.join( site, 'new', 'new.zip' );
 		expect( await resolveAllowedNewPath( created, [ site ], config ) ).toBe( created );
 		expect( await isInsideCanonicalRoot( site, path.join( site, 'tmp', 'new.php' ) ) ).toBe( true );
+	} );
+} );
+
+describe( 'a file of Studio’s own, out of the conversation’s reach', () => {
+	it( 'resolves, existing or not, outside every folder the turn reaches', async () => {
+		const studio = path.join( scratch, 'studio' );
+		await mkdir( studio );
+		await writeFile( path.join( studio, 'shared.json' ), '{}' );
+		expect( await isOutsideReach( path.join( studio, 'shared.json' ), [ site ] ) ).toBe( true );
+		expect( await isOutsideReach( path.join( studio, 'missing.json' ), [ site ] ) ).toBe( true );
+		expect( await isOutsideReach( path.join( site, 'inside.txt' ), [ site ] ) ).toBe( false );
+		expect( await isOutsideReach( path.join( studio, 'shared.json' ), [ site, scratch ] ) ).toBe(
+			false
+		);
+	} );
+
+	it( 'is not one whose folder leads into a folder the turn reaches, nor a path no check can judge', async () => {
+		const linked = path.join( scratch, 'linked' );
+		await symlink( site, linked, 'junction' );
+		expect( await isOutsideReach( path.join( linked, 'inside.txt' ), [ site ] ) ).toBe( false );
+		expect( await isOutsideReach( path.join( linked, 'missing.json' ), [ site ] ) ).toBe( false );
+		expect( await isOutsideReach( 'shared.json', [ site ] ) ).toBe( false );
+		expect(
+			await isOutsideReach( [ scratch, 'studio', '..', 'shared.json' ].join( path.sep ), [ site ] )
+		).toBe( false );
 	} );
 } );
 

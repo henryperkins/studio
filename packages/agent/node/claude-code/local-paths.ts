@@ -102,6 +102,20 @@ async function resolveDeepest( file: string ): Promise< string | undefined > {
 }
 
 /**
+ * Whether a file Studio keeps for itself is out of the conversation's reach:
+ * once its deepest existing part is resolved, it lies outside every folder
+ * `reachable` names. A file that does not exist yet counts by where it would
+ * be; a path no check can judge does not count.
+ */
+export async function isOutsideReach(
+	file: string,
+	reachable: readonly string[]
+): Promise< boolean > {
+	const resolved = await resolveDeepest( file );
+	return resolved !== undefined && ! reachable.some( ( root ) => isInside( root, resolved ) );
+}
+
+/**
  * Whether a path, which may not exist yet, lies in a canonical root once its
  * deepest existing folder is resolved.
  */

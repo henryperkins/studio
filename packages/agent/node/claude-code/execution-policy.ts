@@ -27,6 +27,7 @@ import {
 	isAllowedNativePath,
 	isBundledFolder,
 	isInsideCanonicalRoot,
+	isOutsideReach,
 	resolveAllowedNewPath,
 	resolveAllowedPath,
 } from './local-paths';
@@ -820,7 +821,8 @@ export function createClaudeExecutionPolicy(
 			localPaths = paths;
 		}
 		// The files the tool writes itself lie in the site the turn acts on, and
-		// what it reads of Studio's own files is still Studio's own.
+		// what it reads of Studio's own files and configuration is still Studio's
+		// own, out of the conversation's reach.
 		const filesHold = async () => {
 			if ( localPaths.length ) {
 				const folder = actingSite?.path;
@@ -828,7 +830,11 @@ export function createClaudeExecutionPolicy(
 				for ( const file of localPaths )
 					if ( ! ( await isInsideCanonicalRoot( folder, file ) ) ) return false;
 			}
-			return ! rule.bundled || isBundledFolder( rule.bundled(), context.localRoots );
+			if ( rule.bundled && ! ( await isBundledFolder( rule.bundled(), context.localRoots ) ) )
+				return false;
+			for ( const file of rule.config?.() ?? [] )
+				if ( ! ( await isOutsideReach( file, context.localRoots ) ) ) return false;
+			return true;
 		};
 		if ( ! ( await filesHold() ) ) return false;
 		let remote: string | undefined;
