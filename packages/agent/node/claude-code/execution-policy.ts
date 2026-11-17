@@ -294,7 +294,7 @@ const REFUSALS = {
 	bundledFiles:
 		'Studio copies only the files it ships itself for this tool, from its own folder outside every folder this conversation reaches, and could not read them there, so it copied nothing.',
 	mediaUploads:
-		'Studio adds an image to a site’s media library only when the file it writes for it lies, through every link, inside the site’s own folder and in the folder WordPress made for this month’s uploads; here it does not, since this site keeps its uploads outside its folder. Studio deleted the attachments it had reserved and generated nothing; WordPress may have left an empty folder for this month’s uploads where the site keeps them.',
+		'Studio adds an image to a site’s media library only when the file it writes for it lies, through every link, inside the site’s own folder and in the folder WordPress made for this month’s uploads; here the folder for this month’s uploads is not an existing folder inside this site’s folder. Studio deletes the attachments it reserved for this call and generates nothing; WordPress may have left an empty folder for this month’s uploads wherever it keeps this site’s uploads.',
 } as const;
 
 // What a push or pull with each option overwrites on the side it copies to:
