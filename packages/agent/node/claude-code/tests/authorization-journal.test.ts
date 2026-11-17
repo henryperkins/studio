@@ -120,11 +120,69 @@ const NATIVE_USES: Record< string, ( paths: Paths ) => Record< string, unknown >
 	Bash: () => ( { command: 'echo secret' } ),
 };
 
-// A call of each host operation that does more than read.
+// A site the turn creates in a global conversation, and the host that knows
+// it, for the operations that make it the conversation's site.
+const createdSite = ( paths: Paths ) => ( {
+	...site,
+	id: 'new-site',
+	path: path.join( paths.parent, 'new' ),
+} );
+const knowingCreatedSite = ( host: StudioAgentHost, paths: Paths ) => {
+	host.ui = { showArtifact: vi.fn( async () => {} ), reloadPreview: vi.fn() };
+	host.selectSite = vi.fn( async () => {} );
+	host.sites.findByFolder = vi.fn( async ( folder: string ) =>
+		path.resolve( folder ) === createdSite( paths ).path ? createdSite( paths ) : undefined
+	);
+};
+const creatingSite = ( host: StudioAgentHost, paths: Paths ) =>
+	host.sites.create( 'New', createdSite( paths ).path, () => {} );
+
+// A call of each host operation that does more than read. `before` runs first,
+// on the same guarded host, and what it journals is not this operation's.
 const HOST_CALLS: Record<
 	string,
-	{ global?: true; call: ( host: StudioAgentHost, paths: Paths ) => Promise< unknown > }
+	{
+		global?: true;
+		host?: ( host: StudioAgentHost, paths: Paths ) => void;
+		before?: ( host: StudioAgentHost, paths: Paths ) => Promise< unknown >;
+		call: ( host: StudioAgentHost, paths: Paths ) => Promise< unknown >;
+	}
 > = {
+	selectSite: {
+		global: true,
+		host: knowingCreatedSite,
+		before: creatingSite,
+		call: async ( host, paths ) => {
+			await host.selectSite!( {
+				id: 'new-site',
+				name: 'New',
+				path: createdSite( paths ).path,
+				running: true,
+			} );
+		},
+	},
+	'ui.showArtifact': {
+		global: true,
+		host: knowingCreatedSite,
+		before: creatingSite,
+		call: async ( host, paths ) => {
+			await host.ui!.showArtifact( {
+				version: 1,
+				id: 'created',
+				widgets: [
+					{
+						type: 'site-preview',
+						widgetProps: {
+							path: '/',
+							siteId: 'new-site',
+							siteName: 'New',
+							sitePath: createdSite( paths ).path,
+						},
+					},
+				],
+			} as never );
+		},
+	},
 	'sites.create': {
 		global: true,
 		call: ( host, paths ) => host.sites.create( 'New', path.join( paths.parent, 'new' ), () => {} ),
@@ -284,24 +342,27 @@ describe( 'what the policy journals before an operation that does more than read
 					  }
 					: {}
 			);
+			HOST_CALLS[ name ].host?.( fixture.host, fixture );
+			const guarded = fixture.policy.guardHost( fixture.host, 'call' );
+			await HOST_CALLS[ name ].before?.( guarded, fixture );
+			fixture.journal.length = 0;
 			const record = fixture.context.recordOperation;
 			fixture.context.recordOperation = async ( event ) => {
 				order.push( `journal ${ event.operation.tool }` );
 				await record( event );
 			};
+			type Spy = Mock< ( ...args: unknown[] ) => Promise< unknown > >;
 			const [ group, method ] = name.split( '.' );
-			const spy = (
-				fixture.host as unknown as Record<
-					string,
-					Record< string, Mock< ( ...args: unknown[] ) => Promise< unknown > > >
-				>
-			 )[ group ][ method ];
+			const owner = ( fixture.host as unknown as Record< string, Record< string, Spy > | Spy > )[
+				group
+			];
+			const spy = method ? ( owner as Record< string, Spy > )[ method ] : ( owner as Spy );
 			const result = spy.getMockImplementation();
 			spy.mockImplementation( async ( ...args: unknown[] ) => {
 				order.push( `host ${ name }` );
 				return result?.( ...args );
 			} );
-			await HOST_CALLS[ name ].call( fixture.policy.guardHost( fixture.host, 'call' ), fixture );
+			await HOST_CALLS[ name ].call( guarded, fixture );
 			expect( order ).toEqual( [ `journal ${ name }`, `host ${ name }` ] );
 			expect( fixture.journal ).toEqual( [
 				expect.objectContaining( {

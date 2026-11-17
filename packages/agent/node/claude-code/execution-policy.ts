@@ -185,8 +185,9 @@ export interface ClaudeExecutionPolicy {
 	 * fenced. Once `signal` or the turn aborts, it refuses every host operation
 	 * and the app showing the conversation hears nothing from it. The caller
 	 * aborts `signal` when the call settles, however it ended, since the SDK
-	 * aborts a call's own signal only when it cancels the call. It never changes
-	 * the conversation's site: nothing journals that yet.
+	 * aborts a call's own signal only when it cancels the call. It changes the
+	 * conversation's site only to a site this turn created from a conversation
+	 * without a site, and only once that change is journaled.
 	 */
 	guardHost( host: StudioAgentHost, toolCallId: string, signal?: AbortSignal ): StudioAgentHost;
 	requestApproval(
@@ -221,6 +222,10 @@ const REFUSALS = {
 	notApproved: 'The user did not approve this operation, or did not answer in time.',
 	outsideFolders:
 		'A file Studio reads or writes for this operation must be an absolute path inside the site’s folder or this conversation’s workspace, and not one that holds credentials.',
+	createInSite:
+		'Only a conversation without a site creates sites: this conversation works on its own site. Ask the user to start a new conversation to create one.',
+	siteBinding:
+		'Studio did not make that site this conversation’s site: only a site this turn created, in a conversation without a site, can become it.',
 } as const;
 
 function deepFreeze< T >( value: T ): T {
@@ -276,6 +281,18 @@ export function createClaudeExecutionPolicy(
 	const signal = AbortSignal.any( [ context.signal, controller.signal ] );
 	const grants = new Map< string, string >();
 	const createdSites = new Set< string >();
+	// The targets the conversation may have while this turn runs (carry item
+	// 7): the one it was sent with until this turn makes a site it created the
+	// conversation's site, and that site once the change is written. A change
+	// is accepted from before its write starts, so a check that reads the
+	// stored target meanwhile never stops the turn for the turn's own change.
+	// A write that failed may or may not have landed, so its target is then
+	// accepted next to the ones before it. `targetVersion` counts every change
+	// of what is accepted.
+	let settledTargets: readonly ClaudeStudioTarget[] = [ context.target ];
+	const targetWrites = new Map< Promise< void >, ClaudeStudioTarget >();
+	let targetVersion = 0;
+	const acceptedTargets = () => [ ...settledTargets, ...targetWrites.values() ];
 	const refusals = new Map< string, Set< string > >();
 	const refuse = ( toolCallId: string, reason: string ) => {
 		if ( ! refusals.has( toolCallId ) ) refusals.set( toolCallId, new Set() );
@@ -290,16 +307,15 @@ export function createClaudeExecutionPolicy(
 		! isClaudeReadOnlyClass( operationClass );
 	const asksFirst = ( operationClass: ClaudeOperationClass ) =>
 		requiresClaudeApproval( operationClass ) || gatedAfterRecovery( operationClass );
+	// What an approval and the journal say of an operation: with the recovery
+	// gate's notice when that gate is what asks.
+	const noticed = ( operationClass: ClaudeOperationClass, description: string ) =>
+		gatedAfterRecovery( operationClass ) ? `${ description }. ${ AFTER_RECOVERY }` : description;
 	const describe = (
 		operationClass: ClaudeOperationClass,
 		tool: string,
 		shell?: ClaudeShellConfinement
-	) => {
-		const description = describeClaudeOperation( operationClass, tool, shell );
-		return gatedAfterRecovery( operationClass )
-			? `${ description }. ${ AFTER_RECOVERY }`
-			: description;
-	};
+	) => noticed( operationClass, describeClaudeOperation( operationClass, tool, shell ) );
 	// A tool use is asked about at most once, whether by the hook or by the
 	// permission request, so a hook that times out cannot be answered later.
 	const askedToolUses = new Set< string >();
@@ -349,6 +365,48 @@ export function createClaudeExecutionPolicy(
 		return accountRead;
 	}
 
+	// Whether the conversation still has a target this turn may act under. A
+	// check that found none while this turn's own change of target was being
+	// written, or once what is accepted changed, is made again after that
+	// write has settled; anything else means the conversation moved.
+	async function targetHolds(): Promise< boolean > {
+		for ( let attempt = 0; attempt < 3; attempt++ ) {
+			const version = targetVersion;
+			const writing = [ ...targetWrites.keys() ];
+			const results = await Promise.all(
+				acceptedTargets().map( ( target ) => context.verifyTarget( target ).catch( () => false ) )
+			);
+			if ( results.some( Boolean ) ) return true;
+			if ( writing.length ) await Promise.all( writing );
+			else if ( version === targetVersion ) return false;
+		}
+		return false;
+	}
+
+	// Writes this turn's change of the conversation's target, accepting the new
+	// target from before the write starts (see `settledTargets`).
+	async function writeTarget(
+		target: ClaudeStudioTarget,
+		write: () => Promise< void > | void
+	): Promise< void > {
+		const written = Promise.resolve().then( write );
+		const settled = written.then(
+			() => {},
+			() => {}
+		);
+		targetWrites.set( settled, target );
+		targetVersion++;
+		let landed = false;
+		try {
+			await written;
+			landed = true;
+		} finally {
+			targetWrites.delete( settled );
+			settledTargets = landed ? [ target ] : [ ...settledTargets, target ];
+			targetVersion++;
+		}
+	}
+
 	async function checkpoint( callSignal?: AbortSignal, freshAccount = false ): Promise< boolean > {
 		if (
 			signal.aborted ||
@@ -359,7 +417,7 @@ export function createClaudeExecutionPolicy(
 			return false;
 		const [ connected, targeted ] = await Promise.all( [
 			context.stillConnected().catch( () => false ),
-			context.verifyTarget( context.target ).catch( () => false ),
+			targetHolds(),
 		] );
 		if ( ! connected || ! targeted ) {
 			controller.abort();
@@ -770,8 +828,11 @@ export function createClaudeExecutionPolicy(
 			// Only a global conversation creates sites; a site conversation works
 			// in its own site's folder and needs a new conversation for another.
 			const sitePath = request.args[ 1 ];
+			if ( context.workspace.siteId !== null ) {
+				refuse( toolCallId, REFUSALS.createInSite );
+				return;
+			}
 			if (
-				context.workspace.siteId !== null ||
 				typeof sitePath !== 'string' ||
 				! path.isAbsolute( sitePath ) ||
 				path.dirname( path.resolve( sitePath ) ) !== path.resolve( host.sitesRoot )
@@ -863,6 +924,28 @@ export function createClaudeExecutionPolicy(
 		}
 	}
 
+	// Whether a site may become the conversation's site: one this turn created,
+	// from a conversation without a site, that the host still knows by that id
+	// at that folder.
+	async function isCreatedSite(
+		host: StudioAgentHost,
+		site: { id?: unknown; path?: unknown }
+	): Promise< boolean > {
+		if (
+			context.workspace.siteId !== null ||
+			typeof site.id !== 'string' ||
+			! site.id ||
+			typeof site.path !== 'string' ||
+			! createdSites.has( path.resolve( site.path ) )
+		)
+			return false;
+		try {
+			return ( await host.sites.findByFolder( site.path ) )?.id === site.id;
+		} catch {
+			return false;
+		}
+	}
+
 	function guardHost(
 		host: StudioAgentHost,
 		toolCallId: string,
@@ -919,6 +1002,46 @@ export function createClaudeExecutionPolicy(
 		const refused = async (): Promise< never > => {
 			throw denied();
 		};
+		// A change of the conversation's site, to a site this turn created: asked
+		// about when the turn asks before every change, journaled, then made.
+		const changeSite = async (
+			name: 'selectSite' | 'ui.showArtifact',
+			site: { id?: string; path: string },
+			description: string,
+			make: ( siteId: string ) => Promise< void >
+		): Promise< void > => {
+			if ( operationSignal.aborted ) throw denied();
+			const siteId = site.id;
+			if ( typeof siteId !== 'string' || ! ( await isCreatedSite( host, site ) ) ) {
+				refuse( toolCallId, REFUSALS.siteBinding );
+				throw denied();
+			}
+			if ( ! ( await checkpoint( callSignal ) ) ) throw denied();
+			const operationClass = HOST_OPERATION_CLASSES[ name ];
+			const operation: ClaudeOperation = {
+				tool: name,
+				operationClass,
+				args: [ siteId ],
+				siteId,
+				localPaths: [ site.path ],
+				description: noticed( operationClass, description ),
+			};
+			let grant: ClaudeApprovalGrant | undefined;
+			if ( asksFirst( operationClass ) ) {
+				grant = await requestApproval( operation, toolCallId, callSignal );
+				// The site is checked again once the user has answered.
+				if (
+					! grant ||
+					! ( await authorizeExecution( grant, operation, toolCallId, callSignal ) ) ||
+					! ( await isCreatedSite( host, site ) )
+				)
+					throw denied();
+			}
+			if ( ! ( await admit( operation, toolCallId, callSignal, grant?.requestId ) ) )
+				throw denied();
+			operationSignal.throwIfAborted();
+			await make( siteId );
+		};
 		const { ui } = host;
 		return {
 			...host,
@@ -926,11 +1049,22 @@ export function createClaudeExecutionPolicy(
 			tracks: { record: refused },
 			// What a call shows in the conversation is written to the chat's record,
 			// so it stops with the call's authority. An artifact the run manager
-			// would bind the chat to a site with is refused, like `selectSite`.
+			// binds the chat to a site with changes the conversation's site, as
+			// `selectSite` does, so it shows only a site this turn created, once
+			// that change is journaled.
 			ui: ui && {
 				showArtifact: async ( artifact ) => {
-					if ( operationSignal.aborted || getCreatedSiteFromArtifact( artifact ) ) throw denied();
-					await ui.showArtifact( artifact );
+					if ( operationSignal.aborted ) throw denied();
+					const binding = getCreatedSiteFromArtifact( artifact );
+					if ( ! binding ) return ui.showArtifact( artifact );
+					await changeSite(
+						'ui.showArtifact',
+						{ id: binding.siteId, path: binding.sitePath },
+						'Show a site this turn created in the conversation, which then stays with that site',
+						async () => {
+							await ui.showArtifact( artifact );
+						}
+					);
 				},
 				reloadPreview: () => {
 					if ( ! operationSignal.aborted ) ui.reloadPreview();
@@ -1035,11 +1169,20 @@ export function createClaudeExecutionPolicy(
 							host.sync.pull( current!, options, remoteSite, onProgress, fenceOptions )
 					),
 			},
-			// Changing the conversation's site is refused until the step that
-			// qualifies site creation journals it (carry item 7).
+			// Makes a site this turn created the conversation's site. The turn
+			// keeps acting under the target it was sent with; its checks accept the
+			// new one from before the change is written, and only it once written
+			// (carry item 7).
 			selectSite: host.selectSite
-				? async () => {
-						throw denied();
+				? async ( site ) => {
+						const selectSite = host.selectSite!;
+						await changeSite(
+							'selectSite',
+							site,
+							'Make a site this turn created the conversation’s site',
+							( siteId ) =>
+								writeTarget( { environment: 'local', siteId }, () => selectSite( site ) )
+						);
 				  }
 				: undefined,
 		};

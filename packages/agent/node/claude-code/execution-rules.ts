@@ -61,6 +61,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		exportSiteTool.name,
 		installTaxonomyScriptsTool.name,
 		refreshBrowserTool.name,
+		createSiteTool.name,
 	] ),
 } );
 
@@ -652,7 +653,19 @@ function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefined {
 // Only a qualified tool can be enabled. The rules of the unqualified tools are
 // where each one's qualification starts, not a claim that they are complete.
 export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule > = ruleTable( [
-	[ createSiteTool.name, unqualified( studioRule( 'local-change', { approval: 'host' } ) ) ],
+	[
+		createSiteTool.name,
+		// It creates a site with the CLI's own command, in Studio's sites folder
+		// and only from a conversation without a site; resolves that site; makes
+		// it the conversation's site; and shows it. The guarded host journals the
+		// creation, the selection and the showing before each runs, and refuses
+		// them for any other site. Its module links `tools/utils.ts`, whose
+		// `runWpCli` runs only through the host.
+		qualified(
+			studioRule( 'local-change', { approval: 'host' } ),
+			using( { runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] } )
+		),
+	],
 	[ listSitesTool.name, unqualified( studioRule( 'remote-read' ) ) ],
 	[
 		getSiteInfoTool.name,
@@ -1282,7 +1295,12 @@ export type HostOperationName =
 	| 'previews.update'
 	| 'previews.delete'
 	| 'sync.push'
-	| 'sync.pull';
+	| 'sync.pull'
+	// Changes of the conversation's site: making a site the turn created the
+	// conversation's site, and showing that site in the conversation, which the
+	// app then keeps the conversation with.
+	| 'selectSite'
+	| 'ui.showArtifact';
 
 export const HOST_OPERATION_CLASSES: Readonly<
 	Record< Exclude< HostOperationName, 'sites.wpCli' >, ClaudeOperationClass >
@@ -1298,6 +1316,8 @@ export const HOST_OPERATION_CLASSES: Readonly<
 	'previews.delete': 'remote-overwrite',
 	'sync.push': 'remote-overwrite',
 	'sync.pull': 'remote-overwrite',
+	selectSite: 'local-change',
+	'ui.showArtifact': 'local-change',
 };
 
 /** Whether a name is one of the host operations a Studio tool reaches. */

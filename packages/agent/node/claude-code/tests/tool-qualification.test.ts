@@ -86,6 +86,7 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 		writesLocalFiles: [ 'paths' ],
 	},
 	refresh_browser: { ...noChannels, runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] },
+	site_create: { ...noChannels, runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] },
 };
 const isQualifiedName = ( name: string ) => Object.prototype.hasOwnProperty.call( QUALIFIED, name );
 // In the order the rule table, and so every enabled list, names them.

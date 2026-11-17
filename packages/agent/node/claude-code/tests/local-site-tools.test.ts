@@ -1,12 +1,16 @@
+import { randomUUID } from 'crypto';
 import { existsSync, readdirSync } from 'fs';
 import { mkdir, rename, symlink, writeFile } from 'fs/promises';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isSameClaudeTarget } from '@studio/agent/protocol/claude-code';
 import { getSkillPath } from '../../skills';
 import { fakeSite } from '../../tests/fake-host';
 import { isBundledFolder } from '../local-paths';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
+import type { ClaudeApprovalRequest, ClaudeExecutionContext } from '../execution-policy';
+import type { ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
 // The local site tools qualified for the Claude route, each driven through the
 // real execution policy and the bridge the SDK calls, against a fake host
@@ -422,5 +426,322 @@ describe( 'the folders Studio ships its read-only files in', () => {
 		expect( await isBundledFolder( 'skills/taxonomist/scripts', [] ) ).toBe( false );
 		// Bundled files a conversation could reach would be no longer Studio's own.
 		expect( await isBundledFolder( scripts, [ path.dirname( scripts ) ] ) ).toBe( false );
+	} );
+} );
+
+describe( 'site_create on the Claude route', () => {
+	// A global conversation, on a host whose app shows the conversation and
+	// follows the site the agent creates.
+	async function setupGlobal( overrides: Partial< ClaudeExecutionContext > = {} ) {
+		const fixture = await setup( ( paths ) => ( {
+			target: { environment: 'global' },
+			targetSite: undefined,
+			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
+			localRoots: [ paths.parent ],
+			...overrides,
+		} ) );
+		const created = path.join( fixture.parent, 'my-coffee-shop' );
+		const site = {
+			id: 'new-site',
+			name: 'My Coffee Shop',
+			path: created,
+			url: 'http://localhost:8890',
+			phpVersion: '8.4',
+			adminPassword: 'password',
+		};
+		fixture.host.sites.resolve = vi.fn( async () => site );
+		fixture.host.sites.findByFolder = vi.fn( async ( folder: string ) =>
+			path.resolve( folder ) === created ? site : undefined
+		);
+		const ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
+		fixture.host.ui = ui;
+		// The conversation's stored target, as the turn's checks read it.
+		const stored = { target: { environment: 'global' } as ClaudeStudioTarget };
+		fixture.host.selectSite = vi.fn( async ( selected: { id?: string } ) => {
+			stored.target = { environment: 'local', siteId: selected.id! };
+		} );
+		vi.mocked( fixture.context.verifyTarget ).mockImplementation( async ( expected ) =>
+			isSameClaudeTarget( expected, stored.target )
+		);
+		await writeFile( path.join( fixture.parent, 'notes.md' ), 'fixture' );
+		const bridge = createStudioClaudeToolBridge(
+			fixture.host,
+			{ runId: 'run', turnId: 'turn', policy: fixture.policy },
+			() => {}
+		);
+		cleanups.push( () => bridge.dispose() );
+		const read = () =>
+			fixture.policy.authorizeToolUse( {
+				toolName: 'Read',
+				input: { file_path: path.join( fixture.parent, 'notes.md' ) },
+				toolUseId: randomUUID(),
+			} );
+		return { ...fixture, bridge, created, site, ui, stored, read };
+	}
+
+	it( 'creates a site from a global conversation and makes it the conversation’s site, unprompted, journaling each change before it is made', async () => {
+		const { bridge, host, journal, created, site, ui, stored, context } = await setupGlobal();
+		expect( bridge.tools ).toContain( 'site_create' );
+		const order: string[] = [];
+		const record = context.recordOperation;
+		context.recordOperation = async ( event ) => {
+			order.push( `journal ${ event.operation.tool }` );
+			await record( event );
+		};
+		vi.mocked( host.sites.create ).mockImplementation( async () => {
+			order.push( 'host sites.create' );
+		} );
+		const select = vi.mocked( host.selectSite! );
+		const selecting = select.getMockImplementation()!;
+		select.mockImplementation( async ( selected ) => {
+			order.push( 'host selectSite' );
+			await selecting( selected );
+		} );
+		ui.showArtifact.mockImplementation( async () => {
+			order.push( 'host ui.showArtifact' );
+		} );
+		const result = await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		expect( result.isError ).toBe( false );
+		expect( order ).toEqual( [
+			'journal site_create',
+			'journal sites.create',
+			'host sites.create',
+			'journal selectSite',
+			'host selectSite',
+			'journal ui.showArtifact',
+			'host ui.showArtifact',
+		] );
+		expect( JSON.parse( text( result ) ) ).toMatchObject( { id: 'new-site', path: created } );
+		expect( host.sites.create ).toHaveBeenCalledWith(
+			'My Coffee Shop',
+			created,
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( host.selectSite ).toHaveBeenCalledWith( expect.objectContaining( { id: site.id } ) );
+		expect( stored.target ).toEqual( { environment: 'local', siteId: site.id } );
+		expect( ui.showArtifact ).toHaveBeenCalledWith(
+			expect.objectContaining( {
+				widgets: [ expect.objectContaining( { type: 'site-preview' } ) ],
+			} )
+		);
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect( journaled( journal ) ).toEqual( [
+			[ 'site_create', 'local-change' ],
+			[ 'sites.create', 'local-change' ],
+			[ 'selectSite', 'local-change' ],
+			[ 'ui.showArtifact', 'local-change' ],
+		] );
+		expect( JSON.stringify( journal ) ).not.toContain( created );
+	} );
+
+	it( 'keeps the turn when a check runs while the selection is written, and stops it for a target the turn did not set', async () => {
+		const { bridge, context, stored, policy, read } = await setupGlobal();
+		// A check that starts before the selection and reads the stored target
+		// after it is written (carry item 7).
+		let release!: () => void;
+		const written = new Promise< void >( ( resolve ) => {
+			release = resolve;
+		} );
+		vi.mocked( context.verifyTarget ).mockImplementationOnce( async ( expected ) => {
+			await written;
+			return isSameClaudeTarget( expected, stored.target );
+		} );
+		const checks = vi.mocked( context.verifyTarget ).mock.calls.length;
+		const alongside = read();
+		await vi.waitFor( () =>
+			expect( vi.mocked( context.verifyTarget ).mock.calls.length ).toBe( checks + 1 )
+		);
+		const result = bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		await vi.waitFor( () =>
+			expect( stored.target ).toEqual( { environment: 'local', siteId: 'new-site' } )
+		);
+		release();
+		expect( ( await result ).isError ).toBe( false );
+		expect( await alongside ).toBe( true );
+		expect( policy.signal.aborted ).toBe( false );
+		expect( await read() ).toBe( true );
+		// The conversation moved to a target this turn did not set.
+		stored.target = { environment: 'local', siteId: 'other-site' };
+		expect( await read() ).toBe( false );
+		expect( policy.signal.aborted ).toBe( true );
+	} );
+
+	it( 'keeps the turn when a check reads the new target before the selection lands and the old one after, by checking again once the write has settled', async () => {
+		const { bridge, host, context, stored, policy, read } = await setupGlobal();
+		// The selection's write lands, then takes a while to report back.
+		let land!: () => void;
+		let finish!: () => void;
+		const landing = new Promise< void >( ( resolve ) => {
+			land = resolve;
+		} );
+		const finishing = new Promise< void >( ( resolve ) => {
+			finish = resolve;
+		} );
+		let landed!: () => void;
+		const written = new Promise< void >( ( resolve ) => {
+			landed = resolve;
+		} );
+		host.selectSite = vi.fn( async ( selected: { id?: string } ) => {
+			await landing;
+			stored.target = { environment: 'local', siteId: selected.id! };
+			landed();
+			await finishing;
+		} );
+		const result = bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		await vi.waitFor( () => expect( host.selectSite ).toHaveBeenCalled() );
+		// One check, while the write is in flight: it reads the new target before
+		// the write lands and the old one after.
+		let racing = true;
+		vi.mocked( context.verifyTarget ).mockImplementation( async ( expected ) => {
+			const before = stored.target;
+			if ( racing && expected.environment === 'global' ) {
+				land();
+				await written;
+				return isSameClaudeTarget( expected, stored.target );
+			}
+			return isSameClaudeTarget( expected, before );
+		} );
+		const alongside = read();
+		await written;
+		// The check settles what it can before the write reports back.
+		await new Promise( ( resolve ) => setTimeout( resolve, 10 ) );
+		racing = false;
+		finish();
+		expect( await alongside ).toBe( true );
+		expect( ( await result ).isError ).toBe( false );
+		expect( policy.signal.aborted ).toBe( false );
+		expect( await read() ).toBe( true );
+	} );
+
+	it( 'keeps both targets when the selection fails, since its write may or may not have landed, and stops the turn for any other', async () => {
+		const { bridge, host, stored, policy, read, journal } = await setupGlobal();
+		host.selectSite = vi.fn( async ( selected: { id?: string } ) => {
+			stored.target = { environment: 'local', siteId: selected.id! };
+			throw new Error( 'The disk is full' );
+		} );
+		const result = await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		expect( result.isError ).toBe( true );
+		expect( journaled( journal ) ).toContainEqual( [ 'selectSite', 'local-change' ] );
+		expect( await read() ).toBe( true );
+		stored.target = { environment: 'global' };
+		expect( await read() ).toBe( true );
+		expect( policy.signal.aborted ).toBe( false );
+		stored.target = { environment: 'local', siteId: 'other-site' };
+		expect( await read() ).toBe( false );
+		expect( policy.signal.aborted ).toBe( true );
+	} );
+
+	it( 'after a recovery that left operations uncertain, asks before it creates, selects and shows the site, each approval showing the site’s folder', async () => {
+		const { bridge, host, context, journal, created, stored } = await setupGlobal( {
+			uncertainAfterRecovery: true,
+		} );
+		const result = await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		expect( result.isError ).toBe( false );
+		const requests = vi.mocked( context.approve ).mock.calls.map( ( [ request ] ) => request );
+		expect( requests.map( ( request ) => request.operation.tool ) ).toEqual( [
+			'sites.create',
+			'selectSite',
+			'ui.showArtifact',
+		] );
+		for ( const request of requests ) {
+			expect( request.operation.operationClass ).toBe( 'local-change' );
+			expect( request.operation.localPaths ).toEqual( [ created ] );
+			expect( request.operation.description ).toContain( 'may already have taken effect' );
+		}
+		expect( host.selectSite ).toHaveBeenCalledOnce();
+		expect( stored.target ).toEqual( { environment: 'local', siteId: 'new-site' } );
+		// Each change runs under its own approval, which the journal names.
+		expect( journal.slice( 1 ).map( ( entry ) => entry.requestId ) ).toEqual(
+			requests.map( ( request ) => request.requestId )
+		);
+	} );
+
+	it( 'after such a recovery, leaves the conversation’s site as it was when the user denies the selection, and journals nothing for it', async () => {
+		const { bridge, host, journal, ui, stored, policy } = await setupGlobal( {
+			uncertainAfterRecovery: true,
+			approve: vi.fn( async ( request: ClaudeApprovalRequest ) =>
+				request.operation.tool === 'selectSite' ? ( 'deny' as const ) : ( 'allow' as const )
+			),
+		} );
+		const result = await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( 'The user did not approve this operation' );
+		expect( host.sites.create ).toHaveBeenCalledOnce();
+		expect( host.selectSite ).not.toHaveBeenCalled();
+		expect( ui.showArtifact ).not.toHaveBeenCalled();
+		expect( stored.target ).toEqual( { environment: 'global' } );
+		expect( journaled( journal ) ).toEqual( [
+			[ 'site_create', 'local-change' ],
+			[ 'sites.create', 'local-change' ],
+		] );
+		expect( policy.signal.aborted ).toBe( false );
+	} );
+
+	it( 'after such a recovery, checks the site again once the user has answered, and selects nothing the host no longer knows', async () => {
+		const fixture = await setupGlobal( { uncertainAfterRecovery: true } );
+		vi.mocked( fixture.context.approve ).mockImplementation( async ( request ) => {
+			// The site is removed while the user reads the selection's approval.
+			if ( request.operation.tool === 'selectSite' )
+				vi.mocked( fixture.host.sites.findByFolder ).mockResolvedValue( undefined );
+			return 'allow';
+		} );
+		const result = await fixture.bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		expect( result.isError ).toBe( true );
+		expect( fixture.host.selectSite ).not.toHaveBeenCalled();
+		expect( journaled( fixture.journal ) ).not.toContainEqual( [ 'selectSite', 'local-change' ] );
+	} );
+
+	it( 'creates nothing from a site conversation, and says why', async () => {
+		const { bridge, host } = await setup();
+		const result = await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( 'Only a conversation without a site creates sites' );
+		expect( host.sites.create ).not.toHaveBeenCalled();
+	} );
+
+	it( 'makes no other site the conversation’s site', async () => {
+		const { policy, host, site } = await setupGlobal();
+		const guarded = policy.guardHost( host, 'call' );
+		await expect(
+			guarded.selectSite!( { id: site.id, name: site.name, path: site.path, running: true } )
+		).rejects.toThrow( 'Denied' );
+		await guarded.sites.create( site.name, site.path, () => {} );
+		await expect(
+			guarded.selectSite!( { id: 'forged', name: site.name, path: site.path, running: true } )
+		).rejects.toThrow( 'Denied' );
+		expect( host.selectSite ).not.toHaveBeenCalled();
+	} );
+} );
+
+describe( 'a site binding Studio refuses', () => {
+	it( 'is said to the model with the result of the call that asked for it', async () => {
+		const fixture = await createPolicyFixture();
+		cleanups.push( fixture.cleanup );
+		fixture.host.ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
+		// The conversation's own site, shown as a created site would be: the run
+		// manager would bind the conversation to it.
+		const guarded = fixture.policy.guardHost( fixture.host, 'call' );
+		await expect(
+			guarded.ui!.showArtifact( {
+				version: 1,
+				id: 'binding',
+				widgets: [
+					{
+						type: 'site-preview',
+						widgetProps: {
+							path: '/',
+							siteId: fakeSite.id,
+							siteName: fakeSite.name,
+							sitePath: fixture.site,
+						},
+					},
+				],
+			} as never )
+		).rejects.toThrow( 'Denied' );
+		expect( fixture.host.ui.showArtifact ).not.toHaveBeenCalled();
+		expect( fixture.policy.takeRefusals( 'call' ) ).toEqual( [
+			expect.stringContaining( 'did not make that site this conversation’s site' ),
+		] );
 	} );
 } );

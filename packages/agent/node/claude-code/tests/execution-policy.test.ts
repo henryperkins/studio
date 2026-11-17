@@ -523,7 +523,7 @@ describe( 'Claude targets', () => {
 		await expect( store.readJournals( 'legacy' ) ).resolves.toEqual( [ [ prompt ] ] );
 	} );
 
-	it( 'creates sites only from a global conversation, and keeps the conversation’s site until a site creation is journaled', async () => {
+	it( 'creates sites only from a global conversation, and makes no site the conversation’s site that the host does not know as the one this turn created', async () => {
 		const workspace = { siteId: null, workingDirectory: '', configDirectory: '' };
 		const { policy, host, context, parent, localSite } = await setup( ( paths ) => ( {
 			target: { environment: 'global' },
@@ -551,8 +551,8 @@ describe( 'Claude targets', () => {
 				running: true,
 			} )
 		).rejects.toThrow();
-		// Selecting even the site this turn created changes the conversation's
-		// site, which nothing journals yet, so it is refused.
+		// Even the folder this turn created is refused while the host knows no
+		// site by that id there (local-site-tools.test.ts selects one it does).
 		await expect(
 			guarded.selectSite!( { id: 'new', name: 'New site', path: created, running: true } )
 		).rejects.toThrow( 'Denied' );
@@ -648,7 +648,7 @@ describe( 'Claude Studio tools that act outside the host', () => {
 		expect( policy.guardHost( host, 'none' ).ui ).toBeUndefined();
 	} );
 
-	it( 'refuses to show anything that would bind the conversation to a site, until a site creation is journaled', async () => {
+	it( 'refuses to show anything that would bind a site conversation to a site, its own included', async () => {
 		const { policy, host, site } = await setup();
 		const ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
 		host.ui = ui;

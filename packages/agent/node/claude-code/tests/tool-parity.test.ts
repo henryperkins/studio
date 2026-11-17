@@ -47,18 +47,13 @@ type ClaudeStatus =
 	// Claude Code tool that would stand for it.
 	| { status: 'unqualified'; step: Step; reason: string; native?: string };
 
-const LOCAL = 'Local site operation; its channels are not declared and tested yet';
 const REMOTE = 'Reaches WordPress.com or another service; its scope and approval are not bound yet';
 const BROWSER = 'Drives a browser; needs the navigation guard (contract revision 2)';
 const NATIVE = 'Native equivalent not qualified: argument and write-path adaptation';
 
 const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	wp_cli: { status: 'bridged' },
-	site_create: {
-		status: 'unqualified',
-		step: 'C2a-2',
-		reason: `${ LOCAL }; it changes the conversation's site (selectSite and its site preview), which nothing journals yet, so the guarded host refuses both (carry item 7)`,
-	},
+	site_create: { status: 'bridged' },
 	site_info: { status: 'bridged' },
 	site_start: { status: 'bridged' },
 	site_stop: { status: 'bridged' },
