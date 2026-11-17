@@ -384,6 +384,21 @@ describe( 'install_taxonomy_scripts on the Claude route', () => {
 		] );
 		expect( request.operation.description ).toContain( 'may already have taken effect' );
 	} );
+
+	it( 'checks the files again once the user has answered, immediately before the copy, so a link planted while the user reads the approval is not followed', async () => {
+		const { bridge, context, site, parent } = await setup( () => ( {
+			uncertainAfterRecovery: true,
+		} ) );
+		await mkdir( path.join( parent, 'outside' ) );
+		vi.mocked( context.approve ).mockImplementationOnce( async () => {
+			await symlink( path.join( parent, 'outside' ), path.join( site, 'tmp' ), 'junction' );
+			return 'allow';
+		} );
+		const result = await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'site' } );
+		expect( context.approve ).toHaveBeenCalledOnce();
+		expect( result.isError ).toBe( true );
+		expect( readdirSync( path.join( parent, 'outside' ) ) ).toEqual( [] );
+	} );
 } );
 
 // A file link, planted in the conversation's site, that points out of it,

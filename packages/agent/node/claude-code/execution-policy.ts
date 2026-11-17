@@ -817,17 +817,20 @@ export function createClaudeExecutionPolicy(
 		if ( rule.paths ) {
 			const paths = rule.paths( args, site?.path );
 			if ( ! paths ) return false;
-			if ( paths.length ) {
-				const folder = actingSite?.path;
-				if ( ! folder ) return false;
-				for ( const file of paths )
-					if ( ! ( await isInsideCanonicalRoot( folder, file ) ) ) return false;
-			}
 			localPaths = paths;
 		}
-		// What it reads of Studio's own files must still be Studio's own.
-		if ( rule.bundled && ! ( await isBundledFolder( rule.bundled(), context.localRoots ) ) )
-			return false;
+		// The files the tool writes itself lie in the site the turn acts on, and
+		// what it reads of Studio's own files is still Studio's own.
+		const filesHold = async () => {
+			if ( localPaths.length ) {
+				const folder = actingSite?.path;
+				if ( ! folder ) return false;
+				for ( const file of localPaths )
+					if ( ! ( await isInsideCanonicalRoot( folder, file ) ) ) return false;
+			}
+			return ! rule.bundled || isBundledFolder( rule.bundled(), context.localRoots );
+		};
+		if ( ! ( await filesHold() ) ) return false;
 		let remote: string | undefined;
 		if ( rule.urls ) {
 			const urls = rule.urls( args, site?.url );
@@ -849,29 +852,36 @@ export function createClaudeExecutionPolicy(
 			}
 		}
 		const description = describe( operationClass, name );
+		let authorized: boolean;
 		// A tool approved at its host operations is journaled here too: the
 		// host operations it reaches are journaled again as they run.
 		if ( ! asksFirst( operationClass ) || rule.approval === 'host' )
-			return (
+			authorized =
 				( await checkpoint( callSignal ) ) &&
-				admit( { tool: name, operationClass, description }, toolCallId, callSignal )
+				( await admit( { tool: name, operationClass, description }, toolCallId, callSignal ) );
+		else {
+			// An approval shows the files the rule names; one that names none for
+			// this call would ask about files without showing them.
+			if ( rule.paths && ! localPaths.length ) return false;
+			authorized = await approveOnce(
+				{
+					tool: name,
+					operationClass,
+					args,
+					siteId: site?.id,
+					localPaths,
+					remote,
+					description,
+				},
+				toolCallId,
+				callSignal
 			);
-		// An approval shows the files the rule names; one that names none for
-		// this call would ask about files without showing them.
-		if ( rule.paths && ! localPaths.length ) return false;
-		return approveOnce(
-			{
-				tool: name,
-				operationClass,
-				args,
-				siteId: site?.id,
-				localPaths,
-				remote,
-				description,
-			},
-			toolCallId,
-			callSignal
-		);
+		}
+		// The tool writes its files itself once this returns, so they are checked
+		// again last: a link planted meanwhile, while the user read an approval,
+		// is not followed. Like the fence before a command starts, this comes
+		// after the call is journaled.
+		return authorized && ( await filesHold() );
 	}
 
 	async function prepare(
