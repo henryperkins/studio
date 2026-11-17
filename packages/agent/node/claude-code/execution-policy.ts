@@ -329,6 +329,23 @@ function connectionLabel( site: SyncSite ): string {
 	return `WordPress.com site ${ id }: ${ name }, ${ address }, a ${ kind } site`;
 }
 
+// What an approval of a push or pull, and so its journal entry, says of it
+// after its class and name: the site it syncs with, as Studio keeps its
+// connection, the options and what they replace where the copy lands, and
+// what an interrupted one may have left, which a recovery then says.
+function syncNote( name: 'sync.push' | 'sync.pull', site: SyncSite, options: string[] ): string {
+	const { id, name: siteName, address, kind } = shownConnection( site );
+	const connected = `the connected WordPress.com site ${ id } (${ siteName }, ${ address }, a ${ kind } site)`;
+	const overwrites = options
+		.map( ( option ) => SYNC_OVERWRITES[ option ] )
+		.join( ' and ' )
+		.replace( / and (?=.* and )/g, ', ' );
+	const chosen = `with the options ${ options.join( ', ' ) }`;
+	if ( name === 'sync.push' )
+		return `It uploads this local site to ${ connected } ${ chosen }, replacing ${ overwrites } on that site. If it is interrupted, the import of what it uploaded may still be running on WordPress.com`;
+	return `It copies ${ connected } into this local site ${ chosen }, replacing ${ overwrites } in this local site, and stops the site while it runs if it is running. If it is interrupted, the site’s server may be left stopped and its database emptied, with the previous one in the operating system’s trash`;
+}
+
 function deepFreeze< T >( value: T ): T {
 	if ( value && typeof value === 'object' && ! Object.isFrozen( value ) ) {
 		Object.freeze( value );
@@ -1325,6 +1342,14 @@ export function createClaudeExecutionPolicy(
 				? wpCliOption( request.args, 'post_title' )
 				: undefined;
 		const described = describeClaudeOperation( operationClass, request.name );
+		const note =
+			wpcomSite && syncOptions
+				? syncNote(
+						request.name === 'sync.pull' ? 'sync.pull' : 'sync.push',
+						wpcomSite,
+						syncOptions
+				  )
+				: request.note;
 		const operation: ClaudeOperation = {
 			tool: request.name,
 			operationClass,
@@ -1335,10 +1360,7 @@ export function createClaudeExecutionPolicy(
 			description:
 				draftTitle !== undefined && site
 					? 'Create a draft post on the current local site'
-					: noticed(
-							operationClass,
-							request.note ? `${ described }. ${ request.note }` : described
-					  ),
+					: noticed( operationClass, note ? `${ described }. ${ note }` : described ),
 			...( draftTitle !== undefined && site
 				? {
 						draft: {
@@ -1926,7 +1948,6 @@ export function createClaudeExecutionPolicy(
 							wpcomSite: remoteSite,
 							syncOptions: options,
 							scratch: true,
-							note: 'It uploads this local site to one of its connected WordPress.com sites and replaces what overwrites names on that site',
 						},
 						( current, fenceOptions, _operation, checked ) =>
 							host.sync.push(
@@ -1949,7 +1970,6 @@ export function createClaudeExecutionPolicy(
 							syncOptions: options,
 							scratch: true,
 							defaultPull: true,
-							note: 'It copies one of this site’s connected WordPress.com sites into this local site and replaces what overwrites names in this local site, stopping the site while it runs if it is running',
 						},
 						( current, fenceOptions, _operation, checked ) =>
 							host.sync.pull(

@@ -7,6 +7,7 @@ import { fakeSite } from '../../tests/fake-host';
 import { createClaudeEventAdapter } from '../event-adapter';
 import { recoverClaudeRun } from '../recovery';
 import { claudeLockDigest } from '../run-lock';
+import { recoveryNote } from '../runtime';
 import { createNativeSessionStore } from '../sessions';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
@@ -16,6 +17,28 @@ import type {
 	ClaudeTurnJournalEvent,
 } from '@studio/agent/protocol/backend-events';
 import type { OwnedTreeCheck, ProcessIdentityCheck } from '@studio/common/lib/owned-process';
+
+// For the turns that push or pull: the conversation's site is connected to
+// `fakeRemoteSite` under the stored login, whose user id is all the policy
+// reads of it, in a store that lies outside every folder a turn reaches.
+vi.mock( '@studio/common/lib/connected-sites', async () => {
+	const { fakeRemoteSite } = await import( '../../tests/fake-host' );
+	return { getConnectedWpcomSitesForLocalSite: vi.fn( async () => [ fakeRemoteSite ] ) };
+} );
+vi.mock( '@studio/common/lib/shared-config', async ( importOriginal ) => ( {
+	...( await importOriginal< object >() ),
+	getCurrentUserId: vi.fn( async () => 7 ),
+} ) );
+vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('@studio/common/lib/well-known-paths') >();
+	const { default: nodePath } = await import( 'path' );
+	const { default: nodeOs } = await import( 'os' );
+	return {
+		...actual,
+		getSharedConfigPath: () =>
+			nodePath.join( nodeOs.tmpdir(), 'studio-claude-no-config', 'shared.json' ),
+	};
+} );
 
 const cleanups: Array< () => Promise< void > > = [];
 afterEach( async () => {
@@ -341,6 +364,47 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 		} );
 		const added = ( await fixture.store.readJournals( 'chat' ) )[ 1 ];
 		expect( added.map( ( event ) => event.type ) ).toEqual( [ 'turn.terminal', 'turn.recovered' ] );
+	} );
+
+	it( 'says, for a pull or push that was still running, which WordPress.com site it synced with, its options and what it may have left, in the note the next turn gives Claude', async () => {
+		const cases = [
+			[
+				'site_pull',
+				'sync.pull',
+				'If it is interrupted, the site’s server may be left stopped and its database emptied, with the previous one in the operating system’s trash',
+			],
+			[
+				'site_push',
+				'sync.push',
+				'If it is interrupted, the import of what it uploaded may still be running on WordPress.com',
+			],
+		] as const;
+		for ( const [ name, operation, left ] of cases ) {
+			const fixture = await recoveryFixture();
+			const journal = await journalOf( async ( { bridge, host } ) => {
+				const running = name === 'site_pull' ? host.sync.pull : host.sync.push;
+				vi.mocked( running ).mockImplementation( hangs );
+				void bridge.invoke( name, {
+					nameOrPath: 'site',
+					remoteSite: '111',
+					options: 'sqls,uploads',
+				} );
+				await vi.waitFor( () => expect( running ).toHaveBeenCalled() );
+			} );
+			await fixture.deadTurn( { journal } );
+			const result = await fixture.recover();
+			expect( result.status === 'recovered' && result.uncertainOperations, name ).toEqual( [
+				expect.objectContaining( { tool: operation, evidence: 'authorized' } ),
+			] );
+			const note = recoveryNote( await fixture.store.readJournals( 'chat' ) );
+			for ( const said of [
+				'WordPress.com site 111 (My Production Site, myprod.wordpress.com, a production site)',
+				'with the options sqls, uploads',
+				left,
+			] )
+				expect( note?.text, name ).toContain( said );
+			expect( note?.uncertain, name ).toBe( true );
+		}
 	} );
 
 	it( 'reports an operation that needed no approval and has no result as uncertain, and a read as settled', async () => {

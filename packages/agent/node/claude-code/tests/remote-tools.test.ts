@@ -670,11 +670,19 @@ describe( 'site_push on the Claude route', () => {
 			localPaths: [ site ],
 			remote: PRODUCTION_LABEL,
 		} );
+		// The approval and the journal entry say which site, with which options
+		// and what they replace there, and what an interrupted push may leave.
 		expect( request.operation.description ).toContain(
-			'replaces what overwrites names on that site'
+			'It uploads this local site to the connected WordPress.com site 111 (My Production Site, myprod.wordpress.com, a production site) with the options sqls, plugins, replacing the database and the plugins on that site.'
+		);
+		expect( request.operation.description ).toContain(
+			'If it is interrupted, the import of what it uploaded may still be running on WordPress.com'
 		);
 		expect( order ).toEqual( [ 'journal site_push', 'journal sync.push', 'host sync.push' ] );
-		expect( journal[ 1 ] ).toMatchObject( { requestId: request.requestId } );
+		expect( journal[ 1 ] ).toMatchObject( {
+			requestId: request.requestId,
+			description: request.operation.description,
+		} );
 		expect( JSON.stringify( [ journal, events ] ) ).not.toContain( LOGIN.accessToken );
 	} );
 
@@ -850,11 +858,19 @@ describe( 'site_pull on the Claude route', () => {
 			localPaths: [ site ],
 			remote: PRODUCTION_LABEL,
 		} );
+		// The approval and the journal entry say which site, with which options
+		// and what they replace here, and what an interrupted pull may leave.
 		expect( request.operation.description ).toContain(
-			'replaces what overwrites names in this local site'
+			'It copies the connected WordPress.com site 111 (My Production Site, myprod.wordpress.com, a production site) into this local site with the options uploads, themes, replacing the uploads and the themes in this local site, and stops the site while it runs if it is running.'
+		);
+		expect( request.operation.description ).toContain(
+			'If it is interrupted, the site’s server may be left stopped and its database emptied, with the previous one in the operating system’s trash'
 		);
 		expect( order ).toEqual( [ 'journal site_pull', 'journal sync.pull', 'host sync.pull' ] );
-		expect( journal[ 1 ] ).toMatchObject( { requestId: request.requestId } );
+		expect( journal[ 1 ] ).toMatchObject( {
+			requestId: request.requestId,
+			description: request.operation.description,
+		} );
 		expect( JSON.stringify( [ journal, events ] ) ).not.toContain( LOGIN.accessToken );
 	} );
 
