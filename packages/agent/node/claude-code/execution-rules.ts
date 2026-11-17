@@ -73,6 +73,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		installTaxonomyScriptsTool.name,
 		refreshBrowserTool.name,
 		createSiteTool.name,
+		sendFeedbackTool.name,
 	] ),
 } );
 
@@ -424,6 +425,12 @@ export interface ClaudeStudioToolRule {
 	 * call itself when its effect does not go through the host.
 	 */
 	readonly approval: 'host' | 'tool';
+	/**
+	 * What an approval of the call, and its journal entry, say of it after its
+	 * class and name: a fixed sentence, never a value of the call. A message's
+	 * says what goes with the arguments the approval shows, and where.
+	 */
+	readonly note?: string;
 }
 
 function namedSite( args: unknown ): string | undefined {
@@ -490,6 +497,13 @@ function taxonomistDestinations( siteFolder: string | undefined ): string[] | un
 		return;
 	}
 }
+
+// What `send_feedback` sends besides the type and message an approval shows,
+// and where: `sendStudioFeedback` adds a line naming Studio's version and the
+// operating system, and sends the report to the WordPress.com MCP server's
+// feedback tool with the stored login.
+const FEEDBACK_NOTE =
+	'It sends the type and message shown, with a line naming this Studio version and operating system, to the WordPress Studio team at Automattic through WordPress.com, signed in as the WordPress.com account Studio is logged in to';
 
 // A declaration that marks every channel it does not name as unused.
 function using( used: Partial< ClaudeToolChannelDeclaration > ): ClaudeToolChannelDeclaration {
@@ -961,7 +975,26 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 			using( { runsWpCli: [ 'host' ], callsHostOperation: [ 'host' ] } )
 		),
 	],
-	[ sendFeedbackTool.name, unqualified( studioRule( 'external-message' ) ) ],
+	[
+		sendFeedbackTool.name,
+		// It reads the stored login and sends one report itself, outside the
+		// host: the call's type and message, with a line naming Studio's version
+		// and the operating system, to the WordPress.com MCP server's feedback
+		// tool at an address its code fixes, signed in with that login. Every
+		// call asks the user, whose approval shows the type and message and says
+		// what goes with them and where; never the login. Its module links
+		// `tools/utils.ts`, whose `runWpCli` runs only through the host.
+		qualified(
+			studioRule( 'external-message', { config: storedLogin, note: FEEDBACK_NOTE } ),
+			using( {
+				readsLocalFiles: [ 'config' ],
+				runsWpCli: [ 'host' ],
+				callsHostOperation: [ 'host' ],
+				requestsNetwork: [ 'class' ],
+				reachesWpcom: [ 'class' ],
+			} )
+		),
+	],
 	// Tools built by factories for the host's capabilities.
 	[ 'AskUserQuestion', unqualified( studioRule( 'read' ) ) ],
 	[ 'Skill', unqualified( studioRule( 'read' ) ) ],
@@ -1190,9 +1223,10 @@ const CHANNEL_BOUNDS: Readonly<
 
 const QUALIFIED_KEYS: ReadonlySet< string > = new Set( [ 'qualified', 'channels' ] );
 
-// The elements a qualified rule may have, and whether each is a function or a mark.
+// The elements a qualified rule may have, and whether each is a function, a
+// mark or a sentence.
 const RULE_ELEMENTS: Readonly<
-	Record< keyof ClaudeStudioToolRule, 'function' | 'mark' | 'other' >
+	Record< keyof ClaudeStudioToolRule, 'function' | 'mark' | 'text' | 'other' >
 > = {
 	qualification: 'other',
 	operationClass: 'other',
@@ -1209,16 +1243,16 @@ const RULE_ELEMENTS: Readonly<
 	navigates: 'mark',
 	withoutSite: 'mark',
 	createsSite: 'mark',
+	note: 'text',
 };
 
 function isRuleElement( [ key, value ]: [ string, unknown ] ): boolean {
 	if ( ! hasOwn( RULE_ELEMENTS, key ) ) return false;
 	const kind = RULE_ELEMENTS[ key as keyof ClaudeStudioToolRule ];
-	return (
-		kind === 'other' ||
-		value === undefined ||
-		( kind === 'mark' ? value === true : typeof value === 'function' )
-	);
+	if ( kind === 'other' || value === undefined ) return true;
+	if ( kind === 'mark' ) return value === true;
+	if ( kind === 'text' ) return typeof value === 'string' && value.trim().length > 0;
+	return typeof value === 'function';
 }
 
 function isOperationClass( value: unknown ): value is ClaudeOperationClass {
@@ -1226,7 +1260,8 @@ function isOperationClass( value: unknown ): value is ClaudeOperationClass {
 }
 
 // Whether a rule has what a binding names. `class` bounds a channel only when
-// every call is approved: the class asks, and no argument narrows it.
+// every call is approved: the class asks, no argument narrows it, and the call
+// itself is what the user approves, not the host operations it reaches.
 function ruleHas( rule: Record< string, unknown >, binding: unknown ): boolean {
 	switch ( binding ) {
 		case 'site':
@@ -1243,7 +1278,8 @@ function ruleHas( rule: Record< string, unknown >, binding: unknown ): boolean {
 			return (
 				isOperationClass( rule.operationClass ) &&
 				requiresClaudeApproval( rule.operationClass ) &&
-				rule.classify === undefined
+				rule.classify === undefined &&
+				rule.approval === 'tool'
 			);
 		case 'host':
 			return true;
@@ -1306,6 +1342,9 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 			used.has( 'drivesBrowser' ) ||
 			used.has( 'requestsNetwork' ) ) &&
 		( elements.approval !== 'host' || used.has( 'callsHostOperation' ) ) &&
+		// An approval of a message shows its arguments; it also says what goes
+		// with them and where.
+		( elements.operationClass !== 'external-message' || typeof elements.note === 'string' ) &&
 		( elements.createsSite !== true || elements.withoutSite === true ) &&
 		( ! used.has( 'runsWpCli' ) || used.has( 'callsHostOperation' ) ) &&
 		// A rule approved at its host operations is admitted without an approval

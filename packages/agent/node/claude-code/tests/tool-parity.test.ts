@@ -49,7 +49,6 @@ type ClaudeStatus =
 	// Claude Code tool that would stand for it.
 	| { status: 'unqualified'; step: Step; reason: string; native?: string };
 
-const REMOTE = 'Reaches WordPress.com or another service; its scope and approval are not bound yet';
 const BROWSER = 'Drives a browser; needs the navigation guard (contract revision 2)';
 const NATIVE = 'Native equivalent not qualified: argument and write-path adaptation';
 
@@ -79,7 +78,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	preview_delete: { status: 'bridged' },
 	site_push: { status: 'bridged' },
 	site_pull: { status: 'bridged' },
-	send_feedback: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
+	send_feedback: { status: 'bridged' },
 	generate_images: {
 		status: 'unqualified',
 		step: 'C2a-3',

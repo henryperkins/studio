@@ -1019,7 +1019,11 @@ export function createClaudeExecutionPolicy(
 			}
 			shown = scope.request ?? {};
 		}
-		const description = describe( operationClass, name );
+		const described = describeClaudeOperation( operationClass, name );
+		const description = noticed(
+			operationClass,
+			rule.note ? `${ described }. ${ rule.note }` : described
+		);
 		let authorized: boolean;
 		// A tool approved at its host operations is journaled here too: the
 		// host operations it reaches are journaled again as they run.

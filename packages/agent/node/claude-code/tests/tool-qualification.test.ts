@@ -120,6 +120,14 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 		requestsNetwork: [ 'scope' ],
 		reachesWpcom: [ 'scope' ],
 	},
+	send_feedback: {
+		...noChannels,
+		readsLocalFiles: [ 'config' ],
+		runsWpCli: [ 'host' ],
+		callsHostOperation: [ 'host' ],
+		requestsNetwork: [ 'class' ],
+		reachesWpcom: [ 'class' ],
+	},
 };
 
 // Code a qualified tool's module links but the tool never runs. The scan reads
@@ -139,6 +147,7 @@ const UNREACHED: Record<
 	site_list: [ SHARED_CONFIG_SAVE ],
 	site_connected_remote_sites: [ SHARED_CONFIG_SAVE ],
 	wpcom_request: [ SHARED_CONFIG_SAVE ],
+	send_feedback: [ SHARED_CONFIG_SAVE ],
 	preview_list: [
 		{
 			channels: [ 'requestsNetwork', 'reachesWpcom' ],
@@ -224,7 +233,7 @@ describe( 'Claude Studio tool qualification', () => {
 			all.filter( ( name ) => name !== 'wp_cli' ),
 			...all.map( ( name ) => [ name ] ),
 			[ ...all, '__proto__', 'constructor', 'toString', 'hasOwnProperty', '' ],
-			[ 'WP_CLI', ' wp_cli', 'wp_cli ', 'mcp__studio__wp_cli', 'mcp__studio__send_feedback' ],
+			[ 'WP_CLI', ' wp_cli', 'wp_cli ', 'mcp__studio__wp_cli', 'mcp__studio__pick_design' ],
 		];
 		const navigations: unknown[] = [
 			...unverifiableNavigation( targetOrigin ).map( ( [ , declared ] ) => declared ),
@@ -293,7 +302,7 @@ describe( 'Claude Studio tool qualification', () => {
 	} );
 
 	it( 'returns no tool, without throwing, for a tool list that is not a plain list of names', () => {
-		const smuggle = () => [ 'send_feedback' ];
+		const smuggle = () => [ 'pick_design' ];
 		const lists: unknown[] = [
 			null,
 			undefined,
@@ -308,8 +317,8 @@ describe( 'Claude Studio tool qualification', () => {
 			{ studio: [ Object( 'wp_cli' ) ] },
 			{ studio: [ { toString: () => 'wp_cli' } ] },
 			{ studio: [ 'wp_cli', 7 ] },
-			{ studio: Object.assign( new Array( 3 ), { 0: 'wp_cli', 2: 'send_feedback' } ) },
-			{ studio: new ( class extends Array< string > {} )( 'wp_cli', 'send_feedback' ) },
+			{ studio: Object.assign( new Array( 3 ), { 0: 'wp_cli', 2: 'pick_design' } ) },
+			{ studio: new ( class extends Array< string > {} )( 'wp_cli', 'pick_design' ) },
 			inherit( { studio: [ 'wp_cli' ] } ),
 			withAccessor( {}, 'studio', () => [ 'wp_cli' ] ),
 			new Declared( { studio: [ 'wp_cli' ] } ),
@@ -377,9 +386,9 @@ describe( 'Claude Studio tool qualification', () => {
 				),
 			],
 			[
-				'a message by approval',
+				'a message by approval, which says what goes with it and where',
 				qualifiedRule(
-					{ operationClass: 'external-message' },
+					{ operationClass: 'external-message', note: 'It sends the message shown to a team' },
 					{ ...noChannels, requestsNetwork: [ 'class' ] }
 				),
 			],
@@ -481,6 +490,26 @@ describe( 'Claude Studio tool qualification', () => {
 					{ ...noChannels, requestsNetwork: [ 'class' ] }
 				),
 			],
+			// A rule approved at its host operations is admitted without an approval
+			// of its own, so its class approves no request the tool sends itself.
+			[
+				'approval a rule approved at its host operations never asks for',
+				qualifiedRule(
+					{ operationClass: 'remote-change', approval: 'host' },
+					{ ...noChannels, requestsNetwork: [ 'class' ], callsHostOperation: [ 'host' ] }
+				),
+			],
+			// An approval of a message says what goes with it and where, beyond the
+			// arguments it shows.
+			[
+				'a message whose approval says nothing of what goes with it',
+				qualifiedRule(
+					{ operationClass: 'external-message' },
+					{ ...noChannels, requestsNetwork: [ 'class' ] }
+				),
+			],
+			[ 'a note that is not text', qualifiedRule( { note: 42 }, noChannels ) ],
+			[ 'an empty note', qualifiedRule( { note: ' ' }, noChannels ) ],
 			// A binding must be one that can bound that channel.
 			[
 				'files bound by the site name alone',
@@ -743,24 +772,24 @@ describe( 'Claude Studio tool qualification', () => {
 				qualification: { qualified: boolean; channels: Record< string, string[] > };
 			};
 		const attempts: Array< () => unknown > = [
-			() => table.set( 'send_feedback', forged ),
-			() => Map.prototype.set.call( table, 'send_feedback', forged ),
+			() => table.set( 'pick_design', forged ),
+			() => Map.prototype.set.call( table, 'pick_design', forged ),
 			() => Map.prototype.delete.call( table, 'wp_cli' ),
 			() => table.clear(),
 			() => Object.assign( table, { get: () => forged } ),
-			() => Object.assign( rule( 'send_feedback' ), forged ),
-			() => ( rule( 'send_feedback' ).qualification.qualified = true ),
+			() => Object.assign( rule( 'pick_design' ), forged ),
+			() => ( rule( 'pick_design' ).qualification.qualified = true ),
 			() =>
-				Object.defineProperty( rule( 'send_feedback' ), 'qualification', {
+				Object.defineProperty( rule( 'pick_design' ), 'qualification', {
 					value: forged.qualification,
 				} ),
-			() => Object.setPrototypeOf( rule( 'send_feedback' ), forged ),
+			() => Object.setPrototypeOf( rule( 'pick_design' ), forged ),
 			() => Object.assign( rule( 'take_screenshot' ), { navigates: undefined } ),
 			() => rule( 'wp_cli' ).qualification.channels.runsWpCli.pop(),
 			() => ( rule( 'wp_cli' ).qualification.channels.callsHostOperation = [] ),
 			() => ( CLAUDE_NATIVE_TOOL_RULES as unknown as Map< string, unknown > ).set( 'Bash', forged ),
 			() => Object.assign( CLAUDE_NATIVE_TOOL_RULES.get( 'Bash' ) as object, { shell: undefined } ),
-			() => ( CLAUDE_ENABLED_TOOLS.studio as string[] ).push( 'send_feedback' ),
+			() => ( CLAUDE_ENABLED_TOOLS.studio as string[] ).push( 'pick_design' ),
 			() => ( CLAUDE_TOOL_CHANNELS as unknown as string[] ).pop(),
 		];
 		for ( const attempt of attempts ) expect( attempt ).toThrow( TypeError );
@@ -772,7 +801,7 @@ describe( 'Claude Studio tool qualification', () => {
 		];
 		const unconfinedNative = [ 'Read', 'Grep', 'Glob', 'LS', 'Write', 'Edit', 'MultiEdit' ];
 		expect( enabledNow() ).toEqual( [ qualifiedTools(), unconfinedNative ] );
-		expect( rule( 'send_feedback' ).qualification ).toEqual( { qualified: false } );
+		expect( rule( 'pick_design' ).qualification ).toEqual( { qualified: false } );
 
 		// Values planted on the prototype every plain object shares are not declarations.
 		const planted: Record< string, unknown > = {
@@ -782,7 +811,7 @@ describe( 'Claude Studio tool qualification', () => {
 			mode: 'guarded',
 			guard: completeGuard( targetOrigin ),
 			...completeGuard( targetOrigin ),
-			studio: [ 'send_feedback' ],
+			studio: [ 'pick_design' ],
 			classify: () => 'read',
 			remote: account,
 			urls: pageUrl,

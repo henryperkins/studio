@@ -118,7 +118,7 @@ const STUDIO_CALLS: Record<
 		args: ( paths ) => ( { nameOrPath: 'site', exportFile: path.join( paths.site, 'a.zip' ) } ),
 	},
 	open_annotation_browser: { args: () => ( { url: fakeSite.url } ) },
-	send_feedback: { args: () => ( {} ) },
+	send_feedback: { args: () => ( { type: 'bug', message: 'secret body' } ) },
 	present_design_options: { args: () => ( {} ) },
 };
 
@@ -338,6 +338,7 @@ describe( 'what the policy journals before an operation that does more than read
 				},
 			] );
 			expect( JSON.stringify( fixture.journal ) ).not.toContain( fixture.site );
+			expect( JSON.stringify( fixture.journal ) ).not.toContain( 'secret' );
 		}
 	);
 
