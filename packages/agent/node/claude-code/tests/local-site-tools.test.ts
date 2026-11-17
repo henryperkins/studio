@@ -967,6 +967,31 @@ describe( 'site_create on the Claude route', () => {
 		expect( policy.signal.aborted ).toBe( true );
 	} );
 
+	it( 'after a selection that failed, which may or may not have landed, creates no second site and lists no sites, saying this turn tried to change the conversation’s site rather than that the conversation has one', async () => {
+		const { bridge, host, stored, journal } = await setupGlobal();
+		host.selectSite = vi.fn( async () => {
+			throw new Error( 'The disk is full' );
+		} );
+		expect( ( await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } ) ).isError ).toBe(
+			true
+		);
+		expect( stored.target ).toEqual( { environment: 'global' } );
+		const before = journal.length;
+		for ( const [ name, args ] of [
+			[ 'site_create', { name: 'Another Shop' } ],
+			[ 'site_list', {} ],
+		] as const ) {
+			const result = await bridge.invoke( name, args );
+			expect( result.isError, name ).toBe( true );
+			expect( text( result ), name ).toContain( ONE_SITE );
+			expect( text( result ), name ).toContain( 'this turn has already made, or tried to make' );
+			expect( text( result ), name ).not.toContain( 'already has its site' );
+		}
+		expect( host.sites.create ).toHaveBeenCalledOnce();
+		expect( host.sites.list ).not.toHaveBeenCalled();
+		expect( journal ).toHaveLength( before );
+	} );
+
 	it( 'after a recovery that left operations uncertain, asks before it creates, selects and shows the site, each approval showing the site’s folder', async () => {
 		const { bridge, host, context, journal, created, stored } = await setupGlobal( {
 			uncertainAfterRecovery: true,

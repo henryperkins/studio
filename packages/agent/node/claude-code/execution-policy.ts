@@ -236,6 +236,10 @@ const REFUSALS = {
 		'A conversation works on one site, and this conversation already has its site. Ask the user to start a new conversation to create another one.',
 	withoutSite:
 		'A conversation works on one site, and this conversation already has its site, so Studio runs this tool only in a conversation without a site.',
+	createAfterChange:
+		'A conversation works on one site, and this turn has already made, or tried to make, a site it created this conversation’s site. Ask the user to start a new conversation to create another one.',
+	withoutSiteAfterChange:
+		'A conversation works on one site, and this turn has already made, or tried to make, a site it created this conversation’s site, so Studio runs this tool only in a conversation without a site.',
 	siteBinding:
 		'Studio did not make that site this conversation’s site: only a site this turn created, in a conversation without a site, can become it.',
 	siteFolderMissing:
@@ -430,10 +434,21 @@ export function createClaudeExecutionPolicy(
 	// Whether this turn has changed the conversation's site, from the moment
 	// that change is made, whether or not the turn then found the site's folder.
 	let siteChanged = false;
-	// Whether the conversation has its site: it was started on one, it acts on
-	// one, or this turn changed it. A conversation works on one site.
-	const hasSite = () =>
-		context.workspace.siteId !== null || actingTarget.environment !== 'global' || siteChanged;
+	// Whether the conversation had its site when the turn started: it was
+	// started on one, or its target is one.
+	const hadSite = context.workspace.siteId !== null || context.target.environment !== 'global';
+	// Whether the conversation has its site: it had one, it acts on one, or this
+	// turn changed it. A conversation works on one site.
+	const hasSite = () => hadSite || actingTarget.environment !== 'global' || siteChanged;
+	// Why a call that runs only in a conversation without a site, or creates
+	// the conversation's site, is refused; undefined when it is not. Once this
+	// turn has changed the conversation's site, its write may or may not have
+	// landed, so the sentence says the turn tried, not that the site is set.
+	const siteRefusal = ( creates: boolean ): string | undefined => {
+		if ( ! hasSite() ) return;
+		if ( hadSite ) return creates ? REFUSALS.createInSite : REFUSALS.withoutSite;
+		return creates ? REFUSALS.createAfterChange : REFUSALS.withoutSiteAfterChange;
+	};
 	// The signal each call's guarded host lives by, which aborts once the call
 	// has settled, and the call that is creating a site, if any: one at a time.
 	const callSignals = new Map< string, AbortSignal >();
@@ -903,8 +918,9 @@ export function createClaudeExecutionPolicy(
 		if ( callSignal?.aborted ) return false;
 		const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
 		if ( ! rule || ! studioTools.has( name ) ) return false;
-		if ( rule.withoutSite && hasSite() ) {
-			refuse( toolCallId, rule.createsSite ? REFUSALS.createInSite : REFUSALS.withoutSite );
+		const siteRefused = rule.withoutSite ? siteRefusal( rule.createsSite === true ) : undefined;
+		if ( siteRefused ) {
+			refuse( toolCallId, siteRefused );
 			return false;
 		}
 		if ( rule.createsSite ) {
@@ -1057,8 +1073,9 @@ export function createClaudeExecutionPolicy(
 			// Only a conversation without a site creates one; a conversation works
 			// on one site and needs a new conversation for another.
 			const sitePath = request.args[ 1 ];
-			if ( hasSite() ) {
-				refuse( toolCallId, REFUSALS.createInSite );
+			const siteRefused = siteRefusal( true );
+			if ( siteRefused ) {
+				refuse( toolCallId, siteRefused );
 				return;
 			}
 			if (
