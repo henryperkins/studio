@@ -44,6 +44,7 @@ const signIns = vi.hoisted( () => ( {
 	discoveryUrl: '',
 	flow: null as ChatGptSignInFlow | null,
 	begun: [] as string[],
+	opened: [] as string[],
 } ) );
 
 vi.mock( '@studio/common/lib/os-credential-store', async ( importOriginal ) => {
@@ -65,7 +66,9 @@ vi.mock( '@studio/agent/node/chatgpt/oauth', async ( importOriginal ) => {
 		beginChatGptSignIn: async ( ...args: Parameters< typeof actual.beginChatGptSignIn > ) => {
 			signIns.flow ??= actual.createChatGptSignInFlow( {
 				discoveryUrl: signIns.discoveryUrl,
-				openBrowser: async () => undefined,
+				openBrowser: async ( url ) => {
+					signIns.opened.push( url );
+				},
 				// No socket-table lookup: which user a request comes from isn't what is tested here.
 				platform: 'win32',
 			} );
@@ -195,6 +198,7 @@ describe( 'the system keychain while a ChatGPT sign-in starts', () => {
 		fake = await startFakeAuthorizationServer( signingKey );
 		signIns.discoveryUrl = fake.discoveryUrl;
 		signIns.flow = null;
+		signIns.opened = [];
 	} );
 
 	afterEach( async () => {
@@ -259,6 +263,28 @@ describe( 'the system keychain while a ChatGPT sign-in starts', () => {
 
 			expect( keychain.runs ).toEqual( [] );
 			expect( await secureStorageShown() ).toBe( 'unavailable' );
+		} );
+
+		it( 'waits for an availability check already running before its own read of the key', async () => {
+			await savedInSecureStorage();
+			await knownAs( 'unavailable' );
+			// The Settings group opened: its recheck waits on a Secret Service prompt.
+			const rechecking = recheckChatGptSettings();
+			await new Promise( ( resolve ) => setImmediate( resolve ) );
+
+			const starting = startChatGptSignIn( undefined, { storage: 'vault' } );
+			await new Promise( ( resolve ) => setTimeout( resolve, 50 ) );
+
+			expect( keychain.runs ).toEqual( [ { kind: 'availability check', overlapped: false } ] );
+
+			await keychain.answerChecks();
+			await expect( starting ).resolves.toEqual( { attemptId: expect.any( String ) } );
+			await rechecking;
+			expect( keychain.runs ).toEqual( [
+				{ kind: 'availability check', overlapped: false },
+				{ kind: 'read', overlapped: false },
+			] );
+			expect( await secureStorageShown() ).toBe( 'available' );
 		} );
 
 		it( 'runs its reads one at a time when it signs a saved account in again', async () => {

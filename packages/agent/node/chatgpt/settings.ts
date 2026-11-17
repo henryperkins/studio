@@ -221,6 +221,8 @@ export function startChatGptSignIn(
 		// with a prompt: a sign-in kept in the vault checks the key itself, and
 		// what that found is the answer; one kept for this session only asks the
 		// keychain nothing of its own, so it is checked once the start is done.
+		// A check already out, as when the settings were opened, runs first.
+		await secureStorage.checking;
 		const chosen: { storage?: ChatGptCredentialStorage } = {};
 		try {
 			const { attemptId } = await beginChatGptSignIn(
