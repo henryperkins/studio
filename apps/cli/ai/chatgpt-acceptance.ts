@@ -77,6 +77,7 @@ import {
 	type AcceptanceRunPaths,
 	type RealProfileHazard,
 } from 'cli/ai/acceptance-isolation';
+import { endProcessTree, hasExited } from 'cli/ai/acceptance-process-tree';
 import {
 	ACCEPTANCE_OBSERVER_FILE_ENV,
 	installAcceptanceObserver,
@@ -2942,50 +2943,28 @@ function sendQuietly(
 }
 
 // On POSIX each CLI process the runner starts leads a process group of its
-// own, which holds what it starts in turn; Windows reaches a tree by its PID.
+// own, which holds what it starts in turn; on Windows the runner finds a
+// tree's processes itself (see `endProcessTree`).
 const CHILDREN_LEAD_PROCESS_GROUPS = process.platform !== 'win32';
 const CHILD_STOP_WAIT_MS = 3_000;
-const TASKKILL_TIMEOUT_MS = 10_000;
 
 // Every CLI process this runner started that hasn't closed yet.
 const runningChildren = new Set< ChildProcess >();
 
-// Exited as far as this process knows: until then it hasn't been reaped, so
-// its PID, and on POSIX its process group, can't belong to anything else.
-const hasExited = ( child: ChildProcess ) => child.exitCode !== null || child.signalCode !== null;
-
-/**
- * Ends a child's whole process tree at once: on Windows `taskkill /T /F` by
- * the PID this handle started, which reaches only descendants while the child
- * itself still runs; on POSIX SIGKILL to the process group the child leads.
- * Never anything by name, and nothing once the child has exited.
- */
-function endProcessTree( child: ChildProcess ): void {
-	const { pid } = child;
-	if ( pid === undefined || hasExited( child ) ) {
-		return;
-	}
-	if ( process.platform === 'win32' ) {
-		spawnSync( 'taskkill', [ '/PID', String( pid ), '/T', '/F' ], {
-			windowsHide: true,
-			stdio: 'ignore',
-			timeout: TASKKILL_TIMEOUT_MS,
-		} );
-		return;
-	}
-	try {
-		process.kill( -pid, 'SIGKILL' );
-	} catch {
-		// No such group: the caller ends the child alone.
-	}
-}
+const describeDescendantsMayRemain = () =>
+	__(
+		'A CLI process this run started was ended, but the processes it had started couldn’t be listed, so some of them may still be running.'
+	);
 
 /**
  * Stops a child the runner started: a turn is asked to stop first, over its
  * IPC channel; then its whole tree is ended while the child still runs, since
  * ending the child first would leave its descendants out of reach.
  */
-async function stopChild( child: ChildProcess ): Promise< boolean > {
+async function stopChild(
+	child: ChildProcess,
+	onDescendantsMayRemain: () => void
+): Promise< boolean > {
 	if ( hasExited( child ) ) {
 		return true;
 	}
@@ -2998,11 +2977,11 @@ async function stopChild( child: ChildProcess ): Promise< boolean > {
 			return true;
 		}
 	}
-	endProcessTree( child );
+	endProcessTree( child, { onDescendantsMayRemain } );
 	if ( await exitedWithin( CHILD_STOP_WAIT_MS ) ) {
 		return true;
 	}
-	// The tree couldn't be ended (no taskkill, no group): the child alone, at least.
+	// The tree couldn't be ended (no process group): the child alone, at least.
 	if ( ! hasExited( child ) ) {
 		child.kill( 'SIGKILL' );
 	}
@@ -3011,11 +2990,12 @@ async function stopChild( child: ChildProcess ): Promise< boolean > {
 
 /**
  * Ends the tree of every CLI process this runner started that still runs, at
- * once and without waiting: for an exit that can't finish cleanup.
+ * once and without waiting for them to exit: for an exit that can't finish
+ * cleanup. The same routine as a normal stop.
  */
-export function endRunningAcceptanceChildren(): void {
+export function endRunningAcceptanceChildren( onDescendantsMayRemain: () => void ): void {
 	for ( const child of runningChildren ) {
-		endProcessTree( child );
+		endProcessTree( child, { onDescendantsMayRemain } );
 		if ( ! hasExited( child ) ) {
 			try {
 				child.kill( 'SIGKILL' );
@@ -3057,12 +3037,22 @@ export function createLiveAcceptanceProcesses( {
 	mainScript,
 	scripts,
 	paths,
+	print,
 }: {
 	mainScript: string;
 	scripts: { observer: string; toolImages: string };
 	paths: AcceptanceRunPaths;
+	print: ( line: string ) => void;
 } ): AcceptanceProcesses {
 	let sequence = 0;
+	let warned = false;
+	const onDescendantsMayRemain = () => {
+		if ( ! warned ) {
+			warned = true;
+			print( describeDescendantsMayRemain() );
+		}
+	};
+	const stop = ( child: ChildProcess ) => stopChild( child, onDescendantsMayRemain );
 
 	function track( child: ChildProcess ): Promise< number | null > {
 		runningChildren.add( child );
@@ -3227,7 +3217,7 @@ export function createLiveAcceptanceProcesses( {
 				},
 				result,
 				stop: async () => {
-					await stopChild( child );
+					await stop( child );
 				},
 			};
 		},
@@ -3249,7 +3239,7 @@ export function createLiveAcceptanceProcesses( {
 			const timeoutMs = label === 'site-create' ? 15 * 60_000 : 5 * 60_000;
 			return raceTimeout( exited, timeoutMs ).then( async ( exitCode ) => {
 				if ( exitCode === null && child.exitCode === null ) {
-					await stopChild( child );
+					await stop( child );
 				}
 				return { exitCode, stdout };
 			} );
@@ -3258,7 +3248,7 @@ export function createLiveAcceptanceProcesses( {
 			let stopped = 0;
 			let failed = 0;
 			for ( const child of [ ...runningChildren ] ) {
-				if ( await stopChild( child ) ) {
+				if ( await stop( child ) ) {
 					stopped++;
 				} else {
 					failed++;
@@ -3271,8 +3261,10 @@ export function createLiveAcceptanceProcesses( {
 
 async function createLiveServices( {
 	paths,
+	print,
 }: {
 	paths: AcceptanceRunPaths;
+	print: ( line: string ) => void;
 } ): Promise< ChatGptAcceptanceServices > {
 	process.env.STUDIO_EXPERIMENTAL_CHATGPT = '1';
 	const cliDirectory = import.meta.dirname;
@@ -3321,7 +3313,7 @@ async function createLiveServices( {
 			filePath: async ( sessionId ) =>
 				( await loadAiSession( getSessionsDirectory(), sessionId ) ).summary.filePath,
 		},
-		processes: createLiveAcceptanceProcesses( { mainScript, scripts, paths } ),
+		processes: createLiveAcceptanceProcesses( { mainScript, scripts, paths, print } ),
 		buildPresent: () =>
 			[ mainScript, scripts.observer, scripts.toolImages ].every( ( file ) =>
 				fs.existsSync( file )
@@ -3438,8 +3430,14 @@ export function createLiveChatGptAcceptanceDependencies(): ChatGptAcceptanceDepe
 				target: process,
 				platform: process.platform,
 				forceExit: () => {
+					let warned = false;
 					// Their own process groups keep the terminal's signal from them on POSIX.
-					endRunningAcceptanceChildren();
+					endRunningAcceptanceChildren( () => {
+						if ( ! warned ) {
+							warned = true;
+							process.stdout.write( `${ describeDescendantsMayRemain() }\n` );
+						}
+					} );
 					process.stdout.write(
 						`${ __(
 							'Stopped before cleanup finished. See scripts/chatgpt-acceptance/README.md to stop what this run started.'
@@ -3448,6 +3446,6 @@ export function createLiveChatGptAcceptanceDependencies(): ChatGptAcceptanceDepe
 					process.exit( EXIT_INTERRUPTED );
 				},
 			} ),
-		createServices: ( { paths } ) => createLiveServices( { paths } ),
+		createServices: ( { paths, print } ) => createLiveServices( { paths, print } ),
 	};
 }

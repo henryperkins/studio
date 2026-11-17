@@ -1,10 +1,11 @@
 // @vitest-environment node
-import { spawnSync } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { acceptanceRunPaths } from 'cli/ai/acceptance-isolation';
+import { windowsProcessTreeTools } from 'cli/ai/acceptance-process-tree';
 import {
 	createLiveAcceptanceProcesses,
 	endRunningAcceptanceChildren,
@@ -14,63 +15,59 @@ import {
 /**
  * Real, short-lived Node processes started the way the runner starts its CLI
  * processes: a child that ignores the runner's interrupt and SIGTERM, and a
- * grandchild of its own that ignores SIGTERM too. Each exits by itself within
- * a minute, and `afterEach` ends any this test started that is still running,
- * by its exact PID, so nothing is left whatever the outcome.
+ * grandchild of its own that ignores SIGTERM too.
+ *
+ * The test itself never ends a process. Each one watches a marker file in the
+ * test's own temporary folder and exits by itself once `afterEach` removes it
+ * (or after a minute in any case), so whatever a test leaves running ends
+ * without anything being ended by a PID that may meanwhile belong to another
+ * process. Only the runner's code under test ends processes, through the
+ * handles it holds.
  *
  * On Windows a Node child's ordinary children are in its kill-on-close job
  * and end with it however it ends, so the grandchild there is detached: a
- * descendant outside that job, which only a tree kill by the child's PID,
- * made while the child still runs, reaches. On POSIX it stays in the child's
- * process group, which is how the runner reaches it there.
+ * descendant outside that job, which only the tree stop reaches. On POSIX it
+ * stays in the child's process group, which is how the runner reaches it there.
  */
 const PID_FILE_VARIABLE = 'STUDIO_ACCEPTANCE_PROCESS_TEST_PIDS';
+const MARKER_VARIABLE = 'STUDIO_ACCEPTANCE_PROCESS_TEST_MARKER';
 const SELF_EXIT_MS = 60_000;
+
+// Exits once the marker named by its first argument is gone, or after a minute.
+const UNTIL_MARKER_GONE = `const fs = require( 'node:fs' );
+const marker = process.argv[ 1 ];
+process.on( 'SIGTERM', () => {} );
+setInterval( () => { if ( ! fs.existsSync( marker ) ) process.exit( 0 ); }, 100 );
+setTimeout( () => process.exit( 0 ), ${ SELF_EXIT_MS } );`;
 
 const CHILD_SCRIPT = `
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
-const grandchild = spawn(
-	process.execPath,
-	[ '-e', 'process.on("SIGTERM", () => {}); setTimeout(() => process.exit(0), ${ SELF_EXIT_MS }); setInterval(() => {}, 1000);' ],
-	{ stdio: 'ignore', detached: process.platform === 'win32', windowsHide: true }
-);
+const marker = process.env.${ MARKER_VARIABLE };
+const grandchild = spawn( process.execPath, [ '-e', ${ JSON.stringify(
+	UNTIL_MARKER_GONE
+) }, marker ], {
+	stdio: 'ignore',
+	detached: process.platform === 'win32',
+	windowsHide: true,
+} );
 process.on( 'SIGTERM', () => {} );
 process.on( 'message', () => {} );
+setInterval( () => { if ( ! fs.existsSync( marker ) ) process.exit( 0 ); }, 100 );
 setTimeout( () => process.exit( 0 ), ${ SELF_EXIT_MS } );
-setInterval( () => {}, 1000 );
 fs.writeFileSync(
 	process.env.${ PID_FILE_VARIABLE },
 	JSON.stringify( { child: process.pid, grandchild: grandchild.pid } )
 );
 `;
 
+// Whether a process with this id exists; signal 0 only checks, it delivers nothing.
 function isRunning( pid: number ): boolean {
 	try {
 		process.kill( pid, 0 );
 		return true;
 	} catch ( error ) {
 		return ( error as NodeJS.ErrnoException ).code === 'EPERM';
-	}
-}
-
-// Ends a process this test started, by its exact PID only.
-function endStartedProcess( pid: number ): void {
-	if ( ! isRunning( pid ) ) {
-		return;
-	}
-	if ( process.platform === 'win32' ) {
-		spawnSync( 'taskkill', [ '/PID', String( pid ), '/T', '/F' ], {
-			windowsHide: true,
-			stdio: 'ignore',
-			timeout: 10_000,
-		} );
-	} else {
-		try {
-			process.kill( pid, 'SIGKILL' );
-		} catch {
-			// Gone meanwhile.
-		}
 	}
 }
 
@@ -86,8 +83,12 @@ async function waitUntilGone( pids: number[], timeoutMs = 10_000 ): Promise< num
 }
 
 describe( 'stopping the CLI processes an acceptance run started', () => {
-	const savedPidFile = process.env[ PID_FILE_VARIABLE ];
+	const savedVariables = {
+		[ PID_FILE_VARIABLE ]: process.env[ PID_FILE_VARIABLE ],
+		[ MARKER_VARIABLE ]: process.env[ MARKER_VARIABLE ],
+	};
 	let base: string;
+	let marker: string;
 	let mainScript: string;
 	let pidFile: string;
 	let started: number[];
@@ -101,7 +102,7 @@ describe( 'stopping the CLI processes an acceptance run started', () => {
 		policy: { tools: [] },
 	} );
 
-	function processes() {
+	function processes( print: ( line: string ) => void = () => undefined ) {
 		const scripts = {
 			observer: path.join( base, 'observer.mjs' ),
 			toolImages: path.join( base, 'tool-images.mjs' ),
@@ -112,6 +113,7 @@ describe( 'stopping the CLI processes an acceptance run started', () => {
 			mainScript,
 			scripts,
 			paths: acceptanceRunPaths( path.join( base, 'run' ) ),
+			print,
 		} );
 	}
 
@@ -124,6 +126,7 @@ describe( 'stopping the CLI processes an acceptance run started', () => {
 					child: number;
 					grandchild: number;
 				};
+				fs.rmSync( pidFile );
 				started.push( pids.child, pids.grandchild );
 				return pids;
 			} catch {
@@ -137,28 +140,33 @@ describe( 'stopping the CLI processes an acceptance run started', () => {
 
 	beforeEach( () => {
 		base = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-acceptance-processes-' ) );
+		marker = path.join( base, 'running' );
+		fs.writeFileSync( marker, '' );
 		mainScript = path.join( base, 'child.mjs' );
 		fs.writeFileSync( mainScript, CHILD_SCRIPT );
 		pidFile = path.join( base, 'pids.json' );
 		process.env[ PID_FILE_VARIABLE ] = pidFile;
+		process.env[ MARKER_VARIABLE ] = marker;
 		started = [];
 	} );
 
 	afterEach( async () => {
-		for ( const pid of started ) {
-			endStartedProcess( pid );
-		}
-		await waitUntilGone( started );
-		if ( savedPidFile === undefined ) {
-			delete process.env[ PID_FILE_VARIABLE ];
-		} else {
-			process.env[ PID_FILE_VARIABLE ] = savedPidFile;
+		// Everything this test started exits by itself without the marker.
+		fs.rmSync( marker, { force: true } );
+		await waitUntilGone( started, 15_000 );
+		for ( const [ name, value ] of Object.entries( savedVariables ) ) {
+			if ( value === undefined ) {
+				delete process.env[ name ];
+			} else {
+				process.env[ name ] = value;
+			}
 		}
 		fs.rmSync( base, { recursive: true, force: true, maxRetries: 5 } );
-	} );
+	}, 30_000 );
 
 	it( 'ends a forked turn that ignores the interrupt together with its grandchild', async () => {
-		const turn = processes().startTurn( turnOptions( true ) );
+		const printed: string[] = [];
+		const turn = processes( ( line ) => printed.push( line ) ).startTurn( turnOptions( true ) );
 		const { child, grandchild } = await startedPids();
 		expect( isRunning( child ) && isRunning( grandchild ) ).toBe( true );
 
@@ -166,6 +174,8 @@ describe( 'stopping the CLI processes an acceptance run started', () => {
 
 		expect( await waitUntilGone( [ child, grandchild ] ) ).toEqual( [] );
 		expect( ( await turn.result ).pid ).toBe( child );
+		// The tree could be listed: nothing to warn about.
+		expect( printed ).toEqual( [] );
 	}, 30_000 );
 
 	it( 'ends a spawned turn, which has no channel for the interrupt, together with its grandchild', async () => {
@@ -193,10 +203,12 @@ describe( 'stopping the CLI processes an acceptance run started', () => {
 	it( 'ends every running tree at once when the runner has to exit before cleanup', async () => {
 		const turn = processes().startTurn( turnOptions( true ) );
 		const { child, grandchild } = await startedPids();
+		const onDescendantsMayRemain = vi.fn();
 
-		endRunningAcceptanceChildren();
+		endRunningAcceptanceChildren( onDescendantsMayRemain );
 
 		expect( await waitUntilGone( [ child, grandchild ] ) ).toEqual( [] );
+		expect( onDescendantsMayRemain ).not.toHaveBeenCalled();
 		await turn.result;
 	}, 30_000 );
 
@@ -218,8 +230,54 @@ describe( 'stopping the CLI processes an acceptance run started', () => {
 			persistenceFile: path.join( base, 'no-such-session.jsonl' ),
 		} );
 		const result = await turn.result;
-		started.push( ...( result.pid === undefined ? [] : [ result.pid ] ) );
 		expect( result.events ).toHaveLength( 1 );
 		expect( result.events[ 0 ].persistedAtReceipt ).toBeNull();
 	}, 30_000 );
+
+	describe.runIf( process.platform === 'win32' )( 'the Windows process table', () => {
+		// A process of this test's own, held by its handle until it exits.
+		async function startSleeper(): Promise< ChildProcess > {
+			const sleeper = spawn( process.execPath, [ '-e', UNTIL_MARKER_GONE, marker ], {
+				stdio: 'ignore',
+				windowsHide: true,
+			} );
+			await new Promise( ( resolve ) => sleeper.once( 'spawn', resolve ) );
+			started.push( sleeper.pid as number );
+			return sleeper;
+		}
+
+		it( 'lists a process this test started, with this process as its parent', async () => {
+			const sleeper = await startSleeper();
+			const table = windowsProcessTreeTools.snapshot();
+			expect( table ).not.toBeNull();
+			const own = table?.find( ( entry ) => entry.pid === sleeper.pid );
+			expect( own ).toMatchObject( { parentPid: process.pid } );
+			expect( own?.createdAt ).toBeGreaterThan( BigInt( 0 ) );
+		}, 30_000 );
+
+		it( 'leaves a process alone when its creation time doesn’t match, and ends it on its own handle when it does', async () => {
+			const sleeper = await startSleeper();
+			const own = windowsProcessTreeTools
+				.snapshot()
+				?.find( ( entry ) => entry.pid === sleeper.pid );
+			expect( own ).toBeDefined();
+			if ( ! own ) {
+				return;
+			}
+			const exited = new Promise( ( resolve ) => sleeper.once( 'exit', resolve ) );
+
+			// One second later than the process really was created: not the same process.
+			expect(
+				windowsProcessTreeTools.end( [
+					{ ...own, createdAt: own.createdAt + BigInt( 10_000_000 ) },
+				] )
+			).toEqual( [] );
+			await new Promise( ( resolve ) => setTimeout( resolve, 500 ) );
+			expect( sleeper.exitCode ).toBeNull();
+			expect( sleeper.signalCode ).toBeNull();
+
+			expect( windowsProcessTreeTools.end( [ own ] ) ).toEqual( [ sleeper.pid ] );
+			await exited;
+		}, 30_000 );
+	} );
 } );
