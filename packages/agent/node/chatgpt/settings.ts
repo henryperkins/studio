@@ -20,6 +20,7 @@ import {
 } from './oauth';
 import type {
 	ChatGptAccountView,
+	ChatGptCredentialStorage,
 	ChatGptSessionSelection,
 	ChatGptSettings,
 	ChatGptSignInOptions,
@@ -74,7 +75,8 @@ type SecureStorage = ChatGptSettings[ 'secureStorage' ];
  * Whether the system keychain can keep sign-ins, as last checked. A check runs
  * the keychain's tool, which a Secret Service may answer with a prompt, so the
  * settings, read every few seconds, never check: the first read that needs the
- * answer does, and after that only an explicit recheck.
+ * answer does, and after that only an explicit recheck, or what a sign-in that
+ * starts learns from its own read of the key.
  */
 const secureStorage: {
 	known?: SecureStorage;
@@ -100,6 +102,13 @@ function checkSecureStorage(): Promise< SecureStorage > {
 		} );
 	secureStorage.checking = checking;
 	return checking;
+}
+
+// What a sign-in's own read of the keychain found stands, over a check still out.
+function learnSecureStorage( answer: SecureStorage ): void {
+	secureStorage.checks++;
+	secureStorage.known = answer;
+	secureStorage.checking = undefined;
 }
 
 function knownSecureStorage(): Promise< SecureStorage > {
@@ -207,13 +216,31 @@ export function startChatGptSignIn(
 		) {
 			throw new ChatGptSettingsError( __( 'Choose how to keep the ChatGPT sign-in.' ) );
 		}
-		// For the settings read after it; the sign-in itself checks what it saves to.
-		void checkSecureStorage();
-		const { attemptId } = await beginChatGptSignIn(
-			registrationId,
-			options as ChatGptSignInOptions
-		);
-		return { attemptId };
+		// The settings read after it learn of the keychain without its tool run
+		// beside the start's own runs, which a Secret Service may each answer
+		// with a prompt: a sign-in kept in the vault checks the key itself, and
+		// what that found is the answer; one kept for this session only asks the
+		// keychain nothing of its own, so it is checked once the start is done.
+		const chosen: { storage?: ChatGptCredentialStorage } = {};
+		try {
+			const { attemptId } = await beginChatGptSignIn(
+				registrationId,
+				options as ChatGptSignInOptions,
+				{
+					storageChosen( storage, keychain ) {
+						chosen.storage = storage;
+						if ( keychain ) {
+							learnSecureStorage( keychain );
+						}
+					},
+				}
+			);
+			return { attemptId };
+		} finally {
+			if ( chosen.storage === 'session' ) {
+				void checkSecureStorage();
+			}
+		}
 	} );
 }
 

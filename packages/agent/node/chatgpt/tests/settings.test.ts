@@ -187,14 +187,34 @@ describe( 'ChatGPT application settings facade', () => {
 		} );
 	} );
 
-	it( 'checks the keychain again when a sign-in starts', async () => {
+	it( 'takes what a secure sign-in’s own read of the key found, without checking the keychain itself', async () => {
 		await recheckChatGptSettings();
 		keychainCheck.mockClear();
-		vi.mocked( beginChatGptSignIn ).mockResolvedValue( { attemptId: ATTEMPT } as never );
+		vi.mocked( beginChatGptSignIn ).mockImplementation( async ( _id, _options, observer ) => {
+			observer?.storageChosen?.( 'vault', 'unavailable' );
+			return { attemptId: ATTEMPT };
+		} );
 
 		await startChatGptSignIn( undefined, { storage: 'vault' } );
 
-		await vi.waitFor( () => expect( keychainCheck ).toHaveBeenCalledTimes( 1 ) );
+		await expect( readChatGptSettings() ).resolves.toMatchObject( {
+			secureStorage: 'unavailable',
+		} );
+		expect( keychainCheck ).not.toHaveBeenCalled();
+	} );
+
+	it( 'checks the keychain once a session-only sign-in has started, and not before', async () => {
+		await recheckChatGptSettings();
+		keychainCheck.mockClear();
+		vi.mocked( beginChatGptSignIn ).mockImplementation( async ( _id, _options, observer ) => {
+			observer?.storageChosen?.( 'session' );
+			expect( keychainCheck ).not.toHaveBeenCalled();
+			return { attemptId: ATTEMPT };
+		} );
+
+		await startChatGptSignIn( undefined, { storage: 'session' } );
+
+		expect( keychainCheck ).toHaveBeenCalledTimes( 1 );
 	} );
 
 	it( 'answers a recheck with ChatGPT turned off without running the keychain’s tool', async () => {
@@ -219,10 +239,11 @@ describe( 'ChatGPT application settings facade', () => {
 		await expect(
 			startChatGptSignIn( ID, { storage: 'session', reconsent: true } )
 		).resolves.toEqual( { attemptId: ATTEMPT } );
-		expect( beginChatGptSignIn ).toHaveBeenCalledWith( ID, {
-			storage: 'session',
-			reconsent: true,
-		} );
+		expect( beginChatGptSignIn ).toHaveBeenCalledWith(
+			ID,
+			{ storage: 'session', reconsent: true },
+			{ storageChosen: expect.any( Function ) }
+		);
 	} );
 
 	it( 'refuses a remote callback host before beginning sign-in', async () => {

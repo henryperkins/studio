@@ -132,7 +132,11 @@ describe( 'ChatGPT desktop IPC boundary', () => {
 		await expect( beginChatGptSignIn( event, ID, { storage: 'session' } ) ).resolves.toEqual( {
 			attemptId: ATTEMPT,
 		} );
-		expect( start ).toHaveBeenCalledExactlyOnceWith( ID, { storage: 'session' } );
+		expect( start ).toHaveBeenCalledExactlyOnceWith(
+			ID,
+			{ storage: 'session' },
+			{ storageChosen: expect.any( Function ) }
+		);
 		vi.mocked( finish ).mockResolvedValueOnce( {
 			ok: true,
 			registrationId: ID,

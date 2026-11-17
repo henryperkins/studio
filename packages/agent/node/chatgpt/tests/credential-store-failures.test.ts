@@ -358,15 +358,16 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 					credentialStore: keychain.store,
 				} );
 
-			await expect( broker().checkVaultKey() ).resolves.toBeUndefined();
+			// False: it didn't ask the keychain.
+			await expect( broker().checkVaultKey() ).resolves.toBe( false );
 			await broker().saveSignIn( signIn( 'session', 1 ) );
-			await expect( broker().checkVaultKey() ).resolves.toBeUndefined();
+			await expect( broker().checkVaultKey() ).resolves.toBe( false );
 
 			expect( keychain.calls ).toHaveLength( 0 );
 
 			await broker().saveSignIn( signIn( 'vault', 2 ) );
 			const callsBefore = keychain.calls.length;
-			await expect( broker().checkVaultKey() ).resolves.toBeUndefined();
+			await expect( broker().checkVaultKey() ).resolves.toBe( true );
 			expect( keychain.calls.length ).toBeGreaterThan( callsBefore );
 			keychain.state.saysNothingSaved = true;
 			await expect( broker().checkVaultKey() ).rejects.toMatchObject( {

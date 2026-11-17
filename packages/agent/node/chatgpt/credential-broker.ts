@@ -217,9 +217,12 @@ export interface ChatGptCredentialBroker {
 	/**
 	 * Before a sign-in that will be kept in the vault: refuses with
 	 * `vault-key-unreadable` when saving it would, because saved records exist
-	 * and the keychain says it has no key for them. Writes nothing.
+	 * and the keychain says it has no key for them, and with `vault-unavailable`
+	 * when it couldn't reach the keychain to ask. Writes nothing. Resolves true
+	 * when it asked the keychain, which answered with the key; false when no
+	 * saved sign-in needed it asked.
 	 */
-	checkVaultKey(): Promise< void >;
+	checkVaultKey(): Promise< boolean >;
 	saveSignIn( signIn: ChatGptSignIn ): Promise< ChatGptAccount >;
 	getAccessToken( connectionId: string ): Promise< string >;
 	/** Drops only the rejected access token, preserving any newer token. */
@@ -758,13 +761,14 @@ export function createChatGptCredentialBroker(
 	// The check `getSealingKey` makes before it would make a key, without making
 	// one. The keychain, and any prompt it shows, is asked only when a saved
 	// sign-in needs the key.
-	async function checkVaultKey(): Promise< void > {
-		if (
-			( await hasSealedRecords() ) &&
-			! ( await readWrappingKeyText( getChatGptVaultKeyAccounts().own ) )
-		) {
+	async function checkVaultKey(): Promise< boolean > {
+		if ( ! ( await hasSealedRecords() ) ) {
+			return false;
+		}
+		if ( ! ( await readWrappingKeyText( getChatGptVaultKeyAccounts().own ) ) ) {
 			throw new ChatGptConnectionError( 'vault-key-unreadable' );
 		}
+		return true;
 	}
 
 	async function removeProfileVaultKey(): Promise<
@@ -1687,8 +1691,11 @@ function getAppBroker(): ChatGptCredentialBroker {
 	return appBroker;
 }
 
-/** Refuses, before a sign-in to keep in the vault, when saving it would for an unreadable key. */
-export function checkChatGptVaultKey(): Promise< void > {
+/**
+ * Refuses, before a sign-in to keep in the vault, when saving it would for an
+ * unreadable key; resolves whether it asked the keychain (see `checkVaultKey`).
+ */
+export function checkChatGptVaultKey(): Promise< boolean > {
 	return getAppBroker().checkVaultKey();
 }
 

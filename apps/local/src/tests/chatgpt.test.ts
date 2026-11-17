@@ -173,7 +173,11 @@ describe( 'ChatGPT HTTP boundary', () => {
 		} );
 		expect( response.status ).toBe( 200 );
 		expect( await response.json() ).toEqual( { attemptId: ATTEMPT } );
-		expect( beginChatGptSignIn ).toHaveBeenCalledExactlyOnceWith( ID, { storage: 'session' } );
+		expect( beginChatGptSignIn ).toHaveBeenCalledExactlyOnceWith(
+			ID,
+			{ storage: 'session' },
+			{ storageChosen: expect.any( Function ) }
+		);
 		vi.mocked( waitForChatGptSignIn ).mockResolvedValueOnce( {
 			ok: true,
 			registrationId: ID,
