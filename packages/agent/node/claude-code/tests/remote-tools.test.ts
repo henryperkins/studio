@@ -847,7 +847,7 @@ describe( 'site_pull on the Claude route', () => {
 		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
 		expect( request.operation ).toMatchObject( {
 			tool: 'sync.pull',
-			operationClass: 'remote-overwrite',
+			operationClass: 'local-overwrite',
 			args: [
 				{
 					direction: 'pull',
@@ -857,6 +857,15 @@ describe( 'site_pull on the Claude route', () => {
 			],
 			localPaths: [ site ],
 			remote: PRODUCTION_LABEL,
+		} );
+		// A pull changes local work, and its approval's headline says so, as
+		// does the entry the call itself is journaled with.
+		expect( request.operation.description ).toMatch(
+			/^Change or delete local work: sync\.pull\. /
+		);
+		expect( journal[ 0 ] ).toMatchObject( {
+			operation: { tool: 'site_pull', operationClass: 'local-overwrite' },
+			description: 'Change or delete local work: site_pull',
 		} );
 		// The approval and the journal entry say which site, with which options
 		// and what they replace here, and what an interrupted pull may leave.

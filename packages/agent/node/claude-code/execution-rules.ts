@@ -967,12 +967,12 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		// checked again immediately before the command, with only the options the
 		// command takes. The user approves it, seeing the direction, the site and
 		// what it overwrites in the local site, and it is journaled before it
-		// runs. Only the CLI's default engine runs: the Reprint engine keeps its
-		// state outside Studio's configuration folder, so the host refuses it.
-		// Its module links `tools/utils.ts`, whose `runWpCli` runs only through
-		// the host.
+		// runs. It changes local work, so its class is a local one. Only the
+		// CLI's default engine runs: the Reprint engine keeps its state outside
+		// Studio's configuration folder, so the host refuses it. Its module
+		// links `tools/utils.ts`, whose `runWpCli` runs only through the host.
 		qualified(
-			onSite( 'remote-overwrite', { approval: 'host' } ),
+			onSite( 'local-overwrite', { approval: 'host' } ),
 			using( { ...LOCAL_SITE_HOST_CHANNELS, reachesWpcom: [ 'host' ] } )
 		),
 	],
@@ -1505,7 +1505,9 @@ export const HOST_OPERATION_CLASSES: Readonly<
 	'previews.update': 'remote-overwrite',
 	'previews.delete': 'remote-overwrite',
 	'sync.push': 'remote-overwrite',
-	'sync.pull': 'remote-overwrite',
+	// A pull reads a WordPress.com site and changes local work: the site's files
+	// and database.
+	'sync.pull': 'local-overwrite',
 	// Attachments for images the same call writes, and their completion or
 	// removal; the guarded host lets a call complete or remove only those it
 	// reserved itself.
