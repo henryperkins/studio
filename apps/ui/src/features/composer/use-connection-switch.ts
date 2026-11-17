@@ -30,7 +30,11 @@ export function useConnectionSwitch(
 	const [ error, setError ] = useState( '' );
 	const saving = useRef( false );
 	const created = useRef< AiSessionSummary | null >( null );
-	const started = useRef< AiSessionSummary | null >( null );
+	// The session the last start of the site's new chat created and couldn't
+	// finish, with the account it was put on, once that was saved.
+	const started = useRef< { summary: AiSessionSummary; pinned?: ChatGptSessionSelection } | null >(
+		null
+	);
 	const mounted = useRef( true );
 	useEffect( () => {
 		mounted.current = true;
@@ -108,14 +112,35 @@ export function useConnectionSwitch(
 		if ( ! onSwitchSession || saving.current ) return;
 		saving.current = true;
 		setStarting( true );
+		const pin = async ( start: NonNullable< typeof started.current > ) => {
+			await connector.setSessionChatGptSelection( start.summary.id, selection );
+			start.pinned = selection;
+		};
 		try {
-			// One the last attempt made and couldn't put on the account, if any.
-			const summary = started.current ?? ( await connector.createSession( ownerSiteId ) );
-			started.current = summary;
-			// Once the composer is gone, what was typed stays on the new chat.
-			if ( ! mounted.current ) return;
-			await connector.setSessionChatGptSelection( summary.id, selection );
-			if ( ! mounted.current ) return;
+			// Each step stops once the composer is gone, leaving what was typed on the new chat.
+			let start = started.current;
+			if ( start ) {
+				try {
+					await pin( start );
+				} catch ( failure ) {
+					// On another account already, which the backend refuses as needing a
+					// new chat: this attempt starts one instead, once.
+					const elsewhere =
+						start.pinned &&
+						( start.pinned.connectionId !== selection.connectionId ||
+							start.pinned.revision !== selection.revision );
+					if ( ! elsewhere ) throw failure;
+					start = started.current = null;
+				}
+				if ( ! mounted.current ) return;
+			}
+			if ( ! start ) {
+				start = started.current = { summary: await connector.createSession( ownerSiteId ) };
+				if ( ! mounted.current ) return;
+				await pin( start );
+				if ( ! mounted.current ) return;
+			}
+			const { summary } = start;
 			if ( draft.environment === 'live' ) {
 				await connector.setSessionEnvironment( summary.id, 'live' );
 				if ( ! mounted.current ) return;

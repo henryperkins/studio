@@ -1089,6 +1089,101 @@ describe( 'Starting the site’s new chat on ChatGPT', () => {
 		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
 	} );
 
+	const LIVE_FAILED = 'Studio couldn’t switch this chat to the live site. Try again.';
+	const toastSays = ( text: string ) =>
+		waitFor( () =>
+			expect( getVisibleToasts().some( ( toast ) => toast.title.includes( text ) ) ).toBe( true )
+		);
+	const pinnedTo = ( connector: FakeConnector, id: string ) =>
+		readChatGptSessionSelection(
+			connector.state.sessions.find( ( session ) => session.summary.id === id )!.entries
+		)?.connectionId;
+	// The backend's rule: a chat on one ChatGPT account can't move to another.
+	function refuseAnotherAccount( connector: FakeConnector ) {
+		const persist = connector.setSessionChatGptSelection.getMockImplementation()!;
+		connector.setSessionChatGptSelection.mockImplementation( async ( id, selection ) => {
+			const pinned = pinnedTo( connector, id );
+			if ( pinned && pinned !== selection.connectionId ) {
+				throw new Error( 'Start a new chat to change the ChatGPT account or billing connection.' );
+			}
+			return persist( id, selection );
+		} );
+		return persist;
+	}
+
+	it( 'finishes a start whose environment wasn’t saved on the same session when the same account is chosen again', async () => {
+		const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new', true );
+		refuseAnotherAccount( connector );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		connector.setSessionEnvironment.mockRejectedValueOnce( new Error( LIVE_FAILED ) );
+		await chooseChatGpt( WORK );
+		await toastSays( LIVE_FAILED );
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+		expect( screen.queryByText( `ChatGPT plan · ${ WORK }` ) ).not.toBeInTheDocument();
+
+		await chooseChatGpt( WORK );
+		expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+		const { id } = await connector.createSession.mock.results[ 0 ].value;
+		expect( connector.setSessionEnvironment ).toHaveBeenCalledTimes( 2 );
+		expect( connector.setSessionEnvironment ).toHaveBeenLastCalledWith( id, 'live' );
+		expect( pinnedTo( connector, id ) ).toBe( B );
+		expect( runs ).toHaveLength( 0 );
+	} );
+
+	it( 'starts one fresh session when the backend refuses the remembered one, already on another account', async () => {
+		const { connector, history } = await setup( [], false, TEST_USER, '/sites/one/new', true );
+		refuseAnotherAccount( connector );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		connector.setSessionEnvironment.mockRejectedValueOnce( new Error( LIVE_FAILED ) );
+		await chooseChatGpt( WORK );
+		await toastSays( LIVE_FAILED );
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+		const { id: first } = await connector.createSession.mock.results[ 0 ].value;
+
+		await chooseChatGpt( PERSONAL );
+		expect( await screen.findByText( `ChatGPT plan · ${ PERSONAL }` ) ).toBeVisible();
+		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 2 );
+		const { id: second } = await connector.createSession.mock.results[ 1 ].value;
+		expect( history.location.pathname ).toBe( `/sessions/${ second }` );
+		expect( pinnedTo( connector, second ) ).toBe( A );
+		expect( pinnedTo( connector, first ) ).toBe( B );
+		expect( connector.setSessionEnvironment ).toHaveBeenLastCalledWith( second, 'live' );
+	} );
+
+	it( 'starts at most one fresh session an attempt, and retries on it', async () => {
+		const { connector } = await setup( [], false, TEST_USER, '/sites/one/new', true );
+		const persist = refuseAnotherAccount( connector );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		connector.setSessionEnvironment.mockRejectedValueOnce( new Error( LIVE_FAILED ) );
+		await chooseChatGpt( WORK );
+		await toastSays( LIVE_FAILED );
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+
+		const refuse = connector.setSessionChatGptSelection.getMockImplementation()!;
+		let freshFails = 1;
+		connector.setSessionChatGptSelection.mockImplementation( async ( id, selection ) => {
+			if ( ! pinnedTo( connector, id ) && freshFails-- > 0 ) {
+				throw new Error( 'Studio couldn’t save the model for this chat. Try again.' );
+			}
+			return refuse( id, selection );
+		} );
+		await chooseChatGpt( PERSONAL );
+		await toastSays( 'Studio couldn’t save the model for this chat. Try again.' );
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 2 );
+		expect( input() ).toHaveValue( 'Unsent idea' );
+
+		connector.setSessionChatGptSelection.mockImplementation( persist );
+		await chooseChatGpt( PERSONAL );
+		expect( await screen.findByText( `ChatGPT plan · ${ PERSONAL }` ) ).toBeVisible();
+		expect( connector.createSession ).toHaveBeenCalledTimes( 2 );
+		const { id: second } = await connector.createSession.mock.results[ 1 ].value;
+		expect( pinnedTo( connector, second ) ).toBe( A );
+	} );
+
 	it( 'keeps the Model control busy while the start is pending, so the account it shows is the one pinned', async () => {
 		const { connector } = await setup( [], false, TEST_USER, '/sites/one/new' );
 		const gate = holdNext( connector, 'setSessionChatGptSelection' );
