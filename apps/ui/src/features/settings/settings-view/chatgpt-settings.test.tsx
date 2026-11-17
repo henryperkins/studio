@@ -44,6 +44,10 @@ const READ_FAILURES = [
 	},
 ];
 
+// The whole text, where `toHaveTextContent` with a string matches any part of it.
+const exactly = ( text: string ) =>
+	new RegExp( `^${ text.replace( /[.*+?^${}()|[\]\\]/g, '\\$&' ) }$` );
+
 // As Studio saves them: labelled with the email, a second registration of it numbered.
 const EMAIL = 'same@example.test';
 const SECOND = 'same@example.test (2)';
@@ -265,7 +269,7 @@ describe( 'ChatGPT account settings', () => {
 		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
 		const select = within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } );
 
-		expect( select ).toHaveTextContent( EMAIL );
+		expect( select ).toHaveTextContent( exactly( EMAIL ) );
 		expect( within( group ).getAllByText( EMAIL ) ).toHaveLength( 1 );
 		expect( group ).not.toHaveTextContent( ACCOUNT_A.slice( 0, 8 ) );
 		fireEvent.click( select );
@@ -279,7 +283,7 @@ describe( 'ChatGPT account settings', () => {
 
 		expect(
 			within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
-		).toHaveTextContent( 'Work' );
+		).toHaveTextContent( exactly( 'Work' ) );
 		expect( within( group ).getByText( EMAIL ) ).toBeVisible();
 	} );
 
@@ -288,7 +292,7 @@ describe( 'ChatGPT account settings', () => {
 		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
 		const select = within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } );
 
-		expect( select ).toHaveTextContent( `${ EMAIL } · ${ ACCOUNT_A.slice( 0, 8 ) }` );
+		expect( select ).toHaveTextContent( exactly( `${ EMAIL } · ${ ACCOUNT_A.slice( 0, 8 ) }` ) );
 		fireEvent.click( select );
 		expect(
 			await screen.findByRole( 'option', { name: `${ EMAIL } · ${ ACCOUNT_B.slice( 0, 8 ) }` } )

@@ -299,7 +299,8 @@ describe( 'ChatGPT chats', () => {
 			const row = within( work ).getByRole( 'option' );
 			expect( within( work ).getAllByRole( 'option' ) ).toHaveLength( 1 );
 			expect( row ).toHaveTextContent( 'Sign in to this ChatGPT account in Settings' );
-			expect( row ).toHaveTextContent( badge );
+			// First, so a narrow picker cuts the instruction rather than the state.
+			expect( row ).toHaveTextContent( new RegExp( `^${ badge }` ) );
 			expect( row ).toHaveAttribute( 'aria-disabled', 'true' );
 			fireEvent.click( row );
 			fireEvent.keyDown( screen.getByRole( 'listbox', { name: 'Choose a model' } ), {
