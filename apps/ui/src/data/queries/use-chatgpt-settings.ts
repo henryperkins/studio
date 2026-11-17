@@ -48,6 +48,27 @@ export function useChatGptAccountToOpen(): string | undefined {
 	return connectionId;
 }
 
+/**
+ * A saved ChatGPT account as the UI names it: by its label, which is its email
+ * unless the sign-in gave another, and by the start of its id as well only when
+ * another saved account has the same label.
+ */
+export function nameChatGptAccount(
+	account: ChatGptAccountView,
+	accounts: ChatGptAccountView[]
+): string {
+	return accounts.some(
+		( other ) => other.connectionId !== account.connectionId && other.label === account.label
+	)
+		? sprintf(
+				/* translators: 1: a ChatGPT account's name, 2: the start of its id, telling it apart from another account of the same name. */
+				__( '%1$s · %2$s' ),
+				account.label,
+				account.connectionId.slice( 0, 8 )
+		  )
+		: account.label;
+}
+
 /** Why the last read of the ChatGPT accounts failed, as Settings and the composer say it. */
 export function describeChatGptSettingsError( error: Error | null ): string {
 	return sprintf(

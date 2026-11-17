@@ -17,7 +17,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { toast } from '@/data/app-messages';
-import { useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
+import { nameChatGptAccount, useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
 import { useImageService } from '@/data/queries/use-image-service';
 import { useIsOutOfAiCredits } from '@/data/queries/use-is-out-of-ai-credits';
 import { useSaveUserPreferences, useUserPreferences } from '@/data/queries/use-user-preferences';
@@ -230,12 +230,17 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 			? getAiModelLabel( chatGptModel )
 			: chatGptModel || __( 'ChatGPT model unavailable' )
 		: undefined;
-	const chatGptLabel = chatGpt
+	const chatGptAccountName = chatGpt
 		? chatGpt.account
-			? `${ chatGpt.account.label } · ${
-					chatGpt.account.email ?? chatGpt.account.connectionId.slice( 0, 8 )
-			  } · ${ chatGpt.account.connectionId.slice( 0, 8 ) }`
+			? nameChatGptAccount( chatGpt.account, chatGptSettings?.accounts ?? [] )
 			: chatGpt.selection?.connectionId.slice( 0, 8 ) || __( 'Account unavailable' )
+		: undefined;
+	const chatGptConnection = chatGptAccountName
+		? sprintf(
+				/* translators: %s: the ChatGPT account a chat runs on. */
+				__( 'ChatGPT plan · %s' ),
+				chatGptAccountName
+		  )
 		: undefined;
 	const isWpcom = sessionProvider === 'wpcom';
 	const isOutOfCredits = useIsOutOfAiCredits() && isWpcom;
@@ -404,7 +409,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 			connectionSwitch.request( {
 				provider: 'chatgpt-oauth',
 				selection,
-				label: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
+				label: nameChatGptAccount( account, chatGptAccounts ),
 			} );
 		}
 	};
@@ -686,7 +691,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 									onChange={ changeModel }
 									onAddCredits={ openAddCredits }
 									chatGptAccounts={ chatGptAccounts }
-									chatGptLabel={ chatGptLabel }
+									chatGptConnection={ chatGptConnection }
 									chatGptModel={ chatGptModelLabel }
 									chatGptModelId={ chatGptModel }
 									chatGptConnectionId={ chatGpt?.selection?.connectionId }
@@ -734,12 +739,12 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 					</div>
 					{ chatGpt ? (
 						<div className={ styles.connectionLabel }>
-							{ __( 'ChatGPT plan' ) } · { chatGptLabel }
+							{ chatGptConnection }
 							{ imageService ? (
 								<ImageServiceNote
 									className={ styles.imageServiceNote }
 									state={ imageService }
-									subscription={ __( 'ChatGPT plan' ) }
+									plan="chatgpt"
 									onSetUp={ () => openSettings( 'ai' ) }
 								/>
 							) : null }

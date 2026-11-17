@@ -11,7 +11,7 @@ import { InfoIcon, PlugIcon, SparklesIcon } from 'lucide-react';
 import { useRef, useState, type RefObject, ComponentType } from 'react';
 import { useConnector } from '@/data/core';
 import { useStudioAssistantQuota } from '@/data/queries/use-assistant-quota';
-import { CHATGPT_MODELS_QUERY_KEY } from '@/data/queries/use-chatgpt-settings';
+import { CHATGPT_MODELS_QUERY_KEY, nameChatGptAccount } from '@/data/queries/use-chatgpt-settings';
 import { useUserPreferences } from '@/data/queries/use-user-preferences';
 import { useOpenSettings } from '@/data/use-open-settings';
 import { getCreditsLabel, getModelDescription } from '@/features/composer/model-options';
@@ -43,7 +43,8 @@ interface ModelPickerProps {
 	onChange: ( provider: AiProviderId, model: AiModelId ) => void;
 	onAddCredits: ( returnFocus: RefObject< HTMLElement | null > ) => void;
 	chatGptAccounts?: ChatGptAccountView[];
-	chatGptLabel?: string;
+	// A ChatGPT chat's plan and account, which the Model button says in place of its provider.
+	chatGptConnection?: string;
 	chatGptModel?: string;
 	chatGptModelId?: string;
 	chatGptConnectionId?: string;
@@ -62,7 +63,7 @@ export function ModelPicker( {
 	onChange,
 	onAddCredits,
 	chatGptAccounts = [],
-	chatGptLabel,
+	chatGptConnection,
 	chatGptModel,
 	chatGptModelId,
 	chatGptConnectionId,
@@ -99,11 +100,12 @@ export function ModelPicker( {
 		credits.hasCredits &&
 		getStudioCodeAiAccessState( quota ) === 'available' &&
 		quota.hasPaymentMethod;
-	const modelDetails = [ modelLabel, AI_PROVIDER_LABELS[ sessionProvider ] ];
-	if ( chatGptLabel ) modelDetails.push( chatGptLabel, __( 'ChatGPT plan' ) );
+	const modelDetails = [ modelLabel, chatGptConnection ?? AI_PROVIDER_LABELS[ sessionProvider ] ];
 	if ( isWpcom ) {
 		modelDetails.push( credits.label );
 	}
+	const accountName = ( account: ChatGptAccountView ) =>
+		nameChatGptAccount( account, chatGptAccounts );
 	const chatGptCommands = chatGptAccounts.flatMap( ( account, index ) =>
 		( catalogs[ index ].data?.models ?? [] ).map( ( item ) => ( {
 			value: `chatgpt:${ account.connectionId }:${ item.id }`,
@@ -154,7 +156,7 @@ export function ModelPicker( {
 					.map( ( command ) => ( {
 						value: command.value,
 						label: command.model.label,
-						description: `${ __( 'ChatGPT plan' ) } · ${ account.email ?? account.label }`,
+						description: __( 'ChatGPT plan' ),
 						icon: SparklesIcon,
 					} ) )
 			: [
@@ -177,7 +179,7 @@ export function ModelPicker( {
 			? [
 					{
 						connectionId: account.connectionId,
-						heading: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
+						heading: accountName( account ),
 					},
 			  ]
 			: []
@@ -212,8 +214,12 @@ export function ModelPicker( {
 		},
 		...chatGptAccounts.map(
 			( account, index ): CommandGroup => ( {
-				label: `ChatGPT · ${ account.label } · ${ account.connectionId }`,
-				heading: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
+				label: sprintf(
+					/* translators: %s: the ChatGPT account a chat runs on. */
+					__( 'ChatGPT plan · %s' ),
+					accountName( account )
+				),
+				heading: accountName( account ),
 				items: chatGptAccountItems( account, index ),
 			} )
 		),

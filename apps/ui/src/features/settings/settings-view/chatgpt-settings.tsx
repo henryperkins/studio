@@ -5,6 +5,7 @@ import { useConnector } from '@/data/core';
 import {
 	describeChatGptSettingsError,
 	holdChatGptConnection,
+	nameChatGptAccount,
 	refreshChatGptSettings,
 	useChatGptAccountToOpen,
 	useChatGptModels,
@@ -234,8 +235,11 @@ export function ChatGptSettingsGroup() {
 				<SettingsRow
 					title={ __( 'Saved ChatGPT account' ) }
 					description={
+						// The list names an account by its label, which is usually its email already.
 						account
-							? `${ account.email ?? account.label } · ${ account.connectionId.slice( 0, 8 ) }`
+							? account.email !== account.label
+								? account.email
+								: undefined
 							: __( 'Choose a saved account.' )
 					}
 					additionalContent={
@@ -257,7 +261,7 @@ export function ChatGptSettingsGroup() {
 						disabled={ busy }
 						options={ accounts.map( ( item ) => ( {
 							value: item.connectionId,
-							label: `${ item.label } · ${ item.connectionId.slice( 0, 8 ) }`,
+							label: nameChatGptAccount( item, accounts ),
 						} ) ) }
 						onChange={ ( id ) => {
 							setSelectedId( id );
@@ -370,7 +374,7 @@ export function ChatGptSettingsGroup() {
 					</Button>
 				</SettingsRow>
 			) : null }
-			<ImageServiceSettingsRow subscription={ __( 'ChatGPT plan' ) } />
+			<ImageServiceSettingsRow plan="chatgpt" />
 		</SettingsGroup>
 	);
 }

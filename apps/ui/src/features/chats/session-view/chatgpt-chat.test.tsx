@@ -32,15 +32,18 @@ const pin = ( data: StudioSessionContextData ): SessionEntry => ( {
 	customType: 'studio.session_context',
 	data: { provider: 'chatgpt-oauth', ...data },
 } );
+// As Studio saves them: an account's label is its email.
+const PERSONAL = 'personal@example.test';
+const WORK = 'work@example.test';
 const account = ( connectionId: string, label: string ): ChatGptAccountView => ( {
 	connectionId,
 	providerId: 'chatgpt-oauth',
 	backend: 'pi',
 	revision: 1,
-	identity: { subject: connectionId, email: 'same@example.test' },
+	identity: { verified: true, email: label },
 	authStatus: 'connected',
 	label,
-	email: 'same@example.test',
+	email: label,
 	state: 'signed-in',
 	storage: 'vault',
 } );
@@ -66,7 +69,7 @@ async function setup(
 				enabled: true,
 				signInSupported: true,
 				secureStorage: 'available',
-				accounts: [ account( A, 'Personal' ), account( B, 'Work' ) ],
+				accounts: [ account( A, PERSONAL ), account( B, WORK ) ],
 			},
 			sessions: [
 				{
@@ -134,9 +137,9 @@ async function chooseEffort( label: string ) {
 		)
 	);
 }
-async function chooseChatGpt( label = 'Personal', model = 'GPT-6 Luna' ) {
+async function chooseChatGpt( label = PERSONAL, model = 'GPT-6 Luna' ) {
 	fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
-	const group = await screen.findByRole( 'group', { name: new RegExp( `ChatGPT · ${ label }` ) } );
+	const group = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ label }` } );
 	fireEvent.click( await within( group ).findByRole( 'option', { name: new RegExp( model ) } ) );
 }
 function send( text = 'New request' ) {
@@ -151,7 +154,7 @@ describe( 'ChatGPT chats', () => {
 		expect( screen.getByRole( 'button', { name: 'Model' } ) ).toHaveAccessibleDescription(
 			/ChatGPT plan/
 		);
-		expect( screen.getByText( /ChatGPT plan · Personal/ ) ).toHaveTextContent( A.slice( 0, 8 ) );
+		expect( screen.getByText( `ChatGPT plan · ${ PERSONAL }` ) ).toBeVisible();
 		fireEvent.click( reasoning() );
 		expect( screen.queryByRole( 'group', { name: 'Mode' } ) ).not.toBeInTheDocument();
 		fireEvent.click(
@@ -175,7 +178,7 @@ describe( 'ChatGPT chats', () => {
 				'Images: WordPress.com image service as Test User, not your ChatGPT plan'
 			)
 		).toBeVisible();
-		expect( screen.getByText( /ChatGPT plan · Personal/ ) ).toHaveTextContent( A.slice( 0, 8 ) );
+		expect( screen.getByText( `ChatGPT plan · ${ PERSONAL }` ) ).toBeVisible();
 	} );
 
 	it( 'says images are off without the image service, and opens where to set it up', async () => {
@@ -210,16 +213,17 @@ describe( 'ChatGPT chats', () => {
 		await act( () => queryClient.resetQueries( { queryKey: CHATGPT_MODELS_QUERY_KEY } ) );
 
 		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
-		const personal = await screen.findByRole( 'group', { name: /ChatGPT · Personal/ } );
-		const work = await screen.findByRole( 'group', { name: /ChatGPT · Work/ } );
+		const personal = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ PERSONAL }` } );
+		const work = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ WORK }` } );
 		const sentence = 'Some models this account offers aren’t supported in Studio yet';
 		await waitFor( () => expect( screen.getAllByRole( 'note' ) ).toHaveLength( 2 ) );
 		const notes = screen.getAllByRole( 'note' );
 
 		expect( notes ).toHaveLength( 2 );
 		notes.forEach( ( note ) => expect( note ).toHaveTextContent( sentence ) );
-		expect( notes[ 0 ] ).toHaveTextContent( /Personal/ );
-		expect( notes[ 1 ] ).toHaveTextContent( /Work/ );
+		expect( notes[ 0 ] ).toHaveTextContent( PERSONAL );
+		expect( notes[ 1 ] ).toHaveTextContent( WORK );
+		notes.forEach( ( note ) => expect( note ).not.toHaveTextContent( /f84d75a0|1c8e270b/ ) );
 		expect( screen.queryByRole( 'option', { name: /aren’t supported/ } ) ).not.toBeInTheDocument();
 		expect( within( personal ).getAllByRole( 'option' ) ).toHaveLength( 1 );
 		expect( within( work ).getAllByRole( 'option' ) ).toHaveLength( 1 );
@@ -232,10 +236,46 @@ describe( 'ChatGPT chats', () => {
 		await setup();
 
 		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
-		const personal = await screen.findByRole( 'group', { name: /ChatGPT · Personal/ } );
+		const personal = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ PERSONAL }` } );
 
 		expect( await within( personal ).findByRole( 'option', { name: /GPT-6 Luna/ } ) ).toBeVisible();
 		expect( screen.queryByRole( 'note' ) ).not.toBeInTheDocument();
+	} );
+
+	it( 'names the chat’s account once, by its label, and its plan once on the Model button', async () => {
+		await setup();
+		const model = screen.getByRole( 'button', { name: 'Model' } );
+
+		expect( model ).toHaveAccessibleDescription( `GPT-6 Luna · ChatGPT plan · ${ PERSONAL }` );
+		expect( screen.getByText( `ChatGPT plan · ${ PERSONAL }` ) ).not.toHaveTextContent(
+			A.slice( 0, 8 )
+		);
+		fireEvent.click( model );
+		const personal = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ PERSONAL }` } );
+		const option = await within( personal ).findByRole( 'option', { name: /GPT-6 Luna/ } );
+		expect( within( personal ).getByText( PERSONAL ) ).toBeVisible();
+		expect( option ).toHaveTextContent( /ChatGPT plan/ );
+		expect( option ).not.toHaveTextContent( PERSONAL );
+	} );
+
+	it( 'tells two accounts of the same label apart by the start of their ids', async () => {
+		const { connector, queryClient } = await setup();
+		connector.state.chatGpt.accounts = [ account( A, PERSONAL ), account( B, PERSONAL ) ];
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+		expect(
+			await screen.findByText( `ChatGPT plan · ${ PERSONAL } · ${ A.slice( 0, 8 ) }` )
+		).toBeVisible();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+		expect(
+			await screen.findByRole( 'group', {
+				name: `ChatGPT plan · ${ PERSONAL } · ${ A.slice( 0, 8 ) }`,
+			} )
+		).toBeVisible();
+		expect(
+			screen.getByRole( 'group', { name: `ChatGPT plan · ${ PERSONAL } · ${ B.slice( 0, 8 ) }` } )
+		).toBeVisible();
+		expect( screen.queryByRole( 'group', { name: new RegExp( A ) } ) ).not.toBeInTheDocument();
 	} );
 
 	it( 'sends attached images and documents with the turn on the pinned ChatGPT selection', async () => {
@@ -381,7 +421,7 @@ describe( 'ChatGPT chats', () => {
 						name: /GPT-6 Luna/,
 					} )
 				);
-			} else await chooseChatGpt( direction === 'between-accounts' ? 'Work' : 'Personal' );
+			} else await chooseChatGpt( direction === 'between-accounts' ? WORK : PERSONAL );
 			const dialog = await screen.findByRole( 'dialog', { name: 'Start a new chat?' } );
 			expect( connector.createSession ).not.toHaveBeenCalled();
 			expect(
@@ -421,8 +461,11 @@ describe( 'ChatGPT chats', () => {
 	it( 'carries only an explicitly entered summary into the new composer', async () => {
 		await setup();
 		fireEvent.change( input(), { target: { value: 'Private draft' } } );
-		await chooseChatGpt( 'Work' );
+		await chooseChatGpt( WORK );
 		const dialog = await screen.findByRole( 'dialog', { name: 'Start a new chat?' } );
+		expect(
+			within( dialog ).getByText( `ChatGPT plan · ${ WORK } · GPT-6 Luna · Medium` )
+		).toBeVisible();
 		fireEvent.change(
 			within( dialog ).getByRole( 'textbox', { name: 'Context summary (optional)' } ),
 			{ target: { value: 'Reviewed context' } }
@@ -464,7 +507,7 @@ describe( 'ChatGPT chats', () => {
 		connector.setSessionChatGptSelection.mockRejectedValueOnce(
 			new Error( 'The account signed out.' )
 		);
-		await chooseChatGpt( 'Work' );
+		await chooseChatGpt( WORK );
 		fireEvent.click(
 			within( await screen.findByRole( 'dialog', { name: 'Start a new chat?' } ) ).getByRole(
 				'button',
@@ -591,7 +634,7 @@ describe( 'ChatGPT chats', () => {
 				pin( { ...INITIAL, connectionId: B } ),
 			] );
 			connector.state.chatGpt.accounts[ 1 ] = {
-				...account( B, 'Work' ),
+				...account( B, WORK ),
 				authStatus: 'disconnected',
 				state,
 			};
@@ -608,7 +651,7 @@ describe( 'ChatGPT chats', () => {
 			const group = await within( dialog ).findByRole( 'group', { name: 'ChatGPT plan' } );
 			expect(
 				within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
-			).toHaveTextContent( 'Work' );
+			).toHaveTextContent( WORK );
 			const signIn = within( group ).getByRole( 'button', { name: 'Sign in again' } );
 			expect( signIn ).toHaveAttribute( 'data-variant', 'accent' );
 			expect( within( group ).getByRole( 'button', { name: 'Add account' } ) ).toHaveAttribute(
@@ -629,7 +672,7 @@ describe( 'ChatGPT chats', () => {
 
 	it( 'keeps saying a new chat is needed once the connection has changed, and opens Settings on the chat’s account', async () => {
 		const { connector, queryClient } = await setup( [ pin( { ...INITIAL, connectionId: B } ) ] );
-		connector.state.chatGpt.accounts[ 1 ] = { ...account( B, 'Work' ), revision: 2 };
+		connector.state.chatGpt.accounts[ 1 ] = { ...account( B, WORK ), revision: 2 };
 		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
 
 		expect(
@@ -643,7 +686,7 @@ describe( 'ChatGPT chats', () => {
 		const group = await within( dialog ).findByRole( 'group', { name: 'ChatGPT plan' } );
 		expect(
 			within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
-		).toHaveTextContent( 'Work' );
+		).toHaveTextContent( WORK );
 		expect( within( group ).getByRole( 'button', { name: 'Add account' } ) ).toHaveAttribute(
 			'data-variant',
 			'accent'
@@ -657,7 +700,7 @@ describe( 'ChatGPT chats', () => {
 		send( 'Queued private request' );
 		await screen.findByText( 'Queued private request' );
 		connector.state.chatGpt.accounts[ 0 ] = {
-			...account( A, 'Personal' ),
+			...account( A, PERSONAL ),
 			authStatus: 'disconnected',
 			state: 'signed-out',
 		};

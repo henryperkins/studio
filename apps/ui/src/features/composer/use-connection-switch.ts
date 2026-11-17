@@ -2,7 +2,7 @@ import { getAiModelLabel, isAiModelId } from '@studio/agent/protocol/models';
 import { getOpenAiReasoningEffortLabel } from '@studio/agent/protocol/openai-models';
 import { AI_PROVIDER_LABELS } from '@studio/agent/protocol/providers';
 import { useQueryClient } from '@tanstack/react-query';
-import { __ } from '@wordpress/i18n';
+import { __, sprintf } from '@wordpress/i18n';
 import { useEffect, useRef, useState } from 'react';
 import { useConnector } from '@/data/core';
 import { primeSessionQueryData, SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
@@ -90,13 +90,22 @@ export function useConnectionSwitch(
 		},
 		target:
 			target?.provider === 'chatgpt-oauth'
-				? `${ __( 'ChatGPT plan' ) } · ${ target.label } · ${
+				? sprintf(
+						/* translators: 1: a ChatGPT account, 2: a model, 3: its reasoning effort, e.g. "Medium". */
+						__( 'ChatGPT plan · %1$s · %2$s · %3$s' ),
+						target.label,
 						isAiModelId( target.selection.model )
 							? getAiModelLabel( target.selection.model )
-							: target.selection.model
-				  } · ${ getOpenAiReasoningEffortLabel( target.selection.reasoningEffort ) }`
+							: target.selection.model,
+						getOpenAiReasoningEffortLabel( target.selection.reasoningEffort )
+				  )
 				: target
-				? `${ AI_PROVIDER_LABELS[ target.provider ] } · ${ getAiModelLabel( target.model ) }`
+				? sprintf(
+						/* translators: 1: the model's provider, 2: the model. */
+						__( '%1$s · %2$s' ),
+						AI_PROVIDER_LABELS[ target.provider ],
+						getAiModelLabel( target.model )
+				  )
 				: undefined,
 	};
 }

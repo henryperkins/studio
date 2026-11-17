@@ -14,16 +14,20 @@ const ACCOUNT_A = 'f84d75a0-4e60-4168-a1ab-3134542c637a';
 const ACCOUNT_B = '1c8e270b-9b5c-4687-b989-de052014b9e8';
 const ATTEMPT = 'b69a1ddf-d1a2-4ff6-b293-75c358ff42df';
 
-function account( connectionId = ACCOUNT_A, label = 'Personal' ): ChatGptAccountView {
+// As Studio saves them: labelled with the email, a second registration of it numbered.
+const EMAIL = 'same@example.test';
+const SECOND = 'same@example.test (2)';
+
+function account( connectionId = ACCOUNT_A, label = EMAIL ): ChatGptAccountView {
 	return {
 		connectionId,
 		providerId: 'chatgpt-oauth',
 		backend: 'pi',
 		revision: 1,
-		identity: { subject: connectionId, email: 'same@example.test' },
+		identity: { verified: true, email: EMAIL },
 		authStatus: 'connected',
 		label,
-		email: 'same@example.test',
+		email: EMAIL,
 		storage: 'vault',
 		state: 'signed-in',
 	};
@@ -109,7 +113,7 @@ describe( 'ChatGPT account settings', () => {
 			);
 			expect( await screen.findByText( 'Access was not granted.' ) ).toBeVisible();
 			expect( screen.getByRole( 'combobox', { name: 'Saved ChatGPT account' } ) ).toHaveTextContent(
-				'Personal'
+				EMAIL
 			);
 			expect( screen.getByText( 'Connected' ) ).toBeVisible();
 			expect( connector.signOutChatGpt ).not.toHaveBeenCalled();
@@ -118,10 +122,10 @@ describe( 'ChatGPT account settings', () => {
 
 	it( 'selects registrations with the same email, reauthenticates and signs out only the selected one', async () => {
 		const { connector, outcome } = await openSettings( {
-			accounts: [ account(), account( ACCOUNT_B, 'Work' ) ],
+			accounts: [ account(), account( ACCOUNT_B, SECOND ) ],
 		} );
 		fireEvent.click( await screen.findByRole( 'combobox', { name: 'Saved ChatGPT account' } ) );
-		const option = await screen.findByRole( 'option', { name: /Work/ } );
+		const option = await screen.findByRole( 'option', { name: SECOND } );
 		fireEvent.pointerDown( option, { pointerType: 'mouse' } );
 		fireEvent.click( option );
 		fireEvent.click( screen.getByRole( 'button', { name: 'Sign in again' } ) );
@@ -132,8 +136,8 @@ describe( 'ChatGPT account settings', () => {
 			outcome.resolve( {
 				ok: true,
 				registrationId: ACCOUNT_B,
-				label: 'Work',
-				email: 'same@example.test',
+				label: SECOND,
+				email: EMAIL,
 			} )
 		);
 		fireEvent.click( await screen.findByRole( 'button', { name: 'Sign out' } ) );
@@ -142,6 +146,41 @@ describe( 'ChatGPT account settings', () => {
 		);
 		expect( await screen.findByText( /Remote revocation confirmed/ ) ).toBeVisible();
 		expect( screen.getByText( 'Signed out' ) ).toBeVisible();
+	} );
+
+	it( 'names each saved account once, by its label, without the start of its id', async () => {
+		await openSettings( { accounts: [ account(), account( ACCOUNT_B, SECOND ) ] } );
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+		const select = within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } );
+
+		expect( select ).toHaveTextContent( EMAIL );
+		expect( within( group ).getAllByText( EMAIL ) ).toHaveLength( 1 );
+		expect( group ).not.toHaveTextContent( ACCOUNT_A.slice( 0, 8 ) );
+		fireEvent.click( select );
+		expect( await screen.findByRole( 'option', { name: EMAIL } ) ).toBeVisible();
+		expect( screen.getByRole( 'option', { name: SECOND } ) ).toBeVisible();
+	} );
+
+	it( 'says the account’s email under its label only when the label isn’t it', async () => {
+		await openSettings( { accounts: [ account( ACCOUNT_A, 'Work' ) ] } );
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+
+		expect(
+			within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
+		).toHaveTextContent( 'Work' );
+		expect( within( group ).getByText( EMAIL ) ).toBeVisible();
+	} );
+
+	it( 'tells saved accounts of the same label apart by the start of their ids', async () => {
+		await openSettings( { accounts: [ account(), account( ACCOUNT_B ) ] } );
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+		const select = within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } );
+
+		expect( select ).toHaveTextContent( `${ EMAIL } · ${ ACCOUNT_A.slice( 0, 8 ) }` );
+		fireEvent.click( select );
+		expect(
+			await screen.findByRole( 'option', { name: `${ EMAIL } · ${ ACCOUNT_B.slice( 0, 8 ) }` } )
+		).toBeVisible();
 	} );
 
 	it( 'requires an explicit session-only choice when secure storage is unavailable', async () => {
@@ -257,7 +296,7 @@ describe( 'ChatGPT account settings', () => {
 			expect( within( group ).getByText( /This status may be out of date\./ ) ).toBeVisible();
 			expect(
 				within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
-			).toHaveTextContent( 'Personal' );
+			).toHaveTextContent( EMAIL );
 
 			connector.getChatGptSettings.mockImplementation( async () => structuredClone( settings ) );
 			fireEvent.click( within( group ).getByRole( 'button', { name: 'Retry' } ) );
