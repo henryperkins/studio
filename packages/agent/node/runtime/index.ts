@@ -54,7 +54,7 @@ import {
 	resolveChatGptReasoning,
 } from '@studio/agent/protocol/chatgpt-models';
 import {
-	describeConnectionSelectionError,
+	describeOtherProviderInChatGptChat,
 	resolveConnectionSelection,
 	type ConnectionRegistryEntry,
 	type ConnectionSelection,
@@ -458,17 +458,10 @@ async function validateChatGptSessionBinding(
  * ChatGPT, pinned there or by its last reply, and continues only there.
  * Undefined for any other conversation.
  */
-async function describeChatGptConversation(
-	entries: SessionEntry[]
-): Promise< string | undefined > {
-	if ( getEffectiveSessionProvider( entries, null ) !== 'chatgpt-oauth' ) {
-		return undefined;
-	}
-	const connections = await listChatGptConnections().catch( () => [] );
-	const resolved = resolveConnectionSelection( entries, { connections, settings: null } );
-	return resolved.ok
-		? 'The selected connection doesn’t match the model this turn runs on.'
-		: describeConnectionSelectionError( resolved.error );
+function describeChatGptConversation( entries: SessionEntry[] ): string | undefined {
+	return getEffectiveSessionProvider( entries, null ) === 'chatgpt-oauth'
+		? describeOtherProviderInChatGptChat()
+		: undefined;
 }
 
 /**
@@ -589,7 +582,7 @@ async function runAgentSessionTurn(
 		}
 		routing = resolved.routing;
 	} else {
-		const chatGptProblem = await describeChatGptConversation( config.session.getEntries() );
+		const chatGptProblem = describeChatGptConversation( config.session.getEntries() );
 		if ( chatGptProblem ) {
 			config.onEvent( syntheticErrorAgentEnd( 'error', chatGptProblem, CHATGPT_PI_PROVIDER ) );
 			return;

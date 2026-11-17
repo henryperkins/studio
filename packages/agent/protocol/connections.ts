@@ -223,6 +223,20 @@ function resolveChatGptConnection(
 }
 
 /**
+ * Why a turn on another provider can't run in a conversation that ran on a
+ * ChatGPT plan, however its connection is now: it continues only there.
+ */
+export function describeOtherProviderInChatGptChat(): string {
+	return sprintf(
+		/* translators: %s: AI provider name, e.g. "ChatGPT". */
+		__(
+			'This chat ran on a %s plan, so it can’t continue on another provider. Start a new chat to use another provider.'
+		),
+		AI_PROVIDER_LABELS[ 'chatgpt-oauth' ]
+	);
+}
+
+/**
  * What went wrong with a conversation's connection, and what the user can do.
  * Given the state of the saved account a disconnected conversation ran on,
  * says that signing in to that account again continues it: its revision, and

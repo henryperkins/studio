@@ -1353,11 +1353,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		} );
 
 		it.each( [
-			[
-				'pinned there',
-				( file: string ) => reopen( file ),
-				'The selected connection doesn’t match the model this turn runs on.',
-			],
+			[ 'pinned there', ( file: string ) => reopen( file ) ],
 			[
 				'only by its last reply',
 				( file: string ) => {
@@ -1368,11 +1364,12 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 					fs.writeFileSync( file, lines.join( '\n' ) + '\n' );
 					return reopen( file );
 				},
-				describeConnectionSelectionError( { code: 'unsupported', providerId: 'chatgpt-oauth' } ),
 			],
 		] )(
-			'refuses a turn on another provider in a conversation that ran on ChatGPT, %s',
-			async ( how, open, why ) => {
+			'refuses a turn on another provider in a conversation that ran on ChatGPT, %s, saying another provider needs a new chat',
+			async ( _how, open ) => {
+				const why =
+					'This chat ran on a ChatGPT plan, so it can’t continue on another provider. Start a new chat to use another provider.';
 				const selection = selectionFor();
 				replies.push( () => textReply( 'From the plan.' ) );
 				const chatGpt = await runChatGptTurn(
@@ -1403,20 +1400,13 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				expect( requests ).toHaveLength( sent );
 				expect( fetchSpy ).toHaveBeenCalledTimes( sent );
 
-				// Signed out since, a pinned one says so.
+				// Signed out since, it still says so: the turn is on another provider.
 				fakeBroker.connections = [];
 				const signedOut = await runTurn( reopen( chatGpt.sessionFile ), 'hi again', {
 					model: 'balanced',
 					env: { STUDIO_WPCOM_API_KEY: 'test-wpcom-token' },
 				} );
-				expect( signedOut.error ).toBe(
-					how === 'pinned there'
-						? describeConnectionSelectionError( {
-								code: 'disconnected',
-								providerId: 'chatgpt-oauth',
-						  } )
-						: why
-				);
+				expect( signedOut.error ).toBe( why );
 				expect( requests ).toHaveLength( sent );
 			}
 		);

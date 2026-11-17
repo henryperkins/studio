@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	describeConnectionSelectionError,
+	describeOtherProviderInChatGptChat,
 	resolveConnectionSelection,
 	type ConnectionRegistry,
 	type ConnectionRegistryEntry,
@@ -501,6 +502,18 @@ describe( 'ChatGPT records', () => {
 			).toBe( text );
 		}
 	);
+
+	it( 'says a chat that ran on a ChatGPT plan needs a new chat for another provider, in words of its own', () => {
+		const text = describeOtherProviderInChatGptChat();
+		expect( text ).toBe(
+			'This chat ran on a ChatGPT plan, so it can’t continue on another provider. Start a new chat to use another provider.'
+		);
+		for ( const code of [ 'disconnected', 'changed', 'unsupported' ] as const ) {
+			expect( text ).not.toBe(
+				describeConnectionSelectionError( { code, providerId: 'chatgpt-oauth' } )
+			);
+		}
+	} );
 
 	it( 'keeps saying a new chat is needed when the connection changed or is gone, whatever the account’s state', () => {
 		expect(
