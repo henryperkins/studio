@@ -277,11 +277,13 @@ interface TokenProbeResult {
 
 export interface AcceptanceTokens {
 	holdNextRefresh(): RefreshHold;
+	/** How many refreshes the broker made through this client succeeded. */
+	refreshes(): number;
 	/**
 	 * Tries a refresh with a refresh token kept in memory: the one the last
-	 * refresh retired, the one it issued, or the last one a sign-out revoked.
+	 * refresh retired, or the one it issued.
 	 */
-	probe( which: 'retired' | 'rotated' | 'revoked' ): Promise< TokenProbeResult >;
+	probe( which: 'retired' | 'rotated' ): Promise< TokenProbeResult >;
 	revocations(): { total: number; confirmed: number; rotatedRevoked: boolean };
 	/** Releases any hold and waits for refreshes in flight. */
 	settle(): Promise< void >;
@@ -420,6 +422,7 @@ export function createAcceptanceTokenService(
 	const inFlight = new Set< Promise< unknown > >();
 	let retired: CapturedToken | null = null;
 	let rotated: CapturedToken | null = null;
+	let refreshes = 0;
 	const revoked: Array< CapturedToken & { confirmed: boolean } > = [];
 
 	const revokeQuietly = ( clientId: string, refreshToken: string ) =>
@@ -434,6 +437,7 @@ export function createAcceptanceTokenService(
 		nextHold = null;
 		const result = await inner.refresh( request );
 		if ( result.ok ) {
+			refreshes++;
 			retired = { clientId: request.clientId, refreshToken: request.refreshToken };
 			rotated = {
 				clientId: request.clientId,
@@ -488,9 +492,9 @@ export function createAcceptanceTokenService(
 				},
 			};
 		},
+		refreshes: () => refreshes,
 		async probe( which ) {
-			const target =
-				which === 'retired' ? retired : which === 'rotated' ? rotated : revoked.at( -1 ) ?? null;
+			const target = which === 'retired' ? retired : rotated;
 			if ( ! target ) {
 				return { tried: false, rejected: false, terminal: false };
 			}
@@ -1859,6 +1863,20 @@ const SAVED_STAGES: StageDefinition[] = [
 		},
 	},
 	{
+		// So the sign-out has a grant this runner saw rotate to revoke, which
+		// `remote-revocation` then probes, as the session scenario's hold does.
+		name: 'refresh-before-sign-out',
+		async run( ctx, observations ) {
+			const { broker, tokens } = ctx.services;
+			const id = requireRegistration( ctx );
+			const before = tokens.refreshes();
+			await broker.invalidateAccessToken( id, await broker.getAccessToken( id ) );
+			await broker.getAccessToken( id );
+			observations.refreshed = tokens.refreshes() > before;
+			check( observations.refreshed, 'refresh-not-forced' );
+		},
+	},
+	{
 		name: 'active-run-stops-on-sign-out',
 		async run( ctx, observations ) {
 			const id = requireRegistration( ctx );
@@ -1952,17 +1970,31 @@ const SAVED_STAGES: StageDefinition[] = [
 	{
 		name: 'remote-revocation',
 		async run( ctx, observations ) {
+			const { broker, tokens } = ctx.services;
+			const id = requireRegistration( ctx );
 			observations.serviceConfirmedRevocation =
 				ctx.signOutResult?.remoteRevocationConfirmed === true;
-			observations.revocationRequests = ctx.services.tokens.revocations().total;
-			const probe = await ctx.services.tokens.probe( 'revoked' );
-			observations.probeTried = probe.tried;
-			observations.revokedRefreshRejected = probe.rejected;
-			observations.rejectionTerminal = probe.terminal;
-			if ( ! probe.tried ) {
-				return block( 'nothing-revoked' );
+			const revocations = tokens.revocations();
+			observations.revocationRequests = revocations.total;
+			observations.rotatedRevokedBySignOut = revocations.rotatedRevoked;
+			// The record itself, not the broker's word that it cleared it.
+			observations.vaultRecordAfterSignOut = broker.vaultRecordExists( id );
+			// The rotated token first: presenting the retired one can make the
+			// service revoke the whole grant as reused, which would say nothing
+			// about what the sign-out revoked.
+			const rotated = await tokens.probe( 'rotated' );
+			const retired = await tokens.probe( 'retired' );
+			observations.probeTried = rotated.tried;
+			observations.rotatedRefreshRejected = rotated.tried && rotated.rejected;
+			observations.rejectionTerminal = rotated.terminal;
+			observations.retiredRefreshRejected = retired.tried && retired.rejected;
+			check( ! observations.vaultRecordAfterSignOut, 'vault-record-left' );
+			if ( ! rotated.tried ) {
+				return block( 'no-rotated-grant' );
 			}
-			check( probe.rejected, 'revoked-refresh-accepted' );
+			check( observations.rotatedRefreshRejected, 'rotated-grant-usable' );
+			check( observations.rotatedRevokedBySignOut, 'rotated-not-revoked-by-sign-out' );
+			check( observations.retiredRefreshRejected, 'retired-refresh-accepted' );
 		},
 	},
 	{

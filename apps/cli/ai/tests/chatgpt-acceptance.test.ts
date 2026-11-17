@@ -307,6 +307,9 @@ function scriptedServices(
 		'wp-blogname': () => ( { exitCode: 0, stdout: '' } ),
 	};
 	let attempts = 0;
+	// A renewal after the access token was dropped refreshes, rotating the grant.
+	let accessTokenDropped = false;
+	let refreshes = 0;
 	const account = () =>
 		state === 'none'
 			? null
@@ -355,8 +358,17 @@ function scriptedServices(
 			},
 		},
 		broker: {
-			getAccessToken: async () => 'test-access-token',
-			invalidateAccessToken: async () => undefined,
+			getAccessToken: async () => {
+				if ( accessTokenDropped ) {
+					accessTokenDropped = false;
+					refreshes++;
+					calls.log.push( 'refresh' );
+				}
+				return 'test-access-token';
+			},
+			invalidateAccessToken: async () => {
+				accessTokenDropped = true;
+			},
 			signOut: async () => {
 				calls.log.push( 'sign-out' );
 				signedOut.resolve( services.clock.now() );
@@ -383,8 +395,12 @@ function scriptedServices(
 		},
 		tokens: {
 			holdNextRefresh: () => ( { held: Promise.resolve( false ), release: () => undefined } ),
-			probe: async () => ( { tried: true, rejected: true, terminal: true } ),
-			revocations: () => ( { total: 1, confirmed: 1, rotatedRevoked: false } ),
+			refreshes: () => refreshes,
+			probe: async ( which ) => {
+				calls.log.push( `probe:${ which }` );
+				return { tried: true, rejected: true, terminal: true };
+			},
+			revocations: () => ( { total: 1, confirmed: 1, rotatedRevoked: true } ),
 			settle: async () => undefined,
 		},
 		sessions: {
@@ -1151,7 +1167,7 @@ describe( 'ChatGPT acceptance runner', () => {
 			],
 			[
 				'remote-revocation',
-				'revoked-refresh-accepted',
+				'rotated-grant-usable',
 				'failed',
 				() => {
 					const scripted = scriptedServices();
@@ -1166,7 +1182,7 @@ describe( 'ChatGPT acceptance runner', () => {
 			],
 			[
 				'remote-revocation',
-				'nothing-revoked',
+				'no-rotated-grant',
 				'blocked',
 				() => {
 					const scripted = scriptedServices();
@@ -1415,6 +1431,95 @@ describe( 'ChatGPT acceptance runner', () => {
 				} );
 				expect( record.code === undefined ).toBe( expected.code === undefined );
 				expectNothingUnsafe( [ 'test-access-token' ] );
+			} );
+		} );
+
+		describe( 'the remote revocation of the grant a refresh rotated to before the sign-out', () => {
+			it( 'forces a refresh before the sign-out, probes the rotated grant before the retired one, and finds no vault record', async () => {
+				const { services, calls } = scriptedServices();
+				expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 0 );
+				expect( stageOf( 'refresh-before-sign-out' )[ 0 ] ).toMatchObject( {
+					status: 'passed',
+					observations: { refreshed: true },
+				} );
+				const { log } = calls;
+				expect( log.indexOf( 'refresh' ) ).toBeGreaterThan( -1 );
+				expect( log.indexOf( 'refresh' ) ).toBeLessThan( log.indexOf( 'sign-out' ) );
+				expect( log.filter( ( call ) => call.startsWith( 'probe:' ) ) ).toEqual( [
+					'probe:rotated',
+					'probe:retired',
+				] );
+				expect( stageOf( 'remote-revocation' )[ 0 ] ).toMatchObject( {
+					status: 'passed',
+					observations: expect.objectContaining( {
+						vaultRecordAfterSignOut: false,
+						rotatedRevokedBySignOut: true,
+						rotatedRefreshRejected: true,
+						rejectionTerminal: true,
+						retiredRefreshRejected: true,
+					} ),
+				} );
+			} );
+
+			const probing =
+				( rejected: { rotated?: boolean; retired?: boolean } ) =>
+				async ( which: 'retired' | 'rotated' ) => ( {
+					tried: true,
+					rejected: rejected[ which ] ?? true,
+					terminal: rejected[ which ] ?? true,
+				} );
+
+			it.each( [
+				[
+					'refresh-before-sign-out',
+					'refresh-not-forced',
+					( services: ChatGptAcceptanceServices ) => {
+						services.tokens.refreshes = () => 0;
+					},
+				],
+				[
+					'remote-revocation',
+					'vault-record-left',
+					( services: ChatGptAcceptanceServices ) => {
+						// The broker said it cleared the record; the file says otherwise.
+						services.broker.vaultRecordExists = () => true;
+					},
+				],
+				[
+					'remote-revocation',
+					'rotated-grant-usable',
+					( services: ChatGptAcceptanceServices ) => {
+						services.tokens.probe = probing( { rotated: false } );
+					},
+				],
+				[
+					'remote-revocation',
+					'rotated-not-revoked-by-sign-out',
+					( services: ChatGptAcceptanceServices ) => {
+						services.tokens.revocations = () => ( {
+							total: 1,
+							confirmed: 1,
+							rotatedRevoked: false,
+						} );
+					},
+				],
+				[
+					'remote-revocation',
+					'retired-refresh-accepted',
+					( services: ChatGptAcceptanceServices ) => {
+						services.tokens.probe = probing( { retired: false } );
+					},
+				],
+			] )( 'fails %s with %s, and still cleans up', async ( stage, code, change ) => {
+				const { services } = scriptedServices();
+				change( services );
+				expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 1 );
+				const all = records();
+				const failedAt = all.findIndex( ( record ) => record.stage === stage );
+				expect( all[ failedAt ] ).toMatchObject( { stage, status: 'failed', code } );
+				expect( all.slice( failedAt + 1 ).map( ( record ) => record.stage ) ).toEqual( [
+					'cleanup',
+				] );
 			} );
 		} );
 
@@ -2252,6 +2357,7 @@ describe( 'ChatGPT acceptance runner', () => {
 						},
 					};
 				},
+				refreshes: () => 0,
 				probe: async () => ( { tried: true, rejected: true, terminal: true } ),
 				revocations: () => ( { total: 1, confirmed: 1, rotatedRevoked: true } ),
 				settle: async () => {
@@ -2983,11 +3089,18 @@ describe( 'ChatGPT acceptance runner', () => {
 				status: 'passed',
 				observations: expect.objectContaining( { vaultKeyRemoved: true } ),
 			} );
+			expect( stageOf( 'refresh-before-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'passed',
+				observations: { refreshed: true },
+			} );
 			expect( stageOf( 'remote-revocation' )[ 0 ] ).toMatchObject( {
 				status: 'passed',
 				observations: expect.objectContaining( {
-					revokedRefreshRejected: true,
+					vaultRecordAfterSignOut: false,
+					rotatedRevokedBySignOut: true,
+					rotatedRefreshRejected: true,
 					rejectionTerminal: true,
+					retiredRefreshRejected: true,
 				} ),
 			} );
 
@@ -3049,6 +3162,40 @@ describe( 'ChatGPT acceptance runner', () => {
 			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readManifest()?.runs ).toHaveLength( 2 );
 			expect( ( await readChatGptAccount( registrationId ) )?.state ).toBe( 'signed-out' );
 			expectNothingUnsafe( [ ...fake.secrets(), ...issuedHere ], [ registrationId ] );
+		} );
+
+		it( 'fails the saved run’s remote revocation when the sign-out leaves the grant a refresh rotated to usable', async () => {
+			const owner: { broker: ChatGptCredentialBroker | null } = { broker: null };
+			const saved = realServices( owner );
+			const signOut = saved.broker.signOut;
+			saved.broker.signOut = async ( id ) => {
+				// From the sign-out on, the token service refuses every revocation.
+				fake.script.revoke = () => ( { status: 400, body: { error: 'unsupported_token_type' } } );
+				return signOut( id );
+			};
+			expect(
+				await runChatGptAcceptance(
+					[ '--live', '--scenario', 'saved', '--run-dir', runDir ],
+					dependencies( saved )
+				)
+			).toBe( 1 );
+			expect( stageOf( 'active-run-stops-on-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'passed',
+				observations: expect.objectContaining( {
+					localCleared: true,
+					remoteRevocationConfirmed: false,
+				} ),
+			} );
+			expect( stageOf( 'remote-revocation' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'rotated-grant-usable',
+				observations: expect.objectContaining( {
+					vaultRecordAfterSignOut: false,
+					rotatedRevokedBySignOut: false,
+					rotatedRefreshRejected: false,
+				} ),
+			} );
+			expectNothingUnsafe( [ ...fake.secrets(), ...issuedHere ] );
 		} );
 
 		it( 'fails the refresh hold when the sign-out leaves the rotated grant usable, though a reuse would revoke the grant', async () => {
@@ -3472,7 +3619,15 @@ describe( 'acceptance token service', () => {
 	it( 'probes the retired and rotated refresh tokens, and revokes anything a probe unexpectedly issues', async () => {
 		const { inner, live } = memoryTokens();
 		const tokens = createAcceptanceTokenService( inner );
+		// Before any refresh there is nothing to probe.
+		expect( await tokens.probe( 'rotated' ) ).toEqual( {
+			tried: false,
+			rejected: false,
+			terminal: false,
+		} );
+		expect( tokens.refreshes() ).toBe( 0 );
 		await tokens.client.refresh( request( 'refresh-0' ) );
+		expect( tokens.refreshes() ).toBe( 1 );
 		expect( await tokens.probe( 'retired' ) ).toEqual( {
 			tried: true,
 			rejected: true,
@@ -3485,11 +3640,8 @@ describe( 'acceptance token service', () => {
 			terminal: false,
 		} );
 		expect( live.size ).toBe( 0 );
-		expect( await tokens.probe( 'revoked' ) ).toEqual( {
-			tried: false,
-			rejected: false,
-			terminal: false,
-		} );
+		// A probe's own refresh isn't one the broker made.
+		expect( tokens.refreshes() ).toBe( 1 );
 	} );
 
 	it( 'revokes a held result the broker gave up on, so no grant is left usable', async () => {
