@@ -386,10 +386,25 @@ export function createClaudeExecutionPolicy(
 				acceptedTargets().map( ( target ) => context.verifyTarget( target ).catch( () => false ) )
 			);
 			if ( results.some( Boolean ) ) return true;
-			if ( writing.length ) await Promise.all( writing );
-			else if ( version === targetVersion ) return false;
+			if ( writing.length ) {
+				if ( ! ( await settledWhileTurnLives( Promise.all( writing ) ) ) ) return false;
+			} else if ( version === targetVersion ) return false;
 		}
 		return false;
+	}
+
+	// Waits for work that never rejects, unless the turn ends first: a write
+	// that never settles holds no check past the turn.
+	function settledWhileTurnLives( work: Promise< unknown > ): Promise< boolean > {
+		return new Promise( ( resolve ) => {
+			if ( signal.aborted ) return resolve( false );
+			const ended = () => resolve( false );
+			signal.addEventListener( 'abort', ended, { once: true } );
+			void work.then( () => {
+				signal.removeEventListener( 'abort', ended );
+				resolve( true );
+			} );
+		} );
 	}
 
 	// Writes this turn's change of the conversation's target, accepting the new

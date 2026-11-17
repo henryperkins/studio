@@ -749,6 +749,28 @@ describe( 'site_create on the Claude route', () => {
 		expect( await read() ).toBe( true );
 	} );
 
+	it( 'stops waiting for a selection write that never settles once the turn ends', async () => {
+		const { bridge, host, stored, controller, read } = await setupGlobal();
+		let finish!: () => void;
+		host.selectSite = vi.fn(
+			() =>
+				new Promise< void >( ( resolve ) => {
+					finish = resolve;
+				} )
+		);
+		const creating = bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		await vi.waitFor( () => expect( host.selectSite ).toHaveBeenCalled() );
+		// Neither target holds, so the check waits for the write in flight.
+		stored.target = { environment: 'local', siteId: 'other-site' };
+		const check = read();
+		await new Promise( ( resolve ) => setTimeout( resolve, 10 ) );
+		controller.abort();
+		const hung = new Promise( ( resolve ) => setTimeout( () => resolve( 'still waiting' ), 1000 ) );
+		expect( await Promise.race( [ check, hung ] ) ).toBe( false );
+		finish();
+		await creating;
+	} );
+
 	it( 'keeps both targets when the selection fails, since its write may or may not have landed, and stops the turn for any other', async () => {
 		const { bridge, host, stored, policy, read, journal } = await setupGlobal();
 		host.selectSite = vi.fn( async ( selected: { id?: string } ) => {
