@@ -33,7 +33,9 @@ import type {
 // Claude route below, and that status must be what the Claude execution policy
 // actually enables and what the Claude bridge actually lists.
 
-type Step = 'C2a-2' | 'C2a-3' | 'C2b' | 'C2c';
+// The steps that still qualify a tool, each named by at least one.
+const STEPS = [ 'C2a-3', 'C2b', 'C2c' ] as const;
+type Step = ( typeof STEPS )[ number ];
 type ClaudeStatus =
 	// Bridged from the registry and qualified by the policy.
 	| { status: 'bridged' }
@@ -370,12 +372,16 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 
 	it( 'gives every registered tool exactly one status, and no status to a tool the Pi route never registers', () => {
 		expect( Object.keys( CLAUDE_TOOL_STATUS ).sort() ).toEqual( registered() );
+		const named = new Set< Step >();
 		for ( const [ name, status ] of statuses() ) {
 			if ( status.status === 'unqualified' ) {
 				expect( status.reason.length, name ).toBeGreaterThan( 0 );
-				expect( [ 'C2a-2', 'C2a-3', 'C2b', 'C2c' ], name ).toContain( status.step );
+				expect( STEPS, name ).toContain( status.step );
+				named.add( status.step );
 			}
 		}
+		// A step no tool waits for is done, and named nowhere.
+		expect( [ ...STEPS ] ).toEqual( STEPS.filter( ( step ) => named.has( step ) ) );
 	} );
 
 	it( 'marks qualified exactly what the execution policy enables, and nothing it does not', () => {
