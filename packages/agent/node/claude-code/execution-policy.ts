@@ -451,7 +451,7 @@ interface TargetPreview {
 // What an update approval says of a preview made on Jurassic Ninja, which the
 // CLI's `preview update` moves to WordPress.com rather than updating it.
 const MOVED_PREVIEW_NOTE =
-	'It moves this preview of the site, made on Jurassic Ninja, to WordPress.com: it makes a new preview there, at a new address, from the site’s current content, its database included, which anyone with the new preview’s public address can see, and deletes the preview at the address shown';
+	'It moves this preview of the site, made on Jurassic Ninja, to WordPress.com. It makes a public preview at a new address from the site’s current content, including its database. Studio removes the old preview from its records and tries to delete the site at the address shown. If deletion fails, the old preview expires on its own';
 
 /** What an operation receives in place of what its caller named: the values as checked. */
 interface CheckedHostValues {

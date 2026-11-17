@@ -502,7 +502,7 @@ describe( 'preview_update and preview_delete on the Claude route', () => {
 		// `demo.wp.build` is a preview made on Jurassic Ninja, which the CLI
 		// moves to WordPress.com when it updates it.
 		expect( request.operation.description ).toContain(
-			'It moves this preview of the site, made on Jurassic Ninja, to WordPress.com: it makes a new preview there, at a new address, from the site’s current content, its database included, which anyone with the new preview’s public address can see, and deletes the preview at the address shown'
+			'It moves this preview of the site, made on Jurassic Ninja, to WordPress.com. It makes a public preview at a new address from the site’s current content, including its database. Studio removes the old preview from its records and tries to delete the site at the address shown. If deletion fails, the old preview expires on its own'
 		);
 		// The address shown: the approval as the app is given it carries it.
 		const shown = fixture.events.find( ( event ) => event.type === 'approval.requested' ) as {
