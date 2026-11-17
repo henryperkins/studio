@@ -1,19 +1,47 @@
 import { mkdir, mkdtemp, realpath, rm } from 'fs/promises';
+import { createServer } from 'http';
 import os from 'os';
 import path from 'path';
+import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { fakePreview } from '../../tests/fake-host';
+import { fakeRemoteSite, fakePreview } from '../../tests/fake-host';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
+import type { AddressInfo } from 'net';
 
 // The tools that look beyond the conversation's own site or reach WordPress.com,
 // each driven through the real execution policy and the bridge the SDK calls,
 // against a fake host whose operations are spies. Nothing here leaves the
-// machine: the host's network members are spies, and the stored login is a
-// test value in a configuration folder of this test's own.
+// machine: the host's network members are spies, the stored login is a test
+// value in a configuration folder of this test's own, and the real
+// WordPress.com client sends every request a tool makes itself to a server on
+// this machine instead of its default origin, as `wpcom-request-scope.test.ts`
+// does, so the test sees exactly what the tool would send.
 
 const config = vi.hoisted( () => ( { root: '' } ) );
+const wpcom = vi.hoisted( () => ( {
+	origin: '',
+	received: [] as Array< { method: string; url: string; authorization?: string; body: string } >,
+	respond: ( _url: string ): { status: number; body: unknown } => ( { status: 200, body: {} } ),
+} ) );
+
+vi.mock( '@studio/common/lib/wpcom-xhr-request-factory', async () => {
+	const actual = await vi.importActual< {
+		default: ( options: Record< string, unknown >, callback: unknown ) => unknown;
+	} >( '@studio/common/lib/wpcom-xhr-request-factory' );
+	return {
+		default: ( options: Record< string, unknown >, callback: unknown ) =>
+			actual.default(
+				options.proxyOrigin === undefined ? { ...options, proxyOrigin: wpcom.origin } : options,
+				callback
+			),
+	};
+} );
+
+vi.mock( '@studio/common/lib/connected-sites', () => ( {
+	getConnectedWpcomSitesForLocalSite: vi.fn( async () => [] ),
+} ) );
 
 vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('@studio/common/lib/well-known-paths') >();
@@ -33,18 +61,45 @@ vi.mock( '@studio/common/lib/shared-config', async ( importOriginal ) => ( {
 	readAuthToken: vi.fn(),
 } ) );
 
+let stopServer: () => Promise< void >;
 beforeAll( async () => {
 	config.root = await realpath(
 		await mkdtemp( path.join( os.tmpdir(), 'studio-claude-config-' ) )
 	);
 	await mkdir( path.join( config.root, 'tmp', 'ai-payloads' ), { recursive: true } );
+	const server = createServer( ( request, response ) => {
+		let body = '';
+		request.on( 'data', ( chunk ) => ( body += chunk ) );
+		request.on( 'end', () => {
+			const url = request.url ?? '';
+			wpcom.received.push( {
+				method: request.method ?? '',
+				url,
+				authorization: request.headers.authorization,
+				body,
+			} );
+			const answer = wpcom.respond( url );
+			response.statusCode = answer.status;
+			response.setHeader( 'content-type', 'application/json' );
+			response.end( JSON.stringify( answer.body ) );
+		} );
+	} );
+	await new Promise< void >( ( resolve ) => server.listen( 0, '127.0.0.1', resolve ) );
+	wpcom.origin = `http://127.0.0.1:${ ( server.address() as AddressInfo ).port }`;
+	stopServer = () => new Promise( ( resolve ) => server.close( () => resolve() ) );
 } );
-afterAll( () => rm( config.root, { recursive: true, force: true } ) );
+afterAll( async () => {
+	await stopServer();
+	await rm( config.root, { recursive: true, force: true } );
+} );
 
 beforeEach( () => {
 	vi.mocked( readAuthToken )
 		.mockReset()
 		.mockResolvedValue( LOGIN as never );
+	vi.mocked( getConnectedWpcomSitesForLocalSite ).mockReset().mockResolvedValue( [] );
+	wpcom.received.length = 0;
+	wpcom.respond = () => ( { status: 200, body: {} } );
 } );
 
 const cleanups: Array< () => Promise< void > > = [];
@@ -247,5 +302,89 @@ describe( 'preview_list on the Claude route', () => {
 			'Denied'
 		);
 		expect( host.previews.list ).toHaveBeenCalledOnce();
+	} );
+} );
+
+describe( 'site_connected_remote_sites on the Claude route', () => {
+	// The account's own listing of its sites, as WordPress.com answers it: the
+	// site connected to the conversation's site, and another one.
+	const accountSites = {
+		sites: [
+			{
+				ID: fakeRemoteSite.id,
+				is_wpcom_atomic: true,
+				name: 'Connected',
+				URL: 'https://c.example.test',
+				is_deleted: false,
+			},
+			{
+				ID: 222,
+				is_wpcom_atomic: true,
+				name: 'Unconnected',
+				URL: 'https://u.example.test',
+				is_deleted: false,
+			},
+		],
+	};
+
+	it( 'lists the WordPress.com sites connected to the conversation’s own site, asking WordPress.com only for the account’s own listing, with the stored login, unprompted and unjournaled', async () => {
+		const { bridge, context, journal } = await setup();
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( [ fakeRemoteSite ] );
+		wpcom.respond = () => ( { status: 200, body: accountSites } );
+		expect( bridge.tools ).toContain( 'site_connected_remote_sites' );
+		const result = await bridge.invoke( 'site_connected_remote_sites', { nameOrPath: 'site' } );
+		expect( result.isError ).toBe( false );
+		expect( getConnectedWpcomSitesForLocalSite ).toHaveBeenCalledWith( 'site-123' );
+		expect( JSON.parse( text( result ) ) ).toEqual( [
+			expect.objectContaining( { type: 'wpcom-remote', id: fakeRemoteSite.id, name: 'Connected' } ),
+		] );
+		expect( wpcom.received ).toEqual( [
+			expect.objectContaining( {
+				method: 'GET',
+				url: expect.stringMatching( /^\/rest\/v1\.2\/me\/sites\?/ ),
+				authorization: `Bearer ${ LOGIN.accessToken }`,
+			} ),
+		] );
+		expect( text( result ) ).not.toContain( LOGIN.accessToken );
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect( journal ).toEqual( [] );
+	} );
+
+	it( 'says a failure in a fixed sentence, never with the stored login', async () => {
+		const { bridge } = await setup();
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( [ fakeRemoteSite ] );
+		wpcom.respond = () => ( {
+			status: 500,
+			body: { error: 'oops', message: `bad login ${ LOGIN.accessToken }` },
+		} );
+		const result = await bridge.invoke( 'site_connected_remote_sites', { nameOrPath: 'site' } );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toBe( 'Studio operation denied or failed.' );
+		expect( wpcom.received ).toHaveLength( 1 );
+	} );
+
+	it( 'reads no other site’s connections and asks WordPress.com nothing for them, nor from a conversation without a site', async () => {
+		const onSite = await setup();
+		const unbound = await setup( global );
+		expect(
+			( await onSite.bridge.invoke( 'site_connected_remote_sites', { nameOrPath: 'other' } ) )
+				.isError
+		).toBe( true );
+		expect(
+			( await unbound.bridge.invoke( 'site_connected_remote_sites', { nameOrPath: 'site' } ) )
+				.isError
+		).toBe( true );
+		expect( getConnectedWpcomSitesForLocalSite ).not.toHaveBeenCalled();
+		expect( readAuthToken ).not.toHaveBeenCalled();
+		expect( wpcom.received ).toEqual( [] );
+	} );
+
+	it( 'reads no stored login that lies in a folder the turn reaches', async () => {
+		const { bridge } = await setup( ( paths ) => ( { localRoots: [ paths.site, config.root ] } ) );
+		expect(
+			( await bridge.invoke( 'site_connected_remote_sites', { nameOrPath: 'site' } ) ).isError
+		).toBe( true );
+		expect( readAuthToken ).not.toHaveBeenCalled();
+		expect( wpcom.received ).toEqual( [] );
 	} );
 } );

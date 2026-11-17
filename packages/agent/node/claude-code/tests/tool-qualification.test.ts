@@ -96,6 +96,12 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 		reachesWpcom: [ 'host' ],
 	},
 	preview_list: throughHost,
+	site_connected_remote_sites: {
+		...throughHost,
+		readsLocalFiles: [ 'config' ],
+		requestsNetwork: [ 'scope' ],
+		reachesWpcom: [ 'scope' ],
+	},
 };
 
 // Code a qualified tool's module links but the tool never runs. The scan reads
@@ -113,6 +119,7 @@ const UNREACHED: Record<
 	ReadonlyArray< { channels: string[]; files: string[]; why: string } >
 > = {
 	site_list: [ SHARED_CONFIG_SAVE ],
+	site_connected_remote_sites: [ SHARED_CONFIG_SAVE ],
 	preview_list: [
 		{
 			channels: [ 'requestsNetwork', 'reachesWpcom' ],

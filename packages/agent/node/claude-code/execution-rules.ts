@@ -57,6 +57,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		getSiteInfoTool.name,
 		listSitesTool.name,
 		listPreviewsTool.name,
+		listConnectedRemoteSitesTool.name,
 		startSiteTool.name,
 		stopSiteTool.name,
 		deleteSiteTool.name,
@@ -442,6 +443,10 @@ const taxonomistScripts = () => getSkillPath( 'taxonomist', 'scripts' );
 // Where `readAuthToken` reads the stored WordPress.com login: Studio's shared
 // configuration.
 const storedLogin = () => [ getSharedConfigPath() ];
+
+// The WordPress.com scope of a request whose code asks only for the account's
+// own listing of its sites, whatever the call's arguments.
+const accountListing = () => ( {} );
 
 // Where `install_taxonomy_scripts` writes in a site: its folder and a copy of
 // every file the bundled folder holds. Undefined, which denies the call, when
@@ -865,7 +870,25 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		auditSeoTool.name,
 		unqualified( onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ) ),
 	],
-	[ listConnectedRemoteSitesTool.name, unqualified( onSite( 'remote-read' ) ) ],
+	[
+		listConnectedRemoteSitesTool.name,
+		// It resolves the site it names, which the guarded host allows for the
+		// target site only, and reads that site's connections and the stored
+		// login from Studio's shared configuration. It then sends one request
+		// itself, outside the host: the account's own listing of its sites, which
+		// its code fixes and no argument shapes, with the stored login. It keeps
+		// the connected ones and says nothing of the login. Its module links
+		// `tools/utils.ts`, whose `runWpCli` runs only through the host.
+		qualified(
+			onSite( 'remote-read', { remote: accountListing, config: storedLogin } ),
+			using( {
+				...LOCAL_SITE_HOST_CHANNELS,
+				readsLocalFiles: [ 'config' ],
+				requestsNetwork: [ 'scope' ],
+				reachesWpcom: [ 'scope' ],
+			} )
+		),
+	],
 	[
 		wpcomRequestTool.name,
 		unqualified(
