@@ -26,6 +26,10 @@ const params = new URLSearchParams( window.location.search );
 const scheme = params.get( 'scheme' ) === 'dark' ? 'dark' : 'light';
 const service = params.get( 'service' ) ?? 'account';
 const view = params.get( 'view' ) === 'settings' ? 'settings' : 'chat';
+// The chat's account signed out or needing sign-in; or every read after the first failing.
+const accountState = params.get( 'account' );
+const signedOut = accountState === 'signed-out' || accountState === 'needs-sign-in';
+const failingReads = params.get( 'read' ) === 'failing';
 
 const CONNECTION_ID = 'f84d75a0-4e60-4168-a1ab-3134542c637a';
 const sampleUser = { id: 1, email: 'sample@example.test', displayName: 'Sample Account' };
@@ -35,11 +39,21 @@ const account: ChatGptAccountView = {
 	backend: 'pi',
 	revision: 1,
 	identity: { subject: 'sample-subject', email: 'plan@example.test' },
-	authStatus: 'connected',
+	authStatus: signedOut ? 'disconnected' : 'connected',
 	label: 'Personal',
 	email: 'plan@example.test',
-	state: 'signed-in',
+	state: signedOut ? ( accountState as ChatGptAccountView[ 'state' ] ) : 'signed-in',
 	storage: 'vault',
+};
+const chatGpt = {
+	enabled: true,
+	signInSupported: true,
+	secureStorage: 'available' as const,
+	accounts: [ account ],
+};
+let reads = 0;
+const failRead = async (): Promise< never > => {
+	throw new Error( 'Studio couldn’t complete the ChatGPT action. Try again.' );
 };
 const imageService: ImageServiceState | undefined =
 	service === 'token'
@@ -102,15 +116,17 @@ const connector = createInMemoryConnector(
 		user: service === 'off' ? null : sampleUser,
 		imageService,
 		preferences: { colorScheme: scheme },
-		chatGpt: {
-			enabled: true,
-			signInSupported: true,
-			secureStorage: 'available',
-			accounts: [ account ],
-		},
+		chatGpt,
 		sessions: [ { summary: session, entries } ],
 	},
 	{
+		...( failingReads
+			? {
+					getChatGptSettings: async () =>
+						reads++ === 0 ? structuredClone( chatGpt ) : failRead(),
+					recheckChatGptSettings: failRead,
+			  }
+			: {} ),
 		getOnboardingCompleted: async () => true,
 		getChatGptModels: async ( connectionId, revision ) => ( {
 			connectionId,
@@ -124,7 +140,14 @@ const connector = createInMemoryConnector(
 );
 
 const link = ( changes: Record< string, string > ) =>
-	`?${ new URLSearchParams( { scheme, service, view, ...changes } ) }`;
+	`?${ new URLSearchParams( {
+		scheme,
+		service,
+		view,
+		...( accountState ? { account: accountState } : {} ),
+		...( failingReads ? { read: 'failing' } : {} ),
+		...changes,
+	} ) }`;
 
 createRoot( document.getElementById( 'root' )! ).render(
 	<StrictMode>
@@ -158,6 +181,9 @@ createRoot( document.getElementById( 'root' )! ).render(
 			<a href={ link( { service: 'account' } ) }>As the WordPress.com account</a>
 			<a href={ link( { service: 'token' } ) }>With a token</a>
 			<a href={ link( { service: 'off' } ) }>Not set up</a>
+			<a href={ link( { account: 'signed-out', read: '' } ) }>Account signed out</a>
+			<a href={ link( { account: 'needs-sign-in', read: '' } ) }>Account needs sign-in</a>
+			<a href={ link( { account: '', read: 'failing' } ) }>Reads failing</a>
 			<a href={ link( { view: view === 'chat' ? 'settings' : 'chat' } ) }>
 				{ view === 'chat' ? 'Settings › AI' : 'Chat' }
 			</a>
