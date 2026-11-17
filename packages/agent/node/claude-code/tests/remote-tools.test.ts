@@ -872,6 +872,10 @@ describe( 'site_pull on the Claude route', () => {
 		expect( request.operation.description ).toContain(
 			'It copies the connected WordPress.com site 111 (My Production Site, myprod.wordpress.com, a production site) into this local site with the options uploads, themes, replacing the uploads and the themes in this local site, and stops the site while it runs if it is running.'
 		);
+		// And what else it replaces or moves, and where it unpacks the backup.
+		expect( request.operation.description ).toContain(
+			'It downloads a backup of that site into a temporary folder and extracts it into a second one; it replaces the site’s wp-config.php with the backup’s when the backup has one, and moves the site’s previous database to the operating system’s trash before importing the backup’s when the backup holds one.'
+		);
 		expect( request.operation.description ).toContain(
 			'If it is interrupted, the site’s server may be left stopped and its database emptied, with the previous one in the operating system’s trash'
 		);

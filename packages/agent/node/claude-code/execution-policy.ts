@@ -332,7 +332,9 @@ function connectionLabel( site: SyncSite ): string {
 // What an approval of a push or pull, and so its journal entry, says of it
 // after its class and name: the site it syncs with, as Studio keeps its
 // connection, the options and what they replace where the copy lands, and
-// what an interrupted one may have left, which a recovery then says.
+// what an interrupted one may have left, which a recovery then says. A pull
+// also says what the CLI's default engine and importer replace or move
+// whatever the options, and where they unpack the backup.
 function syncNote( name: 'sync.push' | 'sync.pull', site: SyncSite, options: string[] ): string {
 	const { id, name: siteName, address, kind } = shownConnection( site );
 	const connected = `the connected WordPress.com site ${ id } (${ siteName }, ${ address }, a ${ kind } site)`;
@@ -343,7 +345,7 @@ function syncNote( name: 'sync.push' | 'sync.pull', site: SyncSite, options: str
 	const chosen = `with the options ${ options.join( ', ' ) }`;
 	if ( name === 'sync.push' )
 		return `It uploads this local site to ${ connected } ${ chosen }, replacing ${ overwrites } on that site. If it is interrupted, the import of what it uploaded may still be running on WordPress.com`;
-	return `It copies ${ connected } into this local site ${ chosen }, replacing ${ overwrites } in this local site, and stops the site while it runs if it is running. If it is interrupted, the site’s server may be left stopped and its database emptied, with the previous one in the operating system’s trash`;
+	return `It copies ${ connected } into this local site ${ chosen }, replacing ${ overwrites } in this local site, and stops the site while it runs if it is running. It downloads a backup of that site into a temporary folder and extracts it into a second one; it replaces the site’s wp-config.php with the backup’s when the backup has one, and moves the site’s previous database to the operating system’s trash before importing the backup’s when the backup holds one. If it is interrupted, the site’s server may be left stopped and its database emptied, with the previous one in the operating system’s trash`;
 }
 
 function deepFreeze< T >( value: T ): T {
