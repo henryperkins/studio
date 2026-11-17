@@ -62,7 +62,7 @@ The checks in `outcome.mjs` read that state. A case names the site it asks for i
 
 ### A dedicated ChatGPT test profile
 
-A ChatGPT eval never uses your own Studio profile (`~/.studio`) for its ChatGPT connection. It takes the connection from a **dedicated test profile**: a folder you sign in to only for testing, with the ChatGPT acceptance runner (`scripts/chatgpt-acceptance/README.md`, scenarios `provision` and `retire`). In order, from the repository root, with your consent each time (nothing here runs without `--live`):
+A ChatGPT eval never uses your own Studio profile (`~/.studio`) for its ChatGPT connection. It takes the connection from a **dedicated test profile**: a folder you sign in to only for testing, with the ChatGPT acceptance runner (`scripts/chatgpt-acceptance/README.md`, scenarios `provision` and `retire`). In order, from the repository root, with your consent each time. The acceptance runner's steps change nothing without `--live` (step 1 runs its dry check first); `npm run eval:parity` has no such switch and runs live, on the account, whenever you run it:
 
 ```bash
 npm run cli:build
@@ -84,7 +84,7 @@ node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario saved --run-dir <anothe
 node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario retire --run-dir <run folder> --live
 ```
 
-PowerShell: set each variable with `$env:NAME = 'value'` first, then run the `npm run` line; `Remove-Item env:NAME` afterwards. Run the eval from a shell where `DEV_CONFIG_DIR` is unset or points anywhere but the dedicated profile (`profile-is-config-directory` otherwise). After `retire`, the run folder still holds the account store (with the account's email address) and the signed-out records: delete the folder when you no longer need its evidence.
+PowerShell: set each variable with `$env:NAME = 'value'` first, then run the `npm run` line; `Remove-Item env:NAME` afterwards. Run the eval from a shell where `DEV_CONFIG_DIR` is unset or points anywhere but the dedicated profile (`profile-is-config-directory` otherwise). The dedicated profile keeps its ChatGPT vault key in a system keychain item of its own, `chatgpt-vault-key-<16 hex digits>`, never the `chatgpt-vault-key` item your own profile uses; `retire` removes that item after its sign-out (an abandoned profile's item is removed by its exact name, as `scripts/chatgpt-acceptance/README.md` says under "If a run is killed"). After `retire`, the run folder still holds the account store (with the account's email address) and the signed-out records: delete the folder when you no longer need its evidence.
 
 How a case reaches the connection: before anything else, the runner checks `STUDIO_EVAL_CHATGPT_PROFILE` (an absolute path to an existing folder that is not `~/.studio`, not inside it, does not resolve into it through a link, and is not the folder the eval process keeps its own Studio config in), then points this process's ChatGPT state at it with `setChatGptStateDirectory` (`packages/agent/node/chatgpt/state-directory.ts`, development-only callers; it refuses to move the state once used), and only then lists the connections there. Every read and write of ChatGPT state (the account index, the sealed credential records, a refresh, a sign-in marked as needed) happens in the dedicated profile itself, under the lockfiles that profile's own processes take. Nothing links to or copies credential state; the case's own Studio profile (`shared.json`, global instructions) and site registry are still temporary folders of its own (below). The agent runs in the eval process, so no forked process needs the profile. The runner also installs the ChatGPT token client and writes the conversation's ChatGPT record before every turn, as the CLI does.
 
@@ -217,24 +217,37 @@ Every result now also has `turns` (per user message: whether it was `reopened`, 
 
 Each case makes a site registry (`studio-eval-registry-*`) and a Studio profile (`studio-eval-config-*`, holding the copy of your WordPress.com login, links to Studio's downloads, `server-files`, `php-bin` and `import-runtime`, in the source profile, and the case's own `mu-plugins`) in the system temporary folder, and a sites folder (`studio-eval-sites-*`); a case that names a provider also makes a process manager home (`studio-eval-daemon-*`). The runner removes the registry and the profile when the case ends, whether it passed, failed, was refused or threw (the download links first, as links), the request observations file with them, the process manager home once its process manager has ended, and the sites folder when no site is left in it. It keeps what the result points to: the session file (`studio-eval-sessions`), the outcome folder (`studio-eval-outcome-*`) and the result file. No folder links to ChatGPT state.
 
-A case killed before it ends (Ctrl+C on promptfoo, a closed terminal) leaves its registry, profile, sites folder (`studio-eval-sites-*`) and request observations file (`studio-eval-requests-*`) behind, and may leave a site server running: check for one (`studio site list`, or look for a leftover PHP process) and stop it before removing its folder. Remove a leftover profile's links before the folder, so nothing they point to is touched:
+A case killed before it ends (Ctrl+C on promptfoo, a closed terminal) leaves its registry, profile, sites folder (`studio-eval-sites-*`), request observations file (`studio-eval-requests-*`) and, for a case that named a provider, process manager home (`studio-eval-daemon-*`) behind, and may leave a site server running. `studio site list` doesn't show such a site: it lists the sites in your own Studio profile's registry, never a case's. A site runs as `php` processes started with `-S 127.0.0.1:<port>` in the site's folder: find the ones whose working folder is in the leftover `studio-eval-sites-*` folder (Process Explorer shows it on Windows, `lsof -a -d cwd -c php` on macOS and Linux) and end them by process id before removing anything. A case that named a provider ran its sites under a process manager of its own, which may be left running with nothing to do; its command line is the same as your own Studio's, so end it only by the process id `lsof <its studio-eval-daemon-* folder>/daemon.sock` names (macOS and Linux), and on Windows leave it until you next restart.
+
+Then remove the folders, a leftover profile's links first and as links, so nothing they point to is touched. Windows PowerShell 5.1 can follow a directory link while removing a folder recursively, into the folder the link points to, so the PowerShell lines stop at the first link they can't delete and only then remove anything:
 
 ```powershell
-Get-ChildItem $env:TEMP -Directory -Filter 'studio-eval-config-*' | ForEach-Object {
-	Get-ChildItem $_.FullName -Force | Where-Object { $_.LinkType } | ForEach-Object { $_.Delete() }
-	Remove-Item $_.FullName -Recurse -Force
+& {
+	$ErrorActionPreference = 'Stop'
+	Get-ChildItem $env:TEMP -Directory -Filter 'studio-eval-config-*' | ForEach-Object {
+		$folder = $_.FullName
+		Get-ChildItem $folder -Force | Where-Object { $_.LinkType } | ForEach-Object { $_.Delete() }
+		if ( Get-ChildItem $folder -Force | Where-Object { $_.LinkType } ) {
+			throw "A link is still in $folder, so nothing was removed."
+		}
+		Remove-Item $folder -Recurse -Force
+	}
+	Get-ChildItem $env:TEMP -Directory -Filter 'studio-eval-registry-*' | Remove-Item -Recurse -Force
+	Get-ChildItem $env:TEMP -Directory -Filter 'studio-eval-sites-*' | Remove-Item -Recurse -Force
+	Get-ChildItem $env:TEMP -Directory -Filter 'studio-eval-daemon-*' | Remove-Item -Recurse -Force
+	Get-ChildItem $env:TEMP -File -Filter 'studio-eval-requests-*' | Remove-Item -Force
 }
-Get-ChildItem $env:TEMP -Directory -Filter 'studio-eval-registry-*' | Remove-Item -Recurse -Force
-Get-ChildItem $env:TEMP -Directory -Filter 'studio-eval-sites-*' | Remove-Item -Recurse -Force
-Get-ChildItem $env:TEMP -File -Filter 'studio-eval-requests-*' | Remove-Item -Force
 ```
 
 ```sh
 for dir in "${TMPDIR:-/tmp}"/studio-eval-config-*; do
+	[ -d "$dir" ] || continue
 	find "$dir" -maxdepth 1 -type l -delete && rm -rf "$dir"
 done
-rm -rf "${TMPDIR:-/tmp}"/studio-eval-registry-* "${TMPDIR:-/tmp}"/studio-eval-sites-* "${TMPDIR:-/tmp}"/studio-eval-requests-*
+rm -rf "${TMPDIR:-/tmp}"/studio-eval-registry-* "${TMPDIR:-/tmp}"/studio-eval-sites-* "${TMPDIR:-/tmp}"/studio-eval-daemon-* "${TMPDIR:-/tmp}"/studio-eval-requests-*
 ```
+
+`rm -rf` removes a link as a link. The result files, session files and outcome folders the runner keeps are private too (above): delete `studio-eval-*.json`, `studio-eval-sessions` and `studio-eval-outcome-*` in the same folder when you no longer need them.
 
 ## Running the runner directly
 
