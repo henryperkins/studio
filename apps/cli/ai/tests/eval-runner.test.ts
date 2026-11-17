@@ -730,6 +730,7 @@ describe( 'eval runner provider selection', () => {
 				status: 'passed',
 				observations: {
 					judgesCaseChecks: false,
+					everyCheckRecorded: false,
 					modelRequests: 1,
 					bearerMatches: true,
 					guardRefused: 0,
@@ -746,6 +747,18 @@ describe( 'eval runner provider selection', () => {
 				}
 			}
 
+			// The var a configuration sets when every one of its checks writes a record.
+			const declared = input(
+				{ caseId: 'parity-identity', everyCheckRecorded: true },
+				chatGptEnv()
+			);
+			expect(
+				writeCaseSummary( declared, await runEvalUntyped( declared ), {
+					env: { STUDIO_EVAL_SUMMARY_DIR: summaries },
+					facts,
+				} )?.record.observations
+			).toMatchObject( { everyCheckRecorded: true } );
+
 			// A run that threw: the runner's main writes it with what it caught.
 			expect(
 				writeCaseSummary(
@@ -753,7 +766,7 @@ describe( 'eval runner provider selection', () => {
 					{ success: false, error: 'it threw' },
 					{ env: { STUDIO_EVAL_SUMMARY_DIR: summaries }, threw: true, facts }
 				)?.record
-			).toMatchObject( { run: 2, status: 'failed', code: 'run-failed' } );
+			).toMatchObject( { run: 3, status: 'failed', code: 'run-failed' } );
 
 			const elsewhere = path.join( paths.root, 'no-summaries' );
 			const unselected = input( { caseId: 'identity' } );

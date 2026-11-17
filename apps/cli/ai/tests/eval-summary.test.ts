@@ -119,6 +119,7 @@ describe( 'the sanitized summary of a provider-qualified eval case', () => {
 			durationS: 12.3,
 			observations: {
 				judgesCaseChecks: false,
+				everyCheckRecorded: false,
 				success: true,
 				timedOut: false,
 				modelRequests: 3,
@@ -294,6 +295,19 @@ describe( 'the sanitized summary of a provider-qualified eval case', () => {
 		expect( record ).toMatchObject( { status, code } );
 		expect( findUnsafeRecord( record ) ).toBeNull();
 		expect( JSON.stringify( record ) ).not.toMatch( /jordan|example/i );
+	} );
+
+	it( 'says every check of the case writes a record only when the case’s configuration declares it', () => {
+		expect( write( seeded() ).record.observations ).toMatchObject( { everyCheckRecorded: false } );
+		expect( write( seeded(), { everyCheckRecorded: false } ).record.observations ).toMatchObject( {
+			everyCheckRecorded: false,
+		} );
+		expect( write( seeded(), { everyCheckRecorded: true } ).record.observations ).toMatchObject( {
+			everyCheckRecorded: true,
+		} );
+		expect(
+			evalCaseSummary( seeded(), { ...forCase, everyCheckRecorded: true } ).observations
+		).toMatchObject( { everyCheckRecorded: true } );
 	} );
 
 	it( 'records a run that threw as run-failed, not as a route without a model request', () => {

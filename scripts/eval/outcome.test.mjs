@@ -587,8 +587,7 @@ describe( 'the records a provider-qualified case’s checks add to its summary',
 		const evalSummary = startRun( summaries, result );
 		const file = path.join( dir, `result-${ count++ }.json` );
 		writeFileSync( file, JSON.stringify( { ...result, evalSummary } ) );
-		const output = `EVAL_RUNNER_RESULT_FILE=${ file }
-`;
+		const output = `EVAL_RUNNER_RESULT_FILE=${ file }`;
 		// The result of an earlier invocation: older than this process.
 		const earlier = new Date( Date.now() - 3 * 24 * 3600 * 1000 );
 		utimesSync( file, earlier, earlier );

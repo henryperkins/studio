@@ -62,6 +62,9 @@ defaultTest:
   vars:
     requireProvider: true
     remote: mock
+    # Every check of every case here goes through outcome.mjs, which adds a
+    # record of its own to the case's summary; the route record says so.
+    everyCheckRecorded: true
   assert:
     - type: javascript
       value: file://outcome.mjs:ranOnRequestedRoute

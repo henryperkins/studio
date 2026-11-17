@@ -1302,6 +1302,7 @@ export function writeCaseSummary(
 			provider: input.provider.ok ? input.provider.request.provider : undefined,
 			directory: evalSummaryDirectory( env ),
 			threw,
+			everyCheckRecorded: input.everyCheckRecorded,
 			selection: input.provider.ok ? input.provider.request : undefined,
 			facts: facts(),
 		} );

@@ -93,6 +93,7 @@ export const EVAL_RUNNER_VARS = [
 	'attachments',
 	'resumeAfterStop',
 	'needsToolImages',
+	'everyCheckRecorded',
 ] as const;
 
 export interface EvalRunnerVars {
@@ -134,6 +135,10 @@ export interface EvalRunnerVars {
 	// so on a route whose capability table doesn't qualify the model for them
 	// it is blocked before it runs.
 	needsToolImages: boolean;
+	// The configuration says every check of its cases writes a record to the
+	// case's summary (all its checks go through outcome.mjs). Set in the
+	// parity configuration's defaults only; the route record repeats it.
+	everyCheckRecorded: boolean;
 }
 
 /** Parses the vars the runner reads; zod errors name a malformed one. */
@@ -156,5 +161,6 @@ export function parseEvalRunnerVars( vars: Record< string, unknown > ): EvalRunn
 				: undefined,
 		attachments: vars.attachments ? attachmentsSchema.parse( vars.attachments ) : undefined,
 		needsToolImages: vars.needsToolImages === true,
+		everyCheckRecorded: vars.everyCheckRecorded === true,
 	};
 }

@@ -152,11 +152,18 @@ function summaryNames( caseId: unknown, provider: unknown ) {
  * was not the one selected or the run failed otherwise (each with a typed
  * code), `passed` otherwise. Its `judgesCaseChecks: false` observation says
  * that none of the case's own checks is judged by it: each check appends a
- * record of its own.
+ * record of its own. Its `everyCheckRecorded` observation says whether every
+ * check of the case does so, as the case's configuration declares it: false
+ * when it doesn't (a check that writes no record can't be seen here).
  */
 export function evalCaseSummary(
 	result: EvalSummarySource,
-	{ caseId, provider, threw = false }: { caseId: unknown; provider: unknown; threw?: boolean }
+	{
+		caseId,
+		provider,
+		threw = false,
+		everyCheckRecorded = false,
+	}: { caseId: unknown; provider: unknown; threw?: boolean; everyCheckRecorded?: boolean }
 ): Omit< StageRecord, 'run' > {
 	const names = summaryNames( caseId, provider );
 	const route = result.providerRoute ?? undefined;
@@ -198,6 +205,7 @@ export function evalCaseSummary(
 		durationS: Math.round( totalMs / 100 ) / 10,
 		observations: {
 			judgesCaseChecks: false,
+			everyCheckRecorded: everyCheckRecorded === true,
 			success: result.success === true,
 			timedOut: result.timedOut === true,
 			...routeObservations( route?.requested, route?.executed ),
@@ -237,6 +245,8 @@ export interface EvalSummaryOptions {
 	directory: string;
 	/** The run threw instead of returning a result. */
 	threw?: boolean;
+	/** The case's configuration declares that every check of the case writes a record. */
+	everyCheckRecorded?: boolean;
 	/** What the case selected, for a run refused before its route was resolved. */
 	selection?: { model?: unknown; effort?: unknown };
 	facts: EvalRunFacts;

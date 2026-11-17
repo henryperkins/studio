@@ -8,6 +8,7 @@ import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { parse } from 'yaml';
 import { EVAL_RUNNER_VARS, parseEvalRunnerVars } from '../../apps/cli/ai/eval-input.ts';
+import { evalCaseSummary } from '../../apps/cli/ai/eval-summary.ts';
 import * as checks from './outcome.mjs';
 
 const configText = readFileSync(
@@ -30,6 +31,41 @@ const cases = config.tests.map( ( test ) => ( {
 	vars: { ...config.defaultTest.vars, ...test.vars },
 	checks: [ ...named( config.defaultTest.assert ), ...named( test.assert ) ],
 } ) );
+
+describe( 'whether every check of a case writes a record', () => {
+	const routeRecordSays = ( vars ) =>
+		evalCaseSummary(
+			{ success: true },
+			{
+				caseId: vars.caseId,
+				provider: 'chatgpt-oauth',
+				everyCheckRecorded: parseEvalRunnerVars( vars ).everyCheckRecorded,
+			}
+		).observations.everyCheckRecorded;
+
+	test( 'the parity configuration declares it in its defaults, none of its cases overrides it, and all its checks are outcome.mjs checks', () => {
+		expect( config.defaultTest.vars.everyCheckRecorded ).toBe( true );
+		for ( const test of config.tests ) {
+			expect( test.vars ?? {}, test.vars?.caseId ).not.toHaveProperty( 'everyCheckRecorded' );
+		}
+		for ( const test of config.tests ) {
+			for ( const { value } of [ ...config.defaultTest.assert, ...( test.assert ?? [] ) ] ) {
+				expect( value, test.vars.caseId ).toMatch( /^file:\/\/outcome\.mjs:\w+$/ );
+			}
+		}
+	} );
+
+	test( 'the route record of every parity case says it, and that of every main-suite case says it does not', () => {
+		for ( const { vars } of cases ) {
+			expect( routeRecordSays( vars ), vars.caseId ).toBe( true );
+		}
+		expect( JSON.stringify( mainConfig ) ).not.toContain( 'everyCheckRecorded' );
+		for ( const test of mainConfig.tests ) {
+			const vars = { ...mainConfig.defaultTest?.vars, ...test.vars };
+			expect( routeRecordSays( vars ), vars.caseId ).toBe( false );
+		}
+	} );
+} );
 
 describe( 'the parity script', () => {
 	test( 'runs promptfoo without its cache, so no case is answered from an earlier run’s output', () => {
