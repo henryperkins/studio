@@ -674,6 +674,46 @@ describe( 'generate_images on the Claude route', () => {
 		expect( generateImages ).not.toHaveBeenCalled();
 	} );
 
+	it( 'deletes again what such a reservation inserted for images whose names end in a hyphen and digits, or that WordPress stored under a unique name, and nothing named otherwise', async () => {
+		const requested = [ 'image-0.png', 'image-1.png', 'team-2024.png', 'photo.png' ];
+		const entry = ( id: number, name: string, extra: object = {} ) => ( {
+			id,
+			file: `wp-content/uploads/2026/11/${ name }`,
+			url: `http://localhost:8888/wp-content/uploads/2026/11/${ name }`,
+			...extra,
+		} );
+		const { bridge, host, site } = await setupImages();
+		host.sites.wpCli = vi.fn( async ( _site, args ) => ( {
+			exitCode: 0,
+			stdout: args[ 1 ]?.includes( 'wp_insert_attachment' )
+				? JSON.stringify( [
+						entry( 7, 'image-0.png' ),
+						entry( 8, 'image-1.png' ),
+						entry( 9, 'team-2024.png' ),
+						// photo.png was taken, so WordPress stored it as photo-1.png;
+						// this entry lacks its URL, so the output does not have its shape.
+						entry( 10, 'photo-1.png', { url: undefined } ),
+						// Named for no image of this call: a stem of a requested name,
+						// another suffix, or a requested name's stem with no digits.
+						entry( 3, 'image.png' ),
+						entry( 4, 'team.png' ),
+						entry( 5, 'photo-x.png' ),
+						entry( 6, 'team-2024-copy.png' ),
+				  ] )
+				: '',
+			stderr: '',
+		} ) );
+		const uploads = path.join( site, 'wp-content', 'uploads' );
+		const result = await bridge.invoke( 'generate_images', {
+			images: requested.map( ( name ) => ( { path: path.join( uploads, name ), subject: name } ) ),
+		} );
+		expect( result.isError ).toBe( true );
+		const calls = vi.mocked( host.sites.wpCli ).mock.calls;
+		expect( calls ).toHaveLength( 2 );
+		expect( decoded( calls[ 1 ][ 1 ][ 1 ] ) ).toEqual( { ready: [], failed: [ 7, 8, 9, 10 ] } );
+		expect( generateImages ).not.toHaveBeenCalled();
+	} );
+
 	it( 'still runs no eval through wp_cli, and completes or deletes only attachments the same call reserved in the conversation’s site, once each', async () => {
 		const { bridge, host, policy, localSite, otherSite, other } = await setupImages();
 		reserving( host );

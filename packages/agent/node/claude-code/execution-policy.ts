@@ -493,20 +493,30 @@ function isImageFileName( name: unknown ): name is string {
 	return typeof name === 'string' && name.length <= 255 && /^[^\\/:\0]+\.png$/i.test( name );
 }
 
+// Whether WordPress stored an image the call named as `file`: under that name,
+// or, when the name was taken, under its stem followed by a hyphen and digits,
+// the suffix `wp_unique_filename` adds.
+function isStoredAs( file: string, name: string ): boolean {
+	const stored = file.toLowerCase();
+	const requested = name.toLowerCase();
+	if ( stored === requested ) return true;
+	const stem = requested.replace( /\.png$/, '' );
+	return stored.startsWith( `${ stem }-` ) && /^-\d+\.png$/.test( stored.slice( stem.length ) );
+}
+
 // The attachments a reservation that does not have its shape inserted for the
 // call's images, as far as its output can tell: each entry with an ID of its
-// own and a PNG file named for one of those images, under the name WordPress
-// would give it to keep it unique. An entry named for nothing the call asked
-// for is not this reservation's to delete.
+// own and a PNG file named for one of those images, under its own name or the
+// one WordPress gives it to keep it unique. An entry named for nothing the call
+// asked for is not this reservation's to delete.
 function insertedFor( reserved: unknown, names: readonly string[] ): number[] {
 	if ( ! Array.isArray( reserved ) ) return [];
-	const stems = names.map( ( name ) => name.replace( /\.png$/i, '' ).toLowerCase() );
 	const ids = new Set< number >();
 	for ( const entry of reserved ) {
 		if ( ! isRecord( entry ) || ! isAttachmentId( entry.id ) || typeof entry.file !== 'string' )
 			continue;
-		const named = /^(.+?)(?:-\d+)?\.png$/i.exec( path.posix.basename( entry.file ) )?.[ 1 ];
-		if ( named && stems.includes( named.toLowerCase() ) ) ids.add( entry.id );
+		const file = path.posix.basename( entry.file );
+		if ( names.some( ( name ) => isStoredAs( file, name ) ) ) ids.add( entry.id );
 	}
 	return [ ...ids ];
 }
