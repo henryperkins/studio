@@ -209,3 +209,116 @@ it( 'either denies a hostile path or sends it to exactly the site it allowed', a
 	// The table holds legitimate requests too, so the comparison above really ran.
 	expect( allowed ).toBeGreaterThanOrEqual( 30 );
 } );
+
+// The query keys the eval harness's reviewed checklist refuses, spelled every
+// way the client or the server could read them as the same key, and more.
+const REFUSED_KEYS = [
+	// What the client lifts out of the query into where the request goes.
+	'apiNamespace',
+	'APINAMESPACE',
+	' apiNamespace',
+	'apiNamespace ',
+	'api_namespace',
+	'apiVersion',
+	'apiversion',
+	'proxyOrigin',
+	'PROXYORIGIN',
+	'proxy%4Frigin',
+	// What WordPress reads as another method: PHP folds `.`, spaces and `[`
+	// into `_`, drops leading spaces and makes `_method[]` the same key.
+	'_method',
+	'_METHOD',
+	'.method',
+	' _method',
+	' method',
+	'_method[]',
+	'_method[0]',
+	'%5Fmethod',
+	'%5fmethod',
+	'method',
+	'Method',
+	'me.thod',
+	'http_method_override',
+	// What WordPress reads in place of the path's route.
+	'rest_route',
+	'REST_ROUTE',
+	'rest.route',
+	'rest route',
+	' rest_route',
+	'rest_route[]',
+	'restRoute',
+	'%72est_route',
+	// A key with a control character, which the server may read as anything.
+	'per_page\u0000',
+	'\t_method',
+	'%00method',
+];
+
+it( 'refuses every query key that changes where a request goes, its method or its route, however it is spelled', () => {
+	const scope = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+	for ( const key of REFUSED_KEYS )
+		for ( const method of [ 'GET', 'POST' ] )
+			expect(
+				scope( { siteId: 42, method, path: '/posts', query: { [ key ]: 'x' } } ),
+				`${ method } ${ JSON.stringify( key ) }`
+			).toBeUndefined();
+	for ( const key of [ 'per_page', '_fields', 'fields', 'status', 'context', 'methods', 'page' ] )
+		expect(
+			scope( { siteId: 42, method: 'GET', path: '/posts', query: { [ key ]: '1' } } ),
+			key
+		).toEqual( {
+			wpcomSiteId: 42,
+		} );
+} );
+
+it( 'refuses a `.` segment, which the parser would drop from the path it decides on', () => {
+	const scope = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+	for ( const path of [
+		'/./posts',
+		'/posts/.',
+		'./posts',
+		'!/sites/42/./posts',
+		'!/./sites/42/posts',
+	] )
+		expect( scope( { siteId: 42, method: 'GET', path } ), path ).toBeUndefined();
+} );
+
+it( 'lets a request change a site only through that site’s WordPress REST API, under the site, never the legacy or WordPress.com APIs or the account', () => {
+	const scope = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+	const changes: Array< [ Record< string, unknown >, { wpcomSiteId: number } | undefined ] > = [
+		[ { path: '/posts' }, { wpcomSiteId: 42 } ],
+		[ { path: 'posts/7' }, { wpcomSiteId: 42 } ],
+		[ { path: '/posts', apiNamespace: 'wp/v2' }, { wpcomSiteId: 42 } ],
+		[ { path: '!/sites/42/posts', apiNamespace: 'wp/v2' }, { wpcomSiteId: 42 } ],
+		[ { path: '/templates/twentytwentyfour//home' }, { wpcomSiteId: 42 } ],
+		[ { path: '/plugins/akismet/akismet' }, { wpcomSiteId: 42 } ],
+		// The legacy site API, whose bodies can name another site (a reblog's
+		// `destination_site_id`, a follow, a like), and WordPress.com's own.
+		[ { path: '/settings', apiNamespace: '' }, undefined ],
+		[ { path: '/posts/1/reblogs/new', apiNamespace: '' }, undefined ],
+		[ { path: '/plugins/akismet/install', apiNamespace: '' }, undefined ],
+		[ { path: '!/sites/42/posts/new', apiNamespace: '' }, undefined ],
+		[ { path: '/studio-app/sync/import/initiate', apiNamespace: 'wpcom/v2' }, undefined ],
+		// The site itself rather than something in it, or an empty segment there.
+		[ { path: '/' }, undefined ],
+		[ { path: '' }, undefined ],
+		[ { path: '!/sites/42', apiNamespace: 'wp/v2' }, undefined ],
+		[ { path: '//posts' }, undefined ],
+		// The account.
+		[ { path: '!/me', apiNamespace: '' }, undefined ],
+		[ { path: '!/me/settings', apiNamespace: '' }, undefined ],
+		[ { path: '!/plans/features', apiNamespace: 'wpcom/v2' }, undefined ],
+	];
+	for ( const method of [ 'POST', 'PUT', 'DELETE' ] )
+		for ( const [ args, decided ] of changes )
+			expect(
+				scope( { siteId: 42, method, ...args } ),
+				`${ method } ${ JSON.stringify( args ) }`
+			).toEqual( decided );
+	// What the same paths read, for comparison: reads may use every namespace.
+	expect( scope( { siteId: 42, method: 'GET', path: '/settings', apiNamespace: '' } ) ).toEqual( {
+		wpcomSiteId: 42,
+	} );
+	expect( scope( { siteId: 42, method: 'GET', path: '/' } ) ).toEqual( { wpcomSiteId: 42 } );
+	expect( scope( { siteId: 1, method: 'GET', path: '!/me', apiNamespace: '' } ) ).toEqual( {} );
+} );

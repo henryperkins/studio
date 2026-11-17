@@ -12,16 +12,63 @@ const WPCOM_ACCOUNT_READS: ReadonlySet< string > = new Set( [ '/me', '/plans/fea
 // default; an empty one means WordPress.com REST v1.1.
 const WPCOM_NAMESPACES: ReadonlySet< string > = new Set( [ '', 'wp/v2', 'wpcom/v2' ] );
 
-// Query keys the WordPress.com client turns into where the request goes, or
-// that WordPress reads as another method.
-const WPCOM_TRANSPORT_KEYS: ReadonlySet< string > = new Set( [
+// The only namespace a request may change something through: the site's own
+// WordPress REST API. A change through the legacy site API (v1.1) or
+// WordPress.com's own (`wpcom/v2`), though addressed to the site, can act on
+// another site or on the account through its body (a reblog's
+// `destination_site_id`, a follow, a like), so it is refused.
+const WPCOM_CHANGE_NAMESPACE = 'wp/v2';
+
+// Query keys a request may not carry: those the WordPress.com client lifts out
+// of the query into where the request goes (`apiNamespace`, `apiVersion`,
+// `proxyOrigin`), those WordPress reads as another method (`_method`, and
+// `method` and `http_method_override`, refused as well), and `rest_route`,
+// which WordPress reads in place of the path's route.
+const WPCOM_REFUSED_KEYS: ReadonlySet< string > = new Set( [
 	'apinamespace',
 	'apiversion',
 	'proxyorigin',
 	'_method',
 	'method',
 	'http_method_override',
+	'rest_route',
 ] );
+const WPCOM_REFUSED_LETTERS: ReadonlySet< string > = new Set(
+	[ ...WPCOM_REFUSED_KEYS ].map( ( key ) => key.replace( /_/g, '' ) )
+);
+
+const hasControlCharacter = ( text: string ) =>
+	[ ...text ].some( ( character ) => character < ' ' || character === '\u007f' );
+
+function decodedKey( key: string ): string {
+	try {
+		return decodeURIComponent( key );
+	} catch {
+		return key;
+	}
+}
+
+/**
+ * Whether a query key is one a request may not carry, however the client or
+ * the server could read it: decoded once; trimmed of the leading whitespace
+ * PHP drops; up to a `[`, which makes `_method[]` the same key; with `.`,
+ * whitespace and `[` folded into `_` as PHP folds them; in any case; and also
+ * by its letters and digits alone. A key with a control character is refused
+ * outright. Stricter than the server, as the eval harness's checklist is: a
+ * read refused here costs the model one retry.
+ */
+export function isRefusedWpcomQueryKey( key: string ): boolean {
+	const decoded = decodedKey( key );
+	if ( hasControlCharacter( key ) || hasControlCharacter( decoded ) ) return true;
+	const stripped = decoded.replace( /^\s+/, '' );
+	const bracket = stripped.indexOf( '[' );
+	const base = bracket > 0 ? stripped.slice( 0, bracket ) : stripped;
+	return (
+		WPCOM_REFUSED_KEYS.has( base.replace( /[.\s[]/g, '_' ).toLowerCase() ) ||
+		WPCOM_REFUSED_KEYS.has( stripped.trim().toLowerCase() ) ||
+		WPCOM_REFUSED_LETTERS.has( decoded.replace( /[^a-z0-9]/gi, '' ).toLowerCase() )
+	);
+}
 
 // The origin the WordPress.com client sends to unless a transport option, which
 // the scope refuses, names another.
@@ -29,12 +76,13 @@ const WPCOM_API_ORIGIN = 'https://public-api.wordpress.com';
 
 // A request path: printable ASCII path characters, and percent-escapes that do
 // not decode to whitespace, a control character, '%', '.', '/' or '\'. No
-// query, fragment, backslash or raw whitespace.
+// query, fragment, backslash or raw whitespace, and no `.` or `..` segment.
 const WPCOM_PATH =
 	/^(?:[A-Za-z0-9\-._~!$&'()*+,=:@/]|%(?![01][0-9a-f]|2[05ef]|5c|7f)[0-9a-f]{2})*$/i;
 
 function isWpcomPath( value: string ): boolean {
-	if ( ! WPCOM_PATH.test( value ) || value.includes( '..' ) ) return false;
+	if ( ! WPCOM_PATH.test( value ) || value.includes( '..' ) || value.split( '/' ).includes( '.' ) )
+		return false;
 	try {
 		decodeURIComponent( value );
 		return true;
@@ -46,7 +94,10 @@ function isWpcomPath( value: string ): boolean {
 // The WordPress.com scope of a `wpcom_request` call. The path must match the
 // grammar above; the URL is then composed exactly as the tool and client
 // compose it, parsed as the client parses it, and the scope is the site in
-// that parsed path, which for a relative path must be the site it names.
+// that parsed path, which for a relative path must be the site it names. A
+// read may use any allowed namespace and reach the account's own profile and
+// plan features; a change only goes through the site's WordPress REST API, to
+// something under the site.
 export function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefined {
 	if ( ! isRecord( args ) || typeof args.path !== 'string' ) return;
 	if (
@@ -56,8 +107,7 @@ export function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefine
 		return;
 	if (
 		args.query !== undefined &&
-		( ! isRecord( args.query ) ||
-			Object.keys( args.query ).some( ( key ) => WPCOM_TRANSPORT_KEYS.has( key.toLowerCase() ) ) )
+		( ! isRecord( args.query ) || Object.keys( args.query ).some( isRefusedWpcomQueryKey ) )
 	)
 		return;
 	const absolute = args.path.startsWith( '!' );
@@ -86,11 +136,18 @@ export function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefine
 	)
 		return;
 	const route = url.pathname.slice( base.length );
+	const reads = args.method === 'GET';
 	const site = /^\/sites\/([1-9]\d*)(?:\/|$)/.exec( route );
 	if ( site ) {
 		const id = Number( site[ 1 ] );
 		if ( ! Number.isSafeInteger( id ) || ( ! absolute && id !== siteId ) ) return;
+		// A change reaches something in the site: a first segment after it.
+		if (
+			! reads &&
+			( namespace !== WPCOM_CHANGE_NAMESPACE || ! /^\/sites\/[1-9]\d*\/[^/]/.test( route ) )
+		)
+			return;
 		return { wpcomSiteId: id };
 	}
-	return absolute && args.method === 'GET' && WPCOM_ACCOUNT_READS.has( route ) ? {} : undefined;
+	return absolute && reads && WPCOM_ACCOUNT_READS.has( route ) ? {} : undefined;
 }
