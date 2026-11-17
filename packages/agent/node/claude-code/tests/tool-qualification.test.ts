@@ -139,11 +139,24 @@ const QUALIFIED: Record< string, Record< string, unknown > > = {
 	},
 };
 
+// What a module's code shows when it composes and sends a request itself. Only
+// a channel that bounds such a request explains it: one bound only by the host
+// guard reaches WordPress.com through host operations, whose requests are the
+// host's, so it explains none the tool would send itself.
+const OWN_REQUEST = [ 'requestsNetwork', 'reachesWpcom' ].join();
+const throughHostOnly = ( bindings: unknown ) =>
+	Array.isArray( bindings ) &&
+	bindings.length > 0 &&
+	bindings.every( ( binding ) => binding === 'host' );
+const explains = ( shown: string[], declared: unknown ) =>
+	declared !== false && ! ( shown.join() === OWN_REQUEST && throughHostOnly( declared ) );
+
 // Code a qualified tool's module links but the tool never runs. The scan reads
 // whole files, so a helper the tool does not call shows a channel the tool does
 // not use. Each entry names the channels, the only files that show them, and
 // why the tool never runs that code; it holds only while those files are the
-// only ones that show them and the tool declares those channels unused.
+// only ones that show them and the tool declares those channels unused, or
+// for a request, bound only by the host guard.
 const SHARED_CONFIG_SAVE = {
 	channels: [ 'spawnsProcess' ],
 	files: [ '../common/lib/hide-dir-windows.ts' ],
@@ -153,7 +166,16 @@ const UNREACHED: Record<
 	string,
 	ReadonlyArray< { channels: string[]; files: string[]; why: string } >
 > = {
-	site_list: [ SHARED_CONFIG_SAVE ],
+	site_list: [
+		SHARED_CONFIG_SAVE,
+		// It reaches WordPress.com only through the host's `wpcom.sites`, which
+		// the guarded host binds.
+		{
+			channels: [ 'requestsNetwork', 'reachesWpcom' ],
+			files: [ '../common/lib/automattician.ts' ],
+			why: '`isAutomatticianAccount` asks WordPress.com for the account’s teams; shared-config links only `isAutomatticianEmail` from that module, and the tool only reads the stored login (`readAuthToken`)',
+		},
+	],
 	site_connected_remote_sites: [ SHARED_CONFIG_SAVE ],
 	wpcom_request: [ SHARED_CONFIG_SAVE ],
 	send_feedback: [ SHARED_CONFIG_SAVE ],
@@ -163,6 +185,23 @@ const UNREACHED: Record<
 			channels: [ 'requestsNetwork', 'reachesWpcom' ],
 			files: [ '../common/lib/snapshots.ts' ],
 			why: '`fetchSnapshotUsage` asks WordPress.com for the account’s preview count; the tool only formats the previews the host lists (`getSnapshotLink`, `isSnapshotExpired`)',
+		},
+	],
+	// These reach WordPress.com only through the host's `previews.create` and
+	// `previews.update`, which the guarded host binds; what they link of
+	// `snapshots.ts` only formats the preview the host returns.
+	preview_create: [
+		{
+			channels: [ 'requestsNetwork', 'reachesWpcom' ],
+			files: [ '../common/lib/snapshots.ts' ],
+			why: '`fetchSnapshotUsage` asks WordPress.com for the account’s preview count; the tool only formats the link of the preview the host made (`getSnapshotLink`)',
+		},
+	],
+	preview_update: [
+		{
+			channels: [ 'requestsNetwork', 'reachesWpcom' ],
+			files: [ '../common/lib/snapshots.ts' ],
+			why: '`fetchSnapshotUsage` asks WordPress.com for the account’s preview count; the tool only formats the link of the preview the host updated (`getSnapshotLink`)',
 		},
 	],
 };
@@ -929,7 +968,7 @@ describe( 'Claude Studio tools that drive a browser', () => {
 				const { channels } = rule.qualification as { channels: Record< string, unknown > };
 				const shown = channelEvidence( module );
 				for ( const explained of shown ) {
-					const used = explained.some( ( channel ) => channels[ channel ] !== false );
+					const used = explained.some( ( channel ) => explains( explained, channels[ channel ] ) );
 					const unreached = UNREACHED[ name ]?.find(
 						( entry ) => entry.channels.join() === explained.join()
 					);
@@ -941,17 +980,17 @@ describe( 'Claude Studio tools that drive a browser', () => {
 					}
 					expect( used, `${ name } shows ${ explained.join( ' or ' ) }` ).toBe( true );
 				}
-				// An entry for code the tool no longer links, or for a channel it
-				// declares, is out of date.
+				// An entry for code the tool no longer links, or for a channel that
+				// explains what it shows, is out of date.
 				for ( const entry of UNREACHED[ name ] ?? [] ) {
 					expect(
 						shown.map( ( group ) => group.join() ),
 						`${ name }: ${ entry.why }`
 					).toContain( entry.channels.join() );
 					expect(
-						entry.channels.every( ( channel ) => channels[ channel ] === false ),
+						entry.channels.some( ( channel ) => explains( entry.channels, channels[ channel ] ) ),
 						`${ name }: ${ entry.why }`
-					).toBe( true );
+					).toBe( false );
 				}
 			}
 		expect( checked ).toBe( CLAUDE_ENABLED_TOOLS.studio.length );
