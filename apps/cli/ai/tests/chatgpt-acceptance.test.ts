@@ -2272,7 +2272,10 @@ describe( 'ChatGPT acceptance runner', () => {
 		} );
 
 		describe( 'retire', () => {
-			function provisioned() {
+			// What `provision` leaves: its run, and the registration and key item name in state.json.
+			function provisioned(
+				state: { vaultKeySuffix?: string } = { vaultKeySuffix: VAULT_KEY_SUFFIX }
+			) {
 				fs.mkdirSync( runDir, { recursive: true } );
 				const evidence = openAcceptanceEvidence( runDir, 'chatgpt' );
 				evidence.startRun( {
@@ -2286,7 +2289,12 @@ describe( 'ChatGPT acceptance runner', () => {
 					effort: 'medium',
 					gates: [],
 				} );
-				evidence.writeState( { schemaVersion: 1, registrationId: REGISTRATION, storage: 'vault' } );
+				evidence.writeState( {
+					schemaVersion: 1,
+					registrationId: REGISTRATION,
+					storage: 'vault',
+					...state,
+				} );
 			}
 
 			// Scripted services with the provisioned registration signed in.
@@ -2440,6 +2448,49 @@ describe( 'ChatGPT acceptance runner', () => {
 					observations: expect.objectContaining( { vaultKeyRemoved: true } ),
 				} );
 			} );
+
+			it.each< [ string, { vaultKeySuffix?: string }, () => string ] >( [
+				[
+					'the profile now names another item (the run directory moved since provision)',
+					{ vaultKeySuffix: VAULT_KEY_SUFFIX },
+					() => `${ UNSCOPED_VAULT_KEY_ITEM }-fedcba9876543210`,
+				],
+				[
+					'provision recorded no name (a directory an earlier runner made)',
+					{},
+					() => SCOPED_VAULT_KEY_ITEM,
+				],
+				[
+					'the profile names the unscoped item',
+					{ vaultKeySuffix: VAULT_KEY_SUFFIX },
+					() => UNSCOPED_VAULT_KEY_ITEM,
+				],
+				[
+					'the profile’s item can’t be named',
+					{ vaultKeySuffix: VAULT_KEY_SUFFIX },
+					(): string => {
+						throw new Error( 'unresolved' );
+					},
+				],
+			] )(
+				'fails, signing nothing out and removing nothing, when %s',
+				async ( _case, state, vaultKeyItem ) => {
+					provisioned( state );
+					const { services, calls } = signedIn( { vaultKeyItem } );
+					expect( await runChatGptAcceptance( retireArgs(), dependencies( services ) ) ).toBe( 1 );
+					expect( stageOf( 'profile-sign-out' )[ 0 ] ).toMatchObject( {
+						status: 'failed',
+						code: 'vault-key-name-mismatch',
+						observations: { vaultKeyNameMatches: false },
+					} );
+					expect( calls.log ).not.toContain( 'sign-out' );
+					expect( calls.log ).not.toContain( 'remove-vault-key' );
+					const cleanup = records().at( -1 );
+					expect( cleanup ).toMatchObject( { stage: 'cleanup', status: 'passed' } );
+					expect( cleanup?.observations ).not.toHaveProperty( 'vaultKeyRemoved' );
+					expectNothingUnsafe( [ 'test-access-token' ] );
+				}
+			);
 
 			it( 'fails when the remote revocation is not confirmed, and blocks a profile already signed out', async () => {
 				provisioned();

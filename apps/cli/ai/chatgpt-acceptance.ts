@@ -2071,6 +2071,15 @@ const RETIRE_STAGES: StageDefinition[] = [
 		name: 'profile-sign-out',
 		async run( ctx, observations ) {
 			const id = requireRegistration( ctx );
+			// The broker names the item from the profile's real path now; a profile
+			// moved or copied since `provision` names one its records weren't
+			// sealed under. Nothing is signed out or removed through another name.
+			const recorded = ctx.state.vaultKeySuffix
+				? `${ UNSCOPED_VAULT_KEY_ITEM }-${ ctx.state.vaultKeySuffix }`
+				: null;
+			observations.vaultKeyNameMatches =
+				recorded !== null && scopedVaultKeyItem( ctx ) === recorded;
+			check( observations.vaultKeyNameMatches, 'vault-key-name-mismatch' );
 			registerVaultKeyCleanup( ctx );
 			const account = await ctx.services.broker.readAccount( id );
 			observations.wasSignedIn = account?.state === 'signed-in';
