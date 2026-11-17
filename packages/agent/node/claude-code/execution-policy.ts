@@ -282,6 +282,8 @@ const REFUSALS = {
 		'On this route Studio pulls a site only with its default engine; the Reprint pull (STUDIO_ENABLE_PULL_REPRINT) keeps its state in .studio/pulls under the home folder, whatever Studio’s configuration folder is, and this route does not bind that folder.',
 	siteFiles:
 		'A file this tool writes must be an absolute path inside the folder of this conversation’s site, through every link it passes.',
+	bundledFiles:
+		'Studio copies only the files it ships itself for this tool, from its own folder outside every folder this conversation reaches, and could not read them there, so it copied nothing.',
 	mediaUploads:
 		'Studio adds an image to a site’s media library only when the file it writes for it lies, through every link, inside the site’s own folder and in the folder WordPress made for this month’s uploads; here it does not, since this site keeps its uploads outside its folder. Studio deleted the attachments it had reserved and generated nothing; WordPress may have left an empty folder for this month’s uploads where the site keeps them.',
 } as const;
@@ -1125,7 +1127,9 @@ export function createClaudeExecutionPolicy(
 		if ( rule.paths ) {
 			const paths = rule.paths( args, site?.path );
 			if ( ! paths ) {
-				refuse( toolCallId, REFUSALS.siteFiles );
+				// A rule that copies files Studio ships names what it writes by
+				// listing them, so names it cannot make mean they could not be read.
+				refuse( toolCallId, rule.bundled ? REFUSALS.bundledFiles : REFUSALS.siteFiles );
 				return false;
 			}
 			localPaths = paths;
@@ -1156,8 +1160,10 @@ export function createClaudeExecutionPolicy(
 					);
 					return false;
 				}
-			if ( rule.bundled && ! ( await isBundledFolder( rule.bundled(), context.localRoots ) ) )
+			if ( rule.bundled && ! ( await isBundledFolder( rule.bundled(), context.localRoots ) ) ) {
+				refuse( toolCallId, REFUSALS.bundledFiles );
 				return false;
+			}
 			for ( const file of rule.config?.() ?? [] )
 				if ( ! ( await isOutsideReach( file, context.localRoots ) ) ) return false;
 			if ( payload.files.length && ! ( await inPayloadFolder( payload ) ) ) {

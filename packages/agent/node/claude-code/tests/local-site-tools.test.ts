@@ -12,6 +12,21 @@ import { createPolicyFixture } from './fixtures/execution-policy';
 import type { ClaudeApprovalRequest, ClaudeExecutionContext } from '../execution-policy';
 import type { ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
+// Studio's own skills, unless a test makes the Taxonomist's scripts a folder
+// that does not exist, as a damaged installation would.
+const bundled = vi.hoisted( () => ( { missing: false } ) );
+vi.mock( '../../skills', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('../../skills') >();
+	return {
+		...actual,
+		getSkillPath: ( skillName: string, ...segments: string[] ) =>
+			actual.getSkillPath(
+				bundled.missing ? `${ skillName }-not-installed` : skillName,
+				...segments
+			),
+	};
+} );
+
 // The local site tools qualified for the Claude route, each driven through the
 // real execution policy and the bridge the SDK calls, against a fake host
 // whose operations are spies.
@@ -332,6 +347,7 @@ describe( 'site_export on the Claude route', () => {
 } );
 
 describe( 'install_taxonomy_scripts on the Claude route', () => {
+	const BUNDLED_REFUSAL = 'Studio copies only the files it ships itself for this tool';
 	const scripts = readdirSync( getSkillPath( 'taxonomist', 'scripts' ) );
 	const installed = ( site: string ) =>
 		existsSync( path.join( site, 'tmp', 'taxonomist' ) )
@@ -371,6 +387,22 @@ describe( 'install_taxonomy_scripts on the Claude route', () => {
 		} ) );
 		const result = await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'site' } );
 		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( BUNDLED_REFUSAL );
+		expect( installed( site ) ).toEqual( [] );
+		expect( journal ).toEqual( [] );
+	} );
+
+	it( 'says, when it cannot list the scripts Studio ships, that it copied nothing for that reason, not that a path lies outside the site', async () => {
+		const { bridge, site, journal } = await setup();
+		bundled.missing = true;
+		try {
+			const result = await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'site' } );
+			expect( result.isError ).toBe( true );
+			expect( text( result ) ).toContain( BUNDLED_REFUSAL );
+			expect( text( result ) ).not.toContain( 'inside the folder of this conversation’s site' );
+		} finally {
+			bundled.missing = false;
+		}
 		expect( installed( site ) ).toEqual( [] );
 		expect( journal ).toEqual( [] );
 	} );
