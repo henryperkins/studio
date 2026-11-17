@@ -6,6 +6,7 @@ import {
 	type StudioAgentHost,
 	AskUserQuestion,
 } from '@studio/agent/node';
+import { describeChatGptConnectionProblem } from '@studio/agent/node/chatgpt/connection-problem';
 import {
 	assertChatGptEnabled,
 	chatGptSettingsAction,
@@ -276,7 +277,7 @@ async function resolveChatGptConnection( sm: SessionManager ): Promise< Connecti
 	assertChatGptEnabled();
 	const result = resolveConnectionSelection( sm.getEntries(), await readConnectionRegistry() );
 	if ( ! result.ok ) {
-		throw new LoggerError( describeConnectionSelectionError( result.error ) );
+		throw new LoggerError( await describeChatGptConnectionProblem( result.error ) );
 	}
 	// On ChatGPT without a ChatGPT record (cleared, say): nothing names its connection.
 	if ( result.selection.model.providerId !== 'chatgpt-oauth' ) {

@@ -2924,6 +2924,42 @@ describe( 'acceptance turn digests', () => {
 		expect( classifyTurnFailure( 'Something else entirely' ) ).toEqual( [] );
 	} );
 
+	it.each( [ undefined, 'signed-in', 'signed-out', 'needs-sign-in' ] as const )(
+		'classifies the disconnected connection’s text for an account %s as before, in a turn’s digest too',
+		( state ) => {
+			const text = describeConnectionSelectionError(
+				{ code: 'disconnected', providerId: 'chatgpt-oauth' },
+				state
+			);
+			expect( classifyTurnFailure( text ) ).toEqual( [ 'connection-disconnected' ] );
+			// What blocked-after-sign-out, unoffered and the window fork read.
+			expect( digestTurnEvents( [ cliError( text ) ] ).failureCodes ).toEqual( [
+				'connection-disconnected',
+			] );
+		}
+	);
+
+	it.each( [ 'changed', 'unsupported' ] as const )(
+		'classifies the %s connection’s text alone, whatever the account’s state',
+		( code ) => {
+			for ( const state of [ undefined, 'signed-out', 'needs-sign-in' ] as const ) {
+				expect(
+					classifyTurnFailure(
+						describeConnectionSelectionError( { code, providerId: 'chatgpt-oauth' }, state )
+					)
+				).toEqual( [ `connection-${ code }` ] );
+			}
+		}
+	);
+
+	it( 'never takes another code’s text for a disconnected connection', () => {
+		for ( const code of [ 'signed-out', 'needs-sign-in', 'session-unavailable' ] as const ) {
+			expect( classifyTurnFailure( new ChatGptConnectionError( code ).message ) ).toEqual( [
+				code,
+			] );
+		}
+	} );
+
 	it( 'collects tool calls, the final answer, failure codes and how the turn ended', () => {
 		const digest = digestTurnEvents( [
 			toolStart( '1', 'wp_cli', { command: 'option get blogname' }, 10 ),

@@ -32,6 +32,7 @@ import {
 import { getAiTracksIdentity } from '@studio/common/lib/tracks-identity';
 import { type TSchema } from 'typebox';
 import { withDesignSystemPreview } from '@studio/agent/node/chat-artifacts';
+import { describeChatGptConnectionProblem } from '@studio/agent/node/chatgpt/connection-problem';
 import {
 	beginChatGptTurn,
 	listChatGptConnections,
@@ -57,6 +58,7 @@ import {
 	resolveConnectionSelection,
 	type ConnectionRegistryEntry,
 	type ConnectionSelection,
+	type ConnectionSelectionError,
 } from '@studio/agent/protocol/connections';
 import {
 	aiModelSupportsImages,
@@ -385,25 +387,32 @@ type TurnRouting =
 function validateChatGptSelectionLive(
 	selection: ConnectionSelection,
 	connections: readonly ConnectionRegistryEntry[]
-): string | undefined {
+): ConnectionSelectionError | undefined {
 	const providerId = 'chatgpt-oauth';
-	const connection = connections.find( ( entry ) => entry.connectionId === selection.connectionId );
+	const { connectionId } = selection;
+	const connection = connections.find( ( entry ) => entry.connectionId === connectionId );
 	if ( ! connection ) {
-		return describeConnectionSelectionError( { code: 'disconnected', providerId } );
+		return { code: 'disconnected', providerId, connectionId };
 	}
 	if ( connection.providerId !== providerId || connection.backend !== 'pi' ) {
-		return describeConnectionSelectionError( { code: 'unsupported', providerId } );
+		return { code: 'unsupported', providerId, connectionId };
 	}
 	if ( connection.revision !== selection.revision ) {
-		return describeConnectionSelectionError( { code: 'changed', providerId } );
+		return {
+			code: 'changed',
+			providerId,
+			connectionId,
+			recordedRevision: selection.revision,
+			currentRevision: connection.revision,
+		};
 	}
 	// The broker's own entry, with the subject it verified: never a renderer's view.
 	const identity = connection.identity;
 	if ( connection.authStatus !== 'connected' || ! ( identity && 'subject' in identity ) ) {
-		return describeConnectionSelectionError( { code: 'disconnected', providerId } );
+		return { code: 'disconnected', providerId, connectionId };
 	}
 	if ( ! identity.subject ) {
-		return describeConnectionSelectionError( { code: 'disconnected', providerId } );
+		return { code: 'disconnected', providerId, connectionId };
 	}
 	return undefined;
 }
@@ -412,15 +421,15 @@ function validateChatGptSelectionLive(
 // continues only on the connection, model and revision it recorded, and one
 // that ran elsewhere never continues on ChatGPT. A session with no history
 // yet may start on the selected connection.
-function validateChatGptSessionBinding(
+async function validateChatGptSessionBinding(
 	entries: SessionEntry[],
 	selection: ConnectionSelection,
 	connections: readonly ConnectionRegistryEntry[]
-): string | undefined {
+): Promise< string | undefined > {
 	if ( getEffectiveSessionProvider( entries, null ) === 'chatgpt-oauth' ) {
 		const resolved = resolveConnectionSelection( entries, { connections, settings: null } );
 		if ( ! resolved.ok ) {
-			return describeConnectionSelectionError( resolved.error );
+			return describeChatGptConnectionProblem( resolved.error );
 		}
 		const recorded = resolved.selection;
 		if (
@@ -501,9 +510,9 @@ async function resolveChatGptRouting(
 	}
 	const liveProblem = validateChatGptSelectionLive( selection, connections );
 	if ( liveProblem ) {
-		return { ok: false, reason: liveProblem };
+		return { ok: false, reason: await describeChatGptConnectionProblem( liveProblem ) };
 	}
-	const bindingProblem = validateChatGptSessionBinding(
+	const bindingProblem = await validateChatGptSessionBinding(
 		config.session.getEntries(),
 		selection,
 		connections

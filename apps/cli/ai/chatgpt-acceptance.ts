@@ -568,9 +568,21 @@ export function classifyTurnFailure( text: string ): string[] {
 			}
 		}
 	}
+	// A turn's failure reaches the runner as text only: every text the shared
+	// wording gives a code, one per state of the account the chat runs on.
+	const accountStates: Array< Parameters< typeof describeConnectionSelectionError >[ 1 ] > = [
+		undefined,
+		'signed-in',
+		'signed-out',
+		'needs-sign-in',
+	];
 	for ( const code of [ 'disconnected', 'changed', 'unsupported' ] as const ) {
 		if (
-			text.includes( describeConnectionSelectionError( { code, providerId: 'chatgpt-oauth' } ) )
+			accountStates.some( ( state ) =>
+				text.includes(
+					describeConnectionSelectionError( { code, providerId: 'chatgpt-oauth' }, state )
+				)
+			)
 		) {
 			codes.add( `connection-${ code }` );
 		}

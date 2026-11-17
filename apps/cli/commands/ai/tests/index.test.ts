@@ -1,3 +1,4 @@
+import { readChatGptAccount, type ChatGptAccount } from '@studio/agent/node/chatgpt/account-store';
 import { runStudioAgentTurn } from '@studio/agent/node/runtime';
 import { resolveResumeSessionContext } from '@studio/agent/node/sessions/context';
 import {
@@ -10,6 +11,7 @@ import {
 	readAnthropicApiKey,
 	readSelectedAiProvider,
 } from '@studio/agent/node/settings-store';
+import { describeConnectionSelectionError } from '@studio/agent/protocol/connections';
 import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { fetchStudioAssistantQuota } from '@studio/common/lib/studio-assistant-quota';
@@ -97,6 +99,11 @@ vi.mock( '@studio/agent/node/runtime', () => ( {
 	} ) ),
 } ) );
 vi.mock( 'cli/ai/slash-commands', () => ( { getActiveSlashCommands: vi.fn( () => [] ) } ) );
+// No saved ChatGPT registration unless a test says so; the real index is never read.
+vi.mock( '@studio/agent/node/chatgpt/account-store', async ( importOriginal ) => ( {
+	...( await importOriginal< typeof import('@studio/agent/node/chatgpt/account-store') >() ),
+	readChatGptAccount: vi.fn( async () => null ),
+} ) );
 vi.mock( '@studio/agent/node/browser-utils', () => ( { closeSharedBrowser: vi.fn() } ) );
 vi.mock( 'cli/commands/auth/login', () => ( { runCommand: vi.fn() } ) );
 vi.mock( 'cli/ai/ui', () => ( { AiChatUI: class AiChatUI {} } ) );
@@ -1072,6 +1079,45 @@ describe( 'AI runCommand — ChatGPT conversations', () => {
 		expect( appendCustomEntry ).not.toHaveBeenCalled();
 		expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
 	} );
+
+	it.each( [ 'signed-out', 'needs-sign-in' ] as const )(
+		'says signing in to its %s account again continues the chat when its saved registration is disconnected',
+		async ( state ) => {
+			const registrationId = '4b1f6c2e-8d3a-4e5f-9a7b-2c1d0e9f8a76';
+			entries = [
+				{ ...chatGptRecord(), data: { ...chatGptRecord().data, connectionId: registrationId } },
+			];
+			vi.mocked( readConnectionRegistry ).mockResolvedValueOnce( {
+				connections: [
+					{
+						connectionId: registrationId,
+						providerId: 'chatgpt-oauth',
+						backend: 'pi',
+						revision: 1,
+						identity: { subject: 'test-subject-1' },
+						authStatus: 'disconnected',
+					},
+				],
+				settings: null,
+			} );
+			vi.mocked( readChatGptAccount ).mockImplementationOnce( async ( id ) =>
+				id === registrationId ? ( { registrationId, state } as ChatGptAccount ) : null
+			);
+			await readOwnContext();
+			const adapter = new JsonAdapter();
+			const showError = vi.spyOn( adapter, 'showError' );
+
+			await runCommand( { adapter, initialMessage: 'hello', resumeSession: resumeSession() } );
+
+			expect( showError ).toHaveBeenCalledWith(
+				describeConnectionSelectionError(
+					{ code: 'disconnected', providerId: 'chatgpt-oauth' },
+					state
+				)
+			);
+			expect( runStudioAgentTurn ).not.toHaveBeenCalled();
+		}
+	);
 
 	it( 'blocks a resumed ChatGPT turn while the experimental feature is disabled', async () => {
 		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );

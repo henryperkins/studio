@@ -4,7 +4,12 @@ import path from 'path';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAgent } from '@studio/agent/node/agent';
-import { ChatGptConnectionError } from '@studio/agent/node/chatgpt/account-store';
+import {
+	ChatGptConnectionError,
+	createChatGptAccount,
+	markChatGptSignInNeeded,
+	startChatGptSignOut,
+} from '@studio/agent/node/chatgpt/account-store';
 import { setChatGptToolImagesForLiveCheck } from '@studio/agent/node/chatgpt/tool-images';
 import { buildAttachedFilesPromptBlock } from '@studio/agent/protocol/chat-files';
 import {
@@ -1227,6 +1232,67 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( JSON.stringify( turn.entries ) ).not.toContain( API_KEY );
 			expect( fetchSpy ).not.toHaveBeenCalled();
 			expect( fakeBroker.handles ).toHaveLength( 0 );
+		} );
+
+		// The saved registration as the account store keeps it, in this test's own config directory.
+		const saveRegistration = async ( state: 'signed-out' | 'needs-sign-in' ) => {
+			const account = await createChatGptAccount( CONNECTION_ID, {
+				issuer: 'https://auth.openai.com',
+				subject: 'test-subject-1',
+				clientId: 'test-client-1',
+				storage: 'session',
+			} );
+			if ( state === 'signed-out' ) {
+				await startChatGptSignOut( CONNECTION_ID );
+			} else {
+				await markChatGptSignInNeeded( CONNECTION_ID, {
+					logoutGeneration: account.logoutGeneration,
+					signInGeneration: account.signInGeneration ?? 0,
+				} );
+			}
+		};
+
+		it.each( [ 'signed-out', 'needs-sign-in' ] as const )(
+			'says signing in to its %s account again continues a chat whose saved registration is disconnected',
+			async ( state ) => {
+				await saveRegistration( state );
+				fakeBroker.connections = [ connectionEntry( { authStatus: 'disconnected' } ) ];
+				const selection = selectionFor();
+
+				const turn = await runChatGptTurn(
+					newChatGptSession( selection ),
+					'hi',
+					selection,
+					'medium'
+				);
+
+				expect( turn.error ).toBe(
+					describeConnectionSelectionError(
+						{ code: 'disconnected', providerId: 'chatgpt-oauth' },
+						state
+					)
+				);
+				expect( turn.error ).not.toContain( 'Start a new chat' );
+				expect( fetchSpy ).not.toHaveBeenCalled();
+				expect( fakeBroker.handles ).toHaveLength( 0 );
+			}
+		);
+
+		it( 'keeps saying a new chat is needed once the saved registration has changed, whatever its state', async () => {
+			await saveRegistration( 'signed-out' );
+			fakeBroker.connections = [ connectionEntry( { revision: 2, authStatus: 'disconnected' } ) ];
+			const selection = selectionFor();
+
+			const turn = await runChatGptTurn(
+				newChatGptSession( selection ),
+				'hi',
+				selection,
+				'medium'
+			);
+
+			expect( turn.error ).toBe(
+				describeConnectionSelectionError( { code: 'changed', providerId: 'chatgpt-oauth' } )
+			);
 		} );
 	} );
 
