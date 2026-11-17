@@ -504,6 +504,12 @@ describe( 'preview_update and preview_delete on the Claude route', () => {
 		expect( request.operation.description ).toContain(
 			'It moves this preview of the site, made on Jurassic Ninja, to WordPress.com: it makes a new preview there, at a new address, from the site’s current content, its database included, which anyone with the new preview’s public address can see, and deletes the preview at the address shown'
 		);
+		// The address shown: the approval as the app is given it carries it.
+		const shown = fixture.events.find( ( event ) => event.type === 'approval.requested' ) as {
+			operation: { args: string; remote?: string };
+		};
+		expect( JSON.parse( shown.operation.args ) ).toEqual( [ own.url ] );
+		expect( shown.operation.remote ).toBe( own.url );
 		expect( order ).toEqual( [
 			'journal preview_update',
 			'journal previews.update',

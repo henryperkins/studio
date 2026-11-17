@@ -791,6 +791,54 @@ describe( 'generate_images on the Claude route', () => {
 	} );
 } );
 
+describe( 'what an approval says is shown', () => {
+	// The approval as the app is given it: its description, and the display of
+	// the arguments, local paths and remote.
+	type Shown = { description: string; args: string; localPaths: string[]; remote?: string };
+	const approvals = ( events: unknown[] ) =>
+		events
+			.filter( ( event ) => ( event as { type: string } ).type === 'approval.requested' )
+			.map( ( event ) => {
+				const { description, operation } = event as {
+					description: string;
+					operation: Omit< Shown, 'description' >;
+				};
+				return { description, ...operation };
+			} );
+
+	it( 'carries, for send_feedback, the type and message its note says it shows', async () => {
+		const { bridge, events } = await setup();
+		const report = { type: 'request', message: 'Let me pick the uploads folder.' };
+		await bridge.invoke( 'send_feedback', report );
+		const [ shown ] = approvals( events );
+		expect( shown.description ).toContain( 'the type and message shown' );
+		expect( JSON.parse( shown.args ) ).toEqual( report );
+	} );
+
+	it( 'carries, for generate_images, each image’s specification and the path its note says it shows', async () => {
+		const { bridge, events, site } = await setupImages();
+		const call = {
+			images: [
+				{
+					path: path.join( site, 'hero.png' ),
+					subject: 'A café counter at dawn',
+					pageContext: 'full-width hero',
+					style: 'photorealistic',
+					aspectRatio: 'landscape',
+				},
+				{ path: path.join( site, 'band.png' ), subject: 'Pebbles on a beach' },
+			],
+			siteContext: 'A seaside bakery.',
+			imageGrade: 'warm natural light',
+		};
+		await bridge.invoke( 'generate_images', call );
+		const [ shown ] = approvals( events );
+		expect( shown.description ).toContain( 'at the path shown' );
+		expect( JSON.parse( shown.args ) ).toEqual( call );
+		expect( shown.localPaths ).toEqual( call.images.map( ( image ) => image.path ) );
+	} );
+} );
+
 describe( 'generate_images when its call is cancelled', () => {
 	const MONTH = path.join( 'wp-content', 'uploads', '2026', '11' );
 	const decodedData = ( php: string ) =>
