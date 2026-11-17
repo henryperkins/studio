@@ -236,6 +236,10 @@ const REFUSALS = {
 		'Studio creates one site at a time, and this turn is already creating one. Wait for that call’s result.',
 	payloads:
 		'A file this operation sends must be an existing file in Studio’s payload folder, which the tool’s description names, and only a change the user approves sends one.',
+	wpcomRequest:
+		'On this route Studio sends a WordPress.com request only with a plain path and no query key that changes its method, route, namespace or origin. It reads a site, or the account at !/me and !/plans/features; it changes something in a site only through that site’s WordPress REST API (wp/v2) with POST or PUT, both sent as a POST, and sends no DELETE, which Studio’s WordPress.com client would send as a POST that deletes nothing.',
+	wpcomSite:
+		'Studio sends a WordPress.com request for a site only to this conversation’s own WordPress.com site.',
 } as const;
 
 function deepFreeze< T >( value: T ): T {
@@ -876,15 +880,25 @@ export function createClaudeExecutionPolicy(
 				remote ??= origin;
 			}
 		}
+		// What an approval shows of the call: its arguments, or for a call that
+		// reaches WordPress.com the request as it is sent, never its arguments,
+		// which can carry a body, query values or file contents.
+		let shown: unknown = args;
 		if ( rule.remote ) {
 			const scope = rule.remote( args );
-			if ( ! scope ) return false;
+			if ( ! scope ) {
+				refuse( toolCallId, REFUSALS.wpcomRequest );
+				return false;
+			}
 			if ( scope.wpcomSiteId !== undefined ) {
 				const target = actingTarget;
-				if ( target.environment !== 'live' || target.wpcomSiteId !== scope.wpcomSiteId )
+				if ( target.environment !== 'live' || target.wpcomSiteId !== scope.wpcomSiteId ) {
+					refuse( toolCallId, REFUSALS.wpcomSite );
 					return false;
+				}
 				remote = `WordPress.com site ${ scope.wpcomSiteId }`;
 			}
+			shown = scope.request ?? {};
 		}
 		const description = describe( operationClass, name );
 		let authorized: boolean;
@@ -902,7 +916,7 @@ export function createClaudeExecutionPolicy(
 				{
 					tool: name,
 					operationClass,
-					args,
+					args: shown,
 					siteId: site?.id,
 					localPaths: [ ...localPaths, ...payload.files ],
 					remote,

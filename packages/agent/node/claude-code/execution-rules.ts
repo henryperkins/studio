@@ -34,7 +34,7 @@ import { wpcomRequestTool } from '../tools/wpcom-request';
 import { isInside } from './local-paths';
 import { hasOnlyKeys, hasOwn, plainData, plainList, plainStrings } from './plain-data';
 import { classifyWpCliArgs, wpCliRouteCommands } from './wp-cli-rules';
-import { wpcomScope } from './wpcom-rules';
+import { wpcomBodyFiles, wpcomScope } from './wpcom-rules';
 import type { SandboxSettings } from '@anthropic-ai/claude-agent-sdk/core';
 import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 
@@ -59,6 +59,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		listSitesTool.name,
 		listPreviewsTool.name,
 		listConnectedRemoteSitesTool.name,
+		wpcomRequestTool.name,
 		startSiteTool.name,
 		stopSiteTool.name,
 		deleteSiteTool.name,
@@ -378,9 +379,16 @@ export interface ClaudeStudioToolRule {
 	) => { readonly folder: string; readonly files: readonly string[] } | undefined;
 	/**
 	 * The WordPress.com scope a call reaches directly: a site, which must be the
-	 * turn's live target, or the account. Undefined denies the call.
+	 * turn's live target, or the account; and the request as it is sent, which an
+	 * approval of the call shows in place of the call's arguments. An approval of
+	 * a call with a scope never shows its arguments. Undefined denies the call.
 	 */
-	readonly remote?: ( args: unknown ) => { wpcomSiteId?: number } | undefined;
+	readonly remote?: ( args: unknown ) =>
+		| {
+				readonly wpcomSiteId?: number;
+				readonly request?: { readonly method: string; readonly path: string };
+		  }
+		| undefined;
 	/**
 	 * The URLs a call opens, given the named site's URL; undefined denies the call.
 	 * Only http and https are allowed. A local address must be the target site's
@@ -817,7 +825,17 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	],
 	[
 		wpcomRequestTool.name,
-		unqualified(
+		// It reads the stored login and, for a change, the body files it names in
+		// Studio's payload folder, and sends one request itself, outside the host,
+		// with Studio's WordPress.com client. The scope decides from that request
+		// as the tool composes it and the client parses it: a read of the
+		// conversation's own WordPress.com site, or of the account's profile or
+		// plan features, runs unprompted; a change of something in that site
+		// through its WordPress REST API runs once the user approves it, seeing
+		// the method sent, the site, the path and the body files, never the
+		// body, the query or the login. Its module links `tools/utils.ts`, whose
+		// `runWpCli` runs only through the host.
+		qualified(
 			studioRule( 'remote-overwrite', {
 				classify: ( args ) => {
 					const method = isRecord( args ) ? args.method : undefined;
@@ -826,6 +844,15 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 						return 'remote-overwrite';
 				},
 				remote: wpcomScope,
+				config: storedLogin,
+				payloads: wpcomBodyFiles,
+			} ),
+			using( {
+				readsLocalFiles: [ 'config', 'payloads' ],
+				runsWpCli: [ 'host' ],
+				callsHostOperation: [ 'host' ],
+				requestsNetwork: [ 'scope' ],
+				reachesWpcom: [ 'scope' ],
 			} )
 		),
 	],

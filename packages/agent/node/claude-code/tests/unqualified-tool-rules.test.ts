@@ -49,7 +49,7 @@ describe( 'Unqualified Claude Studio tools', () => {
 	it( 'are all refused by the real gate, which this file replaces', async () => {
 		const actual =
 			await vi.importActual< typeof import('../execution-rules') >( '../execution-rules' );
-		const exercised = [ ...new Set( [ ...offHostTools, ...browserTools, 'wpcom_request' ] ) ];
+		const exercised = [ ...new Set( [ ...offHostTools, ...browserTools ] ) ];
 		for ( const origin of [ targetOrigin, null ] )
 			expect(
 				actual.claudeStudioTools( { native: [], studio: exercised }, guarded( origin ), origin )
@@ -117,58 +117,6 @@ describe( 'Rules for Claude Studio tools that act outside the host', () => {
 				images: [ { path: path.join( site, 'a.png' ), subject: 'A' } ],
 			} )
 		).toBe( false );
-	} );
-} );
-
-describe( 'Rules for Claude WordPress.com requests', () => {
-	it( 'let a request reach only the live target', async () => {
-		const enabledTools = { native: [], studio: [ 'wpcom_request' ] };
-		const live = await setup( () => ( {
-			target: { environment: 'live', siteId: fakeSite.id, wpcomSiteId: 42 },
-			enabledTools,
-		} ) );
-		const call = ( fixture: typeof live, args: Record< string, unknown > ) =>
-			fixture.policy.authorizeStudioCall( {
-				host: fixture.host,
-				name: 'wpcom_request',
-				args,
-				toolCallId: randomUUID(),
-			} );
-		expect( await call( live, { siteId: 42, method: 'GET', path: '/posts' } ) ).toBe( true );
-		expect( await call( live, { siteId: 42, method: 'GET', path: '!/sites/42/posts' } ) ).toBe(
-			true
-		);
-		expect( await call( live, { siteId: 7, method: 'GET', path: '/posts' } ) ).toBe( false );
-		expect( await call( live, { siteId: 42, method: 'GET', path: '!/sites/7/posts' } ) ).toBe(
-			false
-		);
-		expect( live.context.approve ).not.toHaveBeenCalled();
-		expect( await call( live, { siteId: 42, method: 'POST', path: '/posts' } ) ).toBe( true );
-		expect( await call( live, { siteId: 42, method: 'DELETE', path: '!/sites/7/posts/1' } ) ).toBe(
-			false
-		);
-		expect( live.context.approve ).toHaveBeenCalledOnce();
-		expect(
-			await live.policy.authorizeStudioCall( {
-				host: live.host,
-				name: 'wp_cli',
-				args: {},
-				toolCallId: 'call',
-			} )
-		).toBe( false );
-
-		const local = await setup( () => ( { enabledTools } ) );
-		expect( await call( local, { siteId: 42, method: 'GET', path: '/posts' } ) ).toBe( false );
-		const global = await setup( ( paths ) => ( {
-			target: { environment: 'global' },
-			targetSite: undefined,
-			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
-			enabledTools,
-		} ) );
-		expect( await call( global, { siteId: 42, method: 'GET', path: '!/sites/42/posts' } ) ).toBe(
-			false
-		);
-		expect( await call( global, { siteId: 42, method: 'GET', path: '!/me' } ) ).toBe( true );
 	} );
 } );
 

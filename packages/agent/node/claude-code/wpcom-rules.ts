@@ -1,9 +1,29 @@
+import path from 'path';
+import { getAiPayloadsPath } from '@studio/common/lib/well-known-paths';
+
 // What a `wpcom_request` call may reach on WordPress.com: the request it would
 // send, composed and parsed as the tool and its client compose and parse it.
 
 function isRecord( value: unknown ): value is Record< string, unknown > {
 	return !! value && typeof value === 'object' && ! Array.isArray( value );
 }
+
+/**
+ * Where a request goes: a WordPress.com site, or the account when absent; and
+ * the request as Studio's WordPress.com client sends it.
+ */
+export interface WpcomScope {
+	readonly wpcomSiteId?: number;
+	readonly request: { readonly method: string; readonly path: string };
+}
+
+// The method the WordPress.com client sends for each method the tool takes. It
+// sends a PUT as a POST, which WordPress reads alike for every route that
+// takes both, and a DELETE as a POST without a body, which deletes nothing,
+// so a DELETE is refused rather than approved as something it is not.
+const SENT_METHODS: Readonly< Record< string, 'GET' | 'POST' > > = Object.freeze(
+	Object.assign( Object.create( null ), { GET: 'GET', POST: 'POST', PUT: 'POST' } )
+);
 
 // The only account endpoints a request may reach: reads the bundled skills use.
 const WPCOM_ACCOUNT_READS: ReadonlySet< string > = new Set( [ '/me', '/plans/features' ] );
@@ -97,9 +117,12 @@ function isWpcomPath( value: string ): boolean {
 // that parsed path, which for a relative path must be the site it names. A
 // read may use any allowed namespace and reach the account's own profile and
 // plan features; a change only goes through the site's WordPress REST API, to
-// something under the site.
-export function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefined {
+// something under the site. With the scope comes the request as it is sent,
+// its method and path, which is what an approval shows.
+export function wpcomScope( args: unknown ): WpcomScope | undefined {
 	if ( ! isRecord( args ) || typeof args.path !== 'string' ) return;
+	const method = typeof args.method === 'string' ? SENT_METHODS[ args.method ] : undefined;
+	if ( ! method ) return;
 	if (
 		args.apiNamespace !== undefined &&
 		( typeof args.apiNamespace !== 'string' || ! WPCOM_NAMESPACES.has( args.apiNamespace ) )
@@ -136,7 +159,8 @@ export function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefine
 	)
 		return;
 	const route = url.pathname.slice( base.length );
-	const reads = args.method === 'GET';
+	const reads = method === 'GET';
+	const request = { method, path: url.pathname };
 	const site = /^\/sites\/([1-9]\d*)(?:\/|$)/.exec( route );
 	if ( site ) {
 		const id = Number( site[ 1 ] );
@@ -147,7 +171,31 @@ export function wpcomScope( args: unknown ): { wpcomSiteId?: number } | undefine
 			( namespace !== WPCOM_CHANGE_NAMESPACE || ! /^\/sites\/[1-9]\d*\/[^/]/.test( route ) )
 		)
 			return;
-		return { wpcomSiteId: id };
+		return { wpcomSiteId: id, request };
 	}
-	return absolute && reads && WPCOM_ACCOUNT_READS.has( route ) ? {} : undefined;
+	return absolute && reads && WPCOM_ACCOUNT_READS.has( route ) ? { request } : undefined;
+}
+
+/**
+ * The files a `wpcom_request` call names in Studio's payload folder, resolved
+ * as the tool resolves them, and that folder. Only a change sends files; a
+ * read or a call that names one other than by a string is refused.
+ */
+export function wpcomBodyFiles( args: unknown ): { folder: string; files: string[] } | undefined {
+	if ( ! isRecord( args ) ) return;
+	const { bodyFile, bodyFiles } = args;
+	if ( bodyFiles !== undefined && ! isRecord( bodyFiles ) ) return;
+	const named = [
+		...( bodyFile === undefined ? [] : [ bodyFile ] ),
+		...Object.values( bodyFiles ?? {} ),
+	];
+	const folder = getAiPayloadsPath();
+	if ( ! named.length ) return { folder, files: [] };
+	if (
+		typeof args.method !== 'string' ||
+		SENT_METHODS[ args.method ] !== 'POST' ||
+		! named.every( ( file ): file is string => typeof file === 'string' )
+	)
+		return;
+	return { folder, files: named.map( ( file ) => path.resolve( folder, file ) ) };
 }

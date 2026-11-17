@@ -703,12 +703,13 @@ describe( 'Claude Studio tools that act outside the host', () => {
 describe( 'Claude WordPress.com requests', () => {
 	it( 'matches absolute site paths to a site and allows only listed account reads', () => {
 		const remote = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
-		expect( remote( { siteId: 1, method: 'GET', path: '/posts' } ) ).toEqual( { wpcomSiteId: 1 } );
-		expect( remote( { siteId: 1, method: 'GET', path: '!/sites/99/posts' } ) ).toEqual( {
-			wpcomSiteId: 99,
-		} );
-		expect( remote( { siteId: 1, method: 'GET', path: '!/me' } ) ).toEqual( {} );
-		expect( remote( { siteId: 1, method: 'GET', path: '!/plans/features' } ) ).toEqual( {} );
+		const site = ( args: Record< string, unknown > ) => remote( args )?.wpcomSiteId;
+		expect( site( { siteId: 1, method: 'GET', path: '/posts' } ) ).toBe( 1 );
+		expect( site( { siteId: 1, method: 'GET', path: '!/sites/99/posts' } ) ).toBe( 99 );
+		for ( const path of [ '!/me', '!/plans/features' ] ) {
+			expect( remote( { siteId: 1, method: 'GET', path } ), path ).toBeDefined();
+			expect( site( { siteId: 1, method: 'GET', path } ), path ).toBeUndefined();
+		}
 		for ( const args of [
 			{ method: 'POST', path: '!/me' },
 			{ method: 'GET', path: '!/me/settings' },
@@ -1240,8 +1241,10 @@ describe( 'Claude WordPress.com request transport options', () => {
 		const get = ( extra: Record< string, unknown > ) =>
 			remote()( { siteId: 42, method: 'GET', path: '/posts', ...extra } );
 		for ( const apiNamespace of [ undefined, '', 'wp/v2', 'wpcom/v2' ] )
-			expect( get( { apiNamespace } ), String( apiNamespace ) ).toEqual( { wpcomSiteId: 42 } );
-		expect( get( { query: { per_page: 20, _fields: 'id,title' } } ) ).toEqual( {
+			expect( get( { apiNamespace } ), String( apiNamespace ) ).toMatchObject( {
+				wpcomSiteId: 42,
+			} );
+		expect( get( { query: { per_page: 20, _fields: 'id,title' } } ) ).toMatchObject( {
 			wpcomSiteId: 42,
 		} );
 		for ( const extra of [

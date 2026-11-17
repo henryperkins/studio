@@ -27,11 +27,14 @@ vi.mock( '@studio/common/lib/wpcom-xhr-request-factory', async () => {
 } );
 
 const received: string[] = [];
+// The method of each request, in the same order.
+const methods: string[] = [];
 let stopServer: () => Promise< void >;
 
 beforeAll( async () => {
 	const server = createServer( ( request, response ) => {
 		received.push( request.url ?? '' );
+		methods.push( request.method ?? '' );
 		response.setHeader( 'content-type', 'application/json' );
 		response.end( '{}' );
 	} );
@@ -43,6 +46,7 @@ afterAll( () => stopServer() );
 
 async function send( args: Record< string, unknown > ): Promise< string[] > {
 	received.length = 0;
+	methods.length = 0;
 	await wpcomRequestTool.handler( args as never, {
 		host: createFakeHost(),
 		onProgress: () => {},
@@ -69,14 +73,45 @@ it( 'decides from the request the WordPress.com client actually sends', async ()
 			'/rest/v1.1/sites/42/settings?fields=title',
 		],
 		[ { siteId: 1, method: 'GET', path: '!/me', apiNamespace: '' }, '/rest/v1.1/me' ],
+		[
+			{ siteId: 42, method: 'POST', path: '/posts', query: { context: 'edit' }, body: {} },
+			'/wp/v2/sites/42/posts?context=edit',
+		],
+		[ { siteId: 42, method: 'PUT', path: 'pages/4', body: {} }, '/wp/v2/sites/42/pages/4' ],
 	];
 	for ( const [ args, request ] of allowed ) {
 		const decided = scope( args );
 		expect( decided, JSON.stringify( args ) ).toBeDefined();
 		expect( await send( args ) ).toEqual( [ request ] );
 		const site = /^\/[^/]+\/v[\d.]+\/sites\/(\d+)\//.exec( request )?.[ 1 ];
-		expect( decided ).toEqual( site === undefined ? {} : { wpcomSiteId: Number( site ) } );
+		// What an approval shows is the request the client sent: its method and path.
+		expect( decided ).toEqual( {
+			...( site === undefined ? {} : { wpcomSiteId: Number( site ) } ),
+			request: { method: methods[ 0 ], path: request.split( '?' )[ 0 ] },
+		} );
 	}
+} );
+
+it( 'shows a change as the POST the client sends, and refuses a DELETE, which the client sends as a POST that deletes nothing', async () => {
+	const scope = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+	for ( const method of [ 'POST', 'PUT', 'DELETE' ] ) {
+		await send( {
+			siteId: 42,
+			method,
+			path: '/posts/9',
+			body: method === 'DELETE' ? undefined : {},
+		} );
+		expect( [ methods, received ], method ).toEqual( [
+			[ 'POST' ],
+			[ '/wp/v2/sites/42/posts/9' ],
+		] );
+	}
+	expect( scope( { siteId: 42, method: 'PUT', path: '/posts/9' } ) ).toEqual( {
+		wpcomSiteId: 42,
+		request: { method: 'POST', path: '/wp/v2/sites/42/posts/9' },
+	} );
+	expect( scope( { siteId: 42, method: 'DELETE', path: '/posts/9' } ) ).toBeUndefined();
+	expect( scope( { siteId: 42, method: 'PATCH', path: '/posts/9' } ) ).toBeUndefined();
 } );
 
 it( 'denies the requests that would reach another site or origin than they name', async () => {
@@ -203,8 +238,10 @@ it( 'either denies a hostile path or sends it to exactly the site it allowed', a
 		const received = await send( args );
 		expect( received, JSON.stringify( args ) ).toHaveLength( 1 );
 		expect( receivedScope( received[ 0 ] ), JSON.stringify( args ) ).toEqual(
-			decided.wpcomSiteId === undefined ? null : decided
+			decided.wpcomSiteId === undefined ? null : { wpcomSiteId: decided.wpcomSiteId }
 		);
+		// The path an approval would show is the path the client sent.
+		expect( received[ 0 ].split( '?' )[ 0 ], JSON.stringify( args ) ).toBe( decided.request?.path );
 	}
 	// The table holds legitimate requests too, so the comparison above really ran.
 	expect( allowed ).toBeGreaterThanOrEqual( 30 );
@@ -266,9 +303,7 @@ it( 'refuses every query key that changes where a request goes, its method or it
 		expect(
 			scope( { siteId: 42, method: 'GET', path: '/posts', query: { [ key ]: '1' } } ),
 			key
-		).toEqual( {
-			wpcomSiteId: 42,
-		} );
+		).toMatchObject( { wpcomSiteId: 42 } );
 } );
 
 it( 'refuses a `.` segment, which the parser would drop from the path it decides on', () => {
@@ -309,16 +344,25 @@ it( 'lets a request change a site only through that site’s WordPress REST API,
 		[ { path: '!/me/settings', apiNamespace: '' }, undefined ],
 		[ { path: '!/plans/features', apiNamespace: 'wpcom/v2' }, undefined ],
 	];
-	for ( const method of [ 'POST', 'PUT', 'DELETE' ] )
-		for ( const [ args, decided ] of changes )
-			expect(
-				scope( { siteId: 42, method, ...args } ),
-				`${ method } ${ JSON.stringify( args ) }`
-			).toEqual( decided );
+	for ( const method of [ 'POST', 'PUT' ] )
+		for ( const [ args, decided ] of changes ) {
+			const label = `${ method } ${ JSON.stringify( args ) }`;
+			if ( decided )
+				expect( scope( { siteId: 42, method, ...args } ), label ).toMatchObject( decided );
+			else expect( scope( { siteId: 42, method, ...args } ), label ).toBeUndefined();
+		}
+	// A DELETE changes nothing anywhere: the client would send it as a POST.
+	for ( const [ args ] of changes )
+		expect(
+			scope( { siteId: 42, method: 'DELETE', ...args } ),
+			JSON.stringify( args )
+		).toBeUndefined();
 	// What the same paths read, for comparison: reads may use every namespace.
-	expect( scope( { siteId: 42, method: 'GET', path: '/settings', apiNamespace: '' } ) ).toEqual( {
-		wpcomSiteId: 42,
-	} );
-	expect( scope( { siteId: 42, method: 'GET', path: '/' } ) ).toEqual( { wpcomSiteId: 42 } );
-	expect( scope( { siteId: 1, method: 'GET', path: '!/me', apiNamespace: '' } ) ).toEqual( {} );
+	expect(
+		scope( { siteId: 42, method: 'GET', path: '/settings', apiNamespace: '' } )
+	).toMatchObject( { wpcomSiteId: 42 } );
+	expect( scope( { siteId: 42, method: 'GET', path: '/' } ) ).toMatchObject( { wpcomSiteId: 42 } );
+	const account = scope( { siteId: 1, method: 'GET', path: '!/me', apiNamespace: '' } );
+	expect( account ).toBeDefined();
+	expect( account?.wpcomSiteId ).toBeUndefined();
 } );

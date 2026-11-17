@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm } from 'fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
 import { createServer } from 'http';
 import os from 'os';
 import path from 'path';
@@ -386,5 +386,329 @@ describe( 'site_connected_remote_sites on the Claude route', () => {
 		).toBe( true );
 		expect( readAuthToken ).not.toHaveBeenCalled();
 		expect( wpcom.received ).toEqual( [] );
+	} );
+} );
+
+describe( 'wpcom_request on the Claude route', () => {
+	// A conversation on a local site that is connected to WordPress.com site 42.
+	const live = () => ( {
+		target: { environment: 'live' as const, siteId: 'site-123', wpcomSiteId: 42 },
+	} );
+	const sent = () => wpcom.received.map( ( { method, url } ) => `${ method } ${ url }` );
+	const payloads = () => path.join( config.root, 'tmp', 'ai-payloads' );
+	const WPCOM_REFUSAL = 'no query key that changes its method, route, namespace or origin';
+	const SITE_REFUSAL = 'only to this conversation’s own WordPress.com site';
+	const PAYLOAD_REFUSAL = 'must be an existing file in Studio’s payload folder';
+
+	describe( 'reads', () => {
+		it( 'reads the conversation’s own WordPress.com site unprompted and unjournaled, sending exactly the request it decided on, with the stored login', async () => {
+			const { bridge, context, journal } = await setup( live );
+			wpcom.respond = () => ( { status: 200, body: [ { id: 1 } ] } );
+			expect( bridge.tools ).toContain( 'wpcom_request' );
+			const result = await bridge.invoke( 'wpcom_request', {
+				siteId: 42,
+				method: 'GET',
+				path: '/posts',
+				query: { per_page: 2 },
+			} );
+			expect( result.isError ).toBe( false );
+			expect( JSON.parse( text( result ) ) ).toEqual( [ { id: 1 } ] );
+			expect( wpcom.received ).toEqual( [
+				expect.objectContaining( {
+					method: 'GET',
+					url: '/wp/v2/sites/42/posts?per_page=2',
+					authorization: `Bearer ${ LOGIN.accessToken }`,
+				} ),
+			] );
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( journal ).toEqual( [] );
+		} );
+
+		it( 'reads the account’s profile and plan features from any conversation, and nothing else of the account', async () => {
+			const { bridge } = await setup( global );
+			const read = ( accountPath: string, apiNamespace: string ) =>
+				bridge.invoke( 'wpcom_request', {
+					siteId: 1,
+					method: 'GET',
+					path: accountPath,
+					apiNamespace,
+				} );
+			expect( ( await read( '!/me', '' ) ).isError ).toBe( false );
+			expect( ( await read( '!/plans/features', 'wpcom/v2' ) ).isError ).toBe( false );
+			expect( sent() ).toEqual( [ 'GET /rest/v1.1/me', 'GET /wpcom/v2/plans/features' ] );
+			for ( const accountPath of [ '!/me/sites', '!/me/settings', '!/read/following' ] )
+				expect( ( await read( accountPath, '' ) ).isError, accountPath ).toBe( true );
+			expect( wpcom.received ).toHaveLength( 2 );
+		} );
+
+		it( 'reads no other site, and no site from a conversation without one on WordPress.com, says why and sends nothing', async () => {
+			const onLive = await setup( live );
+			const onLocal = await setup();
+			const unbound = await setup( global );
+			const calls: Array< [ typeof onLive, Record< string, unknown > ] > = [
+				[ onLive, { siteId: 7, method: 'GET', path: '/posts' } ],
+				[ onLive, { siteId: 42, method: 'GET', path: '!/sites/7/posts' } ],
+				[ onLocal, { siteId: 42, method: 'GET', path: '/posts' } ],
+				[ unbound, { siteId: 42, method: 'GET', path: '!/sites/42/posts', apiNamespace: '' } ],
+			];
+			for ( const [ fixture, args ] of calls ) {
+				const result = await fixture.bridge.invoke( 'wpcom_request', args );
+				expect( result.isError, JSON.stringify( args ) ).toBe( true );
+				expect( text( result ), JSON.stringify( args ) ).toContain( SITE_REFUSAL );
+			}
+			expect( wpcom.received ).toEqual( [] );
+		} );
+
+		it( 'refuses a request the rules refuse, says why without its values, and sends nothing', async () => {
+			const { bridge } = await setup( live );
+			for ( const args of [
+				{ siteId: 42, method: 'GET', path: '/posts', query: { _method: 'DELETE' } },
+				{
+					siteId: 42,
+					method: 'GET',
+					path: '/posts',
+					query: { rest_route: '/wp/v2/sites/7/posts' },
+				},
+				{ siteId: 42, method: 'GET', path: '/posts', query: { proxyOrigin: 'http://127.0.0.1:9' } },
+				{ siteId: 42, method: 'GET', path: '/posts', apiNamespace: 'wp/v2/sites/7/posts#' },
+				{ siteId: 42, method: 'GET', path: '/../7/posts' },
+			] ) {
+				const result = await bridge.invoke( 'wpcom_request', args );
+				expect( result.isError, JSON.stringify( args ) ).toBe( true );
+				expect( text( result ), JSON.stringify( args ) ).toContain( WPCOM_REFUSAL );
+				expect( text( result ), JSON.stringify( args ) ).not.toMatch( /127\.0\.0\.1|sites\/7/ );
+			}
+			expect( wpcom.received ).toEqual( [] );
+		} );
+
+		it( 'reads no stored login that lies in a folder the turn reaches', async () => {
+			const { bridge } = await setup( ( paths ) => ( {
+				...live(),
+				localRoots: [ paths.site, config.root ],
+			} ) );
+			const result = await bridge.invoke( 'wpcom_request', {
+				siteId: 42,
+				method: 'GET',
+				path: '/posts',
+			} );
+			expect( result.isError ).toBe( true );
+			expect( readAuthToken ).not.toHaveBeenCalled();
+			expect( wpcom.received ).toEqual( [] );
+		} );
+	} );
+
+	describe( 'changes', () => {
+		it( 'changes something in the conversation’s own site once the user approves the request, shown by the method sent, the site and the path and never its body, query or the stored login, journaled before it is sent', async () => {
+			const { bridge, context, journal } = await setup( live );
+			const sentWhenJournaled: number[] = [];
+			const record = context.recordOperation;
+			context.recordOperation = async ( event ) => {
+				sentWhenJournaled.push( wpcom.received.length );
+				await record( event );
+			};
+			wpcom.respond = () => ( { status: 200, body: { id: 9 } } );
+			const result = await bridge.invoke( 'wpcom_request', {
+				siteId: 42,
+				method: 'POST',
+				path: '/posts',
+				query: { context: 'edit' },
+				body: { title: 'Hidden title', content: 'hidden body' },
+			} );
+			expect( result.isError ).toBe( false );
+			expect( context.approve ).toHaveBeenCalledOnce();
+			const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+			expect( request.operation ).toMatchObject( {
+				tool: 'wpcom_request',
+				operationClass: 'remote-overwrite',
+				args: { method: 'POST', path: '/wp/v2/sites/42/posts' },
+				localPaths: [],
+				remote: 'WordPress.com site 42',
+			} );
+			expect( request.target ).toEqual( live().target );
+			expect( JSON.stringify( request ) ).not.toMatch( /hidden|edit|test-login-token/i );
+			expect( journal ).toEqual( [
+				expect.objectContaining( {
+					requestId: request.requestId,
+					operation: expect.objectContaining( {
+						tool: 'wpcom_request',
+						operationClass: 'remote-overwrite',
+					} ),
+				} ),
+			] );
+			expect( JSON.stringify( journal ) ).not.toMatch( /hidden|edit|test-login-token|posts/i );
+			expect( sentWhenJournaled ).toEqual( [ 0 ] );
+			expect( wpcom.received ).toEqual( [
+				expect.objectContaining( {
+					method: 'POST',
+					url: '/wp/v2/sites/42/posts?context=edit',
+					authorization: `Bearer ${ LOGIN.accessToken }`,
+				} ),
+			] );
+			expect( JSON.parse( wpcom.received[ 0 ].body ) ).toEqual( {
+				title: 'Hidden title',
+				content: 'hidden body',
+			} );
+		} );
+
+		it( 'shows a PUT as the POST the client sends', async () => {
+			const { bridge, context } = await setup( live );
+			await bridge.invoke( 'wpcom_request', {
+				siteId: 42,
+				method: 'PUT',
+				path: '/settings',
+				body: { title: 'x' },
+			} );
+			expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation.args ).toEqual( {
+				method: 'POST',
+				path: '/wp/v2/sites/42/settings',
+			} );
+			expect( sent() ).toEqual( [ 'POST /wp/v2/sites/42/settings' ] );
+		} );
+
+		it( 'sends nothing the user denies, says so, and journals nothing', async () => {
+			const { bridge, journal } = await setup( () => ( {
+				...live(),
+				approve: vi.fn( async () => 'deny' as const ),
+			} ) );
+			const result = await bridge.invoke( 'wpcom_request', {
+				siteId: 42,
+				method: 'POST',
+				path: '/posts/9',
+				body: { status: 'trash' },
+			} );
+			expect( result.isError ).toBe( true );
+			expect( text( result ) ).toContain( 'The user did not approve this operation' );
+			expect( wpcom.received ).toEqual( [] );
+			expect( journal ).toEqual( [] );
+		} );
+
+		it( 'changes nothing through the legacy or WordPress.com APIs, on another site or the account, nor by a DELETE, which the client would send as a POST, and asks nothing for them', async () => {
+			const { bridge, context } = await setup( live );
+			for ( const args of [
+				{
+					siteId: 42,
+					method: 'POST',
+					path: '/settings',
+					apiNamespace: '',
+					body: { blogname: 'x' },
+				},
+				{
+					siteId: 42,
+					method: 'POST',
+					path: '/posts/1/reblogs/new',
+					apiNamespace: '',
+					body: { destination_site_id: 7 },
+				},
+				{
+					siteId: 42,
+					method: 'POST',
+					path: '/studio-app/sync/import/initiate',
+					apiNamespace: 'wpcom/v2',
+				},
+				{ siteId: 7, method: 'POST', path: '/posts' },
+				{ siteId: 42, method: 'POST', path: '!/me/settings', apiNamespace: '' },
+				{ siteId: 42, method: 'PUT', path: '/' },
+				{ siteId: 42, method: 'DELETE', path: '/posts/9' },
+			] )
+				expect(
+					( await bridge.invoke( 'wpcom_request', args ) ).isError,
+					JSON.stringify( args )
+				).toBe( true );
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( wpcom.received ).toEqual( [] );
+		} );
+	} );
+
+	describe( 'files a change sends from Studio’s payload folder', () => {
+		it( 'are sent with a change the user approves, which shows them', async () => {
+			const { bridge, context } = await setup( live );
+			await writeFile( path.join( payloads(), 'home.html' ), '<p>Home</p>' );
+			const styles = path.join( payloads(), 'styles.json' );
+			await writeFile( styles, JSON.stringify( { styles: { color: { text: '#000' } } } ) );
+			const page = await bridge.invoke( 'wpcom_request', {
+				siteId: 42,
+				method: 'POST',
+				path: '/pages/4',
+				body: { status: 'publish' },
+				bodyFiles: { content: 'home.html' },
+			} );
+			expect( page.isError ).toBe( false );
+			const globalStyles = await bridge.invoke( 'wpcom_request', {
+				siteId: 42,
+				method: 'PUT',
+				path: '/global-styles/3',
+				bodyFile: styles,
+			} );
+			expect( globalStyles.isError ).toBe( false );
+			expect(
+				vi
+					.mocked( context.approve )
+					.mock.calls.map( ( [ request ] ) => request.operation.localPaths )
+			).toEqual( [ [ path.join( payloads(), 'home.html' ) ], [ styles ] ] );
+			expect( wpcom.received.map( ( { body } ) => JSON.parse( body ) ) ).toEqual( [
+				{ status: 'publish', content: '<p>Home</p>' },
+				{ styles: { color: { text: '#000' } } },
+			] );
+		} );
+
+		it( 'are none from outside that folder, by any path or link, none that holds credentials or does not exist, and none with a read', async () => {
+			const { bridge, context, site } = await setup( live );
+			await writeFile( path.join( config.root, 'tmp', 'outside.json' ), '{}' );
+			await writeFile( path.join( site, 'page.html' ), '<p>Site</p>' );
+			await writeFile( path.join( payloads(), 'secret.json' ), '{}' );
+			await writeFile( path.join( payloads(), 'read.json' ), '{}' );
+			const linked = path.join( payloads(), 'linked' );
+			await symlink( site, linked, 'junction' );
+			try {
+				for ( const args of [
+					{ method: 'POST', bodyFile: '../outside.json' },
+					{ method: 'POST', bodyFile: path.join( config.root, 'tmp', 'outside.json' ) },
+					{ method: 'POST', bodyFiles: { content: path.join( site, 'page.html' ) } },
+					{ method: 'POST', bodyFiles: { content: path.join( 'linked', 'page.html' ) } },
+					{ method: 'POST', bodyFile: 'secret.json' },
+					{ method: 'PUT', bodyFile: 'missing.json' },
+					{ method: 'GET', bodyFile: 'read.json' },
+				] ) {
+					const result = await bridge.invoke( 'wpcom_request', {
+						siteId: 42,
+						path: '/posts/1',
+						...args,
+					} );
+					expect( result.isError, JSON.stringify( args ) ).toBe( true );
+					expect( text( result ), JSON.stringify( args ) ).toContain( PAYLOAD_REFUSAL );
+					expect( text( result ), JSON.stringify( args ) ).not.toContain( config.root );
+				}
+			} finally {
+				await rm( linked );
+			}
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( wpcom.received ).toEqual( [] );
+		} );
+
+		it( 'are checked again once the user has answered, so a link planted while the user reads the approval sends nothing', async () => {
+			const { context, bridge, site } = await setup( live );
+			const staged = path.join( payloads(), 'staged' );
+			await mkdir( staged, { recursive: true } );
+			await writeFile( path.join( staged, 'page.html' ), '<p>Staged</p>' );
+			await writeFile( path.join( site, 'page.html' ), '<p>Site</p>' );
+			vi.mocked( context.approve ).mockImplementationOnce( async () => {
+				await rm( staged, { recursive: true } );
+				await symlink( site, staged, 'junction' );
+				return 'allow';
+			} );
+			try {
+				const result = await bridge.invoke( 'wpcom_request', {
+					siteId: 42,
+					method: 'POST',
+					path: '/pages/4',
+					bodyFiles: { content: path.join( staged, 'page.html' ) },
+				} );
+				expect( result.isError ).toBe( true );
+				expect( text( result ) ).toContain( PAYLOAD_REFUSAL );
+				expect( wpcom.received ).toEqual( [] );
+			} finally {
+				await rm( staged, { recursive: true, force: true } );
+			}
+		} );
 	} );
 } );
