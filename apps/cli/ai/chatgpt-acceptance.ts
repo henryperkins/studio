@@ -2653,9 +2653,10 @@ export async function runChatGptAcceptance(
 	argv: readonly string[],
 	deps: ChatGptAcceptanceDependencies
 ): Promise< number > {
+	// The evidence's own check: no line names a path, an identifier or a secret.
 	const print = ( line: string ) =>
 		deps.print(
-			findUnsafeText( line, { paths: true } )
+			findUnsafeText( line )
 				? __(
 						'[A line was withheld because it looked like a secret, an address or an identifier.]'
 				  )
@@ -2784,13 +2785,7 @@ export async function runChatGptAcceptance(
 			return failed === 0;
 		} );
 		ctx.saveState();
-		print(
-			sprintf(
-				/* translators: %s: the run directory. */
-				__( 'Evidence goes to %s' ),
-				paths.runDir
-			)
-		);
+		print( __( 'Evidence goes to the run directory you passed with --run-dir.' ) );
 
 		let firstFailure: StageRecord | null = null;
 		let gateFailed = false;

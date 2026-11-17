@@ -503,9 +503,11 @@ describe( 'ChatGPT acceptance runner', () => {
 			expect( evidenceText ).not.toContain( identifier );
 			expect( output ).not.toContain( identifier );
 		}
+		// Console lines get the evidence's own check: no path either, not even the run directory's.
 		for ( const line of printed ) {
-			expect( findUnsafeText( line, { paths: true } ) ).toBeNull();
+			expect( findUnsafeText( line ) ).toBeNull();
 		}
+		expect( output ).not.toContain( runDir );
 		expect( evidenceText ).not.toMatch( /@|https?:\/\/|eyJ[\w-]+\.|Bearer\s/ );
 	}
 
