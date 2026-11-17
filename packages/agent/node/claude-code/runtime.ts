@@ -1173,6 +1173,9 @@ export async function runClaudeTurn(
 		} catch {
 			stopped = false;
 		}
+		// Every bridged call ends first, with any command it started: Stop
+		// interrupts no started command, so the terminal event and the release of
+		// the run lock wait for it.
 		try {
 			await bridge?.dispose();
 		} catch {

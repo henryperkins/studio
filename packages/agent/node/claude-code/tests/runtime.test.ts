@@ -2249,6 +2249,119 @@ it( 'on cancel ends the pending approval before the native process hears of it, 
 	}
 } );
 
+it( 'ends a turn stopped while a bridged command runs only once that command has ended, then its terminal event, then the release of its run lock, and appends no tool result after the terminal event (mock SDK)', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { createNativeSessionStore } = await import( '../sessions' );
+	const { Client } = await import( '@modelcontextprotocol/sdk/client/index.js' );
+	// The SDK's wildcard export resolves at runtime, although the ESLint resolver misses it.
+	// eslint-disable-next-line import-x/no-unresolved
+	const { InMemoryTransport } = await import( '@modelcontextprotocol/sdk/inMemory.js' );
+	const { existsSync } = await import( 'fs' );
+	// Once the native tree is gone, time passes for what remains of the turn only
+	// as the test advances it, far past any bound a turn's end could be given.
+	const fixture = await ownedNativeFixture( 'claude-held-command-', {
+		onShutdown: () => void vi.useFakeTimers( { toFake: [ 'setTimeout', 'clearTimeout' ] } ),
+	} );
+	try {
+		const lock = path.join(
+			fixture.storeRoot,
+			`${ createHash( 'sha256' ).update( 'chat' ).digest( 'hex' ) }.json.lock`
+		);
+		const site = {
+			id: 'site',
+			path: fixture.root,
+			name: 'site',
+			url: 'http://localhost',
+			phpVersion: '8.4',
+		};
+		vi.mocked( fixture.host.sites.resolve ).mockResolvedValue( site );
+		const turn = new AbortController();
+		// The user stops the turn once the command has started. Like the CLI
+		// host, which checks the signal only before a command starts, the command
+		// runs to its end, here when the test lets it.
+		let finish = () => {};
+		vi.mocked( fixture.host.sites.wpCli ).mockImplementation( async () => {
+			turn.abort();
+			await new Promise< void >( ( resolve ) => ( finish = resolve ) );
+			return { exitCode: 0, stdout: 'Success: Created post 5.', stderr: '' };
+		} );
+		const query = spawningNativeTurn( fixture.root, async ( options ) => {
+			const stopped = new Promise< void >( ( resolve ) =>
+				( options.abortController as AbortController ).signal.addEventListener(
+					'abort',
+					() => resolve(),
+					{ once: true }
+				)
+			);
+			const [ clientTransport, serverTransport ] = InMemoryTransport.createLinkedPair();
+			const client = new Client( { name: 'studio-test', version: '1.0.0' } );
+			const server = (
+				options.mcpServers as { studio: { instance: { connect( t: unknown ): Promise< void > } } }
+			 ).studio.instance;
+			await Promise.all( [ server.connect( serverTransport ), client.connect( clientTransport ) ] );
+			void client
+				.callTool( {
+					name: 'wp_cli',
+					arguments: {
+						nameOrPath: 'site',
+						command: 'post create --post_status=draft --post_title=Hello',
+					},
+				} )
+				.catch( () => {} );
+			await stopped;
+			return 'end';
+		} );
+		const events: Array< { type: string; outcome?: { status: string } } > = [];
+		let ended = false;
+		const running = runClaudeTurn(
+			turnSnapshot( fixture.root, fixture.config, 'turn' ),
+			fixture.host,
+			{ prompt: 'hello', signal: turn.signal, onEvent: ( event ) => events.push( event ) },
+			{
+				storeRoot: fixture.storeRoot,
+				approve: async () => 'allow',
+				verifyTarget: async () => true,
+				query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				prepareOwner: fixture.prepareOwner,
+				ownerIdentity: async () => ( { pid: 1234, start: '1' } ),
+				connection: fixture.connection,
+				prepare: fixture.prepare,
+				account: fixture.account,
+			}
+		).finally( () => ( ended = true ) );
+		try {
+			await vi.waitFor( () => expect( fixture.order ).toContain( 'owned-shutdown' ) );
+			await vi.advanceTimersByTimeAsync( 10 * 60 * 1000 );
+		} finally {
+			vi.useRealTimers();
+		}
+		await new Promise( ( resolve ) => setTimeout( resolve, 1000 ) );
+		expect( fixture.host.sites.wpCli ).toHaveBeenCalledOnce();
+		expect( ended, 'the turn ended while its command ran' ).toBe( false );
+		expect( events.map( ( event ) => event.type ) ).not.toContain( 'turn.terminal' );
+		expect( existsSync( lock ), 'the run lock was released while its command ran' ).toBe( true );
+
+		finish();
+		await running;
+		const types = events.map( ( event ) => event.type );
+		expect( types.at( -1 ) ).toBe( 'turn.terminal' );
+		expect( types.filter( ( type ) => type === 'turn.terminal' ) ).toHaveLength( 1 );
+		expect( types.indexOf( 'tool.result' ) ).toBeGreaterThan( -1 );
+		expect( types.indexOf( 'tool.result' ) ).toBeLessThan( types.indexOf( 'turn.terminal' ) );
+		expect( events.at( -1 )?.outcome?.status ).toBe( 'interrupted' );
+		const journal = ( await createNativeSessionStore( fixture.storeRoot ).readJournals( 'chat' ) )
+			.flat()
+			.map( ( event ) => event.type );
+		expect( journal.at( -1 ) ).toBe( 'turn.terminal' );
+		expect( journal.indexOf( 'tool.result' ) ).toBeGreaterThan( -1 );
+		expect( journal.indexOf( 'tool.result' ) ).toBeLessThan( journal.indexOf( 'turn.terminal' ) );
+		expect( existsSync( lock ) ).toBe( false );
+	} finally {
+		vi.useRealTimers();
+		await fixture.cleanup();
+	}
+} );
+
 it( 'has an operation’s authorization on disk in the turn’s journal before the host runs it (mock SDK)', async () => {
 	const { runClaudeTurn } = await import( '../runtime' );
 	const { createNativeSessionStore } = await import( '../sessions' );

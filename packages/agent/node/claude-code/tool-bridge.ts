@@ -121,16 +121,7 @@ export interface ClaudeStudioToolBridgeOptions extends ClaudeStudioToolCapabilit
 	 * authorizes a call by its tool's name, so any other definition is dropped.
 	 */
 	candidates?: readonly StudioToolDefinition[];
-	/** How long `dispose` waits for calls still settling; `CLAUDE_TOOL_SETTLE_WAIT_MS` by default. */
-	settleWaitMs?: number;
 }
-
-/**
- * How long a turn that ends waits for its calls still settling, such as the
- * attachments a cancelled `generate_images` call completes or deletes. Once
- * cancelled a call starts no new work, so this bounds only what was under way.
- */
-const CLAUDE_TOOL_SETTLE_WAIT_MS = 30_000;
 
 // Studio's tools as an in-process MCP server, built from the registry and
 // limited to the tools the execution policy enables. Each call runs through the
@@ -226,22 +217,16 @@ export function createStudioClaudeToolBridge(
 		/** The tools `server` lists, as the executable must report them at startup. */
 		tools: Object.freeze( tools.map( ( definition ) => definition.name ) ),
 		invoke,
-		// Waits for the calls still running, at most `settleWaitMs`: the policy has
-		// ended their authority, so they start nothing new, and only what they
-		// must settle can still be under way.
+		// Waits, however long it takes, for every call still running: the policy
+		// has ended their authority, so they start nothing new, but a command one
+		// of them has started runs to its end, and the turn's terminal event and
+		// the release of its run lock come only after it.
 		async dispose() {
 			policy.dispose();
 			try {
 				await server.instance.close();
 			} finally {
-				let timer: ReturnType< typeof setTimeout > | undefined;
-				await Promise.race( [
-					Promise.allSettled( active ),
-					new Promise< void >( ( resolve ) => {
-						timer = setTimeout( resolve, options.settleWaitMs ?? CLAUDE_TOOL_SETTLE_WAIT_MS );
-					} ),
-				] );
-				clearTimeout( timer );
+				while ( active.size ) await Promise.allSettled( [ ...active ] );
 			}
 		},
 	};

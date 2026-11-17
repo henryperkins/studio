@@ -1021,12 +1021,9 @@ describe( 'generate_images when its call is cancelled', () => {
 		);
 	} );
 
-	it( 'keeps the turn up after Stop only for a bounded wait, whatever a call still settling does', async () => {
+	it( 'keeps the turn up after Stop until a settling command it started has ended, however long that takes', async () => {
 		const cancel = new AbortController();
-		const { bridge, host, site } = await setupWith( {
-			imageGeneration: true,
-			settleWaitMs: 50,
-		} );
+		const { bridge, host, site } = await setupImages();
 		const library = mediaLibrary( host, site );
 		vi.mocked( generateImages ).mockResolvedValueOnce( [ { ok: true, bytes: PNG } ] );
 		// The settling command hangs until the test lets it end.
@@ -1043,13 +1040,22 @@ describe( 'generate_images when its call is cancelled', () => {
 			.finally( () => ( settled = true ) );
 		await vi.waitFor( () => expect( host.sites.wpCli ).toHaveBeenCalledTimes( 2 ) );
 		cancel.abort();
-		const disposed = await Promise.race( [
-			bridge.dispose().then( () => 'disposed' ),
-			new Promise( ( resolve ) => setTimeout( () => resolve( 'still waiting' ), 2000 ) ),
-		] );
-		expect( disposed ).toBe( 'disposed' );
-		expect( settled ).toBe( false );
-		release();
+		// Time passes for the turn's end only as the test advances it, far past
+		// any bound it could be given.
+		let disposed = false;
+		vi.useFakeTimers( { toFake: [ 'setTimeout', 'clearTimeout' ] } );
+		try {
+			const disposing = bridge.dispose().then( () => ( disposed = true ) );
+			await vi.advanceTimersByTimeAsync( 10 * 60 * 1000 );
+			vi.useRealTimers();
+			await new Promise( ( resolve ) => setTimeout( resolve, 200 ) );
+			expect( disposed ).toBe( false );
+			expect( settled ).toBe( false );
+			release();
+			await disposing;
+		} finally {
+			vi.useRealTimers();
+		}
 		await call;
 		await library.isSettled();
 	} );
