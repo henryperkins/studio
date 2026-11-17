@@ -2506,6 +2506,34 @@ describe( 'ChatGPT acceptance runner', () => {
 			}
 		);
 
+		it( 'fails a window ask answered with a token even when the offer was no longer advertised', async () => {
+			const { services } = scriptedSession();
+			services.broker.sessionForkEnvironment = () => ( {} );
+			services.broker.askSessionToken = async () => true;
+			expect( await runChatGptAcceptance( sessionArgs(), dependencies( services ) ) ).toBe( 1 );
+			expect( stageOf( 'refresh-hold-across-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'window-ask-got-token',
+				observations: expect.objectContaining( {
+					offerAdvertisedDuringWindow: false,
+					windowDirectAskAnswered: true,
+					windowDirectAskGotToken: true,
+				} ),
+			} );
+
+			// Not advertised and not answered: nothing was handed out, so that alone passes.
+			services.broker.askSessionToken = async () => null;
+			expect( await runChatGptAcceptance( sessionArgs(), dependencies( services ) ) ).toBe( 0 );
+			expect( stageOf( 'refresh-hold-across-sign-out' )[ 1 ] ).toMatchObject( {
+				status: 'passed',
+				observations: expect.objectContaining( {
+					offerAdvertisedDuringWindow: false,
+					windowDirectAskAnswered: false,
+					windowDirectAskGotToken: false,
+				} ),
+			} );
+		} );
+
 		it( 'signs out a returning sign-in that still commits after the interrupt cancelled it', async () => {
 			const { services, calls } = scriptedSession();
 			const signedIn = services.signIn.wait;

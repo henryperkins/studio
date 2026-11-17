@@ -2237,6 +2237,7 @@ const SESSION_STAGES: StageDefinition[] = [
 			const asked = await abortable( raceTimeout( ask, SETTLE_WAIT_MS ) );
 			observations.windowDirectAskAnswered = asked !== null;
 			observations.windowDirectAskRefused = asked === false;
+			observations.windowDirectAskGotToken = asked === true;
 			const forkDigest = forkResult ? digestTurnEvents( forkResult.events ) : null;
 			observations.windowForkTokenAsks = forkResult?.tokenAsks ?? 0;
 			observations.windowForkTokensHandedOut = forkResult?.tokensHandedOut ?? 0;
@@ -2283,10 +2284,11 @@ const SESSION_STAGES: StageDefinition[] = [
 				'inference-during-window'
 			);
 			check( ! observations.windowForkSucceeded, 'window-fork-completed' );
+			// An answer is owed only while the offer lingers; a token never is.
 			if ( observations.offerAdvertisedDuringWindow ) {
 				check( observations.windowDirectAskAnswered, 'window-ask-unanswered' );
-				check( observations.windowDirectAskRefused, 'window-ask-got-token' );
 			}
+			check( ! observations.windowDirectAskGotToken, 'window-ask-got-token' );
 			check( observations.heldRefreshRejectedSignedOut, 'held-refresh-not-rejected' );
 			check( observations.localCleared, 'local-not-cleared' );
 			check( observations.offerGoneAfterSettle, 'offer-not-pruned' );
