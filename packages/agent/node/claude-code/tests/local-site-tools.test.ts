@@ -995,6 +995,20 @@ describe( 'site_create on the Claude route', () => {
 		expect( journal ).toEqual( [] );
 	} );
 
+	it( 'creates nothing from a global conversation whose target is already a site the user picked, says why, and journals nothing', async () => {
+		const { bridge, host, journal, context } = await setup( ( paths ) => ( {
+			workspace: { siteId: null, workingDirectory: paths.parent, configDirectory: paths.config },
+			localRoots: [ paths.parent ],
+		} ) );
+		expect( context.workspace.siteId ).toBeNull();
+		expect( context.target ).toEqual( { environment: 'local', siteId: fakeSite.id } );
+		const result = await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( ONE_SITE );
+		expect( host.sites.create ).not.toHaveBeenCalled();
+		expect( journal ).toEqual( [] );
+	} );
+
 	it( 'works on the site it created once that site is the conversation’s site, each tool under its own class, and on no other site', async () => {
 		const { bridge, host, context, journal, site, created } = await setupGlobal();
 		const onCreated = { nameOrPath: site.name };
