@@ -139,6 +139,7 @@ export interface ChatGptSignInStartObserver {
 	 * Once the sign-in knows where it keeps its tokens. For the vault, `keychain`
 	 * is what its own check of the key before the browser opens found the
 	 * system keychain to be, or undefined when no saved sign-in needed it asked.
+	 * Told again, for the vault, what its save at the end found.
 	 */
 	storageChosen?( storage: ChatGptCredentialStorage, keychain?: ChatGptKeychainAnswer ): void;
 }
@@ -276,6 +277,8 @@ interface Attempt {
 	timer: ReturnType< typeof setTimeout >;
 	/** Aborts the attempt's requests when it is cancelled or times out. */
 	controller: AbortController;
+	/** Told what the attempt's save into the vault found the keychain to be. */
+	observer: ChatGptSignInStartObserver;
 	outcome: Promise< ChatGptSignInOutcome >;
 	resolve: ( outcome: ChatGptSignInOutcome ) => void;
 }
@@ -672,8 +675,15 @@ export function createChatGptSignInFlow(
 		}
 
 		attempt.status = 'committing';
+		// A save into the vault reads or writes its key: what it found is the keychain's answer.
+		const keychainAnswered = ( keychain: ChatGptKeychainAnswer | undefined ) => {
+			if ( pending.storage === 'vault' && keychain ) {
+				attempt.observer.storageChosen?.( 'vault', keychain );
+			}
+		};
+		let account: ChatGptAccount;
 		try {
-			const account = await credentials.saveSignIn( {
+			account = await credentials.saveSignIn( {
 				...( pending.registration ? { registrationId: pending.registration.registrationId } : {} ),
 				issuer: pending.authServer.issuer,
 				subject: identity.subject,
@@ -682,15 +692,17 @@ export function createChatGptSignInFlow(
 				storage: pending.storage,
 				tokens: { ...tokens, refreshToken, idToken },
 			} );
-			return {
-				ok: true,
-				registrationId: account.registrationId,
-				label: account.label,
-				email: account.email,
-			};
 		} catch ( error ) {
+			keychainAnswered( keychainAnswerOf( error ) );
 			return discard( commitFailureCode( error ), identity );
 		}
+		keychainAnswered( 'available' );
+		return {
+			ok: true,
+			registrationId: account.registrationId,
+			label: account.label,
+			email: account.email,
+		};
 	}
 
 	// The outcome that ended the attempt: a cancel or timeout may have come first.
@@ -973,6 +985,7 @@ export function createChatGptSignInFlow(
 			server,
 			peers,
 			controller: new AbortController(),
+			observer,
 			outcome,
 			resolve,
 			timer: setTimeout( () => {

@@ -184,6 +184,15 @@ describe( 'the system keychain while a ChatGPT sign-in starts', () => {
 
 	const secureStorageShown = async () => ( await readChatGptSettings() ).secureStorage;
 
+	// The browser through the start address, the authorize page and back to the callback.
+	async function finishInBrowser( attemptId: string ) {
+		const location = async ( url: string ) =>
+			( await fetch( url, { redirect: 'manual' } ) ).headers.get( 'location' )!;
+		const callback = await location( await location( signIns.opened.at( -1 )! ) );
+		await ( await fetch( callback, { redirect: 'manual' } ) ).text();
+		return signIns.flow!.wait( attemptId );
+	}
+
 	beforeAll( async () => {
 		signingKey = await createSigningKey( 'test-key-1' );
 	} );
@@ -299,6 +308,36 @@ describe( 'the system keychain while a ChatGPT sign-in starts', () => {
 				{ kind: 'read', overlapped: false },
 			] );
 			expect( await secureStorageShown() ).toBe( 'available' );
+		} );
+	} );
+
+	// A first secure sign-in reads nothing at its start: what its save found is the answer.
+	describe( 'once a sign-in kept in secure storage is saved', () => {
+		it( 'shows the keychain available when the save kept its key there', async () => {
+			await knownAs( 'unavailable' );
+			const { attemptId } = await startChatGptSignIn( undefined, { storage: 'vault' } );
+			expect( keychain.runs ).toEqual( [] );
+			expect( await secureStorageShown() ).toBe( 'unavailable' );
+
+			await expect( finishInBrowser( attemptId ) ).resolves.toMatchObject( { ok: true } );
+
+			expect( keychain.runs.map( ( entry ) => entry.kind ) ).toContain( 'write' );
+			expect( keychain.checks() ).toBe( 0 );
+			expect( await secureStorageShown() ).toBe( 'available' );
+		} );
+
+		it( 'shows the keychain unavailable when the save couldn’t reach it', async () => {
+			await knownAs( 'available' );
+			const { attemptId } = await startChatGptSignIn( undefined, { storage: 'vault' } );
+			keychain.state.reachable = false;
+
+			await expect( finishInBrowser( attemptId ) ).resolves.toMatchObject( {
+				ok: false,
+				code: 'vault-unavailable',
+			} );
+
+			expect( keychain.checks() ).toBe( 0 );
+			expect( await secureStorageShown() ).toBe( 'unavailable' );
 		} );
 	} );
 
