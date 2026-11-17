@@ -718,7 +718,7 @@ const PRODUCTION = {
 	kind: 'production',
 };
 const PRODUCTION_LABEL =
-	'WordPress.com site 111: My Production Site, myprod.wordpress.com, a production site';
+	'WordPress.com site 111: a production site, myprod.wordpress.com, named "My Production Site"';
 const REMOTE_REFUSAL = 'only when it is connected to this conversation’s site';
 const OPTIONS_REFUSAL = 'only with options from this list';
 
@@ -761,7 +761,7 @@ describe( 'site_push on the Claude route', () => {
 		// The approval and the journal entry say which site, with which options
 		// and what they replace there, and what an interrupted push may leave.
 		expect( request.operation.description ).toContain(
-			'It uploads this local site to the connected WordPress.com site 111 (My Production Site, myprod.wordpress.com, a production site) with the options sqls, plugins, replacing the database and the plugins on that site.'
+			'It uploads this local site to the connected WordPress.com site 111 (a production site, myprod.wordpress.com, named "My Production Site") with the options sqls, plugins, replacing the database and the plugins on that site.'
 		);
 		expect( request.operation.description ).toContain(
 			'If it is interrupted, the import of what it uploaded may still be running on WordPress.com'
@@ -965,7 +965,7 @@ describe( 'site_pull on the Claude route', () => {
 		// The approval and the journal entry say which site, with which options
 		// and what they replace here, and what an interrupted pull may leave.
 		expect( request.operation.description ).toContain(
-			'It copies the connected WordPress.com site 111 (My Production Site, myprod.wordpress.com, a production site) into this local site with the options uploads, themes, replacing the uploads and the themes in this local site, and stops the site while it runs if it is running.'
+			'It copies the connected WordPress.com site 111 (a production site, myprod.wordpress.com, named "My Production Site") into this local site with the options uploads, themes, replacing the uploads and the themes in this local site, and stops the site while it runs if it is running.'
 		);
 		// And what else it replaces or moves, and where it unpacks the backup.
 		expect( request.operation.description ).toContain(
@@ -1084,7 +1084,7 @@ describe( 'what a push or pull approval shows of the WordPress.com site', () => 
 				} ),
 			] );
 			expect( staging.remote, name ).toBe(
-				'WordPress.com site 112: Staging, staging.example.test, a staging site'
+				'WordPress.com site 112: a staging site, staging.example.test, named "Staging"'
 			);
 			// What a person reads: the approval as the app is given it.
 			const shown = fixture.events
@@ -1102,6 +1102,45 @@ describe( 'what a push or pull approval shows of the WordPress.com site', () => 
 			expect( vi.mocked( fixture.host.sync.push ).mock.calls.length, name ).toBe(
 				name === 'site_push' ? 2 : 0
 			);
+		}
+	} );
+
+	it( 'says whether it is a staging or a production site and its address before its stored title, which it quotes and cuts at 60 characters, so a title that imitates the label cannot change how it reads', async () => {
+		const imitation = 'Shop, shop-staging.example.test, a staging site';
+		const long = `${ 'A very long site title '.repeat( 4 ) }that keeps going`;
+		const cases: Array< [ string, string ] > = [
+			[ imitation, `named "${ imitation }"` ],
+			[ 'Shop", a staging site, "x', 'named "Shop\\", a staging site, \\"x"' ],
+			[ long, `named "${ Array.from( long ).slice( 0, 60 ).join( '' ) }…"` ],
+		];
+		for ( const [ title, named ] of cases ) {
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( [
+				{ ...fakeRemoteSite, name: title },
+			] );
+			for ( const name of [ 'site_push', 'site_pull' ] ) {
+				const fixture = await setup();
+				expect(
+					( await fixture.bridge.invoke( name, { nameOrPath: 'site', remoteSite: '111' } ) )
+						.isError,
+					`${ name } ${ title }`
+				).toBe( false );
+				const [ request ] = vi.mocked( fixture.context.approve ).mock.calls[ 0 ];
+				const label = `WordPress.com site 111: a production site, myprod.wordpress.com, ${ named }`;
+				expect( request.operation.remote, name ).toBe( label );
+				expect( request.operation.description, name ).toContain(
+					`the connected WordPress.com site 111 (a production site, myprod.wordpress.com, ${ named })`
+				);
+				// The structured fields keep the title as Studio stores it.
+				expect( request.operation.args, name ).toEqual( [
+					expect.objectContaining( { remoteSite: { ...PRODUCTION, name: title } } ),
+				] );
+				// The journal entry says the same.
+				expect(
+					fixture.journal.find( ( entry ) => entry.operation.tool.startsWith( 'sync.' ) )
+						?.description,
+					name
+				).toBe( request.operation.description );
+			}
 		}
 	} );
 } );

@@ -338,10 +338,15 @@ function shownConnection( site: SyncSite ) {
 	};
 }
 
-// The same, in one line.
+function connectionDetails( site: SyncSite ): string {
+	const { name, address, kind } = shownConnection( site );
+	const characters = Array.from( name );
+	const title = characters.length > 60 ? characters.slice( 0, 60 ).join( '' ) + '…' : name;
+	return `a ${ kind } site, ${ address }, named ${ JSON.stringify( title ) }`;
+}
+
 function connectionLabel( site: SyncSite ): string {
-	const { id, name, address, kind } = shownConnection( site );
-	return `WordPress.com site ${ id }: ${ name }, ${ address }, a ${ kind } site`;
+	return `WordPress.com site ${ site.id }: ${ connectionDetails( site ) }`;
 }
 
 // What an approval of a push or pull, and so its journal entry, says of it
@@ -351,8 +356,9 @@ function connectionLabel( site: SyncSite ): string {
 // also says what the CLI's default engine and importer replace or move
 // whatever the options, and where they unpack the backup.
 function syncNote( name: 'sync.push' | 'sync.pull', site: SyncSite, options: string[] ): string {
-	const { id, name: siteName, address, kind } = shownConnection( site );
-	const connected = `the connected WordPress.com site ${ id } (${ siteName }, ${ address }, a ${ kind } site)`;
+	const connected = `the connected WordPress.com site ${ site.id } (${ connectionDetails(
+		site
+	) })`;
 	const overwrites = options
 		.map( ( option ) => SYNC_OVERWRITES[ option ] )
 		.join( ' and ' )

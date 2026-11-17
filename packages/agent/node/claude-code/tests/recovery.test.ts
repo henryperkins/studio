@@ -399,7 +399,7 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 			] );
 			const note = recoveryNote( await fixture.store.readJournals( 'chat' ) );
 			for ( const said of [
-				'WordPress.com site 111 (My Production Site, myprod.wordpress.com, a production site)',
+				'WordPress.com site 111 (a production site, myprod.wordpress.com, named "My Production Site")',
 				'with the options sqls, uploads',
 				left,
 			] )
