@@ -1143,7 +1143,8 @@ describe( 'site_create on the Claude route', () => {
 		const result = await bridge.invoke( 'site_create', { name: site.name } );
 		expect( result.isError ).toBe( false );
 		expect( host.selectSite ).toHaveBeenCalledOnce();
-		const note = result.content.at( -1 )?.text ?? '';
+		const last = result.content[ result.content.length - 1 ];
+		const note = last?.type === 'text' ? last.text : '';
 		expect( note ).toContain( 'Studio could not find its folder, so this turn acts on no site' );
 		expect( note ).not.toContain( site.path );
 		expect( ( await bridge.invoke( 'site_info', { nameOrPath: site.name } ) ).isError ).toBe(
