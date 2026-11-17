@@ -15,6 +15,8 @@
  * and written there, in place.
  */
 import { createHash } from 'node:crypto';
+// eslint-disable-next-line no-restricted-imports -- development only: the product's own pi model id for a ChatGPT slug, so the evidence names a reply's model as its requests do.
+import { chatGptPiModelId } from '@studio/agent/node/runtime/chatgpt-transport';
 import {
 	readChatGptSessionSelection,
 	toChatGptSessionContext,
@@ -564,6 +566,19 @@ const distinct = < T >( values: Array< T | undefined > ): T[] => [
 	...new Set( values.filter( ( value ): value is T => value !== undefined ) ),
 ];
 
+/**
+ * A reply's model by the slug requests carry: a ChatGPT reply records pi's id
+ * for the model (`chatGptPiModelId`), or the bare slug in a session written
+ * before it, so the product's own id for each slug the route knows, or the
+ * requests named, is matched. Anything else is left as the runtime recorded it.
+ */
+function replyModelSlug( provider: unknown, model: string, slugs: readonly string[] ): string {
+	if ( provider !== CHATGPT_PI_PROVIDER ) {
+		return model;
+	}
+	return slugs.find( ( slug ) => chatGptPiModelId( slug ) === model ) ?? model;
+}
+
 function replyKind( provider: unknown ): AiProviderId | 'unknown' {
 	switch ( provider ) {
 		case CHATGPT_PI_PROVIDER:
@@ -604,6 +619,8 @@ export function summarizeExecutedRoute( {
 			request.endpoint !== 'models' &&
 			! imageService.includes( request )
 	);
+	const models = distinct( inference.map( ( request ) => request.model ) );
+	const routeSlugs = [ ...new Set( [ ...Object.keys( CHATGPT_MODEL_CAPABILITIES ), ...models ] ) ];
 	const backends = distinct( inference.map( ( request ) => request.host as EvalBackend ) );
 	const backend = backends.length === 1 ? backends[ 0 ] : backends.length ? 'mixed' : 'none';
 	const kind = backend === 'none' || backend === 'mixed' ? backend : PROVIDER_BY_BACKEND[ backend ];
@@ -627,11 +644,15 @@ export function summarizeExecutedRoute( {
 		modelRequests: inference.length,
 		apiKeyBearers: inference.filter( ( request ) => request.bearer === 'api-key' ).length,
 		imageServiceRequests: imageService.length,
-		models: distinct( inference.map( ( request ) => request.model ) ),
+		models,
 		efforts: distinct( inference.map( ( request ) => request.effort ) ),
 		replyKinds: distinct( replies.map( ( reply ) => replyKind( reply.provider ) ) ),
 		replyModels: distinct(
-			replies.map( ( reply ) => ( typeof reply.model === 'string' ? reply.model : undefined ) )
+			replies.map( ( reply ) =>
+				typeof reply.model === 'string'
+					? replyModelSlug( reply.provider, reply.model, routeSlugs )
+					: undefined
+			)
 		),
 		connectionRef,
 		connectionMatchesBearer,

@@ -609,6 +609,35 @@ describe( 'eval provider selection', () => {
 			).toBeNull();
 		} );
 
+		it.each( [
+			[ 'a session recording the pi model id', 'studio-chatgpt:gpt-6-luna' ],
+			[ 'an older session recording the bare slug', 'gpt-6-luna' ],
+		] )(
+			'names the model of the replies of %s by the slug its requests carry',
+			( _name, model ) => {
+				const executed = summarizeExecutedRoute( {
+					requests: [ request( {} ) ],
+					replies: [ { provider: 'studio-chatgpt', model } ],
+					entries: pinned( CONNECTION_ID ),
+				} );
+				expect( executed.models ).toEqual( [ 'gpt-6-luna' ] );
+				expect( executed.replyModels ).toEqual( executed.models );
+			}
+		);
+
+		it( 'leaves a reply model it does not know as the runtime recorded it', () => {
+			expect(
+				summarizeExecutedRoute( {
+					requests: [ request( {} ) ],
+					replies: [
+						{ provider: 'studio-chatgpt', model: 'studio-chatgpt:gpt-6-astra' },
+						{ provider: 'studio-openai', model: 'studio-chatgpt:gpt-6-luna' },
+					],
+					entries: pinned( CONNECTION_ID ),
+				} ).replyModels
+			).toEqual( [ 'studio-chatgpt:gpt-6-astra', 'studio-chatgpt:gpt-6-luna' ] );
+		} );
+
 		it( 'tells which user message each request belongs to', () => {
 			const executed = summarizeExecutedRoute( {
 				requests: [
