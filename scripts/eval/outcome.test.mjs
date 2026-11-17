@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -221,6 +222,151 @@ describe( 'reasons of a provider-qualified case', () => {
 		}
 	);
 
+	// The main suite's checks, run with a provider selected, on results whose
+	// every value the run produced is a word nothing else would withhold: a
+	// name, a page title, a theme or a class the model wrote.
+	const MARK = 'quillonbarrowmere';
+	const mainSuite = parse(
+		readFileSync( new URL( './promptfoo.config.yaml', import.meta.url ), 'utf8' )
+	);
+	const outcomeChecks = ( assertions = [] ) =>
+		assertions
+			.map( ( { value } ) => String( value ).match( /^file:\/\/outcome\.mjs:(\w+)$/ )?.[ 1 ] )
+			.filter( Boolean );
+	const mainCases = mainSuite.tests
+		.map( ( test ) => ( { vars: test.vars, names: outcomeChecks( test.assert ) } ) )
+		.filter( ( { names } ) => names.length );
+	const markedSite = ( vars, overrides = {} ) => ( {
+		name: vars.siteName ?? MARK,
+		url: MARK,
+		created: true,
+		showOnFront: MARK,
+		theme: { stylesheet: MARK, template: vars.parentTheme ?? MARK },
+		themeChanges: [ `${ MARK }.css`, `${ MARK }.json` ],
+		parentThemeChanges: [ `${ MARK }.php` ],
+		themeFiles: {
+			'style.css': `.${ MARK } { display: inline-block; color: #${ 'a1b2c3' } }`,
+			'theme.json': JSON.stringify( {
+				settings: { typography: { fontFamilies: [ { src: [ `file:./${ MARK }.woff2` ] } ] } },
+			} ),
+			[ `${ MARK }.css` ]: `.x { color: #123abc } /* ${ MARK } */`,
+		},
+		themeFileList: [],
+		themeScreenshot: MARK,
+		home: {
+			status: 200,
+			phpErrors: [],
+			navHrefs: [ `#${ MARK }`, `/#${ MARK }`, `/#${ MARK }-two` ],
+			ids: [],
+		},
+		invalidBlocks: [],
+		designMd: `primary: "#a1b2c3"\n${ MARK }: #abcdef`,
+		palette: [],
+		plugins: [ MARK ],
+		products: 0,
+		blockStyles: { 'core/group': [ MARK ] },
+		mergedStyles: { elements: { heading: { typography: { fontFamily: MARK } } } },
+		userGlobalStyles: { styles: { elements: { heading: { typography: { fontFamily: MARK } } } } },
+		customCss: `.${ MARK } { display: inline }`,
+		content: [
+			{
+				type: 'page',
+				isFront: true,
+				title: MARK,
+				blocks: { [ `${ MARK }/block` ]: 2, [ `${ vars.blockPrefix ?? 'core/' }${ MARK }` ]: 1 },
+				content: `<!-- wp:group {"className":"${ MARK }","backgroundColor":"${ MARK }"} --><div class="is-style-${ MARK }"></div><div class="is-style-${ MARK }"></div> "fontSize":"1${ MARK }" "fontSize":"1${ MARK }" "fontSize":"1${ MARK }" #a1b2c3`,
+			},
+		],
+		...overrides,
+	} );
+	// Each result reaches other branches: what fails first, and what passes.
+	const markedResults = ( vars ) => {
+		const site = markedSite( vars );
+		const base = {
+			providerRoute: seeded.providerRoute,
+			success: true,
+			textSegments: [ MARK, `${ MARK }?` ],
+			questions: [ { question: MARK, options: [ MARK, MARK ], answer: MARK } ],
+			toolCalls: [ { id: 'c0', name: MARK, input: { name: MARK } } ],
+			toolResults: [ { toolUseId: 'c0', toolName: 'take_screenshot', isError: false, text: MARK } ],
+			toolEvents: [ { toolName: MARK, input: { message: MARK }, durationMs: 1 } ],
+			turnDurationsMs: [ 1 ],
+			stoppedAt: { toolName: MARK, index: 1 },
+			inspections: [ { args: [], exitCode: 0, stdout: MARK } ],
+		};
+		const outcome = ( sites ) => ( {
+			sites,
+			otherSitesChanged: [ MARK ],
+			otherSitesRemoved: [ MARK ],
+			requestSiteChanged: true,
+		} );
+		const passing = markedSite( vars, {
+			showOnFront: 'page',
+			themeChanges: null,
+			themeFileList: [ `${ MARK }.woff2` ],
+			themeScreenshot: `jpeg:${ MARK }`,
+			parentThemeChanges: [],
+			theme: { stylesheet: MARK, template: vars.parentTheme ?? MARK },
+			designMd: `${ vars.token ?? 'primary' }: "#a1b2c3"`,
+			palette: [ { color: '#a1b2c3' } ],
+			plugins: [ vars.plugin ?? MARK, 'woocommerce' ],
+			products: 2,
+			home: {
+				status: 200,
+				phpErrors: [],
+				navHrefs: [ `/#${ MARK }`, `/#${ MARK }-two` ],
+				ids: [ MARK, `${ MARK }-two` ],
+			},
+		} );
+		return [
+			{ ...base, outcome: outcome( [ site ] ) },
+			{
+				...base,
+				outcome: outcome( [ { ...site, home: { ...site.home, status: 500, error: MARK } } ] ),
+			},
+			{ ...base, outcome: outcome( [ passing ] ), textSegments: [ `WordPress Studio ${ MARK }` ] },
+			{ ...base, outcome: outcome( [] ) },
+		];
+	};
+
+	test.each( mainCases.map( ( { vars, names } ) => [ vars.caseId, vars, names ] ) )(
+		'main suite, %s: with a provider selected, no reason names what the run wrote',
+		( _caseId, vars, names ) => {
+			for ( const name of names ) {
+				for ( const result of markedResults( vars ) ) {
+					const { reason } = run( checks[ name ], result, { ...vars, provider: 'chatgpt-oauth' } );
+					expect( reason, `${ name }: ${ reason }` ).not.toContain( MARK );
+				}
+			}
+		}
+	);
+
+	test( 'a selection made only in the environment counts too, even when the result can’t be loaded', () => {
+		const saved = process.env.STUDIO_EVAL_PROVIDER;
+		process.env.STUDIO_EVAL_PROVIDER = 'chatgpt-oauth';
+		try {
+			const missing = checks.siteWorks(
+				`EVAL_RUNNER_RESULT_FILE=${ path.join( dir, 'jordan-no-such-result.json' ) }`,
+				{ vars: {} }
+			);
+			expect( missing.pass ).toBe( false );
+			expect( missing.reason ).toMatch( /reason withheld: it held what looked like a local path/ );
+			expect( missing.reason ).not.toContain( 'jordan' );
+			const { reason } = run(
+				checks.replyIncludes,
+				{ textSegments: [ NAME ] },
+				{ expectedText: 'X' }
+			);
+			expect( reason ).not.toContain( NAME );
+		} finally {
+			if ( saved === undefined ) {
+				delete process.env.STUDIO_EVAL_PROVIDER;
+			} else {
+				process.env.STUDIO_EVAL_PROVIDER = saved;
+			}
+		}
+	} );
+
 	test( 'a run’s output is still quoted in the reasons of a case that selects no provider', () => {
 		const { reason } = run(
 			checks.replyIncludes,
@@ -254,6 +400,29 @@ describe( 'reasons of a provider-qualified case', () => {
 		expect( verdict.reason ).toBe(
 			'generate_images ran 1 time(s) on the wordpress-com image service, signed in with its wordpress-com-login'
 		);
+	} );
+} );
+
+describe( 'outcome.mjs as promptfoo loads it', () => {
+	// promptfoo imports the checks with plain Node, not through this test
+	// runner's transform: a short-lived Node that only imports the file and exits.
+	test( 'loads with plain Node, its TypeScript import included', () => {
+		const loaded = spawnSync(
+			process.execPath,
+			[
+				'--input-type=module',
+				'-e',
+				'const m = await import( process.env.OUTCOME_URL ); process.stdout.write( String( Object.keys( m ).length ) );',
+			],
+			{
+				env: { ...process.env, OUTCOME_URL: new URL( './outcome.mjs', import.meta.url ).href },
+				encoding: 'utf8',
+				timeout: 60_000,
+			}
+		);
+		expect( loaded.stderr ).not.toMatch( /Error/ );
+		expect( loaded.status ).toBe( 0 );
+		expect( Number( loaded.stdout ) ).toBe( Object.keys( checks ).length );
 	} );
 } );
 

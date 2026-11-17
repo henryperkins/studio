@@ -80,6 +80,29 @@ describe( 'subscription parity config', () => {
 		).toHaveLength( 2 );
 	} );
 
+	test( 'a main-suite case judged on images a tool returns says so by the same rule', () => {
+		const mainCases = mainConfig.tests.map( ( test ) => ( {
+			vars: test.vars,
+			checks: [
+				...named(
+					mainConfig.defaultTest?.assert?.filter( ( a ) => /outcome\.mjs/.test( a.value ) )
+				),
+				...named( test.assert ),
+			],
+		} ) );
+		const judgedOnToolImages = mainCases.filter( ( { checks: names } ) =>
+			names.includes( 'sawDesktopAndMobile' )
+		);
+		expect( judgedOnToolImages.map( ( { vars } ) => vars.caseId ) ).toEqual( [
+			'screenshot-all-timing',
+		] );
+		for ( const { vars } of mainCases ) {
+			expect( vars.needsToolImages === true, vars.caseId ).toBe(
+				judgedOnToolImages.some( ( judged ) => judged.vars === vars )
+			);
+		}
+	} );
+
 	test( 'every case has a unique id, a description and checks outcome.mjs exports', () => {
 		const ids = cases.map( ( { vars } ) => vars.caseId );
 		expect( new Set( ids ).size ).toBe( ids.length );

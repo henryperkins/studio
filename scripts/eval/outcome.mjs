@@ -46,7 +46,7 @@ const LOOKED_LIKE = {
 // whole reason, but for a leading code, withheld if anything left in it still
 // looks like an address, an email address, a path, a token or an identifier,
 // by the acceptance evidence's own check.
-function shareableReason( reason ) {
+function sanitizedReason( reason ) {
 	const withheld = String( reason ).replace( QUOTED, '[run output withheld]' );
 	const kind = findUnsafeText( withheld );
 	if ( ! kind ) return withheld;
@@ -56,11 +56,15 @@ function shareableReason( reason ) {
 	}`;
 }
 
-// Whether the case selected a provider, or its result says one was selected:
-// its reasons may go with its sanitized summary (README, "What may leave this machine").
+// Whether the case selected a provider (in its vars or in the environment
+// promptfoo and the runner share), or its result says one was selected. Its
+// reasons leave out what the run wrote, though they stay on this machine with
+// promptfoo's results: only the sanitized summary may be shared (README,
+// "What may leave this machine").
 const providerQualified = ( d, vars ) =>
 	vars.requireProvider === true ||
 	( typeof vars.provider === 'string' && vars.provider.trim() !== '' ) ||
+	Boolean( process.env.STUDIO_EVAL_PROVIDER?.trim() ) ||
 	Boolean( d?.providerRoute );
 
 // A case the runner blocked before it ran, because the selected route isn't
@@ -130,7 +134,7 @@ function check( name, fn ) {
 		return {
 			...verdict,
 			reason: providerQualified( d, vars )
-				? shareableReason( verdict.reason )
+				? sanitizedReason( verdict.reason )
 				: String( verdict.reason ).replace( QUOTED, '$1' ),
 		};
 	};
@@ -511,9 +515,11 @@ export const builtFromDesign = check( 'builtFromDesign', ( d, vars ) => {
 	const s = site( d, vars );
 	const front = frontPage( s );
 	if ( s.showOnFront !== 'page' || ! front )
-		return fail( `no static front page (show_on_front=${ s.showOnFront })` );
+		return fail( `no static front page (show_on_front=${ quote( s.showOnFront ) })` );
 	if ( Object.keys( front.blocks ).length < 2 )
-		return fail( `the front page has almost no blocks: ${ JSON.stringify( front.blocks ) }` );
+		return fail(
+			`the front page has almost no blocks: ${ quote( JSON.stringify( front.blocks ) ) }`
+		);
 	if ( ! s.designMd ) return fail( 'no DESIGN.md at the site root' );
 	const designColors = [ ...s.designMd.matchAll( /#[0-9a-f]{6}\b/gi ) ].map( ( m ) =>
 		m[ 0 ].toLowerCase()
@@ -522,10 +528,12 @@ export const builtFromDesign = check( 'builtFromDesign', ( d, vars ) => {
 	const followed = designColors.filter( ( c ) => palette.has( c ) );
 	if ( designColors.length && ! followed.length )
 		return fail(
-			`none of DESIGN.md's colors are in the theme palette: ${ designColors.join( ', ' ) }`
+			`none of DESIGN.md's colors are in the theme palette: ${ quote( designColors.join( ', ' ) ) }`
 		);
 	return pass(
-		`front page "${ front.title }" built; ${ followed.length }/${ designColors.length } DESIGN.md colors in the palette`
+		`front page ${ quote( `"${ front.title }"` ) } built; ${ followed.length }/${
+			designColors.length
+		} DESIGN.md colors in the palette`
 	);
 } );
 
@@ -560,14 +568,16 @@ export const ownThemeWithFontsAndScreenshot = check(
 		const missing = fontSources.filter( ( f ) => ! fileList.includes( f ) );
 		if ( ! fontSources.length ) return fail( 'theme.json loads no self-hosted fonts' );
 		if ( missing.length )
-			return fail( `theme.json fonts missing from the theme: ${ missing.join( ', ' ) }` );
+			return fail( `theme.json fonts missing from the theme: ${ quote( missing.join( ', ' ) ) }` );
 		if ( ! s.themeScreenshot?.startsWith( 'jpeg:' ) && ! s.themeScreenshot?.startsWith( 'png:' ) ) {
-			return fail( `theme screenshot is ${ s.themeScreenshot ?? 'missing' }` );
+			return fail(
+				`theme screenshot is ${ s.themeScreenshot ? quote( s.themeScreenshot ) : 'missing' }`
+			);
 		}
 		return pass(
-			`theme ${ s.theme.stylesheet }: ${ fontSources.length } self-hosted font file(s)${
-				parent ? ` of ${ s.theme.template }` : ''
-			}, screenshot ${ s.themeScreenshot }`
+			`theme ${ quote( s.theme.stylesheet ) }: ${ fontSources.length } self-hosted font file(s)${
+				parent ? ` of ${ quote( s.theme.template ) }` : ''
+			}, screenshot ${ quote( s.themeScreenshot ) }`
 		);
 	}
 );
@@ -579,8 +589,8 @@ export const navAnchorsWorkEverywhere = check( 'navAnchorsWorkEverywhere', ( d, 
 	const anchors = ( s.home?.navHrefs || [] ).filter( ( h ) => /#./.test( h ) );
 	if ( anchors.length < 2 )
 		return fail(
-			`the navigation has ${ anchors.length } section link(s): ${ JSON.stringify(
-				s.home?.navHrefs
+			`the navigation has ${ anchors.length } section link(s): ${ quote(
+				JSON.stringify( s.home?.navHrefs )
 			) }`
 		);
 	const bare = anchors.filter( ( h ) => h.startsWith( '#' ) );
@@ -597,7 +607,9 @@ export const navAnchorsWorkEverywhere = check( 'navAnchorsWorkEverywhere', ( d, 
 			`links to sections the home page does not have: ${ quote( dangling.join( ', ' ) ) }`
 		);
 	return pass(
-		`${ anchors.length } section links, all home-relative with targets: ${ anchors.join( ', ' ) }`
+		`${ anchors.length } section links, all home-relative with targets: ${ quote(
+			anchors.join( ', ' )
+		) }`
 	);
 } );
 
@@ -611,9 +623,11 @@ export const pluginBlockOnFrontPage = check( 'pluginBlockOnFrontPage', ( d, vars
 		b.startsWith( vars.blockPrefix )
 	);
 	return used.length
-		? pass( `front page uses ${ used.join( ', ' ) }` )
+		? pass( `front page uses ${ quote( used.join( ', ' ) ) }` )
 		: fail(
-				`no ${ vars.blockPrefix }* block on the front page: ${ JSON.stringify( front?.blocks ) }`
+				`no ${ vars.blockPrefix }* block on the front page: ${ quote(
+					JSON.stringify( front?.blocks )
+				) }`
 		  );
 } );
 
@@ -635,7 +649,9 @@ export const customizedThroughChildTheme = check( 'customizedThroughChildTheme',
 	const child = s.theme.template === vars.parentTheme && s.theme.stylesheet !== vars.parentTheme;
 	if ( ! child && s.theme.stylesheet !== vars.parentTheme ) {
 		return fail(
-			`active theme is ${ s.theme.stylesheet } (template ${ s.theme.template }), not ${ vars.parentTheme } or a child of it`
+			`active theme is ${ quote( s.theme.stylesheet ) } (template ${ quote(
+				s.theme.template
+			) }), not ${ vars.parentTheme } or a child of it`
 		);
 	}
 	const parentChanges = child ? s.parentThemeChanges : s.themeChanges;
@@ -643,9 +659,9 @@ export const customizedThroughChildTheme = check( 'customizedThroughChildTheme',
 		return fail( `could not compare ${ vars.parentTheme } with its release` );
 	if ( parentChanges.length )
 		return fail(
-			`${ vars.parentTheme } differs from its release: ${ parentChanges
-				.slice( 0, 5 )
-				.join( ', ' ) }`
+			`${ vars.parentTheme } differs from its release: ${ quote(
+				parentChanges.slice( 0, 5 ).join( ', ' )
+			) }`
 		);
 	// The released theme sets its own heading font, so on it only the user's
 	// Global Styles show the customization.
@@ -654,9 +670,9 @@ export const customizedThroughChildTheme = check( 'customizedThroughChildTheme',
 	if ( ! /fontFamily/.test( heading ) )
 		return fail( `no heading font family in the ${ child ? 'merged styles' : 'Global Styles' }` );
 	return pass(
-		`${ child ? `child theme ${ s.theme.stylesheet }` : 'Global Styles' }; ${
+		`${ child ? `child theme ${ quote( s.theme.stylesheet ) }` : 'Global Styles' }; ${
 			vars.parentTheme
-		} untouched; heading font ${ heading.match( /"fontFamily":"([^"]+)"/ )?.[ 1 ] }`
+		} untouched; heading font ${ quote( heading.match( /"fontFamily":"([^"]+)"/ )?.[ 1 ] ) }`
 	);
 } );
 
@@ -683,7 +699,8 @@ export const colorsFromPalette = check( 'colorsFromPalette', ( d, vars ) => {
 			/"(?:backgroundColor|textColor|borderColor|overlayColor|gradient)"\s*:\s*"[a-z][a-z0-9-]*"|var\(\s*--wp--preset--color--[a-z0-9-]+/g
 		) || []
 	).length;
-	if ( hex.length ) return fail( `the page hardcodes ${ hex.slice( 0, 8 ).join( ', ' ) }` );
+	if ( hex.length )
+		return fail( `the page hardcodes ${ quote( hex.slice( 0, 8 ).join( ', ' ) ) }` );
 	if ( ! refs ) return fail( 'the page uses no palette colors' );
 	return pass( `${ refs } palette color reference(s), no hardcoded colors` );
 } );
@@ -725,7 +742,7 @@ export const noInlineDisplayOnBlockWrappers = check(
 			}
 		}
 		return offenders.length
-			? fail( `block wrappers with an inline display: ${ offenders.join( ', ' ) }` )
+			? fail( `block wrappers with an inline display: ${ quote( offenders.join( ', ' ) ) }` )
 			: pass( `${ blockClasses.size } block classes, none displayed inline` );
 	}
 );
@@ -767,7 +784,7 @@ export const repeatedTreatmentIsBlockStyle = check(
 			.filter( ( slug ) => registered.has( slug ) );
 		if ( applied.length < 2 )
 			return fail(
-				`registered variations ${ JSON.stringify( [ ...registered ] ) } applied ${
+				`registered variations ${ quote( JSON.stringify( [ ...registered ] ) ) } applied ${
 					applied.length
 				} time(s)`
 			);
@@ -778,10 +795,12 @@ export const repeatedTreatmentIsBlockStyle = check(
 		if ( repeated.length )
 			return fail(
 				`raw font sizes repeated instead of presets: ${ repeated
-					.map( ( [ k, n ] ) => `${ k } x${ n }` )
+					.map( ( [ k, n ] ) => `${ quote( k ) } x${ n }` )
 					.join( ', ' ) }`
 			);
-		return pass( `variation "${ applied[ 0 ] }" applied ${ applied.length } times` );
+		return pass(
+			`variation ${ quote( `"${ applied[ 0 ] }"` ) } applied ${ applied.length } times`
+		);
 	}
 );
 
@@ -792,11 +811,13 @@ export const designTokenReachedTheme = check( 'designTokenReachedTheme', ( d, va
 		?.match( new RegExp( `${ vars.token }:\\s*"?(#[0-9a-fA-F]{3,8})` ) )?.[ 1 ]
 		?.toLowerCase();
 	if ( ! value || value === vars.originalValue.toLowerCase() )
-		return fail( `DESIGN.md ${ vars.token } is ${ value ?? 'missing' }` );
+		return fail( `DESIGN.md ${ vars.token } is ${ value ? quote( value ) : 'missing' }` );
 	const inPalette = ( s.palette || [] ).some( ( p ) => String( p.color ).toLowerCase() === value );
 	return inPalette
-		? pass( `DESIGN.md ${ vars.token } is ${ value }, and the theme palette has it` )
-		: fail( `DESIGN.md ${ vars.token } is ${ value }, but the theme palette does not have it` );
+		? pass( `DESIGN.md ${ vars.token } is ${ quote( value ) }, and the theme palette has it` )
+		: fail(
+				`DESIGN.md ${ vars.token } is ${ quote( value ) }, but the theme palette does not have it`
+		  );
 } );
 
 // Routing: every skill in `vars.skills` was loaded before the run's stop call
@@ -811,7 +832,7 @@ export const skillsLoadedFirst = check( 'skillsLoadedFirst', ( d, vars ) => {
 	const missing = ( vars.skills || [] )
 		.map( ( skill ) => skill.name )
 		.filter( ( name ) => ! loaded.includes( name ) );
-	const before = d.stoppedAt ? `before ${ d.stoppedAt.toolName }` : 'in the whole run';
+	const before = d.stoppedAt ? `before ${ quote( d.stoppedAt.toolName ) }` : 'in the whole run';
 	return missing.length
 		? fail(
 				`not loaded ${ before }: ${ missing.join( ', ' ) }; loaded: ${ quote(
@@ -937,7 +958,7 @@ const lastTurnCalls = ( d ) =>
 export const lastTurnUsedNoTools = check( 'lastTurnUsedNoTools', ( d ) => {
 	const calls = lastTurnCalls( d );
 	return calls.length
-		? fail( `the last turn called ${ calls.map( ( c ) => c.name ).join( ', ' ) }` )
+		? fail( `the last turn called ${ quote( calls.map( ( c ) => c.name ).join( ', ' ) ) }` )
 		: pass( 'the last turn answered from the conversation alone' );
 } );
 
@@ -948,7 +969,11 @@ export const usedOnlyTools = check( 'usedOnlyTools', ( d, vars ) => {
 	if ( ! calls.length ) return fail( `no tool was called; expected ${ allowed.join( ', ' ) }` );
 	const other = calls.filter( ( c ) => ! allowed.includes( c.name ) ).map( ( c ) => c.name );
 	return other.length
-		? fail( `called ${ [ ...new Set( other ) ].join( ', ' ) } besides ${ allowed.join( ', ' ) }` )
+		? fail(
+				`called ${ quote( [ ...new Set( other ) ].join( ', ' ) ) } besides ${ allowed.join(
+					', '
+				) }`
+		  )
 		: pass( `${ calls.length } call(s), all to ${ allowed.join( ', ' ) }` );
 } );
 
@@ -1026,9 +1051,9 @@ export const toolsInOrder = check( 'toolsInOrder', ( d, vars ) => {
 		);
 		if ( index < 0 )
 			return fail(
-				`no successful ${ name } after ${ after < 0 ? 'the start' : calls[ after ].name }: ${ calls
-					.map( ( c ) => c.name )
-					.join( ', ' ) }`
+				`no successful ${ name } after ${
+					after < 0 ? 'the start' : quote( calls[ after ].name )
+				}: ${ quote( calls.map( ( c ) => c.name ).join( ', ' ) ) }`
 			);
 		after = index;
 	}
@@ -1144,7 +1169,9 @@ export const cancelledThenContinued = check( 'cancelledThenContinued', ( d, vars
 	if ( ! next ) return fail( 'the conversation did not go on after the cancellation' );
 	const late = ( d.toolCalls || [] ).slice( d.stoppedAt.index + 1, next.toolCallsStart );
 	if ( late.length )
-		return fail( `${ late.map( ( c ) => c.name ).join( ', ' ) } started after the cancellation` );
+		return fail(
+			`${ quote( late.map( ( c ) => c.name ).join( ', ' ) ) } started after the cancellation`
+		);
 	if ( vars.inspectPattern ) {
 		const matches = inspectionText( d ).match( new RegExp( vars.inspectPattern, 'g' ) ) || [];
 		if ( matches.length > ( vars.maxInspectMatches ?? 0 ) )
@@ -1156,7 +1183,7 @@ export const cancelledThenContinued = check( 'cancelledThenContinued', ( d, vars
 	}
 	const text = finalReply( d );
 	return lowered( text ).includes( lowered( vars.expectedText ) )
-		? pass( `stopped at ${ d.stoppedAt.toolName }; the chat went on` )
+		? pass( `stopped at ${ quote( d.stoppedAt.toolName ) }; the chat went on` )
 		: fail(
 				`the reply after the cancellation lacks ${ vars.expectedText }: ${ quote(
 					text.slice( 0, 300 )
