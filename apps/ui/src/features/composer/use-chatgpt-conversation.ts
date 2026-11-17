@@ -19,6 +19,7 @@ import {
 	describeChatGptSettingsError,
 	useChatGptModels,
 	useChatGptSettings,
+	useOpenChatGptAccount,
 	useRecheckChatGptSettings,
 } from '@/data/queries/use-chatgpt-settings';
 import { saveSessionSettingChange } from '@/data/session-setting-changes';
@@ -53,10 +54,15 @@ export function useChatGptConversation( {
 	const settings = useChatGptSettings();
 	const { mutate: recheck } = useRecheckChatGptSettings();
 	const openSettings = useOpenSettings();
+	const openAccount = useOpenChatGptAccount();
 	const selection = readChatGptSessionSelection( entries );
 	const account = settings.data?.accounts.find(
 		( item ) =>
 			item.connectionId === selection?.connectionId && item.revision === selection.revision
+	);
+	// The registration the chat ran on, whatever its revision is now.
+	const saved = settings.data?.accounts.find(
+		( item ) => item.connectionId === selection?.connectionId
 	);
 	const models = useChatGptModels(
 		account,
@@ -72,10 +78,11 @@ export function useChatGptConversation( {
 		: undefined;
 	const capabilities = selection ? getChatGptModelCapabilities( selection.model ) : undefined;
 	let problem: string | undefined;
-	let action: ComposerNotice[ 'action' ] = {
+	const manage = ( focus?: string ): ComposerNotice[ 'action' ] => ( {
 		label: __( 'Manage ChatGPT' ),
-		onClick: () => openSettings( 'ai' ),
-	};
+		onClick: () => ( saved ? openAccount( saved.connectionId, focus ) : openSettings( 'ai' ) ),
+	} );
+	let action = manage();
 	if ( settings.isPending ) {
 		problem = __( 'Checking the ChatGPT connection…' );
 	} else if ( settings.isError ) {
@@ -84,9 +91,15 @@ export function useChatGptConversation( {
 	} else if ( ! settings.data?.enabled ) {
 		problem = __( 'ChatGPT plan connections are not enabled in this app.' );
 	} else if ( ! selection || ! connection.ok ) {
-		problem = describeConnectionSelectionError(
-			connection.ok ? { code: 'unsupported', providerId: 'chatgpt-oauth' } : connection.error
-		);
+		const error = connection.ok
+			? { code: 'unsupported' as const, providerId: 'chatgpt-oauth' as const }
+			: connection.error;
+		// Its registration still saved, signing in to it again continues the chat.
+		const accountState = error.code === 'disconnected' ? saved?.state : undefined;
+		problem = describeConnectionSelectionError( error, accountState );
+		if ( accountState ) {
+			action = manage( __( 'ChatGPT sign-in' ) );
+		}
 	} else if ( ! reasoning?.ok ) {
 		problem = reasoning
 			? describeChatGptReasoningProblem( reasoning.problem )

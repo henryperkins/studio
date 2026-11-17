@@ -294,6 +294,44 @@ describe( 'ChatGPT account settings', () => {
 		expect( within( group ).getByText( /This status may be out of date\./ ) ).toBeVisible();
 	} );
 
+	it.each( [ 'signed-out', 'needs-sign-in' ] as const )(
+		'makes signing in again to a %s account the primary action, ahead of adding an account',
+		async ( state ) => {
+			const { connector } = await openSettings( {
+				accounts: [ { ...account(), authStatus: 'disconnected', state } ],
+			} );
+			const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+			const again = await within( group ).findByRole( 'button', { name: 'Sign in again' } );
+			const add = within( group ).getByRole( 'button', { name: 'Add account' } );
+
+			expect( again ).toHaveAttribute( 'data-variant', 'accent' );
+			expect( add ).toHaveAttribute( 'data-variant', 'outline' );
+			expect(
+				again.compareDocumentPosition( add ) & Node.DOCUMENT_POSITION_FOLLOWING
+			).toBeTruthy();
+			fireEvent.click( again );
+			await waitFor( () =>
+				expect( connector.beginChatGptSignIn ).toHaveBeenCalledExactlyOnceWith( ACCOUNT_A, {
+					storage: 'vault',
+				} )
+			);
+		}
+	);
+
+	it( 'keeps adding an account the primary action while the chosen account is connected', async () => {
+		await openSettings( { accounts: [ account() ] } );
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+
+		expect( await within( group ).findByRole( 'button', { name: 'Add account' } ) ).toHaveAttribute(
+			'data-variant',
+			'accent'
+		);
+		expect( within( group ).getByRole( 'button', { name: 'Sign in again' } ) ).toHaveAttribute(
+			'data-variant',
+			'outline'
+		);
+	} );
+
 	it( 'explains callback-host restrictions and keeps sign-in unavailable', async () => {
 		const { connector } = await openSettings( { signInSupported: false } );
 		expect( await screen.findByText( /Open Studio on localhost/ ) ).toBeVisible();

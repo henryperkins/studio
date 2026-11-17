@@ -6,6 +6,7 @@ import {
 	describeChatGptSettingsError,
 	holdChatGptConnection,
 	refreshChatGptSettings,
+	useChatGptAccountToOpen,
 	useChatGptModels,
 	useChatGptSettings,
 	useRecheckChatGptSettings,
@@ -27,7 +28,8 @@ export function ChatGptSettingsGroup() {
 	const queryClient = useQueryClient();
 	const settings = useChatGptSettings();
 	const offline = useOffline();
-	const [ selectedId, setSelectedId ] = useState< string >();
+	const accountToOpen = useChatGptAccountToOpen();
+	const [ selectedId, setSelectedId ] = useState( accountToOpen );
 	const [ storage, setStorage ] = useState< ChatGptCredentialStorage >( 'vault' );
 	const [ pending, setPending ] = useState( false );
 	const [ signingOut, setSigningOut ] = useState( false );
@@ -166,6 +168,17 @@ export function ChatGptSettingsGroup() {
 		settings.data.signInSupported &&
 		( storage === 'session' || settings.data.secureStorage === 'available' );
 	const connected = account?.authStatus === 'connected';
+	// Signing in again keeps an account's chats going, which a new account can't.
+	const signInAgainFirst = !! account && ! connected;
+	const signInAgain = account ? (
+		<Button
+			variant={ signInAgainFirst ? 'accent' : 'outline' }
+			disabled={ ! canSignIn }
+			onClick={ () => void signIn( account.connectionId ) }
+		>
+			{ __( 'Sign in again' ) }
+		</Button>
+	) : null;
 	const availability = models.data?.models;
 	const listsUnqualified = !! models.data?.listsUnqualifiedModels;
 	const availabilityDescription = () => {
@@ -314,18 +327,17 @@ export function ChatGptSettingsGroup() {
 						</Button>
 					) : (
 						<>
-							<Button variant="accent" disabled={ ! canSignIn } onClick={ () => void signIn() }>
+							{ signInAgainFirst ? signInAgain : null }
+							<Button
+								variant={ signInAgainFirst ? 'outline' : 'accent' }
+								disabled={ ! canSignIn }
+								onClick={ () => void signIn() }
+							>
 								{ accounts.length ? __( 'Add account' ) : __( 'Start sign-in' ) }
 							</Button>
 							{ account ? (
 								<>
-									<Button
-										variant="outline"
-										disabled={ ! canSignIn }
-										onClick={ () => void signIn( account.connectionId ) }
-									>
-										{ __( 'Sign in again' ) }
-									</Button>
+									{ signInAgainFirst ? null : signInAgain }
 									<Button
 										variant="outline"
 										disabled={ busy }

@@ -96,3 +96,61 @@ describe( 'signing in with /chatgpt where secure storage is unavailable', () => 
 		}
 	);
 } );
+
+describe( 'changing the model of a chat whose ChatGPT account isn’t connected', () => {
+	const ID = 'f84d75a0-4e60-4168-a1ab-3134542c637a';
+
+	afterEach( () => vi.clearAllMocks() );
+
+	it.each( [
+		[ 'signed-out', 'The ChatGPT account this chat runs on is signed out.' ],
+		[ 'needs-sign-in', 'The ChatGPT account this chat runs on needs you to sign in again.' ],
+	] as const )(
+		'says signing in to its %s account again continues the chat, as Studio’s composer does',
+		async ( state, opening ) => {
+			vi.mocked( readChatGptSettings ).mockResolvedValue( {
+				enabled: true,
+				signInSupported: true,
+				secureStorage: 'available',
+				accounts: [
+					{
+						connectionId: ID,
+						providerId: 'chatgpt-oauth',
+						backend: 'pi',
+						revision: 1,
+						identity: { verified: true },
+						authStatus: 'disconnected',
+						label: 'Personal',
+						email: null,
+						storage: 'vault',
+						state,
+					},
+				],
+			} );
+			const ui = makeUi();
+			const ctx = makeCtx( ui );
+			vi.mocked( ctx.getSessionEntries ).mockResolvedValue( [
+				{
+					type: 'custom',
+					id: 'pin',
+					parentId: null,
+					timestamp: new Date().toISOString(),
+					customType: 'studio.session_context',
+					data: {
+						provider: 'chatgpt-oauth',
+						connectionId: ID,
+						revision: 1,
+						chatGpt: { model: 'gpt-6-luna', reasoningEffort: 'medium' },
+					},
+				},
+			] );
+
+			await runChatGptCommand( ctx, 'model' );
+
+			expect( ui.showError ).toHaveBeenCalledExactlyOnceWith(
+				`${ opening } Sign in to that account again to continue this chat; the conversation stays as it is.`
+			);
+			expect( ui.askUser ).not.toHaveBeenCalled();
+		}
+	);
+} );

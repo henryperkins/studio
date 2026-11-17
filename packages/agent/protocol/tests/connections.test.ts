@@ -475,6 +475,48 @@ describe( 'ChatGPT records', () => {
 			expect( text ).not.toMatch( /codex/i );
 		}
 	} );
+
+	it.each( [
+		[
+			'signed-out',
+			'The ChatGPT account this chat runs on is signed out. Sign in to that account again to continue this chat; the conversation stays as it is.',
+		],
+		[
+			'needs-sign-in',
+			'The ChatGPT account this chat runs on needs you to sign in again. Sign in to that account again to continue this chat; the conversation stays as it is.',
+		],
+		// Saved and signed in, yet unusable here (a sign-in kept for another app session).
+		[
+			'signed-in',
+			'The ChatGPT account this chat runs on needs you to sign in again. Sign in to that account again to continue this chat; the conversation stays as it is.',
+		],
+	] as const )(
+		'says signing in again continues a chat whose saved account is %s',
+		( state, text ) => {
+			expect(
+				describeConnectionSelectionError(
+					{ code: 'disconnected', providerId: 'chatgpt-oauth' },
+					state
+				)
+			).toBe( text );
+		}
+	);
+
+	it( 'keeps saying a new chat is needed when the connection changed or is gone, whatever the account’s state', () => {
+		expect(
+			describeConnectionSelectionError(
+				{ code: 'changed', providerId: 'chatgpt-oauth' },
+				'signed-out'
+			)
+		).toBe(
+			'The ChatGPT connection this chat ran on has changed since, so the chat can’t continue. Start a new chat.'
+		);
+		expect(
+			describeConnectionSelectionError( { code: 'disconnected', providerId: 'chatgpt-oauth' } )
+		).toBe(
+			'ChatGPT isn’t connected, so this chat can’t continue. Start a new chat with another provider.'
+		);
+	} );
 } );
 
 describe( 'parity with the legacy rules', () => {

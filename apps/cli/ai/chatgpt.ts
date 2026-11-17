@@ -11,6 +11,7 @@ import {
 } from '@studio/agent/node/chatgpt/settings';
 import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { getChatGptModelCapabilities } from '@studio/agent/protocol/chatgpt-models';
+import { describeConnectionSelectionError } from '@studio/agent/protocol/connections';
 import { getOpenAiReasoningEffortLabel } from '@studio/agent/protocol/openai-models';
 import { getEffectiveSessionProvider, type AiProviderId } from '@studio/agent/protocol/providers';
 import { __, sprintf } from '@wordpress/i18n';
@@ -253,6 +254,13 @@ export async function runChatGptCommand(
 			if ( ! account )
 				throw new ChatGptSettingsError(
 					__( 'This chat’s ChatGPT connection is unavailable. Use /chatgpt to start a new chat.' )
+				);
+			if ( account.authStatus !== 'connected' )
+				throw new ChatGptSettingsError(
+					describeConnectionSelectionError(
+						{ code: 'disconnected', providerId: 'chatgpt-oauth' },
+						account.state
+					)
 				);
 			await configure( ctx, account, selectionOnly === 'reasoning' );
 			return 'continue';

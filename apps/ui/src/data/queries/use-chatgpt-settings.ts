@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { __, sprintf } from '@wordpress/i18n';
+import { useCallback, useEffect, useState } from 'react';
 import { useConnector, type Connector } from '@/data/core';
+import { useOpenSettings } from '@/data/use-open-settings';
 import type { ChatGptAccountView, ChatGptSettings } from '@studio/agent/protocol/chatgpt';
 
 export const CHATGPT_SETTINGS_QUERY_KEY = [ 'chatgpt-settings' ] as const;
@@ -15,6 +17,35 @@ export function useChatGptSettings() {
 		retry: false,
 		meta: { persist: false },
 	} );
+}
+
+// The saved account the ChatGPT settings open on, when a chat opens them for its own.
+const accountsToOpen = new WeakMap< Connector, string >();
+
+/**
+ * Opens the AI settings on a chat's own ChatGPT account, revealing the setting
+ * titled `focus` when given, rather than on whichever account is listed first.
+ */
+export function useOpenChatGptAccount() {
+	const connector = useConnector();
+	const openSettings = useOpenSettings();
+	return useCallback(
+		( connectionId: string, focus?: string ) => {
+			accountsToOpen.set( connector, connectionId );
+			openSettings( 'ai', undefined, focus );
+		},
+		[ connector, openSettings ]
+	);
+}
+
+/** The account the ChatGPT settings were opened on, if a chat opened them; read once. */
+export function useChatGptAccountToOpen(): string | undefined {
+	const connector = useConnector();
+	const [ connectionId ] = useState( () => accountsToOpen.get( connector ) );
+	useEffect( () => {
+		accountsToOpen.delete( connector );
+	}, [ connector ] );
+	return connectionId;
 }
 
 /** Why the last read of the ChatGPT accounts failed, as Settings and the composer say it. */

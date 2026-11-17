@@ -11,6 +11,7 @@ import {
 	type AiSettings,
 } from '@studio/agent/protocol/providers';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import type { ChatGptAccountState } from '@studio/agent/protocol/chatgpt';
 import type { ChatGptErrorSummary } from '@studio/agent/protocol/chatgpt-errors';
 import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
 
@@ -221,13 +222,37 @@ function resolveChatGptConnection(
 	return { ok: true, selection: { connectionId, model: { providerId, modelId }, revision } };
 }
 
-/** What went wrong with a conversation's connection, and what the user can do. */
+/**
+ * What went wrong with a conversation's connection, and what the user can do.
+ * Given the state of the saved account a disconnected conversation ran on,
+ * says that signing in to that account again continues it: its revision, and
+ * so the conversation, stays as it is.
+ */
 export function describeConnectionSelectionError(
-	error: Pick< ConnectionSelectionError, 'code' | 'providerId' >
+	error: Pick< ConnectionSelectionError, 'code' | 'providerId' >,
+	accountState?: ChatGptAccountState
 ): string {
 	const provider = AI_PROVIDER_LABELS[ error.providerId ];
 	switch ( error.code ) {
 		case 'disconnected':
+			if ( accountState === 'signed-out' ) {
+				return sprintf(
+					/* translators: %s: AI provider name, e.g. "ChatGPT". */
+					__(
+						'The %s account this chat runs on is signed out. Sign in to that account again to continue this chat; the conversation stays as it is.'
+					),
+					provider
+				);
+			}
+			if ( accountState ) {
+				return sprintf(
+					/* translators: %s: AI provider name, e.g. "ChatGPT". */
+					__(
+						'The %s account this chat runs on needs you to sign in again. Sign in to that account again to continue this chat; the conversation stays as it is.'
+					),
+					provider
+				);
+			}
 			return sprintf(
 				/* translators: %s: AI provider name, e.g. "ChatGPT". */
 				__(

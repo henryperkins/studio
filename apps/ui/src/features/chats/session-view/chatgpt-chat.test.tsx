@@ -547,6 +547,81 @@ describe( 'ChatGPT chats', () => {
 		expect( runs[ 0 ].selection ).toEqual( INITIAL );
 	} );
 
+	it.each( [
+		[
+			'signed-out',
+			'The ChatGPT account this chat runs on is signed out. Sign in to that account again to continue this chat; the conversation stays as it is.',
+		],
+		[
+			'needs-sign-in',
+			'The ChatGPT account this chat runs on needs you to sign in again. Sign in to that account again to continue this chat; the conversation stays as it is.',
+		],
+	] as const )(
+		'says signing in again to its %s account continues the chat, and opens Settings on that account, not the first',
+		async ( state, text ) => {
+			const { connector, queryClient, runs } = await setup( [
+				pin( { ...INITIAL, connectionId: B } ),
+			] );
+			connector.state.chatGpt.accounts[ 1 ] = {
+				...account( B, 'Work' ),
+				authStatus: 'disconnected',
+				state,
+			};
+			await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+			expect( await screen.findByText( text ) ).toBeVisible();
+			expect( screen.queryByText( /Start a new chat/ ) ).not.toBeInTheDocument();
+			send( 'Held request' );
+			await act( async () => {} );
+			expect( runs ).toHaveLength( 0 );
+			fireEvent.click( screen.getByRole( 'button', { name: 'Manage ChatGPT' } ) );
+
+			const dialog = await screen.findByRole( 'dialog', { name: 'Settings' } );
+			const group = await within( dialog ).findByRole( 'group', { name: 'ChatGPT plan' } );
+			expect(
+				within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
+			).toHaveTextContent( 'Work' );
+			const signIn = within( group ).getByRole( 'button', { name: 'Sign in again' } );
+			expect( signIn ).toHaveAttribute( 'data-variant', 'accent' );
+			expect( within( group ).getByRole( 'button', { name: 'Add account' } ) ).toHaveAttribute(
+				'data-variant',
+				'outline'
+			);
+			await waitFor( () =>
+				expect( document.querySelector( '[data-settings-match]' ) ).toHaveAccessibleName(
+					'ChatGPT sign-in'
+				)
+			);
+			fireEvent.click( signIn );
+			await waitFor( () =>
+				expect( connector.beginChatGptSignIn ).toHaveBeenCalledWith( B, { storage: 'vault' } )
+			);
+		}
+	);
+
+	it( 'keeps saying a new chat is needed once the connection has changed, and opens Settings on the chat’s account', async () => {
+		const { connector, queryClient } = await setup( [ pin( { ...INITIAL, connectionId: B } ) ] );
+		connector.state.chatGpt.accounts[ 1 ] = { ...account( B, 'Work' ), revision: 2 };
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+		expect(
+			await screen.findByText(
+				'The ChatGPT connection this chat ran on has changed since, so the chat can’t continue. Start a new chat.'
+			)
+		).toBeVisible();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Manage ChatGPT' } ) );
+
+		const dialog = await screen.findByRole( 'dialog', { name: 'Settings' } );
+		const group = await within( dialog ).findByRole( 'group', { name: 'ChatGPT plan' } );
+		expect(
+			within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
+		).toHaveTextContent( 'Work' );
+		expect( within( group ).getByRole( 'button', { name: 'Add account' } ) ).toHaveAttribute(
+			'data-variant',
+			'accent'
+		);
+	} );
+
 	it( 'holds queued messages after the selected account disconnects, even with another account and an API key', async () => {
 		const { connector, queryClient, runs } = await setup( [ pin( INITIAL ) ], true );
 		send( 'First request' );
@@ -568,7 +643,11 @@ describe( 'ChatGPT chats', () => {
 				event: { type: 'run.interrupted', timestamp: new Date().toISOString() },
 			} )
 		);
-		await waitFor( () => expect( screen.getByText( /ChatGPT isn’t connected/ ) ).toBeVisible() );
+		await waitFor( () =>
+			expect(
+				screen.getByText( /The ChatGPT account this chat runs on is signed out\./ )
+			).toBeVisible()
+		);
 		expect( screen.getByText( 'Queued private request' ) ).toBeVisible();
 		expect( runs ).toHaveLength( 1 );
 		expect( connector.setSessionProvider ).not.toHaveBeenCalled();
