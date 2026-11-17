@@ -539,6 +539,56 @@ describe( 'ChatGPT account settings', () => {
 		);
 	} );
 
+	it.each( [
+		[ 'needs signing in again', 'needs-sign-in' ],
+		[ 'is signed in for another app session only', 'signed-in' ],
+	] as const )( 'badges an account that %s “Needs sign-in”', async ( _case, state ) => {
+		await openSettings( { accounts: [ { ...account(), authStatus: 'disconnected', state } ] } );
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+
+		expect( await within( group ).findByText( 'Needs sign-in' ) ).toBeVisible();
+		expect( within( group ).queryByText( 'Connected' ) ).not.toBeInTheDocument();
+		expect( within( group ).queryByText( 'Signed out' ) ).not.toBeInTheDocument();
+	} );
+
+	it( 'says an account kept for this app session only, offering where to keep the next sign-in', async () => {
+		await openSettings( { accounts: [ { ...account(), storage: 'session' } ] } );
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+
+		expect(
+			await within( group ).findByText(
+				'This account is signed in only for this app session. Choose where to keep your next sign-in.'
+			)
+		).toBeVisible();
+		expect(
+			within( group ).getByRole( 'combobox', { name: 'Keep ChatGPT sign-in' } )
+		).toBeEnabled();
+	} );
+
+	it( 'offers no sign-in or model check while offline, and signing in again once back online', async () => {
+		const online = vi.spyOn( navigator, 'onLine', 'get' ).mockReturnValue( false );
+		const { connector } = await openSettings( {
+			accounts: [ { ...account(), authStatus: 'disconnected', state: 'signed-out' } ],
+		} );
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+
+		expect(
+			await within( group ).findByRole( 'button', { name: 'Sign in again' } )
+		).toBeDisabled();
+		expect( within( group ).getByRole( 'button', { name: 'Add account' } ) ).toBeDisabled();
+		expect( within( group ).getByRole( 'button', { name: 'Refresh models' } ) ).toBeDisabled();
+		fireEvent.click( within( group ).getByRole( 'button', { name: 'Sign in again' } ) );
+		expect( connector.beginChatGptSignIn ).not.toHaveBeenCalled();
+
+		online.mockReturnValue( true );
+		act( () => {
+			window.dispatchEvent( new Event( 'online' ) );
+		} );
+		await waitFor( () =>
+			expect( within( group ).getByRole( 'button', { name: 'Sign in again' } ) ).toBeEnabled()
+		);
+	} );
+
 	it( 'explains callback-host restrictions and keeps sign-in unavailable', async () => {
 		const { connector } = await openSettings( { signInSupported: false } );
 		expect( await screen.findByText( /Open Studio on localhost/ ) ).toBeVisible();

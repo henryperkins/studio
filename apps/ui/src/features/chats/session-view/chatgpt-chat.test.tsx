@@ -752,6 +752,32 @@ describe( 'ChatGPT chats', () => {
 		);
 	} );
 
+	it( 'holds a chat that ran on ChatGPT once ChatGPT plans are turned off, offering no ChatGPT account', async () => {
+		const { connector, queryClient, runs } = await setup();
+		connector.state.chatGpt = {
+			enabled: false,
+			signInSupported: false,
+			secureStorage: 'unavailable',
+			accounts: [],
+		};
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+		expect(
+			await screen.findByText( 'ChatGPT plan connections are not enabled in this app.' )
+		).toBeVisible();
+		send( 'Held request' );
+		await act( async () => {} );
+		expect( runs ).toHaveLength( 0 );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+		expect( await screen.findByRole( 'listbox', { name: 'Choose a model' } ) ).toBeVisible();
+		expect( screen.queryByRole( 'group', { name: /^ChatGPT plan/ } ) ).not.toBeInTheDocument();
+		expect( connector.getChatGptModels ).not.toHaveBeenCalledWith( B, 1 );
+		expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+		expect( readChatGptSessionSelection( connector.state.sessions[ 0 ].entries ) ).toEqual(
+			INITIAL
+		);
+	} );
+
 	it( 'holds queued messages after the selected account disconnects, even with another account and an API key', async () => {
 		const { connector, queryClient, runs } = await setup( [ pin( INITIAL ) ], true );
 		send( 'First request' );
