@@ -205,6 +205,9 @@ describe( 'site_delete on the Claude route', () => {
 } );
 
 const PATH_REFUSAL = 'inside the site’s folder or this conversation’s workspace';
+// What a path with a `..` segment, or on Windows a colon after anything but its
+// drive, is refused with: the path may look inside, so the reason is its form.
+const PLAIN_PATH_REFUSAL = 'only by a plain absolute path';
 
 describe( 'site_import on the Claude route', () => {
 	it( 'imports a backup from the conversation’s folders once the user approves the operation that names it', async () => {
@@ -536,7 +539,7 @@ describe.runIf( process.platform === 'win32' )( 'a path that names an NTFS strea
 			exportFile: `${ path.join( site, 'link' ) }:s.zip`,
 		} );
 		expect( result.isError ).toBe( true );
-		expect( text( result ) ).toContain( PATH_REFUSAL );
+		expect( text( result ) ).toContain( PLAIN_PATH_REFUSAL );
 		expect( host.sites.export ).not.toHaveBeenCalled();
 		expect( await exists( escaped ) ).toBe( false );
 		expect( await exists( `${ escaped }:s.zip` ) ).toBe( false );
@@ -554,7 +557,7 @@ describe.runIf( process.platform === 'win32' )( 'a path that names an NTFS strea
 			exportFile: `${ path.join( site, 'linked' ) }:s.zip`,
 		} );
 		expect( result.isError ).toBe( true );
-		expect( text( result ) ).toContain( PATH_REFUSAL );
+		expect( text( result ) ).toContain( PLAIN_PATH_REFUSAL );
 		expect( host.sites.export ).not.toHaveBeenCalled();
 		expect( await exists( `${ existing }:s.zip` ) ).toBe( false );
 		expect( await readFile( existing, 'utf8' ) ).toBe( 'outside' );
@@ -615,6 +618,44 @@ describe( 'the file a host operation reads or writes', () => {
 		} );
 	} );
 
+	it( 'is refused by its form, with a sentence that says so, when it has a `..` segment or on Windows a colon after anything but its drive, even where it would lead inside', async () => {
+		const { bridge, host, context, site, parent } = await setup();
+		await mkdir( path.join( site, 'sub' ) );
+		await writeFile( path.join( site, 'backup.zip' ), 'zip' );
+		// Joined by hand: `path.join` would collapse the `..` before any check saw it.
+		const unplain = [
+			[ site, 'sub', '..', 'backup.zip' ].join( path.sep ),
+			[ site, 'sub', '..', 'backup.zip' ].join( '/' ),
+			...( process.platform === 'win32'
+				? [
+						`${ path.join( site, 'backup.zip' ) }:s`,
+						`\\\\?\\${ path.join( site, 'backup.zip' ) }`,
+				  ]
+				: [] ),
+		];
+		for ( const file of unplain ) {
+			for ( const [ name, args ] of [
+				[ 'site_import', { nameOrPath: 'site', importFile: file } ],
+				[ 'site_export', { nameOrPath: 'site', exportFile: file } ],
+			] as const ) {
+				const result = await bridge.invoke( name, args );
+				expect( result.isError, `${ name } ${ file }` ).toBe( true );
+				expect( text( result ), `${ name } ${ file }` ).toContain( PLAIN_PATH_REFUSAL );
+				expect( text( result ), `${ name } ${ file }` ).not.toContain( PATH_REFUSAL );
+				expect( text( result ), `${ name } ${ file }` ).not.toContain( parent );
+			}
+		}
+		// A path whose form is plain keeps the sentence about where it must lie.
+		for ( const file of [ 'backup.zip', path.join( parent, 'elsewhere.zip' ) ] ) {
+			const result = await bridge.invoke( 'site_export', { nameOrPath: 'site', exportFile: file } );
+			expect( text( result ), file ).toContain( PATH_REFUSAL );
+			expect( text( result ), file ).not.toContain( PLAIN_PATH_REFUSAL );
+		}
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect( host.sites.import ).not.toHaveBeenCalled();
+		expect( host.sites.export ).not.toHaveBeenCalled();
+	} );
+
 	// Where the system resolves `..` after following a link, `link/..` is the
 	// folder the link leads into, not the one the link is in.
 	it.runIf( process.platform === 'darwin' || process.platform === 'linux' )(
@@ -629,7 +670,7 @@ describe( 'the file a host operation reads or writes', () => {
 				exportFile: `${ path.join( site, 'link' ) }/../escaped.zip`,
 			} );
 			expect( result.isError ).toBe( true );
-			expect( text( result ) ).toContain( PATH_REFUSAL );
+			expect( text( result ) ).toContain( PLAIN_PATH_REFUSAL );
 			expect( host.sites.export ).not.toHaveBeenCalled();
 			expect( existsSync( path.join( parent, 'outside', 'escaped.zip' ) ) ).toBe( false );
 		}

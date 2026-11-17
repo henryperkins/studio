@@ -32,6 +32,7 @@ import {
 	isAllowedNativePath,
 	isBundledFolder,
 	isInsideCanonicalRoot,
+	isJudgeable,
 	isOutsideReach,
 	resolveAllowedNewPath,
 	resolveAllowedPath,
@@ -229,6 +230,8 @@ const REFUSALS = {
 	notApproved: 'The user did not approve this operation, or did not answer in time.',
 	outsideFolders:
 		'A file Studio reads or writes for this operation must be an absolute path inside the site’s folder or this conversation’s workspace, and not one that holds credentials.',
+	plainPath:
+		'Studio reads or writes a file for this operation only by a plain absolute path: one with no `..` segment and, on Windows, no colon but the one after the drive letter, so no stream name and no device path written with a colon. Name the file by its folder’s path and its own name.',
 	createInSite:
 		'A conversation works on one site, and this conversation already has its site. Ask the user to start a new conversation to create another one.',
 	withoutSite:
@@ -1075,7 +1078,14 @@ export function createClaudeExecutionPolicy(
 		if ( request.file ) {
 			const checked = await conversationFile( request.file );
 			if ( ! checked ) {
-				refuse( toolCallId, REFUSALS.outsideFolders );
+				// An absolute path no check can judge may look inside, so its form is the reason.
+				const named = request.file.path;
+				refuse(
+					toolCallId,
+					typeof named === 'string' && path.isAbsolute( named ) && ! isJudgeable( named )
+						? REFUSALS.plainPath
+						: REFUSALS.outsideFolders
+				);
 				return;
 			}
 			file = { path: checked, existing: request.file.existing };

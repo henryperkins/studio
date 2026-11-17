@@ -29,7 +29,7 @@ function isSensitivePath( candidate: string ): boolean {
 // On Windows a colon anywhere but the drive names an NTFS stream or a device:
 // `link:s.zip` opens a stream of whatever `link` leads to, though neither
 // `realpath` nor `lstat` of that name finds anything to resolve.
-function isJudgeable( file: string ): boolean {
+export function isJudgeable( file: string ): boolean {
 	return (
 		path.isAbsolute( file ) &&
 		! file.split( /[\\/]/ ).includes( '..' ) &&
