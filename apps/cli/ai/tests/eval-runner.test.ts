@@ -7,12 +7,9 @@ import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-direc
 import { wpcomRequestTool } from '@studio/agent/node/tools/wpcom-request';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { findUnsafeRecord } from 'cli/ai/acceptance-evidence';
+import { isolateCaseProfile } from 'cli/ai/eval-case-profile';
 import { evalConnectionRef } from 'cli/ai/eval-provider';
-import {
-	readEvalRunnerInput,
-	runEval as runEvalUntyped,
-	writeCaseSummary,
-} from 'cli/ai/eval-runner';
+import { readEvalRunnerInput, runEval as runCase, writeCaseSummary } from 'cli/ai/eval-runner';
 import { cliAgentHost } from 'cli/ai/host';
 import type { AgentSessionEvent, SessionManager } from '@earendil-works/pi-coding-agent';
 import type { StudioAgentHost } from '@studio/agent/node/host';
@@ -45,6 +42,22 @@ vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 		getSharedConfigPath: () => path.join( config(), 'shared.json' ),
 	};
 } );
+
+// This file loads the runner once for many cases, so the paths modules fix when
+// they load can't name each case's folders: these stand in for them, named in
+// the case's own profile and process manager home, as the runner's entry gives
+// them. eval-runner-isolation.test.ts starts each case from the entry, with the
+// real ones.
+vi.mock( 'cli/ai/eval-fixed-paths', () => ( {
+	pathsFixedAtLoad: () => {
+		const profile = process.env.DEV_CONFIG_DIR ?? '';
+		return {
+			payloadDescriptions: [ `stored in ${ path.join( profile, 'tmp', 'ai-payloads' ) }` ],
+			rootCaCertificate: path.join( profile, 'certificates', 'studio-ca.crt' ),
+			processManagerHome: process.env.STUDIO_PROCESS_MANAGER_HOME ?? '',
+		};
+	},
+} ) );
 
 const removal = vi.hoisted( () => ( { failObserverFile: false } ) );
 vi.mock( 'node:fs/promises', async ( importOriginal ) => {
@@ -255,6 +268,51 @@ interface RunReport {
 	questions?: Array< { answer: string } >;
 	uiEvents?: { artifacts: unknown[]; previewReloads: number };
 	compactions?: number;
+}
+// The environment the runner's entry sets up for a case, before and after the case ran.
+const ENTRY_ENVIRONMENT = [
+	'E2E',
+	'E2E_CLI_CONFIG_PATH',
+	'E2E_SHARED_CONFIG_PATH',
+	'DEV_CONFIG_DIR',
+	'STUDIO_PROCESS_MANAGER_HOME',
+] as const;
+const environment = () =>
+	Object.fromEntries( ENTRY_ENVIRONMENT.map( ( name ) => [ name, process.env[ name ] ] ) );
+const lastCase = {
+	prepared: {} as Record< string, unknown >,
+	after: {} as Record< string, unknown >,
+};
+
+// Runs a case as its own `eval-runner.mjs` process would: the entry first makes
+// the case's profile and registry from the test's source profile, and, for a
+// case that names a provider, its own process manager home; the environment is
+// then as the process started, as the next case's process starts.
+async function runEvalUntyped( given: Parameters< typeof runCase >[ 0 ] ) {
+	const startedWith = environment();
+	for ( const name of ENTRY_ENVIRONMENT ) {
+		delete process.env[ name ];
+	}
+	process.env.DEV_CONFIG_DIR = path.join( paths.root, 'profile' );
+	isolateCaseProfile( process.env );
+	if ( given.provider?.ok ) {
+		process.env.STUDIO_PROCESS_MANAGER_HOME = fs.realpathSync(
+			fs.mkdtempSync( path.join( os.tmpdir(), 'studio-eval-daemon-' ) )
+		);
+	}
+	lastCase.prepared = environment();
+	try {
+		return await runCase( given );
+	} finally {
+		lastCase.after = environment();
+		for ( const [ name, value ] of Object.entries( startedWith ) ) {
+			if ( value === undefined ) {
+				delete process.env[ name ];
+			} else {
+				process.env[ name ] = value;
+			}
+		}
+	}
 }
 const runEval = async ( ...args: Parameters< typeof runEvalUntyped > ) =>
 	( await runEvalUntyped( ...args ) ) as RunReport;
@@ -590,8 +648,7 @@ describe( 'eval runner provider selection', () => {
 				'shared.json',
 			] );
 			expect( leftovers() ).toEqual( [] );
-			expect( process.env.E2E_SHARED_CONFIG_PATH ).toBeUndefined();
-			expect( process.env.E2E_CLI_CONFIG_PATH ).toBeUndefined();
+			expect( lastCase.after ).toEqual( lastCase.prepared );
 		} );
 
 		const base64url = ( value: unknown ) =>
@@ -720,9 +777,7 @@ describe( 'eval runner provider selection', () => {
 			stderr.mockRestore();
 			expect( result ).not.toHaveProperty( 'refusal' );
 			expect( warned ).toMatch( /studio-eval warning: could not remove the request observer file/ );
-			expect( process.env.E2E ).toBeUndefined();
-			expect( process.env.E2E_CLI_CONFIG_PATH ).toBeUndefined();
-			expect( process.env.E2E_SHARED_CONFIG_PATH ).toBeUndefined();
+			expect( lastCase.after ).toEqual( lastCase.prepared );
 			expect(
 				fs
 					.readdirSync( path.join( paths.root, 'tmp' ) )

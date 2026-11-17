@@ -2,6 +2,7 @@ import { mkdtempSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { isolateCaseProcessManager } from './eval-case-daemon';
+import { prepareCaseProfile } from './eval-case-profile';
 import { claimPortRange } from './eval-port-range';
 
 // Each case creates its sites in a folder of its own, so concurrent cases,
@@ -14,6 +15,10 @@ process.env.E2E_SITES_ROOT = realpathSync(
 // A case that names a provider runs its sites under a process manager of its
 // own, which the runner ends with the case; read once, when the CLI's paths load.
 isolateCaseProcessManager( process.argv, process.env );
+// The case's own Studio profile and site registry, for the whole process: some
+// modules fix a path under the profile when they load. The runner refuses the
+// case if this failed or came too late.
+prepareCaseProfile( process.env );
 
 // Set before the port finder loads: it reads its first port then. A port the
 // user picked stays theirs.

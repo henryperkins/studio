@@ -7,15 +7,9 @@
  */
 
 import {
-	existsSync,
 	mkdirSync,
 	mkdtempSync,
-	readdirSync,
-	readFileSync,
 	rmdirSync,
-	rmSync,
-	symlinkSync,
-	unlinkSync,
 	writeFileSync,
 	writeSync as fsWriteSync,
 } from 'node:fs';
@@ -49,7 +43,12 @@ import { portFinder } from '@studio/common/lib/port-finder';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { SITE_FILE_ACCESS_SITE_DIRECTORY } from '@studio/common/lib/site-file-access';
 import { fetchSyncableSites } from '@studio/common/lib/sync/sync-api';
-import { getConfigDirectory, getSharedConfigPath } from '@studio/common/lib/well-known-paths';
+import {
+	getAiPayloadsPath,
+	getCertificatesPath,
+	getCliConfigPath,
+	getConfigDirectory,
+} from '@studio/common/lib/well-known-paths';
 import {
 	resolveAiEnvironment,
 	resolveInitialAiProvider,
@@ -61,6 +60,13 @@ import {
 	type ObservedRequest,
 } from 'cli/ai/chatgpt-acceptance-observer';
 import { caseProcessManagerHome, stopCaseProcessManager } from 'cli/ai/eval-case-daemon';
+import {
+	caseProfile,
+	removeCaseProfile,
+	withdrawCaseLogin,
+	type CaseProfile,
+} from 'cli/ai/eval-case-profile';
+import { pathsFixedAtLoad } from 'cli/ai/eval-fixed-paths';
 import {
 	evalHistoryMessages,
 	findEvalFixturesDir,
@@ -140,82 +146,62 @@ function siteSlug( name: string ): string {
 		.replace( /^-|-$/g, '' );
 }
 
-const REGISTRY_PREFIX = 'studio-eval-registry-';
+const sameFolder = ( a: string, b: string ) => path.relative( a, b ) === '';
+const isInside = ( folder: string, file: string ) => {
+	const relative = path.relative( folder, file );
+	return relative !== '' && ! relative.startsWith( '..' ) && ! path.isAbsolute( relative );
+};
 
-// Each eval runs against its own Studio site registry (cli.json), so sites that
-// other Studio sessions on this machine create never enter the turn, and
-// concurrent cases do not see each other's sites. Ports already given to the
-// user's sites and to other eval registries stay reserved.
-async function isolateSiteRegistry(): Promise< string > {
-	const ports = ( await readCliConfig() ).sites.map( ( site ) => site.port );
-	for ( const entry of readdirSync( os.tmpdir() ) ) {
-		if ( ! entry.startsWith( REGISTRY_PREFIX ) ) continue;
-		try {
-			const registry = JSON.parse(
-				readFileSync( path.join( os.tmpdir(), entry, 'cli.json' ), 'utf8' )
-			) as { sites?: Array< { port: number } > };
-			ports.push( ...( registry.sites ?? [] ).map( ( site ) => site.port ) );
-		} catch {
-			// A registry with no sites yet.
+/**
+ * Whether this process runs the case on the Studio profile and site registry
+ * its entry made for it (`eval-case-profile.ts`) and, for a case that names a
+ * provider, on its own process manager: as the path helpers resolve them now,
+ * and as the modules that fix a path when they load fixed it. A bundler can
+ * evaluate a module before the entry's overrides, so this is checked before
+ * the first site or turn, and the case never proceeds on the owner's profile
+ * or the owner's process manager.
+ */
+function caseIsolationRefusal( namesProvider: boolean ): EvalRefusal | null {
+	const own = caseProfile();
+	const refusal = ( reason: string ): EvalRefusal => ( {
+		code: 'case-profile-not-isolated',
+		message: `This case runs only on a Studio profile of its own, made before the runner loads, and ${ reason }, so nothing ran.`,
+	} );
+	if ( ! own.ok ) {
+		return refusal( own.problem );
+	}
+	const { profile, registry } = own.profile;
+	const fixed = pathsFixedAtLoad();
+	if (
+		! sameFolder( getConfigDirectory(), profile ) ||
+		! sameFolder( path.dirname( getCliConfigPath() ), registry )
+	) {
+		return refusal( 'Studio’s paths resolve to another profile now' );
+	}
+	const payloads = getAiPayloadsPath();
+	if (
+		! isInside( profile, payloads ) ||
+		! fixed.payloadDescriptions.some( ( text ) => text.includes( payloads ) )
+	) {
+		return refusal( 'wpcom_request names a payload folder outside it' );
+	}
+	if (
+		! isInside( profile, fixed.rootCaCertificate ) ||
+		! sameFolder( path.dirname( fixed.rootCaCertificate ), getCertificatesPath() )
+	) {
+		return refusal( 'Studio’s certificates folder was fixed outside it when it loaded' );
+	}
+	if ( namesProvider ) {
+		const home = caseProcessManagerHome( process.env );
+		if ( ! home || ! sameFolder( home, fixed.processManagerHome ) ) {
+			return {
+				code: 'process-manager-not-isolated',
+				message:
+					'A case that names a provider runs its sites only under a process manager of its own, which is not the one this process’s daemon client loaded with, so nothing ran.',
+			};
 		}
 	}
-	for ( const port of ports ) {
-		portFinder.addUnavailablePort( port );
-	}
-	process.env.E2E = '1';
-	process.env.E2E_CLI_CONFIG_PATH = mkdtempSync( path.join( os.tmpdir(), REGISTRY_PREFIX ) );
-	return process.env.E2E_CLI_CONFIG_PATH;
-}
-
-// What Studio downloads once per machine, which every eval reads as the user's
-// Studio does. Not `mu-plugins`: a site start writes there, so each case keeps
-// its own.
-const STUDIO_DOWNLOADS = [ 'server-files', 'php-bin', 'import-runtime' ];
-
-// Each eval runs against its own Studio config directory, signed in as the
-// user, so what a case seeds (global instructions, WordPress.com connections)
-// and what its turn changes stay in the case: concurrent cases and the user's
-// own Studio never see them. The profile this process started with (from
-// `DEV_CONFIG_DIR`, or the default) is only read: the login copy and the links
-// to its downloads come from it. `DEV_CONFIG_DIR`, which every path helper
-// reads first, then names the case's profile until the case ends.
-function isolateStudioConfig( { withoutWpcomLogin = false } = {} ): string {
-	const userDir = getConfigDirectory();
-	const shared = JSON.parse( readFileSync( getSharedConfigPath(), 'utf8' ) ) as Record<
-		string,
-		unknown
-	>;
-	const { version, aiProvider } = shared;
-	// Without the login, Studio's image service, which signs with it, is off.
-	const authToken = withoutWpcomLogin ? undefined : shared.authToken;
-	const dir = mkdtempSync( path.join( os.tmpdir(), 'studio-eval-config-' ) );
-	for ( const name of STUDIO_DOWNLOADS ) {
-		if ( existsSync( path.join( userDir, name ) ) ) {
-			symlinkSync( path.join( userDir, name ), path.join( dir, name ) );
-		}
-	}
-	writeFileSync(
-		path.join( dir, 'shared.json' ),
-		JSON.stringify( { version, authToken, aiProvider } )
-	);
-	process.env.E2E_SHARED_CONFIG_PATH = dir;
-	process.env.DEV_CONFIG_DIR = dir;
-	return dir;
-}
-
-// A case's own folder, removed with the case. Its links to Studio's downloads
-// are removed as links first, so nothing they point to is ever touched.
-function removeCaseFolder( dir: string ): void {
-	try {
-		for ( const entry of readdirSync( dir, { withFileTypes: true } ) ) {
-			if ( entry.isSymbolicLink() ) {
-				unlinkSync( path.join( dir, entry.name ) );
-			}
-		}
-		rmSync( dir, { recursive: true, force: true, maxRetries: 5 } );
-	} catch ( error ) {
-		warnTeardown( `could not remove the case folder ${ path.basename( dir ) }`, error );
-	}
+	return null;
 }
 
 // A teardown failure never changes the case's outcome, but is never silent:
@@ -228,7 +214,8 @@ function warnTeardown( what: string, error: unknown ): void {
 	);
 }
 
-// The environment a case points at its own folders, as it was before the case.
+// The environment that points the case at its own folders, as the entry set
+// it: put back as it was when the case started, whatever the case did to it.
 const CASE_ENVIRONMENT = [
 	'E2E',
 	'E2E_CLI_CONFIG_PATH',
@@ -580,7 +567,11 @@ const liveProviderDeps: EvalProviderDeps = {
 	get home() {
 		return os.homedir();
 	},
-	configDirectory: getConfigDirectory,
+	// The profile the eval process started with, which the case reads, never the case's own.
+	configDirectory: () => {
+		const own = caseProfile();
+		return own.ok ? own.profile.source : getConfigDirectory();
+	},
 	useChatGptProfile: setChatGptStateDirectory,
 };
 
@@ -590,6 +581,8 @@ interface EvalRefusal {
 }
 
 type EvalSetupRefusalCode =
+	| 'case-profile-not-isolated'
+	| 'process-manager-not-isolated'
 	| 'staging-not-designated'
 	| 'staging-not-confirmed'
 	| 'staging-needs-active-site'
@@ -703,7 +696,31 @@ interface UiEvents {
 	previewReloads: number;
 }
 
+/**
+ * Runs one case on the profile, registry and (for a case that names a
+ * provider) process manager its entry made for it, refused before anything
+ * else when it isn't on them, and removes the profile and registry when it
+ * ends, whatever the outcome.
+ */
 export async function runEval( input: EvalRunnerInput ) {
+	const restoreCaseEnvironment = saveCaseEnvironment();
+	try {
+		const isolation = caseIsolationRefusal( input.provider?.ok === true );
+		const own = caseProfile();
+		if ( isolation || ! own.ok ) {
+			return refusedRun(
+				isolation ?? { code: 'case-profile-not-isolated', message: own.ok ? '' : own.problem },
+				input.provider ? { requested: null } : undefined
+			);
+		}
+		return await runCase( input, own.profile );
+	} finally {
+		restoreCaseEnvironment();
+		removeCaseProfile( warnTeardown );
+	}
+}
+
+async function runCase( input: EvalRunnerInput, own: CaseProfile ) {
 	const evalStartedAt = Date.now();
 	const elapsed = () => Date.now() - evalStartedAt;
 	const phaseTimingsMs: Record< string, number > = {};
@@ -908,8 +925,6 @@ export async function runEval( input: EvalRunnerInput ) {
 	// token cost of prompt variants, not just their outcomes.
 	const usage = createTokenUsage();
 
-	const restoreCaseEnvironment = saveCaseEnvironment();
-	const caseFolders: string[] = [];
 	let observerFile: string | null = null;
 	// What the case swaps in for its turns, put back in reverse order.
 	const restorers: Array< () => void > = [];
@@ -923,8 +938,14 @@ export async function runEval( input: EvalRunnerInput ) {
 	let seeded: SeededFixtures | null = null;
 	let sitesDeleted = false;
 	try {
-		caseFolders.push( await isolateSiteRegistry() );
-		caseFolders.push( isolateStudioConfig( { withoutWpcomLogin: input.imageService === 'off' } ) );
+		// The case's sites never take a port the user's sites or another case's have.
+		for ( const port of own.reservedPorts ) {
+			portFinder.addUnavailablePort( port );
+		}
+		if ( input.imageService === 'off' ) {
+			// Without the login, Studio's image service, which signs with it, is off.
+			withdrawCaseLogin( own );
+		}
 		// As the runtime decides it: whether this run offers generate_images.
 		const imageServiceConfigured = input.imageService
 			? await isImageGenerationAvailable()
@@ -933,7 +954,7 @@ export async function runEval( input: EvalRunnerInput ) {
 			return providerRefusal( {
 				code: 'image-service-still-configured',
 				message:
-					'This case needs Studio’s image service off, but it is still configured (a DEV_CONFIG_DIR profile with a WordPress.com login, say).',
+					'This case needs Studio’s image service off, but the case’s own profile still configures it, so nothing ran.',
 			} );
 		}
 		if ( input.imageService === 'required' && ! imageServiceConfigured ) {
@@ -1251,10 +1272,6 @@ export async function runEval( input: EvalRunnerInput ) {
 				warnTeardown( 'could not remove the request observer file', error );
 			}
 		}
-		restoreCaseEnvironment();
-		for ( const dir of caseFolders ) {
-			removeCaseFolder( dir );
-		}
 	}
 }
 
@@ -1334,6 +1351,8 @@ export async function main() {
 		result = { success: false, error: error instanceof Error ? error.message : String( error ) };
 		exitCode = 1;
 	}
+	// Also when the case never started: its input was unreadable.
+	removeCaseProfile( warnTeardown );
 	emit( result );
 	if ( input ) {
 		writeCaseSummary( input, result );
