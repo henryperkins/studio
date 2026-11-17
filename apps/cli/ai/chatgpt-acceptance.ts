@@ -2905,43 +2905,89 @@ function sendQuietly(
 	}
 }
 
+// On POSIX each CLI process the runner starts leads a process group of its
+// own, which holds what it starts in turn; Windows reaches a tree by its PID.
+const CHILDREN_LEAD_PROCESS_GROUPS = process.platform !== 'win32';
+const CHILD_STOP_WAIT_MS = 3_000;
+const TASKKILL_TIMEOUT_MS = 10_000;
+
+// Every CLI process this runner started that hasn't closed yet.
+const runningChildren = new Set< ChildProcess >();
+
+// Exited as far as this process knows: until then it hasn't been reaped, so
+// its PID, and on POSIX its process group, can't belong to anything else.
+const hasExited = ( child: ChildProcess ) => child.exitCode !== null || child.signalCode !== null;
+
+/**
+ * Ends a child's whole process tree at once: on Windows `taskkill /T /F` by
+ * the PID this handle started, which reaches only descendants while the child
+ * itself still runs; on POSIX SIGKILL to the process group the child leads.
+ * Never anything by name, and nothing once the child has exited.
+ */
+function endProcessTree( child: ChildProcess ): void {
+	const { pid } = child;
+	if ( pid === undefined || hasExited( child ) ) {
+		return;
+	}
+	if ( process.platform === 'win32' ) {
+		spawnSync( 'taskkill', [ '/PID', String( pid ), '/T', '/F' ], {
+			windowsHide: true,
+			stdio: 'ignore',
+			timeout: TASKKILL_TIMEOUT_MS,
+		} );
+		return;
+	}
+	try {
+		process.kill( -pid, 'SIGKILL' );
+	} catch {
+		// No such group: the caller ends the child alone.
+	}
+}
+
+/**
+ * Stops a child the runner started: a turn is asked to stop first, over its
+ * IPC channel; then its whole tree is ended while the child still runs, since
+ * ending the child first would leave its descendants out of reach.
+ */
 async function stopChild( child: ChildProcess ): Promise< boolean > {
-	if ( child.exitCode !== null || child.signalCode !== null ) {
+	if ( hasExited( child ) ) {
 		return true;
 	}
-	const exited = new Promise< void >( ( resolve ) => child.once( 'exit', () => resolve() ) );
+	const exited = new Promise< true >( ( resolve ) => child.once( 'exit', () => resolve( true ) ) );
+	const exitedWithin = async ( ms: number ) =>
+		hasExited( child ) || ( await raceTimeout( exited, ms ) ) === true;
 	if ( child.connected ) {
 		sendQuietly( child, { type: 'interrupt' } );
-		if (
-			( await raceTimeout(
-				exited.then( () => true ),
-				3_000
-			) ) === true
-		) {
+		if ( await exitedWithin( CHILD_STOP_WAIT_MS ) ) {
 			return true;
 		}
 	}
-	child.kill();
-	if (
-		( await raceTimeout(
-			exited.then( () => true ),
-			3_000
-		) ) === true
-	) {
+	endProcessTree( child );
+	if ( await exitedWithin( CHILD_STOP_WAIT_MS ) ) {
 		return true;
 	}
-	// The child's own tree, by the PID this handle started; never anything by name.
-	if ( process.platform === 'win32' && child.pid !== undefined && child.exitCode === null ) {
-		spawnSync( 'taskkill', [ '/PID', String( child.pid ), '/T', '/F' ], { windowsHide: true } );
-	} else {
+	// The tree couldn't be ended (no taskkill, no group): the child alone, at least.
+	if ( ! hasExited( child ) ) {
 		child.kill( 'SIGKILL' );
 	}
-	return (
-		( await raceTimeout(
-			exited.then( () => true ),
-			3_000
-		) ) === true
-	);
+	return exitedWithin( CHILD_STOP_WAIT_MS );
+}
+
+/**
+ * Ends the tree of every CLI process this runner started that still runs, at
+ * once and without waiting: for an exit that can't finish cleanup.
+ */
+export function endRunningAcceptanceChildren(): void {
+	for ( const child of runningChildren ) {
+		endProcessTree( child );
+		if ( ! hasExited( child ) ) {
+			try {
+				child.kill( 'SIGKILL' );
+			} catch {
+				// Gone meanwhile.
+			}
+		}
+	}
 }
 
 function refuseQuestions(
@@ -2971,7 +3017,7 @@ export function acceptanceTurnExecArgv(
 	];
 }
 
-function createLiveProcesses( {
+export function createLiveAcceptanceProcesses( {
 	mainScript,
 	scripts,
 	paths,
@@ -2980,19 +3026,18 @@ function createLiveProcesses( {
 	scripts: { observer: string; toolImages: string };
 	paths: AcceptanceRunPaths;
 } ): AcceptanceProcesses {
-	const owned = new Set< ChildProcess >();
 	let sequence = 0;
 
 	function track( child: ChildProcess ): Promise< number | null > {
-		owned.add( child );
+		runningChildren.add( child );
 		return new Promise( ( resolve ) => {
 			// After its output and IPC channel close too, so no last event is lost.
 			child.once( 'close', ( code ) => {
-				owned.delete( child );
+				runningChildren.delete( child );
 				resolve( code );
 			} );
 			child.once( 'error', () => {
-				owned.delete( child );
+				runningChildren.delete( child );
 				resolve( null );
 			} );
 		} );
@@ -3031,11 +3076,13 @@ function createLiveProcesses( {
 						env,
 						execArgv,
 						stdio: [ 'ignore', 'ignore', 'ignore', 'ipc' ],
+						detached: CHILDREN_LEAD_PROCESS_GROUPS,
 				  } )
 				: spawn( process.execPath, [ ...execArgv, mainScript, ...args ], {
 						env,
 						stdio: [ 'ignore', 'pipe', 'ignore' ],
 						windowsHide: true,
+						detached: CHILDREN_LEAD_PROCESS_GROUPS,
 				  } );
 			const startedAt = Date.now();
 			const events: TimedEvent[] = [];
@@ -3153,6 +3200,7 @@ function createLiveProcesses( {
 				env: acceptanceChildEnvironment(),
 				stdio: [ 'ignore', 'pipe', 'ignore' ],
 				windowsHide: true,
+				detached: CHILDREN_LEAD_PROCESS_GROUPS,
 			} );
 			let stdout = '';
 			child.stdout?.setEncoding( 'utf8' );
@@ -3173,7 +3221,7 @@ function createLiveProcesses( {
 		async stopOwned() {
 			let stopped = 0;
 			let failed = 0;
-			for ( const child of [ ...owned ] ) {
+			for ( const child of [ ...runningChildren ] ) {
 				if ( await stopChild( child ) ) {
 					stopped++;
 				} else {
@@ -3237,7 +3285,7 @@ async function createLiveServices( {
 			filePath: async ( sessionId ) =>
 				( await loadAiSession( getSessionsDirectory(), sessionId ) ).summary.filePath,
 		},
-		processes: createLiveProcesses( { mainScript, scripts, paths } ),
+		processes: createLiveAcceptanceProcesses( { mainScript, scripts, paths } ),
 		buildPresent: () =>
 			[ mainScript, scripts.observer, scripts.toolImages ].every( ( file ) =>
 				fs.existsSync( file )
@@ -3315,6 +3363,8 @@ export function createLiveChatGptAcceptanceDependencies(): ChatGptAcceptanceDepe
 					handler();
 					return;
 				}
+				// Their own process groups keep the terminal's signal from them on POSIX.
+				endRunningAcceptanceChildren();
 				process.stdout.write(
 					`${ __(
 						'Stopped before cleanup finished. See scripts/chatgpt-acceptance/README.md to stop what this run started.'
