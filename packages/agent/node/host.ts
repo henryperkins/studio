@@ -33,6 +33,26 @@ export interface WpCliOutput {
 	stderr: string;
 }
 
+// An attachment reserved in a site's media library for an image about to be
+// written: its ID, where its file goes relative to the site's folder, and its URL.
+export interface MediaAttachment {
+	id: number;
+	file: string;
+	url: string;
+}
+
+// The fixed operations the image tool adds images to a site's media library
+// with. None of them runs anything composed from the model's text.
+export interface StudioAgentMediaLibrary {
+	// The site whose folder holds every file named; throws when no one site does.
+	siteContaining( files: string[] ): Promise< HostSite >;
+	// Reserves an attachment for each file name, in the uploads folder WordPress
+	// picks, under a name WordPress makes unique there.
+	reserve( site: HostSite, names: string[] ): Promise< MediaAttachment[] >;
+	// Completes the attachments whose images were written and deletes the others.
+	finalize( site: HostSite, ready: number[], failed: number[] ): Promise< void >;
+}
+
 // What an app that shows the conversation does for the agent.
 export interface StudioAgentUi {
 	// Shows a tool's result in the conversation, such as a site preview or an image.
@@ -142,6 +162,10 @@ export interface StudioAgentHost {
 	selectSite?( site: SiteInfo ): Promise< void > | void;
 	// Where screenshots are saved; a temporary folder when absent or null.
 	screenshotsDirectory?(): Promise< string | null > | string | null;
+	// Set by a host that runs the media library's fixed operations as operations
+	// of its own, as the Claude route's guarded host does. Without it, the image
+	// tool runs them as WP-CLI `eval` commands through `sites.wpCli`.
+	media?: StudioAgentMediaLibrary;
 	// Present when an app shows the conversation. Tools that only make sense
 	// there, and their mentions in the prompt, depend on it.
 	ui?: StudioAgentUi;
