@@ -1,4 +1,5 @@
 import { LOCKFILE_STALE_TIME, LOCKFILE_WAIT_TIME } from '@studio/common/constants';
+import { isErrnoException } from '@studio/common/lib/is-errno-exception';
 import { __ } from '@wordpress/i18n';
 import { lockChatGptFile } from '@studio/agent/node/chatgpt/account-store';
 import { ChatGptSettingsError } from '@studio/agent/node/chatgpt/settings';
@@ -22,7 +23,8 @@ import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/e
 /**
  * Serializes connection checks and writes across the two application hosts.
  * Only a known message leaves it: a lock or file error names a path in the
- * user's home, so the hosts are told only that the choice wasn't saved.
+ * user's home, so the hosts are told only that the choice wasn't saved. The
+ * original stays the error's `cause` and goes to the host's log.
  */
 export async function withSessionSelection< T >(
 	sessionsRoot: string,
@@ -39,16 +41,36 @@ export async function withSessionSelection< T >(
 		try {
 			return await write( await readPiFileEntries( summary.filePath ) );
 		} finally {
-			await release();
+			// A lock left behind goes stale; it never undoes a choice already saved.
+			await release().catch( ( error: unknown ) =>
+				logSelectionFailure( 'Failed to release the model selection lock of a chat:', error )
+			);
 		}
 	} catch ( error ) {
 		if ( error instanceof ChatGptSettingsError ) {
 			throw error;
 		}
-		throw new ChatGptSettingsError(
-			__( 'Studio couldn’t save the model for this chat. Try again.' )
+		logSelectionFailure( 'Failed to save the model selection for a chat:', error );
+		throw Object.assign(
+			new ChatGptSettingsError( __( 'Studio couldn’t save the model for this chat. Try again.' ) ),
+			{ cause: error }
 		);
 	}
+}
+
+// Desktop writes the console to its log file; the studio ui server's console is
+// its terminal. A held lock, a file the system refused or a chat that's gone is
+// expected; anything else is a defect and is logged with its stack.
+function logSelectionFailure( context: string, error: unknown ): void {
+	if (
+		error instanceof Error &&
+		( ( isErrnoException( error ) && typeof error.code === 'string' ) ||
+			error.message.startsWith( 'Code session not found:' ) )
+	) {
+		console.warn( `[session-selection] ${ context }`, error.message );
+		return;
+	}
+	console.error( `[session-selection] ${ context }`, error );
 }
 
 function needsNewChat(): never {
