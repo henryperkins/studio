@@ -118,7 +118,13 @@ export type BackendTurnEvent = BackendTurnIds &
 		// Authoritative replacement for any provisional text for this block.
 		| ( { type: 'content.confirmed' } & ContentBlock )
 		| ( { type: 'tool.started'; name: string; messageId?: string; blockId?: string } & ToolCall )
-		| ( { type: 'tool.progress'; message: string; update?: boolean } & ToolCall )
+		| ( {
+				type: 'tool.progress';
+				message: string;
+				update?: boolean;
+				/** Set by Studio when cleanup of a Claude call's image reservations could not be confirmed. */
+				unsettledMediaReservations?: number;
+		  } & ToolCall )
 		| ( { type: 'tool.result'; message?: string; isError: boolean } & ToolCall )
 		| ( {
 				type: 'approval.requested';

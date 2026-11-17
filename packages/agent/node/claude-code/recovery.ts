@@ -132,12 +132,20 @@ async function uncertainOperationsOf(
 ): Promise< ClaudeUncertainOperation[] > {
 	const idOf = ( event: { toolCallId?: unknown } ) =>
 		typeof event.toolCallId === 'string' && event.toolCallId ? event.toolCallId : undefined;
-	const completed = new Set(
-		events.flatMap( ( event ) => {
-			const id = event.type === 'tool.result' ? idOf( event ) : undefined;
-			return id ? [ id ] : [];
-		} )
-	);
+	const completed = new Set< string >();
+	const unsettledMedia = new Map< string, string >();
+	for ( const event of events ) {
+		if ( event.type !== 'tool.result' && event.type !== 'tool.progress' ) continue;
+		const id = idOf( event );
+		if ( ! id ) continue;
+		if ( event.type === 'tool.result' ) completed.add( id );
+		else if (
+			Number.isSafeInteger( event.unsettledMediaReservations ) &&
+			( event.unsettledMediaReservations ?? 0 ) > 0
+		) {
+			unsettledMedia.set( id, event.message );
+		}
+	}
 	const found = new Map< string, ClaudeUncertainOperation >();
 	const accounted = new Set< string >();
 	for ( const [ index, event ] of events.entries() ) {
@@ -145,7 +153,15 @@ async function uncertainOperationsOf(
 		const id = idOf( event );
 		if ( id ) accounted.add( id );
 		const operation: Partial< typeof event.operation > = event.operation ?? {};
-		if ( ( id && completed.has( id ) ) || isClaudeReadOnlyClass( operation.operationClass ) )
+		// A tool can return while cleanup of its authorized reservation remains unconfirmed.
+		const cleanup =
+			id && event.type === 'operation.authorized' && operation.tool === 'media.reserve'
+				? unsettledMedia.get( id )
+				: undefined;
+		if (
+			( id && completed.has( id ) && ! cleanup ) ||
+			isClaudeReadOnlyClass( operation.operationClass )
+		)
 			continue;
 		const tool = typeof operation.tool === 'string' ? operation.tool : '';
 		const key = id ? JSON.stringify( [ id, event.requestId ?? null, tool ] ) : `unnamed ${ index }`;
@@ -153,6 +169,7 @@ async function uncertainOperationsOf(
 		const known = found.get( key );
 		if ( known ) {
 			if ( evidence === 'authorized' ) known.evidence = evidence;
+			if ( cleanup ) known.description = cleanup;
 			continue;
 		}
 		found.set( key, {
@@ -162,7 +179,7 @@ async function uncertainOperationsOf(
 				? { operationClass: operation.operationClass }
 				: {} ),
 			...( operation.target ? { target: operation.target } : {} ),
-			description: typeof event.description === 'string' ? event.description : tool,
+			description: cleanup ?? ( typeof event.description === 'string' ? event.description : tool ),
 			evidence,
 			...( event.requestId
 				? { requestId: event.requestId, resolved: resolved.has( event.requestId ) }

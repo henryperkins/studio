@@ -219,6 +219,33 @@ const terminals = ( journals: ClaudeJournalEvent[][] ) =>
 	journals.flat().filter( ( event ) => event.type === 'turn.terminal' );
 
 describe( 'recovering a conversation whose run outlived its owner', () => {
+	it( 'carries unconfirmed image cleanup into recovery even after the tool returned', async () => {
+		const fixture = await recoveryFixture();
+		const toolCallId = 'image-call';
+		const message = 'Studio could not confirm cleanup of 2 image reservations.';
+		await fixture.deadTurn( {
+			journal: [
+				{
+					type: 'operation.authorized',
+					...ids,
+					toolCallId,
+					operation: { tool: 'media.reserve', operationClass: 'local-change', target },
+					description: 'Reserve attachments',
+				},
+				{ type: 'tool.progress', ...ids, toolCallId, message, unsettledMediaReservations: 2 },
+				{ type: 'tool.progress', ...ids, toolCallId, message: 'Ordinary tool progress' },
+				{ type: 'tool.result', ...ids, toolCallId, isError: true },
+			],
+		} );
+		const result = await fixture.recover();
+		expect( result.status === 'recovered' && result.uncertainOperations ).toEqual( [
+			expect.objectContaining( { tool: 'media.reserve', target, description: message } ),
+		] );
+		const note = recoveryNote( await fixture.store.readJournals( 'chat' ) );
+		expect( note?.text ).toContain( message );
+		expect( note?.text ).not.toContain( 'Ordinary tool progress' );
+	} );
+
 	it( 'recovers once the owner and the whole native tree are provably gone: one interrupted outcome, partial output kept, pending approvals closed, and the same native session resumes next', async () => {
 		const fixture = await recoveryFixture();
 		// The prompt as the runtime journals it, the partial answer through the
