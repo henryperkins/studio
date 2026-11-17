@@ -305,27 +305,127 @@ describe( 'preview_list on the Claude route', () => {
 	} );
 } );
 
+type Fixture = Awaited< ReturnType< typeof setup > >;
+
+// The order of the journal entries the policy writes and the host operations
+// that then run, each spy keeping what it returned.
+function journalOrder(
+	fixture: Fixture,
+	operations: Record< string, ( ...args: never[] ) => Promise< unknown > >
+) {
+	const order: string[] = [];
+	const record = fixture.context.recordOperation;
+	fixture.context.recordOperation = async ( event ) => {
+		order.push( `journal ${ event.operation.tool }` );
+		await record( event );
+	};
+	for ( const [ name, spy ] of Object.entries( operations ) ) {
+		const result = vi.mocked( spy ).getMockImplementation();
+		vi.mocked( spy ).mockImplementation( async ( ...args: never[] ) => {
+			order.push( `host ${ name }` );
+			return result?.( ...args );
+		} );
+	}
+	return order;
+}
+
+// A preview of the conversation's own site, as the host lists that site's previews.
+const own = { ...fakePreview };
+
+describe( 'preview_create on the Claude route', () => {
+	it( 'creates a preview of the conversation’s own site once the user approves it, saying that anyone with its public address can see the site’s content, journaled before the command', async () => {
+		const fixture = await setup();
+		const { bridge, host, context, journal, site, localSite } = fixture;
+		const order = journalOrder( fixture, { 'previews.create': host.previews.create } );
+		expect( bridge.tools ).toContain( 'preview_create' );
+		const result = await bridge.invoke( 'preview_create', { nameOrPath: 'site' } );
+		expect( result.isError ).toBe( false );
+		expect( text( result ) ).toContain( own.url );
+		expect( host.previews.create ).toHaveBeenCalledWith(
+			localSite,
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( context.approve ).toHaveBeenCalledOnce();
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		expect( request.operation ).toMatchObject( {
+			tool: 'previews.create',
+			operationClass: 'remote-change',
+			args: [],
+			localPaths: [ site ],
+			remote: 'A new preview site on WordPress.com',
+		} );
+		expect( request.operation.description ).toContain(
+			'anyone with the preview’s public address can see'
+		);
+		expect( order ).toEqual( [
+			'journal preview_create',
+			'journal previews.create',
+			'host previews.create',
+		] );
+		expect( journal[ 1 ] ).toMatchObject( { requestId: request.requestId } );
+	} );
+
+	it( 'previews no other site, nothing from a conversation without a site, and nothing the user denies', async () => {
+		const onSite = await setup();
+		const unbound = await setup( global );
+		const denying = await setup( () => ( { approve: vi.fn( async () => 'deny' as const ) } ) );
+		expect(
+			( await onSite.bridge.invoke( 'preview_create', { nameOrPath: 'other' } ) ).isError
+		).toBe( true );
+		expect(
+			( await unbound.bridge.invoke( 'preview_create', { nameOrPath: 'site' } ) ).isError
+		).toBe( true );
+		const denied = await denying.bridge.invoke( 'preview_create', { nameOrPath: 'site' } );
+		expect( denied.isError ).toBe( true );
+		expect( text( denied ) ).toContain( 'The user did not approve this operation' );
+		expect( denying.journal.map( ( entry ) => entry.operation.tool ) ).not.toContain(
+			'previews.create'
+		);
+		for ( const { host } of [ onSite, unbound, denying ] )
+			expect( host.previews.create ).not.toHaveBeenCalled();
+	} );
+
+	it( 'writes the archive it sends only where the conversation cannot reach, checked again immediately before the command starts', async () => {
+		const temporary = await realpath( os.tmpdir() );
+		const reaching = await setup( ( paths ) => ( { localRoots: [ paths.site, temporary ] } ) );
+		vi.mocked( reaching.host.previews.list ).mockResolvedValue( [ own ] );
+		for ( const [ name, args ] of [
+			[ 'preview_create', { nameOrPath: 'site' } ],
+			[ 'preview_update', { nameOrPath: 'site', host: own.url } ],
+		] as const ) {
+			const refused = await reaching.bridge.invoke( name, args );
+			expect( refused.isError, name ).toBe( true );
+			expect( text( refused ), name ).toContain( 'the system’s temporary folder' );
+		}
+		expect( reaching.context.approve ).not.toHaveBeenCalled();
+		expect( reaching.host.previews.create ).not.toHaveBeenCalled();
+		expect( reaching.host.previews.update ).not.toHaveBeenCalled();
+		// The conversation's target moves while the command is about to start.
+		const moved = await setup();
+		let ran = false;
+		vi.mocked( moved.host.previews.create ).mockImplementation(
+			async ( _site, _onProgress, options ) => {
+				vi.mocked( moved.context.verifyTarget ).mockResolvedValue( false );
+				await options?.beforeSpawn?.();
+				ran = true;
+				return own;
+			}
+		);
+		expect(
+			( await moved.bridge.invoke( 'preview_create', { nameOrPath: 'site' } ) ).isError
+		).toBe( true );
+		expect( ran ).toBe( false );
+	} );
+} );
+
 describe( 'preview_update and preview_delete on the Claude route', () => {
 	const PREVIEW_REFUSAL = 'one of this conversation’s site’s own previews';
-	// A preview of the conversation's own site, as the host lists that site's previews.
-	const own = { ...fakePreview };
-	// The order of the journal entries and the host's commands.
-	const ordered = ( fixture: Awaited< ReturnType< typeof setup > > ) => {
-		const order: string[] = [];
-		const record = fixture.context.recordOperation;
-		fixture.context.recordOperation = async ( event ) => {
-			order.push( `journal ${ event.operation.tool }` );
-			await record( event );
-		};
-		vi.mocked( fixture.host.previews.update ).mockImplementation( async () => {
-			order.push( 'host previews.update' );
-			return own;
+	const ordered = ( fixture: Fixture ) =>
+		journalOrder( fixture, {
+			'previews.update': fixture.host.previews.update,
+			'previews.delete': fixture.host.previews.delete,
 		} );
-		vi.mocked( fixture.host.previews.delete ).mockImplementation( async () => {
-			order.push( 'host previews.delete' );
-		} );
-		return order;
-	};
 
 	it( 'updates a preview of the conversation’s own site once the user approves it, showing the preview, the site’s folder and that anyone with its address can see it, journaled before the command', async () => {
 		const fixture = await setup();

@@ -58,6 +58,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		getSiteInfoTool.name,
 		listSitesTool.name,
 		listPreviewsTool.name,
+		createPreviewTool.name,
 		updatePreviewTool.name,
 		deletePreviewTool.name,
 		listConnectedRemoteSitesTool.name,
@@ -680,7 +681,21 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 			using( LOCAL_SITE_HOST_CHANNELS )
 		),
 	],
-	[ createPreviewTool.name, unqualified( onSite( 'remote-change', { approval: 'host' } ) ) ],
+	[
+		createPreviewTool.name,
+		// It resolves the site it names and makes a new preview of it through the
+		// host, which runs the CLI's own `preview create` for the site the turn
+		// acts on only. The user approves it, told that a copy of the site's
+		// content becomes visible to anyone with the preview's public address,
+		// and it is journaled before it runs. The command keeps its archive in the
+		// system's temporary folder, which must lie out of the turn's reach. Its
+		// module links `tools/utils.ts`, whose `runWpCli` runs only through the
+		// host.
+		qualified(
+			onSite( 'remote-change', { approval: 'host' } ),
+			using( { ...LOCAL_SITE_HOST_CHANNELS, reachesWpcom: [ 'host' ] } )
+		),
+	],
 	[
 		listPreviewsTool.name,
 		// It resolves the site it names and lists that site's previews from the

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
+import os from 'os';
 import path from 'path';
 import {
 	escapeClaudeApprovalText,
@@ -244,6 +245,8 @@ const REFUSALS = {
 		'Studio updates or deletes a preview only when it is one of this conversation’s site’s own previews, named by the address preview_list gives for it.',
 	previewOverwrite:
 		'Studio updates a preview only from the site it was made from, so overwrite must be false or left out.',
+	scratch:
+		'Studio runs this operation only while the system’s temporary folder, where its command keeps the archive it sends or receives, lies outside every folder this conversation reaches.',
 } as const;
 
 function deepFreeze< T >( value: T ): T {
@@ -289,6 +292,12 @@ interface HostRequest {
 	 * argument, before `args`, and what it reaches.
 	 */
 	preview?: unknown;
+	/**
+	 * The command keeps the archive it sends or receives in the system's
+	 * temporary folder, under a name it makes up, and follows a link it finds
+	 * there; that folder must lie outside every folder the turn reaches.
+	 */
+	scratch?: true;
 	/** What the approval and the journal say of the operation after its class and name: a fixed sentence. */
 	note?: string;
 }
@@ -313,6 +322,7 @@ interface PreparedHostOperation {
 	file?: HostFile< string >;
 	/** The preview as checked. */
 	preview?: TargetPreview;
+	scratch?: true;
 }
 
 const WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
@@ -1025,6 +1035,10 @@ export function createClaudeExecutionPolicy(
 			args = [ preview.url, ...args ];
 			remote = preview.url;
 		}
+		if ( request.scratch && ! ( await scratchOutsideReach() ) ) {
+			refuse( toolCallId, REFUSALS.scratch );
+			return;
+		}
 		if ( ! ( await checkpoint( callSignal ) ) ) return;
 		// The only WP-CLI command this build runs with approval is the bounded draft.
 		const draftTitle =
@@ -1056,9 +1070,17 @@ export function createClaudeExecutionPolicy(
 				  }
 				: {} ),
 		};
-		if ( ! asksFirst( operationClass ) ) return { operation, site, file, preview };
+		const prepared = { operation, site, file, preview, scratch: request.scratch };
+		if ( ! asksFirst( operationClass ) ) return prepared;
 		const grant = await requestApproval( operation, toolCallId, callSignal );
-		return grant ? { operation, grant, site, file, preview } : undefined;
+		return grant ? { ...prepared, grant } : undefined;
+	}
+
+	// Whether the system's temporary folder, where a command keeps the archive
+	// it sends or receives, lies outside every folder the turn reaches, so
+	// nothing the conversation writes can be a link the command follows there.
+	function scratchOutsideReach(): Promise< boolean > {
+		return isOutsideReach( os.tmpdir(), context.localRoots );
 	}
 
 	// The preview of the site the turn acts on that an address names: the one
@@ -1145,6 +1167,7 @@ export function createClaudeExecutionPolicy(
 					prepared.preview.atomicSiteId
 			)
 				return false;
+			if ( prepared.scratch && ! ( await scratchOutsideReach() ) ) return false;
 			if (
 				prepared.operation.tool === 'sites.wpCli' &&
 				( ! targetSite || ( await hasWpCliOverrides( targetSite.path ) ) )
@@ -1403,9 +1426,19 @@ export function createClaudeExecutionPolicy(
 			previews: {
 				...host.previews,
 				list: ( site ) => reading( site, () => host.previews.list( site ) ),
+				// A new preview of the site the turn acts on, from the archive the CLI's
+				// `preview create` makes of it.
 				create: ( site, onProgress ) =>
-					run( { name: 'previews.create', site, args: [] }, ( current, options ) =>
-						host.previews.create( current!, onProgress, options )
+					run(
+						{
+							name: 'previews.create',
+							site,
+							args: [],
+							remote: 'A new preview site on WordPress.com',
+							scratch: true,
+							note: 'It uploads a copy of this site’s content, its database included, to a new preview site on WordPress.com, which anyone with the preview’s public address can see',
+						},
+						( current, options ) => host.previews.create( current!, onProgress, options )
 					),
 				// A preview of the site the turn acts on, by its address, as that site's
 				// own previews list it; checked again immediately before the command.
@@ -1422,7 +1455,8 @@ export function createClaudeExecutionPolicy(
 							site,
 							args: [],
 							preview: hostname,
-							note: 'It replaces what a preview of this site on WordPress.com shows with the site’s current content, which anyone with the preview’s public address can see',
+							scratch: true,
+							note: 'It replaces what a preview of this site on WordPress.com shows with the site’s current content, its database included, which anyone with the preview’s public address can see',
 						},
 						( current, options, _operation, checked ) =>
 							host.previews.update( current!, checked.preview!, false, onProgress, options )

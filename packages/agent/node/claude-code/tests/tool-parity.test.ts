@@ -73,7 +73,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_list: { status: 'bridged' },
 	site_connected_remote_sites: { status: 'bridged' },
 	wpcom_request: { status: 'bridged' },
-	preview_create: { status: 'unqualified', step: 'C2a-3', reason: REMOTE },
+	preview_create: { status: 'bridged' },
 	preview_list: { status: 'bridged' },
 	preview_update: { status: 'bridged' },
 	preview_delete: { status: 'bridged' },
