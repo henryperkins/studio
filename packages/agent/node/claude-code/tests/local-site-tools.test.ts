@@ -1070,6 +1070,43 @@ describe( 'site_create on the Claude route', () => {
 		expect( journal ).toHaveLength( before );
 	} );
 
+	it( 'creates one site at a time: a second site_create while the first runs is refused before anything of it is journaled, and says why', async () => {
+		const { bridge, host, journal } = await setupGlobal();
+		let release!: () => void;
+		const held = new Promise< void >( ( resolve ) => {
+			release = resolve;
+		} );
+		const create = vi.mocked( host.sites.create );
+		const creating = create.getMockImplementation()!;
+		create.mockImplementationOnce( async ( ...args ) => {
+			await held;
+			await creating( ...args );
+		} );
+		const first = bridge.invoke( 'site_create', { name: 'My Coffee Shop' } );
+		await vi.waitFor( () => expect( host.sites.create ).toHaveBeenCalledOnce() );
+		const before = journal.length;
+		const second = await bridge.invoke( 'site_create', { name: 'Another Shop' } );
+		expect( second.isError ).toBe( true );
+		expect( text( second ) ).toContain( 'Studio creates one site at a time' );
+		expect( journal ).toHaveLength( before );
+		expect( host.sites.create ).toHaveBeenCalledOnce();
+		release();
+		expect( ( await first ).isError ).toBe( false );
+		expect( host.selectSite ).toHaveBeenCalledOnce();
+	} );
+
+	it( 'creates a site again after a site_create that failed before it changed the conversation’s site', async () => {
+		const { bridge, host } = await setupGlobal();
+		vi.mocked( host.sites.create ).mockRejectedValueOnce( new Error( 'The disk is full' ) );
+		expect( ( await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } ) ).isError ).toBe(
+			true
+		);
+		expect( ( await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } ) ).isError ).toBe(
+			false
+		);
+		expect( host.sites.create ).toHaveBeenCalledTimes( 2 );
+	} );
+
 	it( 'has its site once the selection has landed, even when that site’s folder cannot be found, and then says the turn acts on no site', async () => {
 		const { bridge, host, journal, site } = await setupGlobal();
 		// The host creates nothing on disk, so the selected site's folder cannot be resolved.

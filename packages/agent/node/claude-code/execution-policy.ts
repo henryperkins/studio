@@ -229,6 +229,8 @@ const REFUSALS = {
 		'Studio did not make that site this conversation’s site: only a site this turn created, in a conversation without a site, can become it.',
 	siteFolderMissing:
 		'The new site is now this conversation’s site, but Studio could not find its folder, so this turn acts on no site.',
+	createInFlight:
+		'Studio creates one site at a time, and this turn is already creating one. Wait for that call’s result.',
 } as const;
 
 function deepFreeze< T >( value: T ): T {
@@ -315,6 +317,10 @@ export function createClaudeExecutionPolicy(
 	// one, or this turn changed it. A conversation works on one site.
 	const hasSite = () =>
 		context.workspace.siteId !== null || actingTarget.environment !== 'global' || siteChanged;
+	// The signal each call's guarded host lives by, which aborts once the call
+	// has settled, and the call that is creating a site, if any: one at a time.
+	const callSignals = new Map< string, AbortSignal >();
+	let creatingCall: string | undefined;
 	const refusals = new Map< string, Set< string > >();
 	const refuse = ( toolCallId: string, reason: string ) => {
 		if ( ! refusals.has( toolCallId ) ) refusals.set( toolCallId, new Set() );
@@ -780,9 +786,24 @@ export function createClaudeExecutionPolicy(
 		if ( callSignal?.aborted ) return false;
 		const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
 		if ( ! rule || ! studioTools.has( name ) ) return false;
-		if ( rule.withoutSite && hasSite() ) {
-			refuse( toolCallId, REFUSALS.createInSite );
-			return false;
+		if ( rule.withoutSite ) {
+			if ( hasSite() ) {
+				refuse( toolCallId, REFUSALS.createInSite );
+				return false;
+			}
+			if ( creatingCall !== undefined ) {
+				refuse( toolCallId, REFUSALS.createInFlight );
+				return false;
+			}
+			// Until the call settles, or the turn ends for a call run without a
+			// guarded host.
+			creatingCall = toolCallId;
+			const settled = callSignals.get( toolCallId ) ?? signal;
+			const done = () => {
+				if ( creatingCall === toolCallId ) creatingCall = undefined;
+			};
+			if ( settled.aborted ) done();
+			else settled.addEventListener( 'abort', done, { once: true } );
 		}
 		const operationClass = rule.classify ? rule.classify( args ) : rule.operationClass;
 		if ( ! operationClass ) return false;
@@ -1023,6 +1044,16 @@ export function createClaudeExecutionPolicy(
 		callSignal?: AbortSignal
 	): StudioAgentHost {
 		const operationSignal = callSignal ? AbortSignal.any( [ signal, callSignal ] ) : signal;
+		if ( ! operationSignal.aborted ) {
+			callSignals.set( toolCallId, operationSignal );
+			operationSignal.addEventListener(
+				'abort',
+				() => {
+					if ( callSignals.get( toolCallId ) === operationSignal ) callSignals.delete( toolCallId );
+				},
+				{ once: true }
+			);
+		}
 		const run = async < T >(
 			request: HostRequest,
 			execute: (
