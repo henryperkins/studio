@@ -551,8 +551,14 @@ describe( 'Claude targets', () => {
 		const selectSite = vi.fn( async () => {} );
 		host.selectSite = selectSite;
 		const guarded = policy.guardHost( host, 'call' );
+		// Only directly in Studio's sites folder.
+		await expect(
+			guarded.sites.create( 'Nested', path.join( parent, 'nested', 'site' ), () => {} )
+		).rejects.toThrow();
+		expect( host.sites.create ).not.toHaveBeenCalled();
 		const created = path.join( parent, 'new-site' );
 		await guarded.sites.create( 'New site', created, () => {} );
+		expect( context.verifyTarget ).toHaveBeenLastCalledWith( { environment: 'global' } );
 		expect( host.sites.create ).toHaveBeenCalledWith(
 			'New site',
 			created,
@@ -574,12 +580,15 @@ describe( 'Claude targets', () => {
 			guarded.selectSite!( { id: 'new', name: 'New site', path: created, running: true } )
 		).rejects.toThrow( 'Denied' );
 		expect( selectSite ).not.toHaveBeenCalled();
-		await guarded.sites.create( 'Another', path.join( parent, 'another' ), () => {} );
-		expect( context.verifyTarget ).toHaveBeenLastCalledWith( { environment: 'global' } );
+		// A turn creates one site, whether or not it became the conversation's site.
+		policy.takeRefusals( 'call' );
 		await expect(
-			guarded.sites.create( 'Nested', path.join( parent, 'nested', 'site' ), () => {} )
-		).rejects.toThrow();
-		expect( host.sites.create ).toHaveBeenCalledTimes( 2 );
+			guarded.sites.create( 'Another', path.join( parent, 'another' ), () => {} )
+		).rejects.toThrow( 'Denied' );
+		expect( policy.takeRefusals( 'call' ) ).toEqual( [
+			expect.stringContaining( 'Studio creates one site in a turn' ),
+		] );
+		expect( host.sites.create ).toHaveBeenCalledOnce();
 
 		const siteConversation = await setup();
 		await expect(

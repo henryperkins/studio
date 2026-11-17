@@ -240,6 +240,7 @@ const REFUSALS = {
 		'A conversation works on one site, and this turn has already made, or tried to make, a site it created this conversation’s site. Ask the user to start a new conversation to create another one.',
 	withoutSiteAfterChange:
 		'A conversation works on one site, and this turn has already made, or tried to make, a site it created this conversation’s site, so Studio runs this tool only in a conversation without a site.',
+	createdInTurn: 'Studio creates one site in a turn, and this turn has already created one.',
 	siteBinding:
 		'Studio did not make that site this conversation’s site: only a site this turn created, in a conversation without a site, can become it.',
 	siteFolderMissing:
@@ -443,11 +444,15 @@ export function createClaudeExecutionPolicy(
 	// Why a call that runs only in a conversation without a site, or creates
 	// the conversation's site, is refused; undefined when it is not. Once this
 	// turn has changed the conversation's site, its write may or may not have
-	// landed, so the sentence says the turn tried, not that the site is set.
+	// landed, so the sentence says the turn tried, not that the site is set. A
+	// turn creates one site, also where the host cannot make it the
+	// conversation's site (a terminal has no `selectSite`).
 	const siteRefusal = ( creates: boolean ): string | undefined => {
-		if ( ! hasSite() ) return;
-		if ( hadSite ) return creates ? REFUSALS.createInSite : REFUSALS.withoutSite;
-		return creates ? REFUSALS.createAfterChange : REFUSALS.withoutSiteAfterChange;
+		if ( hasSite() ) {
+			if ( hadSite ) return creates ? REFUSALS.createInSite : REFUSALS.withoutSite;
+			return creates ? REFUSALS.createAfterChange : REFUSALS.withoutSiteAfterChange;
+		}
+		if ( creates && createdSites.size ) return REFUSALS.createdInTurn;
 	};
 	// The signal each call's guarded host lives by, which aborts once the call
 	// has settled, and the call that is creating a site, if any: one at a time.

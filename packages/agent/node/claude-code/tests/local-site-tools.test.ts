@@ -1190,6 +1190,25 @@ describe( 'site_create on the Claude route', () => {
 		expect( host.selectSite ).toHaveBeenCalledOnce();
 	} );
 
+	it( 'creates one site in a turn also on a host that cannot make it the conversation’s site, as a terminal cannot, says why, and journals nothing for the second', async () => {
+		const { bridge, host, journal, stored } = await setupGlobal();
+		// A terminal `studio code`: no app shows the conversation, and nothing
+		// makes the new site the conversation's site.
+		host.selectSite = undefined;
+		host.ui = undefined;
+		expect( ( await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } ) ).isError ).toBe(
+			false
+		);
+		expect( stored.target ).toEqual( { environment: 'global' } );
+		const before = journal.length;
+		const second = await bridge.invoke( 'site_create', { name: 'Another Shop' } );
+		expect( second.isError ).toBe( true );
+		expect( text( second ) ).toContain( 'Studio creates one site in a turn' );
+		expect( text( second ) ).not.toContain( 'already has its site' );
+		expect( host.sites.create ).toHaveBeenCalledOnce();
+		expect( journal ).toHaveLength( before );
+	} );
+
 	it( 'creates a site again after a site_create that failed before it changed the conversation’s site', async () => {
 		const { bridge, host } = await setupGlobal();
 		vi.mocked( host.sites.create ).mockRejectedValueOnce( new Error( 'The disk is full' ) );
