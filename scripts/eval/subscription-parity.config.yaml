@@ -18,7 +18,8 @@
 #
 # Every case is judged on a deterministic final state or on what the user was
 # shown (outcome.mjs). Under `remote: mock` no state-changing request leaves
-# the eval process itself: pushes, pulls and preview create, update and
+# the eval process itself by the senders its guard patches (README says which,
+# and what it can't cover): pushes, pulls and preview create, update and
 # delete are recorded by a mocked host, writes through `wpcom_request` (a
 # `_method` or `method` override in its query argument or in a query written
 # into its path, including the key spellings PHP folds into `_method`, counts as
