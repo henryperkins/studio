@@ -38,6 +38,9 @@ const providerOff = params.get( 'provider' ) === 'off';
 // A chat with nothing in it yet: the picker offers the ChatGPT accounts beside the
 // models, and choosing one puts the chat on it where it is.
 const emptyChat = providerOff || params.get( 'chat' ) === 'empty';
+// The site's new chat, where choosing a ChatGPT model starts a chat on the account. The
+// start takes a few seconds here, so the busy Model control and the held Send can be seen.
+const newChat = params.get( 'chat' ) === 'new';
 
 const CONNECTION_ID = 'f84d75a0-4e60-4168-a1ab-3134542c637a';
 const sampleUser = { id: 1, email: 'sample@example.test', displayName: 'Sample Account' };
@@ -155,6 +158,14 @@ const connector = createInMemoryConnector(
 	}
 );
 
+if ( newChat ) {
+	const pin = connector.setSessionChatGptSelection;
+	connector.setSessionChatGptSelection = async ( id, selection ) => {
+		await new Promise( ( resolve ) => setTimeout( resolve, 5000 ) );
+		return pin( id, selection );
+	};
+}
+
 const link = ( changes: Record< string, string > ) =>
 	`?${ new URLSearchParams( {
 		scheme,
@@ -163,7 +174,7 @@ const link = ( changes: Record< string, string > ) =>
 		...( accountState ? { account: accountState } : {} ),
 		...( failingReads ? { read: 'failing' } : {} ),
 		...( twoAccounts ? { accounts: 'two' } : {} ),
-		...( params.get( 'chat' ) === 'empty' ? { chat: 'empty' } : {} ),
+		...( params.get( 'chat' ) === 'empty' || newChat ? { chat: params.get( 'chat' )! } : {} ),
 		...( providerOff ? { provider: 'off' } : {} ),
 		...changes,
 	} ) }`;
@@ -175,7 +186,9 @@ createRoot( document.getElementById( 'root' )! ).render(
 			queryClient={ new QueryClient() }
 			history={ createMemoryHistory( {
 				initialEntries: [
-					`/sessions/${ session.id }${ view === 'settings' ? '?settings=ai' : '' }`,
+					`${ newChat ? `/sites/${ site.id }/new` : `/sessions/${ session.id }` }${
+						view === 'settings' ? '?settings=ai' : ''
+					}`,
 				],
 			} ) }
 		/>
@@ -208,6 +221,9 @@ createRoot( document.getElementById( 'root' )! ).render(
 			</a>
 			<a href={ link( { chat: params.get( 'chat' ) === 'empty' ? '' : 'empty', provider: '' } ) }>
 				{ params.get( 'chat' ) === 'empty' ? 'ChatGPT chat' : 'Empty chat' }
+			</a>
+			<a href={ link( { chat: newChat ? '' : 'new', provider: '' } ) }>
+				{ newChat ? 'ChatGPT chat' : 'Site’s new chat' }
 			</a>
 			<a href={ link( { provider: providerOff ? '' : 'off' } ) }>
 				{ providerOff ? 'ChatGPT plans on' : 'ChatGPT plans off' }
