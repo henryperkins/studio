@@ -2967,7 +2967,7 @@ const runningChildren = new Set< ChildProcess >();
 
 const describeDescendantsMayRemain = () =>
 	__(
-		'A CLI process this run started was ended, but the processes it had started couldn’t be listed, so some of them may still be running.'
+		'A CLI process this run started was ended, but some of the processes it had started may still be running.'
 	);
 
 /**

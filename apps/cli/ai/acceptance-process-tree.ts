@@ -199,9 +199,10 @@ export const hasExited = ( child: Pick< ChildProcess, 'exitCode' | 'signalCode' 
  * Ends a child's whole process tree while the child still runs. On Windows:
  * from one snapshot, its descendants deepest first, each on a handle whose
  * creation time matched, then the child itself on the handle this process
- * holds; without a usable snapshot the child alone, and
- * `onDescendantsMayRemain` is called. On POSIX: SIGKILL to the process group
- * the child leads. Never anything by name, and nothing once the child has exited.
+ * holds; `onDescendantsMayRemain` is called when there was no usable snapshot
+ * (the child alone is ended) or a process it chose wasn't ended. On POSIX:
+ * SIGKILL to the process group the child leads. Never anything by name, and
+ * nothing once the child has exited.
  */
 export function endProcessTree(
 	child: HeldChild,
@@ -222,10 +223,14 @@ export function endProcessTree(
 	if ( platform === 'win32' ) {
 		const table = tools.snapshot();
 		const victims = table && selectProcessTreeVictims( table, pid );
-		if ( victims ) {
-			tools.end( victims );
-		} else {
+		if ( ! victims ) {
 			onDescendantsMayRemain();
+		} else {
+			const ended = new Set( tools.end( victims ) );
+			// One not ended may have exited meanwhile, or may still run: say so either way.
+			if ( victims.some( ( victim ) => ! ended.has( victim.pid ) ) ) {
+				onDescendantsMayRemain();
+			}
 		}
 		// The snapshot and the ends ran synchronously, so nothing has reaped
 		// the child meanwhile: this is still the handle it was started with.

@@ -198,6 +198,24 @@ describe( 'ending a child’s process tree', () => {
 		expect( onDescendantsMayRemain ).toHaveBeenCalledTimes( 2 );
 	} );
 
+	it( 'on Windows says descendants may remain when a process it chose wasn’t ended, and still ends its own child', () => {
+		const { child, log } = fakeChild();
+		const onDescendantsMayRemain = vi.fn();
+		const listed = tools( log, [
+			row( 100, 4, 1_000 ),
+			row( 200, 100, 1_100 ),
+			row( 300, 200, 1_200 ),
+		] );
+		endProcessTree( child, {
+			platform: 'win32',
+			// The end step ended only one of them: the other's creation time didn't match, or the step failed.
+			tools: { ...listed, end: ( victims ) => [ listed.end( victims )[ 0 ] ] },
+			onDescendantsMayRemain,
+		} );
+		expect( log ).toEqual( [ 'snapshot', 'end:300,200', 'kill-root:SIGKILL' ] );
+		expect( onDescendantsMayRemain ).toHaveBeenCalledTimes( 1 );
+	} );
+
 	it( 'touches nothing once its child has exited, or for a child that never started', () => {
 		for ( const { child, log } of [
 			fakeChild( { exitCode: 0 } ),
