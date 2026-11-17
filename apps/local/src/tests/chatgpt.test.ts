@@ -32,6 +32,22 @@ vi.mock( '@studio/common/lib/os-credential-store', async ( original ) => ( {
 		};
 	},
 } ) );
+// As the lockfile package gives up once another process has held a session's selection lock past the wait.
+const { selectionLock } = vi.hoisted( () => ( { selectionLock: { held: false } } ) );
+vi.mock( '@studio/common/lib/lockfile', async ( original ) => {
+	const actual = await original< typeof import('@studio/common/lib/lockfile') >();
+	return {
+		...actual,
+		lockFileAsync: async ( ...args: Parameters< typeof actual.lockFileAsync > ) => {
+			if ( selectionLock.held && args[ 0 ].endsWith( '.settings.lock' ) ) {
+				throw Object.assign( new Error( `EEXIST: file already exists, open '${ args[ 0 ] }'` ), {
+					code: 'EEXIST',
+				} );
+			}
+			return actual.lockFileAsync( ...args );
+		},
+	};
+} );
 vi.mock( '@studio/agent/node/chatgpt/oauth', async ( original ) => ( {
 	...( await original< object >() ),
 	beginChatGptSignIn: vi.fn(),
@@ -58,6 +74,7 @@ const request = ( route: string, body?: unknown, method = 'POST', headers = {} )
 	} );
 
 beforeEach( async () => {
+	selectionLock.held = false;
 	root = await fs.mkdtemp( path.join( os.tmpdir(), 'studio-chatgpt-http-' ) );
 	vi.stubEnv( 'DEV_CONFIG_DIR', root );
 	vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' );
@@ -273,6 +290,41 @@ describe( 'ChatGPT HTTP boundary', () => {
 		expect( readChatGptSessionSelection( ( await loadAiSession( root, id ) ).entries ) ).toEqual(
 			SELECTION
 		);
+	} );
+
+	it( 'answers a chat’s model or provider choice whose lock stays held with a 400 naming no path', async () => {
+		const { id } = await createAiSession( root );
+		selectionLock.held = true;
+
+		const responses = await Promise.all( [
+			request( `/sessions/${ id }/provider`, { provider: 'wpcom', model: 'balanced' } ),
+			request( `/sessions/${ id }/model`, { model: 'fast' } ),
+			request( `/sessions/${ id }/chatgpt-selection`, SELECTION ),
+		] );
+
+		for ( const response of responses ) {
+			expect( response.status ).toBe( 400 );
+			const text = await response.text();
+			expect( JSON.parse( text ) ).toEqual( {
+				error: 'Studio couldn’t save the model for this chat. Try again.',
+			} );
+			expect( text ).not.toMatch( /settings\.lock|EEXIST|studio-chatgpt-http/ );
+		}
+		expect(
+			( await loadAiSession( root, id ) ).entries.filter( ( entry ) => entry.type !== 'session' )
+		).toEqual( [] );
+	} );
+
+	it( 'answers a choice for a chat it can’t read with a 400 naming no path', async () => {
+		const response = await request( '/sessions/missing-chat/provider', {
+			provider: 'wpcom',
+			model: 'balanced',
+		} );
+
+		expect( response.status ).toBe( 400 );
+		expect( await response.json() ).toEqual( {
+			error: 'Studio couldn’t save the model for this chat. Try again.',
+		} );
 	} );
 
 	it( 'refuses a model or effort the route isn’t qualified for, keeping the saved choice', async () => {

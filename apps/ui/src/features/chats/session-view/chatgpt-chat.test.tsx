@@ -431,6 +431,34 @@ describe( 'ChatGPT chats', () => {
 		await waitFor( () => expect( input() ).toHaveValue( 'Reviewed context' ) );
 	} );
 
+	it.each( [
+		'Studio couldn’t save the model for this chat. Try again.',
+		'Choose a model this provider supports.',
+	] )(
+		'says only “%s” when the new chat’s provider can’t be saved, keeping the original chat',
+		async ( message ) => {
+			const { connector } = await setup( [ pin( INITIAL ) ], true );
+			connector.setSessionProvider.mockRejectedValueOnce( new Error( message ) );
+			fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+			fireEvent.click(
+				within( await screen.findByRole( 'group', { name: 'Models' } ) ).getByRole( 'option', {
+					name: /GPT-6 Luna/,
+				} )
+			);
+			const dialog = await screen.findByRole( 'dialog', { name: 'Start a new chat?' } );
+			fireEvent.click( within( dialog ).getByRole( 'button', { name: 'Start new chat' } ) );
+
+			expect( await within( dialog ).findByText( message ) ).toBeVisible();
+			expect( dialog ).not.toHaveTextContent( /settings\.lock|EEXIST|[A-Z]:\\/ );
+			expect( connector.continueSession ).not.toHaveBeenCalled();
+			expect(
+				readChatGptSessionSelection(
+					connector.state.sessions.find( ( session ) => session.summary.id === 'chat' )!.entries
+				)
+			).toEqual( INITIAL );
+		}
+	);
+
 	it( 'keeps the original chat when the new connection cannot be saved', async () => {
 		const { connector } = await setup();
 		connector.setSessionChatGptSelection.mockRejectedValueOnce(

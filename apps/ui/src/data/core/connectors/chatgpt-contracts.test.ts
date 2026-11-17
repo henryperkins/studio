@@ -107,6 +107,50 @@ describe( 'ChatGPT connector contracts', () => {
 		);
 	} );
 
+	describe.each( [
+		'Studio couldn’t save the model for this chat. Try again.',
+		'Choose a model this provider supports.',
+		'Choose a supported model.',
+	] )( 'a session model or provider that wasn’t saved: %s', ( message ) => {
+		it( 'reaches the renderer as the message alone through Desktop IPC', async () => {
+			const envelope = ( channel: string ) =>
+				new Error(
+					`Error invoking remote method '${ channel }': ChatGptSettingsError: ${ message }`
+				);
+			vi.stubGlobal( 'ipcApi', {
+				setAiSessionProvider: vi.fn( async () => {
+					throw envelope( 'setAiSessionProvider' );
+				} ),
+				setAiSessionModel: vi.fn( async () => {
+					throw envelope( 'setAiSessionModel' );
+				} ),
+			} );
+			const connector = createIpcConnector();
+
+			await expect(
+				connector.setSessionProvider( 'chat', 'wpcom', 'balanced' )
+			).rejects.toThrowError( new Error( message ) );
+			await expect( connector.setSessionModel( 'chat', 'balanced' ) ).rejects.toThrowError(
+				new Error( message )
+			);
+		} );
+
+		it( 'reaches the page as the message alone from studio ui’s 400', async () => {
+			vi.stubGlobal(
+				'fetch',
+				vi.fn( async () => new Response( JSON.stringify( { error: message } ), { status: 400 } ) )
+			);
+			const connector = createLocalConnector( { apiBaseUrl: 'http://localhost:8081' } );
+
+			await expect(
+				connector.setSessionProvider( 'chat', 'wpcom', 'balanced' )
+			).rejects.toThrowError( new Error( message ) );
+			await expect( connector.setSessionModel( 'chat', 'balanced' ) ).rejects.toThrowError(
+				new Error( message )
+			);
+		} );
+	} );
+
 	it.each( [ 'localhost', '127.0.0.1', '[::1]', 'studio.local' ] )(
 		'advertises callback support on %s',
 		async ( hostname ) => {

@@ -4,7 +4,9 @@
 import { IpcMainInvokeEvent, dialog, shell } from 'electron';
 import { existsSync } from 'fs';
 import { normalize } from 'path';
+import { createAiSession } from '@studio/agent/node/sessions/store';
 import { fetchSyncableSites } from '@studio/common/lib/sync/sync-api';
+import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { readSitePath } from '@studio/common/sites/site-path';
 import { vol } from 'memfs';
 import { vi } from 'vitest';
@@ -13,6 +15,8 @@ import {
 	getFileSize,
 	openURL,
 	readBlueprintFile,
+	setAiSessionModel,
+	setAiSessionProvider,
 	showOpenFolderDialog,
 } from 'src/ipc-handlers';
 import { getAuthenticationToken } from 'src/lib/oauth';
@@ -25,6 +29,23 @@ vi.mock( 'fs/promises', async () => {
 vi.mock( '@studio/common/sites/site-path' );
 vi.mock( '@studio/common/lib/sync/sync-api' );
 vi.mock( 'src/lib/oauth' );
+// As the lockfile package gives up once another process has held a chat's selection lock past the wait.
+const { selectionLock } = vi.hoisted( () => ( { selectionLock: { held: false, refused: 0 } } ) );
+vi.mock( '@studio/common/lib/lockfile', async ( original ) => {
+	const actual = await original< typeof import('@studio/common/lib/lockfile') >();
+	return {
+		...actual,
+		lockFileAsync: async ( ...args: Parameters< typeof actual.lockFileAsync > ) => {
+			if ( selectionLock.held && args[ 0 ].endsWith( '.settings.lock' ) ) {
+				selectionLock.refused++;
+				throw Object.assign( new Error( `EEXIST: file already exists, open '${ args[ 0 ] }'` ), {
+					code: 'EEXIST',
+				} );
+			}
+			return actual.lockFileAsync( ...args );
+		},
+	};
+} );
 
 beforeEach( () => {
 	vol.reset();
@@ -106,6 +127,45 @@ describe( 'getFileSize', () => {
 		expect( warnSpy ).toHaveBeenCalledWith( expect.stringContaining( 'advanced-cache.php' ) );
 
 		warnSpy.mockRestore();
+	} );
+} );
+
+describe( 'a chat’s model or provider', () => {
+	// Electron sends the error's name with its message, which the renderer takes off.
+	const known = ( message: string ) => ( { name: 'ChatGptSettingsError', message } );
+	const notSaved = known( 'Studio couldn’t save the model for this chat. Try again.' );
+
+	afterEach( () => {
+		selectionLock.held = false;
+		selectionLock.refused = 0;
+	} );
+
+	it( 'says only that the choice wasn’t saved while the chat’s lock stays held, naming no path', async () => {
+		const { id } = await createAiSession( getSessionsDirectory() );
+		selectionLock.held = true;
+
+		await expect(
+			setAiSessionProvider( mockIpcMainInvokeEvent, id, 'wpcom', 'balanced' )
+		).rejects.toMatchObject( notSaved );
+		await expect( setAiSessionModel( mockIpcMainInvokeEvent, id, 'fast' ) ).rejects.toMatchObject(
+			notSaved
+		);
+		expect( selectionLock.refused ).toBe( 2 );
+	} );
+
+	it( 'says only that the choice wasn’t saved for a chat it can’t read', async () => {
+		await expect(
+			setAiSessionProvider( mockIpcMainInvokeEvent, 'missing-chat', 'wpcom', 'balanced' )
+		).rejects.toMatchObject( notSaved );
+	} );
+
+	it( 'refuses a provider or model Studio doesn’t know with a known message', async () => {
+		await expect(
+			setAiSessionProvider( mockIpcMainInvokeEvent, 'any', 'unknown-provider', 'balanced' )
+		).rejects.toMatchObject( known( 'Choose a model this provider supports.' ) );
+		await expect(
+			setAiSessionModel( mockIpcMainInvokeEvent, 'any', 'unknown-model' )
+		).rejects.toMatchObject( known( 'Choose a supported model.' ) );
 	} );
 } );
 

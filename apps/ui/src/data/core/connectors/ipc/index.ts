@@ -577,11 +577,11 @@ export function createIpcConnector(): Connector {
 		},
 
 		async setSessionModel( sessionId, model ) {
-			await ipcApi.setAiSessionModel( sessionId, model );
+			await unwrapIpcError( ipcApi.setAiSessionModel( sessionId, model ) );
 		},
 
 		async setSessionProvider( sessionId, provider, model ) {
-			await ipcApi.setAiSessionProvider( sessionId, provider, model );
+			await unwrapIpcError( ipcApi.setAiSessionProvider( sessionId, provider, model ) );
 		},
 
 		async setSessionOpenAiSelection( sessionId, selection ) {

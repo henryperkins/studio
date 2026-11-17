@@ -25,7 +25,7 @@ vi.mock( '@studio/common/lib/shared-config', async ( original ) => ( {
 } ) );
 // Windows refuses to open a lockfile for a moment while another program
 // deletes it; a test makes the selection's lock refused that many times.
-const lockRace = vi.hoisted( () => ( { refusals: 0 } ) );
+const lockRace = vi.hoisted( () => ( { refusals: 0, held: false } ) );
 vi.mock( '@studio/common/lib/lockfile', async ( original ) => {
 	const actual = await original< typeof import('@studio/common/lib/lockfile') >();
 	return {
@@ -35,6 +35,12 @@ vi.mock( '@studio/common/lib/lockfile', async ( original ) => {
 				lockRace.refusals--;
 				throw Object.assign( new Error( 'EPERM: operation not permitted, open' ), {
 					code: 'EPERM',
+				} );
+			}
+			// As the lockfile package gives up once another process held the lock past the wait.
+			if ( args[ 0 ].endsWith( '.settings.lock' ) && lockRace.held ) {
+				throw Object.assign( new Error( `EEXIST: file already exists, open '${ args[ 0 ] }'` ), {
+					code: 'EEXIST',
 				} );
 			}
 			return actual.lockFileAsync( ...args );
@@ -47,6 +53,7 @@ const selection = { connectionId: A, revision: 1, model: 'gpt-6-luna', reasoning
 let root: string;
 beforeEach( async () => {
 	lockRace.refusals = 0;
+	lockRace.held = false;
 	root = await fs.mkdtemp( path.join( os.tmpdir(), 'studio-chatgpt-selection-' ) );
 	vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' );
 	vi.mocked( listChatGptConnections ).mockResolvedValue(
@@ -246,6 +253,67 @@ describe( 'ChatGPT session selection', () => {
 			setSessionProvider( root, id, 'openai-api-key', 'gpt-6-luna' ),
 		] );
 		expect( results.filter( ( result ) => result.status === 'fulfilled' ) ).toHaveLength( 1 );
+	} );
+
+	it( 'says only that the choice wasn’t saved when the session’s lock stays held, naming no path', async () => {
+		const { id } = await createAiSession( root );
+		lockRace.held = true;
+		const failures = await Promise.allSettled( [
+			setSessionProvider( root, id, 'wpcom', 'balanced' ),
+			setSessionModel( root, id, 'fast' ),
+			setSessionChatGptSelection( root, id, selection ),
+			setSessionOpenAiSelection( root, id, {
+				model: 'gpt-6-luna',
+				reasoningEffort: 'medium',
+				reasoningMode: 'standard',
+			} ),
+		] );
+
+		for ( const failure of failures ) {
+			expect( failure ).toEqual( {
+				status: 'rejected',
+				reason: expect.objectContaining( {
+					name: 'ChatGptSettingsError',
+					message: 'Studio couldn’t save the model for this chat. Try again.',
+				} ),
+			} );
+		}
+		lockRace.held = false;
+		await setSessionProvider( root, id, 'wpcom', 'balanced' );
+	} );
+
+	it( 'says only that the choice wasn’t saved for a session that can’t be read', async () => {
+		const failures = await Promise.allSettled( [
+			setSessionProvider( root, 'missing-session', 'wpcom', 'balanced' ),
+			setSessionModel( root, 'missing-session', 'fast' ),
+		] );
+
+		for ( const failure of failures ) {
+			expect( failure ).toMatchObject( {
+				status: 'rejected',
+				reason: { message: 'Studio couldn’t save the model for this chat. Try again.' },
+			} );
+		}
+	} );
+
+	it.each( [
+		[
+			'a provider Studio doesn’t know',
+			() => setSessionProvider( root, 'any', 'unknown-provider', 'balanced' ),
+			'Choose a model this provider supports.',
+		],
+		[
+			'a model the provider doesn’t serve',
+			() => setSessionProvider( root, 'any', 'anthropic-api-key', 'gpt-6-luna' ),
+			'Choose a model this provider supports.',
+		],
+		[
+			'an unknown model',
+			() => setSessionModel( root, 'any', 'unknown-model' ),
+			'Choose a supported model.',
+		],
+	] )( 'refuses %s with a known message', async ( _name, write, message ) => {
+		await expect( write() ).rejects.toMatchObject( { name: 'ChatGptSettingsError', message } );
 	} );
 
 	it( 'releases the session lock after an invalid selection and preserves site placement', async () => {

@@ -19,22 +19,35 @@ import { isStudioCustomEntryOfType } from '@studio/agent/protocol/sessions/entry
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
 
-/** Serializes connection checks and writes across the two application hosts. */
+/**
+ * Serializes connection checks and writes across the two application hosts.
+ * Only a known message leaves it: a lock or file error names a path in the
+ * user's home, so the hosts are told only that the choice wasn't saved.
+ */
 export async function withSessionSelection< T >(
 	sessionsRoot: string,
 	sessionId: string,
 	write: ( entries: SessionEntry[] ) => Promise< T >
 ): Promise< T > {
-	const { summary } = await loadAiSession( sessionsRoot, sessionId );
-	// Retried while Windows refuses a lockfile another process is letting go.
-	const release = await lockChatGptFile( `${ summary.filePath }.settings.lock`, {
-		stale: LOCKFILE_STALE_TIME,
-		wait: LOCKFILE_WAIT_TIME,
-	} );
 	try {
-		return await write( await readPiFileEntries( summary.filePath ) );
-	} finally {
-		await release();
+		const { summary } = await loadAiSession( sessionsRoot, sessionId );
+		// Retried while Windows refuses a lockfile another process is letting go.
+		const release = await lockChatGptFile( `${ summary.filePath }.settings.lock`, {
+			stale: LOCKFILE_STALE_TIME,
+			wait: LOCKFILE_WAIT_TIME,
+		} );
+		try {
+			return await write( await readPiFileEntries( summary.filePath ) );
+		} finally {
+			await release();
+		}
+	} catch ( error ) {
+		if ( error instanceof ChatGptSettingsError ) {
+			throw error;
+		}
+		throw new ChatGptSettingsError(
+			__( 'Studio couldn’t save the model for this chat. Try again.' )
+		);
 	}
 }
 
@@ -97,7 +110,7 @@ export async function setSessionProvider(
 		! isAiModelId( model ) ||
 		! providerServesModel( provider, model )
 	) {
-		throw new Error( 'Choose a model this provider supports.' );
+		throw new ChatGptSettingsError( __( 'Choose a model this provider supports.' ) );
 	}
 	await appendSessionSelection( sessionsRoot, sessionId, { provider, model } );
 }
@@ -108,7 +121,7 @@ export async function setSessionModel(
 	model: string
 ): Promise< void > {
 	if ( ! isAiModelId( model ) ) {
-		throw new Error( 'Choose a supported model.' );
+		throw new ChatGptSettingsError( __( 'Choose a supported model.' ) );
 	}
 	await withSessionSelection( sessionsRoot, sessionId, async ( entries ) => {
 		if ( getEffectiveSessionProvider( entries ) === 'chatgpt-oauth' ) {
