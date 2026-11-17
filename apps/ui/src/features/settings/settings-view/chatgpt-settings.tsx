@@ -22,6 +22,8 @@ import type { ChatGptCredentialStorage } from '@studio/agent/protocol/chatgpt';
 interface SignInAttempt {
 	id?: string;
 	cancelled: boolean;
+	// Its outcome has arrived, or it failed: there is nothing left to cancel.
+	ended?: boolean;
 }
 
 export function ChatGptSettingsGroup() {
@@ -113,6 +115,7 @@ export function ChatGptSettingsGroup() {
 				);
 			}
 		} finally {
+			active.ended = true;
 			await refreshChatGptSettings( queryClient, signedIn );
 			if ( mounted.current && attempt.current === active ) {
 				attempt.current = null;
@@ -130,6 +133,8 @@ export function ChatGptSettingsGroup() {
 		try {
 			await connector.cancelChatGptSignIn( active.id );
 		} catch ( failure ) {
+			// Too late to matter once the attempt has ended: its outcome is what's said.
+			if ( ! mounted.current || attempt.current !== active || active.ended ) return;
 			setError(
 				failure instanceof Error ? failure.message : __( 'Couldn’t cancel sign-in. Try again.' )
 			);

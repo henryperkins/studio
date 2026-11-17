@@ -223,6 +223,55 @@ describe( 'ChatGPT account settings', () => {
 		expect( within( group ).queryByRole( 'alert' ) ).not.toBeInTheDocument();
 	} );
 
+	it.each( [ 'while the accounts are read again', 'once they have been' ] as const )(
+		'says nothing of a cancel that fails after the attempt connected the account, %s',
+		async ( when ) => {
+			const { connector, outcome } = await openSettings();
+			let failCancel!: ( error: Error ) => void;
+			connector.cancelChatGptSignIn.mockImplementationOnce(
+				() => new Promise( ( _, fail ) => ( failCancel = fail ) )
+			);
+			const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+			const status = within( group ).getByRole( 'status', { name: 'ChatGPT sign-in status' } );
+			fireEvent.click( await screen.findByRole( 'button', { name: 'Start sign-in' } ) );
+			await waitFor( () => expect( connector.waitForChatGptSignIn ).toHaveBeenCalled() );
+			fireEvent.click( screen.getByRole( 'button', { name: 'Cancel sign-in' } ) );
+			await waitFor( () =>
+				expect( connector.cancelChatGptSignIn ).toHaveBeenCalledWith( ATTEMPT )
+			);
+			// The read that follows the outcome, held so the cancel can fail before it ends.
+			const reread = deferred< void >();
+			const read = connector.getChatGptSettings.getMockImplementation()!;
+			const reads = connector.getChatGptSettings.mock.calls.length;
+			connector.getChatGptSettings.mockImplementation( async () => {
+				await reread.promise;
+				return read();
+			} );
+
+			await act( async () =>
+				outcome.resolve( { ok: true, registrationId: ACCOUNT_A, label: EMAIL, email: EMAIL } )
+			);
+			await waitFor( () =>
+				expect( connector.getChatGptSettings.mock.calls.length ).toBeGreaterThan( reads )
+			);
+			if ( when === 'once they have been' ) {
+				await act( async () => reread.resolve() );
+				await waitFor( () =>
+					expect( status ).toHaveTextContent( exactly( 'ChatGPT account connected.' ) )
+				);
+			}
+			await act( async () =>
+				failCancel( new Error( 'Studio couldn’t complete the ChatGPT action. Try again.' ) )
+			);
+			await act( async () => reread.resolve() );
+
+			await waitFor( () =>
+				expect( status ).toHaveTextContent( exactly( 'ChatGPT account connected.' ) )
+			);
+			expect( within( group ).queryByRole( 'alert' ) ).not.toBeInTheDocument();
+		}
+	);
+
 	it( 'says a sign-out that couldn’t clear the sign-in as an error', async () => {
 		const { connector } = await openSettings( { accounts: [ account() ] } );
 		connector.signOutChatGpt.mockResolvedValueOnce( {
