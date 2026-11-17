@@ -28,6 +28,7 @@
 				"ai/eval-runner-entry.ts",
 				"ai/chatgpt-acceptance-entry.ts",
 				"ai/chatgpt-acceptance-observer.ts",
+				"ai/chatgpt-acceptance-tool-images.ts",
 				"commands/**/*.ts",
 				"vite.config.*.ts"
 			],

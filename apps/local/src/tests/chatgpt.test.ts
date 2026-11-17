@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { createChatGptAccount } from '@studio/agent/node/chatgpt/account-store';
 import { listChatGptConnections } from '@studio/agent/node/chatgpt/credential-broker';
 import {
 	beginChatGptSignIn,
@@ -16,10 +17,37 @@ import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { startLocalServer, type LocalServer } from '../index';
 
+// Each call stands for one run of the system keychain's tool.
+const { keychainChecks } = vi.hoisted( () => ( { keychainChecks: vi.fn() } ) );
 vi.mock( '@studio/common/lib/os-credential-store', async ( original ) => ( {
 	...( await original< typeof import('@studio/common/lib/os-credential-store') >() ),
-	createOsCredentialStore: () => createFakeCredentialStore().store,
+	createOsCredentialStore: () => {
+		const { store } = createFakeCredentialStore();
+		return {
+			...store,
+			check: () => {
+				keychainChecks();
+				return store.check();
+			},
+		};
+	},
 } ) );
+// As the lockfile package gives up once another process has held a session's selection lock past the wait.
+const { selectionLock } = vi.hoisted( () => ( { selectionLock: { held: false } } ) );
+vi.mock( '@studio/common/lib/lockfile', async ( original ) => {
+	const actual = await original< typeof import('@studio/common/lib/lockfile') >();
+	return {
+		...actual,
+		lockFileAsync: async ( ...args: Parameters< typeof actual.lockFileAsync > ) => {
+			if ( selectionLock.held && args[ 0 ].endsWith( '.settings.lock' ) ) {
+				throw Object.assign( new Error( `EEXIST: file already exists, open '${ args[ 0 ] }'` ), {
+					code: 'EEXIST',
+				} );
+			}
+			return actual.lockFileAsync( ...args );
+		},
+	};
+} );
 vi.mock( '@studio/agent/node/chatgpt/oauth', async ( original ) => ( {
 	...( await original< object >() ),
 	beginChatGptSignIn: vi.fn(),
@@ -46,6 +74,7 @@ const request = ( route: string, body?: unknown, method = 'POST', headers = {} )
 	} );
 
 beforeEach( async () => {
+	selectionLock.held = false;
 	root = await fs.mkdtemp( path.join( os.tmpdir(), 'studio-chatgpt-http-' ) );
 	vi.stubEnv( 'DEV_CONFIG_DIR', root );
 	vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' );
@@ -75,6 +104,49 @@ afterEach( async () => {
 } );
 
 describe( 'ChatGPT HTTP boundary', () => {
+	it( 'lists saved accounts without their subject', async () => {
+		await createChatGptAccount( ID, {
+			issuer: 'https://auth.example.test',
+			subject: 'test-private-subject',
+			email: 'someone@example.test',
+			clientId: 'test-issued-client',
+			storage: 'vault',
+		} );
+
+		const response = await request( '/chatgpt', undefined, 'GET' );
+		const text = await response.text();
+
+		expect( response.status ).toBe( 200 );
+		expect( JSON.parse( text ).accounts ).toEqual( [
+			expect.objectContaining( {
+				connectionId: ID,
+				identity: { verified: true, email: 'someone@example.test' },
+			} ),
+		] );
+		expect( text ).not.toContain( 'test-private-subject' );
+		expect( text ).not.toContain( 'subject' );
+	} );
+
+	it( 'answers repeated reads without the keychain’s tool, and runs it again on a recheck', async () => {
+		await request( '/chatgpt/recheck', {} );
+		keychainChecks.mockClear();
+
+		for ( let poll = 0; poll < 3; poll++ ) {
+			expect( ( await request( '/chatgpt', undefined, 'GET' ) ).status ).toBe( 200 );
+		}
+		expect( keychainChecks ).not.toHaveBeenCalled();
+		const rechecked = await request( '/chatgpt/recheck', {} );
+
+		expect( rechecked.status ).toBe( 200 );
+		expect( await rechecked.json() ).toEqual( {
+			enabled: true,
+			signInSupported: true,
+			secureStorage: 'available',
+			accounts: [],
+		} );
+		expect( keychainChecks ).toHaveBeenCalledTimes( 1 );
+	} );
+
 	it( 'rejects a global ChatGPT default with a settings error and preserves the saved provider', async () => {
 		const configPath = path.join( root, 'shared.json' );
 		const config = JSON.stringify( { version: 1, aiProvider: 'wpcom', locale: 'es' } );
@@ -101,7 +173,11 @@ describe( 'ChatGPT HTTP boundary', () => {
 		} );
 		expect( response.status ).toBe( 200 );
 		expect( await response.json() ).toEqual( { attemptId: ATTEMPT } );
-		expect( beginChatGptSignIn ).toHaveBeenCalledExactlyOnceWith( ID, { storage: 'session' } );
+		expect( beginChatGptSignIn ).toHaveBeenCalledExactlyOnceWith(
+			ID,
+			{ storage: 'session' },
+			{ storageChosen: expect.any( Function ) }
+		);
 		vi.mocked( waitForChatGptSignIn ).mockResolvedValueOnce( {
 			ok: true,
 			registrationId: ID,
@@ -186,6 +262,11 @@ describe( 'ChatGPT HTTP boundary', () => {
 			secureStorage: 'unavailable',
 			accounts: [],
 		} );
+		keychainChecks.mockClear();
+		expect( await ( await request( '/chatgpt/recheck', {} ) ).json() ).toEqual(
+			await ( await request( '/chatgpt', undefined, 'GET' ) ).json()
+		);
+		expect( keychainChecks ).not.toHaveBeenCalled();
 		expect( ( await request( '/chatgpt/sign-in', {} ) ).status ).toBe( 400 );
 		expect( beginChatGptSignIn ).not.toHaveBeenCalled();
 		const { id } = await createAiSession( root );
@@ -213,6 +294,43 @@ describe( 'ChatGPT HTTP boundary', () => {
 		expect( readChatGptSessionSelection( ( await loadAiSession( root, id ) ).entries ) ).toEqual(
 			SELECTION
 		);
+	} );
+
+	it( 'answers a chat’s model or provider choice whose lock stays held with a 400 naming no path', async () => {
+		const { id } = await createAiSession( root );
+		selectionLock.held = true;
+
+		const responses = await Promise.all( [
+			request( `/sessions/${ id }/provider`, { provider: 'wpcom', model: 'balanced' } ),
+			request( `/sessions/${ id }/model`, { model: 'fast' } ),
+			request( `/sessions/${ id }/chatgpt-selection`, SELECTION ),
+		] );
+
+		for ( const response of responses ) {
+			expect( response.status ).toBe( 400 );
+			const text = await response.text();
+			expect( JSON.parse( text ) ).toEqual( {
+				error: 'Studio couldn’t save the model for this chat. Try again.',
+			} );
+			expect( text ).not.toMatch( /settings\.lock|EEXIST|studio-chatgpt-http/ );
+		}
+		expect(
+			( await loadAiSession( root, id ) ).entries.filter(
+				( entry ) => entry.type === 'custom' || entry.type === 'model_change'
+			)
+		).toEqual( [] );
+	} );
+
+	it( 'answers a choice for a chat it can’t read with a 400 naming no path', async () => {
+		const response = await request( '/sessions/missing-chat/provider', {
+			provider: 'wpcom',
+			model: 'balanced',
+		} );
+
+		expect( response.status ).toBe( 400 );
+		expect( await response.json() ).toEqual( {
+			error: 'Studio couldn’t save the model for this chat. Try again.',
+		} );
 	} );
 
 	it( 'refuses a model or effort the route isn’t qualified for, keeping the saved choice', async () => {

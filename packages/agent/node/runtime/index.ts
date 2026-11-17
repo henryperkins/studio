@@ -32,6 +32,7 @@ import {
 import { getAiTracksIdentity } from '@studio/common/lib/tracks-identity';
 import { type TSchema } from 'typebox';
 import { withDesignSystemPreview } from '@studio/agent/node/chat-artifacts';
+import { describeChatGptConnectionProblem } from '@studio/agent/node/chatgpt/connection-problem';
 import {
 	beginChatGptTurn,
 	listChatGptConnections,
@@ -54,10 +55,11 @@ import {
 	resolveChatGptReasoning,
 } from '@studio/agent/protocol/chatgpt-models';
 import {
-	describeConnectionSelectionError,
+	describeOtherProviderInChatGptChat,
 	resolveConnectionSelection,
 	type ConnectionRegistryEntry,
 	type ConnectionSelection,
+	type ConnectionSelectionError,
 } from '@studio/agent/protocol/connections';
 import {
 	aiModelSupportsImages,
@@ -88,6 +90,8 @@ import { findLastAssistant, isEmptyStop } from '@studio/agent/protocol/session-e
 import {
 	buildChatGptModel,
 	createChatGptProviderConfig,
+	recordsBareChatGptSlug,
+	sendsChatGptToolImages,
 	type ChatGptTurnSnapshot,
 } from './chatgpt-transport';
 import { getFileToolPrompt } from './file-tool-prompts';
@@ -374,6 +378,8 @@ type TurnRouting =
 			kind: 'chatgpt';
 			turn: ChatGptTurnHandle;
 			model: Model< 'openai-responses' >;
+			/** The route's name for the model, which pi's id only contains. */
+			slug: string;
 			reasoningEffort: OpenAiReasoningEffort;
 	  };
 
@@ -382,20 +388,32 @@ type TurnRouting =
 function validateChatGptSelectionLive(
 	selection: ConnectionSelection,
 	connections: readonly ConnectionRegistryEntry[]
-): string | undefined {
+): ConnectionSelectionError | undefined {
 	const providerId = 'chatgpt-oauth';
-	const connection = connections.find( ( entry ) => entry.connectionId === selection.connectionId );
+	const { connectionId } = selection;
+	const connection = connections.find( ( entry ) => entry.connectionId === connectionId );
 	if ( ! connection ) {
-		return describeConnectionSelectionError( { code: 'disconnected', providerId } );
+		return { code: 'disconnected', providerId, connectionId };
 	}
 	if ( connection.providerId !== providerId || connection.backend !== 'pi' ) {
-		return describeConnectionSelectionError( { code: 'unsupported', providerId } );
+		return { code: 'unsupported', providerId, connectionId };
 	}
 	if ( connection.revision !== selection.revision ) {
-		return describeConnectionSelectionError( { code: 'changed', providerId } );
+		return {
+			code: 'changed',
+			providerId,
+			connectionId,
+			recordedRevision: selection.revision,
+			currentRevision: connection.revision,
+		};
 	}
-	if ( connection.authStatus !== 'connected' || ! connection.identity?.subject ) {
-		return describeConnectionSelectionError( { code: 'disconnected', providerId } );
+	// The broker's own entry, with the subject it verified: never a renderer's view.
+	const identity = connection.identity;
+	if ( connection.authStatus !== 'connected' || ! ( identity && 'subject' in identity ) ) {
+		return { code: 'disconnected', providerId, connectionId };
+	}
+	if ( ! identity.subject ) {
+		return { code: 'disconnected', providerId, connectionId };
 	}
 	return undefined;
 }
@@ -404,15 +422,15 @@ function validateChatGptSelectionLive(
 // continues only on the connection, model and revision it recorded, and one
 // that ran elsewhere never continues on ChatGPT. A session with no history
 // yet may start on the selected connection.
-function validateChatGptSessionBinding(
+async function validateChatGptSessionBinding(
 	entries: SessionEntry[],
 	selection: ConnectionSelection,
 	connections: readonly ConnectionRegistryEntry[]
-): string | undefined {
+): Promise< string | undefined > {
 	if ( getEffectiveSessionProvider( entries, null ) === 'chatgpt-oauth' ) {
 		const resolved = resolveConnectionSelection( entries, { connections, settings: null } );
 		if ( ! resolved.ok ) {
-			return describeConnectionSelectionError( resolved.error );
+			return describeChatGptConnectionProblem( resolved.error );
 		}
 		const recorded = resolved.selection;
 		if (
@@ -433,6 +451,17 @@ function validateChatGptSessionBinding(
 	);
 	return hasHistory
 		? 'This chat ran on another provider, so it can’t continue on ChatGPT. Start a new chat with ChatGPT.'
+		: undefined;
+}
+
+/**
+ * Why a turn on another provider can't run in this conversation: it ran on
+ * ChatGPT, pinned there or by its last reply, and continues only there.
+ * Undefined for any other conversation.
+ */
+function describeChatGptConversation( entries: SessionEntry[] ): string | undefined {
+	return getEffectiveSessionProvider( entries, null ) === 'chatgpt-oauth'
+		? describeOtherProviderInChatGptChat()
 		: undefined;
 }
 
@@ -461,7 +490,9 @@ async function resolveChatGptRouting(
 	}
 	let model: Model< 'openai-responses' >;
 	try {
-		model = buildChatGptModel( selection.model, config.chatGpt?.label );
+		model = buildChatGptModel( selection.model, config.chatGpt?.label, {
+			bareSlugId: recordsBareChatGptSlug( config.session.getEntries(), selection.model.modelId ),
+		} );
 	} catch ( error ) {
 		return { ok: false, reason: error instanceof Error ? error.message : String( error ) };
 	}
@@ -473,9 +504,9 @@ async function resolveChatGptRouting(
 	}
 	const liveProblem = validateChatGptSelectionLive( selection, connections );
 	if ( liveProblem ) {
-		return { ok: false, reason: liveProblem };
+		return { ok: false, reason: await describeChatGptConnectionProblem( liveProblem ) };
 	}
-	const bindingProblem = validateChatGptSessionBinding(
+	const bindingProblem = await validateChatGptSessionBinding(
 		config.session.getEntries(),
 		selection,
 		connections
@@ -498,7 +529,13 @@ async function resolveChatGptRouting(
 	}
 	return {
 		ok: true,
-		routing: { kind: 'chatgpt', turn, model, reasoningEffort: reasoning.effort },
+		routing: {
+			kind: 'chatgpt',
+			turn,
+			model,
+			slug: selection.model.modelId,
+			reasoningEffort: reasoning.effort,
+		},
 	};
 }
 
@@ -546,6 +583,11 @@ async function runAgentSessionTurn(
 		}
 		routing = resolved.routing;
 	} else {
+		const chatGptProblem = describeChatGptConversation( config.session.getEntries() );
+		if ( chatGptProblem ) {
+			config.onEvent( syntheticErrorAgentEnd( 'error', chatGptProblem, CHATGPT_PI_PROVIDER ) );
+			return;
+		}
 		const family = getAiModelFamily( config.model );
 		const resolved = resolveCredentials( family, config.env );
 		if ( ! resolved.ok ) {
@@ -656,20 +698,27 @@ async function createStudioAgentSession(
 			: routing.openAiSettings
 			? buildOpenAiModel( routing.openAiSettings, getAiModelLabel( routing.openAiSettings.model ) )
 			: buildModel( config.model, routing.family, routing.creds );
+	// Whether tool results may carry images. On the ChatGPT route that is
+	// qualified apart from the images a user attaches.
 	const visionEnabled =
 		routing.kind === 'chatgpt'
-			? routing.model.input.includes( 'image' )
+			? sendsChatGptToolImages( routing.slug )
 			: aiModelSupportsImages( config.model );
 	const [ userInstructions, imageGenerationEnabled ] = await Promise.all( [
 		readGlobalInstructions(),
 		isImageGenerationAvailable(),
 	] );
 
-	const tools = buildAgentTools( config, imageGenerationEnabled, visionEnabled );
+	const tools = buildAgentTools( config, imageGenerationEnabled, {
+		visionEnabled,
+		// The model sees attached images; only this connection's tool results go without.
+		toolImagesUnavailable: routing.kind === 'chatgpt' && ! visionEnabled,
+	} );
 	const systemPrompt = buildSystemPrompt( {
 		userInstructions,
 		tools: tools.map( toolPromptContribution ),
 		activeSite: config.activeSite,
+		chatGptRoute: routing.kind === 'chatgpt',
 	} );
 
 	const pendingWork = getPendingWork( config.session );
@@ -1052,6 +1101,11 @@ function toToolDefinition(
 			if ( details && pending ) {
 				delete details.pending;
 			}
+			// Which service made the images is shown only beside a subscription
+			// plan, which doesn't pay for them; elsewhere the result is as before.
+			if ( details?.studioService && ! chatGptTurn ) {
+				delete details.studioService;
+			}
 			// Every tool's result, pi's file tools' included, carries the notes and
 			// what work left running reports.
 			const content = await completeToolResult( result.content, pending, {
@@ -1066,7 +1120,10 @@ function toToolDefinition(
 function buildAgentTools(
 	config: ResolvedStudioAgentTurnConfig,
 	imageGenerationEnabled: boolean,
-	visionEnabled: boolean
+	{
+		visionEnabled,
+		toolImagesUnavailable,
+	}: { visionEnabled: boolean; toolImagesUnavailable: boolean }
 ): AgentToolAny[] {
 	const { host } = config;
 	const askUserTool: AgentToolAny[] = config.onAskUser
@@ -1111,6 +1168,7 @@ function buildAgentTools(
 	const studioTools = resolveStudioTools( host, {
 		imageGeneration: imageGenerationEnabled,
 		visionEnabled,
+		toolImagesUnavailable,
 		canAskUser: Boolean( config.onAskUser ),
 		tracks,
 	} ) as unknown as AgentToolAny[];

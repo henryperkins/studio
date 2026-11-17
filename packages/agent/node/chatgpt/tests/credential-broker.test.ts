@@ -30,6 +30,7 @@ import {
 	type ChatGptTokenSet,
 	type ChatGptTurnHandle,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
 import {
 	createFakeCredentialStore,
 	type FakeCredentialStore,
@@ -54,15 +55,19 @@ vi.mock( 'node:fs', async ( importOriginal ) => {
 	} ) as typeof actual.watch;
 	return { ...actual, default: { ...actual, watch }, watch };
 } );
+type LockPause = { lockName: string; reached: () => void; release: Promise< void > };
+
 const lockRace = vi.hoisted( () => ( {
 	refusals: 0,
 	attempts: 0,
-	pause: null as { lockName: string; reached: () => void; release: Promise< void > } | null,
+	pause: null as LockPause | null,
+	pauseAfterUnlock: null as LockPause | null,
 } ) );
 
 // Windows refuses to open a lockfile while another program still has the old
 // one open as it is deleted; a test makes it happen on demand. A test can also
-// hold the next taking of one lockfile, to interleave two operations exactly.
+// hold the next taking of one lockfile, or whoever next lets one go once it
+// has, to interleave two operations exactly.
 vi.mock( '@studio/common/lib/lockfile', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('@studio/common/lib/lockfile') >();
 	return {
@@ -82,6 +87,15 @@ vi.mock( '@studio/common/lib/lockfile', async ( importOriginal ) => {
 				} );
 			}
 			return actual.lockFileAsync( ...args );
+		},
+		unlockFileAsync: async ( ...args: Parameters< typeof actual.unlockFileAsync > ) => {
+			await actual.unlockFileAsync( ...args );
+			const pause = lockRace.pauseAfterUnlock;
+			if ( pause && args[ 0 ].endsWith( pause.lockName ) ) {
+				lockRace.pauseAfterUnlock = null;
+				pause.reached();
+				await pause.release;
+			}
 		},
 	};
 } );
@@ -155,6 +169,18 @@ function pauseNextLock( lockName: string ) {
 	const reached = deferred< void >();
 	const release = deferred< void >();
 	lockRace.pause = { lockName, reached: () => reached.resolve(), release: release.promise };
+	return { reached: reached.promise, release: () => release.resolve() };
+}
+
+// Holds whatever next lets the lockfile named `lockName` go, once it has, until `release`.
+function pauseAfterNextUnlock( lockName: string ) {
+	const reached = deferred< void >();
+	const release = deferred< void >();
+	lockRace.pauseAfterUnlock = {
+		lockName,
+		reached: () => reached.resolve(),
+		release: release.promise,
+	};
 	return { reached: reached.promise, release: () => release.resolve() };
 }
 
@@ -302,6 +328,8 @@ describe( 'ChatGPT credential broker', () => {
 					: fs.readFileSync( entryPath, 'utf8' );
 			} )
 			.join( '\n' );
+	// The test profile's own vault key item, which `vault-key-scope.test.ts` names.
+	const keyItem = () => getChatGptVaultKeyAccounts().own;
 
 	// One process's broker; a test starts another to play a second app.
 	function startBroker( options: Partial< ChatGptCredentialBrokerOptions > = {} ) {
@@ -325,6 +353,7 @@ describe( 'ChatGPT credential broker', () => {
 		lockRace.refusals = 0;
 		lockRace.attempts = 0;
 		lockRace.pause = null;
+		lockRace.pauseAfterUnlock = null;
 		fileWatching.refused = false;
 	} );
 
@@ -505,10 +534,8 @@ describe( 'ChatGPT credential broker', () => {
 			expect( envelope ).toMatchObject( { version: 1 } );
 			expect( Buffer.from( envelope.iv, 'base64' ) ).toHaveLength( 12 );
 			expect( Buffer.from( envelope.tag, 'base64' ) ).toHaveLength( 16 );
-			expect( [ ...keychain.items.keys() ] ).toEqual( [ 'chatgpt-vault-key' ] );
-			expect( Buffer.from( keychain.items.get( 'chatgpt-vault-key' )!, 'base64url' ) ).toHaveLength(
-				32
-			);
+			expect( [ ...keychain.items.keys() ] ).toEqual( [ keyItem() ] );
+			expect( Buffer.from( keychain.items.get( keyItem() )!, 'base64url' ) ).toHaveLength( 32 );
 
 			await broker.saveSignIn(
 				signIn( { registrationId: first.registrationId, tokens: tokens( 3 ) } )
@@ -532,7 +559,7 @@ describe( 'ChatGPT credential broker', () => {
 			const first = await broker.saveSignIn( signIn() );
 			const second = await broker.saveSignIn( signIn( { tokens: tokens( 2 ) } ) );
 			// The vault's own format and key, as only something holding the key could use them.
-			const key = Buffer.from( keychain.items.get( 'chatgpt-vault-key' )!, 'base64url' );
+			const key = Buffer.from( keychain.items.get( keyItem() )!, 'base64url' );
 			const aad = ( registrationId: string ) =>
 				Buffer.from( `studio.chatgpt-credentials.v1:${ registrationId }` );
 			const sealed = JSON.parse( fs.readFileSync( vaultPath( first.registrationId ), 'utf8' ) );
@@ -637,11 +664,11 @@ describe( 'ChatGPT credential broker', () => {
 					tokens: tokens( 2 ),
 				} )
 			);
-			const replacement = keychain.items.get( 'chatgpt-vault-key' );
+			const replacement = keychain.items.get( keyItem() );
 
 			await app.saveSignIn( signIn( { registrationId, tokens: tokens( 3 ) } ) );
 
-			expect( keychain.items.get( 'chatgpt-vault-key' ) ).toBe( replacement );
+			expect( keychain.items.get( keyItem() ) ).toBe( replacement );
 			for ( const reader of [ other, startBroker(), app ] ) {
 				await expect( reader.getAccessToken( registrationId ) ).resolves.toBe(
 					'test-access-token-3'
@@ -652,7 +679,7 @@ describe( 'ChatGPT credential broker', () => {
 		it( 'refuses to save a sign-in while the keychain is locked, even with a key from before, and makes no new one', async () => {
 			const app = startBroker();
 			const { registrationId } = await app.saveSignIn( signIn() );
-			const key = keychain.items.get( 'chatgpt-vault-key' );
+			const key = keychain.items.get( keyItem() );
 			keychain.state.available = false;
 
 			await expect(
@@ -660,7 +687,7 @@ describe( 'ChatGPT credential broker', () => {
 			).rejects.toMatchObject( { code: 'vault-unavailable' } );
 
 			keychain.state.available = true;
-			expect( [ ...keychain.items.entries() ] ).toEqual( [ [ 'chatgpt-vault-key', key ] ] );
+			expect( [ ...keychain.items.entries() ] ).toEqual( [ [ keyItem(), key ] ] );
 			await expect( startBroker().getAccessToken( registrationId ) ).resolves.toBe(
 				'test-access-token-1'
 			);
@@ -749,9 +776,7 @@ describe( 'ChatGPT credential broker', () => {
 			expect( service.revocations ).toEqual( [
 				{ clientId: 'test-issued-client-1', refreshToken: large.refreshToken },
 			] );
-			expect( [ ...passwordVault.items.keys() ] ).toEqual( [
-				'wordpress-studio/chatgpt-vault-key',
-			] );
+			expect( [ ...passwordVault.items.keys() ] ).toEqual( [ `wordpress-studio/${ keyItem() }` ] );
 			const [ key ] = passwordVault.items.values();
 			expect( key ).toMatch( /^[A-Za-z0-9_-]{43}$/ );
 			expect( Buffer.from( key, 'base64url' ) ).toHaveLength( 32 );
@@ -1407,6 +1432,201 @@ describe( 'ChatGPT credential broker', () => {
 		} );
 	} );
 
+	// Two apps can each hold a session-only sign-in of one registration: what
+	// one holds from before the other signed in again belongs to that earlier
+	// sign-in only, and is never used or the cause of a "needs sign-in" again.
+	describe( 'a held session-only record and a sign-in again', () => {
+		const refused = async (): Promise< ChatGptTokenServiceResult< ChatGptTokenSet > > => ( {
+			ok: false,
+			error: { kind: 'terminal', code: 'invalid_grant', status: 400 },
+		} );
+
+		// App A signed in for this session only, then app B signed the same
+		// registration in again, also for its session only.
+		async function signedInAgainElsewhere( firstTokens: ChatGptTokenSet ) {
+			const a = startBroker();
+			const { registrationId } = await a.saveSignIn(
+				signIn( { storage: 'session', tokens: firstTokens } )
+			);
+			const b = startBroker();
+			const again = await b.saveSignIn(
+				signIn( { registrationId, storage: 'session', tokens: tokens( 3 ) } )
+			);
+			expect( again ).toMatchObject( { state: 'signed-in', signInGeneration: 2 } );
+			return { a, b, registrationId };
+		}
+
+		async function expectSignInAgainKept( b: ChatGptCredentialBroker, registrationId: string ) {
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				state: 'signed-in',
+				storage: 'session',
+				signInGeneration: 2,
+			} );
+			await expect( b.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-3' );
+			expect( b.getSessionForkEnvironment() ).toEqual( {
+				STUDIO_CHATGPT_SESSIONS_OFFERED: registrationId,
+			} );
+			expect( await b.listConnections() ).toEqual( [
+				expect.objectContaining( { connectionId: registrationId, authStatus: 'connected' } ),
+			] );
+		}
+
+		it( 'never refreshes, in one app, the record it held from before another app signed in again, so its refusal can’t mark that sign-in', async () => {
+			const { a, b, registrationId } = await signedInAgainElsewhere( expiring() );
+			// The earlier sign-in's refresh token would be refused now.
+			service.answerRefresh( refused );
+
+			const used = await settled( a.getAccessToken( registrationId ) );
+
+			expect( used ).toEqual( {
+				error: expect.objectContaining( { code: 'session-unavailable' } ),
+			} );
+			expect( service.refreshes ).toEqual( [] );
+			expect( a.getSessionForkEnvironment() ).toEqual( {} );
+			expect( await a.listConnections() ).toEqual( [
+				expect.objectContaining( { connectionId: registrationId, authStatus: 'disconnected' } ),
+			] );
+			await expectSignInAgainKept( b, registrationId );
+		} );
+
+		it( 'hands a turn it forked no token from the record it held from before another app signed in again, and drops that record without marking anything', async () => {
+			const { a, b, registrationId } = await signedInAgainElsewhere( tokens( 1 ) );
+			const reply = vi.fn();
+
+			a.answerSessionTokenRequest(
+				{
+					type: 'studio.chatgpt-session-token.request',
+					requestId: 'request-after-sign-in-again',
+					connectionId: registrationId,
+					logoutGeneration: 0,
+				},
+				reply
+			);
+
+			await vi.waitFor( () => expect( reply ).toHaveBeenCalledOnce() );
+			expect( reply ).toHaveBeenCalledWith(
+				expect.objectContaining( {
+					requestId: 'request-after-sign-in-again',
+					accessToken: null,
+				} )
+			);
+			expect( a.getSessionForkEnvironment() ).toEqual( {} );
+			await expect( a.readIdTokenHint( registrationId ) ).resolves.toBeNull();
+			expect( service.refreshes ).toEqual( [] );
+			await expectSignInAgainKept( b, registrationId );
+		} );
+
+		it( 'stops holding the record from before another app signed in again once it sees the account list change', async () => {
+			const a = startBroker( { timing: { accountsPollMs: 20 } } );
+			const { registrationId } = await a.saveSignIn( signIn( { storage: 'session' } ) );
+			expect( a.getSessionForkEnvironment() ).toEqual( {
+				STUDIO_CHATGPT_SESSIONS_OFFERED: registrationId,
+			} );
+			const b = startBroker();
+
+			await b.saveSignIn( signIn( { registrationId, storage: 'session', tokens: tokens( 3 ) } ) );
+
+			await vi.waitFor( () => expect( a.getSessionForkEnvironment() ).toEqual( {} ) );
+			expect( service.refreshes ).toEqual( [] );
+			await expectSignInAgainKept( b, registrationId );
+		} );
+
+		it( 'drops, rather than keeps, a renewal of the earlier record that comes back after another app signed in again', async () => {
+			const a = startBroker();
+			const { registrationId } = await a.saveSignIn(
+				signIn( { storage: 'session', tokens: expiring() } )
+			);
+			const refresh = deferred< ChatGptTokenServiceResult< ChatGptTokenSet > >();
+			service.answerRefresh( () => refresh.promise );
+			const renewing = settled( a.getAccessToken( registrationId ) );
+			await vi.waitFor( () => expect( service.refreshes ).toHaveLength( 1 ) );
+			const b = startBroker();
+			try {
+				await b.saveSignIn( signIn( { registrationId, storage: 'session', tokens: tokens( 3 ) } ) );
+			} finally {
+				refresh.resolve( { ok: true, value: tokens( 2 ) } );
+			}
+
+			expect( await renewing ).toEqual( {
+				error: expect.objectContaining( { code: 'session-unavailable' } ),
+			} );
+			expect( a.getSessionForkEnvironment() ).toEqual( {} );
+			// Were it kept, its refusal later would mark the sign-in again.
+			service.answerRefresh( refused );
+			await expect( a.getAccessToken( registrationId ) ).rejects.toMatchObject( {
+				code: 'session-unavailable',
+			} );
+			expect( service.refreshes ).toHaveLength( 1 );
+			await expectSignInAgainKept( b, registrationId );
+		} );
+
+		it( 'never marks a sign-in again in one app from a refresh that starts after its account change is saved but before it holds the new record', async () => {
+			const app = startBroker();
+			const { registrationId } = await app.saveSignIn(
+				signIn( { storage: 'session', tokens: expiring() } )
+			);
+			service.answerRefresh( refused );
+			// The sign-in again has saved the account list and let its lock go,
+			// and hasn't yet queued taking the new record.
+			const accountList = pauseAfterNextUnlock( 'chatgpt-accounts.json.lock' );
+			const signingIn = settled(
+				app.saveSignIn( signIn( { registrationId, storage: 'session', tokens: tokens( 3 ) } ) )
+			);
+			await accountList.reached;
+			let used: Awaited< ReturnType< typeof settled > >;
+			try {
+				expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+					state: 'signed-in',
+					signInGeneration: 2,
+				} );
+				used = await settled( app.getAccessToken( registrationId ) );
+			} finally {
+				accountList.release();
+			}
+
+			expect( used ).toEqual( {
+				error: expect.objectContaining( { code: 'session-unavailable' } ),
+			} );
+			expect( await signingIn ).toEqual( {
+				value: expect.objectContaining( { state: 'signed-in', signInGeneration: 2 } ),
+			} );
+			expect( service.refreshes ).toEqual( [] );
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				state: 'signed-in',
+				signInGeneration: 2,
+			} );
+			await expect( app.getAccessToken( registrationId ) ).resolves.toBe( 'test-access-token-3' );
+			expect( app.getSessionForkEnvironment() ).toEqual( {
+				STUDIO_CHATGPT_SESSIONS_OFFERED: registrationId,
+			} );
+		} );
+
+		// The vault record and the sign-in it belongs to change together, under
+		// the registration's refresh lock, and a refresh reads both under it.
+		it( 'refreshes nothing of an earlier vault sign-in whose token request began before another app signed in again, using that sign-in’s record', async () => {
+			const a = startBroker();
+			const { registrationId } = await a.saveSignIn( signIn( { tokens: expiring() } ) );
+			service.answerRefresh( refused );
+			// A read the expiring record and waits for the refresh lock.
+			const refreshLock = pauseNextLock( `${ registrationId }.lock` );
+			const renewing = settled( a.getAccessToken( registrationId ) );
+			await refreshLock.reached;
+			try {
+				await startBroker().saveSignIn( signIn( { registrationId, tokens: tokens( 3 ) } ) );
+			} finally {
+				refreshLock.release();
+			}
+
+			expect( await renewing ).toEqual( { value: 'test-access-token-3' } );
+			expect( service.refreshes ).toEqual( [] );
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				state: 'signed-in',
+				storage: 'vault',
+				signInGeneration: 2,
+			} );
+		} );
+	} );
+
 	describe( 'sign-out', () => {
 		it.each( [ false, true ] )(
 			'revokes a session-only token after pruning it while the turn exits (polling only: %s)',
@@ -1539,6 +1759,82 @@ describe( 'ChatGPT credential broker', () => {
 				'test-access-token-3'
 			);
 			expect( service.revocations ).toEqual( [] );
+		} );
+
+		// A re-sign-in commits while an older session token's refresh is still out;
+		// that refresh is then refused: the new sign-in stays, and its grant with it.
+		it.each( [
+			[ 'in the same process', 'session' as const, false ],
+			[ 'in another process', 'vault' as const, true ],
+		] )(
+			'keeps a sign-in again that commits while a rejected refresh of the old session token is out, %s',
+			async ( _where, storage, otherProcess ) => {
+				const app = startBroker();
+				const { registrationId } = await app.saveSignIn(
+					signIn( { storage: 'session', tokens: expiring() } )
+				);
+				const refresh = deferred< ChatGptTokenServiceResult< ChatGptTokenSet > >();
+				service.answerRefresh( () => refresh.promise );
+				const renewing = settled( app.getAccessToken( registrationId ) );
+				await vi.waitFor( () => expect( service.refreshes ).toHaveLength( 1 ) );
+
+				const signer = otherProcess ? startBroker() : app;
+				const signingIn = signer.saveSignIn(
+					signIn( { registrationId, storage, email: 'again@example.com', tokens: tokens( 3 ) } )
+				);
+				try {
+					await vi.waitFor( async () =>
+						expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+							email: 'again@example.com',
+							storage,
+						} )
+					);
+				} finally {
+					refresh.resolve( {
+						ok: false,
+						error: { kind: 'terminal', code: 'invalid_grant', status: 400 },
+					} );
+				}
+				await signingIn;
+
+				expect( await renewing ).toEqual( {
+					error: expect.objectContaining( { code: 'needs-sign-in' } ),
+				} );
+				expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+					state: 'signed-in',
+					storage,
+				} );
+				await expect( signer.getAccessToken( registrationId ) ).resolves.toBe(
+					'test-access-token-3'
+				);
+				expect( service.revocations ).toEqual( [] );
+			}
+		);
+
+		it( 'reads an account saved before sign-ins were counted as its first, and still marks a refused one', async () => {
+			const broker = startBroker();
+			const { registrationId } = await broker.saveSignIn( signIn( { tokens: expiring() } ) );
+			const index = JSON.parse( fs.readFileSync( accountsPath(), 'utf8' ) );
+			delete index.accounts[ 0 ].signInGeneration;
+			fs.writeFileSync( accountsPath(), JSON.stringify( index ) );
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				signInGeneration: 0,
+				state: 'signed-in',
+			} );
+			service.answerRefresh( async () => ( {
+				ok: false,
+				error: { kind: 'terminal', code: 'invalid_grant', status: 400 },
+			} ) );
+
+			await expect( startBroker().getAccessToken( registrationId ) ).rejects.toMatchObject( {
+				code: 'needs-sign-in',
+			} );
+
+			expect( await readChatGptAccount( registrationId ) ).toMatchObject( {
+				state: 'needs-sign-in',
+			} );
+			const again = await broker.saveSignIn( signIn( { registrationId, tokens: tokens( 2 ) } ) );
+			expect( again ).toMatchObject( { state: 'signed-in', signInGeneration: 1 } );
 		} );
 
 		it( 'keeps each overlapping session sign-out’s revocation tied to its own generation', async () => {
@@ -2454,7 +2750,7 @@ describe( 'ChatGPT credential broker', () => {
 			code: 'refresh-failed',
 		} );
 		expect( await readChatGptAccount( registrationId ) ).toMatchObject( { state: 'signed-in' } );
-		expect( [ ...keychain.items.keys() ] ).toEqual( [ 'chatgpt-vault-key' ] );
+		expect( [ ...keychain.items.keys() ] ).toEqual( [ keyItem() ] );
 
 		broker.setChatGptTokenClient( service.client );
 		await expect( broker.getChatGptAccessToken( registrationId ) ).resolves.toBe(

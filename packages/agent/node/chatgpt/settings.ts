@@ -19,6 +19,8 @@ import {
 	waitForChatGptSignIn,
 } from './oauth';
 import type {
+	ChatGptAccountView,
+	ChatGptCredentialStorage,
 	ChatGptSessionSelection,
 	ChatGptSettings,
 	ChatGptSignInOptions,
@@ -57,7 +59,9 @@ export async function chatGptSettingsAction< T >( action: () => Promise< T > ): 
 			throw new ChatGptSettingsError( new ChatGptSignInError( error.code ).message );
 		}
 		if ( error instanceof ChatGptConnectionError ) {
-			throw new ChatGptSettingsError( new ChatGptConnectionError( error.code ).message );
+			throw new ChatGptSettingsError(
+				new ChatGptConnectionError( error.code, error.detail ).message
+			);
 		}
 		throw new ChatGptSettingsError(
 			__( 'Studio couldn’t complete the ChatGPT action. Try again.' )
@@ -65,49 +69,117 @@ export async function chatGptSettingsAction< T >( action: () => Promise< T > ): 
 	}
 }
 
+type SecureStorage = ChatGptSettings[ 'secureStorage' ];
+
+/**
+ * Whether the system keychain can keep sign-ins, as last checked. A check runs
+ * the keychain's tool, which a Secret Service may answer with a prompt, so the
+ * settings, read every few seconds, never check: the first read that needs the
+ * answer does, and after that only an explicit recheck, or what a sign-in that
+ * starts learns from its own read of the key.
+ */
+const secureStorage: {
+	known?: SecureStorage;
+	checking?: Promise< SecureStorage >;
+	checks: number;
+} = { checks: 0 };
+
+function checkSecureStorage(): Promise< SecureStorage > {
+	const check = ++secureStorage.checks;
+	const checking = createOsCredentialStore()
+		.check()
+		.then(
+			( status ): SecureStorage => ( status.available ? 'available' : 'unavailable' ),
+			(): SecureStorage => 'unavailable'
+		)
+		.then( ( answer ) => {
+			// A later check's answer stands over an earlier one that finished after it.
+			if ( check === secureStorage.checks ) {
+				secureStorage.known = answer;
+				secureStorage.checking = undefined;
+			}
+			return answer;
+		} );
+	secureStorage.checking = checking;
+	return checking;
+}
+
+// What a sign-in's own read of the keychain found stands, over a check still out.
+function learnSecureStorage( answer: SecureStorage ): void {
+	secureStorage.checks++;
+	secureStorage.known = answer;
+	secureStorage.checking = undefined;
+}
+
+function knownSecureStorage(): Promise< SecureStorage > {
+	return secureStorage.known
+		? Promise.resolve( secureStorage.known )
+		: secureStorage.checking ?? checkSecureStorage();
+}
+
+const disabledSettings = (): ChatGptSettings => ( {
+	enabled: false,
+	signInSupported: false,
+	secureStorage: 'unavailable',
+	accounts: [],
+} );
+
 export function readChatGptSettings( signInSupported = true ): Promise< ChatGptSettings > {
-	return chatGptSettingsAction( async () => {
-		const enabled = isChatGptEnabled();
-		if ( ! enabled ) {
-			return { enabled, signInSupported: false, secureStorage: 'unavailable', accounts: [] };
-		}
-		const accounts = await readChatGptAccounts();
-		const [ connections, secureStorage ] = await Promise.all( [
-			listChatGptConnections(),
-			createOsCredentialStore()
-				.check()
-				.catch( () => ( { available: false } ) ),
-		] );
-		return {
-			enabled,
-			signInSupported,
-			secureStorage: secureStorage.available ? 'available' : 'unavailable',
-			accounts: accounts.map( ( account ) => ( {
-				connectionId: account.registrationId,
-				providerId: 'chatgpt-oauth',
-				backend: 'pi',
-				revision: account.revision,
-				identity: {
-					subject: account.subject,
-					...( account.email ? { email: account.email } : {} ),
-				},
-				authStatus:
-					account.state === 'signed-in' &&
-					connections.some(
-						( connection ) =>
-							connection.connectionId === account.registrationId &&
-							connection.revision === account.revision &&
-							connection.authStatus === 'connected'
-					)
-						? 'connected'
-						: 'disconnected',
-				label: account.label,
-				email: account.email,
-				storage: account.storage,
-				state: account.state,
-			} ) ),
-		};
-	} );
+	return chatGptSettingsAction( async () =>
+		isChatGptEnabled()
+			? readEnabledSettings( signInSupported, knownSecureStorage() )
+			: disabledSettings()
+	);
+}
+
+/**
+ * The settings, after checking the system keychain again: for when the user
+ * opens the ChatGPT settings or asks to retry, never for a polled read.
+ */
+export function recheckChatGptSettings( signInSupported = true ): Promise< ChatGptSettings > {
+	return chatGptSettingsAction( async () =>
+		isChatGptEnabled()
+			? readEnabledSettings( signInSupported, checkSecureStorage() )
+			: disabledSettings()
+	);
+}
+
+async function readEnabledSettings(
+	signInSupported: boolean,
+	storage: Promise< SecureStorage >
+): Promise< ChatGptSettings > {
+	const accounts = await readChatGptAccounts();
+	const [ connections, available ] = await Promise.all( [ listChatGptConnections(), storage ] );
+	return {
+		enabled: true,
+		signInSupported,
+		secureStorage: available,
+		accounts: accounts.map( ( account ) => ( {
+			connectionId: account.registrationId,
+			providerId: 'chatgpt-oauth',
+			backend: 'pi',
+			revision: account.revision,
+			// The subject stays in the backend: a renderer only needs to know there is one.
+			identity: {
+				verified: true,
+				...( account.email ? { email: account.email } : {} ),
+			},
+			authStatus:
+				account.state === 'signed-in' &&
+				connections.some(
+					( connection ) =>
+						connection.connectionId === account.registrationId &&
+						connection.revision === account.revision &&
+						connection.authStatus === 'connected'
+				)
+					? 'connected'
+					: 'disconnected',
+			label: account.label,
+			email: account.email,
+			storage: account.storage,
+			state: account.state,
+		} ) ),
+	};
 }
 
 function requireRegistration( value: unknown ): asserts value is string {
@@ -144,11 +216,33 @@ export function startChatGptSignIn(
 		) {
 			throw new ChatGptSettingsError( __( 'Choose how to keep the ChatGPT sign-in.' ) );
 		}
-		const { attemptId } = await beginChatGptSignIn(
-			registrationId,
-			options as ChatGptSignInOptions
-		);
-		return { attemptId };
+		// The settings read after it learn of the keychain without its tool run
+		// beside the start's own runs, which a Secret Service may each answer
+		// with a prompt: a sign-in kept in the vault checks the key itself, and
+		// what that found is the answer; one kept for this session only asks the
+		// keychain nothing of its own, so it is checked once the start is done.
+		// A check already out, as when the settings were opened, runs first.
+		await secureStorage.checking;
+		const chosen: { storage?: ChatGptCredentialStorage } = {};
+		try {
+			const { attemptId } = await beginChatGptSignIn(
+				registrationId,
+				options as ChatGptSignInOptions,
+				{
+					storageChosen( storage, keychain ) {
+						chosen.storage = storage;
+						if ( keychain ) {
+							learnSecureStorage( keychain );
+						}
+					},
+				}
+			);
+			return { attemptId };
+		} finally {
+			if ( chosen.storage === 'session' ) {
+				void checkSecureStorage();
+			}
+		}
 	} );
 }
 
@@ -176,9 +270,27 @@ export function stopChatGptSignIn( attemptId: unknown ): Promise< boolean > {
 	} );
 }
 
+/**
+ * The saved sign-ins there are to sign out of, whether or not ChatGPT is
+ * turned on: removing Studio's access never depends on an experimental flag.
+ */
+export function readSavedChatGptSignIns(): Promise<
+	Array< Pick< ChatGptAccountView, 'connectionId' | 'label' | 'email' > >
+> {
+	return chatGptSettingsAction( async () =>
+		( await readChatGptAccounts() )
+			.filter( ( account ) => account.state === 'signed-in' )
+			.map( ( account ) => ( {
+				connectionId: account.registrationId,
+				label: account.label,
+				email: account.email,
+			} ) )
+	);
+}
+
+// Not behind the flag: removing Studio's access never depends on it.
 export function disconnectChatGpt( connectionId: unknown ): Promise< ChatGptSignOutResult > {
 	return chatGptSettingsAction( async () => {
-		assertChatGptEnabled();
 		requireRegistration( connectionId );
 		const { localCleared, remoteRevocationConfirmed } = await signOutChatGpt( connectionId );
 		return { localCleared, remoteRevocationConfirmed };

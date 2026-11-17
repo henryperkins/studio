@@ -8,6 +8,7 @@ import path from 'node:path';
 import { describe, expect, test } from 'vitest';
 import { parse } from 'yaml';
 import { EVAL_RUNNER_VARS, parseEvalRunnerVars } from '../../apps/cli/ai/eval-input.ts';
+import { evalCaseSummary } from '../../apps/cli/ai/eval-summary.ts';
 import * as checks from './outcome.mjs';
 
 const configText = readFileSync(
@@ -30,6 +31,50 @@ const cases = config.tests.map( ( test ) => ( {
 	vars: { ...config.defaultTest.vars, ...test.vars },
 	checks: [ ...named( config.defaultTest.assert ), ...named( test.assert ) ],
 } ) );
+
+describe( 'whether every check of a case writes a record', () => {
+	const routeRecordSays = ( vars ) =>
+		evalCaseSummary(
+			{ success: true },
+			{
+				caseId: vars.caseId,
+				provider: 'chatgpt-oauth',
+				everyCheckRecorded: parseEvalRunnerVars( vars ).everyCheckRecorded,
+			}
+		).observations.everyCheckRecorded;
+
+	test( 'the parity configuration declares it in its defaults, none of its cases overrides it, and all its checks are outcome.mjs checks', () => {
+		expect( config.defaultTest.vars.everyCheckRecorded ).toBe( true );
+		for ( const test of config.tests ) {
+			expect( test.vars ?? {}, test.vars?.caseId ).not.toHaveProperty( 'everyCheckRecorded' );
+		}
+		for ( const test of config.tests ) {
+			for ( const { value } of [ ...config.defaultTest.assert, ...( test.assert ?? [] ) ] ) {
+				expect( value, test.vars.caseId ).toMatch( /^file:\/\/outcome\.mjs:\w+$/ );
+			}
+		}
+	} );
+
+	test( 'the route record of every parity case says it, and that of every main-suite case says it does not', () => {
+		for ( const { vars } of cases ) {
+			expect( routeRecordSays( vars ), vars.caseId ).toBe( true );
+		}
+		expect( JSON.stringify( mainConfig ) ).not.toContain( 'everyCheckRecorded' );
+		for ( const test of mainConfig.tests ) {
+			const vars = { ...mainConfig.defaultTest?.vars, ...test.vars };
+			expect( routeRecordSays( vars ), vars.caseId ).toBe( false );
+		}
+	} );
+} );
+
+describe( 'the parity script', () => {
+	test( 'runs promptfoo without its cache, so no case is answered from an earlier run’s output', () => {
+		const scripts = JSON.parse(
+			readFileSync( path.join( import.meta.dirname, '..', '..', 'package.json' ), 'utf8' )
+		).scripts;
+		expect( scripts[ 'eval:parity' ] ).toMatch( /\bpromptfoo@\S+ eval\b.* --no-cache\b/ );
+	} );
+} );
 
 describe( 'subscription parity config', () => {
 	test( 'runs the same eval runner as the main suite, one case at a time', () => {
@@ -60,6 +105,47 @@ describe( 'subscription parity config', () => {
 			{ name: 'take_screenshot' },
 		] );
 		expect( pending.description ).not.toMatch( /settles/ );
+	} );
+
+	test( 'a case judged on images a tool returns to the model says so, so a route not qualified for them blocks it', () => {
+		const judgedOnToolImages = cases.filter(
+			( { vars, checks: names } ) =>
+				names.includes( 'sawDesktopAndMobile' ) ||
+				vars.caseId === 'parity-screenshot-interpretation'
+		);
+		expect( judgedOnToolImages.map( ( { vars } ) => vars.caseId ).sort() ).toEqual( [
+			'parity-screenshot-desktop-mobile',
+			'parity-screenshot-interpretation',
+		] );
+		for ( const { vars } of judgedOnToolImages ) {
+			expect( vars.needsToolImages, vars.caseId ).toBe( true );
+		}
+		expect(
+			cases.filter( ( { vars } ) => vars.needsToolImages ).map( ( { vars } ) => vars.caseId )
+		).toHaveLength( 2 );
+	} );
+
+	test( 'a main-suite case judged on images a tool returns says so by the same rule', () => {
+		const mainCases = mainConfig.tests.map( ( test ) => ( {
+			vars: test.vars,
+			checks: [
+				...named(
+					mainConfig.defaultTest?.assert?.filter( ( a ) => /outcome\.mjs/.test( a.value ) )
+				),
+				...named( test.assert ),
+			],
+		} ) );
+		const judgedOnToolImages = mainCases.filter( ( { checks: names } ) =>
+			names.includes( 'sawDesktopAndMobile' )
+		);
+		expect( judgedOnToolImages.map( ( { vars } ) => vars.caseId ) ).toEqual( [
+			'screenshot-all-timing',
+		] );
+		for ( const { vars } of mainCases ) {
+			expect( vars.needsToolImages === true, vars.caseId ).toBe(
+				judgedOnToolImages.some( ( judged ) => judged.vars === vars )
+			);
+		}
 	} );
 
 	test( 'every case has a unique id, a description and checks outcome.mjs exports', () => {

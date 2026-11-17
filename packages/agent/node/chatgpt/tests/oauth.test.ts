@@ -1747,6 +1747,43 @@ describe( 'Signing in to ChatGPT', () => {
 			expect( fake.authorizeRequests ).toHaveLength( 0 );
 		} );
 
+		it.each( [ 'completed', 'been cancelled', 'timed out' ] as const )(
+			'closes a connection that sent part of a request once the sign-in has %s, the final page still whole',
+			async ( ending ) => {
+				const using = startFlow( { timeoutMs: ending === 'timed out' ? 300 : 60_000 } );
+				const start = await begin( undefined, undefined, using );
+				const address = new URL( start.startUrl );
+				const partial = net.connect( Number( address.port ), address.hostname );
+				partial.on( 'error', () => undefined );
+				const closed = new Promise< number >( ( resolve ) =>
+					partial.on( 'close', () => resolve( Date.now() ) )
+				);
+				await once( partial, 'connect' );
+				const connectedAt = Date.now();
+				// Headers begun, never ended: such a connection is held, not idle.
+				partial.write( `GET /auth/callback HTTP/1.1\r\nHost: ${ address.host }\r\n` );
+
+				if ( ending === 'completed' ) {
+					const delivery = await deliver( await authorize( start.url ) );
+					expect( delivery.status ).toBe( 200 );
+					expect( delivery.page ).toMatch( /^<!doctype html>[\s\S]*<\/p>\n$/ );
+					expect( ( await using.wait( start.attemptId ) ).ok ).toBe( true );
+				} else if ( ending === 'been cancelled' ) {
+					expect( using.cancel( start.attemptId ) ).toBe( true );
+					expect( await using.wait( start.attemptId ) ).toEqual( failed( 'cancelled' ) );
+				} else {
+					expect( await using.wait( start.attemptId ) ).toEqual( failed( 'timed-out' ) );
+				}
+				const endedAt = Date.now();
+				const closedAt = await closed;
+
+				// Soon after the attempt ended, however long the sign-in itself took,
+				// and never by the 10 seconds a held connection otherwise keeps.
+				expect( closedAt - endedAt ).toBeLessThan( 5_000 );
+				expect( closedAt - connectedAt ).toBeLessThan( 10_000 );
+			}
+		);
+
 		it.each< NodeJS.Platform >( [ 'linux', 'darwin', 'win32' ] )(
 			'on %s, is served on 8 connections at most, each closed when it sends no request within 10 seconds, and one beyond doesn’t use it up',
 			async ( platform ) => {

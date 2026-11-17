@@ -1,5 +1,6 @@
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { isErrnoException } from '@studio/common/lib/is-errno-exception';
 import {
@@ -27,7 +28,10 @@ import {
 	type ChatGptAccount,
 	type ChatGptAccountSignIn,
 } from '@studio/agent/node/chatgpt/account-store';
-import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
+import {
+	getChatGptStateDirectory,
+	getChatGptVaultKeyAccounts,
+} from '@studio/agent/node/chatgpt/state-directory';
 import type { ParentChannel } from '@studio/agent/node/openai-credentials';
 import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections';
 
@@ -38,7 +42,9 @@ import type { ConnectionRegistryEntry } from '@studio/agent/protocol/connections
  *
  * A registration's tokens are one record in a vault file, sealed with
  * AES-256-GCM under a random key kept in the system keychain and bound to the
- * registration and the record's version. Without a keychain the vault
+ * registration and the record's version. Each profile keeps its key under an
+ * item of its own (see `getChatGptVaultKeyAccounts`), so one profile never
+ * replaces the key another's records need. Without a keychain the vault
  * refuses; it never falls back to plaintext. A keychain that says it has no
  * key while saved records exist may only be locked, so the key reads as
  * unreadable, never lost: no record is cleared and no new key made until the
@@ -73,7 +79,6 @@ export const CHATGPT_TURN_WATCH_POLL_MS = 2_000;
 
 const CREDENTIALS_DIRECTORY = 'chatgpt-credentials';
 const RECORD_VERSION = 1;
-const WRAPPING_KEY_ACCOUNT = 'chatgpt-vault-key';
 const WRAPPING_KEY_BYTES = 32;
 // 32 bytes, base64url: within what every keychain tool takes without escaping.
 const WRAPPING_KEY_TEXT = /^[A-Za-z0-9_-]{43}$/;
@@ -92,6 +97,8 @@ const SESSION_OFFER_ENV = 'STUDIO_CHATGPT_SESSIONS_OFFERED';
 const SESSION_TOKEN_REQUEST = 'studio.chatgpt-session-token.request';
 const SESSION_TOKEN_REPLY = 'studio.chatgpt-session-token';
 const SESSION_TOKEN_INVALIDATE = 'studio.chatgpt-session-token.invalidate';
+// The longest a keychain tool's own words run in a message for the user.
+const KEYCHAIN_DETAIL_MAX_LENGTH = 200;
 
 export interface ChatGptBrokerTiming {
 	/** How long a sign-out waits for this process's turns on the account to settle. */
@@ -210,9 +217,12 @@ export interface ChatGptCredentialBroker {
 	/**
 	 * Before a sign-in that will be kept in the vault: refuses with
 	 * `vault-key-unreadable` when saving it would, because saved records exist
-	 * and the keychain says it has no key for them. Writes nothing.
+	 * and the keychain says it has no key for them, and with `vault-unavailable`
+	 * when it couldn't reach the keychain to ask. Writes nothing. Resolves true
+	 * when it asked the keychain, which answered with the key; false when no
+	 * saved sign-in needed it asked.
 	 */
-	checkVaultKey(): Promise< void >;
+	checkVaultKey(): Promise< boolean >;
 	saveSignIn( signIn: ChatGptSignIn ): Promise< ChatGptAccount >;
 	getAccessToken( connectionId: string ): Promise< string >;
 	/** Drops only the rejected access token, preserving any newer token. */
@@ -226,6 +236,12 @@ export interface ChatGptCredentialBroker {
 	answerSessionTokenRequest( message: unknown, reply: ( message: unknown ) => void ): boolean;
 	answerSessionTokenInvalidation( message: unknown ): boolean;
 	acceptSessionTokensFromParent( channel?: ChatGptParentChannel, env?: NodeJS.ProcessEnv ): void;
+	/**
+	 * For a profile other than the default one, once it is retired: removes its
+	 * own vault key from the keychain. Refuses, removing nothing, for the
+	 * default profile and while a saved sign-in still needs the key.
+	 */
+	removeProfileVaultKey(): Promise< 'removed' | 'default-profile' | 'records-exist' >;
 }
 
 interface CredentialRecord {
@@ -265,6 +281,8 @@ interface AccessToken {
 interface SessionCredentials {
 	record: CredentialRecord;
 	logoutGeneration: number;
+	/** The sign-in the record came from: any sign-in since supersedes it. */
+	signInGeneration: number;
 	tokenGeneration: string;
 }
 
@@ -284,6 +302,70 @@ interface ActiveTurn {
 
 const isNonEmptyString = ( value: unknown ): value is string =>
 	typeof value === 'string' && value !== '';
+
+// Which sign-in of a registration an account read belongs to.
+const signInOf = ( account: ChatGptAccount ) => ( {
+	logoutGeneration: account.logoutGeneration,
+	signInGeneration: account.signInGeneration ?? 0,
+} );
+
+// A held session-only record belongs to the sign-in that made it alone: once
+// the registration is signed in again, here or in another app, it is never
+// used again, nor the cause of a "needs sign-in".
+const isSuperseded = ( held: SessionCredentials, account: ChatGptAccount ) =>
+	held.signInGeneration < ( account.signInGeneration ?? 0 );
+
+const escapeRegExp = ( text: string ) => text.replace( /[.*+?^${}()|[\]\\]/g, '\\$&' );
+
+// A path's name segment ends at a separator, a space, a quote or punctuation.
+const NAME_SEGMENT = '[^\\\\/\\s\'"`‘’“”:;,()<>|[\\]{}]+';
+// The name after a `Users` or `home` segment, in either slash style and any
+// case; words a space apart count as one name when a separator follows them.
+const HOME_SEGMENT = new RegExp(
+	`(^|[\\\\/\\s'"\`‘’“”(])(users|home)([\\\\/])` +
+		`(?:${ NAME_SEGMENT }(?: ${ NAME_SEGMENT })*(?=[\\\\/])|${ NAME_SEGMENT })`,
+	'giu'
+);
+
+function accountHome(): string | undefined {
+	try {
+		return os.userInfo().homedir;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * What a keychain tool said, as the user, the transcript and a session file
+ * may see it: its first line, without terminal escapes or other control
+ * characters, the home directory (which names the user) written `~`, and no
+ * longer than `KEYCHAIN_DETAIL_MAX_LENGTH`. Undefined when nothing is left.
+ */
+function cleanKeychainDetail( text: string ): string | undefined {
+	let line = text
+		.split( /\r\n|[\n\r\u0085\p{Zl}\p{Zp}]/u )[ 0 ]
+		// eslint-disable-next-line no-control-regex
+		.replace( /\u001b\[[0-?]*[ -/]*[@-~]/g, '' )
+		.replace( /\t/g, ' ' )
+		.replace( /\p{Cc}/gu, '' );
+	const windows = process.platform === 'win32';
+	// HOME, and the account's own home where HOME names another.
+	for ( const home of new Set( [ os.homedir(), accountHome() ] ) ) {
+		if ( ! home || home === path.parse( home ).root ) {
+			continue;
+		}
+		for ( const form of new Set( [ home, windows ? home.replace( /\\/g, '/' ) : home ] ) ) {
+			line = line.replace( new RegExp( escapeRegExp( form ), windows ? 'gi' : 'g' ), '~' );
+		}
+	}
+	// Any other spelling of a home: a short name, a share, another case.
+	line = line.replace( HOME_SEGMENT, '$1$2$3~' );
+	line = line.trim();
+	if ( line.length > KEYCHAIN_DETAIL_MAX_LENGTH ) {
+		line = `${ line.slice( 0, KEYCHAIN_DETAIL_MAX_LENGTH - 1 ).trimEnd() }…`;
+	}
+	return line || undefined;
+}
 
 const splitScopes = ( scope: string ) => scope.split( /\s+/ ).filter( Boolean );
 
@@ -534,7 +616,12 @@ export function createChatGptCredentialBroker(
 	const { tokenClient } = options;
 	const credentialStore = options.credentialStore ?? createOsCredentialStore();
 	const timing: ChatGptBrokerTiming = { ...DEFAULT_TIMING, ...options.timing };
-	let wrappingKey: Buffer | null = null;
+	// The key as this process last read it, for the profile whose item it read.
+	let wrappingKey: { account: string; key: Buffer } | null = null;
+	// Keys read from the default profile's item for another profile's records
+	// sealed before keys were kept per profile: never written, and a record one
+	// can't open is kept, since that item may hold another key by now.
+	const sharedKeys = new WeakSet< Buffer >();
 	// Session-only tokens this app holds, with the logout generation they belong to.
 	const sessions = new Map< string, SessionCredentials >();
 	const sessionQueues = new Map< string, Promise< unknown > >();
@@ -577,41 +664,63 @@ export function createChatGptCredentialBroker(
 	const credentialsDirectory = () => path.join( getChatGptStateDirectory(), CREDENTIALS_DIRECTORY );
 	const recordFile = ( registrationId: string ) => `${ registrationId }.vault`;
 
+	// The one place a keychain tool's words become a detail: cleaned here, every
+	// message built from it, in settings, the transcript or a session file, is too.
 	function vaultUnavailable( error: unknown, secret?: string ): ChatGptConnectionError {
 		const reason = error instanceof Error ? error.message : String( error );
 		return new ChatGptConnectionError(
 			'vault-unavailable',
-			secret ? reason.split( secret ).join( '[redacted]' ) : reason
+			cleanKeychainDetail( secret ? reason.split( secret ).join( '[redacted]' ) : reason )
 		);
 	}
 
-	async function readWrappingKeyText(): Promise< string | null > {
+	async function readWrappingKeyText( account: string ): Promise< string | null > {
 		try {
-			return await credentialStore.get( WRAPPING_KEY_ACCOUNT );
+			return await credentialStore.get( account );
 		} catch ( error ) {
 			throw vaultUnavailable( error );
 		}
 	}
 
-	function cacheWrappingKey( text: string ): Buffer {
+	function cacheWrappingKey( account: string, text: string, shared = false ): Buffer {
 		if ( ! WRAPPING_KEY_TEXT.test( text ) ) {
 			throw new ChatGptConnectionError(
 				'vault-unavailable',
 				__( 'the key Studio saved there is damaged' )
 			);
 		}
-		wrappingKey = Buffer.from( text, 'base64url' );
-		return wrappingKey;
+		const key = Buffer.from( text, 'base64url' );
+		if ( shared ) {
+			sharedKeys.add( key );
+		}
+		wrappingKey = { account, key };
+		return key;
 	}
 
-	/** The vault's key, as this process last read it; null while there is none. */
+	/**
+	 * The vault's key, as this process last read it; null while there is none.
+	 * A profile without a key of its own whose records were sealed before keys
+	 * were kept per profile reads the default profile's item for them.
+	 */
 	async function getWrappingKey(): Promise< Buffer | null > {
-		if ( wrappingKey ) {
-			return wrappingKey;
+		const { own, shared } = getChatGptVaultKeyAccounts();
+		if ( wrappingKey?.account === own ) {
+			return wrappingKey.key;
 		}
-		const text = await readWrappingKeyText();
-		return text ? cacheWrappingKey( text ) : null;
+		const text = await readWrappingKeyText( own );
+		if ( text ) {
+			return cacheWrappingKey( own, text );
+		}
+		if ( ! shared || ! ( await hasSealedRecords() ) ) {
+			return null;
+		}
+		const sharedText = await readWrappingKeyText( shared );
+		return sharedText ? cacheWrappingKey( own, sharedText, true ) : null;
 	}
+
+	// A record this key can't open may still be good: the key may only be
+	// locked away, or be one the record was never sealed with.
+	const isUnconfirmedKey = ( key: Buffer | null ) => ! key || sharedKeys.has( key );
 
 	// Whether a registration Studio lists keeps a sealed record. One no
 	// registration owns can't be signed out, so it doesn't count.
@@ -634,44 +743,78 @@ export function createChatGptCredentialBroker(
 		);
 	}
 
-	/**
-	 * The key a record is sealed with: the one the keychain holds now, which
-	 * another process may have put there since this one last read it. Created
-	 * there, under the key's lock, only when there is none and no saved record
-	 * needs one: a keychain may say it has none when it is only locked, and a
-	 * new key would replace the one those records were sealed with.
-	 */
-	async function getSealingKey(): Promise< Buffer > {
-		const text = await withLock(
+	const withVaultKeyLock = < T >( task: () => Promise< T > ) =>
+		withLock(
 			path.join( credentialsDirectory(), 'vault-key.lock' ),
 			{ wait: WRAPPING_KEY_LOCK_MS, stale: WRAPPING_KEY_LOCK_MS },
-			async () => {
-				const existing = await readWrappingKeyText();
-				if ( existing ) {
-					return existing;
-				}
-				if ( await hasSealedRecords() ) {
-					throw new ChatGptConnectionError( 'vault-key-unreadable' );
-				}
-				const created = randomBytes( WRAPPING_KEY_BYTES ).toString( 'base64url' );
-				try {
-					await credentialStore.set( WRAPPING_KEY_ACCOUNT, created );
-				} catch ( error ) {
-					throw vaultUnavailable( error, created );
-				}
-				return created;
-			}
+			task
 		);
-		return cacheWrappingKey( text );
+
+	/**
+	 * The key a record is sealed with: the one the profile's own item holds
+	 * now, which another process may have put there since this one last read
+	 * it. Created there, under the key's lock, only when there is none and no
+	 * saved record needs one: a keychain may say it has none when it is only
+	 * locked, and a new key would replace the one those records were sealed
+	 * with. Records sealed under the default profile's item before keys were
+	 * kept per profile count too, so a profile with such records saves again
+	 * only once they are signed out.
+	 */
+	async function getSealingKey(): Promise< Buffer > {
+		const { own } = getChatGptVaultKeyAccounts();
+		const text = await withVaultKeyLock( async () => {
+			const existing = await readWrappingKeyText( own );
+			if ( existing ) {
+				return existing;
+			}
+			if ( await hasSealedRecords() ) {
+				throw new ChatGptConnectionError( 'vault-key-unreadable' );
+			}
+			const created = randomBytes( WRAPPING_KEY_BYTES ).toString( 'base64url' );
+			try {
+				await credentialStore.set( own, created );
+			} catch ( error ) {
+				throw vaultUnavailable( error, created );
+			}
+			return created;
+		} );
+		return cacheWrappingKey( own, text );
 	}
 
 	// The check `getSealingKey` makes before it would make a key, without making
 	// one. The keychain, and any prompt it shows, is asked only when a saved
 	// sign-in needs the key.
-	async function checkVaultKey(): Promise< void > {
-		if ( ( await hasSealedRecords() ) && ! ( await readWrappingKeyText() ) ) {
+	async function checkVaultKey(): Promise< boolean > {
+		if ( ! ( await hasSealedRecords() ) ) {
+			return false;
+		}
+		if ( ! ( await readWrappingKeyText( getChatGptVaultKeyAccounts().own ) ) ) {
 			throw new ChatGptConnectionError( 'vault-key-unreadable' );
 		}
+		return true;
+	}
+
+	async function removeProfileVaultKey(): Promise<
+		'removed' | 'default-profile' | 'records-exist'
+	> {
+		const { own, shared } = getChatGptVaultKeyAccounts();
+		if ( ! shared ) {
+			return 'default-profile';
+		}
+		return withVaultKeyLock( async () => {
+			if ( await hasSealedRecords() ) {
+				return 'records-exist';
+			}
+			try {
+				await credentialStore.delete( own );
+			} catch ( error ) {
+				throw vaultUnavailable( error );
+			}
+			if ( wrappingKey?.account === own ) {
+				wrappingKey = null;
+			}
+			return 'removed';
+		} );
 	}
 
 	async function lockRefresh( registrationId: string ): Promise< () => Promise< void > > {
@@ -746,7 +889,10 @@ export function createChatGptCredentialBroker(
 		return account;
 	}
 
-	const isUnchanged = ( account: ChatGptAccount | null, logoutGeneration: number ) =>
+	const isUnchanged = (
+		account: ChatGptAccount | null,
+		logoutGeneration: number
+	): account is ChatGptAccount =>
 		account?.state === 'signed-in' && account.logoutGeneration === logoutGeneration;
 
 	// The registration as it is now, provided no sign-out happened since `logoutGeneration`.
@@ -824,7 +970,7 @@ export function createChatGptCredentialBroker(
 	// sign-in, unless it was signed out meanwhile.
 	async function clearUnusable( account: ChatGptAccount ): Promise< void > {
 		await removeRecord( account.registrationId );
-		await markChatGptSignInNeeded( account.registrationId, account.logoutGeneration );
+		await markChatGptSignInNeeded( account.registrationId, signInOf( account ) );
 	}
 
 	// Under the registration's refresh lock, the record is read again: another
@@ -847,7 +993,7 @@ export function createChatGptCredentialBroker(
 				throw new ChatGptConnectionError( 'newer-format' );
 			}
 			// A keychain that says it has no key may only be locked: the record stays.
-			if ( read.status === 'unusable' && ! key ) {
+			if ( read.status === 'unusable' && isUnconfirmedKey( key ) ) {
 				throw new ChatGptConnectionError( 'vault-key-unreadable' );
 			}
 			if ( read.status !== 'ok' || ! key ) {
@@ -942,7 +1088,7 @@ export function createChatGptCredentialBroker(
 	// anywhere, so it stops holding and offering tokens nothing should use.
 	function holdSession(
 		registrationId: string,
-		session: { record: CredentialRecord; logoutGeneration: number }
+		session: Omit< SessionCredentials, 'tokenGeneration' >
 	): SessionCredentials {
 		const held = { ...session, tokenGeneration: randomUUID() };
 		sessions.set( registrationId, held );
@@ -960,7 +1106,7 @@ export function createChatGptCredentialBroker(
 	}
 
 	// A held record goes once its registration was signed out, here or in
-	// another process, or keeps its tokens elsewhere now.
+	// another process, keeps its tokens elsewhere now, or was signed in again.
 	function pruneSession( registrationId: string ): Promise< void > {
 		return serializeSession( registrationId, async () => {
 			const held = sessions.get( registrationId );
@@ -971,7 +1117,8 @@ export function createChatGptCredentialBroker(
 			if (
 				account?.state !== 'signed-in' ||
 				account.storage !== 'session' ||
-				account.logoutGeneration !== held.logoutGeneration
+				account.logoutGeneration !== held.logoutGeneration ||
+				isSuperseded( held, account )
 			) {
 				dropSession( registrationId );
 			}
@@ -987,7 +1134,12 @@ export function createChatGptCredentialBroker(
 		return serializeSession( registrationId, async () => {
 			const current = await requireUnchanged( registrationId, logoutGeneration );
 			const held = sessions.get( registrationId );
-			if ( ! held || held.logoutGeneration !== logoutGeneration || current.storage !== 'session' ) {
+			if (
+				! held ||
+				held.logoutGeneration !== logoutGeneration ||
+				current.storage !== 'session' ||
+				isSuperseded( held, current )
+			) {
 				if ( held ) {
 					dropSession( registrationId );
 				}
@@ -1002,17 +1154,31 @@ export function createChatGptCredentialBroker(
 			}
 			if ( renewal.status === 'rejected' ) {
 				dropSession( registrationId );
-				await markChatGptSignInNeeded( registrationId, logoutGeneration );
+				// Only the sign-in the refused token came from: one made since stays.
+				await markChatGptSignInNeeded( registrationId, {
+					logoutGeneration: held.logoutGeneration,
+					signInGeneration: held.signInGeneration,
+				} );
 				throw new ChatGptConnectionError( 'needs-sign-in' );
 			}
-			if ( ! isUnchanged( await readChatGptAccount( registrationId ), logoutGeneration ) ) {
+			const after = await readChatGptAccount( registrationId );
+			if ( ! isUnchanged( after, logoutGeneration ) ) {
 				if ( ! retainSessionRevocation( registrationId, logoutGeneration, renewal.record ) ) {
 					revokeQuietly( current.clientId, renewal.record.refreshToken );
 				}
 				throw new ChatGptConnectionError( 'signed-out' );
 			}
+			// Signed in again while the refresh was out: the renewal is the earlier sign-in's.
+			if ( isSuperseded( held, after ) ) {
+				dropSession( registrationId );
+				throw new ChatGptConnectionError( 'session-unavailable' );
+			}
 			return sessionAccessToken(
-				holdSession( registrationId, { record: renewal.record, logoutGeneration } )
+				holdSession( registrationId, {
+					record: renewal.record,
+					logoutGeneration,
+					signInGeneration: held.signInGeneration,
+				} )
 			);
 		} );
 	}
@@ -1140,7 +1306,8 @@ export function createChatGptCredentialBroker(
 			return null;
 		}
 		if ( account.storage === 'session' ) {
-			return sessions.get( connectionId )?.record.idToken ?? null;
+			const held = sessions.get( connectionId );
+			return held && ! isSuperseded( held, account ) ? held.record.idToken : null;
 		}
 		const key = await getWrappingKey().catch( () => null );
 		try {
@@ -1223,7 +1390,11 @@ export function createChatGptCredentialBroker(
 				if ( key ) {
 					dropSession( registrationId );
 				} else {
-					holdSession( registrationId, { record, logoutGeneration: account.logoutGeneration } );
+					holdSession( registrationId, {
+						record,
+						logoutGeneration: account.logoutGeneration,
+						signInGeneration: account.signInGeneration ?? 0,
+					} );
 				}
 			} );
 			parent?.tokens.delete( registrationId );
@@ -1403,7 +1574,7 @@ export function createChatGptCredentialBroker(
 		}
 		const held = sessions.get( account.registrationId );
 		return held
-			? held.logoutGeneration === account.logoutGeneration
+			? held.logoutGeneration === account.logoutGeneration && ! isSuperseded( held, account )
 			: Boolean( reachableParent()?.offered.has( account.registrationId ) );
 	}
 
@@ -1515,6 +1686,7 @@ export function createChatGptCredentialBroker(
 		answerSessionTokenRequest,
 		answerSessionTokenInvalidation,
 		acceptSessionTokensFromParent,
+		removeProfileVaultKey,
 	};
 }
 
@@ -1542,8 +1714,11 @@ function getAppBroker(): ChatGptCredentialBroker {
 	return appBroker;
 }
 
-/** Refuses, before a sign-in to keep in the vault, when saving it would for an unreadable key. */
-export function checkChatGptVaultKey(): Promise< void > {
+/**
+ * Refuses, before a sign-in to keep in the vault, when saving it would for an
+ * unreadable key; resolves whether it asked the keychain (see `checkVaultKey`).
+ */
+export function checkChatGptVaultKey(): Promise< boolean > {
 	return getAppBroker().checkVaultKey();
 }
 

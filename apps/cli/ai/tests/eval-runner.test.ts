@@ -6,8 +6,11 @@ import path from 'node:path';
 import { getChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
 import { wpcomRequestTool } from '@studio/agent/node/tools/wpcom-request';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { findUnsafeRecord, openAcceptanceEvidence } from 'cli/ai/acceptance-evidence';
+import { isolateCaseProfile } from 'cli/ai/eval-case-profile';
 import { evalConnectionRef } from 'cli/ai/eval-provider';
-import { readEvalRunnerInput, runEval as runEvalUntyped } from 'cli/ai/eval-runner';
+import { readEvalRunnerInput, runEval as runCase, writeCaseSummary } from 'cli/ai/eval-runner';
+import { cliAgentHost } from 'cli/ai/host';
 import type { AgentSessionEvent, SessionManager } from '@earendil-works/pi-coding-agent';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 import type { StudioAgentTurnConfig } from '@studio/agent/node/runtime';
@@ -39,6 +42,22 @@ vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 		getSharedConfigPath: () => path.join( config(), 'shared.json' ),
 	};
 } );
+
+// This file loads the runner once for many cases, so the paths modules fix when
+// they load can't name each case's folders: these stand in for them, named in
+// the case's own profile and process manager home, as the runner's entry gives
+// them. eval-runner-isolation.test.ts starts each case from the entry, with the
+// real ones.
+vi.mock( 'cli/ai/eval-fixed-paths', () => ( {
+	pathsFixedAtLoad: () => {
+		const profile = process.env.DEV_CONFIG_DIR ?? '';
+		return {
+			payloadDescriptions: [ `stored in ${ path.join( profile, 'tmp', 'ai-payloads' ) }` ],
+			rootCaCertificate: path.join( profile, 'certificates', 'studio-ca.crt' ),
+			processManagerHome: process.env.STUDIO_PROCESS_MANAGER_HOME ?? '',
+		};
+	},
+} ) );
 
 const removal = vi.hoisted( () => ( { failObserverFile: false } ) );
 vi.mock( 'node:fs/promises', async ( importOriginal ) => {
@@ -121,6 +140,20 @@ vi.mock( 'cli/ai/host', async () => {
 		} );
 	}
 	return { cliAgentHost: host };
+} );
+
+// The ChatGPT route's capability table, as a test sets it: whether its model
+// takes images in tool results.
+const table = vi.hoisted( () => ( { toolImages: false } ) );
+vi.mock( '@studio/agent/protocol/chatgpt-models', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('@studio/agent/protocol/chatgpt-models') >();
+	return {
+		...actual,
+		getChatGptModelCapabilities: ( slug: string ) => {
+			const capabilities = actual.getChatGptModelCapabilities( slug );
+			return capabilities && { ...capabilities, toolImageInput: table.toolImages };
+		},
+	};
 } );
 
 const broker = vi.hoisted( () => ( {
@@ -228,13 +261,58 @@ interface RunReport {
 	};
 	stoppedAt?: unknown;
 	remoteCalls?: unknown[];
-	remoteGuard?: { code: string | null; blocked: unknown[] };
+	remoteGuard?: { code: string | null; blocked: unknown[]; allowed?: unknown[] };
 	imageService?: { configured: boolean };
 	attachments?: unknown[];
 	turns?: Array< Record< string, unknown > >;
 	questions?: Array< { answer: string } >;
 	uiEvents?: { artifacts: unknown[]; previewReloads: number };
 	compactions?: number;
+}
+// The environment the runner's entry sets up for a case, before and after the case ran.
+const ENTRY_ENVIRONMENT = [
+	'E2E',
+	'E2E_CLI_CONFIG_PATH',
+	'E2E_SHARED_CONFIG_PATH',
+	'DEV_CONFIG_DIR',
+	'STUDIO_PROCESS_MANAGER_HOME',
+] as const;
+const environment = () =>
+	Object.fromEntries( ENTRY_ENVIRONMENT.map( ( name ) => [ name, process.env[ name ] ] ) );
+const lastCase = {
+	prepared: {} as Record< string, unknown >,
+	after: {} as Record< string, unknown >,
+};
+
+// Runs a case as its own `eval-runner.mjs` process would: the entry first makes
+// the case's profile and registry from the test's source profile, and, for a
+// case that names a provider, its own process manager home; the environment is
+// then as the process started, as the next case's process starts.
+async function runEvalUntyped( given: Parameters< typeof runCase >[ 0 ] ) {
+	const startedWith = environment();
+	for ( const name of ENTRY_ENVIRONMENT ) {
+		delete process.env[ name ];
+	}
+	process.env.DEV_CONFIG_DIR = path.join( paths.root, 'profile' );
+	isolateCaseProfile( process.env );
+	if ( given.provider?.ok ) {
+		process.env.STUDIO_PROCESS_MANAGER_HOME = fs.realpathSync(
+			fs.mkdtempSync( path.join( os.tmpdir(), 'studio-eval-daemon-' ) )
+		);
+	}
+	lastCase.prepared = environment();
+	try {
+		return await runCase( given );
+	} finally {
+		lastCase.after = environment();
+		for ( const [ name, value ] of Object.entries( startedWith ) ) {
+			if ( value === undefined ) {
+				delete process.env[ name ];
+			} else {
+				process.env[ name ] = value;
+			}
+		}
+	}
 }
 const runEval = async ( ...args: Parameters< typeof runEvalUntyped > ) =>
 	( await runEvalUntyped( ...args ) ) as RunReport;
@@ -570,8 +648,7 @@ describe( 'eval runner provider selection', () => {
 				'shared.json',
 			] );
 			expect( leftovers() ).toEqual( [] );
-			expect( process.env.E2E_SHARED_CONFIG_PATH ).toBeUndefined();
-			expect( process.env.E2E_CLI_CONFIG_PATH ).toBeUndefined();
+			expect( lastCase.after ).toEqual( lastCase.prepared );
 		} );
 
 		const base64url = ( value: unknown ) =>
@@ -619,6 +696,89 @@ describe( 'eval runner provider selection', () => {
 			}
 		);
 
+		it( 'writes a provider-qualified case’s sanitized summary, and none for a case that selects no provider', async () => {
+			agent.behavior = {
+				request: {
+					url: 'https://api.openai.com/v1/responses',
+					authorization: `Bearer ${ fakeJwt( { sub: 'test-subject', ...claims } ) }`,
+					body: { model: 'gpt-6-luna', reasoning: { effort: 'medium' } },
+				},
+				replyProvider: 'studio-chatgpt',
+			};
+			const summaries = path.join( paths.root, 'summaries' );
+			const facts = () => ( {
+				source: { sha: '0123456789abcdef0123456789abcdef01234567', dirty: false },
+				platform: { os: 'linux', release: null, arch: 'x64' },
+				runtime: { node: '24.22.1', npm: null },
+				build: { cliVersion: '0.0.0', buildId: null },
+			} );
+			const selected = input( { caseId: 'parity-identity' }, chatGptEnv() );
+			const written = writeCaseSummary( selected, await runEvalUntyped( selected ), {
+				env: { STUDIO_EVAL_SUMMARY_DIR: summaries },
+				facts,
+			} );
+			const runDirectory = path.join( summaries, 'chatgpt-oauth', 'parity-identity' );
+			expect( written?.location ).toEqual( {
+				directory: runDirectory,
+				run: 1,
+				stage: 'parity-identity',
+			} );
+			expect( written?.record ).toMatchObject( {
+				run: 1,
+				scenario: 'eval-route-chatgpt-oauth',
+				stage: 'parity-identity',
+				status: 'passed',
+				observations: {
+					judgesCaseChecks: false,
+					everyCheckRecorded: false,
+					modelRequests: 1,
+					bearerMatches: true,
+					guardRefused: 0,
+				},
+			} );
+			expect( findUnsafeRecord( written?.record ) ).toBeNull();
+			expect(
+				openAcceptanceEvidence( runDirectory, 'chatgpt-oauth' ).readManifest()?.runs[ 0 ]
+			).toMatchObject( { model: 'gpt-6-luna', effort: 'medium', source: facts().source } );
+			for ( const file of fs.readdirSync( runDirectory ) ) {
+				const text = fs.readFileSync( path.join( runDirectory, file ), 'utf8' );
+				for ( const value of [ CONNECTION_ID, 'test-subject', 'eval-person', paths.root ] ) {
+					expect( text ).not.toContain( value );
+				}
+			}
+
+			// The var a configuration sets when every one of its checks writes a record.
+			const declared = input(
+				{ caseId: 'parity-identity', everyCheckRecorded: true },
+				chatGptEnv()
+			);
+			expect(
+				writeCaseSummary( declared, await runEvalUntyped( declared ), {
+					env: { STUDIO_EVAL_SUMMARY_DIR: summaries },
+					facts,
+				} )?.record.observations
+			).toMatchObject( { everyCheckRecorded: true } );
+
+			// A run that threw: the runner's main writes it with what it caught.
+			expect(
+				writeCaseSummary(
+					selected,
+					{ success: false, error: 'it threw' },
+					{ env: { STUDIO_EVAL_SUMMARY_DIR: summaries }, threw: true, facts }
+				)?.record
+			).toMatchObject( { run: 3, status: 'failed', code: 'run-failed' } );
+
+			const elsewhere = path.join( paths.root, 'no-summaries' );
+			const unselected = input( { caseId: 'identity' } );
+			expect(
+				writeCaseSummary( unselected, await runEvalUntyped( unselected ), {
+					env: { STUDIO_EVAL_SUMMARY_DIR: elsewhere },
+					facts,
+				} )
+			).toBeNull();
+			expect( fs.existsSync( elsewhere ) ).toBe( false );
+		} );
+
 		it( 'restores fetch and removes its temporary folders when a run fails partway, at any stage', async () => {
 			agent.behavior = { replyProvider: 'studio-chatgpt' };
 			// A bystander site that can't be deleted makes the run throw after its turns.
@@ -663,9 +823,7 @@ describe( 'eval runner provider selection', () => {
 			stderr.mockRestore();
 			expect( result ).not.toHaveProperty( 'refusal' );
 			expect( warned ).toMatch( /studio-eval warning: could not remove the request observer file/ );
-			expect( process.env.E2E ).toBeUndefined();
-			expect( process.env.E2E_CLI_CONFIG_PATH ).toBeUndefined();
-			expect( process.env.E2E_SHARED_CONFIG_PATH ).toBeUndefined();
+			expect( lastCase.after ).toEqual( lastCase.prepared );
 			expect(
 				fs
 					.readdirSync( path.join( paths.root, 'tmp' ) )
@@ -864,14 +1022,14 @@ describe( 'eval runner provider selection', () => {
 				expect( agent.turns ).toEqual( [] );
 			} );
 
-			it( 'runs connected to the site as WordPress.com lists it, with no record of mocked calls', async () => {
+			it( 'runs connected to the site as WordPress.com lists it, with the write guard on', async () => {
 				Object.assign( process.env, designated );
 				wpcom.sites.mockResolvedValue( [ listed() ] );
 				agent.behavior = { replyProvider: 'studio-wpcom' };
 				const result = await runEval( stagingCase() );
 				expect( result.success ).toBe( true );
-				expect( result ).not.toHaveProperty( 'remoteCalls' );
-				expect( result ).not.toHaveProperty( 'remoteGuard' );
+				expect( result.remoteCalls ).toEqual( [] );
+				expect( result.remoteGuard ).toEqual( { code: null, blocked: [], allowed: [] } );
 				expect( wpcom.connected ).toEqual( [
 					{
 						localSiteId: 'seeded-site',
@@ -883,6 +1041,232 @@ describe( 'eval runner provider selection', () => {
 						} ),
 					},
 				] );
+			} );
+
+			const pushSite = {
+				id: 'site-1',
+				name: 'Parity Staging Source',
+				path: '/sites/parity',
+				url: 'http://localhost:8881',
+				phpVersion: '8.3',
+			};
+			const sentToNetwork = () =>
+				fetchSpy.mock.calls.map(
+					( [ url, init ]: [ unknown, RequestInit | undefined ] ) =>
+						`${ init?.method ?? 'GET' } ${ String( url ) }`
+				);
+
+			it.each( [
+				[
+					'through wpcom_request',
+					async ( host: StudioAgentHost ) => {
+						await wpcomRequestTool
+							.handler(
+								{ siteId: 113, method: 'POST', path: '/posts', body: { title: 'Hi' } },
+								{ host, onProgress: () => undefined }
+							)
+							.catch( () => undefined );
+					},
+				],
+				[
+					'through a raw request',
+					async () => {
+						await fetch( 'https://public-api.wordpress.com/rest/v1.1/sites/113/posts/new', {
+							method: 'POST',
+						} ).catch( () => undefined );
+					},
+				],
+				[
+					'through a push with another remote',
+					async ( host: StudioAgentHost ) => {
+						await host.sync
+							.push( pushSite, 'all', 'https://myprod.wordpress.com', () => undefined )
+							.catch( () => undefined );
+					},
+				],
+			] )(
+				'refuses a write to another site of the account %s, and fails the case',
+				async ( _channel, write ) => {
+					Object.assign( process.env, designated );
+					wpcom.sites.mockResolvedValue( [ listed() ] );
+					agent.behavior = { replyProvider: 'studio-wpcom', act: ( { host } ) => write( host ) };
+					const result = await runEval( stagingCase() );
+					expect( result ).toMatchObject( {
+						success: false,
+						error: expect.stringMatching( /^wpcom-write-outside-staging/ ),
+						remoteGuard: {
+							code: 'wpcom-write-outside-staging',
+							blocked: [ expect.objectContaining( { code: 'wpcom-write-outside-staging' } ) ],
+							allowed: [],
+						},
+					} );
+					expect(
+						sentToNetwork().filter( ( sent: string ) => ! sent.startsWith( 'GET' ) )
+					).toEqual( [] );
+					expect( cliAgentHost.sync.push ).not.toHaveBeenCalled();
+					expect( JSON.stringify( result.remoteGuard ) ).not.toMatch( /113|myprod|public-api/ );
+				}
+			);
+
+			const api = 'https://public-api.wordpress.com';
+			// The real tool's transport, sending to the address WordPress.com's client
+			// composes, through fetch: the spied fetch never sends anything.
+			const transport = vi.fn(
+				async ( args: { siteId: number; method: string; path: string; apiNamespace?: string } ) => {
+					const namespace = args.apiNamespace ?? 'wp/v2';
+					await fetch(
+						`${ api }/${ namespace || 'rest/v1.1' }/sites/${ args.siteId }${ args.path }`,
+						{
+							method: args.method,
+						}
+					);
+					return { content: [ { type: 'text' as const, text: '{}' } ], details: {} };
+				}
+			);
+			async function runWithTransport( act: FakeTurnBehavior[ 'act' ] ) {
+				const original = wpcomRequestTool.handler;
+				transport.mockClear();
+				wpcomRequestTool.handler = transport as unknown as typeof wpcomRequestTool.handler;
+				agent.behavior = { replyProvider: 'studio-wpcom', act };
+				try {
+					return await runEval( stagingCase() );
+				} finally {
+					wpcomRequestTool.handler = original;
+				}
+			}
+
+			it.each( [
+				[
+					'a reblog onto another site',
+					{ path: '/posts/7/reblogs/new', apiNamespace: '', body: { destination_site_id: 113 } },
+				],
+				[ 'a follow', { path: '/follows/new', apiNamespace: '' } ],
+				[ 'a like', { path: '/posts/7/likes/new', apiNamespace: '' } ],
+			] )(
+				'refuses %s addressed through the staging site before it is sent, and fails the case',
+				async ( _name, request ) => {
+					Object.assign( process.env, designated );
+					wpcom.sites.mockResolvedValue( [ listed() ] );
+					const result = await runWithTransport( async ( { host } ) => {
+						await wpcomRequestTool
+							.handler(
+								{ siteId: 4242, method: 'POST', ...request },
+								{ host, onProgress: () => undefined }
+							)
+							.catch( () => undefined );
+						await fetch( `${ api }/rest/v1.1/sites/4242${ request.path }`, {
+							method: 'POST',
+						} ).catch( () => undefined );
+					} );
+					expect( result ).toMatchObject( {
+						success: false,
+						error: expect.stringMatching( /^wpcom-write-outside-staging/ ),
+						remoteGuard: {
+							code: 'wpcom-write-outside-staging',
+							blocked: [
+								expect.objectContaining( { via: 'fetch' } ),
+								expect.objectContaining( { via: 'fetch' } ),
+							],
+							allowed: [],
+						},
+					} );
+					expect( result.remoteCalls ).toEqual( [
+						expect.objectContaining( { operation: 'wpcom-request', designated: false } ),
+					] );
+					expect( transport ).toHaveBeenCalledTimes( 1 );
+					expect(
+						sentToNetwork().filter( ( sent: string ) => ! sent.startsWith( 'GET' ) )
+					).toEqual( [] );
+				}
+			);
+
+			it( 'lets the push’s two requests and a wp/v2 write to the designated site through, and records them', async () => {
+				Object.assign( process.env, designated );
+				wpcom.sites.mockResolvedValue( [ listed() ] );
+				const upload = `${ api }/rest/v1.1/studio-file-uploads/4242`;
+				const importArchive = `${ api }/wpcom/v2/sites/4242/studio-app/sync/import/initiate`;
+				vi.mocked( cliAgentHost.sync.push ).mockImplementationOnce( async () => {
+					// As the push sends them: the archive's upload, then its import.
+					await fetch( upload, { method: 'POST' } );
+					await fetch( importArchive, { method: 'POST' } );
+					return listed() as never;
+				} );
+				const result = await runWithTransport( async ( { host } ) => {
+					await wpcomRequestTool.handler(
+						{ siteId: 4242, method: 'POST', path: '/posts/7', body: { title: 'Hi' } },
+						{ host, onProgress: () => undefined }
+					);
+					await host.sync.push( pushSite, 'all', '4242', () => undefined );
+				} );
+				expect( result ).toMatchObject( {
+					success: true,
+					remoteGuard: {
+						code: null,
+						blocked: [],
+						allowed: [
+							{ method: 'POST', via: 'fetch' },
+							{ method: 'POST', via: 'fetch' },
+							{ method: 'POST', via: 'fetch' },
+						],
+					},
+				} );
+				expect( result.remoteCalls ).toEqual( [
+					expect.objectContaining( { operation: 'wpcom-request', designated: true } ),
+					expect.objectContaining( { operation: 'push', designated: true } ),
+				] );
+				expect( cliAgentHost.sync.push ).toHaveBeenCalledTimes( 1 );
+				expect( sentToNetwork() ).toEqual( [
+					`POST ${ api }/wp/v2/sites/4242/posts/7`,
+					`POST ${ upload }`,
+					`POST ${ importArchive }`,
+				] );
+			} );
+		} );
+
+		describe( 'a case judged on images a tool returns to the model', () => {
+			afterEach( () => {
+				table.toolImages = false;
+			} );
+
+			it( 'is blocked on the ChatGPT route while its capability table leaves tool images off, before any site or turn', async () => {
+				agent.behavior = { replyProvider: 'studio-chatgpt' };
+				const result = ( await runEvalUntyped(
+					input( { needsToolImages: true }, chatGptEnv() )
+				) ) as RunReport & { blocked?: { code: string; message: string } };
+				expect( result ).toMatchObject( {
+					success: false,
+					blocked: { code: 'tool-images-not-qualified' },
+					providerRoute: {
+						requested: { kind: 'chatgpt-oauth', model: 'gpt-6-luna' },
+						blocked: { code: 'tool-images-not-qualified' },
+					},
+				} );
+				expect( result ).not.toHaveProperty( 'refusal' );
+				expect( agent.turns ).toEqual( [] );
+				expect( sites.create ).not.toHaveBeenCalled();
+				expect( fetchSpy ).not.toHaveBeenCalled();
+				expect( leftovers() ).toEqual( [] );
+			} );
+
+			it( 'runs on the ChatGPT route once the table says its model takes tool images', async () => {
+				table.toolImages = true;
+				agent.behavior = { replyProvider: 'studio-chatgpt' };
+				const result = ( await runEvalUntyped(
+					input( { needsToolImages: true }, chatGptEnv() )
+				) ) as RunReport & { blocked?: unknown };
+				expect( result.blocked ).toBeUndefined();
+				expect( result.success ).toBe( true );
+				expect( agent.turns ).toHaveLength( 1 );
+			} );
+
+			it( 'runs as before on a route the table does not cover, and without the var', async () => {
+				agent.behavior = { replyProvider: 'studio-wpcom' };
+				expect( await runEval( input( { needsToolImages: true } ) ) ).not.toHaveProperty(
+					'blocked'
+				);
+				agent.behavior = { replyProvider: 'studio-chatgpt' };
+				expect( await runEval( input( {}, chatGptEnv() ) ) ).not.toHaveProperty( 'blocked' );
+				expect( agent.turns ).toHaveLength( 2 );
 			} );
 		} );
 

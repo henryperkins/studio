@@ -1,5 +1,5 @@
 import { __, _n, sprintf } from '@wordpress/i18n';
-import type { ImageServiceUse } from '@studio/agent/protocol/image-service';
+import type { ImageServiceRecord } from '@studio/agent/protocol/image-service';
 
 export function getInputString(
 	input: Record< string, unknown > | undefined,
@@ -482,8 +482,8 @@ export interface NormalizedToolResult {
 	text: string;
 	isError: boolean;
 	diff?: string;
-	// The image service and account that made the result's images.
-	imageService?: ImageServiceUse;
+	// The image service that made the result's images, on a subscription plan's route.
+	imageService?: ImageServiceRecord;
 }
 
 export function getToolResultDiff( details: unknown ): string | undefined {

@@ -4,6 +4,7 @@ import {
 	finishChatGptSignIn,
 	readChatGptModels,
 	readChatGptSettings,
+	recheckChatGptSettings as recheckChatGptSettingsInHost,
 	startChatGptSignIn,
 	stopChatGptSignIn,
 } from '@studio/agent/node/chatgpt/settings';
@@ -146,6 +147,10 @@ export async function getAiSettings() {
 
 export async function getChatGptSettings() {
 	return readChatGptSettings();
+}
+
+export async function recheckChatGptSettings() {
+	return recheckChatGptSettingsInHost();
 }
 
 export async function getImageServiceState() {

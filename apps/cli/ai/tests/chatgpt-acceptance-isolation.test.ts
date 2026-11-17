@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { applyAcceptanceIsolation } from 'cli/ai/acceptance-isolation';
+import { applyAcceptanceIsolation, checkAcceptanceRunDirectory } from 'cli/ai/acceptance-isolation';
 import { acceptanceChildEnvironment } from 'cli/ai/chatgpt-acceptance';
 
 const cliRoot = path.resolve( import.meta.dirname, '..', '..' );
@@ -21,6 +21,8 @@ const PATH_MODULES: Record< string, () => Promise< Record< string, unknown > > >
 const OUTSIDE_THE_RUN: Record< string, string > = {
 	'cli/lib/paths#STUDIO_CLI_HOME':
 		'only the default under PROCESS_MANAGER_HOME, which the run sets; migration 03 keeps its own copy, and the runner refuses the one profile state in which it renames anything',
+	'@studio/common/lib/well-known-paths#getDefaultConfigDirectory':
+		'names your own profile only so the run can tell it is another one and keep its ChatGPT vault key under an item of its own; nothing is read from or written there',
 };
 
 const isWithin = ( inner: string, outer: string ) => {
@@ -145,5 +147,133 @@ describe( 'ChatGPT acceptance child isolation', () => {
 		}
 		expect( php.HOME ).toBe( savedEnv.HOME );
 		expect( php.USERPROFILE ).toBe( savedEnv.USERPROFILE );
+	} );
+} );
+
+describe( 'ChatGPT acceptance run directory', () => {
+	let base: string;
+	let home: string;
+	const links: string[] = [];
+
+	// A directory link that needs no special rights on Windows.
+	const link = ( target: string, at: string ) => {
+		fs.symlinkSync( target, at, process.platform === 'win32' ? 'junction' : 'dir' );
+		links.push( at );
+		return at;
+	};
+
+	beforeEach( () => {
+		base = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-acceptance-run-dir-' ) );
+		home = path.join( base, 'home' );
+	} );
+
+	afterEach( () => {
+		for ( const at of links.splice( 0 ) ) {
+			fs.unlinkSync( at );
+		}
+		fs.rmSync( base, { recursive: true, force: true } );
+	} );
+
+	it( 'refuses a run directory that only a link puts inside the Studio profile, existing or not yet', () => {
+		fs.mkdirSync( path.join( home, '.studio' ), { recursive: true } );
+		const looksSeparate = link( path.join( home, '.studio' ), path.join( base, 'looks-separate' ) );
+		const refused = { ok: false, problem: 'run-dir-in-studio-profile' };
+
+		expect(
+			checkAcceptanceRunDirectory( path.join( looksSeparate, 'new-run' ), {
+				mustBeNew: true,
+				home,
+			} )
+		).toEqual( refused );
+		expect(
+			checkAcceptanceRunDirectory( path.join( looksSeparate, 'not', 'there', 'yet' ), {
+				mustBeNew: true,
+				home,
+			} )
+		).toEqual( refused );
+		fs.mkdirSync( path.join( looksSeparate, 'earlier-run' ) );
+		expect(
+			checkAcceptanceRunDirectory( path.join( looksSeparate, 'earlier-run' ), {
+				mustBeNew: false,
+				home,
+			} )
+		).toEqual( refused );
+	} );
+
+	it( 'refuses a run directory where a linked Studio profile really is', () => {
+		const realProfile = path.join( base, 'elsewhere', 'studio-profile' );
+		fs.mkdirSync( realProfile, { recursive: true } );
+		fs.mkdirSync( home, { recursive: true } );
+		link( realProfile, path.join( home, '.studio' ) );
+
+		expect(
+			checkAcceptanceRunDirectory( path.join( realProfile, 'run' ), { mustBeNew: true, home } )
+		).toEqual( { ok: false, problem: 'run-dir-in-studio-profile' } );
+	} );
+
+	it( 'accepts a run directory outside the Studio profile, through a link that resolves outside too', () => {
+		fs.mkdirSync( path.join( home, '.studio' ), { recursive: true } );
+		const runs = path.join( base, 'runs' );
+		fs.mkdirSync( runs );
+		const linked = link( runs, path.join( base, 'linked-runs' ) );
+
+		const check = checkAcceptanceRunDirectory( path.join( linked, 'run' ), {
+			mustBeNew: true,
+			home,
+		} );
+		expect( check ).toMatchObject( { ok: true } );
+		// The paths it hands on are the ones it was given.
+		expect( check.ok && check.paths.runDir ).toBe( path.join( linked, 'run' ) );
+	} );
+
+	describe( 'the folders of a run it continues', () => {
+		let runDir: string;
+		const continuing = () => checkAcceptanceRunDirectory( runDir, { mustBeNew: false, home } );
+		const refused = { ok: false, problem: 'run-dir-folder-outside' };
+
+		beforeEach( () => {
+			runDir = path.join( base, 'run' );
+			fs.mkdirSync( runDir, { recursive: true } );
+			fs.writeFileSync( path.join( runDir, 'manifest.json' ), '{}' );
+		} );
+
+		it( 'refuses a profile folder that a link puts in another profile', () => {
+			const otherProfile = path.join( base, 'other-profile' );
+			fs.mkdirSync( otherProfile );
+			link( otherProfile, path.join( runDir, 'profile' ) );
+			expect( continuing() ).toEqual( refused );
+		} );
+
+		it( 'refuses any other folder of the run that a link leads out of it, the process manager’s included', () => {
+			fs.mkdirSync( path.join( home, '.studio', 'daemon' ), { recursive: true } );
+			fs.mkdirSync( path.join( runDir, 'profile' ) );
+			link( path.join( home, '.studio', 'daemon' ), path.join( runDir, 'daemon' ) );
+			expect( continuing() ).toEqual( refused );
+		} );
+
+		it( 'refuses a link that leads nowhere', () => {
+			const gone = path.join( base, 'gone' );
+			fs.mkdirSync( gone );
+			link( gone, path.join( runDir, 'profile' ) );
+			fs.rmdirSync( gone );
+			expect( continuing() ).toEqual( refused );
+		} );
+
+		it( 'refuses a profile folder that is the run directory itself', () => {
+			link( runDir, path.join( runDir, 'profile' ) );
+			expect( continuing() ).toEqual( refused );
+		} );
+
+		it( 'accepts folders that resolve inside the run, through the run’s own link or one inside it', () => {
+			fs.mkdirSync( path.join( runDir, 'real-profile' ) );
+			link( path.join( runDir, 'real-profile' ), path.join( runDir, 'profile' ) );
+			fs.mkdirSync( path.join( runDir, 'daemon' ) );
+			expect( continuing() ).toMatchObject( { ok: true } );
+
+			const linkedRun = link( runDir, path.join( base, 'linked-run' ) );
+			expect( checkAcceptanceRunDirectory( linkedRun, { mustBeNew: false, home } ) ).toMatchObject(
+				{ ok: true }
+			);
+		} );
 	} );
 } );

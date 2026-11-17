@@ -1,3 +1,4 @@
+import { toChatGptSessionContext } from '@studio/agent/protocol/chatgpt';
 import {
 	describeOpenAiSettingsProblem,
 	OPENAI_MODEL_CATALOG_VERSION,
@@ -408,7 +409,7 @@ export function createInMemoryConnector(
 					id: `selection-${ nextId++ }`,
 					parentId: null,
 					timestamp: new Date().toISOString(),
-					data: { provider: 'chatgpt-oauth', ...selection },
+					data: toChatGptSessionContext( selection ),
 				},
 			];
 		},
@@ -443,6 +444,7 @@ export function createInMemoryConnector(
 			...openAi,
 		} ),
 		getChatGptSettings: async () => structuredClone( state.chatGpt ),
+		recheckChatGptSettings: async () => structuredClone( state.chatGpt ),
 		beginChatGptSignIn: async () => ( { attemptId: 'test-sign-in-attempt' } ),
 		waitForChatGptSignIn: async () => ( {
 			ok: false,

@@ -50,6 +50,12 @@ export interface ChatGptAccount {
 	revision: number;
 	/** Goes up at every sign-out, so a refresh that began before it never commits. */
 	logoutGeneration: number;
+	/**
+	 * Goes up at every sign-in, so a refresh of an earlier sign-in's tokens
+	 * that fails never marks a later one as needing a sign-in. Absent from
+	 * accounts saved before it was kept, which read as 0.
+	 */
+	signInGeneration?: number;
 	storage: ChatGptCredentialStorage;
 	state: ChatGptAccountState;
 	createdAt: string;
@@ -150,11 +156,14 @@ function describeChatGptConnectionError(
 /** Why a ChatGPT account can't be used or changed. The message is for the user and never holds a secret. */
 export class ChatGptConnectionError extends Error {
 	readonly code: ChatGptConnectionErrorCode;
+	/** Why, where the code takes one: what the system keychain answered, say. */
+	readonly detail?: string;
 
 	constructor( code: ChatGptConnectionErrorCode, detail?: string ) {
 		super( describeChatGptConnectionError( code, detail ) );
 		this.name = 'ChatGptConnectionError';
 		this.code = code;
+		this.detail = detail;
 	}
 }
 
@@ -198,6 +207,7 @@ function isAccount( value: unknown ): value is ChatGptAccount {
 		typeof value.label === 'string' &&
 		isWholeNumber( value.revision, 1 ) &&
 		isWholeNumber( value.logoutGeneration, 0 ) &&
+		( value.signInGeneration === undefined || isWholeNumber( value.signInGeneration, 0 ) ) &&
 		( value.storage === 'vault' || value.storage === 'session' ) &&
 		( value.state === 'signed-in' ||
 			value.state === 'signed-out' ||
@@ -240,6 +250,7 @@ function toAccount( account: ChatGptAccount ): ChatGptAccount {
 		label: account.label,
 		revision: account.revision,
 		logoutGeneration: account.logoutGeneration,
+		signInGeneration: account.signInGeneration ?? 0,
 		storage: account.storage,
 		state: account.state,
 		createdAt: account.createdAt,
@@ -502,6 +513,7 @@ export function createChatGptAccount(
 			label: distinctLabel( index.accounts, signIn.label?.trim() || signIn.email || 'ChatGPT' ),
 			revision: 1,
 			logoutGeneration: 0,
+			signInGeneration: 1,
 			storage: signIn.storage,
 			state: 'signed-in',
 			createdAt: now,
@@ -541,6 +553,7 @@ export function updateChatGptAccountSignIn(
 		account.email = signIn.email ?? account.email;
 		account.storage = signIn.storage;
 		account.state = 'signed-in';
+		account.signInGeneration = ( account.signInGeneration ?? 0 ) + 1;
 		account.updatedAt = new Date().toISOString();
 		return toAccount( account );
 	} );
@@ -560,17 +573,21 @@ export function startChatGptSignOut( registrationId: string ): Promise< ChatGptA
 	} );
 }
 
-/** Marks a signed-in registration as needing a sign-in again, unless it was signed out since `logoutGeneration`. */
+/**
+ * Marks a signed-in registration as needing a sign-in again, unless it was
+ * signed out or signed in again since the sign-in the failure belongs to.
+ */
 export function markChatGptSignInNeeded(
 	registrationId: string,
-	logoutGeneration: number
+	{ logoutGeneration, signInGeneration }: { logoutGeneration: number; signInGeneration: number }
 ): Promise< void > {
 	return updateIndex( ( index ) => {
 		const account = index.accounts.find( ( item ) => item.registrationId === registrationId );
 		if (
 			account &&
 			account.state === 'signed-in' &&
-			account.logoutGeneration === logoutGeneration
+			account.logoutGeneration === logoutGeneration &&
+			( account.signInGeneration ?? 0 ) === signInGeneration
 		) {
 			account.state = 'needs-sign-in';
 			account.updatedAt = new Date().toISOString();

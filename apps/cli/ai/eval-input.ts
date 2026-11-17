@@ -76,6 +76,7 @@ const attachmentsSchema = z.array( z.object( { fixture: z.string() } ) );
 
 /** Every var the runner itself reads; the rest are the outcome checks' parameters. */
 export const EVAL_RUNNER_VARS = [
+	'caseId',
 	'prompt',
 	'ui',
 	'followUps',
@@ -91,10 +92,14 @@ export const EVAL_RUNNER_VARS = [
 	'imageService',
 	'attachments',
 	'resumeAfterStop',
+	'needsToolImages',
+	'everyCheckRecorded',
 ] as const;
 
 export interface EvalRunnerVars {
 	ui: boolean;
+	// The case's id, which names it in a provider-qualified case's sanitized summary.
+	caseId?: string;
 	prompt?: string;
 	// Sent in order, each as a new user message in the same session once the
 	// previous one finishes, so a case can measure a multi-message conversation.
@@ -126,12 +131,21 @@ export interface EvalRunnerVars {
 	imageService?: 'off' | 'required' | 'unused';
 	// Files from scripts/eval/fixtures attached to the first message.
 	attachments?: Array< { fixture: string } >;
+	// The case is judged on images a tool returns to the model (screenshots),
+	// so on a route whose capability table doesn't qualify the model for them
+	// it is blocked before it runs.
+	needsToolImages: boolean;
+	// The configuration says every check of its cases writes a record to the
+	// case's summary (all its checks go through outcome.mjs). Set in the
+	// parity configuration's defaults only; the route record repeats it.
+	everyCheckRecorded: boolean;
 }
 
 /** Parses the vars the runner reads; zod errors name a malformed one. */
 export function parseEvalRunnerVars( vars: Record< string, unknown > ): EvalRunnerVars {
 	return {
 		ui: vars.ui === true,
+		...( typeof vars.caseId === 'string' ? { caseId: vars.caseId } : {} ),
 		...( vars.prompt !== undefined ? { prompt: vars.prompt as string } : {} ),
 		followUps: vars.followUps ? followUpsSchema.parse( vars.followUps ) : undefined,
 		answers: vars.answers ? answersSchema.parse( vars.answers ) : undefined,
@@ -146,5 +160,7 @@ export function parseEvalRunnerVars( vars: Record< string, unknown > ): EvalRunn
 				? z.enum( [ 'off', 'required', 'unused' ] ).parse( vars.imageService )
 				: undefined,
 		attachments: vars.attachments ? attachmentsSchema.parse( vars.attachments ) : undefined,
+		needsToolImages: vars.needsToolImages === true,
+		everyCheckRecorded: vars.everyCheckRecorded === true,
 	};
 }

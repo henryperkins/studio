@@ -11,7 +11,7 @@ import { InfoIcon, PlugIcon, SparklesIcon } from 'lucide-react';
 import { useRef, useState, type RefObject, ComponentType } from 'react';
 import { useConnector } from '@/data/core';
 import { useStudioAssistantQuota } from '@/data/queries/use-assistant-quota';
-import { CHATGPT_MODELS_QUERY_KEY } from '@/data/queries/use-chatgpt-settings';
+import { chatGptModelsQuery, nameChatGptAccount } from '@/data/queries/use-chatgpt-settings';
 import { useUserPreferences } from '@/data/queries/use-user-preferences';
 import { useOpenSettings } from '@/data/use-open-settings';
 import { getCreditsLabel, getModelDescription } from '@/features/composer/model-options';
@@ -39,11 +39,14 @@ interface ModelPickerProps {
 	sessionProvider: AiProviderId;
 	getModelLockReason: ( id: AiModelId ) => ModelLockReason | undefined;
 	disabled: boolean;
+	// A choice is being saved; no other can be made until it is.
+	busy?: boolean;
 	anchor: HTMLElement | null;
 	onChange: ( provider: AiProviderId, model: AiModelId ) => void;
 	onAddCredits: ( returnFocus: RefObject< HTMLElement | null > ) => void;
 	chatGptAccounts?: ChatGptAccountView[];
-	chatGptLabel?: string;
+	// A ChatGPT chat's plan and account, which the Model button says in place of its provider.
+	chatGptConnection?: string;
 	chatGptModel?: string;
 	chatGptModelId?: string;
 	chatGptConnectionId?: string;
@@ -58,11 +61,12 @@ export function ModelPicker( {
 	sessionProvider,
 	getModelLockReason,
 	disabled,
+	busy = false,
 	anchor,
 	onChange,
 	onAddCredits,
 	chatGptAccounts = [],
-	chatGptLabel,
+	chatGptConnection,
 	chatGptModel,
 	chatGptModelId,
 	chatGptConnectionId,
@@ -70,14 +74,7 @@ export function ModelPicker( {
 }: ModelPickerProps ) {
 	const connector = useConnector();
 	const catalogs = useQueries( {
-		queries: chatGptAccounts.map( ( account ) => ( {
-			queryKey: [ ...CHATGPT_MODELS_QUERY_KEY, account.connectionId, account.revision ],
-			queryFn: () => connector.getChatGptModels( account.connectionId, account.revision ),
-			enabled: open && account.authStatus === 'connected',
-			staleTime: 60_000,
-			retry: false,
-			meta: { persist: false },
-		} ) ),
+		queries: chatGptAccounts.map( ( account ) => chatGptModelsQuery( connector, account, open ) ),
 	} );
 	const [ highlight, setHighlight ] = useState< string >();
 	const listRef = useRef< HTMLDivElement | null >( null );
@@ -99,11 +96,12 @@ export function ModelPicker( {
 		credits.hasCredits &&
 		getStudioCodeAiAccessState( quota ) === 'available' &&
 		quota.hasPaymentMethod;
-	const modelDetails = [ modelLabel, AI_PROVIDER_LABELS[ sessionProvider ] ];
-	if ( chatGptLabel ) modelDetails.push( chatGptLabel, __( 'ChatGPT plan' ) );
+	const modelDetails = [ modelLabel, chatGptConnection ?? AI_PROVIDER_LABELS[ sessionProvider ] ];
 	if ( isWpcom ) {
 		modelDetails.push( credits.label );
 	}
+	const accountName = ( account: ChatGptAccountView ) =>
+		nameChatGptAccount( account, chatGptAccounts );
 	const chatGptCommands = chatGptAccounts.flatMap( ( account, index ) =>
 		( catalogs[ index ].data?.models ?? [] ).map( ( item ) => ( {
 			value: `chatgpt:${ account.connectionId }:${ item.id }`,
@@ -143,7 +141,10 @@ export function ModelPicker( {
 			? [
 					{
 						value: `disconnected:${ account.connectionId }`,
-						label: __( 'Sign in to this ChatGPT account in Settings' ),
+						// Why the account offers no models here, in Settings' words for it: first,
+						// so a narrow picker cuts the instruction rather than the state.
+						label: account.state === 'signed-out' ? __( 'Signed out' ) : __( 'Needs sign-in' ),
+						description: __( 'Sign in to this ChatGPT account in Settings' ),
 						disabled: true,
 						icon: PlugIcon,
 					},
@@ -154,7 +155,7 @@ export function ModelPicker( {
 					.map( ( command ) => ( {
 						value: command.value,
 						label: command.model.label,
-						description: `${ __( 'ChatGPT plan' ) } · ${ account.email ?? account.label }`,
+						description: __( 'ChatGPT plan' ),
 						icon: SparklesIcon,
 					} ) )
 			: [
@@ -177,7 +178,7 @@ export function ModelPicker( {
 			? [
 					{
 						connectionId: account.connectionId,
-						heading: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
+						heading: accountName( account ),
 					},
 			  ]
 			: []
@@ -212,8 +213,12 @@ export function ModelPicker( {
 		},
 		...chatGptAccounts.map(
 			( account, index ): CommandGroup => ( {
-				label: `ChatGPT · ${ account.label } · ${ account.connectionId }`,
-				heading: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
+				label: sprintf(
+					/* translators: %s: the ChatGPT account a chat runs on. */
+					__( 'ChatGPT plan · %s' ),
+					accountName( account )
+				),
+				heading: accountName( account ),
 				items: chatGptAccountItems( account, index ),
 			} )
 		),
@@ -268,6 +273,7 @@ export function ModelPicker( {
 						aria-description={ modelDetails.join( ' · ' ) }
 						title={ modelDetails.join( ' · ' ) }
 						disabled={ disabled }
+						loading={ busy }
 					/>
 				}
 			>

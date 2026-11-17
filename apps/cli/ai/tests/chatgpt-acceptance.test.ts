@@ -1,7 +1,10 @@
 // @vitest-environment node
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Writable } from 'node:stream';
+import { pathToFileURL } from 'node:url';
 import {
 	ChatGptConnectionError,
 	readChatGptAccount,
@@ -13,6 +16,7 @@ import {
 } from '@studio/agent/node/chatgpt/credential-broker';
 import { createChatGptSignInFlow } from '@studio/agent/node/chatgpt/oauth';
 import { ChatGptSettingsError } from '@studio/agent/node/chatgpt/settings';
+import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
 import {
 	createSigningKey,
 	GRANTED_SCOPE,
@@ -32,13 +36,16 @@ import { findUnsafeText, openAcceptanceEvidence } from 'cli/ai/acceptance-eviden
 import { acceptanceRunPaths, acceptanceStartsNewRun } from 'cli/ai/acceptance-isolation';
 import {
 	acceptancePlatform,
+	acceptanceTurnExecArgv,
 	askOwnerForSessionToken,
 	classifyToolCall,
 	classifyTurnFailure,
 	createAcceptanceTokenService,
+	createLiveChatGptAcceptanceDependencies,
 	digestTurnEvents,
 	isToolResultPersisted,
 	isWpCliReadCommand,
+	onAcceptanceSignals,
 	parseChatGptAcceptanceArgs,
 	parseWpPostList,
 	PROVISION_STAGE_NAMES,
@@ -57,6 +64,10 @@ import type { ObservedRequest } from 'cli/ai/chatgpt-acceptance-observer';
 
 const REGISTRATION = '0d6b5a8e-3c1f-4e2a-9b7d-5f4c3a2b1e0d';
 const SHA = '5c742434a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5';
+// The default profile's vault key item, and one of another profile's.
+const UNSCOPED_VAULT_KEY_ITEM = 'chatgpt-vault-key';
+const VAULT_KEY_SUFFIX = '0123456789abcdef';
+const SCOPED_VAULT_KEY_ITEM = `${ UNSCOPED_VAULT_KEY_ITEM }-${ VAULT_KEY_SUFFIX }`;
 const signedOutText = new ChatGptConnectionError( 'signed-out' ).message;
 const disconnectedText = describeConnectionSelectionError( {
 	code: 'disconnected',
@@ -300,6 +311,9 @@ function scriptedServices(
 		'wp-blogname': () => ( { exitCode: 0, stdout: '' } ),
 	};
 	let attempts = 0;
+	// A renewal after the access token was dropped refreshes, rotating the grant.
+	let accessTokenDropped = false;
+	let refreshes = 0;
 	const account = () =>
 		state === 'none'
 			? null
@@ -348,8 +362,17 @@ function scriptedServices(
 			},
 		},
 		broker: {
-			getAccessToken: async () => 'test-access-token',
-			invalidateAccessToken: async () => undefined,
+			getAccessToken: async () => {
+				if ( accessTokenDropped ) {
+					accessTokenDropped = false;
+					refreshes++;
+					calls.log.push( 'refresh' );
+				}
+				return 'test-access-token';
+			},
+			invalidateAccessToken: async () => {
+				accessTokenDropped = true;
+			},
 			signOut: async () => {
 				calls.log.push( 'sign-out' );
 				signedOut.resolve( services.clock.now() );
@@ -360,6 +383,12 @@ function scriptedServices(
 			askSessionToken: async () => false,
 			readAccount: async () => account(),
 			vaultRecordExists: () => state === 'signed-in' && storage === 'vault',
+			vaultKeyItem: () => SCOPED_VAULT_KEY_ITEM,
+			// As the broker does: kept while a saved sign-in still needs it.
+			removeProfileVaultKey: async () => {
+				calls.log.push( 'remove-vault-key' );
+				return state === 'signed-in' && storage === 'vault' ? 'records-exist' : 'removed';
+			},
 			readModels: async ( connectionId, revision ) => ( {
 				connectionId,
 				revision,
@@ -370,8 +399,12 @@ function scriptedServices(
 		},
 		tokens: {
 			holdNextRefresh: () => ( { held: Promise.resolve( false ), release: () => undefined } ),
-			probe: async () => ( { tried: true, rejected: true, terminal: true } ),
-			revocations: () => ( { total: 1, confirmed: 1, rotatedRevoked: false } ),
+			refreshes: () => refreshes,
+			probe: async ( which ) => {
+				calls.log.push( `probe:${ which }` );
+				return { tried: true, rejected: true, terminal: true };
+			},
+			revocations: () => ( { total: 1, confirmed: 1, rotatedRevoked: true } ),
 			settle: async () => undefined,
 		},
 		sessions: {
@@ -472,9 +505,11 @@ describe( 'ChatGPT acceptance runner', () => {
 			expect( evidenceText ).not.toContain( identifier );
 			expect( output ).not.toContain( identifier );
 		}
+		// Console lines get the evidence's own check: no path either, not even the run directory's.
 		for ( const line of printed ) {
-			expect( findUnsafeText( line, { paths: true } ) ).toBeNull();
+			expect( findUnsafeText( line ) ).toBeNull();
 		}
+		expect( output ).not.toContain( runDir );
 		expect( evidenceText ).not.toMatch( /@|https?:\/\/|eyJ[\w-]+\.|Bearer\s/ );
 	}
 
@@ -820,6 +855,73 @@ describe( 'ChatGPT acceptance runner', () => {
 			expectNothingUnsafe( [ 'test-access-token' ] );
 		} );
 
+		it( 'removes the run profile’s own vault key item after the sign-out, and records that it did', async () => {
+			const { services, calls } = scriptedServices();
+			expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 0 );
+			expect( stageOf( 'prerequisites' )[ 0 ].observations ).toMatchObject( {
+				vaultKeyScoped: true,
+			} );
+			// Only the suffix: the full item name reads like an opaque token.
+			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readState() ).toMatchObject( {
+				vaultKeySuffix: VAULT_KEY_SUFFIX,
+			} );
+			expect( calls.log.filter( ( call ) => call === 'remove-vault-key' ) ).toHaveLength( 1 );
+			expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+				calls.log.indexOf( 'remove-vault-key' )
+			);
+			expect( records().at( -1 ) ).toMatchObject( {
+				stage: 'cleanup',
+				status: 'passed',
+				observations: expect.objectContaining( { vaultKeyRemoved: true } ),
+			} );
+		} );
+
+		it( 'fails cleanup, after its other steps, when the run profile’s vault key item stays', async () => {
+			const { services, calls } = scriptedServices();
+			services.broker.removeProfileVaultKey = async () => {
+				calls.log.push( 'remove-vault-key' );
+				throw new Error( 'The keychain went away.' );
+			};
+			expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 1 );
+			expect( records().at( -1 ) ).toMatchObject( {
+				stage: 'cleanup',
+				status: 'failed',
+				code: 'cleanup-failed',
+				observations: expect.objectContaining( { vaultKeyRemoved: false, stepFailures: 1 } ),
+			} );
+			expect( calls.log.indexOf( 'cli:daemon-stop' ) ).toBeLessThan(
+				calls.log.indexOf( 'remove-vault-key' )
+			);
+		} );
+
+		it.each( [
+			[ 'the unscoped item', () => UNSCOPED_VAULT_KEY_ITEM ],
+			[
+				'no item it can name',
+				(): string => {
+					throw new Error( 'unresolved' );
+				},
+			],
+		] )(
+			'blocks before any sign-in when the run profile would keep its vault key under %s',
+			async ( _label, vaultKeyItem ) => {
+				const { services, calls } = scriptedServices();
+				services.broker.vaultKeyItem = vaultKeyItem;
+				expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 1 );
+				expect(
+					records().map( ( record ) => [ record.stage, record.status, record.code ] )
+				).toEqual( [
+					[ 'prerequisites', 'blocked', 'vault-key-not-scoped' ],
+					[ 'cleanup', 'passed', undefined ],
+				] );
+				expect( stageOf( 'prerequisites' )[ 0 ].observations ).toMatchObject( {
+					vaultKeyScoped: false,
+				} );
+				expect( calls.log.some( ( call ) => call.startsWith( 'begin:' ) ) ).toBe( false );
+				expect( calls.log ).not.toContain( 'remove-vault-key' );
+			}
+		);
+
 		it( 'records an unexpected tool call, stops judging there, and still cleans up', async () => {
 			const { services } = scriptedServices(
 				{},
@@ -1071,7 +1173,7 @@ describe( 'ChatGPT acceptance runner', () => {
 			],
 			[
 				'remote-revocation',
-				'revoked-refresh-accepted',
+				'rotated-grant-usable',
 				'failed',
 				() => {
 					const scripted = scriptedServices();
@@ -1086,7 +1188,7 @@ describe( 'ChatGPT acceptance runner', () => {
 			],
 			[
 				'remote-revocation',
-				'nothing-revoked',
+				'no-rotated-grant',
 				'blocked',
 				() => {
 					const scripted = scriptedServices();
@@ -1338,6 +1440,95 @@ describe( 'ChatGPT acceptance runner', () => {
 			} );
 		} );
 
+		describe( 'the remote revocation of the grant a refresh rotated to before the sign-out', () => {
+			it( 'forces a refresh before the sign-out, probes the rotated grant before the retired one, and finds no vault record', async () => {
+				const { services, calls } = scriptedServices();
+				expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 0 );
+				expect( stageOf( 'refresh-before-sign-out' )[ 0 ] ).toMatchObject( {
+					status: 'passed',
+					observations: { refreshed: true },
+				} );
+				const { log } = calls;
+				expect( log.indexOf( 'refresh' ) ).toBeGreaterThan( -1 );
+				expect( log.indexOf( 'refresh' ) ).toBeLessThan( log.indexOf( 'sign-out' ) );
+				expect( log.filter( ( call ) => call.startsWith( 'probe:' ) ) ).toEqual( [
+					'probe:rotated',
+					'probe:retired',
+				] );
+				expect( stageOf( 'remote-revocation' )[ 0 ] ).toMatchObject( {
+					status: 'passed',
+					observations: expect.objectContaining( {
+						vaultRecordAfterSignOut: false,
+						rotatedRevokedBySignOut: true,
+						rotatedRefreshRejected: true,
+						rejectionTerminal: true,
+						retiredRefreshRejected: true,
+					} ),
+				} );
+			} );
+
+			const probing =
+				( rejected: { rotated?: boolean; retired?: boolean } ) =>
+				async ( which: 'retired' | 'rotated' ) => ( {
+					tried: true,
+					rejected: rejected[ which ] ?? true,
+					terminal: rejected[ which ] ?? true,
+				} );
+
+			it.each( [
+				[
+					'refresh-before-sign-out',
+					'refresh-not-forced',
+					( services: ChatGptAcceptanceServices ) => {
+						services.tokens.refreshes = () => 0;
+					},
+				],
+				[
+					'remote-revocation',
+					'vault-record-left',
+					( services: ChatGptAcceptanceServices ) => {
+						// The broker said it cleared the record; the file says otherwise.
+						services.broker.vaultRecordExists = () => true;
+					},
+				],
+				[
+					'remote-revocation',
+					'rotated-grant-usable',
+					( services: ChatGptAcceptanceServices ) => {
+						services.tokens.probe = probing( { rotated: false } );
+					},
+				],
+				[
+					'remote-revocation',
+					'rotated-not-revoked-by-sign-out',
+					( services: ChatGptAcceptanceServices ) => {
+						services.tokens.revocations = () => ( {
+							total: 1,
+							confirmed: 1,
+							rotatedRevoked: false,
+						} );
+					},
+				],
+				[
+					'remote-revocation',
+					'retired-refresh-accepted',
+					( services: ChatGptAcceptanceServices ) => {
+						services.tokens.probe = probing( { retired: false } );
+					},
+				],
+			] )( 'fails %s with %s, and still cleans up', async ( stage, code, change ) => {
+				const { services } = scriptedServices();
+				change( services );
+				expect( await runChatGptAcceptance( savedArgs(), dependencies( services ) ) ).toBe( 1 );
+				const all = records();
+				const failedAt = all.findIndex( ( record ) => record.stage === stage );
+				expect( all[ failedAt ] ).toMatchObject( { stage, status: 'failed', code } );
+				expect( all.slice( failedAt + 1 ).map( ( record ) => record.stage ) ).toEqual( [
+					'cleanup',
+				] );
+			} );
+		} );
+
 		it( 'keeps the original failure when cleanup also fails', async () => {
 			const { services, calls } = scriptedServices(
 				{},
@@ -1427,6 +1618,166 @@ describe( 'ChatGPT acceptance runner', () => {
 			} );
 		} );
 
+		describe( 'a terminal that has gone away', () => {
+			const writeError = ( code: string ) =>
+				Object.assign( new Error( 'The write failed.' ), { code } );
+
+			/**
+			 * A stand-in for stdout or stderr whose every write fails with `code`:
+			 * reported as the stream's 'error', as a terminal or pipe reports it,
+			 * or thrown by `write` itself, as a stream onto a file does.
+			 */
+			function failingStream( code: string, how: 'reported' | 'thrown' ) {
+				const attempts: string[] = [];
+				const stream = new Writable( {
+					write( _chunk, _encoding, callback ) {
+						callback( writeError( code ) );
+					},
+				} );
+				const write = stream.write.bind( stream ) as ( chunk: unknown ) => boolean;
+				stream.write = ( ( chunk: unknown ) => {
+					attempts.push( String( chunk ) );
+					if ( how === 'thrown' ) {
+						throw writeError( code );
+					}
+					return write( chunk );
+				} ) as typeof stream.write;
+				return { stream, attempts };
+			}
+
+			function liveConsole( code: string, how: 'reported' | 'thrown' ) {
+				const stdout = failingStream( code, how );
+				const stderr = failingStream( code, how );
+				// A stand-in for the process's signals, so no real signal reaches the test worker.
+				const signals = new EventEmitter();
+				const exit = vi.fn();
+				const live = createLiveChatGptAcceptanceDependencies( {
+					stdout: stdout.stream,
+					stderr: stderr.stream,
+					signals: signals as unknown as Pick< NodeJS.Process, 'on' | 'off' >,
+					platform: 'linux',
+					exit,
+				} );
+				return { stdout, stderr, signals, exit, live };
+			}
+
+			it.each( [
+				[ 'EIO', 'reported' ],
+				[ 'EPIPE', 'reported' ],
+				[ 'EIO', 'thrown' ],
+				[ 'EPIPE', 'thrown' ],
+			] as const )(
+				'a first SIGHUP still runs cleanup to its end when every write fails with %s (%s)',
+				async ( code, how ) => {
+					const { stdout, signals, exit, live } = liveConsole( code, how );
+					const { services, calls } = scriptedServices(
+						{},
+						{
+							// A turn still running when the terminal goes away.
+							draft: () => ( {
+								firstRequest: async () => true,
+								result: deferred< TurnResult >().promise,
+								stop: async () => undefined,
+							} ),
+						}
+					);
+					services.processes.stopOwned = async () => {
+						calls.log.push( 'stop-owned' );
+						return { stopped: 1, failed: 0 };
+					};
+					const running = runChatGptAcceptance( savedArgs(), {
+						...dependencies( services ),
+						print: live.print,
+						onInterrupt: live.onInterrupt,
+					} );
+					await vi.waitFor( () =>
+						expect( stdout.attempts.join( '' ) ).toMatch( /Evidence goes to/ )
+					);
+					await vi.waitFor( () => expect( calls.log ).toContain( 'turn:draft' ) );
+
+					signals.emit( 'SIGHUP' );
+
+					expect( await running ).toBe( 130 );
+					expect( stdout.attempts.join( '' ) ).toMatch( /Interrupted/ );
+					expect( stageOf( 'draft-turn' )[ 0 ] ).toMatchObject( {
+						status: 'failed',
+						code: 'interrupted',
+					} );
+					// What the run started, the running turn's tree included, was stopped,
+					// and the sign-out and the key removal were attempted, in that order.
+					expect( calls.log ).toEqual(
+						expect.arrayContaining( [ 'stop-owned', 'sign-out', 'remove-vault-key' ] )
+					);
+					expect( calls.log.indexOf( 'stop-owned' ) ).toBeLessThan(
+						calls.log.indexOf( 'sign-out' )
+					);
+					expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+						calls.log.indexOf( 'remove-vault-key' )
+					);
+					expect( records().at( -1 ) ).toMatchObject( {
+						stage: 'cleanup',
+						observations: expect.objectContaining( {
+							processesStopped: 1,
+							testRegistrationSignedOut: true,
+							vaultKeyRemoved: true,
+						} ),
+					} );
+					expect( exit ).not.toHaveBeenCalled();
+				}
+			);
+
+			it( 'a second signal still exits when every write fails', () => {
+				const { signals, exit, live } = liveConsole( 'EIO', 'thrown' );
+				const stop = live.onInterrupt( vi.fn() );
+				signals.emit( 'SIGHUP' );
+				signals.emit( 'SIGHUP' );
+				expect( exit ).toHaveBeenCalledWith( 130 );
+				stop();
+			} );
+
+			it( 'swallows every write error the stream reports, as Node’s own console does', () => {
+				const reported = liveConsole( 'ENOSPC', 'reported' );
+				for ( const code of [ 'ENOSPC', 'EAGAIN', 'EIO', 'EPIPE' ] ) {
+					expect( () => reported.stdout.stream.emit( 'error', writeError( code ) ) ).not.toThrow();
+					expect( () => reported.stderr.stream.emit( 'error', writeError( code ) ) ).not.toThrow();
+				}
+			} );
+
+			it.each( [ 'ENOSPC', 'EAGAIN' ] )(
+				'goes on to the end of the run and its cleanup when every write is reported failing with %s',
+				async ( code ) => {
+					const { stdout, stderr, live } = liveConsole( code, 'reported' );
+					const { services, calls } = scriptedServices();
+					const running = runChatGptAcceptance( savedArgs(), {
+						...dependencies( services ),
+						print: live.print,
+						onInterrupt: live.onInterrupt,
+					} );
+					// A console write from any other module, failing the same way.
+					stderr.stream.write( 'A line from another module.\n' );
+
+					expect( await running ).toBe( 0 );
+					expect( stdout.attempts.join( '' ) ).toMatch( /Evidence goes to/ );
+					expect( stderr.attempts ).toHaveLength( 1 );
+					expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+						calls.log.indexOf( 'remove-vault-key' )
+					);
+					expect( records().at( -1 ) ).toMatchObject( {
+						stage: 'cleanup',
+						status: 'passed',
+						observations: expect.objectContaining( { vaultKeyRemoved: true } ),
+					} );
+				}
+			);
+
+			it( 'lets any other write error its own line’s write throws surface', () => {
+				const thrown = liveConsole( 'ENOSPC', 'thrown' );
+				expect( () => thrown.live.print( 'A line.' ) ).toThrow( 'The write failed.' );
+				expect( () => liveConsole( 'EIO', 'thrown' ).live.print( 'A line.' ) ).not.toThrow();
+				expect( () => liveConsole( 'EPIPE', 'thrown' ).live.print( 'A line.' ) ).not.toThrow();
+			} );
+		} );
+
 		it( 'records a requested gate the image service can’t serve as blocked, never failed, and goes on', async () => {
 			const { services } = scriptedServices();
 			expect(
@@ -1481,9 +1832,21 @@ describe( 'ChatGPT acceptance runner', () => {
 				}
 				return runCli( label, args );
 			};
+			const startTurn = services.processes.startTurn;
+			const toolImages: Record< string, boolean | undefined > = {};
+			services.processes.startTurn = ( options ) => {
+				toolImages[ options.label ] = options.toolImages;
+				return startTurn( options );
+			};
 			expect(
 				await runChatGptAcceptance( savedArgs( '--gates', 'T1' ), dependencies( services ) )
 			).toBe( 0 );
+			// Only the live check's own turn turns images in tool results on, through the override.
+			expect( toolImages[ 'gate-t1' ] ).toBe( true );
+			expect(
+				Object.entries( toolImages ).filter( ( [ label, on ] ) => label !== 'gate-t1' && on )
+			).toEqual( [] );
+			expect( Object.keys( toolImages ).length ).toBeGreaterThan( 1 );
 			expect( stageOf( 'gate-t1-image-tool-result' )[ 0 ] ).toMatchObject( {
 				status: 'passed',
 				observations: expect.objectContaining( {
@@ -1495,15 +1858,35 @@ describe( 'ChatGPT acceptance runner', () => {
 			} );
 		} );
 
+		it( 'loads the tool-image override into a turn’s CLI process only when the turn asks for it, after the observer', () => {
+			const scripts = {
+				observer: path.join( os.tmpdir(), 'cli', 'chatgpt-acceptance-observer.mjs' ),
+				toolImages: path.join( os.tmpdir(), 'cli', 'chatgpt-acceptance-tool-images.mjs' ),
+			};
+			const imports = ( argv: string[] ) =>
+				argv.filter( ( _arg, index ) => argv[ index - 1 ] === '--import' );
+
+			expect( imports( acceptanceTurnExecArgv( scripts, {} ) ) ).toEqual( [
+				pathToFileURL( scripts.observer ).href,
+			] );
+			expect( imports( acceptanceTurnExecArgv( scripts, { toolImages: false } ) ) ).toEqual( [
+				pathToFileURL( scripts.observer ).href,
+			] );
+			expect( imports( acceptanceTurnExecArgv( scripts, { toolImages: true } ) ) ).toEqual( [
+				pathToFileURL( scripts.observer ).href,
+				pathToFileURL( scripts.toolImages ).href,
+			] );
+		} );
+
 		it( 'passes gate T3 only when the service details arrive before the result is persisted', async () => {
-			const imageTurn = ( persistedAtReceipt: boolean ) => () =>
+			const imageTurn = ( persistedAtReceipt?: boolean | null ) => () =>
 				finishedTurn(
 					turnResult( {
 						events: [
 							toolStart( 'g', 'generate_images', { prompt: 'a plain blue square' } ),
 							{
 								...toolEnd( 'g', 'generate_images', { studioService: { service: 'images' } } ),
-								persistedAtReceipt,
+								...( persistedAtReceipt === undefined ? {} : { persistedAtReceipt } ),
 							},
 							answered( 'DONE' ),
 							completed( 'success' ),
@@ -1540,6 +1923,43 @@ describe( 'ChatGPT acceptance runner', () => {
 				observations: expect.objectContaining( { deliveredBeforePersisted: false } ),
 			} );
 			expect( stageOf( 'blocked-after-sign-out' )[ 0 ].status ).toBe( 'passed' );
+		} );
+
+		it.each( [
+			[ 'the session file couldn’t be read when the result arrived', null ],
+			[ 'no session file was named to read', undefined ],
+		] )( 'fails gate T3, never passes it, when %s', async ( _label, persistedAtReceipt ) => {
+			const { services } = scriptedServices(
+				{ imageServiceConfigured: async () => true },
+				{
+					'gate-t3': () =>
+						finishedTurn(
+							turnResult( {
+								events: [
+									toolStart( 'g', 'generate_images', { prompt: 'a plain blue square' } ),
+									{
+										...toolEnd( 'g', 'generate_images', { studioService: { service: 'images' } } ),
+										...( persistedAtReceipt === undefined ? {} : { persistedAtReceipt } ),
+									},
+									answered( 'DONE' ),
+									completed( 'success' ),
+								],
+							} )
+						),
+				}
+			);
+			expect(
+				await runChatGptAcceptance( savedArgs( '--gates', 'T3' ), dependencies( services ) )
+			).toBe( 1 );
+			expect( stageOf( 'gate-t3-image-service-row' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'session-file-unreadable',
+				observations: expect.objectContaining( {
+					detailsDelivered: true,
+					persistenceChecked: false,
+					deliveredBeforePersisted: false,
+				} ),
+			} );
 		} );
 
 		it( 'blocks gate T2 when no reasoning item was produced, and fails it when one was dropped', async () => {
@@ -1827,11 +2247,17 @@ describe( 'ChatGPT acceptance runner', () => {
 				'begin:vault',
 			] );
 			expect( calls.log ).not.toContain( 'sign-out' );
+			// The profile stays signed in for evals, so its vault key item stays too.
+			expect( calls.log ).not.toContain( 'remove-vault-key' );
+			expect( stageOf( 'prerequisites' )[ 0 ].observations ).toMatchObject( {
+				vaultKeyScoped: true,
+			} );
 			expect( calls.log.some( ( call ) => call.startsWith( 'turn:' ) ) ).toBe( false );
 			expect( calls.log.some( ( call ) => call.startsWith( 'cli:' ) ) ).toBe( false );
 			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readState() ).toMatchObject( {
 				registrationId: REGISTRATION,
 				storage: 'vault',
+				vaultKeySuffix: VAULT_KEY_SUFFIX,
 			} );
 			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readManifest()?.runs ).toEqual( [
 				expect.objectContaining( { run: 1, scenario: 'provision', gates: [] } ),
@@ -1850,13 +2276,33 @@ describe( 'ChatGPT acceptance runner', () => {
 				code: 'vault-record-missing',
 			} );
 			expect( calls.log.filter( ( call ) => call === 'sign-out' ) ).toHaveLength( 1 );
+			expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+				calls.log.indexOf( 'remove-vault-key' )
+			);
 			expect( stageOf( 'cleanup' )[ 0 ].observations ).toMatchObject( {
 				testRegistrationSignedOut: true,
+				vaultKeyRemoved: true,
 			} );
 		} );
 
+		it( 'blocks before the sign-in when the run profile would keep its vault key under the unscoped item', async () => {
+			const { services, calls } = scriptedServices();
+			services.broker.vaultKeyItem = () => UNSCOPED_VAULT_KEY_ITEM;
+			expect( await runChatGptAcceptance( provisionArgs(), dependencies( services ) ) ).toBe( 1 );
+			expect( stageOf( 'prerequisites' )[ 0 ] ).toMatchObject( {
+				status: 'blocked',
+				code: 'vault-key-not-scoped',
+			} );
+			expect( stageOf( 'profile-sign-in' ) ).toEqual( [] );
+			expect( calls.log.some( ( call ) => call.startsWith( 'begin:' ) ) ).toBe( false );
+			expect( calls.log ).not.toContain( 'remove-vault-key' );
+		} );
+
 		describe( 'retire', () => {
-			function provisioned() {
+			// What `provision` leaves: its run, and the registration and key item name in state.json.
+			function provisioned(
+				state: { vaultKeySuffix?: string } = { vaultKeySuffix: VAULT_KEY_SUFFIX }
+			) {
 				fs.mkdirSync( runDir, { recursive: true } );
 				const evidence = openAcceptanceEvidence( runDir, 'chatgpt' );
 				evidence.startRun( {
@@ -1870,7 +2316,12 @@ describe( 'ChatGPT acceptance runner', () => {
 					effort: 'medium',
 					gates: [],
 				} );
-				evidence.writeState( { schemaVersion: 1, registrationId: REGISTRATION, storage: 'vault' } );
+				evidence.writeState( {
+					schemaVersion: 1,
+					registrationId: REGISTRATION,
+					storage: 'vault',
+					...state,
+				} );
 			}
 
 			// Scripted services with the provisioned registration signed in.
@@ -1900,6 +2351,10 @@ describe( 'ChatGPT acceptance runner', () => {
 						scripted.calls.log.push( 'sign-out' );
 						signedOut = true;
 						return { localCleared: true, remoteRevocationConfirmed: true };
+					},
+					removeProfileVaultKey: async () => {
+						scripted.calls.log.push( 'remove-vault-key' );
+						return signedOut ? 'removed' : 'records-exist';
 					},
 					...overrides,
 				};
@@ -1946,6 +2401,38 @@ describe( 'ChatGPT acceptance runner', () => {
 				expect( create ).not.toHaveBeenCalled();
 			} );
 
+			it( 'refuses a provisioned run whose profile folder a link puts in another profile, before reading or writing anything', async () => {
+				provisioned();
+				const otherProfile = path.join( base, 'other-profile' );
+				fs.mkdirSync( otherProfile );
+				const profileLink = acceptanceRunPaths( runDir ).profileDir;
+				fs.symlinkSync(
+					otherProfile,
+					profileLink,
+					process.platform === 'win32' ? 'junction' : 'dir'
+				);
+				const statePath = path.join( runDir, 'state.json' );
+				const stateBefore = fs.readFileSync( statePath, 'utf8' );
+				const collectFacts = vi.fn();
+				const create = vi.fn();
+				try {
+					expect(
+						await runChatGptAcceptance(
+							retireArgs(),
+							dependencies( undefined, { createServices: create, collectFacts } )
+						)
+					).toBe( 2 );
+				} finally {
+					fs.unlinkSync( profileLink );
+				}
+				expect( printed.join( '\n' ) ).toMatch( /leads outside it/ );
+				expect( collectFacts ).not.toHaveBeenCalled();
+				expect( create ).not.toHaveBeenCalled();
+				expect( fs.readFileSync( statePath, 'utf8' ) ).toBe( stateBefore );
+				expect( fs.readdirSync( otherProfile ) ).toEqual( [] );
+				expectNothingUnsafe();
+			} );
+
 			it( 'signs the profile’s registration out, from any commit, and reports the remote revocation', async () => {
 				provisioned();
 				const { services, calls } = signedIn();
@@ -1958,11 +2445,111 @@ describe( 'ChatGPT acceptance runner', () => {
 					wasSignedIn: true,
 					localCleared: true,
 					remoteRevocationConfirmed: true,
+					vaultKeyRemoved: true,
 				} );
 				expect( calls.log.filter( ( call ) => call === 'sign-out' ) ).toHaveLength( 1 );
+				// Removed once, by the stage, after its sign-out: cleanup has nothing left to remove.
+				expect( calls.log.filter( ( call ) => call === 'remove-vault-key' ) ).toHaveLength( 1 );
+				expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+					calls.log.indexOf( 'remove-vault-key' )
+				);
 				expect( calls.log.some( ( call ) => call.startsWith( 'begin:' ) ) ).toBe( false );
 				expectNothingUnsafe( [ 'test-access-token' ] );
 			} );
+
+			it( 'fails when the profile’s vault key item couldn’t be removed after the sign-out', async () => {
+				provisioned();
+				const kept = signedIn( { removeProfileVaultKey: async () => 'records-exist' } );
+				expect( await runChatGptAcceptance( retireArgs(), dependencies( kept.services ) ) ).toBe(
+					1
+				);
+				expect( stageOf( 'profile-sign-out' )[ 0 ] ).toMatchObject( {
+					status: 'failed',
+					code: 'vault-key-not-removed',
+					observations: expect.objectContaining( { localCleared: true, vaultKeyRemoved: false } ),
+				} );
+				expect( records().at( -1 ) ).toMatchObject( {
+					stage: 'cleanup',
+					status: 'failed',
+					observations: expect.objectContaining( { vaultKeyRemoved: false } ),
+				} );
+
+				const unreachable = signedIn( {
+					removeProfileVaultKey: async () => {
+						throw new Error( 'The keychain went away.' );
+					},
+				} );
+				expect(
+					await runChatGptAcceptance( retireArgs(), dependencies( unreachable.services ) )
+				).toBe( 1 );
+				expect( stageOf( 'profile-sign-out' )[ 1 ] ).toMatchObject( {
+					status: 'failed',
+					code: 'vault-key-not-removed',
+				} );
+			} );
+
+			it( 'still removes the vault key item of a profile already signed out', async () => {
+				provisioned();
+				// Nothing saved needs the key any more.
+				const { services, calls } = signedIn( {
+					readAccount: async () => null,
+					removeProfileVaultKey: async () => 'removed',
+				} );
+				expect( await runChatGptAcceptance( retireArgs(), dependencies( services ) ) ).toBe( 1 );
+				expect( stageOf( 'profile-sign-out' )[ 0 ] ).toMatchObject( {
+					status: 'blocked',
+					code: 'already-signed-out',
+				} );
+				expect( calls.log ).not.toContain( 'sign-out' );
+				expect( records().at( -1 ) ).toMatchObject( {
+					stage: 'cleanup',
+					status: 'passed',
+					observations: expect.objectContaining( { vaultKeyRemoved: true } ),
+				} );
+			} );
+
+			it.each< [ string, { vaultKeySuffix?: string }, () => string ] >( [
+				[
+					'the profile now names another item (the run directory moved since provision)',
+					{ vaultKeySuffix: VAULT_KEY_SUFFIX },
+					() => `${ UNSCOPED_VAULT_KEY_ITEM }-fedcba9876543210`,
+				],
+				[
+					'provision recorded no name (a directory an earlier runner made)',
+					{},
+					() => SCOPED_VAULT_KEY_ITEM,
+				],
+				[
+					'the profile names the unscoped item',
+					{ vaultKeySuffix: VAULT_KEY_SUFFIX },
+					() => UNSCOPED_VAULT_KEY_ITEM,
+				],
+				[
+					'the profile’s item can’t be named',
+					{ vaultKeySuffix: VAULT_KEY_SUFFIX },
+					(): string => {
+						throw new Error( 'unresolved' );
+					},
+				],
+			] )(
+				'fails, signing nothing out and removing nothing, when %s',
+				async ( _case, state, vaultKeyItem ) => {
+					provisioned( state );
+					const { services, calls } = signedIn( { vaultKeyItem } );
+					expect( await runChatGptAcceptance( retireArgs(), dependencies( services ) ) ).toBe( 1 );
+					expect( stageOf( 'profile-sign-out' )[ 0 ] ).toMatchObject( {
+						status: 'failed',
+						code: 'vault-key-name-mismatch',
+						observations: { vaultKeyNameMatches: false },
+					} );
+					expect( calls.log ).not.toContain( 'sign-out' );
+					expect( calls.log ).not.toContain( 'remove-vault-key' );
+					const cleanup = records().at( -1 );
+					expect( cleanup ).toMatchObject( { stage: 'cleanup', status: 'passed' } );
+					expect( cleanup?.observations ).not.toHaveProperty( 'vaultKeyRemoved' );
+					expectNothingUnsafe( [ 'test-access-token' ] );
+				}
+			);
 
 			it( 'fails when the remote revocation is not confirmed, and blocks a profile already signed out', async () => {
 				provisioned();
@@ -2056,6 +2643,7 @@ describe( 'ChatGPT acceptance runner', () => {
 						},
 					};
 				},
+				refreshes: () => 0,
 				probe: async () => ( { tried: true, rejected: true, terminal: true } ),
 				revocations: () => ( { total: 1, confirmed: 1, rotatedRevoked: true } ),
 				settle: async () => {
@@ -2309,6 +2897,34 @@ describe( 'ChatGPT acceptance runner', () => {
 				expectNothingUnsafe( [ 'test-access-token' ], [ REGISTRATION ] );
 			}
 		);
+
+		it( 'fails a window ask answered with a token even when the offer was no longer advertised', async () => {
+			const { services } = scriptedSession();
+			services.broker.sessionForkEnvironment = () => ( {} );
+			services.broker.askSessionToken = async () => true;
+			expect( await runChatGptAcceptance( sessionArgs(), dependencies( services ) ) ).toBe( 1 );
+			expect( stageOf( 'refresh-hold-across-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'window-ask-got-token',
+				observations: expect.objectContaining( {
+					offerAdvertisedDuringWindow: false,
+					windowDirectAskAnswered: true,
+					windowDirectAskGotToken: true,
+				} ),
+			} );
+
+			// Not advertised and not answered: nothing was handed out, so that alone passes.
+			services.broker.askSessionToken = async () => null;
+			expect( await runChatGptAcceptance( sessionArgs(), dependencies( services ) ) ).toBe( 0 );
+			expect( stageOf( 'refresh-hold-across-sign-out' )[ 1 ] ).toMatchObject( {
+				status: 'passed',
+				observations: expect.objectContaining( {
+					offerAdvertisedDuringWindow: false,
+					windowDirectAskAnswered: false,
+					windowDirectAskGotToken: false,
+				} ),
+			} );
+		} );
 
 		it( 'signs out a returning sign-in that still commits after the interrupt cancelled it', async () => {
 			const { services, calls } = scriptedSession();
@@ -2624,9 +3240,22 @@ describe( 'ChatGPT acceptance runner', () => {
 					readAccount: ( id: string ) => readChatGptAccount( id ),
 					vaultRecordExists: ( id: string ) =>
 						fs.existsSync( path.join( profileDir, 'chatgpt-credentials', `${ id }.vault` ) ),
+					vaultKeyItem: () => getChatGptVaultKeyAccounts().own,
+					removeProfileVaultKey: () => broker.removeProfileVaultKey(),
 				},
 				tokens,
 			} satisfies ChatGptAcceptanceServices;
+		}
+
+		// Every keychain item a run wrote, by name.
+		function recordKeychainWrites(): string[] {
+			const written: string[] = [];
+			const set = keychain.store.set;
+			keychain.store.set = async ( account, secret ) => {
+				written.push( account );
+				return set( account, secret );
+			};
+			return written;
 		}
 
 		// A turn the app forks: its own broker, asking the owner over an in-memory channel.
@@ -2718,6 +3347,7 @@ describe( 'ChatGPT acceptance runner', () => {
 
 		it( 'runs saved, then session in the same run directory, with real sign-ins, sign-outs and a refresh held across one', async () => {
 			const owner: { broker: ChatGptCredentialBroker | null } = { broker: null };
+			const written = recordKeychainWrites();
 			const saved = realServices( owner );
 			expect(
 				await runChatGptAcceptance(
@@ -2725,15 +3355,38 @@ describe( 'ChatGPT acceptance runner', () => {
 					dependencies( saved )
 				)
 			).toBe( 0 );
-			const { registrationId } = openAcceptanceEvidence( runDir, 'chatgpt' ).readState() as {
+			const { registrationId, vaultKeySuffix } = openAcceptanceEvidence(
+				runDir,
+				'chatgpt'
+			).readState() as {
 				registrationId: string;
+				vaultKeySuffix: string;
 			};
 			expect( ( await readChatGptAccount( registrationId ) )?.state ).toBe( 'signed-out' );
+			// The run's profile keyed its record under an item of its own, never the
+			// unscoped one, and removed that item again after its sign-out.
+			expect( new Set( written ) ).toEqual(
+				new Set( [ `${ UNSCOPED_VAULT_KEY_ITEM }-${ vaultKeySuffix }` ] )
+			);
+			expect( vaultKeySuffix ).toMatch( /^[0-9a-f]{16}$/ );
+			expect( [ ...keychain.items.keys() ] ).toEqual( [] );
+			expect( records().at( -1 ) ).toMatchObject( {
+				stage: 'cleanup',
+				status: 'passed',
+				observations: expect.objectContaining( { vaultKeyRemoved: true } ),
+			} );
+			expect( stageOf( 'refresh-before-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'passed',
+				observations: { refreshed: true },
+			} );
 			expect( stageOf( 'remote-revocation' )[ 0 ] ).toMatchObject( {
 				status: 'passed',
 				observations: expect.objectContaining( {
-					revokedRefreshRejected: true,
+					vaultRecordAfterSignOut: false,
+					rotatedRevokedBySignOut: true,
+					rotatedRefreshRejected: true,
 					rejectionTerminal: true,
+					retiredRefreshRejected: true,
 				} ),
 			} );
 
@@ -2795,6 +3448,40 @@ describe( 'ChatGPT acceptance runner', () => {
 			expect( openAcceptanceEvidence( runDir, 'chatgpt' ).readManifest()?.runs ).toHaveLength( 2 );
 			expect( ( await readChatGptAccount( registrationId ) )?.state ).toBe( 'signed-out' );
 			expectNothingUnsafe( [ ...fake.secrets(), ...issuedHere ], [ registrationId ] );
+		} );
+
+		it( 'fails the saved run’s remote revocation when the sign-out leaves the grant a refresh rotated to usable', async () => {
+			const owner: { broker: ChatGptCredentialBroker | null } = { broker: null };
+			const saved = realServices( owner );
+			const signOut = saved.broker.signOut;
+			saved.broker.signOut = async ( id ) => {
+				// From the sign-out on, the token service refuses every revocation.
+				fake.script.revoke = () => ( { status: 400, body: { error: 'unsupported_token_type' } } );
+				return signOut( id );
+			};
+			expect(
+				await runChatGptAcceptance(
+					[ '--live', '--scenario', 'saved', '--run-dir', runDir ],
+					dependencies( saved )
+				)
+			).toBe( 1 );
+			expect( stageOf( 'active-run-stops-on-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'passed',
+				observations: expect.objectContaining( {
+					localCleared: true,
+					remoteRevocationConfirmed: false,
+				} ),
+			} );
+			expect( stageOf( 'remote-revocation' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'rotated-grant-usable',
+				observations: expect.objectContaining( {
+					vaultRecordAfterSignOut: false,
+					rotatedRevokedBySignOut: false,
+					rotatedRefreshRejected: false,
+				} ),
+			} );
+			expectNothingUnsafe( [ ...fake.secrets(), ...issuedHere ] );
 		} );
 
 		it( 'fails the refresh hold when the sign-out leaves the rotated grant usable, though a reuse would revoke the grant', async () => {
@@ -2872,6 +3559,40 @@ describe( 'ChatGPT acceptance runner', () => {
 				observations: expect.objectContaining( { testRegistrationSignedOut: true } ),
 			} );
 		} );
+
+		it( 'keeps a provisioned profile’s own vault key item until retire removes it after the sign-out', async () => {
+			const owner: { broker: ChatGptCredentialBroker | null } = { broker: null };
+			const written = recordKeychainWrites();
+			expect(
+				await runChatGptAcceptance(
+					[ '--live', '--scenario', 'provision', '--run-dir', runDir ],
+					dependencies( realServices( owner ) )
+				)
+			).toBe( 0 );
+			const { registrationId, vaultKeySuffix } = openAcceptanceEvidence(
+				runDir,
+				'chatgpt'
+			).readState() as { registrationId: string; vaultKeySuffix: string };
+			const item = `${ UNSCOPED_VAULT_KEY_ITEM }-${ vaultKeySuffix }`;
+			expect( ( await readChatGptAccount( registrationId ) )?.state ).toBe( 'signed-in' );
+			expect( [ ...keychain.items.keys() ] ).toEqual( [ item ] );
+
+			printed = [];
+			expect(
+				await runChatGptAcceptance(
+					[ '--live', '--scenario', 'retire', '--run-dir', runDir ],
+					dependencies( realServices( owner ) )
+				)
+			).toBe( 0 );
+			expect( stageOf( 'profile-sign-out' )[ 0 ] ).toMatchObject( {
+				status: 'passed',
+				observations: expect.objectContaining( { localCleared: true, vaultKeyRemoved: true } ),
+			} );
+			expect( ( await readChatGptAccount( registrationId ) )?.state ).toBe( 'signed-out' );
+			expect( [ ...keychain.items.keys() ] ).toEqual( [] );
+			expect( new Set( written ) ).toEqual( new Set( [ item ] ) );
+			expectNothingUnsafe( [ ...fake.secrets(), ...issuedHere ], [ registrationId ] );
+		} );
 	} );
 } );
 
@@ -2888,6 +3609,42 @@ describe( 'acceptance turn digests', () => {
 			classifyTurnFailure( 'Limit (HTTP 429, subscription_sharing_usage_limit_exceeded)' )
 		).toEqual( [ 'usage-limit' ] );
 		expect( classifyTurnFailure( 'Something else entirely' ) ).toEqual( [] );
+	} );
+
+	it.each( [ undefined, 'signed-in', 'signed-out', 'needs-sign-in' ] as const )(
+		'classifies the disconnected connection’s text for an account %s as before, in a turn’s digest too',
+		( state ) => {
+			const text = describeConnectionSelectionError(
+				{ code: 'disconnected', providerId: 'chatgpt-oauth' },
+				state
+			);
+			expect( classifyTurnFailure( text ) ).toEqual( [ 'connection-disconnected' ] );
+			// What blocked-after-sign-out, unoffered and the window fork read.
+			expect( digestTurnEvents( [ cliError( text ) ] ).failureCodes ).toEqual( [
+				'connection-disconnected',
+			] );
+		}
+	);
+
+	it.each( [ 'changed', 'unsupported' ] as const )(
+		'classifies the %s connection’s text alone, whatever the account’s state',
+		( code ) => {
+			for ( const state of [ undefined, 'signed-out', 'needs-sign-in' ] as const ) {
+				expect(
+					classifyTurnFailure(
+						describeConnectionSelectionError( { code, providerId: 'chatgpt-oauth' }, state )
+					)
+				).toEqual( [ `connection-${ code }` ] );
+			}
+		}
+	);
+
+	it( 'never takes another code’s text for a disconnected connection', () => {
+		for ( const code of [ 'signed-out', 'needs-sign-in', 'session-unavailable' ] as const ) {
+			expect( classifyTurnFailure( new ChatGptConnectionError( code ).message ) ).toEqual( [
+				code,
+			] );
+		}
 	} );
 
 	it( 'collects tool calls, the final answer, failure codes and how the turn ended', () => {
@@ -3055,7 +3812,9 @@ describe( 'acceptance turn digests', () => {
 		const dir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-acceptance-session-file-' ) );
 		const file = path.join( dir, 'session.jsonl' );
 		try {
-			expect( isToolResultPersisted( file, 'call-1' ) ).toBe( false );
+			// A file it can't read says nothing either way.
+			expect( isToolResultPersisted( file, 'call-1' ) ).toBeNull();
+			expect( isToolResultPersisted( dir, 'call-1' ) ).toBeNull();
 			fs.writeFileSync(
 				file,
 				[
@@ -3088,6 +3847,60 @@ describe( 'acceptance turn digests', () => {
 		] );
 		expect( parseWpPostList( 'Error: not a site' ) ).toBeNull();
 		expect( parseWpPostList( '[{"ID":"x"}]' ) ).toBeNull();
+	} );
+} );
+
+describe( 'the signals that stop an acceptance run', () => {
+	// A stand-in for the process, so no real signal reaches the test worker.
+	const signalTarget = () => new EventEmitter() as unknown as Pick< NodeJS.Process, 'on' | 'off' >;
+
+	it.each( [ 'SIGINT', 'SIGTERM', 'SIGHUP' ] as const )(
+		'stops the run and cleans up on %s; a second signal of any kind exits without waiting',
+		( signal ) => {
+			const target = signalTarget();
+			const handler = vi.fn();
+			const forceExit = vi.fn();
+			const stop = onAcceptanceSignals( handler, { target, platform: 'linux', forceExit } );
+
+			( target as unknown as EventEmitter ).emit( signal );
+			expect( handler ).toHaveBeenCalledTimes( 1 );
+			expect( forceExit ).not.toHaveBeenCalled();
+
+			( target as unknown as EventEmitter ).emit( signal === 'SIGINT' ? 'SIGTERM' : 'SIGINT' );
+			expect( handler ).toHaveBeenCalledTimes( 1 );
+			expect( forceExit ).toHaveBeenCalledTimes( 1 );
+			stop();
+		}
+	);
+
+	it( 'listens for Ctrl+Break on Windows only', () => {
+		const windows = signalTarget();
+		const windowsHandler = vi.fn();
+		const stopWindows = onAcceptanceSignals( windowsHandler, {
+			target: windows,
+			platform: 'win32',
+			forceExit: vi.fn(),
+		} );
+		( windows as unknown as EventEmitter ).emit( 'SIGBREAK' );
+		expect( windowsHandler ).toHaveBeenCalledTimes( 1 );
+		stopWindows();
+
+		const linux = signalTarget();
+		onAcceptanceSignals( vi.fn(), { target: linux, platform: 'linux', forceExit: vi.fn() } );
+		expect( ( linux as unknown as EventEmitter ).listenerCount( 'SIGBREAK' ) ).toBe( 0 );
+	} );
+
+	it( 'stops listening for every signal once the run is over', () => {
+		const target = signalTarget();
+		const emitter = target as unknown as EventEmitter;
+		const stop = onAcceptanceSignals( vi.fn(), { target, platform: 'win32', forceExit: vi.fn() } );
+		for ( const signal of [ 'SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK' ] ) {
+			expect( emitter.listenerCount( signal ) ).toBe( 1 );
+		}
+		stop();
+		for ( const signal of [ 'SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK' ] ) {
+			expect( emitter.listenerCount( signal ) ).toBe( 0 );
+		}
 	} );
 } );
 
@@ -3148,7 +3961,15 @@ describe( 'acceptance token service', () => {
 	it( 'probes the retired and rotated refresh tokens, and revokes anything a probe unexpectedly issues', async () => {
 		const { inner, live } = memoryTokens();
 		const tokens = createAcceptanceTokenService( inner );
+		// Before any refresh there is nothing to probe.
+		expect( await tokens.probe( 'rotated' ) ).toEqual( {
+			tried: false,
+			rejected: false,
+			terminal: false,
+		} );
+		expect( tokens.refreshes() ).toBe( 0 );
 		await tokens.client.refresh( request( 'refresh-0' ) );
+		expect( tokens.refreshes() ).toBe( 1 );
 		expect( await tokens.probe( 'retired' ) ).toEqual( {
 			tried: true,
 			rejected: true,
@@ -3161,11 +3982,8 @@ describe( 'acceptance token service', () => {
 			terminal: false,
 		} );
 		expect( live.size ).toBe( 0 );
-		expect( await tokens.probe( 'revoked' ) ).toEqual( {
-			tried: false,
-			rejected: false,
-			terminal: false,
-		} );
+		// A probe's own refresh isn't one the broker made.
+		expect( tokens.refreshes() ).toBe( 1 );
 	} );
 
 	it( 'revokes a held result the broker gave up on, so no grant is left usable', async () => {

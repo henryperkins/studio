@@ -1,4 +1,7 @@
-import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
+import {
+	readChatGptSessionSelection,
+	toChatGptSessionContext,
+} from '@studio/agent/protocol/chatgpt';
 import {
 	describeChatGptReasoningProblem,
 	getChatGptModelCapabilities,
@@ -12,7 +15,13 @@ import { useQueryClient } from '@tanstack/react-query';
 import { __, sprintf } from '@wordpress/i18n';
 import { toast } from '@/data/app-messages';
 import { useConnector } from '@/data/core';
-import { useChatGptModels, useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
+import {
+	describeChatGptSettingsError,
+	useChatGptModels,
+	useChatGptSettings,
+	useOpenChatGptAccount,
+	useRecheckChatGptSettings,
+} from '@/data/queries/use-chatgpt-settings';
 import { saveSessionSettingChange } from '@/data/session-setting-changes';
 import { useOpenSettings } from '@/data/use-open-settings';
 import type { ComposerNotice } from './notice-tab';
@@ -27,7 +36,7 @@ export function createChatGptSelectionEntry( selection: ChatGptSessionSelection 
 		parentId: null,
 		timestamp: new Date().toISOString(),
 		customType: 'studio.session_context',
-		data: { provider: 'chatgpt-oauth', ...selection },
+		data: toChatGptSessionContext( selection ),
 	};
 }
 
@@ -43,11 +52,17 @@ export function useChatGptConversation( {
 	const connector = useConnector();
 	const queryClient = useQueryClient();
 	const settings = useChatGptSettings();
+	const { mutate: recheck } = useRecheckChatGptSettings();
 	const openSettings = useOpenSettings();
+	const openAccount = useOpenChatGptAccount();
 	const selection = readChatGptSessionSelection( entries );
 	const account = settings.data?.accounts.find(
 		( item ) =>
 			item.connectionId === selection?.connectionId && item.revision === selection.revision
+	);
+	// The registration the chat ran on, whatever its revision is now.
+	const saved = settings.data?.accounts.find(
+		( item ) => item.connectionId === selection?.connectionId
 	);
 	const models = useChatGptModels(
 		account,
@@ -63,16 +78,28 @@ export function useChatGptConversation( {
 		: undefined;
 	const capabilities = selection ? getChatGptModelCapabilities( selection.model ) : undefined;
 	let problem: string | undefined;
+	const manage = ( focus?: string ): ComposerNotice[ 'action' ] => ( {
+		label: __( 'Manage ChatGPT' ),
+		onClick: () => ( saved ? openAccount( saved.connectionId, focus ) : openSettings( 'ai' ) ),
+	} );
+	let action = manage();
 	if ( settings.isPending ) {
 		problem = __( 'Checking the ChatGPT connection…' );
 	} else if ( settings.isError ) {
-		problem = __( 'Couldn’t check the ChatGPT connection. Open Settings to retry.' );
+		problem = describeChatGptSettingsError( settings.error );
+		action = { label: __( 'Retry' ), onClick: () => recheck() };
 	} else if ( ! settings.data?.enabled ) {
 		problem = __( 'ChatGPT plan connections are not enabled in this app.' );
 	} else if ( ! selection || ! connection.ok ) {
-		problem = describeConnectionSelectionError(
-			connection.ok ? { code: 'unsupported', providerId: 'chatgpt-oauth' } : connection.error
-		);
+		const error = connection.ok
+			? { code: 'unsupported' as const, providerId: 'chatgpt-oauth' as const }
+			: connection.error;
+		// Its registration still saved, signing in to it again continues the chat.
+		const accountState = error.code === 'disconnected' ? saved?.state : undefined;
+		problem = describeConnectionSelectionError( error, accountState );
+		if ( accountState ) {
+			action = manage( __( 'ChatGPT sign-in' ) );
+		}
 	} else if ( ! reasoning?.ok ) {
 		problem = reasoning
 			? describeChatGptReasoningProblem( reasoning.problem )
@@ -84,12 +111,7 @@ export function useChatGptConversation( {
 			'This model isn’t listed for the selected ChatGPT account. Choose another model.'
 		);
 	}
-	const notice: ComposerNotice | undefined = problem
-		? {
-				message: problem,
-				action: { label: __( 'Manage ChatGPT' ), onClick: () => openSettings( 'ai' ) },
-		  }
-		: undefined;
+	const notice: ComposerNotice | undefined = problem ? { message: problem, action } : undefined;
 	const changeSelection = ( next: ChatGptSessionSelection ) => {
 		if ( ! sessionId ) return;
 		const result = resolveChatGptReasoning( next.model, next.reasoningEffort );

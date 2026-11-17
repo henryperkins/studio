@@ -115,7 +115,6 @@ function createTools(
 					? renderSkill( args.skill )
 					: buildSystemPrompt( {
 							external: true,
-							ownImageTool: client.ownImageTool,
 							tools: [ ...definitions, designOptions ],
 					  } )
 			),

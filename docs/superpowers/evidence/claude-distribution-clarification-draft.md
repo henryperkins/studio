@@ -43,7 +43,7 @@ Thank you,
 
 ## Basis (for the owner; remove before sending)
 
-Files read in the Claude worktree at `ce4eea5dc` (`C:/Users/htper/.codex/worktrees/add-claude-runtime/studio`), under `packages/agent/node/claude-code/` unless noted:
+Files read in the Claude worktree at `ce4eea5dc` (`~/.codex/worktrees/add-claude-runtime/studio`), under `packages/agent/node/claude-code/` unless noted:
 
 - B1: `discovery.ts` `inspectClaudeExecutable` (absolute `.exe` path, PE header and x64 machine check, PowerShell `Get-AuthenticodeSignature` status Valid with signer `Anthropic, PBC`, `--version` compared with `QUALIFIED_CLAUDE_CODE_VERSION`, platform gate `win32`). `studio-surface.ts` `configureClaudeRuntime` ("save" takes `executablePath` from the user). No download code in `discovery.ts` or `connection.ts`.
 - B2: `connection.ts` `openClaudeNativeSignIn` (PowerShell `Start-Process ... -ArgumentList @('auth','login') -WindowStyle Normal`, after the same executable, environment, configuration and managed-policy checks).

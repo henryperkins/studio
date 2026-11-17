@@ -1,3 +1,4 @@
+import { canPinChatGptInPlace } from '@studio/agent/protocol/chatgpt';
 import { getDefaultChatGptReasoningEffort } from '@studio/agent/protocol/chatgpt-models';
 import { aiModelSupportsImages, getAiModelLabel, isAiModelId } from '@studio/agent/protocol/models';
 import { isOpenAiReasoningEffort } from '@studio/agent/protocol/openai-models';
@@ -17,7 +18,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { toast } from '@/data/app-messages';
-import { useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
+import { nameChatGptAccount, useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
 import { useImageService } from '@/data/queries/use-image-service';
 import { useIsOutOfAiCredits } from '@/data/queries/use-is-out-of-ai-credits';
 import { useSaveUserPreferences, useUserPreferences } from '@/data/queries/use-user-preferences';
@@ -224,18 +225,31 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		chatGptSettings?.enabled && onSwitchSession && ! isField ? chatGptSettings.accounts : [];
 	const canChooseModel = providers.length > 0 || chatGptAccounts.length > 0 || !! chatGpt;
 	const connectionSwitch = useConnectionSwitch( ownerSiteId, onSwitchSession );
+	// Until the site's new chat is on the chosen ChatGPT account, nothing is sent
+	// and no other model is chosen: the composer still shows the previous one.
+	const startingChat = ! sessionId && ! isField && connectionSwitch.starting;
+	// Nor while a send from it is on its way, where a ChatGPT account can be chosen:
+	// the message leaves on the model shown, and the chat it opens is that message's.
+	const modelBusy =
+		startingChat ||
+		( ! sessionId && ! isField && chatGptAccounts.length > 0 && connectionSwitch.sendingDraft );
 	const chatGptModel = chatGpt?.selection?.model;
 	const chatGptModelLabel = chatGpt
 		? chatGptModel && isAiModelId( chatGptModel )
 			? getAiModelLabel( chatGptModel )
 			: chatGptModel || __( 'ChatGPT model unavailable' )
 		: undefined;
-	const chatGptLabel = chatGpt
+	const chatGptAccountName = chatGpt
 		? chatGpt.account
-			? `${ chatGpt.account.label } · ${
-					chatGpt.account.email ?? chatGpt.account.connectionId.slice( 0, 8 )
-			  } · ${ chatGpt.account.connectionId.slice( 0, 8 ) }`
+			? nameChatGptAccount( chatGpt.account, chatGptSettings?.accounts ?? [] )
 			: chatGpt.selection?.connectionId.slice( 0, 8 ) || __( 'Account unavailable' )
+		: undefined;
+	const chatGptConnection = chatGptAccountName
+		? sprintf(
+				/* translators: %s: the ChatGPT account a chat runs on. */
+				__( 'ChatGPT plan · %s' ),
+				chatGptAccountName
+		  )
 		: undefined;
 	const isWpcom = sessionProvider === 'wpcom';
 	const isOutOfCredits = useIsOutOfAiCredits() && isWpcom;
@@ -267,6 +281,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 			canChangeEnvironment: !! onEnvironmentChange,
 		} ),
 		isDisabled: ( name ) =>
+			( name === 'model' && modelBusy ) ||
 			( name === siteCommand && siteActionDisabled ) ||
 			( name === 'auto-start' && ( ! preferences || savePreferences.isPending ) ) ||
 			( ( name === 'live' || name === 'local' ) && busy ),
@@ -373,6 +388,9 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		attachments,
 	} );
 	const changeModel = ( nextProvider: AiProviderId, nextModel: AiModelId ) => {
+		if ( modelBusy ) {
+			return;
+		}
 		if ( chatGpt && nextProvider !== 'chatgpt-oauth' ) {
 			connectionSwitch.request( { provider: nextProvider, model: nextModel } );
 		} else {
@@ -380,6 +398,9 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		}
 	};
 	const changeChatGptModel = ( account: ChatGptAccountView, nextModel: string ) => {
+		if ( modelBusy ) {
+			return;
+		}
 		const current = chatGpt?.selection;
 		const sameConnection =
 			current?.connectionId === account.connectionId && current.revision === account.revision;
@@ -400,11 +421,23 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		};
 		if ( sameConnection && chatGpt ) {
 			chatGpt.changeSelection( selection );
+		} else if ( ! chatGpt && canPinChatGptInPlace( entries ?? [] ) ) {
+			connectionSwitch
+				.startInPlace( selection, sessionId, { key: draftKey, environment } )
+				.catch( ( error: unknown ) =>
+					toast.error(
+						sprintf(
+							/* translators: %s: why the choice could not be saved. */
+							__( 'The ChatGPT model or reasoning change wasn’t saved. %s' ),
+							error instanceof Error ? error.message : __( 'Try again.' )
+						)
+					)
+				);
 		} else {
 			connectionSwitch.request( {
 				provider: 'chatgpt-oauth',
 				selection,
-				label: `${ account.label } · ${ account.connectionId.slice( 0, 8 ) }`,
+				label: nameChatGptAccount( account, chatGptAccounts ),
 			} );
 		}
 	};
@@ -425,7 +458,11 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		const trimmed = value.trim();
 		// Read at send time: the preview may have staged notes a moment ago.
 		const sentNotes = busy ? [] : getStagedAnnotations( annotationSiteId );
-		if ( sending || ( ! trimmed && attachments.length === 0 && sentNotes.length === 0 ) ) {
+		if (
+			sending ||
+			startingChat ||
+			( ! trimmed && attachments.length === 0 && sentNotes.length === 0 )
+		) {
 			return;
 		}
 		if ( blockingNotice || isOutOfCredits ) {
@@ -495,6 +532,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		value,
 		draftKey,
 		sending,
+		startingChat,
 		attachments,
 		busy,
 		blockingNotice,
@@ -528,7 +566,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 
 	const showStop = ! isField && busy && ( sending || ! hasContent );
 	const showStart = ! busy && ! sending && ! hasContent && !! onStartSite;
-	const canSend = hasContent && ! sending;
+	const canSend = hasContent && ! sending && ! startingChat;
 	const placeholder = answerQuestion
 		? __( 'Your answer' )
 		: placeholderOverride ??
@@ -682,11 +720,12 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 									sessionProvider={ sessionProvider }
 									getModelLockReason={ getModelLockReason }
 									disabled={ busy && ! chatGpt }
+									busy={ modelBusy }
 									anchor={ rootNode }
 									onChange={ changeModel }
 									onAddCredits={ openAddCredits }
 									chatGptAccounts={ chatGptAccounts }
-									chatGptLabel={ chatGptLabel }
+									chatGptConnection={ chatGptConnection }
 									chatGptModel={ chatGptModelLabel }
 									chatGptModelId={ chatGptModel }
 									chatGptConnectionId={ chatGpt?.selection?.connectionId }
@@ -734,12 +773,12 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 					</div>
 					{ chatGpt ? (
 						<div className={ styles.connectionLabel }>
-							{ __( 'ChatGPT plan' ) } · { chatGptLabel }
+							{ chatGptConnection }
 							{ imageService ? (
 								<ImageServiceNote
 									className={ styles.imageServiceNote }
 									state={ imageService }
-									subscription={ __( 'ChatGPT plan' ) }
+									plan="chatgpt"
 									onSetUp={ () => openSettings( 'ai' ) }
 								/>
 							) : null }

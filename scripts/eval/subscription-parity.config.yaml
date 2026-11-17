@@ -18,7 +18,8 @@
 #
 # Every case is judged on a deterministic final state or on what the user was
 # shown (outcome.mjs). Under `remote: mock` no state-changing request leaves
-# the eval process itself: pushes, pulls and preview create, update and
+# the eval process itself by the senders its guard patches (README says which,
+# and what it can't cover): pushes, pulls and preview create, update and
 # delete are recorded by a mocked host, writes through `wpcom_request` (a
 # `_method` or `method` override in its query argument or in a query written
 # into its path, including the key spellings PHP folds into `_method`, counts as
@@ -31,15 +32,21 @@
 # HEAD) still reach WordPress.com with the case's copy of your login, and a
 # command the agent starts from its shell still runs with the case's copied
 # login and is not covered, as in the rest of the eval suite (README). The
-# `staging:` cases at the end run without the write guard, belong alone in their
-# run, and change only the staging site you designate for
-# the run and are refused without it. Cases marked `[image service]` need
+# `staging:` cases at the end belong alone in their run and are refused without
+# a staging site you designate for the run; the write guard stays on in them
+# and lets through only a push to that site and writes to its core REST API
+# (`wp/v2`), refusing any other write, pull or preview change
+# (`wpcom-write-outside-staging`; README, "Staging"). Cases marked `[image service]` need
 # Studio's separate WordPress.com image service and are refused without it; the
 # `imageService` states each case's mode: "required" (the `[image service]`
 # cases), "off" (purely local: no WordPress.com login) or "unused" (keeps the
 # login for a connected site, push or preview; an image request fails the case).
 # `[fixture-forced compaction]` case starts from a seeded history whose last
-# reply reports a context at the compaction threshold.
+# reply reports a context at the compaction threshold. A case with
+# `needsToolImages` is judged on images a tool returns to the model: on a route
+# whose capability table doesn't qualify the model for them (ChatGPT until gate
+# T1) it is blocked before it runs (`tool-images-not-qualified`), and it runs by
+# itself once the table does.
 
 description: Studio Code subscription provider parity
 
@@ -55,6 +62,9 @@ defaultTest:
   vars:
     requireProvider: true
     remote: mock
+    # Every check of every case here goes through outcome.mjs, which adds a
+    # record of its own to the case's summary; the route record says so.
+    everyCheckRecorded: true
   assert:
     - type: javascript
       value: file://outcome.mjs:ranOnRequestedRoute
@@ -235,6 +245,7 @@ tests:
     vars:
       imageService: "off"
       caseId: parity-screenshot-desktop-mobile
+      needsToolImages: true
       timeoutMs: 240000
       seed:
         activeSite:
@@ -251,6 +262,7 @@ tests:
     vars:
       imageService: "off"
       caseId: parity-screenshot-interpretation
+      needsToolImages: true
       expectedText: PARITY VISION 4402
       allowedTools: [{ name: take_screenshot }, { name: Skill }]
       timeoutMs: 240000

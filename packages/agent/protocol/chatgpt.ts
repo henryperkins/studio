@@ -1,7 +1,9 @@
 import { getDefaultChatGptReasoningEffort } from './chatgpt-models';
 import { readSessionPin } from './providers';
+import { isStudioCustomEntryOfType } from './sessions/entry-types';
 import type { ConnectionRegistryEntry } from './connections';
 import type { OpenAiReasoningEffort } from './openai-models';
+import type { StudioSessionContextData } from './sessions/entry-types';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 
 export type ChatGptCredentialStorage = 'vault' | 'session';
@@ -32,15 +34,65 @@ export interface ChatGptSessionSelection {
 	reasoningEffort: OpenAiReasoningEffort;
 }
 
+const asString = ( value: unknown ) => ( typeof value === 'string' ? value : undefined );
+
+/**
+ * The `studio.session_context` record of a ChatGPT selection. Its model and
+ * effort go under `chatGpt`, never in the fields every provider's records
+ * share, so a build that doesn't know ChatGPT finds nothing there to act on.
+ */
+export function toChatGptSessionContext(
+	selection: Pick< ChatGptSessionSelection, 'connectionId' | 'revision' | 'model' > & {
+		reasoningEffort: string;
+	}
+): StudioSessionContextData {
+	return {
+		provider: 'chatgpt-oauth',
+		connectionId: selection.connectionId,
+		revision: selection.revision,
+		chatGpt: { model: selection.model, reasoningEffort: selection.reasoningEffort },
+	};
+}
+
+/** A ChatGPT record's model and effort, as written now or before they moved under `chatGpt`. */
+export function readChatGptContextChoice( record: StudioSessionContextData | undefined ): {
+	model?: string;
+	reasoningEffort?: string;
+} {
+	const chatGpt = typeof record?.chatGpt === 'object' ? record.chatGpt : undefined;
+	return {
+		model: asString( chatGpt?.model ) ?? asString( record?.model ),
+		reasoningEffort: asString( chatGpt?.reasoningEffort ) ?? asString( record?.reasoningEffort ),
+	};
+}
+
+/**
+ * Whether a chat that isn't on ChatGPT can be put on it where it is, rather
+ * than in a new chat: only while nothing in it could move between billing
+ * routes, so no turn, model change, summary or provider pin yet.
+ */
+export function canPinChatGptInPlace( entries: SessionEntry[] ): boolean {
+	return ! entries.some(
+		( entry ) =>
+			entry.type === 'message' ||
+			entry.type === 'model_change' ||
+			entry.type === 'compaction' ||
+			entry.type === 'branch_summary' ||
+			isStudioCustomEntryOfType( entry, 'studio.user_prompt' ) ||
+			isStudioCustomEntryOfType( entry, 'studio.session_context' )
+	);
+}
+
 /** Keeps an unsupported stored effort visible until the user changes it. */
 export function readChatGptSessionSelection( entries: SessionEntry[] ) {
 	const pin = readSessionPin( entries );
 	if ( pin?.provider !== 'chatgpt-oauth' ) return undefined;
+	const { model = '', reasoningEffort } = readChatGptContextChoice( pin );
 	return {
 		connectionId: pin.connectionId ?? '',
 		revision: pin.revision ?? -1,
-		model: pin.model ?? '',
-		reasoningEffort: pin.reasoningEffort ?? getDefaultChatGptReasoningEffort( pin.model ?? '' ),
+		model,
+		reasoningEffort: reasoningEffort ?? getDefaultChatGptReasoningEffort( model ),
 	};
 }
 

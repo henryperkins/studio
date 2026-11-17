@@ -1,4 +1,5 @@
 export { ConnectorProvider, useConnector } from './connector-context';
+export { ChatGptSettingsError } from './connectors/chatgpt-settings-error';
 export { queryClient, persistPromise } from './query-client';
 export type {
 	AgentApp,

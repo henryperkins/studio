@@ -15,11 +15,14 @@ export interface ChatGptModelCapabilities {
 	 * sent, and the route's mode support is undocumented, so this is standard.
 	 */
 	reasoningModes: readonly OpenAiReasoningMode[];
-	/**
-	 * Accepts images: those the user attaches, and those tool results carry
-	 * (screenshots, image files read), so screenshot tools may be offered.
-	 */
+	/** Accepts images the user attaches to a message. */
 	imageInput: boolean;
+	/**
+	 * Accepts images in tool results (screenshots, image files read). Off, the
+	 * tools still run and return their text without the image, as for a model
+	 * that can't view images.
+	 */
+	toolImageInput: boolean;
 }
 
 /**
@@ -41,12 +44,15 @@ export const CHATGPT_LOCAL_CONTEXT_BUDGET = 200_000;
 export const CHATGPT_MODEL_CAPABILITIES: Readonly< Record< string, ChatGptModelCapabilities > > =
 	Object.freeze( {
 		// Low and medium completed in a captured run; the other efforts were never
-		// sent. Image input: the route takes images when the model accepts them
-		// (SIWC "Preview limitations"), which this model's page states.
+		// sent. Attached images: the route takes images when the model accepts
+		// them (SIWC "Preview limitations"), which this model's page states.
+		// Images in tool results: no source names them for this route and no
+		// request carrying one was seen, so off until gate T1 observes one accepted.
 		'gpt-6-luna': Object.freeze( {
 			reasoningEfforts: Object.freeze( [ 'low', 'medium' ] as const ),
 			reasoningModes: Object.freeze( [ 'standard' ] as const ),
 			imageInput: true,
+			toolImageInput: false,
 		} ),
 	} );
 

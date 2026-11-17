@@ -3,10 +3,14 @@ import { __, sprintf } from '@wordpress/i18n';
 import { useEffect, useRef, useState } from 'react';
 import { useConnector } from '@/data/core';
 import {
+	describeChatGptSettingsError,
 	holdChatGptConnection,
+	nameChatGptAccount,
 	refreshChatGptSettings,
+	useChatGptAccountToOpen,
 	useChatGptModels,
 	useChatGptSettings,
+	useRecheckChatGptSettings,
 } from '@/data/queries/use-chatgpt-settings';
 import { useOffline } from '@/lib/hooks';
 import { Badge, Button } from '@/lib/ui';
@@ -18,6 +22,8 @@ import type { ChatGptCredentialStorage } from '@studio/agent/protocol/chatgpt';
 interface SignInAttempt {
 	id?: string;
 	cancelled: boolean;
+	// Its outcome has arrived, or it failed: there is nothing left to cancel.
+	ended?: boolean;
 }
 
 export function ChatGptSettingsGroup() {
@@ -25,7 +31,8 @@ export function ChatGptSettingsGroup() {
 	const queryClient = useQueryClient();
 	const settings = useChatGptSettings();
 	const offline = useOffline();
-	const [ selectedId, setSelectedId ] = useState< string >();
+	const accountToOpen = useChatGptAccountToOpen();
+	const [ selectedId, setSelectedId ] = useState( accountToOpen );
 	const [ storage, setStorage ] = useState< ChatGptCredentialStorage >( 'vault' );
 	const [ pending, setPending ] = useState( false );
 	const [ signingOut, setSigningOut ] = useState( false );
@@ -39,6 +46,18 @@ export function ChatGptSettingsGroup() {
 		? accounts.find( ( item ) => item.connectionId === selectedId )
 		: accounts[ 0 ];
 	const models = useChatGptModels( account, false );
+	const rechecking = useRecheckChatGptSettings();
+	const { mutate: recheck } = rechecking;
+	const enabled = !! settings.data?.enabled;
+	const rechecked = useRef( false );
+
+	// Once the provider is known to be on: polled reads don't check the keychain.
+	useEffect( () => {
+		if ( enabled && ! rechecked.current ) {
+			rechecked.current = true;
+			recheck();
+		}
+	}, [ enabled, recheck ] );
 
 	useEffect( () => {
 		mounted.current = true;
@@ -60,6 +79,8 @@ export function ChatGptSettingsGroup() {
 		setPending( true );
 		setMessage( '' );
 		setError( '' );
+		// The account whose model list the sign-in may change: none yet for a new one.
+		let signedIn = registrationId;
 		try {
 			const started = await connector.beginChatGptSignIn( registrationId, {
 				storage,
@@ -68,6 +89,7 @@ export function ChatGptSettingsGroup() {
 			active.id = started.attemptId;
 			if ( active.cancelled ) {
 				await connector.cancelChatGptSignIn( active.id );
+				if ( mounted.current ) setError( __( 'Signing in was cancelled.' ) );
 				return;
 			}
 			const outcome = await connector.waitForChatGptSignIn( active.id );
@@ -75,11 +97,15 @@ export function ChatGptSettingsGroup() {
 				return;
 			}
 			if ( outcome.ok ) {
+				signedIn = outcome.registrationId;
 				setSelectedId( outcome.registrationId );
+				// Including a failed cancel's: the attempt it couldn't stop succeeded.
+				setError( '' );
 				setMessage( __( 'ChatGPT account connected.' ) );
 				setReconsent( false );
 			} else {
-				setMessage( outcome.message );
+				// Cancelled, timed out, denied…: said once, as the attempt's outcome.
+				setError( outcome.message );
 				setReconsent( outcome.code === 'permission-missing' );
 			}
 		} catch ( failure ) {
@@ -89,7 +115,8 @@ export function ChatGptSettingsGroup() {
 				);
 			}
 		} finally {
-			await refreshChatGptSettings( queryClient );
+			active.ended = true;
+			await refreshChatGptSettings( queryClient, signedIn );
 			if ( mounted.current && attempt.current === active ) {
 				attempt.current = null;
 				setPending( false );
@@ -97,14 +124,17 @@ export function ChatGptSettingsGroup() {
 		}
 	};
 
+	// The attempt then ends as cancelled, which `signIn` says.
 	const cancel = async () => {
 		const active = attempt.current;
 		if ( ! active ) return;
 		active.cancelled = true;
+		if ( ! active.id ) return;
 		try {
-			if ( active.id ) await connector.cancelChatGptSignIn( active.id );
-			setMessage( __( 'Signing in was cancelled.' ) );
+			await connector.cancelChatGptSignIn( active.id );
 		} catch ( failure ) {
+			// Too late to matter once the attempt has ended: its outcome is what's said.
+			if ( ! mounted.current || attempt.current !== active || active.ended ) return;
 			setError(
 				failure instanceof Error ? failure.message : __( 'Couldn’t cancel sign-in. Try again.' )
 			);
@@ -113,17 +143,18 @@ export function ChatGptSettingsGroup() {
 
 	const signOut = async () => {
 		if ( ! account ) return;
+		const { connectionId } = account;
 		setSigningOut( true );
 		setError( '' );
 		setMessage( '' );
 		try {
-			await holdChatGptConnection( queryClient, account.connectionId );
-			const result = await connector.signOutChatGpt( account.connectionId );
-			if ( mounted.current ) {
+			await holdChatGptConnection( queryClient, connectionId );
+			const result = await connector.signOutChatGpt( connectionId );
+			if ( mounted.current && ! result.localCleared ) {
+				setError( __( 'Studio couldn’t clear this sign-in. Try signing out again.' ) );
+			} else if ( mounted.current ) {
 				setMessage(
-					! result.localCleared
-						? __( 'Studio couldn’t clear this sign-in. Try signing out again.' )
-						: result.remoteRevocationConfirmed
+					result.remoteRevocationConfirmed
 						? __( 'Signed out locally. Remote revocation confirmed.' )
 						: __(
 								'Signed out locally. Remote revocation wasn’t confirmed; you can remove Studio in your ChatGPT account settings.'
@@ -136,21 +167,14 @@ export function ChatGptSettingsGroup() {
 					failure instanceof Error ? failure.message : __( 'Couldn’t sign out. Try again.' )
 				);
 		} finally {
-			await refreshChatGptSettings( queryClient );
+			await refreshChatGptSettings( queryClient, connectionId );
 			if ( mounted.current ) setSigningOut( false );
 		}
 	};
 
+	// Nothing about ChatGPT shows until a read has said it is on, whatever a failed read says.
 	if ( ! settings.data?.enabled ) {
-		return settings.isError ? (
-			<SettingsGroup title={ __( 'ChatGPT plan' ) }>
-				<SettingsRow title={ __( 'Couldn’t load ChatGPT accounts.' ) }>
-					<Button variant="outline" onClick={ () => void settings.refetch() }>
-						{ __( 'Retry' ) }
-					</Button>
-				</SettingsRow>
-			</SettingsGroup>
-		) : null;
+		return null;
 	}
 	const busy = pending || signingOut;
 	const canSignIn =
@@ -159,6 +183,17 @@ export function ChatGptSettingsGroup() {
 		settings.data.signInSupported &&
 		( storage === 'session' || settings.data.secureStorage === 'available' );
 	const connected = account?.authStatus === 'connected';
+	// Signing in again keeps an account's chats going, which a new account can't.
+	const signInAgainFirst = !! account && ! connected;
+	const signInAgain = account ? (
+		<Button
+			variant={ signInAgainFirst ? 'accent' : 'outline' }
+			disabled={ ! canSignIn }
+			onClick={ () => void signIn( account.connectionId ) }
+		>
+			{ __( 'Sign in again' ) }
+		</Button>
+	) : null;
 	const availability = models.data?.models;
 	const listsUnqualified = !! models.data?.listsUnqualifiedModels;
 	const availabilityDescription = () => {
@@ -195,13 +230,34 @@ export function ChatGptSettingsGroup() {
 				'Use your ChatGPT plan in Studio. Choose the account and model in each chat; usage counts toward that account’s plan limits.'
 			) }
 		>
+			{ settings.isError ? (
+				<SettingsRow
+					title={ __( 'ChatGPT accounts' ) }
+					error={ describeChatGptSettingsError( settings.error ) }
+				>
+					<Button
+						variant="outline"
+						loading={ rechecking.isPending }
+						loadingAnnouncement={ __( 'Checking ChatGPT accounts' ) }
+						onClick={ () => recheck() }
+					>
+						{ __( 'Retry' ) }
+					</Button>
+				</SettingsRow>
+			) : null }
 			{ accounts.length > 0 ? (
 				<SettingsRow
 					title={ __( 'Saved ChatGPT account' ) }
 					description={
+						// The list names an account by its label, which is usually its email already.
 						account
-							? `${ account.email ?? account.label } · ${ account.connectionId.slice( 0, 8 ) }`
+							? account.email !== account.label
+								? account.email
+								: undefined
 							: __( 'Choose a saved account.' )
+					}
+					additionalContent={
+						settings.isError ? __( 'This status may be out of date.' ) : undefined
 					}
 					badge={
 						connected ? (
@@ -219,7 +275,7 @@ export function ChatGptSettingsGroup() {
 						disabled={ busy }
 						options={ accounts.map( ( item ) => ( {
 							value: item.connectionId,
-							label: `${ item.label } · ${ item.connectionId.slice( 0, 8 ) }`,
+							label: nameChatGptAccount( item, accounts ),
 						} ) ) }
 						onChange={ ( id ) => {
 							setSelectedId( id );
@@ -265,55 +321,56 @@ export function ChatGptSettingsGroup() {
 				stacked
 				error={ error || undefined }
 				description={
-					! settings.data.signInSupported ? (
-						__( 'Open Studio on localhost to sign in to ChatGPT on this computer.' )
-					) : pending ? (
-						<span role="status" aria-label={ __( 'ChatGPT sign-in status' ) }>
-							{ __( 'Complete sign-in in your browser. You can cancel here.' ) }
-						</span>
-					) : message ? (
-						<span role="status" aria-label={ __( 'ChatGPT sign-in status' ) }>
-							{ message }
-						</span>
-					) : (
-						__(
-							'Sign-in opens in your system browser. Grant permission to use models with your ChatGPT plan.'
-						)
-					)
+					settings.data.signInSupported
+						? __(
+								'Sign-in opens in your system browser. Grant permission to use models with your ChatGPT plan.'
+						  )
+						: __( 'Open Studio on localhost to sign in to ChatGPT on this computer.' )
 				}
 			>
-				<div className={ styles.keyForm }>
-					{ pending ? (
-						<Button variant="outline" onClick={ () => void cancel() }>
-							{ __( 'Cancel sign-in' ) }
-						</Button>
-					) : (
-						<>
-							<Button variant="accent" disabled={ ! canSignIn } onClick={ () => void signIn() }>
-								{ accounts.length ? __( 'Add account' ) : __( 'Start sign-in' ) }
+				<div className={ styles.signInControl }>
+					<div className={ styles.keyForm }>
+						{ pending ? (
+							<Button variant="outline" onClick={ () => void cancel() }>
+								{ __( 'Cancel sign-in' ) }
 							</Button>
-							{ account ? (
-								<>
-									<Button
-										variant="outline"
-										disabled={ ! canSignIn }
-										onClick={ () => void signIn( account.connectionId ) }
-									>
-										{ __( 'Sign in again' ) }
-									</Button>
-									<Button
-										variant="outline"
-										disabled={ busy }
-										loading={ signingOut }
-										loadingAnnouncement={ __( 'Signing out' ) }
-										onClick={ () => void signOut() }
-									>
-										{ __( 'Sign out' ) }
-									</Button>
-								</>
-							) : null }
-						</>
-					) }
+						) : (
+							<>
+								{ signInAgainFirst ? signInAgain : null }
+								<Button
+									variant={ signInAgainFirst ? 'outline' : 'accent' }
+									disabled={ ! canSignIn }
+									onClick={ () => void signIn() }
+								>
+									{ accounts.length ? __( 'Add account' ) : __( 'Start sign-in' ) }
+								</Button>
+								{ account ? (
+									<>
+										{ signInAgainFirst ? null : signInAgain }
+										<Button
+											variant="outline"
+											disabled={ busy }
+											loading={ signingOut }
+											loadingAnnouncement={ __( 'Signing out' ) }
+											onClick={ () => void signOut() }
+										>
+											{ __( 'Sign out' ) }
+										</Button>
+									</>
+								) : null }
+							</>
+						) }
+					</div>
+					{ /* Mounted before it has anything to say, so its first message is announced. */ }
+					<p
+						role="status"
+						aria-label={ __( 'ChatGPT sign-in status' ) }
+						className={ styles.signInStatus }
+					>
+						{ pending
+							? __( 'Complete sign-in in your browser. You can cancel here.' )
+							: message || null }
+					</p>
 				</div>
 			</SettingsRow>
 			{ account ? (
@@ -333,7 +390,7 @@ export function ChatGptSettingsGroup() {
 					</Button>
 				</SettingsRow>
 			) : null }
-			<ImageServiceSettingsRow subscription={ __( 'ChatGPT plan' ) } />
+			<ImageServiceSettingsRow plan="chatgpt" />
 		</SettingsGroup>
 	);
 }

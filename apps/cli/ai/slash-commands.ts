@@ -1,4 +1,4 @@
-import { isChatGptEnabled } from '@studio/agent/node/chatgpt/settings';
+import { isChatGptEnabled, readSavedChatGptSignIns } from '@studio/agent/node/chatgpt/settings';
 import { readAiSettings, removeOpenAiApiKey } from '@studio/agent/node/settings-store';
 import {
 	aiModelRequiresPaidCredits,
@@ -91,6 +91,21 @@ export function getActiveSlashCommands(): SlashCommandDef[] {
 	return AI_CHAT_SLASH_COMMANDS.filter(
 		( command ) => command.name !== 'chatgpt' || isChatGptEnabled()
 	).sort( ( a, b ) => a.name.localeCompare( b.name ) );
+}
+
+/**
+ * The command a prompt that is exactly `/<name>` runs. With ChatGPT off,
+ * `/chatgpt` isn't listed, and is a command only while a saved sign-in exists,
+ * to sign it out: removing Studio's access never depends on the flag. Without
+ * one, read from the accounts index alone, it is a prompt, as before ChatGPT.
+ */
+export async function findSlashCommand( prompt: string ): Promise< SlashCommandDef | undefined > {
+	const command = AI_CHAT_SLASH_COMMANDS.find( ( item ) => `/${ item.name }` === prompt );
+	if ( command?.name !== 'chatgpt' || isChatGptEnabled() ) {
+		return command;
+	}
+	const saved = await readSavedChatGptSignIns().catch( () => [] );
+	return saved.length ? command : undefined;
 }
 
 function isPromptAbortError( error: unknown ): boolean {

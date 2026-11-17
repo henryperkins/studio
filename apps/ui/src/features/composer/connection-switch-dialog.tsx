@@ -36,13 +36,15 @@ export function ConnectionSwitchDialog( {
 			<DialogContent layout="compact" initialFocus={ cancelRef } closeButtonDisabled={ inFlight }>
 				<DialogHeader>
 					<DialogTitle>{ __( 'Start a new chat?' ) }</DialogTitle>
-					<DialogDescription className={ styles.dialogDescription }>
-						{ __(
-							'Changing the account or billing connection starts a new chat. The previous history, draft and attachments stay in the original chat. Only a summary you enter below carries over.'
-						) }
+					<DialogDescription className={ styles.dialogDescription } render={ <div /> }>
+						<p>
+							{ __(
+								'Changing the account or billing connection starts a new chat. The previous history, draft and attachments stay in the original chat. Only a summary you enter below carries over.'
+							) }
+						</p>
+						<p className={ styles.connectionTarget }>{ target }</p>
 					</DialogDescription>
 				</DialogHeader>
-				<p className={ styles.connectionTarget }>{ target }</p>
 				<Field>
 					<FieldLabel htmlFor={ id }>{ __( 'Context summary (optional)' ) }</FieldLabel>
 					<Textarea

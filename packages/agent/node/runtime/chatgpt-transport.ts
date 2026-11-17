@@ -3,6 +3,7 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
+	type Message,
 	type Model,
 	type SimpleStreamOptions,
 	type ThinkingLevelMap,
@@ -17,6 +18,7 @@ import {
 	type ChatGptRouteResponse,
 	type ChatGptTokenSource,
 } from '@studio/agent/node/chatgpt/route';
+import { isChatGptToolImageLiveCheckOn } from '@studio/agent/node/chatgpt/tool-images';
 import { OPENAI_API_BASE_URL } from '@studio/agent/node/openai-model-list';
 import { toPiThinkingLevel } from '@studio/agent/node/runtime/openai-transport';
 import {
@@ -36,7 +38,7 @@ import {
 	type OpenAiReasoningEffort,
 } from '@studio/agent/protocol/openai-models';
 import { CHATGPT_PI_PROVIDER } from '@studio/agent/protocol/providers';
-import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import type { ModelRuntime, SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { ProviderModelRef } from '@studio/agent/protocol/connections';
 
 /*
@@ -346,10 +348,91 @@ function buildThinkingLevelMap( efforts: readonly OpenAiReasoningEffort[] ): Thi
 	) as ThinkingLevelMap;
 }
 
+/**
+ * Whether a turn on this ChatGPT-route model sends the images tool results
+ * carry. Off unless the table qualifies them, or the live check's override is
+ * on for a model that takes images at all.
+ */
+export function sendsChatGptToolImages( modelId: string ): boolean {
+	const capabilities = getChatGptModelCapabilities( modelId );
+	return Boolean(
+		capabilities?.imageInput && ( capabilities.toolImageInput || isChatGptToolImageLiveCheckOn() )
+	);
+}
+
+// What the model reads where a tool result's image was, on a route that isn't
+// sent images from tools.
+const TOOL_IMAGE_LEFT_OUT = {
+	type: 'text' as const,
+	text: '(image left out: images from tools aren’t sent on this route)',
+};
+
+// Every image a tool result carries, this turn's or one recorded before,
+// replaced by one note; images the user attached stay.
+function withoutToolResultImages< T extends { messages: Message[] } >( context: T ): T {
+	const carriesImage = ( message: Message ) =>
+		message.role === 'toolResult' && message.content.some( ( block ) => block.type === 'image' );
+	if ( ! context.messages.some( carriesImage ) ) {
+		return context;
+	}
+	return {
+		...context,
+		messages: context.messages.map( ( message ) => {
+			if ( message.role !== 'toolResult' || ! carriesImage( message ) ) {
+				return message;
+			}
+			const content: typeof message.content = [];
+			for ( const block of message.content ) {
+				if ( block.type !== 'image' ) {
+					content.push( block );
+				} else if ( content.at( -1 ) !== TOOL_IMAGE_LEFT_OUT ) {
+					content.push( TOOL_IMAGE_LEFT_OUT );
+				}
+			}
+			return { ...message, content };
+		} ),
+	};
+}
+
+// pi records its model's id in the session (`model_change` entries, each
+// reply). A slug alone there would read, to a Studio that doesn't know
+// ChatGPT, as the OpenAI API model of the same name, so the chat would go on
+// there with its history. Only requests carry the bare slug.
+const PI_MODEL_ID_PREFIX = `${ CHATGPT_PI_PROVIDER }:`;
+
+/** The id a ChatGPT-route model has in pi and in session records: never a bare slug. */
+export function chatGptPiModelId( slug: string ): string {
+	return `${ PI_MODEL_ID_PREFIX }${ slug }`;
+}
+
+// The route's slug for a pi model id, or the id itself for one without the prefix.
+const chatGptSlugOf = ( piModelId: string ) =>
+	piModelId.startsWith( PI_MODEL_ID_PREFIX )
+		? piModelId.slice( PI_MODEL_ID_PREFIX.length )
+		: piModelId;
+
+/**
+ * Whether a session's ChatGPT replies were recorded under the bare slug, as
+ * this branch recorded them before: such a session keeps that id, so pi
+ * replays its history as the same model's, unchanged.
+ */
+export function recordsBareChatGptSlug( entries: SessionEntry[], slug: string ): boolean {
+	return entries.some( ( entry ) => {
+		if ( entry.type === 'model_change' ) {
+			return entry.provider === CHATGPT_PI_PROVIDER && entry.modelId === slug;
+		}
+		if ( entry.type !== 'message' || entry.message.role !== 'assistant' ) {
+			return false;
+		}
+		return entry.message.provider === CHATGPT_PI_PROVIDER && entry.message.model === slug;
+	} );
+}
+
 /** The pi model of one ChatGPT-route model, by the slug the route lists it under. */
 export function buildChatGptModel(
 	model: ProviderModelRef,
-	label?: string
+	label?: string,
+	{ bareSlugId = false }: { bareSlugId?: boolean } = {}
 ): Model< 'openai-responses' > {
 	if ( model.providerId !== 'chatgpt-oauth' ) {
 		throw new Error( `${ model.modelId } isn’t a ChatGPT model.` );
@@ -361,7 +444,7 @@ export function buildChatGptModel(
 		);
 	}
 	return {
-		id: model.modelId,
+		id: bareSlugId ? model.modelId : chatGptPiModelId( model.modelId ),
 		name: label ?? model.modelId,
 		api: 'openai-responses',
 		provider: CHATGPT_PI_PROVIDER,
@@ -725,11 +808,17 @@ export function createChatGptProviderConfig(
 	if ( model.provider !== CHATGPT_PI_PROVIDER ) {
 		throw new Error( `${ model.id } isn’t a ChatGPT model.` );
 	}
-	const reasoning = resolveChatGptReasoning( model.id, turnSnapshot.reasoningEffort );
+	const slug = chatGptSlugOf( model.id );
+	const reasoning = resolveChatGptReasoning( slug, turnSnapshot.reasoningEffort );
 	if ( ! reasoning.ok ) {
 		throw new Error( describeChatGptReasoningProblem( reasoning.problem ) );
 	}
-	const target = { model: model.id, reasoningEffort: reasoning.effort };
+	const target = { model: slug, reasoningEffort: reasoning.effort };
+	const toolImages = sendsChatGptToolImages( slug );
+	// pi names this turn's model by its pi id; the request names it by the
+	// route's slug. Any other model stays as pi named it, for the serializer to refuse.
+	const forRoute = ( params: unknown ) =>
+		isRecord( params ) && params.model === model.id ? { ...params, model: slug } : params;
 	return {
 		baseUrl: OPENAI_API_BASE_URL,
 		apiKey: TOKEN_FROM_TURN,
@@ -741,8 +830,9 @@ export function createChatGptProviderConfig(
 				turnSnapshot.invalidateAccessToken
 			);
 			const userSignal = options?.signal;
+			const sent = toolImages ? context : withoutToolResultImages( context );
 			return withChatGptOutcome(
-				streamOpenAiResponses( m as Model< 'openai-responses' >, context, {
+				streamOpenAiResponses( m as Model< 'openai-responses' >, sent, {
 					...options,
 					signal: userSignal
 						? AbortSignal.any( [ userSignal, turnSnapshot.signal ] )
@@ -752,7 +842,7 @@ export function createChatGptProviderConfig(
 					fetch: exchange.fetch,
 					onPayload: async ( params: unknown, payloadModel ) => {
 						const next = ( await options?.onPayload?.( params, payloadModel ) ) ?? params;
-						return exchange.serialize( next );
+						return exchange.serialize( forRoute( next ) );
 					},
 				} ),
 				exchange,

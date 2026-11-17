@@ -195,6 +195,7 @@ const api: IpcApi = {
 	setAiSessionChatGptSelection: ( sessionId, selection ) =>
 		ipcRendererInvoke( 'setAiSessionChatGptSelection', sessionId, selection ),
 	getChatGptSettings: () => ipcRendererInvoke( 'getChatGptSettings' ),
+	recheckChatGptSettings: () => ipcRendererInvoke( 'recheckChatGptSettings' ),
 	beginChatGptSignIn: ( registrationId, options ) =>
 		ipcRendererInvoke( 'beginChatGptSignIn', registrationId, options ),
 	waitForChatGptSignIn: ( attemptId ) => ipcRendererInvoke( 'waitForChatGptSignIn', attemptId ),

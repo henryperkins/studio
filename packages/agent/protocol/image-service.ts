@@ -33,37 +33,29 @@ export type ImageServiceState =
 			setup: 'wordpress-com-login';
 	  };
 
+/**
+ * What a tool result keeps of the service that made its images, on a
+ * subscription plan's route: which service, and how Studio signed in to it.
+ * Never the account.
+ */
+export interface ImageServiceRecord {
+	service: 'wordpress-com';
+	credential: ImageServiceCredential;
+}
+
 const isRecord = ( value: unknown ): value is Record< string, unknown > =>
 	Boolean( value ) && typeof value === 'object' && ! Array.isArray( value );
 
-function isImageServiceUse( value: unknown ): value is ImageServiceUse {
-	if ( ! isRecord( value ) || value.service !== 'wordpress-com' ) {
-		return false;
-	}
-	if ( value.credential === 'environment-token' ) {
-		return value.account === null;
-	}
-	return (
-		value.credential === 'wordpress-com-login' &&
-		isRecord( value.account ) &&
-		typeof value.account.displayName === 'string' &&
-		typeof value.account.email === 'string'
-	);
-}
-
 /**
  * The image service a tool's result says made it, from the result's details:
- * kept with the result for display, never sent to the model.
+ * kept with the result for display, never sent to the model. A record written
+ * before kept the account too, which is never read.
  */
-export function getToolResultImageService( details: unknown ): ImageServiceUse | undefined {
+export function getToolResultImageService( details: unknown ): ImageServiceRecord | undefined {
 	const service = isRecord( details ) ? details.studioService : undefined;
-	return isImageServiceUse( service )
-		? {
-				service: service.service,
-				credential: service.credential,
-				account: service.account
-					? { displayName: service.account.displayName, email: service.account.email }
-					: null,
-		  }
+	return isRecord( service ) &&
+		service.service === 'wordpress-com' &&
+		( service.credential === 'wordpress-com-login' || service.credential === 'environment-token' )
+		? { service: service.service, credential: service.credential }
 		: undefined;
 }

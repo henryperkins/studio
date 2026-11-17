@@ -18,6 +18,7 @@ import {
 	type ChatGptSignIn,
 	type ChatGptTokenClient,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
 
 /**
  * The ChatGPT vault on this machine's real system keychain: a sealed record on
@@ -30,7 +31,6 @@ import {
 const gate = nativeCredentialStoreTestGate();
 const identity = createNativeTestIdentity();
 const FIXTURE = path.join( import.meta.dirname, 'fixtures', 'native-vault-process.ts' );
-const WRAPPING_KEY_ACCOUNT = 'chatgpt-vault-key';
 const TIMEOUT_MS = 180_000;
 // Placeholders only, recognisable on disk.
 const TOKEN_MARKERS = [ 'test-access-token', 'test-refresh-token', 'test-id-token' ];
@@ -70,6 +70,8 @@ const signIn = (
 interface Profile {
 	session: NativeStoreSession;
 	configDir: string;
+	/** The keychain account of the profile's vault key. */
+	keyAccount: string;
 	broker(): ReturnType< typeof createChatGptCredentialBroker >;
 	vaultPath( registrationId: string ): string;
 	readAllFiles(): string;
@@ -81,10 +83,12 @@ const withProfile = ( test: ( profile: Profile ) => Promise< void > ) => () =>
 		identity,
 		( service ) => createOsCredentialStore( { service } ),
 		async ( session ) => {
-			session.track( WRAPPING_KEY_ACCOUNT );
 			const configDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-native-vault-' ) );
 			const previousConfigDir = process.env.DEV_CONFIG_DIR;
 			process.env.DEV_CONFIG_DIR = configDir;
+			// The temporary profile's own item, never the default profile's.
+			const keyAccount = getChatGptVaultKeyAccounts().own;
+			session.track( keyAccount );
 			const readAllFiles = ( directory = configDir ): string =>
 				fs
 					.readdirSync( directory, { withFileTypes: true } )
@@ -99,6 +103,7 @@ const withProfile = ( test: ( profile: Profile ) => Promise< void > ) => () =>
 				await test( {
 					session,
 					configDir,
+					keyAccount,
 					broker: () =>
 						createChatGptCredentialBroker( {
 							tokenClient: unreachableTokenService,
@@ -159,92 +164,100 @@ describe.skipIf( ! gate.run )(
 	() => {
 		it(
 			'keeps a large sign-in for a fresh process, with only a 32-byte key in the keychain',
-			withProfile( async ( { session, configDir, broker, vaultPath, readAllFiles } ) => {
-				const large = signIn( 'vault', { access: 16 * 1024, id: 8 * 1024, refresh: 2 * 1024 } );
+			withProfile(
+				async ( { session, configDir, keyAccount, broker, vaultPath, readAllFiles } ) => {
+					const large = signIn( 'vault', { access: 16 * 1024, id: 8 * 1024, refresh: 2 * 1024 } );
 
-				const account = await broker().saveSignIn( large );
+					const account = await broker().saveSignIn( large );
 
-				await expect(
-					readInAnotherProcess( configDir, account.registrationId, large.tokens.accessToken )
-				).resolves.toEqual( { matches: true } );
-				const key = await session.store.get( WRAPPING_KEY_ACCOUNT );
-				expect( key ).toMatch( /^[A-Za-z0-9_-]{43}$/ );
-				expect( Buffer.from( key!, 'base64url' ) ).toHaveLength( 32 );
-				expect( fs.existsSync( vaultPath( account.registrationId ) ) ).toBe( true );
-				expectNoToken( readAllFiles() );
-			} ),
+					await expect(
+						readInAnotherProcess( configDir, account.registrationId, large.tokens.accessToken )
+					).resolves.toEqual( { matches: true } );
+					const key = await session.store.get( keyAccount );
+					expect( key ).toMatch( /^[A-Za-z0-9_-]{43}$/ );
+					expect( Buffer.from( key!, 'base64url' ) ).toHaveLength( 32 );
+					expect( fs.existsSync( vaultPath( account.registrationId ) ) ).toBe( true );
+					expectNoToken( readAllFiles() );
+				}
+			),
 			TIMEOUT_MS
 		);
 
 		it(
 			'asks for a sign-in again when the record is damaged, keeping the key',
-			withProfile( async ( { session, configDir, broker, vaultPath, readAllFiles } ) => {
-				const saved = signIn( 'vault' );
-				const account = await broker().saveSignIn( saved );
-				const key = await session.store.get( WRAPPING_KEY_ACCOUNT );
-				const sealed = JSON.parse( fs.readFileSync( vaultPath( account.registrationId ), 'utf8' ) );
-				const ciphertext = Buffer.from( sealed.ciphertext, 'base64' );
-				ciphertext[ 0 ] ^= 0xff;
-				fs.writeFileSync(
-					vaultPath( account.registrationId ),
-					JSON.stringify( { ...sealed, ciphertext: ciphertext.toString( 'base64' ) } )
-				);
+			withProfile(
+				async ( { session, configDir, keyAccount, broker, vaultPath, readAllFiles } ) => {
+					const saved = signIn( 'vault' );
+					const account = await broker().saveSignIn( saved );
+					const key = await session.store.get( keyAccount );
+					const sealed = JSON.parse(
+						fs.readFileSync( vaultPath( account.registrationId ), 'utf8' )
+					);
+					const ciphertext = Buffer.from( sealed.ciphertext, 'base64' );
+					ciphertext[ 0 ] ^= 0xff;
+					fs.writeFileSync(
+						vaultPath( account.registrationId ),
+						JSON.stringify( { ...sealed, ciphertext: ciphertext.toString( 'base64' ) } )
+					);
 
-				await expect(
-					readInAnotherProcess( configDir, account.registrationId, saved.tokens.accessToken )
-				).resolves.toEqual( { code: 'needs-sign-in' } );
-				expect( await readChatGptAccount( account.registrationId ) ).toMatchObject( {
-					state: 'needs-sign-in',
-				} );
-				expect( fs.existsSync( vaultPath( account.registrationId ) ) ).toBe( false );
-				await expect( session.store.get( WRAPPING_KEY_ACCOUNT ) ).resolves.toBe( key );
-				expectNoToken( readAllFiles() );
-			} ),
+					await expect(
+						readInAnotherProcess( configDir, account.registrationId, saved.tokens.accessToken )
+					).resolves.toEqual( { code: 'needs-sign-in' } );
+					expect( await readChatGptAccount( account.registrationId ) ).toMatchObject( {
+						state: 'needs-sign-in',
+					} );
+					expect( fs.existsSync( vaultPath( account.registrationId ) ) ).toBe( false );
+					await expect( session.store.get( keyAccount ) ).resolves.toBe( key );
+					expectNoToken( readAllFiles() );
+				}
+			),
 			TIMEOUT_MS
 		);
 
 		it(
 			'keeps the record once the keychain has lost the key, and makes a new key only after the account is signed out',
-			withProfile( async ( { session, configDir, broker, vaultPath, readAllFiles } ) => {
-				const lost = signIn( 'vault' );
-				const account = await broker().saveSignIn( lost );
-				const oldKey = await session.store.get( WRAPPING_KEY_ACCOUNT );
-				const sealed = fs.readFileSync( vaultPath( account.registrationId ), 'utf8' );
-				await session.store.delete( WRAPPING_KEY_ACCOUNT );
+			withProfile(
+				async ( { session, configDir, keyAccount, broker, vaultPath, readAllFiles } ) => {
+					const lost = signIn( 'vault' );
+					const account = await broker().saveSignIn( lost );
+					const oldKey = await session.store.get( keyAccount );
+					const sealed = fs.readFileSync( vaultPath( account.registrationId ), 'utf8' );
+					await session.store.delete( keyAccount );
 
-				// A locked keychain can answer the same, so nothing is cleared or replaced.
-				await expect(
-					readInAnotherProcess( configDir, account.registrationId, lost.tokens.accessToken )
-				).resolves.toEqual( { code: 'vault-key-unreadable' } );
-				expect( fs.readFileSync( vaultPath( account.registrationId ), 'utf8' ) ).toBe( sealed );
-				expect( await readChatGptAccount( account.registrationId ) ).toMatchObject( {
-					state: 'signed-in',
-				} );
-				await expect( broker().saveSignIn( signIn( 'vault' ) ) ).rejects.toMatchObject( {
-					code: 'vault-key-unreadable',
-				} );
-				await expect( session.store.get( WRAPPING_KEY_ACCOUNT ) ).resolves.toBeNull();
+					// A locked keychain can answer the same, so nothing is cleared or replaced.
+					await expect(
+						readInAnotherProcess( configDir, account.registrationId, lost.tokens.accessToken )
+					).resolves.toEqual( { code: 'vault-key-unreadable' } );
+					expect( fs.readFileSync( vaultPath( account.registrationId ), 'utf8' ) ).toBe( sealed );
+					expect( await readChatGptAccount( account.registrationId ) ).toMatchObject( {
+						state: 'signed-in',
+					} );
+					await expect( broker().saveSignIn( signIn( 'vault' ) ) ).rejects.toMatchObject( {
+						code: 'vault-key-unreadable',
+					} );
+					await expect( session.store.get( keyAccount ) ).resolves.toBeNull();
 
-				await broker().signOut( account.registrationId );
-				expect( fs.existsSync( vaultPath( account.registrationId ) ) ).toBe( false );
-				const next = signIn( 'vault' );
-				const again = await broker().saveSignIn( next );
-				const newKey = await session.store.get( WRAPPING_KEY_ACCOUNT );
-				expect( newKey ).toMatch( /^[A-Za-z0-9_-]{43}$/ );
-				expect( newKey ).not.toBe( oldKey );
-				await expect(
-					readInAnotherProcess( configDir, again.registrationId, next.tokens.accessToken )
-				).resolves.toEqual( { matches: true } );
-				expectNoToken( readAllFiles() );
-			} ),
+					await broker().signOut( account.registrationId );
+					expect( fs.existsSync( vaultPath( account.registrationId ) ) ).toBe( false );
+					const next = signIn( 'vault' );
+					const again = await broker().saveSignIn( next );
+					const newKey = await session.store.get( keyAccount );
+					expect( newKey ).toMatch( /^[A-Za-z0-9_-]{43}$/ );
+					expect( newKey ).not.toBe( oldKey );
+					await expect(
+						readInAnotherProcess( configDir, again.registrationId, next.tokens.accessToken )
+					).resolves.toEqual( { matches: true } );
+					expectNoToken( readAllFiles() );
+				}
+			),
 			TIMEOUT_MS
 		);
 
 		it(
 			'keeps a session-only sign-in out of the keychain and off the disk',
-			withProfile( async ( { session, broker, vaultPath, readAllFiles } ) => {
+			withProfile( async ( { session, keyAccount, broker, vaultPath, readAllFiles } ) => {
 				await broker().saveSignIn( signIn( 'vault' ) );
-				const key = await session.store.get( WRAPPING_KEY_ACCOUNT );
+				const key = await session.store.get( keyAccount );
 				const app = broker();
 
 				const kept = await app.saveSignIn( signIn( 'session' ) );
@@ -253,7 +266,7 @@ describe.skipIf( ! gate.run )(
 				await expect( app.getAccessToken( kept.registrationId ) ).resolves.toMatch(
 					/^test-access-token-/
 				);
-				await expect( session.store.get( WRAPPING_KEY_ACCOUNT ) ).resolves.toBe( key );
+				await expect( session.store.get( keyAccount ) ).resolves.toBe( key );
 				expect( fs.existsSync( vaultPath( kept.registrationId ) ) ).toBe( false );
 				expectNoToken( readAllFiles() );
 			} ),

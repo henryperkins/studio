@@ -90,11 +90,14 @@ tests:
   # The model must see a desktop and a mobile capture of the home page, with
   # the screenshot time summed across however many calls it made. Pinned to
   # an image-capable tier: text-only models get files, not image payloads.
+  # `needsToolImages`: with a provider selected whose route isn't qualified for
+  # images a tool returns, the case is blocked instead of run (README).
   - description: screenshot verification shows the model desktop and mobile quickly
     vars:
       caseId: screenshot-all-timing
       siteName: "Eval Screenshot Timing"
       model: balanced
+      needsToolImages: true
       timeoutMs: 240000
       prompt: |
         Create a new site named "Eval Screenshot Timing". Do not

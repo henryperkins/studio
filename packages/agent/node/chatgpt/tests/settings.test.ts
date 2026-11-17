@@ -20,15 +20,22 @@ import {
 	finishChatGptSignIn,
 	readChatGptModels,
 	readChatGptSettings,
+	readSavedChatGptSignIns,
+	recheckChatGptSettings,
 	startChatGptSignIn,
 	stopChatGptSignIn,
 	validateChatGptSelection,
 } from '@studio/agent/node/chatgpt/settings';
 import type { ChatGptAccount } from '@studio/agent/node/chatgpt/account-store';
 import type { ChatGptTurnHandle } from '@studio/agent/node/chatgpt/credential-broker';
+import type { CredentialStoreStatus } from '@studio/common/lib/os-credential-store';
 
+// Each call stands for one run of the system keychain's tool.
+const { keychainCheck } = vi.hoisted( () => ( {
+	keychainCheck: vi.fn< () => Promise< CredentialStoreStatus > >(),
+} ) );
 vi.mock( '@studio/common/lib/os-credential-store', () => ( {
-	createOsCredentialStore: () => ( { check: async () => ( { available: true } ) } ),
+	createOsCredentialStore: () => ( { check: keychainCheck } ),
 } ) );
 vi.mock( '@studio/agent/node/chatgpt/account-store', async ( original ) => ( {
 	...( await original< object >() ),
@@ -70,6 +77,7 @@ let turn: ChatGptTurnHandle;
 
 beforeEach( () => {
 	vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '1' );
+	keychainCheck.mockResolvedValue( { available: true } );
 	vi.mocked( readChatGptAccounts ).mockResolvedValue( [ ACCOUNT ] );
 	vi.mocked( listChatGptConnections ).mockResolvedValue( [
 		{
@@ -112,7 +120,7 @@ describe( 'ChatGPT application settings facade', () => {
 		expect( beginChatGptSignIn ).not.toHaveBeenCalled();
 	} );
 
-	it( 'projects only renderer-safe account fields and treats a stale registry as disconnected', async () => {
+	it( 'projects only renderer-safe account fields, never the subject, and treats a stale registry as disconnected', async () => {
 		vi.mocked( readChatGptAccounts ).mockResolvedValue( [ { ...ACCOUNT, revision: 2 } ] );
 		const settings = await readChatGptSettings();
 		expect( settings.accounts[ 0 ] ).toEqual( {
@@ -120,7 +128,7 @@ describe( 'ChatGPT application settings facade', () => {
 			providerId: 'chatgpt-oauth',
 			backend: 'pi',
 			revision: 2,
-			identity: { subject: ACCOUNT.subject, email: ACCOUNT.email },
+			identity: { verified: true, email: ACCOUNT.email },
 			authStatus: 'disconnected',
 			label: ACCOUNT.label,
 			email: ACCOUNT.email,
@@ -128,6 +136,99 @@ describe( 'ChatGPT application settings facade', () => {
 			state: 'signed-in',
 		} );
 		expect( JSON.stringify( settings ) ).not.toContain( ACCOUNT.clientId );
+		expect( JSON.stringify( settings ) ).not.toContain( ACCOUNT.subject );
+		expect( JSON.stringify( settings ) ).not.toContain( 'subject' );
+	} );
+
+	it( 'runs the keychain’s tool once, on the first read, however often the settings are read', async () => {
+		vi.resetModules();
+		const accounts = await import( '@studio/agent/node/chatgpt/account-store' );
+		const broker = await import( '@studio/agent/node/chatgpt/credential-broker' );
+		vi.mocked( accounts.readChatGptAccounts ).mockResolvedValue( [ ACCOUNT ] );
+		vi.mocked( broker.listChatGptConnections ).mockResolvedValue( await listChatGptConnections() );
+		const fresh = await import( '@studio/agent/node/chatgpt/settings' );
+		keychainCheck.mockClear();
+
+		const reads = await Promise.all( [ 1, 2, 3 ].map( () => fresh.readChatGptSettings() ) );
+		for ( let poll = 0; poll < 5; poll++ ) {
+			reads.push( await fresh.readChatGptSettings() );
+		}
+
+		expect( keychainCheck ).toHaveBeenCalledTimes( 1 );
+		expect( reads.map( ( settings ) => settings.secureStorage ) ).toEqual(
+			Array( 8 ).fill( 'available' )
+		);
+	} );
+
+	it( 'reads the last known answer between rechecks, and a recheck’s answer from then on', async () => {
+		await recheckChatGptSettings();
+		keychainCheck.mockClear();
+		keychainCheck.mockResolvedValue( { available: false, reason: 'The keychain is locked.' } );
+
+		for ( let poll = 0; poll < 5; poll++ ) {
+			await expect( readChatGptSettings() ).resolves.toMatchObject( {
+				secureStorage: 'available',
+			} );
+		}
+		expect( keychainCheck ).not.toHaveBeenCalled();
+
+		await expect( recheckChatGptSettings() ).resolves.toMatchObject( {
+			enabled: true,
+			signInSupported: true,
+			secureStorage: 'unavailable',
+			accounts: [ expect.objectContaining( { connectionId: ID, authStatus: 'connected' } ) ],
+		} );
+		await expect( readChatGptSettings() ).resolves.toMatchObject( {
+			secureStorage: 'unavailable',
+		} );
+		expect( keychainCheck ).toHaveBeenCalledTimes( 1 );
+		await expect( recheckChatGptSettings( false ) ).resolves.toMatchObject( {
+			signInSupported: false,
+		} );
+	} );
+
+	it( 'takes what a secure sign-in’s own read of the key found, without checking the keychain itself', async () => {
+		await recheckChatGptSettings();
+		keychainCheck.mockClear();
+		vi.mocked( beginChatGptSignIn ).mockImplementation( async ( _id, _options, observer ) => {
+			observer?.storageChosen?.( 'vault', 'unavailable' );
+			return { attemptId: ATTEMPT };
+		} );
+
+		await startChatGptSignIn( undefined, { storage: 'vault' } );
+
+		await expect( readChatGptSettings() ).resolves.toMatchObject( {
+			secureStorage: 'unavailable',
+		} );
+		expect( keychainCheck ).not.toHaveBeenCalled();
+	} );
+
+	it( 'checks the keychain once a session-only sign-in has started, and not before', async () => {
+		await recheckChatGptSettings();
+		keychainCheck.mockClear();
+		vi.mocked( beginChatGptSignIn ).mockImplementation( async ( _id, _options, observer ) => {
+			observer?.storageChosen?.( 'session' );
+			expect( keychainCheck ).not.toHaveBeenCalled();
+			return { attemptId: ATTEMPT };
+		} );
+
+		await startChatGptSignIn( undefined, { storage: 'session' } );
+
+		expect( keychainCheck ).toHaveBeenCalledTimes( 1 );
+	} );
+
+	it( 'answers a recheck with ChatGPT turned off without running the keychain’s tool', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+		keychainCheck.mockClear();
+
+		await expect( recheckChatGptSettings() ).resolves.toEqual( {
+			enabled: false,
+			signInSupported: false,
+			secureStorage: 'unavailable',
+			accounts: [],
+		} );
+		expect( keychainCheck ).not.toHaveBeenCalled();
+		expect( readChatGptAccounts ).not.toHaveBeenCalled();
 	} );
 
 	it( 'returns only an attempt id for a returning sign-in', async () => {
@@ -138,10 +239,11 @@ describe( 'ChatGPT application settings facade', () => {
 		await expect(
 			startChatGptSignIn( ID, { storage: 'session', reconsent: true } )
 		).resolves.toEqual( { attemptId: ATTEMPT } );
-		expect( beginChatGptSignIn ).toHaveBeenCalledWith( ID, {
-			storage: 'session',
-			reconsent: true,
-		} );
+		expect( beginChatGptSignIn ).toHaveBeenCalledWith(
+			ID,
+			{ storage: 'session', reconsent: true },
+			{ storageChosen: expect.any( Function ) }
+		);
 	} );
 
 	it( 'refuses a remote callback host before beginning sign-in', async () => {
@@ -205,6 +307,42 @@ describe( 'ChatGPT application settings facade', () => {
 			remoteRevocationConfirmed: false,
 		} );
 		expect( signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( ID );
+	} );
+
+	it( 'signs out with ChatGPT turned off, and lists only the saved sign-ins there are to sign out of', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+		vi.mocked( readChatGptAccounts ).mockResolvedValue( [
+			ACCOUNT,
+			{ ...ACCOUNT, registrationId: ATTEMPT, label: 'Gone', state: 'signed-out' },
+		] );
+		vi.mocked( signOutChatGpt ).mockResolvedValue( {
+			localCleared: true,
+			remoteRevocationConfirmed: true,
+		} );
+
+		await expect( readSavedChatGptSignIns() ).resolves.toEqual( [
+			{ connectionId: ID, label: ACCOUNT.label, email: ACCOUNT.email },
+		] );
+		await expect( disconnectChatGpt( ID ) ).resolves.toEqual( {
+			localCleared: true,
+			remoteRevocationConfirmed: true,
+		} );
+		expect( signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( ID );
+		await expect( readChatGptSettings() ).resolves.toMatchObject( {
+			enabled: false,
+			accounts: [],
+		} );
+	} );
+
+	it( 'keeps why the keychain couldn’t be reached in the message it passes on', async () => {
+		vi.mocked( signOutChatGpt ).mockRejectedValueOnce(
+			new ChatGptConnectionError( 'vault-unavailable', 'its tool didn’t answer in time' )
+		);
+
+		const failed = await disconnectChatGpt( ID ).catch( ( error: unknown ) => error );
+
+		expect( ( failed as Error ).message ).toContain( '(its tool didn’t answer in time)' );
+		expect( ( failed as Error ).message ).not.toContain( 'unknown error' );
 	} );
 
 	it( 'validates cancellation and sanitizes unexpected cancellation errors', async () => {

@@ -2,7 +2,10 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { readChatGptAccounts } from '@studio/agent/node/chatgpt/account-store';
+import {
+	ChatGptConnectionError,
+	readChatGptAccounts,
+} from '@studio/agent/node/chatgpt/account-store';
 import {
 	beginChatGptTurn,
 	listChatGptConnections,
@@ -23,7 +26,13 @@ import {
 	getEffectiveSessionProvider,
 } from '@studio/agent/protocol/providers';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { resolveAiEnvironment, saveSelectedAiProvider } from 'cli/ai/auth';
+import {
+	resolveAiEnvironment,
+	resolveInitialAiProvider,
+	resolveUnavailableAiProvider,
+	saveSelectedAiProvider,
+} from 'cli/ai/auth';
+import { runsOnChatGpt } from 'cli/ai/chatgpt';
 import { getActiveSlashCommands } from 'cli/ai/slash-commands';
 import { AiChatUI } from 'cli/ai/ui';
 import { runCommand } from '../index';
@@ -33,8 +42,9 @@ import type { StudioAgentTurnConfig } from '@studio/agent/node/runtime';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
 
 vi.mock( '@studio/common/lib/shared-config', () => ( { readAuthToken: async () => null } ) );
+const keychainChecks = vi.hoisted( () => vi.fn( async () => ( { available: true } ) ) );
 vi.mock( '@studio/common/lib/os-credential-store', () => ( {
-	createOsCredentialStore: () => ( { check: async () => ( { available: true } ) } ),
+	createOsCredentialStore: () => ( { check: keychainChecks } ),
 } ) );
 vi.mock( '@studio/agent/node/settings-store', async ( original ) => ( {
 	...( await original< object >() ),
@@ -67,8 +77,8 @@ vi.mock( 'cli/lib/tracks', async ( original ) => ( {
 } ) );
 vi.mock( 'cli/ai/sessions/replay', () => ( { replaySessionHistory: vi.fn() } ) );
 vi.mock( 'cli/ai/auth', () => ( {
-	resolveInitialAiProvider: async () => 'openai-api-key',
-	resolveUnavailableAiProvider: async () => undefined,
+	resolveInitialAiProvider: vi.fn( async () => 'openai-api-key' ),
+	resolveUnavailableAiProvider: vi.fn( async () => undefined ),
 	isAiProviderReady: async () => true,
 	getAvailableAiProviders: async () => [ 'wpcom', 'anthropic-api-key', 'openai-api-key' ],
 	prepareAiProvider: async () => {},
@@ -397,6 +407,177 @@ describe( 'ChatGPT interactive CLI', () => {
 		expect( listChatGptConnections ).not.toHaveBeenCalled();
 	} );
 
+	it( 'keeps a ChatGPT chat chosen on a first run when an API key is set afterwards', async () => {
+		vi.mocked( readSelectedAiProvider ).mockResolvedValue( undefined );
+		// A first run offers to choose how to connect only off OpenAI and ChatGPT.
+		vi.mocked( resolveInitialAiProvider ).mockResolvedValueOnce( 'wpcom' );
+		const ui = terminal(
+			[ '/chatgpt', '/api-key', 'New request' ],
+			[
+				'Select saved account',
+				`Personal · ${ A }`,
+				'GPT-6 Luna · gpt-6-luna',
+				'Low',
+				'Start new chat',
+			]
+		);
+		const answer = ui.askUser;
+		// The first run's "Choose how to connect" is closed without a choice.
+		ui.askUser = vi.fn( async ( questions: Parameters< typeof answer >[ 0 ] ) =>
+			questions[ 0 ].question === 'Choose how to connect' ? {} : answer( questions )
+		);
+
+		await runCommand( { adapter: ui } );
+
+		expect( ui.showOnboarding ).toHaveBeenCalled();
+		expect( ui.showError ).not.toHaveBeenCalled();
+		expect( saveSelectedAiProvider ).not.toHaveBeenCalled();
+		expect( runs ).toHaveLength( 1 );
+		expect( runs[ 0 ].config.connection?.connectionId ).toBe( A );
+		expect( readChatGptSessionSelection( runs[ 0 ].entries ) ).toMatchObject( {
+			connectionId: A,
+			reasoningEffort: 'low',
+		} );
+	} );
+
+	it( 'leaves a conversation that ran on ChatGPT when switching provider, pinned there or only by its last reply', () => {
+		const reply = {
+			type: 'message',
+			id: 'reply',
+			parentId: null,
+			timestamp: new Date( 0 ).toISOString(),
+			message: { role: 'assistant', content: [], provider: 'studio-chatgpt', model: 'x' },
+		} as unknown as SessionEntry;
+		const pin = {
+			type: 'custom',
+			id: 'pin',
+			parentId: null,
+			timestamp: new Date( 0 ).toISOString(),
+			customType: 'studio.session_context',
+			data: { provider: 'chatgpt-oauth', connectionId: A, revision: 1 },
+		} as unknown as SessionEntry;
+
+		expect( runsOnChatGpt( 'chatgpt-oauth', [] ) ).toBe( true );
+		expect( runsOnChatGpt( 'wpcom', [ reply ] ) ).toBe( true );
+		expect( runsOnChatGpt( 'chatgpt-oauth', [ reply ] ) ).toBe( true );
+		expect( runsOnChatGpt( 'wpcom', [ pin ] ) ).toBe( true );
+		expect( runsOnChatGpt( 'openai-api-key', [] ) ).toBe( false );
+	} );
+
+	it.each( [
+		[ 'pinned there', () => previousChat() ],
+		[
+			'only by its last reply',
+			async () => {
+				const session = await createStudioSession( root );
+				session.appendMessage( {
+					role: 'user',
+					content: 'Previous private conversation',
+					timestamp: Date.now(),
+				} );
+				session.appendMessage( {
+					role: 'assistant',
+					content: [ { type: 'text', text: 'From the plan.' } ],
+					provider: 'studio-chatgpt',
+					model: 'gpt-6-luna',
+					api: 'openai-responses',
+					stopReason: 'stop',
+					timestamp: Date.now(),
+				} as never );
+				return session;
+			},
+		],
+	] )(
+		'starts a new conversation when the CLI switches a chat that ran on ChatGPT, %s, to another provider',
+		async ( _how, start ) => {
+			const old = await start();
+			expect( getEffectiveSessionProvider( old.getEntries() ) ).toBe( 'chatgpt-oauth' );
+			const original = await fs.readFile( old.getSessionFile()!, 'utf8' );
+			// Switched before the turn, as when the provider it's on stops being available.
+			vi.mocked( resolveUnavailableAiProvider ).mockResolvedValueOnce( 'openai-api-key' );
+			const ui = terminal( [ 'New request' ], [] );
+
+			await runCommand( { adapter: ui, resumeSession: resume( old ) } );
+
+			expect( runs ).toHaveLength( 1 );
+			expect( runs[ 0 ].sessionId ).not.toBe( old.getSessionId() );
+			expect( runs[ 0 ].config.connection ).toBeUndefined();
+			expect( getEffectiveSessionProvider( runs[ 0 ].entries ) ).toBe( 'openai-api-key' );
+			expect( JSON.stringify( runs[ 0 ].entries ) ).not.toContain(
+				'Previous private conversation'
+			);
+			expect( ui.clearTranscript ).toHaveBeenCalledTimes( 1 );
+			// Nothing of the switch lands in the chat that ran on ChatGPT.
+			expect( await fs.readFile( old.getSessionFile()!, 'utf8' ) ).toBe( original );
+		}
+	);
+
+	it( 'with ChatGPT off, says so at /chatgpt and offers only signing out of the saved sign-ins', async () => {
+		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+		vi.mocked( signOutChatGpt ).mockResolvedValueOnce( {
+			localCleared: true,
+			remoteRevocationConfirmed: true,
+		} );
+		const ui = terminal( [ '/chatgpt' ], [ 'Sign out', `Personal · ${ A }` ] );
+
+		await runCommand( { adapter: ui } );
+
+		expect( ui.showInfo ).toHaveBeenCalledWith(
+			'ChatGPT plan connections are not enabled in this app.'
+		);
+		expect(
+			vi.mocked( ui.askUser ).mock.calls[ 0 ][ 0 ][ 0 ].options.map( ( option ) => option.label )
+		).toEqual( [ 'Sign out' ] );
+		expect( signOutChatGpt ).toHaveBeenCalledExactlyOnceWith( A );
+		expect( ui.showInfo ).toHaveBeenCalledWith(
+			'Signed out locally. Remote revocation confirmed.'
+		);
+		expect( beginChatGptSignIn ).not.toHaveBeenCalled();
+		expect( listChatGptConnections ).not.toHaveBeenCalled();
+		expect( runs ).toHaveLength( 0 );
+		// It stays out of the command list while ChatGPT is off.
+		expect( getActiveSlashCommands().some( ( command ) => command.name === 'chatgpt' ) ).toBe(
+			false
+		);
+	} );
+
+	it.each( [
+		[ 'none saved', async () => [] ],
+		[
+			'only a signed-out one',
+			async () => [ { ...account( A, 'Personal' ), state: 'signed-out' } ],
+		],
+		[
+			'an accounts file it can’t read',
+			async () => {
+				throw new ChatGptConnectionError( 'accounts-unreadable' );
+			},
+		],
+	] )(
+		'with ChatGPT off and no saved sign-in (%s), leaves /chatgpt to the agent as a prompt, as before ChatGPT',
+		async ( _name, accounts ) => {
+			vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+			vi.mocked( readChatGptAccounts ).mockImplementation( accounts as () => Promise< [] > );
+			const ui = terminal( [ '/chatgpt' ], [] );
+
+			await runCommand( { adapter: ui } );
+
+			expect( ui.showError ).not.toHaveBeenCalled();
+			expect( ui.showInfo ).not.toHaveBeenCalledWith(
+				'ChatGPT plan connections are not enabled in this app.'
+			);
+			expect( ui.askUser ).not.toHaveBeenCalled();
+			expect( runs ).toHaveLength( 1 );
+			expect( runs[ 0 ].config.prompt ).toBe( '/chatgpt' );
+			// Only the accounts index decides: no connection, keychain or sign-in is read.
+			expect( readChatGptAccounts ).toHaveBeenCalledTimes( 1 );
+			expect( listChatGptConnections ).not.toHaveBeenCalled();
+			expect( keychainChecks ).not.toHaveBeenCalled();
+			expect( beginChatGptSignIn ).not.toHaveBeenCalled();
+			expect( signOutChatGpt ).not.toHaveBeenCalled();
+		}
+	);
+
 	it.each( [
 		[ 'an unknown recorded effort', { reasoningEffort: 'future-effort' }, 'future-effort' ],
 		[
@@ -467,7 +648,11 @@ describe( 'ChatGPT interactive CLI', () => {
 		} );
 		vi.mocked( cancelChatGptSignIn ).mockReturnValueOnce( true );
 		await runCommand( { adapter: ui, resumeSession: resume( await previousChat() ) } );
-		expect( beginChatGptSignIn ).toHaveBeenCalledWith( A, { storage: 'session' } );
+		expect( beginChatGptSignIn ).toHaveBeenCalledWith(
+			A,
+			{ storage: 'session' },
+			{ storageChosen: expect.any( Function ) }
+		);
 		expect( cancelChatGptSignIn ).toHaveBeenCalledWith( ATTEMPT );
 		expect( ui.showInfo ).toHaveBeenCalledWith( 'Signing in to ChatGPT was cancelled.' );
 		expect( JSON.stringify( [ ui.showInfo.mock.calls, ui.showError.mock.calls ] ) ).not.toContain(

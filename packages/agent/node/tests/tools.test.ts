@@ -327,6 +327,66 @@ describe( 'Studio AI MCP tools', () => {
 			expect( result.studioArtifacts ).toBeUndefined();
 		} );
 
+		it( 'says the connection doesn’t take images from tools only where it is told so, keeping every other route’s text', async () => {
+			const MODEL_NOTE =
+				'This model cannot view images, so the capture is not shown to you: verify the rendered page with inspect_design.';
+			// How to read a skill's "if you can view images" there, since the model does see a user's images.
+			const READING =
+				'Where a skill or instruction asks whether you can view images, treat screenshots and other images in tool results as not viewable on this connection; images the user attaches remain visible to you.';
+			const CONNECTION_NOTE = `Images in tool results are not available on this connection yet, so the capture is not shown to you: verify the rendered page with inspect_design. ${ READING }`;
+			const screenshotWith = async ( options: StudioToolsOptions ) => {
+				mockScreenshotBrowser(
+					createMockPage( { buffer: Buffer.from( 'jpeg' ), documentHeight: 900 } )
+				);
+				const tool = resolveStudioTools( host, options ).find(
+					( definition ) => definition.name === 'take_screenshot'
+				)!;
+				const result = await tool.rawHandler( { url: 'http://localhost:8903/' } as never );
+				return {
+					description: tool.description,
+					snippet: tool.promptSnippet,
+					text: result.content.find( ( block ) => block.type === 'text' )?.text ?? '',
+					images: result.content.filter( ( block ) => block.type === 'image' ).length,
+				};
+			};
+
+			// A model that can't view images, as on trunk.
+			const model = await screenshotWith( { visionEnabled: false } );
+			expect( model.description ).toContain( `${ MODEL_NOTE } Supports desktop and mobile` );
+			expect( model.snippet ).toBe(
+				'Save a full-page screenshot of a URL to a file (supports desktop, mobile, or `viewport: "all"` for both). You cannot view the image, but it still sets the theme screenshot.'
+			);
+			expect( model.text ).toContain( MODEL_NOTE );
+			expect( model.images ).toBe( 0 );
+			for ( const text of [ model.description, model.snippet, model.text ] ) {
+				expect( text ).not.toContain( 'asks whether you can view images' );
+			}
+
+			// One that can, as on trunk: the reason is never read then.
+			const vision = await screenshotWith( { visionEnabled: true, toolImagesUnavailable: true } );
+			expect( vision.description ).toContain( 'analyze visually' );
+			expect( vision.description ).not.toContain( 'this connection' );
+			expect( vision.images ).toBe( 1 );
+			for ( const text of [ vision.description, vision.snippet, vision.text ] ) {
+				expect( text ).not.toContain( 'asks whether you can view images' );
+			}
+
+			// A connection that doesn't take images from tools yet.
+			const connection = await screenshotWith( {
+				visionEnabled: false,
+				toolImagesUnavailable: true,
+			} );
+			expect( connection.description ).toBe(
+				model.description.replace( MODEL_NOTE, CONNECTION_NOTE )
+			);
+			expect( connection.snippet ).toBe(
+				`Save a full-page screenshot of a URL to a file (supports desktop, mobile, or \`viewport: "all"\` for both). Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot. ${ READING }`
+			);
+			expect( connection.text ).toContain( CONNECTION_NOTE );
+			expect( connection.text ).not.toContain( 'cannot view images' );
+			expect( connection.images ).toBe( 0 );
+		} );
+
 		it( 'says when the user sees only the saved file path', async () => {
 			const note = 'The user does not see this capture';
 			const resultWith = async ( options: StudioToolsOptions, display?: boolean ) => {
@@ -814,7 +874,7 @@ describe( 'Studio AI MCP tools', () => {
 		}
 	} );
 
-	it( 'keeps the image service and account that made the images with the result, out of what the model reads', async () => {
+	it( 'keeps only which image service made the images and how Studio signed in to it with the result, never the account, out of what the model reads', async () => {
 		const sitePath = await mkdtemp( path.join( os.tmpdir(), 'studio-generate-images-' ) );
 		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );
 		const use = {
@@ -832,11 +892,19 @@ describe( 'Studio AI MCP tools', () => {
 			const executed = await executeTool( getTool( 'generate_images' ), args );
 			await ( executed.details as { pending?: Promise< unknown > } ).pending;
 
-			expect( raw.studioService ).toEqual( use );
-			expect( getToolResultImageService( executed.details ) ).toEqual( use );
+			const record = { service: 'wordpress-com', credential: 'wordpress-com-login' };
+			expect( raw.studioService ).toEqual( record );
+			expect( getToolResultImageService( executed.details ) ).toEqual( record );
+			expect(
+				JSON.stringify( { ...( executed.details as object ), pending: undefined } )
+			).not.toMatch( /Someone|someone@example|account/ );
 			for ( const content of [ raw.content, executed.content ] ) {
 				expect( JSON.stringify( content ) ).not.toMatch( /Someone|someone@example|wordpress-com/ );
 			}
+			// A record written before kept the account too: it is read without it.
+			expect(
+				getToolResultImageService( { studioService: { ...record, account: use.account } } )
+			).toEqual( record );
 		} finally {
 			await rm( sitePath, { recursive: true, force: true } );
 		}

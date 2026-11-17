@@ -60,18 +60,26 @@ export interface StudioTurnClosedData {
 // back, so its per-turn records also carry the provider and the reasoning the
 // turn ran with. ChatGPT never falls back either: its pins and per-turn
 // records carry the provider, the connection and the connection's revision,
-// and their model is one that connection listed. Reasoning fields are plain
-// strings for the same reason as `provider`: readers validate them against the
-// model's capabilities, as they do the connection fields.
+// and their model, one that connection listed, and effort under `chatGpt`.
+// Reasoning fields are plain strings for the same reason as `provider`:
+// readers validate them against the model's capabilities, as they do the
+// connection fields.
 export interface StudioSessionContextData {
 	provider?: string;
 	/** The connection a ChatGPT record ran on: an opaque id, never parsed. */
 	connectionId?: string;
 	/** The connection's configuration revision when a ChatGPT record was written. */
 	revision?: number;
-	model: string;
+	/** Absent from a ChatGPT record: older ChatGPT records carry theirs here. */
+	model?: string;
 	reasoningEffort?: string;
 	reasoningMode?: string;
+	/**
+	 * A ChatGPT record's model and effort, which only the ChatGPT reader uses:
+	 * a build that doesn't know that provider finds no model or effort to run
+	 * the chat on.
+	 */
+	chatGpt?: { model?: string; reasoningEffort?: string };
 }
 
 // Lightweight attachment summaries persisted on a user-prompt entry so the

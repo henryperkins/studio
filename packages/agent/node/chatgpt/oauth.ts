@@ -130,8 +130,26 @@ export interface ChatGptSignInFlowOptions {
 	loopbackPeers?: () => LoopbackPeerLookup;
 }
 
+/** What the system keychain was found to be, as the ChatGPT settings show it. */
+export type ChatGptKeychainAnswer = 'available' | 'unavailable';
+
+/** Told what a sign-in's start learned, for the ChatGPT settings. */
+export interface ChatGptSignInStartObserver {
+	/**
+	 * Once the sign-in knows where it keeps its tokens. For the vault, `keychain`
+	 * is what its own check of the key before the browser opens found the
+	 * system keychain to be, or undefined when no saved sign-in needed it asked.
+	 * Told again, for the vault, what its save at the end found.
+	 */
+	storageChosen?( storage: ChatGptCredentialStorage, keychain?: ChatGptKeychainAnswer ): void;
+}
+
 export interface ChatGptSignInFlow {
-	begin( registrationId?: string, options?: ChatGptSignInOptions ): Promise< ChatGptSignInStart >;
+	begin(
+		registrationId?: string,
+		options?: ChatGptSignInOptions,
+		observer?: ChatGptSignInStartObserver
+	): Promise< ChatGptSignInStart >;
 	wait( attemptId: string ): Promise< ChatGptSignInOutcome >;
 	cancel( attemptId: string ): boolean;
 }
@@ -259,6 +277,8 @@ interface Attempt {
 	timer: ReturnType< typeof setTimeout >;
 	/** Aborts the attempt's requests when it is cancelled or times out. */
 	controller: AbortController;
+	/** Told what the attempt's save into the vault found the keychain to be. */
+	observer: ChatGptSignInStartObserver;
 	outcome: Promise< ChatGptSignInOutcome >;
 	resolve: ( outcome: ChatGptSignInOutcome ) => void;
 }
@@ -277,6 +297,20 @@ function isSameText( value: string, expected: string ): boolean {
 
 function failure( code: ChatGptSignInFailureCode ): ChatGptSignInOutcome {
 	return { ok: false, code, message: describeSignInFailure( code ) };
+}
+
+// What a refused check of the vault key says of the keychain itself: one that
+// answered without the key could still be asked, so it isn't unavailable.
+function keychainAnswerOf( error: unknown ): ChatGptKeychainAnswer | undefined {
+	if ( error instanceof ChatGptConnectionError ) {
+		switch ( error.code ) {
+			case 'vault-unavailable':
+				return 'unavailable';
+			case 'vault-key-unreadable':
+				return 'available';
+		}
+	}
+	return undefined;
 }
 
 function commitFailureCode( error: unknown ): ChatGptSignInFailureCode {
@@ -527,11 +561,20 @@ export function createChatGptSignInFlow(
 		if ( attempt.status === 'done' ) {
 			return;
 		}
+		// A callback being answered closes the connections once its page is out.
+		const answering = attempt.status === 'completing' || attempt.status === 'committing';
 		attempt.status = 'done';
 		attempt.pending = null;
 		clearTimeout( attempt.timer );
 		attempt.controller.abort();
 		attempt.server.close();
+		// Including any that sent part of a request, which would otherwise be
+		// held until the request timeout.
+		if ( answering ) {
+			attempt.server.closeIdleConnections();
+		} else {
+			attempt.server.closeAllConnections();
+		}
 		void attempt.peers?.close().catch( () => undefined );
 		attempt.resolve( outcome );
 		const forget = setTimeout( () => attempts.delete( attempt.attemptId ), OUTCOME_RETENTION_MS );
@@ -632,8 +675,15 @@ export function createChatGptSignInFlow(
 		}
 
 		attempt.status = 'committing';
+		// A save into the vault reads or writes its key: what it found is the keychain's answer.
+		const keychainAnswered = ( keychain: ChatGptKeychainAnswer | undefined ) => {
+			if ( pending.storage === 'vault' && keychain ) {
+				attempt.observer.storageChosen?.( 'vault', keychain );
+			}
+		};
+		let account: ChatGptAccount;
 		try {
-			const account = await credentials.saveSignIn( {
+			account = await credentials.saveSignIn( {
 				...( pending.registration ? { registrationId: pending.registration.registrationId } : {} ),
 				issuer: pending.authServer.issuer,
 				subject: identity.subject,
@@ -642,15 +692,17 @@ export function createChatGptSignInFlow(
 				storage: pending.storage,
 				tokens: { ...tokens, refreshToken, idToken },
 			} );
-			return {
-				ok: true,
-				registrationId: account.registrationId,
-				label: account.label,
-				email: account.email,
-			};
 		} catch ( error ) {
+			keychainAnswered( keychainAnswerOf( error ) );
 			return discard( commitFailureCode( error ), identity );
 		}
+		keychainAnswered( 'available' );
+		return {
+			ok: true,
+			registrationId: account.registrationId,
+			label: account.label,
+			email: account.email,
+		};
 	}
 
 	// The outcome that ended the attempt: a cancel or timeout may have come first.
@@ -712,9 +764,11 @@ export function createChatGptSignInFlow(
 	 * `another-user`, told the link isn't valid, or `unchecked`, told to
 	 * reload, as the start address and the attempt are left as they were.
 	 *
-	 * Only on Linux, where any local user can read the browser opener's
-	 * command line, start address and all, from /proc; macOS and Windows show
-	 * a process's arguments only to its own user and administrators.
+	 * Only on Linux, where xdg-open takes the start address as an argument and
+	 * any local user can read it there, from /proc. On macOS, whose `ps` shows
+	 * every user's arguments, and on Windows the CLI's opener reads the address
+	 * from its environment instead (`apps/cli/lib/browser.ts`), and the Desktop
+	 * app's opener takes no arguments at all.
 	 *
 	 * The request goes on only when the kernel's socket tables show it comes
 	 * from this process's user or root, when a table that could be read has no
@@ -794,6 +848,8 @@ export function createChatGptSignInFlow(
 			return;
 		}
 		attempt.status = 'completing';
+		// The last answer: every connection goes once it is out, or the browser has left.
+		response.once( 'close', () => attempt.server.closeAllConnections() );
 		void settle( attempt, pending, params ).then( ( outcome ) =>
 			respond( response, 200, finishedPage( outcome ) )
 		);
@@ -801,7 +857,8 @@ export function createChatGptSignInFlow(
 
 	async function begin(
 		registrationId?: string,
-		signInOptions: ChatGptSignInOptions = {}
+		signInOptions: ChatGptSignInOptions = {},
+		observer: ChatGptSignInStartObserver = {}
 	): Promise< ChatGptSignInStart > {
 		const openBrowser = options.openBrowser ?? installedBrowserOpener;
 		if ( ! openBrowser ) {
@@ -814,14 +871,23 @@ export function createChatGptSignInFlow(
 		// Saving would refuse for an unreadable key: say so before the browser
 		// opens. Saving checks again, as the keychain may lock in between; any
 		// other answer here is left for it to report.
-		if ( storage === 'vault' ) {
-			const refusal = await credentials.checkVaultKey().then(
-				() => null,
-				( error: unknown ) => error
-			);
-			if ( refusal instanceof ChatGptConnectionError && refusal.code === 'vault-key-unreadable' ) {
-				throw new ChatGptSignInError( 'vault-key-unreadable' );
-			}
+		type KeyCheck = { keychain?: ChatGptKeychainAnswer; refusal?: unknown };
+		const checked: KeyCheck =
+			storage === 'vault'
+				? await credentials.checkVaultKey().then(
+						( asked ): KeyCheck => ( asked ? { keychain: 'available' } : {} ),
+						( error: unknown ): KeyCheck => ( {
+							keychain: keychainAnswerOf( error ),
+							refusal: error,
+						} )
+				  )
+				: {};
+		observer.storageChosen?.( storage, checked.keychain );
+		if (
+			checked.refusal instanceof ChatGptConnectionError &&
+			checked.refusal.code === 'vault-key-unreadable'
+		) {
+			throw new ChatGptSignInError( 'vault-key-unreadable' );
 		}
 		let hostId: string;
 		try {
@@ -919,6 +985,7 @@ export function createChatGptSignInFlow(
 			server,
 			peers,
 			controller: new AbortController(),
+			observer,
 			outcome,
 			resolve,
 			timer: setTimeout( () => {
@@ -971,13 +1038,15 @@ const getAppFlow = () => ( appFlow ??= createChatGptSignInFlow() );
  * Starts signing in to ChatGPT: a new registration, or `registrationId` again.
  * Listens for the callback, opens the authorization page with the browser
  * opener installed at startup, and returns the attempt's id; wait for it with
- * `waitForChatGptSignIn`.
+ * `waitForChatGptSignIn`. `observer` is told where the sign-in keeps its tokens
+ * and what its own check of the system keychain found.
  */
 export function beginChatGptSignIn(
 	registrationId?: string,
-	options?: ChatGptSignInOptions
+	options?: ChatGptSignInOptions,
+	observer?: ChatGptSignInStartObserver
 ): Promise< ChatGptSignInStart > {
-	return getAppFlow().begin( registrationId, options );
+	return getAppFlow().begin( registrationId, options, observer );
 }
 
 /** How the attempt ended, once it has. */

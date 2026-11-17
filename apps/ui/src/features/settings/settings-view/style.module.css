@@ -327,6 +327,24 @@
 	gap: var( --space-2 );
 }
 
+.signInControl {
+	display: flex;
+	flex-direction: column;
+}
+
+/* Takes no room while it has nothing to say, but stays in place to announce. */
+.signInStatus {
+	margin: 0;
+	color: var( --muted-foreground );
+	font-size: var( --text-xxs );
+	line-height: var( --text-xxs--line-height );
+	text-wrap: pretty;
+}
+
+.signInStatus:not( :empty ) {
+	margin-top: var( --space-2 );
+}
+
 .settingsControl:has( > .colorControl, > .sliderControl ) {
 	min-width: 192px;
 	max-width: 100%;

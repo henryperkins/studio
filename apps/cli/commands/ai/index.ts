@@ -8,6 +8,7 @@ import {
 	type StudioAgentHost,
 	AskUserQuestion,
 } from '@studio/agent/node';
+import { describeChatGptConnectionProblem } from '@studio/agent/node/chatgpt/connection-problem';
 import {
 	assertChatGptEnabled,
 	chatGptSettingsAction,
@@ -33,7 +34,10 @@ import {
 	type StudioChatFileAttachment,
 } from '@studio/agent/protocol/chat-files';
 import { type StudioChatImage } from '@studio/agent/protocol/chat-images';
-import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
+import {
+	readChatGptSessionSelection,
+	toChatGptSessionContext,
+} from '@studio/agent/protocol/chatgpt';
 import {
 	describeChatGptReasoningProblem,
 	getDefaultChatGptReasoningEffort,
@@ -84,6 +88,7 @@ import {
 	resolveUnavailableAiProvider,
 	saveSelectedAiProvider,
 } from 'cli/ai/auth';
+import { runsOnChatGpt } from 'cli/ai/chatgpt';
 import { createClaudeApprovalRouter, getTerminalClaudeApprover } from 'cli/ai/claude-approval';
 import { cliAgentHost } from 'cli/ai/host';
 import { emitEvent } from 'cli/ai/json-events';
@@ -97,7 +102,7 @@ import {
 	type AiProviderId,
 } from 'cli/ai/providers';
 import { replaySessionHistory } from 'cli/ai/sessions/replay';
-import { getActiveSlashCommands, type SlashCommandContext } from 'cli/ai/slash-commands';
+import { findSlashCommand, type SlashCommandContext } from 'cli/ai/slash-commands';
 import { AiChatUI } from 'cli/ai/ui';
 import { runCommand as runLoginCommand } from 'cli/commands/auth/login';
 import { findSiteByFolder, findSiteById } from 'cli/lib/cli-config/sites';
@@ -288,7 +293,7 @@ async function resolveChatGptConnection( sm: SessionManager ): Promise< Connecti
 	assertChatGptEnabled();
 	const result = resolveConnectionSelection( sm.getEntries(), await readConnectionRegistry() );
 	if ( ! result.ok ) {
-		throw new LoggerError( describeConnectionSelectionError( result.error ) );
+		throw new LoggerError( await describeChatGptConnectionProblem( result.error ) );
 	}
 	// On ChatGPT without a ChatGPT record (cleared, say): nothing names its connection.
 	if ( result.selection.model.providerId !== 'chatgpt-oauth' ) {
@@ -601,13 +606,16 @@ export async function runCommand( options: {
 		reasoningEffort: OpenAiReasoningEffort
 	): Promise< void > {
 		await append( ( sm ) =>
-			appendStudioEntry( sm, 'studio.session_context', {
-				provider: 'chatgpt-oauth',
-				connectionId: selection.connectionId,
-				revision: selection.revision,
-				model: selection.model.modelId,
-				reasoningEffort,
-			} )
+			appendStudioEntry(
+				sm,
+				'studio.session_context',
+				toChatGptSessionContext( {
+					connectionId: selection.connectionId,
+					revision: selection.revision,
+					model: selection.model.modelId,
+					reasoningEffort,
+				} )
+			)
 		);
 	}
 
@@ -632,10 +640,7 @@ export async function runCommand( options: {
 				: undefined;
 		session = await agent.sessions.create();
 		if ( chatGpt ) {
-			appendStudioEntry( session, 'studio.session_context', {
-				provider: 'chatgpt-oauth',
-				...chatGpt,
-			} );
+			appendStudioEntry( session, 'studio.session_context', toChatGptSessionContext( chatGpt ) );
 		} else if ( preserveConnection ) {
 			await persistSessionContext();
 		}
@@ -697,10 +702,10 @@ export async function runCommand( options: {
 		if ( provider === 'chatgpt-oauth' ) {
 			throw new LoggerError( __( 'Use /chatgpt to choose a saved account and model.' ) );
 		}
-		if (
-			currentProvider === 'chatgpt-oauth' &&
-			readChatGptSessionSelection( ( await ensureSession() ).getEntries() )
-		) {
+		// The entries this run has, without starting a session to read them.
+		const entries =
+			session?.getEntries() ?? resumedById?.getEntries() ?? options.resumeSession?.entries ?? [];
+		if ( runsOnChatGpt( currentProvider, entries ) ) {
 			await clearConversation( { preserveConnection: false } );
 		}
 		// The pin written below carries the model, so the quota-based default
@@ -1263,7 +1268,7 @@ export async function runCommand( options: {
 					current?.connectionId === selected.connectionId &&
 					current.revision === selected.revision;
 				const next = sameConnection ? previous : await agent.sessions.create();
-				const context = { provider: 'chatgpt-oauth' as const, ...selected };
+				const context = toChatGptSessionContext( selected );
 				assertSessionSelection( next.getEntries(), context );
 				appendStudioEntry( next, 'studio.session_context', context );
 				if ( ! sameConnection && ui.activeSite ) {
@@ -1281,6 +1286,8 @@ export async function runCommand( options: {
 				currentProvider = 'chatgpt-oauth';
 				ui.currentProvider = currentProvider;
 				quotaDefaultApplicable = false;
+				// Chosen: setting a key or logging in later doesn't move this chat elsewhere.
+				showCapabilitiesOnConnect = false;
 				if ( isAiModelId( selected.model ) ) currentModel = selected.model;
 				ui.currentModel = currentModel;
 				if ( ! sameConnection ) {
@@ -1305,7 +1312,7 @@ export async function runCommand( options: {
 			// Match the exact prompt: `/clear foo` falls through to the AI agent
 			// rather than running `/clear`.
 			const cmd = trimmedPrompt.startsWith( '/' )
-				? getActiveSlashCommands().find( ( c ) => `/${ c.name }` === trimmedPrompt )
+				? await findSlashCommand( trimmedPrompt )
 				: undefined;
 			if ( cmd ) {
 				if ( cmd.handler ) {

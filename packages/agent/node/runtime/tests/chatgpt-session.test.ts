@@ -4,14 +4,33 @@ import path from 'path';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAgent } from '@studio/agent/node/agent';
-import { ChatGptConnectionError } from '@studio/agent/node/chatgpt/account-store';
+import {
+	ChatGptConnectionError,
+	createChatGptAccount,
+	markChatGptSignInNeeded,
+	startChatGptSignOut,
+} from '@studio/agent/node/chatgpt/account-store';
+import { setChatGptToolImagesForLiveCheck } from '@studio/agent/node/chatgpt/tool-images';
 import { buildAttachedFilesPromptBlock } from '@studio/agent/protocol/chat-files';
+import {
+	readChatGptSessionSelection,
+	toChatGptSessionContext,
+} from '@studio/agent/protocol/chatgpt';
+import { describeConnectionSelectionError } from '@studio/agent/protocol/connections';
 import { getToolResultImageService } from '@studio/agent/protocol/image-service';
+import { getAiModelFamily, isAiModelId } from '@studio/agent/protocol/models';
 import { OPENAI_MODEL_CAPABILITIES } from '@studio/agent/protocol/openai-models';
-import { readLastReplyProvider } from '@studio/agent/protocol/providers';
+import {
+	getAiModelFamilyProvider,
+	getEffectiveSessionProvider,
+	readLastReplyProvider,
+	resolveSessionProvider,
+	type AiProviderId,
+} from '@studio/agent/protocol/providers';
 import { formatVisualAnnotationsPrompt } from '@studio/agent/protocol/visual-annotations';
 import { createFakeHost, fakeSite } from '../../tests/fake-host';
-import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
+import { chatGptPiModelId } from '../chatgpt-transport';
+import type { AgentSessionEvent, SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { ChatGptTurnHandle } from '@studio/agent/node/chatgpt/credential-broker';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 import type { StudioAgentTurnConfig, StudioAgentTurnHandle } from '@studio/agent/node/runtime';
@@ -520,6 +539,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 	afterEach( () => {
 		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
+		setChatGptToolImagesForLiveCheck( false );
 		fs.rmSync( paths.root, { recursive: true, force: true } );
 	} );
 
@@ -527,12 +547,15 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 	// one before its first turn.
 	function newChatGptSession( selection: ConnectionSelection ): SessionManager {
 		const session = SessionManager.create( sitesRoot, sessionDir );
-		session.appendCustomEntry( 'studio.session_context', {
-			provider: 'chatgpt-oauth',
-			connectionId: selection.connectionId,
-			revision: selection.revision,
-			model: selection.model.modelId,
-		} );
+		session.appendCustomEntry(
+			'studio.session_context',
+			toChatGptSessionContext( {
+				connectionId: selection.connectionId,
+				revision: selection.revision,
+				model: selection.model.modelId,
+				reasoningEffort: 'medium',
+			} )
+		);
 		return session;
 	}
 
@@ -597,6 +620,175 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 
 	const itemsOfType = ( request: CapturedRequest, type: string ) =>
 		request.body.input.filter( ( item ) => item.type === type );
+
+	// How this fork's trunk before ChatGPT (merge base 8672a64e7) chose a
+	// conversation's provider from its records: a pin it knows, the latest model
+	// a `model_change` or `studio.session_context` names (verbatim), the OpenAI
+	// effort and mode any context record carries, and the latest reply's pi
+	// provider, any it doesn't know read as WordPress.com.
+	function readAsMergeBase( entries: SessionEntry[], globalProvider?: AiProviderId ) {
+		const known: string[] = [ 'wpcom', 'anthropic-api-key', 'openai-api-key' ];
+		let pinnedProvider: AiProviderId | undefined;
+		let recordedModelId: string | undefined;
+		let lastReplyProvider: AiProviderId | undefined;
+		const efforts: unknown[] = [];
+		for ( const entry of [ ...entries ].reverse() ) {
+			if ( entry.type === 'model_change' ) {
+				recordedModelId ??= entry.modelId;
+			}
+			if ( entry.type === 'custom' && entry.customType === 'studio.session_context' ) {
+				const data = entry.data as Record< string, unknown >;
+				if ( typeof data.model === 'string' ) {
+					recordedModelId ??= data.model;
+				}
+				if ( typeof data.provider === 'string' && known.includes( data.provider ) ) {
+					pinnedProvider ??= data.provider as AiProviderId;
+				}
+				efforts.push( ...[ data.reasoningEffort, data.reasoningMode ].filter( Boolean ) );
+			}
+			if ( entry.type === 'message' && entry.message.role === 'assistant' ) {
+				const provider = ( entry.message as { provider?: string } ).provider;
+				lastReplyProvider ??=
+					provider === 'studio-openai'
+						? 'openai-api-key'
+						: provider === 'anthropic'
+						? 'anthropic-api-key'
+						: 'wpcom';
+			}
+		}
+		const recordedModel =
+			recordedModelId && isAiModelId( recordedModelId ) ? recordedModelId : undefined;
+		const recordedProvider = recordedModel
+			? getAiModelFamilyProvider( getAiModelFamily( recordedModel ) )
+			: undefined;
+		let provider: AiProviderId;
+		if ( pinnedProvider === 'openai-api-key' ) {
+			provider = pinnedProvider;
+		} else if (
+			! pinnedProvider &&
+			( recordedProvider === 'openai-api-key' || lastReplyProvider === 'openai-api-key' )
+		) {
+			provider = 'openai-api-key';
+		} else if ( ! pinnedProvider && globalProvider === 'openai-api-key' ) {
+			provider = recordedProvider ?? lastReplyProvider ?? globalProvider;
+		} else {
+			provider = pinnedProvider ?? globalProvider ?? 'wpcom';
+		}
+		return { pinnedProvider, recordedModelId, recordedModel, efforts, provider };
+	}
+
+	it( 'leaves nothing in its session file an older Studio would take as an OpenAI or other model, provider or effort', async () => {
+		const selection = selectionFor();
+		replies.push( toolCallReply, () => textReply( 'DB_NAME is studio.' ) );
+		const turn = await runChatGptTurn(
+			newChatGptSession( selection ),
+			'What is the database name?',
+			selection,
+			'medium'
+		);
+		expect( turn.error ).toBeUndefined();
+		const entries = reopen( turn.sessionFile ).getEntries();
+		expect( entries.some( ( entry ) => entry.type === 'model_change' ) ).toBe( true );
+
+		for ( const globalProvider of [
+			'openai-api-key',
+			'anthropic-api-key',
+			'wpcom',
+			undefined,
+		] as const ) {
+			const older = readAsMergeBase( entries, globalProvider );
+			expect( older.pinnedProvider ).toBeUndefined();
+			expect( older.recordedModel ).toBeUndefined();
+			expect( older.recordedModelId ).not.toBe( 'gpt-6-luna' );
+			expect( older.efforts ).toEqual( [] );
+			// It falls to that build's own choice for a chat it can't place, never to OpenAI's API.
+			expect( older.provider ).not.toBe( 'openai-api-key' );
+			expect( older.provider ).toBe(
+				globalProvider === 'openai-api-key' ? 'wpcom' : globalProvider ?? 'wpcom'
+			);
+		}
+		// This build still reads it as the ChatGPT chat it is.
+		expect( resolveSessionProvider( entries ) ).toBe( 'chatgpt-oauth' );
+		expect( readChatGptSessionSelection( entries ) ).toEqual( {
+			connectionId: selection.connectionId,
+			revision: selection.revision,
+			model: 'gpt-6-luna',
+			reasoningEffort: 'medium',
+		} );
+	} );
+
+	it( 'continues a session written before the model and effort moved out of the shared fields', async () => {
+		const selection = selectionFor();
+		replies.push( toolCallReply, () => textReply( 'DB_NAME is studio.' ) );
+		const first = await runChatGptTurn(
+			newChatGptSession( selection ),
+			'What is the database name?',
+			selection,
+			'medium'
+		);
+		// As this branch wrote it before: the record's model and effort in the
+		// shared fields, and pi's records under the bare slug.
+		const lines = fs
+			.readFileSync( first.sessionFile, 'utf8' )
+			.split( '\n' )
+			.filter( Boolean )
+			.map( ( line ) => JSON.parse( line ) );
+		const rewritten = lines.map( ( line ) => {
+			if ( line.type === 'custom' && line.customType === 'studio.session_context' ) {
+				return {
+					...line,
+					data: {
+						provider: 'chatgpt-oauth',
+						connectionId: selection.connectionId,
+						revision: selection.revision,
+						model: 'gpt-6-luna',
+						reasoningEffort: 'medium',
+					},
+				};
+			}
+			return JSON.parse(
+				JSON.stringify( line )
+					.split( `"${ chatGptPiModelId( 'gpt-6-luna' ) }"` )
+					.join( '"gpt-6-luna"' )
+			);
+		} );
+		fs.writeFileSync(
+			first.sessionFile,
+			rewritten.map( ( line ) => JSON.stringify( line ) ).join( '\n' ) + '\n'
+		);
+		expect( fs.readFileSync( first.sessionFile, 'utf8' ) ).not.toContain(
+			chatGptPiModelId( 'gpt-6-luna' )
+		);
+		requests.length = 0;
+		replies.push( () => textReply( 'Still studio.' ) );
+
+		const next = await runChatGptTurn(
+			reopen( first.sessionFile ),
+			'And the prefix?',
+			selection,
+			'low'
+		);
+
+		expect( next.error ).toBeUndefined();
+		expect( next.text ).toContain( 'Still studio.' );
+		expect( requests ).toHaveLength( 1 );
+		expectPinned( 'low' );
+		// Its history goes out as before: the same call ids, the reasoning replayed.
+		const [ output ] = itemsOfType( requests[ 0 ], 'function_call_output' );
+		expect( output.call_id ).toBe( READ_CALL.call_id );
+		expect( itemsOfType( requests[ 0 ], 'reasoning' ) ).toEqual( [
+			expect.objectContaining( { id: REASONING.id } ),
+		] );
+		expect( fs.readFileSync( first.sessionFile, 'utf8' ) ).not.toContain(
+			chatGptPiModelId( 'gpt-6-luna' )
+		);
+		expect( readChatGptSessionSelection( reopen( first.sessionFile ).getEntries() ) ).toEqual( {
+			connectionId: selection.connectionId,
+			revision: selection.revision,
+			model: 'gpt-6-luna',
+			reasoningEffort: 'medium',
+		} );
+	} );
 
 	it( 'keeps reasoning, tool calls and effort straight across tool use, reopened sessions and compaction', async () => {
 		const selection = selectionFor();
@@ -817,7 +1009,8 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( turn.entries.some( ( entry ) => entry.type === 'compaction' ) ).toBe( false );
 	} );
 
-	it( 'sends an image tool result back as image input', async () => {
+	it( 'with the live check’s override on, sends an image tool result back as image input', async () => {
+		setChatGptToolImagesForLiveCheck( true );
 		const selection = selectionFor();
 		replies.push( imageToolCallReply, () => textReply( 'It is a tiny image.' ) );
 
@@ -835,6 +1028,70 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 		expect( JSON.stringify( output.output ) ).toContain( 'input_image' );
 		expect( JSON.stringify( output.output ) ).toContain( 'data:image/png;base64,' );
 		expect( fakeBroker.handles[ 0 ].tokenRequests ).toBe( 2 );
+	} );
+
+	it( 'leaves the image out of a tool result by default, sending its text, while attached images still go', async () => {
+		const selection = selectionFor();
+		replies.push( imageToolCallReply, () => textReply( 'It is a tiny image.' ) );
+
+		const turn = await runTurn( newChatGptSession( selection ), 'Describe screenshot.png', {
+			connection: selection,
+			chatGpt: { reasoningEffort: 'medium' },
+			images: [
+				{
+					id: 'attached',
+					name: 'attached.png',
+					mimeType: 'image/png',
+					size: Buffer.from( TINY_PNG_BASE64, 'base64' ).length,
+					dataBase64: TINY_PNG_BASE64,
+				},
+			],
+		} );
+
+		expect( turn.error ).toBeUndefined();
+		expect( requests ).toHaveLength( 2 );
+		const [ output ] = itemsOfType( requests[ 1 ], 'function_call_output' );
+		expect( output.call_id ).toBe( IMAGE_READ_CALL.call_id );
+		expect( JSON.stringify( output.output ) ).not.toContain( 'input_image' );
+		expect( JSON.stringify( output.output ) ).not.toContain( 'data:image/png;base64,' );
+		expect( JSON.stringify( output.output ) ).toContain( 'image left out' );
+		// The image the user attached is image input on both requests.
+		for ( const request of requests ) {
+			expect( JSON.stringify( request.body.input ) ).toMatch(
+				/"type":"input_image"[^}]*"image_url":"data:image\/png;base64,/
+			);
+			expect( JSON.stringify( request.body.input ).match( /"type":"input_image"/g ) ).toHaveLength(
+				1
+			);
+		}
+	} );
+
+	it( 'leaves out, on the next request, an image a tool result recorded while the override was on', async () => {
+		setChatGptToolImagesForLiveCheck( true );
+		const selection = selectionFor();
+		replies.push( imageToolCallReply, () => textReply( 'It is a tiny image.' ) );
+		const first = await runChatGptTurn(
+			newChatGptSession( selection ),
+			'Describe screenshot.png',
+			selection,
+			'medium'
+		);
+		expect( JSON.stringify( requests[ 1 ].body.input ) ).toContain( 'input_image' );
+		setChatGptToolImagesForLiveCheck( false );
+		replies.push( () => textReply( 'Still tiny.' ) );
+
+		const next = await runChatGptTurn(
+			reopen( first.sessionFile ),
+			'And now?',
+			selection,
+			'medium'
+		);
+
+		expect( next.error ).toBeUndefined();
+		expect( requests ).toHaveLength( 3 );
+		expect( JSON.stringify( requests[ 2 ].body.input ) ).not.toContain( 'input_image' );
+		const [ output ] = itemsOfType( requests[ 2 ], 'function_call_output' );
+		expect( JSON.stringify( output.output ) ).toContain( 'image left out' );
 	} );
 
 	it( 'ends the turn when the connection is signed out mid-stream', async () => {
@@ -976,6 +1233,67 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( fetchSpy ).not.toHaveBeenCalled();
 			expect( fakeBroker.handles ).toHaveLength( 0 );
 		} );
+
+		// The saved registration as the account store keeps it, in this test's own config directory.
+		const saveRegistration = async ( state: 'signed-out' | 'needs-sign-in' ) => {
+			const account = await createChatGptAccount( CONNECTION_ID, {
+				issuer: 'https://auth.openai.com',
+				subject: 'test-subject-1',
+				clientId: 'test-client-1',
+				storage: 'session',
+			} );
+			if ( state === 'signed-out' ) {
+				await startChatGptSignOut( CONNECTION_ID );
+			} else {
+				await markChatGptSignInNeeded( CONNECTION_ID, {
+					logoutGeneration: account.logoutGeneration,
+					signInGeneration: account.signInGeneration ?? 0,
+				} );
+			}
+		};
+
+		it.each( [ 'signed-out', 'needs-sign-in' ] as const )(
+			'says signing in to its %s account again continues a chat whose saved registration is disconnected',
+			async ( state ) => {
+				await saveRegistration( state );
+				fakeBroker.connections = [ connectionEntry( { authStatus: 'disconnected' } ) ];
+				const selection = selectionFor();
+
+				const turn = await runChatGptTurn(
+					newChatGptSession( selection ),
+					'hi',
+					selection,
+					'medium'
+				);
+
+				expect( turn.error ).toBe(
+					describeConnectionSelectionError(
+						{ code: 'disconnected', providerId: 'chatgpt-oauth' },
+						state
+					)
+				);
+				expect( turn.error ).not.toContain( 'Start a new chat' );
+				expect( fetchSpy ).not.toHaveBeenCalled();
+				expect( fakeBroker.handles ).toHaveLength( 0 );
+			}
+		);
+
+		it( 'keeps saying a new chat is needed once the saved registration has changed, whatever its state', async () => {
+			await saveRegistration( 'signed-out' );
+			fakeBroker.connections = [ connectionEntry( { revision: 2, authStatus: 'disconnected' } ) ];
+			const selection = selectionFor();
+
+			const turn = await runChatGptTurn(
+				newChatGptSession( selection ),
+				'hi',
+				selection,
+				'medium'
+			);
+
+			expect( turn.error ).toBe(
+				describeConnectionSelectionError( { code: 'changed', providerId: 'chatgpt-oauth' } )
+			);
+		} );
 	} );
 
 	describe( 'selections the runtime refuses', () => {
@@ -1033,6 +1351,65 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( requests ).toHaveLength( sent );
 			expect( fakeBroker.handles ).toHaveLength( 0 );
 		} );
+
+		it.each( [
+			[ 'pinned there', ( file: string ) => reopen( file ) ],
+			[
+				'only by its last reply',
+				( file: string ) => {
+					const lines = fs
+						.readFileSync( file, 'utf8' )
+						.split( '\n' )
+						.filter( ( line ) => line && ! line.includes( 'studio.session_context' ) );
+					fs.writeFileSync( file, lines.join( '\n' ) + '\n' );
+					return reopen( file );
+				},
+			],
+		] )(
+			'refuses a turn on another provider in a conversation that ran on ChatGPT, %s, saying another provider needs a new chat',
+			async ( _how, open ) => {
+				const why =
+					'This chat ran on a ChatGPT plan, so it can’t continue on another provider. Start a new chat to use another provider.';
+				const selection = selectionFor();
+				replies.push( () => textReply( 'From the plan.' ) );
+				const chatGpt = await runChatGptTurn(
+					newChatGptSession( selection ),
+					'hi',
+					selection,
+					'medium'
+				);
+				expect( chatGpt.error ).toBeUndefined();
+				const sent = requests.length;
+				const session = open( chatGpt.sessionFile );
+				expect( getEffectiveSessionProvider( session.getEntries(), null ) ).toBe( 'chatgpt-oauth' );
+
+				const legacyTurns: Array<
+					Omit< StudioAgentTurnConfig, 'prompt' | 'session' | 'onEvent' >
+				> = [
+					{
+						model: 'gpt-6-luna',
+						openAi: openAiSettingsFor( 'medium' ),
+						env: { STUDIO_OPENAI_API_KEY: API_KEY },
+					},
+					{ model: 'balanced', env: { STUDIO_WPCOM_API_KEY: 'test-wpcom-token' } },
+				];
+				for ( const turn of legacyTurns ) {
+					const legacy = await runTurn( session, 'hi again', turn );
+					expect( legacy.error ).toBe( why );
+				}
+				expect( requests ).toHaveLength( sent );
+				expect( fetchSpy ).toHaveBeenCalledTimes( sent );
+
+				// Signed out since, it still says so: the turn is on another provider.
+				fakeBroker.connections = [];
+				const signedOut = await runTurn( reopen( chatGpt.sessionFile ), 'hi again', {
+					model: 'balanced',
+					env: { STUDIO_WPCOM_API_KEY: 'test-wpcom-token' },
+				} );
+				expect( signedOut.error ).toBe( why );
+				expect( requests ).toHaveLength( sent );
+			}
+		);
 
 		it.each( [ 'gpt-7-nova', 'gpt-6.1-sol' ] )(
 			'refuses %s, a ChatGPT model Studio doesn’t support, saying it isn’t qualified',
@@ -1159,7 +1536,51 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( declaredTools( requests[ 0 ] ) ).not.toContain( 'generate_images' );
 		} );
 
-		it( 'returns a screenshot to the model as image input, shows it as an artifact with progress, and refreshes the preview', async () => {
+		it( 'with the live check’s override on, returns a screenshot to the model as image input and replays it', async () => {
+			setChatGptToolImagesForLiveCheck( true );
+			const selection = selectionFor();
+			const shot = toolCalls( {
+				name: 'take_screenshot',
+				args: { url: 'http://localhost:8881/' },
+			} );
+			replies.push(
+				shot.reply,
+				() => textReply( 'The page renders.' ),
+				() => textReply( 'Still fine.' )
+			);
+			const first = await runChatGptTurn(
+				newChatGptSession( selection ),
+				'Check the home page.',
+				selection,
+				'medium'
+			);
+
+			expect( first.error ).toBeUndefined();
+			const declared = requests[ 0 ].body.input[ 0 ].tools as Array< {
+				name: string;
+				description: string;
+			} >;
+			expect( declared.find( ( tool ) => tool.name === 'take_screenshot' )?.description ).toContain(
+				'Returns the screenshot as an image that you can analyze visually'
+			);
+			expect( seams.captureScreenshotBuffer ).toHaveBeenCalledWith(
+				'http://localhost:8881/',
+				expect.anything(),
+				expect.objectContaining( { forModel: true } )
+			);
+			expect( outputFor( requests[ 1 ], shot.callIds[ 0 ] ) ).toEqual( [
+				{ type: 'input_text', text: expect.stringContaining( 'Screenshot captured' ) },
+				expect.objectContaining( {
+					type: 'input_image',
+					image_url: `data:image/jpeg;base64,${ SCREENSHOT_JPEG.toString( 'base64' ) }`,
+				} ),
+			] );
+			// The next request replays the capture with the rest of the history.
+			await runChatGptTurn( reopen( first.sessionFile ), 'And now?', selection, 'medium' );
+			expect( imageCount( outputFor( requests[ 2 ], shot.callIds[ 0 ] ) ) ).toBe( 1 );
+		} );
+
+		it( 'returns a screenshot to the model as text by default, shows it as an artifact with progress, and refreshes the preview', async () => {
 			const ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
 			host.ui = ui;
 			const selection = selectionFor();
@@ -1184,23 +1605,36 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				name: string;
 				description: string;
 			} >;
-			expect( declared.find( ( tool ) => tool.name === 'take_screenshot' )?.description ).toContain(
-				'Returns the screenshot as an image that you can analyze visually'
+			// The tool without the image block, saying why without claiming the
+			// model can't view images: it does see the images a user attaches.
+			const description = declared.find( ( tool ) => tool.name === 'take_screenshot' )?.description;
+			expect( description ).toContain(
+				'Images in tool results are not available on this connection yet'
 			);
+			expect( description ).not.toMatch( /model cannot view|cannot view images/ );
+			// And how to read a skill's "if you can view images" on this connection.
+			const reading =
+				'Where a skill or instruction asks whether you can view images, treat screenshots and other images in tool results as not viewable on this connection; images the user attaches remain visible to you.';
+			expect( description ).toContain( reading );
+			const instructions = String( requests[ 0 ].body.instructions );
+			expect( instructions ).toContain(
+				`Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot. ${ reading }`
+			);
+			expect( instructions ).not.toContain( 'You cannot view the image' );
 			expect( seams.captureScreenshotBuffer ).toHaveBeenCalledWith(
 				'http://localhost:8881/',
 				expect.anything(),
-				expect.objectContaining( { forModel: true } )
+				expect.objectContaining( { forModel: false } )
 			);
-			expect( outputFor( requests[ 1 ], shot.callIds[ 0 ] ) ).toEqual( [
-				{ type: 'input_text', text: expect.stringContaining( 'Screenshot captured' ) },
-				expect.objectContaining( {
-					type: 'input_image',
-					image_url: `data:image/jpeg;base64,${ SCREENSHOT_JPEG.toString( 'base64' ) }`,
-				} ),
-			] );
-			// The next request replays the capture with the rest of the history.
-			expect( imageCount( outputFor( requests[ 2 ], shot.callIds[ 0 ] ) ) ).toBe( 1 );
+			const output = outputFor( requests[ 1 ], shot.callIds[ 0 ] );
+			expect( imageCount( output ) ).toBe( 0 );
+			expect( JSON.stringify( output ) ).toContain( 'Screenshot captured' );
+			expect( JSON.stringify( output ) ).toContain(
+				'Images in tool results are not available on this connection yet'
+			);
+			expect( JSON.stringify( output ) ).toContain( reading );
+			expect( JSON.stringify( output ) ).not.toContain( 'cannot view images' );
+			expect( imageCount( requests[ 2 ].body.input ) ).toBe( 0 );
 			expect( ui.showArtifact ).toHaveBeenCalledTimes( 1 );
 			expect( ui.showArtifact.mock.calls[ 0 ][ 0 ].widgets ).toEqual( [
 				expect.objectContaining( {
@@ -1301,7 +1735,9 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			);
 			const output = outputFor( requests[ 1 ], browse.callIds[ 0 ] );
 			expect( JSON.stringify( output ) ).toContain( 'Use the brand blue here.' );
-			expect( imageCount( output ) ).toBe( 1 );
+			// The annotation browser's image comes back in a tool result, which this route isn't sent.
+			expect( imageCount( output ) ).toBe( 0 );
+			expect( JSON.stringify( output ) ).toContain( 'image left out' );
 		} );
 
 		it( 'reads an attached document, reports a missing one and refuses a core-file write to the model, without failing the turn', async () => {
@@ -1454,14 +1890,14 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				{ STUDIO_IMAGE_API_TOKEN: IMAGE_SERVICE_TOKEN },
 				null,
 				IMAGE_SERVICE_TOKEN,
-				{ service: 'wordpress-com', credential: 'environment-token', account: null },
+				{ service: 'wordpress-com', credential: 'environment-token' },
 			],
 			[
 				'a WordPress.com login',
 				{},
 				'test-wpcom-login-token',
 				'test-wpcom-login-token',
-				{ service: 'wordpress-com', credential: 'wordpress-com-login', account: IMAGE_ACCOUNT },
+				{ service: 'wordpress-com', credential: 'wordpress-com-login' },
 			],
 		] as const )(
 			'offers image generation with %s, on its own credential',
@@ -1514,6 +1950,13 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 						( message ) => message?.role === 'toolResult' && message.toolName === 'generate_images'
 					);
 				expect( getToolResultImageService( result?.details ) ).toEqual( expectedService );
+				// Never the WordPress.com account, in the result or the session file.
+				expect( JSON.stringify( result?.details ?? {} ) ).not.toMatch(
+					/Image Account|images@example\.test|account/
+				);
+				expect( fs.readFileSync( turn.sessionFile, 'utf8' ) ).not.toMatch(
+					/Image Account|images@example\.test/
+				);
 				// The record is Studio's: no ChatGPT request carries it, nor the
 				// image service's credential.
 				expect( JSON.stringify( requests.map( ( request ) => request.body ) ) ).not.toMatch(
@@ -1569,7 +2012,8 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				}
 			);
 			expect( first.error ).toBeUndefined();
-			expect( imageCount( requests[ 1 ].body.input ) ).toBe( 3 );
+			// The two attached; the image file read is left out of its tool result on this route.
+			expect( imageCount( requests[ 1 ].body.input ) ).toBe( 2 );
 			expectPinned( 'medium' );
 
 			// Reopened in a fresh agent, at another effort, near the budget.
@@ -1591,7 +2035,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expectPinned( 'low' );
 			const [ turnRequest, ...summaryRequests ] = requests;
 			expect( isSummaryRequest( turnRequest ) ).toBe( false );
-			expect( imageCount( turnRequest.body.input ) ).toBe( 3 );
+			expect( imageCount( turnRequest.body.input ) ).toBe( 2 );
 			expect( summaryRequests.length ).toBeGreaterThan( 0 );
 			for ( const request of summaryRequests ) {
 				expect( isSummaryRequest( request ) ).toBe( true );

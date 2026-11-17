@@ -7,15 +7,9 @@
  */
 
 import {
-	existsSync,
 	mkdirSync,
 	mkdtempSync,
-	readdirSync,
-	readFileSync,
 	rmdirSync,
-	rmSync,
-	symlinkSync,
-	unlinkSync,
 	writeFileSync,
 	writeSync as fsWriteSync,
 } from 'node:fs';
@@ -29,6 +23,7 @@ import {
 	createTokenUsage,
 	type AskUserHandler,
 	type SiteInfo,
+	type StudioAgentHost,
 } from '@studio/agent/node';
 import {
 	listChatGptConnections,
@@ -39,6 +34,7 @@ import { setChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-direc
 import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { writeGlobalInstructions } from '@studio/agent/node/global-instructions';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
+import { getChatGptModelCapabilities } from '@studio/agent/protocol/chatgpt-models';
 import { DEFAULT_MODEL, isAiModelId, type AiModelId } from '@studio/agent/protocol/models';
 import { findLastAssistant } from '@studio/agent/protocol/session-events';
 import { DEFAULT_PHP_VERSION } from '@studio/common/constants';
@@ -47,7 +43,12 @@ import { portFinder } from '@studio/common/lib/port-finder';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { SITE_FILE_ACCESS_SITE_DIRECTORY } from '@studio/common/lib/site-file-access';
 import { fetchSyncableSites } from '@studio/common/lib/sync/sync-api';
-import { getConfigDirectory, getSharedConfigPath } from '@studio/common/lib/well-known-paths';
+import {
+	getAiPayloadsPath,
+	getCertificatesPath,
+	getCliConfigPath,
+	getConfigDirectory,
+} from '@studio/common/lib/well-known-paths';
 import {
 	resolveAiEnvironment,
 	resolveInitialAiProvider,
@@ -58,6 +59,14 @@ import {
 	readObservedLines,
 	type ObservedRequest,
 } from 'cli/ai/chatgpt-acceptance-observer';
+import { caseProcessManagerHome, stopCaseProcessManager } from 'cli/ai/eval-case-daemon';
+import {
+	caseProfile,
+	removeCaseProfile,
+	withdrawCaseLogin,
+	type CaseProfile,
+} from 'cli/ai/eval-case-profile';
+import { pathsFixedAtLoad } from 'cli/ai/eval-fixed-paths';
 import {
 	evalHistoryMessages,
 	findEvalFixturesDir,
@@ -65,8 +74,11 @@ import {
 	loadEvalAttachments,
 	withMockedRemote,
 	withMockedWpcomRequest,
+	withStagingRemote,
 	type EvalAttachments,
 	type RemoteCall,
+	type StagingSite,
+	type WpcomWriteAttempt,
 	type WpcomWriteGuard,
 } from 'cli/ai/eval-harness';
 import { parseEvalRunnerVars, type EvalRunnerVars, type EvalSeed } from 'cli/ai/eval-input';
@@ -82,7 +94,15 @@ import {
 	type ExecutedRoute,
 	type RequestedRoute,
 } from 'cli/ai/eval-provider';
+import { liveEvalRunFacts } from 'cli/ai/eval-run-facts';
 import { matchesStopRule } from 'cli/ai/eval-stop';
+import {
+	evalSummaryDirectory,
+	writeEvalCaseSummary,
+	type EvalRunFacts,
+	type EvalSummaryLocation,
+	type EvalSummarySource,
+} from 'cli/ai/eval-summary';
 import { summarizeTiming, type ModelRequestRecord } from 'cli/ai/eval-timing';
 import { cliAgentHost } from 'cli/ai/host';
 import { getAiProviderDefinition } from 'cli/ai/providers';
@@ -95,6 +115,8 @@ import {
 	unlockCliConfig,
 } from 'cli/lib/cli-config/core';
 import { getSiteByFolder } from 'cli/lib/cli-config/sites';
+import { disconnectFromDaemon, killDaemonAndChildren } from 'cli/lib/daemon-client';
+import { PROCESS_MANAGER_HOME } from 'cli/lib/paths';
 import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
 import { STUDIO_SITES_ROOT } from 'cli/lib/site-paths';
 import { Logger } from 'cli/logger';
@@ -102,6 +124,7 @@ import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
 import type { StudioChatArtifactData } from '@studio/agent/protocol/chat-artifacts';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type { SyncSite } from '@studio/common/types/sync';
+import type { StageRecord } from 'cli/ai/acceptance-evidence';
 import type { AiProviderId } from 'cli/ai/providers';
 
 interface Inspection {
@@ -118,13 +141,6 @@ interface SeededFixtures {
 	activeSitePath?: string;
 }
 
-/**
- * Writes the requested fixtures into cli.json (local site + snapshots) and
- * shared.json (connected WordPress.com sites). Returns a cleanup function that
- * removes exactly what was added, so reruns start from a clean slate.
- * `globalInstructions` is the exception: it overwrites the user's real
- * instructions file, so cleanup restores the prior content instead.
- */
 // The folder site_create gives a site of this name.
 function siteSlug( name: string ): string {
 	return name
@@ -133,77 +149,62 @@ function siteSlug( name: string ): string {
 		.replace( /^-|-$/g, '' );
 }
 
-const REGISTRY_PREFIX = 'studio-eval-registry-';
+const sameFolder = ( a: string, b: string ) => path.relative( a, b ) === '';
+const isInside = ( folder: string, file: string ) => {
+	const relative = path.relative( folder, file );
+	return relative !== '' && ! relative.startsWith( '..' ) && ! path.isAbsolute( relative );
+};
 
-// Each eval runs against its own Studio site registry (cli.json), so sites that
-// other Studio sessions on this machine create never enter the turn, and
-// concurrent cases do not see each other's sites. Ports already given to the
-// user's sites and to other eval registries stay reserved.
-async function isolateSiteRegistry(): Promise< string > {
-	const ports = ( await readCliConfig() ).sites.map( ( site ) => site.port );
-	for ( const entry of readdirSync( os.tmpdir() ) ) {
-		if ( ! entry.startsWith( REGISTRY_PREFIX ) ) continue;
-		try {
-			const registry = JSON.parse(
-				readFileSync( path.join( os.tmpdir(), entry, 'cli.json' ), 'utf8' )
-			) as { sites?: Array< { port: number } > };
-			ports.push( ...( registry.sites ?? [] ).map( ( site ) => site.port ) );
-		} catch {
-			// A registry with no sites yet.
+/**
+ * Whether this process runs the case on the Studio profile and site registry
+ * its entry made for it (`eval-case-profile.ts`) and, for a case that names a
+ * provider, on its own process manager: as the path helpers resolve them now,
+ * and as the modules that fix a path when they load fixed it. A bundler can
+ * evaluate a module before the entry's overrides, so this is checked before
+ * the first site or turn, and the case never proceeds on the owner's profile
+ * or the owner's process manager.
+ */
+function caseIsolationRefusal( namesProvider: boolean ): EvalRefusal | null {
+	const own = caseProfile();
+	const refusal = ( reason: string ): EvalRefusal => ( {
+		code: 'case-profile-not-isolated',
+		message: `This case runs only on a Studio profile of its own, made before the runner loads, and ${ reason }, so nothing ran.`,
+	} );
+	if ( ! own.ok ) {
+		return refusal( own.problem );
+	}
+	const { profile, registry } = own.profile;
+	const fixed = pathsFixedAtLoad();
+	if (
+		! sameFolder( getConfigDirectory(), profile ) ||
+		! sameFolder( path.dirname( getCliConfigPath() ), registry )
+	) {
+		return refusal( 'Studio’s paths resolve to another profile now' );
+	}
+	const payloads = getAiPayloadsPath();
+	if (
+		! isInside( profile, payloads ) ||
+		! fixed.payloadDescriptions.some( ( text ) => text.includes( payloads ) )
+	) {
+		return refusal( 'wpcom_request names a payload folder outside it' );
+	}
+	if (
+		! isInside( profile, fixed.rootCaCertificate ) ||
+		! sameFolder( path.dirname( fixed.rootCaCertificate ), getCertificatesPath() )
+	) {
+		return refusal( 'Studio’s certificates folder was fixed outside it when it loaded' );
+	}
+	if ( namesProvider ) {
+		const home = caseProcessManagerHome( process.env );
+		if ( ! home || ! sameFolder( home, fixed.processManagerHome ) ) {
+			return {
+				code: 'process-manager-not-isolated',
+				message:
+					'A case that names a provider runs its sites only under a process manager of its own, which is not the one this process’s daemon client loaded with, so nothing ran.',
+			};
 		}
 	}
-	for ( const port of ports ) {
-		portFinder.addUnavailablePort( port );
-	}
-	process.env.E2E = '1';
-	process.env.E2E_CLI_CONFIG_PATH = mkdtempSync( path.join( os.tmpdir(), REGISTRY_PREFIX ) );
-	return process.env.E2E_CLI_CONFIG_PATH;
-}
-
-// What Studio downloads once per machine, which every eval reads as the user's
-// Studio does.
-const STUDIO_DOWNLOADS = [ 'server-files', 'php-bin', 'import-runtime', 'mu-plugins' ];
-
-// Each eval runs against its own Studio config directory, signed in as the
-// user, so what a case seeds (global instructions, WordPress.com connections)
-// and what its turn changes stay in the case: concurrent cases and the user's
-// own Studio never see them.
-function isolateStudioConfig( { withoutWpcomLogin = false } = {} ): string {
-	const userDir = getConfigDirectory();
-	const shared = JSON.parse( readFileSync( getSharedConfigPath(), 'utf8' ) ) as Record<
-		string,
-		unknown
-	>;
-	const { version, aiProvider } = shared;
-	// Without the login, Studio's image service, which signs with it, is off.
-	const authToken = withoutWpcomLogin ? undefined : shared.authToken;
-	const dir = mkdtempSync( path.join( os.tmpdir(), 'studio-eval-config-' ) );
-	for ( const name of STUDIO_DOWNLOADS ) {
-		if ( existsSync( path.join( userDir, name ) ) ) {
-			symlinkSync( path.join( userDir, name ), path.join( dir, name ) );
-		}
-	}
-	writeFileSync(
-		path.join( dir, 'shared.json' ),
-		JSON.stringify( { version, authToken, aiProvider } )
-	);
-	process.env.E2E_SHARED_CONFIG_PATH = dir;
-	return dir;
-}
-
-// A case's own folder, removed with the case. Its links to Studio's downloads
-// are removed as links first, so nothing they point to is ever touched.
-function removeCaseFolder( dir: string ): void {
-	try {
-		for ( const entry of readdirSync( dir, { withFileTypes: true } ) ) {
-			if ( entry.isSymbolicLink() ) {
-				unlinkSync( path.join( dir, entry.name ) );
-			}
-		}
-		rmSync( dir, { recursive: true, force: true, maxRetries: 5 } );
-	} catch ( error ) {
-		warnTeardown( `could not remove the case folder ${ path.basename( dir ) }`, error );
-	}
+	return null;
 }
 
 // A teardown failure never changes the case's outcome, but is never silent:
@@ -216,8 +217,14 @@ function warnTeardown( what: string, error: unknown ): void {
 	);
 }
 
-// The environment a case points at its own folders, as it was before the case.
-const CASE_ENVIRONMENT = [ 'E2E', 'E2E_CLI_CONFIG_PATH', 'E2E_SHARED_CONFIG_PATH' ] as const;
+// The environment that points the case at its own folders, as the entry set
+// it: put back as it was when the case started, whatever the case did to it.
+const CASE_ENVIRONMENT = [
+	'E2E',
+	'E2E_CLI_CONFIG_PATH',
+	'E2E_SHARED_CONFIG_PATH',
+	'DEV_CONFIG_DIR',
+] as const;
 
 function saveCaseEnvironment(): () => void {
 	const saved = CASE_ENVIRONMENT.map( ( name ) => [ name, process.env[ name ] ] as const );
@@ -271,6 +278,12 @@ async function deleteSites( sitePaths: string[] ): Promise< void > {
 	}
 }
 
+/**
+ * Writes the requested fixtures into the case's own profile: cli.json (local
+ * site and snapshots, in the case's registry), shared.json (connected
+ * WordPress.com sites) and the global instructions file, all removed with the
+ * case. Returns a cleanup function that deletes the seeded active site.
+ */
 async function seedFixtures( seed: EvalSeed ): Promise< SeededFixtures > {
 	const {
 		localSite,
@@ -557,7 +570,11 @@ const liveProviderDeps: EvalProviderDeps = {
 	get home() {
 		return os.homedir();
 	},
-	configDirectory: getConfigDirectory,
+	// The profile the eval process started with, which the case reads, never the case's own.
+	configDirectory: () => {
+		const own = caseProfile();
+		return own.ok ? own.profile.source : getConfigDirectory();
+	},
 	useChatGptProfile: setChatGptStateDirectory,
 };
 
@@ -567,6 +584,8 @@ interface EvalRefusal {
 }
 
 type EvalSetupRefusalCode =
+	| 'case-profile-not-isolated'
+	| 'process-manager-not-isolated'
 	| 'staging-not-designated'
 	| 'staging-not-confirmed'
 	| 'staging-needs-active-site'
@@ -579,6 +598,25 @@ interface ProviderRouteReport {
 	requested: RequestedRoute | null;
 	executed?: ExecutedRoute;
 	failure?: EvalRefusal;
+	blocked?: EvalBlock;
+}
+
+/**
+ * A case that can't pass on the selected route yet, by what the route is
+ * qualified for: neither run nor failed, and never silently skipped.
+ */
+interface EvalBlock {
+	code: 'tool-images-not-qualified';
+	message: string;
+}
+
+function blockedRun( block: EvalBlock, requested: RequestedRoute ) {
+	return {
+		success: false,
+		error: block.message,
+		blocked: block,
+		providerRoute: { requested, blocked: block } satisfies ProviderRouteReport,
+	};
 }
 
 /**
@@ -661,7 +699,31 @@ interface UiEvents {
 	previewReloads: number;
 }
 
+/**
+ * Runs one case on the profile, registry and (for a case that names a
+ * provider) process manager its entry made for it, refused before anything
+ * else when it isn't on them, and removes the profile and registry when it
+ * ends, whatever the outcome.
+ */
 export async function runEval( input: EvalRunnerInput ) {
+	const restoreCaseEnvironment = saveCaseEnvironment();
+	try {
+		const isolation = caseIsolationRefusal( input.provider?.ok === true );
+		const own = caseProfile();
+		if ( isolation || ! own.ok ) {
+			return refusedRun(
+				isolation ?? { code: 'case-profile-not-isolated', message: own.ok ? '' : own.problem },
+				input.provider ? { requested: null } : undefined
+			);
+		}
+		return await runCase( input, own.profile );
+	} finally {
+		restoreCaseEnvironment();
+		removeCaseProfile( warnTeardown );
+	}
+}
+
+async function runCase( input: EvalRunnerInput, own: CaseProfile ) {
 	const evalStartedAt = Date.now();
 	const elapsed = () => Date.now() - evalStartedAt;
 	const phaseTimingsMs: Record< string, number > = {};
@@ -705,8 +767,23 @@ export async function runEval( input: EvalRunnerInput ) {
 	const resolvedModel = plan ? plan.requested.model : input.model ?? DEFAULT_MODEL;
 	const providerRefusal = ( failure: EvalRefusal ) =>
 		refusedRun( failure, plan ? { requested: plan.requested } : undefined );
+	// Decided by the route's capability table alone, so the case runs as soon as the table qualifies it.
+	if (
+		input.needsToolImages &&
+		plan?.requested.kind === 'chatgpt-oauth' &&
+		getChatGptModelCapabilities( plan.requested.model )?.toolImageInput !== true
+	) {
+		return blockedRun(
+			{
+				code: 'tool-images-not-qualified',
+				message: `This case is judged on images a tool returns to the model, and the ChatGPT route isn't qualified for them on ${ plan.requested.model } yet (gate T1), so it was not run.`,
+			},
+			plan.requested
+		);
+	}
 
 	let seed = input.seed;
+	let stagingSite: StagingSite | null = null;
 	if ( input.remote === 'staging' ) {
 		const designated = designatedStagingSite();
 		if ( ! designated ) {
@@ -723,6 +800,7 @@ export async function runEval( input: EvalRunnerInput ) {
 			} );
 		}
 		const staging = confirmed.site;
+		stagingSite = { id: staging.id, url: staging.url };
 		if ( ! seed?.activeSite ) {
 			return providerRefusal( {
 				code: 'staging-needs-active-site',
@@ -760,8 +838,16 @@ export async function runEval( input: EvalRunnerInput ) {
 	}
 
 	const remoteCalls: RemoteCall[] = [];
+	// Every request and remote operation the case's guards refused, in order.
+	const refusedWrites: WpcomWriteAttempt[] = [];
 	const uiEvents: UiEvents = { artifacts: [], previewReloads: 0 };
-	const baseHost = remote === 'mock' ? withMockedRemote( cliAgentHost, remoteCalls ) : cliAgentHost;
+	let baseHost: StudioAgentHost = cliAgentHost;
+	if ( remote === 'mock' ) {
+		baseHost = withMockedRemote( cliAgentHost, remoteCalls );
+	} else if ( stagingSite ) {
+		baseHost = withStagingRemote( cliAgentHost, remoteCalls, stagingSite, refusedWrites );
+	}
+	const guarded = remote === 'mock' || stagingSite !== null;
 	const host = input.ui
 		? {
 				...baseHost,
@@ -842,8 +928,6 @@ export async function runEval( input: EvalRunnerInput ) {
 	// token cost of prompt variants, not just their outcomes.
 	const usage = createTokenUsage();
 
-	const restoreCaseEnvironment = saveCaseEnvironment();
-	const caseFolders: string[] = [];
 	let observerFile: string | null = null;
 	// What the case swaps in for its turns, put back in reverse order.
 	const restorers: Array< () => void > = [];
@@ -857,8 +941,14 @@ export async function runEval( input: EvalRunnerInput ) {
 	let seeded: SeededFixtures | null = null;
 	let sitesDeleted = false;
 	try {
-		caseFolders.push( await isolateSiteRegistry() );
-		caseFolders.push( isolateStudioConfig( { withoutWpcomLogin: input.imageService === 'off' } ) );
+		// The case's sites never take a port the user's sites or another case's have.
+		for ( const port of own.reservedPorts ) {
+			portFinder.addUnavailablePort( port );
+		}
+		if ( input.imageService === 'off' ) {
+			// Without the login, Studio's image service, which signs with it, is off.
+			withdrawCaseLogin( own );
+		}
 		// As the runtime decides it: whether this run offers generate_images.
 		const imageServiceConfigured = input.imageService
 			? await isImageGenerationAvailable()
@@ -867,7 +957,7 @@ export async function runEval( input: EvalRunnerInput ) {
 			return providerRefusal( {
 				code: 'image-service-still-configured',
 				message:
-					'This case needs Studio’s image service off, but it is still configured (a DEV_CONFIG_DIR profile with a WordPress.com login, say).',
+					'This case needs Studio’s image service off, but the case’s own profile still configures it, so nothing ran.',
 			} );
 		}
 		if ( input.imageService === 'required' && ! imageServiceConfigured ) {
@@ -888,11 +978,18 @@ export async function runEval( input: EvalRunnerInput ) {
 				} )
 			);
 		}
-		if ( remote === 'mock' ) {
-			restorers.push( withMockedWpcomRequest( remoteCalls ) );
+		if ( guarded ) {
+			restorers.push(
+				withMockedWpcomRequest(
+					remoteCalls,
+					stagingSite ? { site: stagingSite, refused: refusedWrites } : undefined
+				)
+			);
 			wpcomGuard = installWpcomWriteGuard( {
 				allowImageService: input.imageService === 'required',
 				allowProxyInference: runProvider === 'wpcom',
+				...( stagingSite ? { stagingSite } : {} ),
+				attempts: refusedWrites,
 			} );
 			restorers.push( wpcomGuard.uninstall );
 		}
@@ -1096,13 +1193,14 @@ export async function runEval( input: EvalRunnerInput ) {
 		}
 		phaseTimingsMs.total_eval_ms = elapsed();
 		const blockedWrites = wpcomGuard?.attempts ?? [];
+		const guardCode = stagingSite ? 'wpcom-write-outside-staging' : 'wpcom-write-under-mock';
 		if ( blockedWrites.length ) {
 			success = false;
-			error = `wpcom-write-under-mock: the case tried ${
+			error = `${ guardCode }: the case tried ${
 				blockedWrites.length
-			} request(s) that could change WordPress.com under remote: mock; none was sent.${
-				error ? ` ${ error }` : ''
-			}`;
+			} request(s) that could change WordPress.com ${
+				stagingSite ? 'outside its designated staging site' : 'under remote: mock'
+			}; none was sent.${ error ? ` ${ error }` : '' }`;
 		}
 
 		const providerRoute: ProviderRouteReport | null =
@@ -1122,12 +1220,13 @@ export async function runEval( input: EvalRunnerInput ) {
 
 		return {
 			...( providerRoute ? { providerRoute } : {} ),
-			...( remote === 'mock' ? { remoteCalls } : {} ),
+			...( guarded ? { remoteCalls } : {} ),
 			...( wpcomGuard
 				? {
 						remoteGuard: {
-							code: blockedWrites.length ? 'wpcom-write-under-mock' : null,
+							code: blockedWrites.length ? guardCode : null,
 							blocked: blockedWrites,
+							...( stagingSite ? { allowed: wpcomGuard.allowed } : {} ),
 						},
 				  }
 				: {} ),
@@ -1176,10 +1275,40 @@ export async function runEval( input: EvalRunnerInput ) {
 				warnTeardown( 'could not remove the request observer file', error );
 			}
 		}
-		restoreCaseEnvironment();
-		for ( const dir of caseFolders ) {
-			removeCaseFolder( dir );
-		}
+	}
+}
+
+/**
+ * For a case that selects a provider (or must), its sanitized summary
+ * (`eval-summary.ts`): the one output of the case that may leave the machine,
+ * a new run with the case's route record, which its checks then append to.
+ * Never fails the case; the evidence writer's guards decide what it holds.
+ */
+export function writeCaseSummary(
+	input: EvalRunnerInput,
+	result: unknown,
+	{
+		env = process.env,
+		threw = false,
+		facts = liveEvalRunFacts,
+	}: { env?: NodeJS.ProcessEnv; threw?: boolean; facts?: () => EvalRunFacts } = {}
+): { location: EvalSummaryLocation; record: StageRecord } | null {
+	if ( ! input.provider ) {
+		return null;
+	}
+	try {
+		return writeEvalCaseSummary( ( result ?? {} ) as EvalSummarySource, {
+			caseId: input.caseId,
+			provider: input.provider.ok ? input.provider.request.provider : undefined,
+			directory: evalSummaryDirectory( env ),
+			threw,
+			everyCheckRecorded: input.everyCheckRecorded,
+			selection: input.provider.ok ? input.provider.request : undefined,
+			facts: facts(),
+		} );
+	} catch ( error ) {
+		warnTeardown( 'could not write the case’s sanitized summary', error );
+		return null;
 	}
 }
 
@@ -1225,12 +1354,27 @@ export async function main() {
 	};
 
 	let exitCode = 0;
+	let input: EvalRunnerInput | null = null;
+	let result: unknown;
 	try {
-		emit( await runEval( readEvalRunnerInput() ) );
+		input = readEvalRunnerInput();
+		result = await runEval( input );
 	} catch ( error ) {
-		emit( { success: false, error: error instanceof Error ? error.message : String( error ) } );
+		result = { success: false, error: error instanceof Error ? error.message : String( error ) };
 		exitCode = 1;
 	}
+	// Also when the case never started: its input was unreadable.
+	removeCaseProfile( warnTeardown );
+	// Its location goes with the result, as the result's own goes on stdout, for the checks' records.
+	const summary = input ? writeCaseSummary( input, result, { threw: exitCode !== 0 } ) : null;
+	emit( summary ? { ...( result as object ), evalSummary: summary.location } : result );
+	await stopCaseProcessManager( {
+		home: caseProcessManagerHome( process.env ),
+		processManagerHome: PROCESS_MANAGER_HOME,
+		kill: killDaemonAndChildren,
+		disconnect: disconnectFromDaemon,
+		warn: warnTeardown,
+	} );
 	removeEmptySitesRoot();
 	// The Agent SDK keeps internal handles open past conversation end; bail out
 	// rather than leaving promptfoo waiting on its exec child.

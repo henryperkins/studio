@@ -1,15 +1,29 @@
 import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import { getVisibleToasts } from '@/data/app-messages';
+import { ChatGptSettingsError, type AuthUser, type SessionEntry } from '@/data/core';
 import {
 	CHATGPT_MODELS_QUERY_KEY,
 	CHATGPT_SETTINGS_QUERY_KEY,
 } from '@/data/queries/use-chatgpt-settings';
-import { createFakeConnector, makeSession, makeSite, TEST_USER } from '@/test/fake-connector';
+import {
+	changeAnnotation,
+	getSiteAnnotations,
+	pickAnnotation,
+	removeAnnotations,
+	requestAnnotationSend,
+} from '@/features/annotations';
+import { clearComposerDrafts } from '@/features/composer';
+import {
+	createFakeConnector,
+	makeSession,
+	makeSite,
+	TEST_USER,
+	type FakeConnector,
+} from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
-import type { AuthUser, SessionEntry } from '@/data/core';
 import type { ChatGptAccountView, ChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
 
@@ -32,15 +46,18 @@ const pin = ( data: StudioSessionContextData ): SessionEntry => ( {
 	customType: 'studio.session_context',
 	data: { provider: 'chatgpt-oauth', ...data },
 } );
+// As Studio saves them: an account's label is its email.
+const PERSONAL = 'personal@example.test';
+const WORK = 'work@example.test';
 const account = ( connectionId: string, label: string ): ChatGptAccountView => ( {
 	connectionId,
 	providerId: 'chatgpt-oauth',
 	backend: 'pi',
 	revision: 1,
-	identity: { subject: connectionId, email: 'same@example.test' },
+	identity: { verified: true, email: label },
 	authStatus: 'connected',
 	label,
-	email: 'same@example.test',
+	email: label,
 	state: 'signed-in',
 	storage: 'vault',
 } );
@@ -56,7 +73,11 @@ function deferred< T >() {
 async function setup(
 	entries = [ pin( INITIAL ) ],
 	withApi = false,
-	user: AuthUser | null = null
+	user: AuthUser | null = null,
+	// The chat, or the site's new chat, which has no session until it starts.
+	path = '/sessions/chat',
+	// The site's new chat works on its live site, so starting it writes the environment too.
+	live = false
 ) {
 	const connector = createFakeConnector(
 		{
@@ -66,7 +87,7 @@ async function setup(
 				enabled: true,
 				signInSupported: true,
 				secureStorage: 'available',
-				accounts: [ account( A, 'Personal' ), account( B, 'Work' ) ],
+				accounts: [ account( A, PERSONAL ), account( B, WORK ) ],
 			},
 			sessions: [
 				{
@@ -120,11 +141,45 @@ async function setup(
 		} );
 		return { runId: `run-${ runs.length }` };
 	} );
-	const view = renderApp( { connector, path: '/sessions/chat' } );
+	if ( live ) {
+		connector.getConnectedWpcomSites.mockResolvedValue( [
+			{ id: 42, localSiteId: 'one', name: 'Hosted example', url: 'https://example.com' },
+		] as never );
+	}
+	const view = renderApp( { connector, path } );
 	await screen.findByRole( 'combobox', { name: 'Message WordPress Studio' } );
 	await waitFor( () => expect( view.queryClient.isFetching() ).toBe( 0 ) );
+	if ( live ) {
+		await act( async () => {
+			view.queryClient.setQueryData( [ 'site-chat-draft', 'one' ], {
+				activeEnvironment: 'live',
+				lastSelectedWpcomSiteId: 42,
+			} );
+		} );
+		await screen.findByRole( 'button', { name: 'Remove Live' } );
+	}
 	return { ...view, connector, runs };
 }
+type StartStep = 'createSession' | 'setSessionChatGptSelection' | 'setSessionEnvironment';
+// Holds the connector's next call of `step` open until the test settles it.
+function holdNext( connector: FakeConnector, step: StartStep | 'setSessionProvider' ) {
+	const gate = deferred< void >();
+	const mock = connector[ step ] as unknown as Mock< ( ...args: unknown[] ) => Promise< unknown > >;
+	const run = mock.getMockImplementation()!;
+	mock.mockImplementationOnce( async ( ...args ) => {
+		await gate.promise;
+		return run( ...args );
+	} );
+	return gate;
+}
+async function attachBrief() {
+	fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
+		target: { files: [ new File( [ '# Brief' ], 'brief.md', { type: 'text/markdown' } ) ] },
+	} );
+	await screen.findByRole( 'listitem', { name: /^brief\.md/ } );
+}
+const modelButton = () => screen.getByRole( 'button', { name: 'Model' } );
+const sendButton = () => screen.getByRole( 'button', { name: 'Send message' } );
 async function chooseEffort( label: string ) {
 	fireEvent.click( reasoning() );
 	fireEvent.click(
@@ -134,9 +189,9 @@ async function chooseEffort( label: string ) {
 		)
 	);
 }
-async function chooseChatGpt( label = 'Personal', model = 'GPT-6 Luna' ) {
+async function chooseChatGpt( label = PERSONAL, model = 'GPT-6 Luna' ) {
 	fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
-	const group = await screen.findByRole( 'group', { name: new RegExp( `ChatGPT · ${ label }` ) } );
+	const group = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ label }` } );
 	fireEvent.click( await within( group ).findByRole( 'option', { name: new RegExp( model ) } ) );
 }
 function send( text = 'New request' ) {
@@ -151,7 +206,7 @@ describe( 'ChatGPT chats', () => {
 		expect( screen.getByRole( 'button', { name: 'Model' } ) ).toHaveAccessibleDescription(
 			/ChatGPT plan/
 		);
-		expect( screen.getByText( /ChatGPT plan · Personal/ ) ).toHaveTextContent( A.slice( 0, 8 ) );
+		expect( screen.getByText( `ChatGPT plan · ${ PERSONAL }` ) ).toBeVisible();
 		fireEvent.click( reasoning() );
 		expect( screen.queryByRole( 'group', { name: 'Mode' } ) ).not.toBeInTheDocument();
 		fireEvent.click(
@@ -175,7 +230,7 @@ describe( 'ChatGPT chats', () => {
 				'Images: WordPress.com image service as Test User, not your ChatGPT plan'
 			)
 		).toBeVisible();
-		expect( screen.getByText( /ChatGPT plan · Personal/ ) ).toHaveTextContent( A.slice( 0, 8 ) );
+		expect( screen.getByText( `ChatGPT plan · ${ PERSONAL }` ) ).toBeVisible();
 	} );
 
 	it( 'says images are off without the image service, and opens where to set it up', async () => {
@@ -210,16 +265,17 @@ describe( 'ChatGPT chats', () => {
 		await act( () => queryClient.resetQueries( { queryKey: CHATGPT_MODELS_QUERY_KEY } ) );
 
 		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
-		const personal = await screen.findByRole( 'group', { name: /ChatGPT · Personal/ } );
-		const work = await screen.findByRole( 'group', { name: /ChatGPT · Work/ } );
+		const personal = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ PERSONAL }` } );
+		const work = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ WORK }` } );
 		const sentence = 'Some models this account offers aren’t supported in Studio yet';
 		await waitFor( () => expect( screen.getAllByRole( 'note' ) ).toHaveLength( 2 ) );
 		const notes = screen.getAllByRole( 'note' );
 
 		expect( notes ).toHaveLength( 2 );
 		notes.forEach( ( note ) => expect( note ).toHaveTextContent( sentence ) );
-		expect( notes[ 0 ] ).toHaveTextContent( /Personal/ );
-		expect( notes[ 1 ] ).toHaveTextContent( /Work/ );
+		expect( notes[ 0 ] ).toHaveTextContent( PERSONAL );
+		expect( notes[ 1 ] ).toHaveTextContent( WORK );
+		notes.forEach( ( note ) => expect( note ).not.toHaveTextContent( /f84d75a0|1c8e270b/ ) );
 		expect( screen.queryByRole( 'option', { name: /aren’t supported/ } ) ).not.toBeInTheDocument();
 		expect( within( personal ).getAllByRole( 'option' ) ).toHaveLength( 1 );
 		expect( within( work ).getAllByRole( 'option' ) ).toHaveLength( 1 );
@@ -232,11 +288,86 @@ describe( 'ChatGPT chats', () => {
 		await setup();
 
 		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
-		const personal = await screen.findByRole( 'group', { name: /ChatGPT · Personal/ } );
+		const personal = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ PERSONAL }` } );
 
 		expect( await within( personal ).findByRole( 'option', { name: /GPT-6 Luna/ } ) ).toBeVisible();
 		expect( screen.queryByRole( 'note' ) ).not.toBeInTheDocument();
 	} );
+
+	it( 'names the chat’s account once, by its label, and its plan once on the Model button', async () => {
+		await setup();
+		const model = screen.getByRole( 'button', { name: 'Model' } );
+
+		expect( model ).toHaveAccessibleDescription( `GPT-6 Luna · ChatGPT plan · ${ PERSONAL }` );
+		expect( screen.getByText( `ChatGPT plan · ${ PERSONAL }` ) ).not.toHaveTextContent(
+			A.slice( 0, 8 )
+		);
+		fireEvent.click( model );
+		const personal = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ PERSONAL }` } );
+		const option = await within( personal ).findByRole( 'option', { name: /GPT-6 Luna/ } );
+		expect( within( personal ).getByText( PERSONAL ) ).toBeVisible();
+		expect( option ).toHaveTextContent( /ChatGPT plan/ );
+		expect( option ).not.toHaveTextContent( PERSONAL );
+	} );
+
+	it( 'tells two accounts of the same label apart by the start of their ids', async () => {
+		const { connector, queryClient } = await setup();
+		connector.state.chatGpt.accounts = [ account( A, PERSONAL ), account( B, PERSONAL ) ];
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+		expect(
+			await screen.findByText( `ChatGPT plan · ${ PERSONAL } · ${ A.slice( 0, 8 ) }` )
+		).toBeVisible();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+		expect(
+			await screen.findByRole( 'group', {
+				name: `ChatGPT plan · ${ PERSONAL } · ${ A.slice( 0, 8 ) }`,
+			} )
+		).toBeVisible();
+		expect(
+			screen.getByRole( 'group', { name: `ChatGPT plan · ${ PERSONAL } · ${ B.slice( 0, 8 ) }` } )
+		).toBeVisible();
+		expect( screen.queryByRole( 'group', { name: new RegExp( A ) } ) ).not.toBeInTheDocument();
+	} );
+
+	it.each( [
+		[ 'signed-out', 'Signed out' ],
+		[ 'needs-sign-in', 'Needs sign-in' ],
+	] as const )(
+		'says in the picker that another account is %s, offering none of its models to choose',
+		async ( state, badge ) => {
+			const { connector, queryClient, runs } = await setup();
+			connector.state.chatGpt.accounts[ 1 ] = {
+				...account( B, WORK ),
+				authStatus: 'disconnected',
+				state,
+			};
+			await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+			fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+
+			const work = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ WORK }` } );
+			const row = within( work ).getByRole( 'option' );
+			expect( within( work ).getAllByRole( 'option' ) ).toHaveLength( 1 );
+			expect( row ).toHaveTextContent( 'Sign in to this ChatGPT account in Settings' );
+			// First, so a narrow picker cuts the instruction rather than the state.
+			expect( row ).toHaveTextContent( new RegExp( `^${ badge }` ) );
+			expect( row ).toHaveAttribute( 'aria-disabled', 'true' );
+			fireEvent.click( row );
+			fireEvent.keyDown( screen.getByRole( 'listbox', { name: 'Choose a model' } ), {
+				key: 'End',
+			} );
+			expect( screen.getByRole( 'listbox', { name: 'Choose a model' } ) ).not.toHaveAttribute(
+				'aria-activedescendant',
+				row.id
+			);
+			expect(
+				screen.queryByRole( 'dialog', { name: 'Start a new chat?' } )
+			).not.toBeInTheDocument();
+			expect( connector.getChatGptModels ).not.toHaveBeenCalledWith( B, 1 );
+			expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+			expect( runs ).toHaveLength( 0 );
+		}
+	);
 
 	it( 'sends attached images and documents with the turn on the pinned ChatGPT selection', async () => {
 		const { runs } = await setup();
@@ -381,7 +512,7 @@ describe( 'ChatGPT chats', () => {
 						name: /GPT-6 Luna/,
 					} )
 				);
-			} else await chooseChatGpt( direction === 'between-accounts' ? 'Work' : 'Personal' );
+			} else await chooseChatGpt( direction === 'between-accounts' ? WORK : PERSONAL );
 			const dialog = await screen.findByRole( 'dialog', { name: 'Start a new chat?' } );
 			expect( connector.createSession ).not.toHaveBeenCalled();
 			expect(
@@ -418,11 +549,132 @@ describe( 'ChatGPT chats', () => {
 		}
 	);
 
+	it( 'puts a chat with nothing in it yet on ChatGPT where it is, keeping what was typed', async () => {
+		const { connector, runs } = await setup( [] );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		await chooseChatGpt( WORK );
+
+		await waitFor( () =>
+			expect( connector.setSessionChatGptSelection ).toHaveBeenCalledExactlyOnceWith( 'chat', {
+				...INITIAL,
+				connectionId: B,
+			} )
+		);
+		expect( screen.queryByRole( 'dialog', { name: 'Start a new chat?' } ) ).not.toBeInTheDocument();
+		expect( connector.createSession ).not.toHaveBeenCalled();
+		expect( input() ).toHaveValue( 'Unsent idea' );
+		expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+		fireEvent.keyDown( input(), { key: 'Enter' } );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( runs[ 0 ] ).toMatchObject( {
+			id: 'chat',
+			prompt: 'Unsent idea',
+			selection: { ...INITIAL, connectionId: B },
+		} );
+	} );
+
+	it( 'takes back a chat put on ChatGPT where it is when that can’t be saved, saying why', async () => {
+		const { connector, runs } = await setup( [] );
+		connector.setSessionChatGptSelection.mockRejectedValueOnce(
+			new Error( 'Studio couldn’t save the model for this chat. Try again.' )
+		);
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		await chooseChatGpt( WORK );
+
+		await waitFor( () =>
+			expect(
+				getVisibleToasts().some( ( toast ) =>
+					toast.title.includes( 'Studio couldn’t save the model for this chat. Try again.' )
+				)
+			).toBe( true )
+		);
+		await waitFor( () =>
+			expect( screen.queryByText( `ChatGPT plan · ${ WORK }` ) ).not.toBeInTheDocument()
+		);
+		expect( input() ).toHaveValue( 'Unsent idea' );
+		expect( connector.createSession ).not.toHaveBeenCalled();
+		expect( runs ).toHaveLength( 0 );
+	} );
+
+	it( 'starts the site’s new chat on ChatGPT without asking, taking what was typed to it', async () => {
+		const { connector, runs } = await setup( [], false, null, '/sites/one/new' );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		await chooseChatGpt( WORK );
+
+		await waitFor( () =>
+			expect( connector.createSession ).toHaveBeenCalledExactlyOnceWith( 'one' )
+		);
+		const { id } = await connector.createSession.mock.results[ 0 ].value;
+		await waitFor( () =>
+			expect( connector.setSessionChatGptSelection ).toHaveBeenCalledExactlyOnceWith( id, {
+				...INITIAL,
+				connectionId: B,
+			} )
+		);
+		expect( screen.queryByRole( 'dialog', { name: 'Start a new chat?' } ) ).not.toBeInTheDocument();
+		expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+		fireEvent.keyDown( input(), { key: 'Enter' } );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( runs[ 0 ] ).toMatchObject( {
+			id,
+			prompt: 'Unsent idea',
+			selection: { ...INITIAL, connectionId: B },
+		} );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+	} );
+
+	it( 'starts the site’s new chat on one session however often the account had to be chosen', async () => {
+		const { connector, runs } = await setup( [], false, null, '/sites/one/new' );
+		connector.setSessionChatGptSelection.mockRejectedValueOnce(
+			new Error( 'Studio couldn’t save the model for this chat. Try again.' )
+		);
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		await chooseChatGpt( WORK );
+		await waitFor( () =>
+			expect(
+				getVisibleToasts().some( ( toast ) =>
+					toast.title.includes( 'Studio couldn’t save the model for this chat. Try again.' )
+				)
+			).toBe( true )
+		);
+		expect( input() ).toHaveValue( 'Unsent idea' );
+
+		await chooseChatGpt( WORK );
+		await waitFor( () =>
+			expect( connector.setSessionChatGptSelection ).toHaveBeenCalledTimes( 2 )
+		);
+		expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+		const { id } = await connector.createSession.mock.results[ 0 ].value;
+		fireEvent.keyDown( input(), { key: 'Enter' } );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( runs[ 0 ] ).toMatchObject( { id, prompt: 'Unsent idea' } );
+	} );
+
+	it( 'still asks to start a new chat once a chat without turns is pinned to another provider', async () => {
+		const { connector } = await setup(
+			[ pin( { provider: 'openai-api-key', model: 'gpt-6-luna' } ) ],
+			true
+		);
+		await chooseChatGpt( WORK );
+
+		expect( await screen.findByRole( 'dialog', { name: 'Start a new chat?' } ) ).toBeVisible();
+		expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+	} );
+
 	it( 'carries only an explicitly entered summary into the new composer', async () => {
 		await setup();
 		fireEvent.change( input(), { target: { value: 'Private draft' } } );
-		await chooseChatGpt( 'Work' );
+		await chooseChatGpt( WORK );
 		const dialog = await screen.findByRole( 'dialog', { name: 'Start a new chat?' } );
+		const target = `ChatGPT plan · ${ WORK } · GPT-6 Luna · Medium`;
+		expect( within( dialog ).getByText( target ) ).toBeVisible();
+		expect( dialog ).toHaveAccessibleDescription(
+			expect.stringMatching( /^Changing the account or billing connection starts a new chat\./ )
+		);
+		expect( dialog ).toHaveAccessibleDescription( expect.stringContaining( target ) );
 		fireEvent.change(
 			within( dialog ).getByRole( 'textbox', { name: 'Context summary (optional)' } ),
 			{ target: { value: 'Reviewed context' } }
@@ -431,12 +683,40 @@ describe( 'ChatGPT chats', () => {
 		await waitFor( () => expect( input() ).toHaveValue( 'Reviewed context' ) );
 	} );
 
+	it.each( [
+		'Studio couldn’t save the model for this chat. Try again.',
+		'Choose a model this provider supports.',
+	] )(
+		'says only “%s” when the new chat’s provider can’t be saved, keeping the original chat',
+		async ( message ) => {
+			const { connector } = await setup( [ pin( INITIAL ) ], true );
+			connector.setSessionProvider.mockRejectedValueOnce( new Error( message ) );
+			fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+			fireEvent.click(
+				within( await screen.findByRole( 'group', { name: 'Models' } ) ).getByRole( 'option', {
+					name: /GPT-6 Luna/,
+				} )
+			);
+			const dialog = await screen.findByRole( 'dialog', { name: 'Start a new chat?' } );
+			fireEvent.click( within( dialog ).getByRole( 'button', { name: 'Start new chat' } ) );
+
+			expect( await within( dialog ).findByText( message ) ).toBeVisible();
+			expect( dialog ).not.toHaveTextContent( /settings\.lock|EEXIST|[A-Z]:\\/ );
+			expect( connector.continueSession ).not.toHaveBeenCalled();
+			expect(
+				readChatGptSessionSelection(
+					connector.state.sessions.find( ( session ) => session.summary.id === 'chat' )!.entries
+				)
+			).toEqual( INITIAL );
+		}
+	);
+
 	it( 'keeps the original chat when the new connection cannot be saved', async () => {
 		const { connector } = await setup();
 		connector.setSessionChatGptSelection.mockRejectedValueOnce(
 			new Error( 'The account signed out.' )
 		);
-		await chooseChatGpt( 'Work' );
+		await chooseChatGpt( WORK );
 		fireEvent.click(
 			within( await screen.findByRole( 'dialog', { name: 'Start a new chat?' } ) ).getByRole(
 				'button',
@@ -520,6 +800,152 @@ describe( 'ChatGPT chats', () => {
 		}
 	);
 
+	// As each app's connector reports a failed read (pinned in chatgpt-contracts.test.ts).
+	it.each( [
+		{
+			host: 'Desktop, or studio ui with the server’s { error }',
+			failure: () =>
+				new ChatGptSettingsError( 'Studio couldn’t complete the ChatGPT action. Try again.' ),
+			shown: 'Studio couldn’t complete the ChatGPT action. Try again.',
+		},
+		{
+			host: 'studio ui with the server not answering',
+			failure: () => new Error( 'GET /chatgpt failed (502): Bad Gateway' ),
+			shown: 'Try again.',
+		},
+	] )(
+		'says why the ChatGPT accounts couldn’t be checked in $host and retries from the notice, sending nothing meanwhile',
+		async ( { failure, shown } ) => {
+			const { connector, queryClient, runs } = await setup();
+			connector.getChatGptSettings.mockRejectedValue( failure() );
+			await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+			expect(
+				await screen.findByText( `Couldn’t check your ChatGPT accounts. ${ shown }` )
+			).toBeVisible();
+			expect( screen.queryByText( /GET \/chatgpt|Bad Gateway/ ) ).not.toBeInTheDocument();
+			send( 'Held request' );
+			await act( async () => {} );
+			expect( runs ).toHaveLength( 0 );
+
+			connector.getChatGptSettings.mockImplementation( async () =>
+				structuredClone( connector.state.chatGpt )
+			);
+			fireEvent.click( screen.getByRole( 'button', { name: 'Retry' } ) );
+
+			await waitFor( () =>
+				expect(
+					screen.queryByText( /Couldn’t check your ChatGPT accounts/ )
+				).not.toBeInTheDocument()
+			);
+			expect( connector.recheckChatGptSettings ).toHaveBeenCalledTimes( 1 );
+			send( 'Following request' );
+			await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+			expect( runs[ 0 ].selection ).toEqual( INITIAL );
+		}
+	);
+
+	it.each( [
+		[
+			'signed-out',
+			'The ChatGPT account this chat runs on is signed out. Sign in to that account again to continue this chat; the conversation stays as it is.',
+		],
+		[
+			'needs-sign-in',
+			'The ChatGPT account this chat runs on needs you to sign in again. Sign in to that account again to continue this chat; the conversation stays as it is.',
+		],
+	] as const )(
+		'says signing in again to its %s account continues the chat, and opens Settings on that account, not the first',
+		async ( state, text ) => {
+			const { connector, queryClient, runs } = await setup( [
+				pin( { ...INITIAL, connectionId: B } ),
+			] );
+			connector.state.chatGpt.accounts[ 1 ] = {
+				...account( B, WORK ),
+				authStatus: 'disconnected',
+				state,
+			};
+			await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+			expect( await screen.findByText( text ) ).toBeVisible();
+			expect( screen.queryByText( /Start a new chat/ ) ).not.toBeInTheDocument();
+			send( 'Held request' );
+			await act( async () => {} );
+			expect( runs ).toHaveLength( 0 );
+			fireEvent.click( screen.getByRole( 'button', { name: 'Manage ChatGPT' } ) );
+
+			const dialog = await screen.findByRole( 'dialog', { name: 'Settings' } );
+			const group = await within( dialog ).findByRole( 'group', { name: 'ChatGPT plan' } );
+			expect(
+				within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
+			).toHaveTextContent( WORK );
+			const signIn = within( group ).getByRole( 'button', { name: 'Sign in again' } );
+			expect( signIn ).toHaveAttribute( 'data-variant', 'accent' );
+			expect( within( group ).getByRole( 'button', { name: 'Add account' } ) ).toHaveAttribute(
+				'data-variant',
+				'outline'
+			);
+			await waitFor( () =>
+				expect( document.querySelector( '[data-settings-match]' ) ).toHaveAccessibleName(
+					'ChatGPT sign-in'
+				)
+			);
+			fireEvent.click( signIn );
+			await waitFor( () =>
+				expect( connector.beginChatGptSignIn ).toHaveBeenCalledWith( B, { storage: 'vault' } )
+			);
+		}
+	);
+
+	it( 'keeps saying a new chat is needed once the connection has changed, and opens Settings on the chat’s account', async () => {
+		const { connector, queryClient } = await setup( [ pin( { ...INITIAL, connectionId: B } ) ] );
+		connector.state.chatGpt.accounts[ 1 ] = { ...account( B, WORK ), revision: 2 };
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+		expect(
+			await screen.findByText(
+				'The ChatGPT connection this chat ran on has changed since, so the chat can’t continue. Start a new chat.'
+			)
+		).toBeVisible();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Manage ChatGPT' } ) );
+
+		const dialog = await screen.findByRole( 'dialog', { name: 'Settings' } );
+		const group = await within( dialog ).findByRole( 'group', { name: 'ChatGPT plan' } );
+		expect(
+			within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
+		).toHaveTextContent( WORK );
+		expect( within( group ).getByRole( 'button', { name: 'Add account' } ) ).toHaveAttribute(
+			'data-variant',
+			'accent'
+		);
+	} );
+
+	it( 'holds a chat that ran on ChatGPT once ChatGPT plans are turned off, offering no ChatGPT account', async () => {
+		const { connector, queryClient, runs } = await setup();
+		connector.state.chatGpt = {
+			enabled: false,
+			signInSupported: false,
+			secureStorage: 'unavailable',
+			accounts: [],
+		};
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+		expect(
+			await screen.findByText( 'ChatGPT plan connections are not enabled in this app.' )
+		).toBeVisible();
+		send( 'Held request' );
+		await act( async () => {} );
+		expect( runs ).toHaveLength( 0 );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Model' } ) );
+		expect( await screen.findByRole( 'listbox', { name: 'Choose a model' } ) ).toBeVisible();
+		expect( screen.queryByRole( 'group', { name: /^ChatGPT plan/ } ) ).not.toBeInTheDocument();
+		expect( connector.getChatGptModels ).not.toHaveBeenCalledWith( B, 1 );
+		expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+		expect( readChatGptSessionSelection( connector.state.sessions[ 0 ].entries ) ).toEqual(
+			INITIAL
+		);
+	} );
+
 	it( 'holds queued messages after the selected account disconnects, even with another account and an API key', async () => {
 		const { connector, queryClient, runs } = await setup( [ pin( INITIAL ) ], true );
 		send( 'First request' );
@@ -527,7 +953,7 @@ describe( 'ChatGPT chats', () => {
 		send( 'Queued private request' );
 		await screen.findByText( 'Queued private request' );
 		connector.state.chatGpt.accounts[ 0 ] = {
-			...account( A, 'Personal' ),
+			...account( A, PERSONAL ),
 			authStatus: 'disconnected',
 			state: 'signed-out',
 		};
@@ -541,9 +967,405 @@ describe( 'ChatGPT chats', () => {
 				event: { type: 'run.interrupted', timestamp: new Date().toISOString() },
 			} )
 		);
-		await waitFor( () => expect( screen.getByText( /ChatGPT isn’t connected/ ) ).toBeVisible() );
+		await waitFor( () =>
+			expect(
+				screen.getByText( /The ChatGPT account this chat runs on is signed out\./ )
+			).toBeVisible()
+		);
 		expect( screen.getByText( 'Queued private request' ) ).toBeVisible();
 		expect( runs ).toHaveLength( 1 );
 		expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+	} );
+} );
+
+describe( 'Starting the site’s new chat on ChatGPT', () => {
+	beforeEach( () => clearComposerDrafts() );
+	afterEach( () =>
+		removeAnnotations(
+			'one',
+			getSiteAnnotations( 'one' ).notes.map( ( note ) => note.id )
+		)
+	);
+	const NOT_SENT =
+		'This wasn’t sent while the chat starts on ChatGPT. Send it again once it has started.';
+	// A note on the site's preview, then sent from there on its own (not with the draft).
+	function addNote() {
+		const id = pickAnnotation( 'one', { tag: 'h1', selector: 'h1', path: '/' } )!;
+		changeAnnotation( 'one', id, { comment: 'Make the heading shorter' } );
+		return id;
+	}
+	const sendNote = ( id: string ) =>
+		act( () => requestAnnotationSend( { siteId: 'one', noteIds: [ id ] } ) );
+	const STEPS: StartStep[] = [
+		'createSession',
+		'setSessionChatGptSelection',
+		'setSessionEnvironment',
+	];
+
+	it.each( STEPS )(
+		'takes no Send while %s is pending, then has the ChatGPT chat with the draft, unsent',
+		async ( step ) => {
+			const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new', true );
+			fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+			await attachBrief();
+			const gate = holdNext( connector, step );
+			await chooseChatGpt( WORK );
+			await waitFor( () => expect( connector[ step ] ).toHaveBeenCalled() );
+
+			expect( modelButton() ).toHaveAttribute( 'aria-busy', 'true' );
+			expect( sendButton() ).toHaveAttribute( 'aria-disabled', 'true' );
+			fireEvent.click( sendButton() );
+			fireEvent.keyDown( input(), { key: 'Enter' } );
+			await act( async () => {} );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+			expect( runs ).toHaveLength( 0 );
+
+			await act( async () => gate.resolve() );
+			expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+			await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+			expect( screen.getByRole( 'listitem', { name: /^brief\.md/ } ) ).toBeVisible();
+			expect( modelButton() ).not.toHaveAttribute( 'aria-busy' );
+			expect( runs ).toHaveLength( 0 );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+			const { id } = await connector.createSession.mock.results[ 0 ].value;
+			expect( connector.setSessionChatGptSelection ).toHaveBeenCalledExactlyOnceWith( id, {
+				...INITIAL,
+				connectionId: B,
+			} );
+			expect( connector.setSessionEnvironment ).toHaveBeenCalledExactlyOnceWith( id, 'live' );
+
+			fireEvent.keyDown( input(), { key: 'Enter' } );
+			await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+			expect( runs[ 0 ] ).toMatchObject( {
+				id,
+				prompt: 'Unsent idea',
+				selection: { ...INITIAL, connectionId: B },
+			} );
+			expect( runs[ 0 ].options?.files ).toEqual( [
+				expect.objectContaining( { name: 'brief.md' } ),
+			] );
+		}
+	);
+
+	it.each( STEPS )(
+		'sends nothing when %s fails, keeping the draft and the previous model on the new chat',
+		async ( step ) => {
+			const { connector, runs, history } = await setup(
+				[],
+				false,
+				TEST_USER,
+				'/sites/one/new',
+				true
+			);
+			fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+			await attachBrief();
+			const previous = modelButton().textContent;
+			const gate = holdNext( connector, step );
+			await chooseChatGpt( WORK );
+			await waitFor( () => expect( connector[ step ] ).toHaveBeenCalled() );
+			fireEvent.keyDown( input(), { key: 'Enter' } );
+			await act( async () => {} );
+
+			await act( async () =>
+				gate.reject( new Error( 'Studio couldn’t save the model for this chat. Try again.' ) )
+			);
+			await waitFor( () =>
+				expect(
+					getVisibleToasts().some( ( toast ) =>
+						toast.title.includes( 'Studio couldn’t save the model for this chat. Try again.' )
+					)
+				).toBe( true )
+			);
+			await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+			expect( history.location.pathname ).toBe( '/sites/one/new' );
+			expect( modelButton() ).toHaveTextContent( previous! );
+			expect( screen.queryByText( `ChatGPT plan · ${ WORK }` ) ).not.toBeInTheDocument();
+			expect( input() ).toHaveValue( 'Unsent idea' );
+			expect( screen.getByRole( 'listitem', { name: /^brief\.md/ } ) ).toBeVisible();
+			expect( runs ).toHaveLength( 0 );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+		}
+	);
+
+	it( 'leaves the typed draft on the new chat when its composer goes away before the start ends', async () => {
+		const { connector, history } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		const gate = holdNext( connector, 'setSessionChatGptSelection' );
+		await chooseChatGpt( WORK );
+		await waitFor( () => expect( connector.setSessionChatGptSelection ).toHaveBeenCalled() );
+		const { id } = await connector.createSession.mock.results[ 0 ].value;
+
+		act( () => history.push( '/sessions/chat' ) );
+		await waitFor( () => expect( input() ).toHaveValue( '' ) );
+		// Another chat of the site isn't held by the new chat's start.
+		expect( modelButton() ).not.toHaveAttribute( 'aria-busy' );
+		await act( async () => gate.resolve() );
+		await act( async () => {} );
+		expect( history.location.pathname ).toBe( '/sessions/chat' );
+
+		act( () => history.push( `/sessions/${ id }` ) );
+		await waitFor( () => expect( history.location.pathname ).toBe( `/sessions/${ id }` ) );
+		await screen.findByRole( 'combobox', { name: 'Message WordPress Studio' } );
+		expect( input() ).toHaveValue( '' );
+		act( () => history.push( '/sites/one/new' ) );
+		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+	} );
+
+	const LIVE_FAILED = 'Studio couldn’t switch this chat to the live site. Try again.';
+	const toastSays = ( text: string ) =>
+		waitFor( () =>
+			expect( getVisibleToasts().some( ( toast ) => toast.title.includes( text ) ) ).toBe( true )
+		);
+	const pinnedTo = ( connector: FakeConnector, id: string ) =>
+		readChatGptSessionSelection(
+			connector.state.sessions.find( ( session ) => session.summary.id === id )!.entries
+		)?.connectionId;
+	// The backend's rule: a chat on one ChatGPT account can't move to another.
+	function refuseAnotherAccount( connector: FakeConnector ) {
+		const persist = connector.setSessionChatGptSelection.getMockImplementation()!;
+		connector.setSessionChatGptSelection.mockImplementation( async ( id, selection ) => {
+			const pinned = pinnedTo( connector, id );
+			if ( pinned && pinned !== selection.connectionId ) {
+				throw new Error( 'Start a new chat to change the ChatGPT account or billing connection.' );
+			}
+			return persist( id, selection );
+		} );
+		return persist;
+	}
+
+	it( 'finishes a start whose environment wasn’t saved on the same session when the same account is chosen again', async () => {
+		const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new', true );
+		refuseAnotherAccount( connector );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		connector.setSessionEnvironment.mockRejectedValueOnce( new Error( LIVE_FAILED ) );
+		await chooseChatGpt( WORK );
+		await toastSays( LIVE_FAILED );
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+		expect( screen.queryByText( `ChatGPT plan · ${ WORK }` ) ).not.toBeInTheDocument();
+
+		await chooseChatGpt( WORK );
+		expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+		const { id } = await connector.createSession.mock.results[ 0 ].value;
+		expect( connector.setSessionEnvironment ).toHaveBeenCalledTimes( 2 );
+		expect( connector.setSessionEnvironment ).toHaveBeenLastCalledWith( id, 'live' );
+		expect( pinnedTo( connector, id ) ).toBe( B );
+		expect( runs ).toHaveLength( 0 );
+	} );
+
+	it( 'starts one fresh session when the backend refuses the remembered one, already on another account', async () => {
+		const { connector, history } = await setup( [], false, TEST_USER, '/sites/one/new', true );
+		refuseAnotherAccount( connector );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		connector.setSessionEnvironment.mockRejectedValueOnce( new Error( LIVE_FAILED ) );
+		await chooseChatGpt( WORK );
+		await toastSays( LIVE_FAILED );
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+		const { id: first } = await connector.createSession.mock.results[ 0 ].value;
+
+		await chooseChatGpt( PERSONAL );
+		expect( await screen.findByText( `ChatGPT plan · ${ PERSONAL }` ) ).toBeVisible();
+		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 2 );
+		const { id: second } = await connector.createSession.mock.results[ 1 ].value;
+		expect( history.location.pathname ).toBe( `/sessions/${ second }` );
+		expect( pinnedTo( connector, second ) ).toBe( A );
+		expect( pinnedTo( connector, first ) ).toBe( B );
+		expect( connector.setSessionEnvironment ).toHaveBeenLastCalledWith( second, 'live' );
+	} );
+
+	it( 'starts at most one fresh session an attempt, and retries on it', async () => {
+		const { connector } = await setup( [], false, TEST_USER, '/sites/one/new', true );
+		const persist = refuseAnotherAccount( connector );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		connector.setSessionEnvironment.mockRejectedValueOnce( new Error( LIVE_FAILED ) );
+		await chooseChatGpt( WORK );
+		await toastSays( LIVE_FAILED );
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+
+		const refuse = connector.setSessionChatGptSelection.getMockImplementation()!;
+		let freshFails = 1;
+		connector.setSessionChatGptSelection.mockImplementation( async ( id, selection ) => {
+			if ( ! pinnedTo( connector, id ) && freshFails-- > 0 ) {
+				throw new Error( 'Studio couldn’t save the model for this chat. Try again.' );
+			}
+			return refuse( id, selection );
+		} );
+		await chooseChatGpt( PERSONAL );
+		await toastSays( 'Studio couldn’t save the model for this chat. Try again.' );
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 2 );
+		expect( input() ).toHaveValue( 'Unsent idea' );
+
+		connector.setSessionChatGptSelection.mockImplementation( persist );
+		await chooseChatGpt( PERSONAL );
+		expect( await screen.findByText( `ChatGPT plan · ${ PERSONAL }` ) ).toBeVisible();
+		expect( connector.createSession ).toHaveBeenCalledTimes( 2 );
+		const { id: second } = await connector.createSession.mock.results[ 1 ].value;
+		expect( pinnedTo( connector, second ) ).toBe( A );
+	} );
+
+	it.each( [ 'createSession', 'setSessionChatGptSelection' ] as const )(
+		'sends no preview note on its own while %s is pending, keeping it, then sends it to the ChatGPT chat',
+		async ( step ) => {
+			const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new' );
+			const gate = holdNext( connector, step );
+			await chooseChatGpt( WORK );
+			await waitFor( () => expect( connector[ step ] ).toHaveBeenCalled() );
+			const id = addNote();
+
+			sendNote( id );
+			await act( async () => {} );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+			await toastSays( NOT_SENT );
+			expect( runs ).toHaveLength( 0 );
+			expect( getSiteAnnotations( 'one' ).notes.map( ( note ) => note.id ) ).toEqual( [ id ] );
+
+			await act( async () => gate.resolve() );
+			expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+			const { id: started } = await connector.createSession.mock.results[ 0 ].value;
+			sendNote( id );
+			await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+			expect( runs[ 0 ] ).toMatchObject( {
+				id: started,
+				selection: { ...INITIAL, connectionId: B },
+			} );
+			expect( runs[ 0 ].options?.visualAnnotations ).toEqual( [
+				expect.objectContaining( { comment: 'Make the heading shorter' } ),
+			] );
+			await waitFor( () => expect( getSiteAnnotations( 'one' ).notes ).toHaveLength( 0 ) );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
+		}
+	);
+
+	it( 'sends a preview note held back by a start that then fails where the composer shows', async () => {
+		const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		const gate = holdNext( connector, 'setSessionChatGptSelection' );
+		const previous = modelButton().textContent;
+		await chooseChatGpt( WORK );
+		await waitFor( () => expect( connector.setSessionChatGptSelection ).toHaveBeenCalled() );
+		const id = addNote();
+		sendNote( id );
+		await toastSays( NOT_SENT );
+		expect( runs ).toHaveLength( 0 );
+
+		await act( async () =>
+			gate.reject( new Error( 'Studio couldn’t save the model for this chat. Try again.' ) )
+		);
+		await waitFor( () => expect( modelButton() ).not.toHaveAttribute( 'aria-busy' ) );
+		expect( modelButton() ).toHaveTextContent( previous! );
+		sendNote( id );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 2 );
+		const { id: sent } = await connector.createSession.mock.results[ 1 ].value;
+		expect( runs[ 0 ].id ).toBe( sent );
+		expect( runs[ 0 ].selection ).toBeUndefined();
+		expect( connector.setSessionProvider ).toHaveBeenCalledWith( sent, 'wpcom', expect.anything() );
+		expect( runs[ 0 ].options?.visualAnnotations ).toEqual( [
+			expect.objectContaining( { comment: 'Make the heading shorter' } ),
+		] );
+		await waitFor( () => expect( getSiteAnnotations( 'one' ).notes ).toHaveLength( 0 ) );
+	} );
+
+	it( 'keeps the Model control busy while the start is pending, so the account it shows is the one pinned', async () => {
+		const { connector } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		const gate = holdNext( connector, 'setSessionChatGptSelection' );
+		await chooseChatGpt( WORK );
+		await waitFor( () => expect( connector.setSessionChatGptSelection ).toHaveBeenCalled() );
+
+		expect( modelButton() ).toHaveAttribute( 'aria-busy', 'true' );
+		fireEvent.click( modelButton() );
+		await act( async () => {} );
+		expect( screen.queryByRole( 'listbox', { name: 'Choose a model' } ) ).not.toBeInTheDocument();
+
+		await act( async () => gate.resolve() );
+		expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+		const { id } = await connector.createSession.mock.results[ 0 ].value;
+		expect( connector.setSessionChatGptSelection ).toHaveBeenCalledExactlyOnceWith( id, {
+			...INITIAL,
+			connectionId: B,
+		} );
+		expect(
+			readChatGptSessionSelection(
+				connector.state.sessions.find( ( session ) => session.summary.id === id )!.entries
+			)?.connectionId
+		).toBe( B );
+	} );
+
+	it.each( [ 'createSession', 'setSessionProvider' ] as const )(
+		'starts nothing on ChatGPT while a send from the new chat waits on %s, and the message runs where it was sent',
+		async ( step ) => {
+			const { connector, runs, history } = await setup( [], false, TEST_USER, '/sites/one/new' );
+			fireEvent.change( input(), { target: { value: 'Sent idea' } } );
+			// The picker is open when Send is pressed, so the pick lands during the send.
+			fireEvent.click( modelButton() );
+			const group = await screen.findByRole( 'group', { name: `ChatGPT plan · ${ WORK }` } );
+			const luna = await within( group ).findByRole( 'option', { name: /GPT-6 Luna/ } );
+			const gate = holdNext( connector, step );
+			fireEvent.keyDown( input(), { key: 'Enter' } );
+			await waitFor( () => expect( connector[ step ] ).toHaveBeenCalled() );
+			expect( modelButton() ).toHaveAttribute( 'aria-busy', 'true' );
+
+			fireEvent.click( luna );
+			await act( async () => {} );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+
+			await act( async () => gate.resolve() );
+			await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+			const { id } = await connector.createSession.mock.results[ 0 ].value;
+			await waitFor( () => expect( history.location.pathname ).toBe( `/sessions/${ id }` ) );
+			expect( runs[ 0 ] ).toMatchObject( { id, prompt: 'Sent idea' } );
+			expect( runs[ 0 ].selection ).toBeUndefined();
+			expect( connector.setSessionProvider ).toHaveBeenCalledWith( id, 'wpcom', expect.anything() );
+			expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+			expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+			expect( screen.queryByText( `ChatGPT plan · ${ WORK }` ) ).not.toBeInTheDocument();
+		}
+	);
+
+	it( 'keeps the Model control busy while a send from the new chat is pending', async () => {
+		const { connector, runs } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		const gate = holdNext( connector, 'createSession' );
+		send( 'Sent idea' );
+		await waitFor( () => expect( connector.createSession ).toHaveBeenCalled() );
+
+		expect( modelButton() ).toHaveAttribute( 'aria-busy', 'true' );
+		fireEvent.click( modelButton() );
+		await act( async () => {} );
+		expect( screen.queryByRole( 'listbox', { name: 'Choose a model' } ) ).not.toBeInTheDocument();
+
+		await act( async () => gate.resolve() );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+		expect( connector.setSessionChatGptSelection ).not.toHaveBeenCalled();
+	} );
+
+	it( 'leaves the Model control as it was during a send from the new chat with ChatGPT plans off', async () => {
+		const { connector, queryClient, runs } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		connector.state.chatGpt = {
+			enabled: false,
+			signInSupported: false,
+			secureStorage: 'unavailable',
+			accounts: [],
+		};
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+		const gate = holdNext( connector, 'createSession' );
+		send( 'Sent idea' );
+		await waitFor( () => expect( connector.createSession ).toHaveBeenCalled() );
+
+		expect( modelButton() ).not.toHaveAttribute( 'aria-busy' );
+		expect( modelButton() ).toBeEnabled();
+		fireEvent.click( modelButton() );
+		expect( await screen.findByRole( 'listbox', { name: 'Choose a model' } ) ).toBeVisible();
+
+		await act( async () => gate.resolve() );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
 	} );
 } );

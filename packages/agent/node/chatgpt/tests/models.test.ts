@@ -10,6 +10,7 @@ import {
 	type ChatGptModelListResult,
 } from '@studio/agent/node/chatgpt/models';
 import { CHATGPT_UNAVAILABLE_RETRY_DELAYS_MS } from '@studio/agent/node/chatgpt/route';
+import { describeChatGptError } from '@studio/agent/protocol/chatgpt-errors';
 import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
 import type { OpenAiModelCapabilities, OpenAiModelId } from '@studio/agent/protocol/openai-models';
 
@@ -355,6 +356,24 @@ describe( 'fetchChatGptModels', () => {
 		expect( http.spy ).not.toHaveBeenCalled();
 	} );
 
+	it( 'reports a lock or file the broker couldn’t use with a fixed message, never its path', async () => {
+		const home = [ '', 'home', 'someone', '.studio', 'chatgpt-credentials', 'x.lock' ].join( '/' );
+		broker.failure = Object.assign(
+			new Error( `EPERM: operation not permitted, open '${ home }'` ),
+			{ code: 'EPERM', path: home }
+		);
+		const http = captureFetch( () => json( { models: [] } ) );
+
+		const error = failureOf( await fetchChatGptModels( ACCOUNT_A ) );
+
+		expect( error ).toEqual( { kind: 'credentials' } );
+		expect( describeChatGptError( error ) ).toBe(
+			'Studio couldn’t use your ChatGPT sign-in for this request.'
+		);
+		expect( JSON.stringify( error ) ).not.toMatch( /someone|EPERM|lock/ );
+		expect( http.spy ).not.toHaveBeenCalled();
+	} );
+
 	it( 'reports a network failure as one, with no token in it', async () => {
 		vi.spyOn( globalThis, 'fetch' ).mockRejectedValue(
 			Object.assign( new TypeError( 'fetch failed' ), {
@@ -485,13 +504,15 @@ describe( 'fetchChatGptModels', () => {
 } );
 
 // What the route is qualified for (ledger section A, "G2 record"): gpt-6-luna
-// at the efforts a captured run completed, with image input per the route's
-// documentation. Every other model and effort is unknown, so unavailable.
+// at the efforts a captured run completed, with attached images per the route's
+// documentation. Images in tool results stay off until gate T1 observes the
+// route accept one. Every other model and effort is unknown, so unavailable.
 const QUALIFIED_ROUTE_CAPABILITIES = {
 	'gpt-6-luna': {
 		reasoningEfforts: [ 'low', 'medium' ],
 		reasoningModes: [ 'standard' ],
 		imageInput: true,
+		toolImageInput: false,
 	},
 };
 

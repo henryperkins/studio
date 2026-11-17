@@ -15,7 +15,12 @@
  * and written there, in place.
  */
 import { createHash } from 'node:crypto';
-import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
+// eslint-disable-next-line no-restricted-imports -- development only: the product's own pi model id for a ChatGPT slug, so the evidence names a reply's model as its requests do.
+import { chatGptPiModelId } from '@studio/agent/node/runtime/chatgpt-transport';
+import {
+	readChatGptSessionSelection,
+	toChatGptSessionContext,
+} from '@studio/agent/protocol/chatgpt';
 import {
 	CHATGPT_MODEL_CAPABILITIES,
 	describeChatGptReasoningProblem,
@@ -297,7 +302,7 @@ const PROFILE_PROBLEMS: Record< DedicatedProfileProblem, string > = {
 	'profile-not-found': `${ EVAL_CHATGPT_PROFILE_ENV } names no directory.`,
 	'profile-in-studio-profile': `${ EVAL_CHATGPT_PROFILE_ENV } is your own Studio profile, inside it, or resolves into it. Use a dedicated test profile.`,
 	'profile-is-config-directory':
-		'This process keeps its own Studio config in the dedicated test profile (DEV_CONFIG_DIR), so a case would seed it. Run the eval without pointing DEV_CONFIG_DIR there.',
+		'DEV_CONFIG_DIR points at the dedicated test profile, which the eval would then also read as your own Studio profile. Run the eval without pointing DEV_CONFIG_DIR there.',
 };
 
 const REPLY_API: Record< AiProviderId, string > = {
@@ -386,20 +391,20 @@ async function planChatGpt(
 			'That connection is not a ChatGPT connection Studio’s agent can run on.'
 		);
 	}
-	if ( entry.authStatus !== 'connected' || ! entry.identity?.subject ) {
+	const subject =
+		entry.identity && 'subject' in entry.identity ? entry.identity.subject : undefined;
+	if ( entry.authStatus !== 'connected' || ! subject ) {
 		return failure(
 			'connection-signed-out',
 			'That ChatGPT connection is not signed in to the dedicated profile. Sign in again with secure storage: a session-only sign-in lives only in the app that holds it.'
 		);
 	}
-	const sessionContext: StudioSessionContextData = {
-		provider: 'chatgpt-oauth',
+	const sessionContext: StudioSessionContextData = toChatGptSessionContext( {
 		connectionId,
 		revision: entry.revision,
 		model,
 		reasoningEffort: reasoning.effort,
-	};
-	const { subject } = entry.identity;
+	} );
 	return {
 		ok: true,
 		plan: {
@@ -561,6 +566,19 @@ const distinct = < T >( values: Array< T | undefined > ): T[] => [
 	...new Set( values.filter( ( value ): value is T => value !== undefined ) ),
 ];
 
+/**
+ * A reply's model by the slug requests carry: a ChatGPT reply records pi's id
+ * for the model (`chatGptPiModelId`), or the bare slug in a session written
+ * before it, so the product's own id for each slug the route knows, or the
+ * requests named, is matched. Anything else is left as the runtime recorded it.
+ */
+function replyModelSlug( provider: unknown, model: string, slugs: readonly string[] ): string {
+	if ( provider !== CHATGPT_PI_PROVIDER ) {
+		return model;
+	}
+	return slugs.find( ( slug ) => chatGptPiModelId( slug ) === model ) ?? model;
+}
+
 function replyKind( provider: unknown ): AiProviderId | 'unknown' {
 	switch ( provider ) {
 		case CHATGPT_PI_PROVIDER:
@@ -601,6 +619,8 @@ export function summarizeExecutedRoute( {
 			request.endpoint !== 'models' &&
 			! imageService.includes( request )
 	);
+	const models = distinct( inference.map( ( request ) => request.model ) );
+	const routeSlugs = [ ...new Set( [ ...Object.keys( CHATGPT_MODEL_CAPABILITIES ), ...models ] ) ];
 	const backends = distinct( inference.map( ( request ) => request.host as EvalBackend ) );
 	const backend = backends.length === 1 ? backends[ 0 ] : backends.length ? 'mixed' : 'none';
 	const kind = backend === 'none' || backend === 'mixed' ? backend : PROVIDER_BY_BACKEND[ backend ];
@@ -624,11 +644,15 @@ export function summarizeExecutedRoute( {
 		modelRequests: inference.length,
 		apiKeyBearers: inference.filter( ( request ) => request.bearer === 'api-key' ).length,
 		imageServiceRequests: imageService.length,
-		models: distinct( inference.map( ( request ) => request.model ) ),
+		models,
 		efforts: distinct( inference.map( ( request ) => request.effort ) ),
 		replyKinds: distinct( replies.map( ( reply ) => replyKind( reply.provider ) ) ),
 		replyModels: distinct(
-			replies.map( ( reply ) => ( typeof reply.model === 'string' ? reply.model : undefined ) )
+			replies.map( ( reply ) =>
+				typeof reply.model === 'string'
+					? replyModelSlug( reply.provider, reply.model, routeSlugs )
+					: undefined
+			)
 		),
 		connectionRef,
 		connectionMatchesBearer,

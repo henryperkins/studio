@@ -2,6 +2,7 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { readChatGptAccounts } from '@studio/agent/node/chatgpt/account-store';
 import {
 	beginChatGptSignIn as start,
 	cancelChatGptSignIn as cancel,
@@ -15,14 +16,26 @@ import {
 	beginChatGptSignIn,
 	cancelChatGptSignIn,
 	getChatGptSettings,
+	recheckChatGptSettings,
 	setAiProvider,
 	waitForChatGptSignIn,
 } from 'src/modules/user-settings/lib/ipc-handlers';
 import type { IpcMainInvokeEvent } from 'electron';
 
+// Each call stands for one run of the system keychain's tool.
+const { keychainChecks } = vi.hoisted( () => ( { keychainChecks: vi.fn() } ) );
 vi.mock( '@studio/common/lib/os-credential-store', async ( original ) => ( {
 	...( await original< typeof import('@studio/common/lib/os-credential-store') >() ),
-	createOsCredentialStore: () => createFakeCredentialStore().store,
+	createOsCredentialStore: () => {
+		const { store } = createFakeCredentialStore();
+		return {
+			...store,
+			check: () => {
+				keychainChecks();
+				return store.check();
+			},
+		};
+	},
 } ) );
 vi.mock( '@studio/agent/node/chatgpt/oauth', async ( original ) => ( {
 	...( await original< object >() ),
@@ -30,6 +43,11 @@ vi.mock( '@studio/agent/node/chatgpt/oauth', async ( original ) => ( {
 	waitForChatGptSignIn: vi.fn(),
 	cancelChatGptSignIn: vi.fn(),
 } ) );
+// This app's tests write no files (`atomically` is mocked), so saved accounts come from here.
+vi.mock( '@studio/agent/node/chatgpt/account-store', async ( original ) => {
+	const actual = await original< typeof import('@studio/agent/node/chatgpt/account-store') >();
+	return { ...actual, readChatGptAccounts: vi.fn( actual.readChatGptAccounts ) };
+} );
 
 const ID = 'f84d75a0-4e60-4168-a1ab-3134542c637a';
 const ATTEMPT = 'b69a1ddf-d1a2-4ff6-b293-75c358ff42df';
@@ -49,6 +67,56 @@ afterEach( async () => {
 } );
 
 describe( 'ChatGPT desktop IPC boundary', () => {
+	it( 'lists saved accounts without their subject', async () => {
+		vi.mocked( readChatGptAccounts ).mockResolvedValue( [
+			{
+				registrationId: ID,
+				issuer: 'https://auth.example.test',
+				subject: 'test-private-subject',
+				email: 'someone@example.test',
+				clientId: 'test-issued-client',
+				label: 'someone@example.test',
+				revision: 1,
+				logoutGeneration: 0,
+				storage: 'vault',
+				state: 'signed-in',
+				createdAt: '2026-11-10T00:00:00Z',
+				updatedAt: '2026-11-10T00:00:00Z',
+			},
+		] );
+
+		const settings = await getChatGptSettings();
+
+		expect( settings.accounts ).toEqual( [
+			expect.objectContaining( {
+				connectionId: ID,
+				identity: { verified: true, email: 'someone@example.test' },
+				authStatus: 'connected',
+			} ),
+		] );
+		expect( JSON.stringify( settings ) ).not.toContain( 'test-private-subject' );
+		expect( JSON.stringify( settings ) ).not.toContain( 'subject' );
+	} );
+
+	it( 'answers repeated reads without the keychain’s tool, and runs it again on a recheck', async () => {
+		vi.mocked( readChatGptAccounts ).mockResolvedValue( [] );
+		await recheckChatGptSettings();
+		keychainChecks.mockClear();
+
+		for ( let poll = 0; poll < 3; poll++ ) {
+			await getChatGptSettings();
+		}
+		expect( keychainChecks ).not.toHaveBeenCalled();
+
+		await expect( recheckChatGptSettings() ).resolves.toEqual( {
+			enabled: true,
+			signInSupported: true,
+			secureStorage: 'available',
+			accounts: [],
+		} );
+		expect( keychainChecks ).toHaveBeenCalledTimes( 1 );
+	} );
+
 	it( 'rejects ChatGPT as a global default before writing settings', async () => {
 		await expect( setAiProvider( event, 'chatgpt-oauth' ) ).rejects.toThrow(
 			'Choose a ChatGPT account in a new chat instead of setting a default provider.'
@@ -64,7 +132,11 @@ describe( 'ChatGPT desktop IPC boundary', () => {
 		await expect( beginChatGptSignIn( event, ID, { storage: 'session' } ) ).resolves.toEqual( {
 			attemptId: ATTEMPT,
 		} );
-		expect( start ).toHaveBeenCalledExactlyOnceWith( ID, { storage: 'session' } );
+		expect( start ).toHaveBeenCalledExactlyOnceWith(
+			ID,
+			{ storage: 'session' },
+			{ storageChosen: expect.any( Function ) }
+		);
 		vi.mocked( finish ).mockResolvedValueOnce( {
 			ok: true,
 			registrationId: ID,

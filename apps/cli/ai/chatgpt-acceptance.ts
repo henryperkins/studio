@@ -16,6 +16,7 @@ import {
 	answerChatGptSessionTokenInvalidation,
 	answerChatGptSessionTokenRequest,
 	CHATGPT_TURN_WATCH_POLL_MS,
+	createChatGptCredentialBroker,
 	getChatGptAccessToken,
 	getChatGptSessionForkEnvironment,
 	invalidateChatGptAccessToken,
@@ -31,6 +32,7 @@ import {
 	createChatGptSignInFlow,
 } from '@studio/agent/node/chatgpt/oauth';
 import { ChatGptSettingsError, readChatGptModels } from '@studio/agent/node/chatgpt/settings';
+import { getChatGptVaultKeyAccounts } from '@studio/agent/node/chatgpt/state-directory';
 import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
 import { setSessionChatGptSelection } from '@studio/agent/node/sessions/chatgpt-selection';
@@ -75,6 +77,7 @@ import {
 	type AcceptanceRunPaths,
 	type RealProfileHazard,
 } from 'cli/ai/acceptance-isolation';
+import { endProcessTree, hasExited } from 'cli/ai/acceptance-process-tree';
 import {
 	ACCEPTANCE_OBSERVER_FILE_ENV,
 	installAcceptanceObserver,
@@ -254,6 +257,10 @@ interface AcceptanceBroker {
 	askSessionToken( connectionId: string, logoutGeneration: number ): Promise< boolean | null >;
 	readAccount( registrationId: string ): Promise< ChatGptAccount | null >;
 	vaultRecordExists( registrationId: string ): boolean;
+	/** The keychain item that holds this profile's vault key; throws when it can't be named. */
+	vaultKeyItem(): string;
+	/** Removes this profile's own vault key item, unless a saved sign-in still needs it. */
+	removeProfileVaultKey(): Promise< 'removed' | 'default-profile' | 'records-exist' >;
 	readModels( connectionId: string, revision: number ): Promise< ChatGptModelAvailability >;
 }
 
@@ -271,11 +278,13 @@ interface TokenProbeResult {
 
 export interface AcceptanceTokens {
 	holdNextRefresh(): RefreshHold;
+	/** How many refreshes the broker made through this client succeeded. */
+	refreshes(): number;
 	/**
 	 * Tries a refresh with a refresh token kept in memory: the one the last
-	 * refresh retired, the one it issued, or the last one a sign-out revoked.
+	 * refresh retired, or the one it issued.
 	 */
-	probe( which: 'retired' | 'rotated' | 'revoked' ): Promise< TokenProbeResult >;
+	probe( which: 'retired' | 'rotated' ): Promise< TokenProbeResult >;
 	revocations(): { total: number; confirmed: number; rotatedRevoked: boolean };
 	/** Releases any hold and waits for refreshes in flight. */
 	settle(): Promise< void >;
@@ -308,12 +317,15 @@ export interface TurnOptions {
 	policy: ToolPolicy;
 	/** The session file, to see whether a tool result was persisted when its event arrived. */
 	persistenceFile?: string;
+	/** Gate T1's live check: images in tool results turned on, in this turn's process only. */
+	toolImages?: boolean;
 }
 
 export interface TimedEvent {
 	receivedAt: number;
 	event: JsonEvent;
-	persistedAtReceipt?: boolean;
+	/** For a tool result: whether the session file held it on arrival; null when unreadable. */
+	persistedAtReceipt?: boolean | null;
 }
 
 export interface TurnResult {
@@ -412,6 +424,7 @@ export function createAcceptanceTokenService(
 	const inFlight = new Set< Promise< unknown > >();
 	let retired: CapturedToken | null = null;
 	let rotated: CapturedToken | null = null;
+	let refreshes = 0;
 	const revoked: Array< CapturedToken & { confirmed: boolean } > = [];
 
 	const revokeQuietly = ( clientId: string, refreshToken: string ) =>
@@ -426,6 +439,7 @@ export function createAcceptanceTokenService(
 		nextHold = null;
 		const result = await inner.refresh( request );
 		if ( result.ok ) {
+			refreshes++;
 			retired = { clientId: request.clientId, refreshToken: request.refreshToken };
 			rotated = {
 				clientId: request.clientId,
@@ -480,9 +494,9 @@ export function createAcceptanceTokenService(
 				},
 			};
 		},
+		refreshes: () => refreshes,
 		async probe( which ) {
-			const target =
-				which === 'retired' ? retired : which === 'rotated' ? rotated : revoked.at( -1 ) ?? null;
+			const target = which === 'retired' ? retired : rotated;
 			if ( ! target ) {
 				return { tried: false, rejected: false, terminal: false };
 			}
@@ -566,9 +580,21 @@ export function classifyTurnFailure( text: string ): string[] {
 			}
 		}
 	}
+	// A turn's failure reaches the runner as text only: every text the shared
+	// wording gives a code, one per state of the account the chat runs on.
+	const accountStates: Array< Parameters< typeof describeConnectionSelectionError >[ 1 ] > = [
+		undefined,
+		'signed-in',
+		'signed-out',
+		'needs-sign-in',
+	];
 	for ( const code of [ 'disconnected', 'changed', 'unsupported' ] as const ) {
 		if (
-			text.includes( describeConnectionSelectionError( { code, providerId: 'chatgpt-oauth' } ) )
+			accountStates.some( ( state ) =>
+				text.includes(
+					describeConnectionSelectionError( { code, providerId: 'chatgpt-oauth' }, state )
+				)
+			)
 		) {
 			codes.add( `connection-${ code }` );
 		}
@@ -587,7 +613,7 @@ interface ToolCallDigest {
 	endedAt?: number;
 	isError?: boolean;
 	hasStudioService: boolean;
-	persistedAtReceipt?: boolean;
+	persistedAtReceipt?: boolean | null;
 }
 
 export interface TurnDigest {
@@ -962,15 +988,22 @@ interface AcceptanceState {
 	marker?: string;
 	effort?: string;
 	offeredSessionId?: string;
+	/**
+	 * What follows `chatgpt-vault-key-` in the name of the run profile's own
+	 * keychain item, so an abandoned run's item can be removed by its exact
+	 * name. The whole name would read as an opaque token.
+	 */
+	vaultKeySuffix?: string;
 }
 
-type CleanupSlot = 'sign-in' | 'refresh' | 'processes' | 'site' | 'registration';
+type CleanupSlot = 'sign-in' | 'refresh' | 'processes' | 'site' | 'registration' | 'vault-key';
 const CLEANUP_ORDER: readonly CleanupSlot[] = [
 	'sign-in',
 	'refresh',
 	'processes',
 	'site',
 	'registration',
+	'vault-key',
 ];
 
 /** One cleanup step: records what it did in `report`; false or a throw is a failed step. */
@@ -1039,6 +1072,40 @@ function registerRegistrationCleanup( ctx: StageContext ): void {
 			report.signOutFailed = true;
 			return false;
 		}
+	} );
+}
+
+// The default profile's vault key item: the run's profile must never key its records under it.
+const UNSCOPED_VAULT_KEY_ITEM = 'chatgpt-vault-key';
+
+/** The run profile's own vault key item, or null when it would be the unscoped one or can't be named. */
+function scopedVaultKeyItem( ctx: StageContext ): string | null {
+	let item: string;
+	try {
+		item = ctx.services.broker.vaultKeyItem();
+	} catch {
+		return null;
+	}
+	return item !== UNSCOPED_VAULT_KEY_ITEM && item.startsWith( `${ UNSCOPED_VAULT_KEY_ITEM }-` )
+		? item
+		: null;
+}
+
+/** Whether the run profile's own vault key item is gone: never while a saved sign-in needs it. */
+async function removeRunVaultKey( ctx: StageContext ): Promise< boolean > {
+	try {
+		return ( await ctx.services.broker.removeProfileVaultKey() ) === 'removed';
+	} catch {
+		return false;
+	}
+}
+
+// Removes the run profile's own vault key item on the way out, after the
+// registration's sign-out, so a run leaves nothing of its own in the keychain.
+function registerVaultKeyCleanup( ctx: StageContext ): void {
+	ctx.cleanup.set( 'vault-key', async ( report ) => {
+		report.vaultKeyRemoved = await removeRunVaultKey( ctx );
+		return report.vaultKeyRemoved;
 	} );
 }
 
@@ -1394,6 +1461,17 @@ const prerequisitesStage: StageDefinition = {
 		if ( ! observations.buildPresent ) {
 			block( 'build-missing' );
 		}
+		// A saved sign-in creates its profile's vault key: never under the item
+		// the user's own profile keeps its key in, which it could replace.
+		if ( ctx.options.scenario === 'saved' || ctx.options.scenario === 'provision' ) {
+			const item = scopedVaultKeyItem( ctx );
+			observations.vaultKeyScoped = item !== null;
+			if ( item === null ) {
+				return block( 'vault-key-not-scoped' );
+			}
+			ctx.state.vaultKeySuffix = item.slice( UNSCOPED_VAULT_KEY_ITEM.length + 1 );
+			ctx.saveState();
+		}
 		// Which keychain, and whether it answered: a session-only run records it
 		// too, so a result on a machine without one is told apart.
 		const store = ctx.services.credentialStoreKind();
@@ -1414,6 +1492,7 @@ const SAVED_STAGES: StageDefinition[] = [
 		name: 'sign-in',
 		async run( ctx, observations ) {
 			registerRegistrationCleanup( ctx );
+			registerVaultKeyCleanup( ctx );
 			const outcome = await signInStage( ctx, observations, undefined, 'vault' );
 			const account = await ctx.services.broker.readAccount( outcome.registrationId );
 			observations.signedIn = account?.state === 'signed-in';
@@ -1722,6 +1801,7 @@ const SAVED_STAGES: StageDefinition[] = [
 				offerSessions: false,
 				ipc: true,
 				policy,
+				toolImages: true,
 			} );
 			const digest = judgeTurn( observations, result, policy );
 			const screenshots = digest.toolCalls.filter(
@@ -1778,10 +1858,27 @@ const SAVED_STAGES: StageDefinition[] = [
 				( call ) => call.name === 'generate_images'
 			).length;
 			observations.detailsDelivered = generated?.hasStudioService === true;
+			// Read from the session file when the row arrived; no reading is no evidence.
+			observations.persistenceChecked = typeof generated?.persistedAtReceipt === 'boolean';
 			observations.deliveredBeforePersisted = generated?.persistedAtReceipt === false;
 			check( generated !== undefined, 'no-image-generation' );
 			check( observations.detailsDelivered, 'service-details-missing' );
+			check( observations.persistenceChecked, 'session-file-unreadable' );
 			check( observations.deliveredBeforePersisted, 'details-only-after-persisting' );
+		},
+	},
+	{
+		// So the sign-out has a grant this runner saw rotate to revoke, which
+		// `remote-revocation` then probes, as the session scenario's hold does.
+		name: 'refresh-before-sign-out',
+		async run( ctx, observations ) {
+			const { broker, tokens } = ctx.services;
+			const id = requireRegistration( ctx );
+			const before = tokens.refreshes();
+			await broker.invalidateAccessToken( id, await broker.getAccessToken( id ) );
+			await broker.getAccessToken( id );
+			observations.refreshed = tokens.refreshes() > before;
+			check( observations.refreshed, 'refresh-not-forced' );
 		},
 	},
 	{
@@ -1878,17 +1975,31 @@ const SAVED_STAGES: StageDefinition[] = [
 	{
 		name: 'remote-revocation',
 		async run( ctx, observations ) {
+			const { broker, tokens } = ctx.services;
+			const id = requireRegistration( ctx );
 			observations.serviceConfirmedRevocation =
 				ctx.signOutResult?.remoteRevocationConfirmed === true;
-			observations.revocationRequests = ctx.services.tokens.revocations().total;
-			const probe = await ctx.services.tokens.probe( 'revoked' );
-			observations.probeTried = probe.tried;
-			observations.revokedRefreshRejected = probe.rejected;
-			observations.rejectionTerminal = probe.terminal;
-			if ( ! probe.tried ) {
-				return block( 'nothing-revoked' );
+			const revocations = tokens.revocations();
+			observations.revocationRequests = revocations.total;
+			observations.rotatedRevokedBySignOut = revocations.rotatedRevoked;
+			// The record itself, not the broker's word that it cleared it.
+			observations.vaultRecordAfterSignOut = broker.vaultRecordExists( id );
+			// The rotated token first: presenting the retired one can make the
+			// service revoke the whole grant as reused, which would say nothing
+			// about what the sign-out revoked.
+			const rotated = await tokens.probe( 'rotated' );
+			const retired = await tokens.probe( 'retired' );
+			observations.probeTried = rotated.tried;
+			observations.rotatedRefreshRejected = rotated.tried && rotated.rejected;
+			observations.rejectionTerminal = rotated.terminal;
+			observations.retiredRefreshRejected = retired.tried && retired.rejected;
+			check( ! observations.vaultRecordAfterSignOut, 'vault-record-left' );
+			if ( ! rotated.tried ) {
+				return block( 'no-rotated-grant' );
 			}
-			check( probe.rejected, 'revoked-refresh-accepted' );
+			check( observations.rotatedRefreshRejected, 'rotated-grant-usable' );
+			check( observations.rotatedRevokedBySignOut, 'rotated-not-revoked-by-sign-out' );
+			check( observations.retiredRefreshRejected, 'retired-refresh-accepted' );
 		},
 	},
 	{
@@ -1936,26 +2047,40 @@ const PROVISION_STAGES: StageDefinition[] = [
 		name: 'profile-sign-in',
 		async run( ctx, observations ) {
 			registerRegistrationCleanup( ctx );
+			registerVaultKeyCleanup( ctx );
 			const outcome = await signInStage( ctx, observations, undefined, 'vault' );
 			const account = await ctx.services.broker.readAccount( outcome.registrationId );
 			observations.signedIn = account?.state === 'signed-in';
 			observations.storedInVault = ctx.services.broker.vaultRecordExists( outcome.registrationId );
 			check( observations.signedIn, 'not-signed-in' );
 			check( observations.storedInVault, 'vault-record-missing' );
-			// Ready for evals: only a failure before here signs it out again.
+			// Ready for evals: only a failure before here signs it out again, and
+			// its vault key item stays until `retire`.
 			ctx.cleanup.delete( 'registration' );
+			ctx.cleanup.delete( 'vault-key' );
 			observations.leftSignedIn = true;
 		},
 	},
 ];
 
-// Retires a dedicated eval profile: its registration signed out, locally and at ChatGPT.
+// Retires a dedicated eval profile: its registration signed out, locally and
+// at ChatGPT, then its own vault key item removed.
 const RETIRE_STAGES: StageDefinition[] = [
 	prerequisitesStage,
 	{
 		name: 'profile-sign-out',
 		async run( ctx, observations ) {
 			const id = requireRegistration( ctx );
+			// The broker names the item from the profile's real path now; a profile
+			// moved or copied since `provision` names one its records weren't
+			// sealed under. Nothing is signed out or removed through another name.
+			const recorded = ctx.state.vaultKeySuffix
+				? `${ UNSCOPED_VAULT_KEY_ITEM }-${ ctx.state.vaultKeySuffix }`
+				: null;
+			observations.vaultKeyNameMatches =
+				recorded !== null && scopedVaultKeyItem( ctx ) === recorded;
+			check( observations.vaultKeyNameMatches, 'vault-key-name-mismatch' );
+			registerVaultKeyCleanup( ctx );
 			const account = await ctx.services.broker.readAccount( id );
 			observations.wasSignedIn = account?.state === 'signed-in';
 			if ( ! observations.wasSignedIn ) {
@@ -1964,8 +2089,13 @@ const RETIRE_STAGES: StageDefinition[] = [
 			const result = await ctx.services.broker.signOut( id );
 			observations.localCleared = result.localCleared;
 			observations.remoteRevocationConfirmed = result.remoteRevocationConfirmed;
+			observations.vaultKeyRemoved = await removeRunVaultKey( ctx );
+			if ( observations.vaultKeyRemoved ) {
+				ctx.cleanup.delete( 'vault-key' );
+			}
 			check( result.localCleared, 'local-not-cleared' );
 			check( result.remoteRevocationConfirmed, 'remote-revocation-unconfirmed' );
+			check( observations.vaultKeyRemoved, 'vault-key-not-removed' );
 		},
 	},
 ];
@@ -2153,6 +2283,7 @@ const SESSION_STAGES: StageDefinition[] = [
 			const asked = await abortable( raceTimeout( ask, SETTLE_WAIT_MS ) );
 			observations.windowDirectAskAnswered = asked !== null;
 			observations.windowDirectAskRefused = asked === false;
+			observations.windowDirectAskGotToken = asked === true;
 			const forkDigest = forkResult ? digestTurnEvents( forkResult.events ) : null;
 			observations.windowForkTokenAsks = forkResult?.tokenAsks ?? 0;
 			observations.windowForkTokensHandedOut = forkResult?.tokensHandedOut ?? 0;
@@ -2199,10 +2330,11 @@ const SESSION_STAGES: StageDefinition[] = [
 				'inference-during-window'
 			);
 			check( ! observations.windowForkSucceeded, 'window-fork-completed' );
+			// An answer is owed only while the offer lingers; a token never is.
 			if ( observations.offerAdvertisedDuringWindow ) {
 				check( observations.windowDirectAskAnswered, 'window-ask-unanswered' );
-				check( observations.windowDirectAskRefused, 'window-ask-got-token' );
 			}
+			check( ! observations.windowDirectAskGotToken, 'window-ask-got-token' );
 			check( observations.heldRefreshRejectedSignedOut, 'held-refresh-not-rejected' );
 			check( observations.localCleared, 'local-not-cleared' );
 			check( observations.offerGoneAfterSettle, 'offer-not-pruned' );
@@ -2397,6 +2529,10 @@ function describeIsolationProblem( problem: AcceptanceIsolationProblem ): string
 			);
 		case 'run-dir-in-studio-profile':
 			return __( 'The run directory can’t be inside your Studio profile.' );
+		case 'run-dir-folder-outside':
+			return __(
+				'A folder of the run directory (its profile, process manager, sites or another) leads outside it through a link, so nothing was run.'
+			);
 	}
 }
 
@@ -2531,9 +2667,10 @@ export async function runChatGptAcceptance(
 	argv: readonly string[],
 	deps: ChatGptAcceptanceDependencies
 ): Promise< number > {
+	// The evidence's own check: no line names a path, an identifier or a secret.
 	const print = ( line: string ) =>
 		deps.print(
-			findUnsafeText( line, { paths: true } )
+			findUnsafeText( line )
 				? __(
 						'[A line was withheld because it looked like a secret, an address or an identifier.]'
 				  )
@@ -2627,8 +2764,9 @@ export async function runChatGptAcceptance(
 	let interrupted = false;
 	const stopListening = deps.onInterrupt( () => {
 		interrupted = true;
-		print( __( 'Interrupted: stopping the current stage and cleaning up…' ) );
+		// Before any write: after a hang-up the terminal may take none.
 		controller.abort();
+		print( __( 'Interrupted: stopping the current stage and cleaning up…' ) );
 	} );
 	try {
 		const services = await deps.createServices( { paths, options, print } );
@@ -2662,13 +2800,7 @@ export async function runChatGptAcceptance(
 			return failed === 0;
 		} );
 		ctx.saveState();
-		print(
-			sprintf(
-				/* translators: %s: the run directory. */
-				__( 'Evidence goes to %s' ),
-				paths.runDir
-			)
-		);
+		print( __( 'Evidence goes to the run directory you passed with --run-dir.' ) );
 
 		let firstFailure: StageRecord | null = null;
 		let gateFailed = false;
@@ -2775,13 +2907,16 @@ const sleep = ( ms: number, signal?: AbortSignal ) =>
 		);
 	} );
 
-/** Whether the session file already holds the result of a tool call. */
-export function isToolResultPersisted( sessionFile: string, toolCallId: string ): boolean {
+/**
+ * Whether the session file already holds the result of a tool call; null when
+ * the file can't be read, which says nothing either way.
+ */
+export function isToolResultPersisted( sessionFile: string, toolCallId: string ): boolean | null {
 	let text: string;
 	try {
 		text = fs.readFileSync( sessionFile, 'utf8' );
 	} catch {
-		return false;
+		return null;
 	}
 	return text.split( /\r?\n/ ).some( ( line ) => {
 		if ( ! line.includes( toolCallId ) ) {
@@ -2821,43 +2956,68 @@ function sendQuietly(
 	}
 }
 
-async function stopChild( child: ChildProcess ): Promise< boolean > {
-	if ( child.exitCode !== null || child.signalCode !== null ) {
+// On POSIX each CLI process the runner starts leads a process group of its
+// own, which holds what it starts in turn; on Windows the runner finds a
+// tree's processes itself (see `endProcessTree`).
+const CHILDREN_LEAD_PROCESS_GROUPS = process.platform !== 'win32';
+const CHILD_STOP_WAIT_MS = 3_000;
+
+// Every CLI process this runner started that hasn't closed yet.
+const runningChildren = new Set< ChildProcess >();
+
+const describeDescendantsMayRemain = () =>
+	__(
+		'A CLI process this run started was ended, but some of the processes it had started may still be running.'
+	);
+
+/**
+ * Stops a child the runner started: a turn is asked to stop first, over its
+ * IPC channel; then its whole tree is ended while the child still runs, since
+ * ending the child first would leave its descendants out of reach.
+ */
+async function stopChild(
+	child: ChildProcess,
+	onDescendantsMayRemain: () => void
+): Promise< boolean > {
+	if ( hasExited( child ) ) {
 		return true;
 	}
-	const exited = new Promise< void >( ( resolve ) => child.once( 'exit', () => resolve() ) );
+	const exited = new Promise< true >( ( resolve ) => child.once( 'exit', () => resolve( true ) ) );
+	const exitedWithin = async ( ms: number ) =>
+		hasExited( child ) || ( await raceTimeout( exited, ms ) ) === true;
 	if ( child.connected ) {
 		sendQuietly( child, { type: 'interrupt' } );
-		if (
-			( await raceTimeout(
-				exited.then( () => true ),
-				3_000
-			) ) === true
-		) {
+		if ( await exitedWithin( CHILD_STOP_WAIT_MS ) ) {
 			return true;
 		}
 	}
-	child.kill();
-	if (
-		( await raceTimeout(
-			exited.then( () => true ),
-			3_000
-		) ) === true
-	) {
+	endProcessTree( child, { onDescendantsMayRemain } );
+	if ( await exitedWithin( CHILD_STOP_WAIT_MS ) ) {
 		return true;
 	}
-	// The child's own tree, by the PID this handle started; never anything by name.
-	if ( process.platform === 'win32' && child.pid !== undefined && child.exitCode === null ) {
-		spawnSync( 'taskkill', [ '/PID', String( child.pid ), '/T', '/F' ], { windowsHide: true } );
-	} else {
+	// The tree couldn't be ended (no process group): the child alone, at least.
+	if ( ! hasExited( child ) ) {
 		child.kill( 'SIGKILL' );
 	}
-	return (
-		( await raceTimeout(
-			exited.then( () => true ),
-			3_000
-		) ) === true
-	);
+	return exitedWithin( CHILD_STOP_WAIT_MS );
+}
+
+/**
+ * Ends the tree of every CLI process this runner started that still runs, at
+ * once and without waiting for them to exit: for an exit that can't finish
+ * cleanup. The same routine as a normal stop.
+ */
+export function endRunningAcceptanceChildren( onDescendantsMayRemain: () => void ): void {
+	for ( const child of runningChildren ) {
+		endProcessTree( child, { onDescendantsMayRemain } );
+		if ( ! hasExited( child ) ) {
+			try {
+				child.kill( 'SIGKILL' );
+			} catch {
+				// Gone meanwhile.
+			}
+		}
+	}
 }
 
 function refuseQuestions(
@@ -2872,29 +3032,59 @@ function refuseQuestions(
 	);
 }
 
-function createLiveProcesses( {
+/**
+ * What a turn's CLI process preloads: the request observer, and for gate T1's
+ * live check alone the module that turns images in tool results on in it.
+ */
+export function acceptanceTurnExecArgv(
+	scripts: { observer: string; toolImages: string },
+	options: Pick< TurnOptions, 'toolImages' >
+): string[] {
+	return [
+		'--import',
+		pathToFileURL( scripts.observer ).href,
+		...( options.toolImages ? [ '--import', pathToFileURL( scripts.toolImages ).href ] : [] ),
+	];
+}
+
+export function createLiveAcceptanceProcesses( {
 	mainScript,
-	observerScript,
+	scripts,
 	paths,
+	print,
 }: {
 	mainScript: string;
-	observerScript: string;
+	scripts: { observer: string; toolImages: string };
 	paths: AcceptanceRunPaths;
+	print: ( line: string ) => void;
 } ): AcceptanceProcesses {
-	const owned = new Set< ChildProcess >();
 	let sequence = 0;
-	const execArgv = [ '--import', pathToFileURL( observerScript ).href ];
+	// What this run started and hasn't closed: cleanup stops these, and only these.
+	const owned = new Set< ChildProcess >();
+	let warned = false;
+	const onDescendantsMayRemain = () => {
+		if ( ! warned ) {
+			warned = true;
+			print( describeDescendantsMayRemain() );
+		}
+	};
+	const stop = ( child: ChildProcess ) => stopChild( child, onDescendantsMayRemain );
 
 	function track( child: ChildProcess ): Promise< number | null > {
+		runningChildren.add( child );
 		owned.add( child );
+		const forget = () => {
+			runningChildren.delete( child );
+			owned.delete( child );
+		};
 		return new Promise( ( resolve ) => {
 			// After its output and IPC channel close too, so no last event is lost.
 			child.once( 'close', ( code ) => {
-				owned.delete( child );
+				forget();
 				resolve( code );
 			} );
 			child.once( 'error', () => {
-				owned.delete( child );
+				forget();
 				resolve( null );
 			} );
 		} );
@@ -2927,16 +3117,19 @@ function createLiveProcesses( {
 				'--json',
 				'--avoid-telemetry',
 			];
+			const execArgv = acceptanceTurnExecArgv( scripts, options );
 			const child = options.ipc
 				? fork( mainScript, args, {
 						env,
 						execArgv,
 						stdio: [ 'ignore', 'ignore', 'ignore', 'ipc' ],
+						detached: CHILDREN_LEAD_PROCESS_GROUPS,
 				  } )
 				: spawn( process.execPath, [ ...execArgv, mainScript, ...args ], {
 						env,
 						stdio: [ 'ignore', 'pipe', 'ignore' ],
 						windowsHide: true,
+						detached: CHILDREN_LEAD_PROCESS_GROUPS,
 				  } );
 			const startedAt = Date.now();
 			const events: TimedEvent[] = [];
@@ -3045,7 +3238,7 @@ function createLiveProcesses( {
 				},
 				result,
 				stop: async () => {
-					await stopChild( child );
+					await stop( child );
 				},
 			};
 		},
@@ -3054,6 +3247,7 @@ function createLiveProcesses( {
 				env: acceptanceChildEnvironment(),
 				stdio: [ 'ignore', 'pipe', 'ignore' ],
 				windowsHide: true,
+				detached: CHILDREN_LEAD_PROCESS_GROUPS,
 			} );
 			let stdout = '';
 			child.stdout?.setEncoding( 'utf8' );
@@ -3066,7 +3260,7 @@ function createLiveProcesses( {
 			const timeoutMs = label === 'site-create' ? 15 * 60_000 : 5 * 60_000;
 			return raceTimeout( exited, timeoutMs ).then( async ( exitCode ) => {
 				if ( exitCode === null && child.exitCode === null ) {
-					await stopChild( child );
+					await stop( child );
 				}
 				return { exitCode, stdout };
 			} );
@@ -3075,7 +3269,7 @@ function createLiveProcesses( {
 			let stopped = 0;
 			let failed = 0;
 			for ( const child of [ ...owned ] ) {
-				if ( await stopChild( child ) ) {
+				if ( await stop( child ) ) {
 					stopped++;
 				} else {
 					failed++;
@@ -3088,16 +3282,24 @@ function createLiveProcesses( {
 
 async function createLiveServices( {
 	paths,
+	print,
 }: {
 	paths: AcceptanceRunPaths;
+	print: ( line: string ) => void;
 } ): Promise< ChatGptAcceptanceServices > {
 	process.env.STUDIO_EXPERIMENTAL_CHATGPT = '1';
 	const cliDirectory = import.meta.dirname;
 	const mainScript = path.join( cliDirectory, 'main.mjs' );
-	const observerScript = path.join( cliDirectory, 'chatgpt-acceptance-observer.mjs' );
+	const scripts = {
+		observer: path.join( cliDirectory, 'chatgpt-acceptance-observer.mjs' ),
+		toolImages: path.join( cliDirectory, 'chatgpt-acceptance-tool-images.mjs' ),
+	};
 	installAcceptanceObserver( path.join( paths.observerDir, '00-runner.ndjson' ) );
 	const tokens = createAcceptanceTokenService( createChatGptTokenClient() );
 	setChatGptTokenClient( tokens.client );
+	// The app's broker has no module-level call for removing the profile's vault
+	// key: a broker of the runner's own, on the same keychain, makes it.
+	const keyBroker = createChatGptCredentialBroker( { tokenClient: tokens.client } );
 	const flow = createChatGptSignInFlow( { openBrowser: ( url ) => openBrowser( url ) } );
 	return {
 		clock: { now: () => Date.now(), sleep },
@@ -3118,6 +3320,8 @@ async function createLiveServices( {
 			readAccount: readChatGptAccount,
 			vaultRecordExists: ( id ) =>
 				fs.existsSync( path.join( getConfigDirectory(), 'chatgpt-credentials', `${ id }.vault` ) ),
+			vaultKeyItem: () => getChatGptVaultKeyAccounts().own,
+			removeProfileVaultKey: () => keyBroker.removeProfileVaultKey(),
 			readModels: ( id, revision ) => readChatGptModels( id, revision ),
 		},
 		tokens,
@@ -3130,8 +3334,11 @@ async function createLiveServices( {
 			filePath: async ( sessionId ) =>
 				( await loadAiSession( getSessionsDirectory(), sessionId ) ).summary.filePath,
 		},
-		processes: createLiveProcesses( { mainScript, observerScript, paths } ),
-		buildPresent: () => fs.existsSync( mainScript ) && fs.existsSync( observerScript ),
+		processes: createLiveAcceptanceProcesses( { mainScript, scripts, paths, print } ),
+		buildPresent: () =>
+			[ mainScript, scripts.observer, scripts.toolImages ].every( ( file ) =>
+				fs.existsSync( file )
+			),
 		credentialStoreKind: () => credentialStoreKindFor( process.platform ),
 		secureStorageAvailable: async () => ( await createOsCredentialStore().check() ).available,
 		imageServiceConfigured: () => isImageGenerationAvailable(),
@@ -3188,33 +3395,118 @@ async function collectLiveFacts(): Promise< RunFacts > {
 	};
 }
 
+/**
+ * Calls `handler` on the first signal that ends a run: Ctrl+C, a termination
+ * request, a closed terminal and, on Windows, Ctrl+Break; any second one calls
+ * `forceExit`. Returns what stops listening.
+ */
+export function onAcceptanceSignals(
+	handler: () => void,
+	{
+		target,
+		platform,
+		forceExit,
+	}: {
+		target: Pick< NodeJS.Process, 'on' | 'off' >;
+		platform: NodeJS.Platform;
+		forceExit: () => void;
+	}
+): () => void {
+	const signals: NodeJS.Signals[] = [
+		'SIGINT',
+		'SIGTERM',
+		'SIGHUP',
+		...( platform === 'win32' ? [ 'SIGBREAK' as const ] : [] ),
+	];
+	let received = 0;
+	const onSignal = () => {
+		received++;
+		if ( received === 1 ) {
+			handler();
+		} else {
+			forceExit();
+		}
+	};
+	for ( const signal of signals ) {
+		target.on( signal, onSignal );
+	}
+	return () => {
+		for ( const signal of signals ) {
+			target.off( signal, onSignal );
+		}
+	};
+}
+
+// A terminal that hung up (EIO) or a reader that went away (EPIPE).
+const isLostOutput = ( error: unknown ) => {
+	const code = ( error as NodeJS.ErrnoException | null )?.code;
+	return code === 'EIO' || code === 'EPIPE';
+};
+
+// A stream onto a file throws a failed write; a terminal or pipe reports it as 'error'.
+function writeLine( stream: NodeJS.WritableStream, line: string ): void {
+	try {
+		stream.write( `${ line }\n` );
+	} catch ( error ) {
+		if ( ! isLostOutput( error ) ) {
+			throw error;
+		}
+	}
+}
+
 /** The dependencies of a real run, from the built CLI's directory. */
-export function createLiveChatGptAcceptanceDependencies(): ChatGptAcceptanceDependencies {
+export function createLiveChatGptAcceptanceDependencies(
+	io: {
+		stdout: NodeJS.WritableStream;
+		stderr: NodeJS.WritableStream;
+		signals: Pick< NodeJS.Process, 'on' | 'off' >;
+		platform: NodeJS.Platform;
+		exit: ( code: number ) => void;
+	} = {
+		stdout: process.stdout,
+		stderr: process.stderr,
+		signals: process,
+		platform: process.platform,
+		exit: ( code ) => process.exit( code ),
+	}
+): ChatGptAcceptanceDependencies {
+	// For the life of the run, a write the stream reports as failed never ends
+	// it, so cleanup after a closed terminal runs to its end. Every code is
+	// swallowed, as Node's console does while a stream has no listener of its
+	// own: a console write from any module would otherwise end the run.
+	for ( const stream of [ io.stdout, io.stderr ] ) {
+		stream.on( 'error', () => undefined );
+	}
+	const print = ( line: string ) => writeLine( io.stdout, line );
 	return {
 		env: process.env,
 		home: os.homedir(),
-		print: ( line ) => process.stdout.write( `${ line }\n` ),
+		print,
 		collectFacts: collectLiveFacts,
 		configDirectory: getConfigDirectory,
 		processManagerHome: () => PROCESS_MANAGER_HOME,
-		onInterrupt: ( handler ) => {
-			let presses = 0;
-			const onSignal = () => {
-				presses++;
-				if ( presses === 1 ) {
-					handler();
-					return;
-				}
-				process.stdout.write(
-					`${ __(
-						'Stopped before cleanup finished. See scripts/chatgpt-acceptance/README.md to stop what this run started.'
-					) }\n`
-				);
-				process.exit( EXIT_INTERRUPTED );
-			};
-			process.on( 'SIGINT', onSignal );
-			return () => process.off( 'SIGINT', onSignal );
-		},
-		createServices: ( { paths } ) => createLiveServices( { paths } ),
+		onInterrupt: ( handler ) =>
+			onAcceptanceSignals( handler, {
+				target: io.signals,
+				platform: io.platform,
+				forceExit: () => {
+					let warned = false;
+					// Their own process groups keep the terminal's signal from them on POSIX.
+					endRunningAcceptanceChildren( () => {
+						if ( ! warned ) {
+							warned = true;
+							print( describeDescendantsMayRemain() );
+						}
+					} );
+					print(
+						__(
+							'Stopped before cleanup finished. See scripts/chatgpt-acceptance/README.md to stop what this run started.'
+						)
+					);
+					io.exit( EXIT_INTERRUPTED );
+				},
+			} ),
+		createServices: ( { paths, print: printLine } ) =>
+			createLiveServices( { paths, print: printLine } ),
 	};
 }

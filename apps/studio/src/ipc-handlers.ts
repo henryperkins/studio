@@ -258,6 +258,7 @@ export {
 	getOnboardingHints,
 	getUserPreferences,
 	getWapuuScore,
+	recheckChatGptSettings,
 	refreshOpenAiModels,
 	removeOpenAiApiKey,
 	saveAnthropicApiKey,

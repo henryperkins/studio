@@ -29,7 +29,8 @@ export type AcceptanceIsolationProblem =
 	| 'run-dir-relative'
 	| 'run-dir-not-empty'
 	| 'run-dir-not-found'
-	| 'run-dir-in-studio-profile';
+	| 'run-dir-in-studio-profile'
+	| 'run-dir-folder-outside';
 
 export type AcceptanceRunDirectoryCheck =
 	| { ok: true; paths: AcceptanceRunPaths }
@@ -84,9 +85,58 @@ function isWithin( inner: string, outer: string ): boolean {
 const realStudioProfile = ( home: string ) => path.join( home, '.studio' );
 
 /**
+ * The path with every link resolved as far as it exists, and the rest as
+ * named, so a directory a run would create is placed where it would really be.
+ */
+const resolvedPath = ( value: string ) => {
+	const missing: string[] = [];
+	for ( let current = path.resolve( value ); ; current = path.dirname( current ) ) {
+		try {
+			return path.join( fs.realpathSync.native( current ), ...missing );
+		} catch {
+			if ( path.dirname( current ) === current ) {
+				return path.resolve( value );
+			}
+			missing.unshift( path.basename( current ) );
+		}
+	}
+};
+
+/** Whether `inner` is in the user's Studio profile, as named or once links resolve. */
+function isInStudioProfile( inner: string, home: string ): boolean {
+	const studio = realStudioProfile( home );
+	const resolved = resolvedPath( inner );
+	return [ studio, resolvedPath( studio ) ].some(
+		( outer ) => isWithin( inner, outer ) || isWithin( resolved, outer )
+	);
+}
+
+/**
+ * Whether a folder of the run, where it exists at all, resolves strictly
+ * inside the run directory's real path: a link there could point the run, and
+ * the vault key item its profile names, at another profile or process manager.
+ */
+function staysInRun( folder: string, realRunDir: string ): boolean {
+	try {
+		fs.lstatSync( folder );
+	} catch ( error ) {
+		return ( error as NodeJS.ErrnoException ).code === 'ENOENT';
+	}
+	let real: string;
+	try {
+		real = fs.realpathSync.native( folder );
+	} catch {
+		// A link that leads nowhere.
+		return false;
+	}
+	return isWithin( real, realRunDir ) && comparable( real ) !== comparable( realRunDir );
+}
+
+/**
  * Checks a run directory without creating it: absolute, outside the user's
- * Studio profile, and new or empty for a run that starts one (`mustBeNew`), or
- * existing for a run that continues one.
+ * Studio profile (also once links resolve), and new or empty for a run that
+ * starts one (`mustBeNew`), or existing for a run that continues one, with
+ * every folder of it that exists really inside it.
  */
 export function checkAcceptanceRunDirectory(
 	runDir: string | undefined,
@@ -98,7 +148,7 @@ export function checkAcceptanceRunDirectory(
 	if ( ! path.isAbsolute( runDir ) ) {
 		return { ok: false, problem: 'run-dir-relative' };
 	}
-	if ( isWithin( runDir, realStudioProfile( home ) ) ) {
+	if ( isInStudioProfile( runDir, home ) ) {
 		return { ok: false, problem: 'run-dir-in-studio-profile' };
 	}
 	let entries: string[] | null;
@@ -116,7 +166,15 @@ export function checkAcceptanceRunDirectory(
 	if ( ! mustBeNew && ! entries ) {
 		return { ok: false, problem: 'run-dir-not-found' };
 	}
-	return { ok: true, paths: acceptanceRunPaths( runDir ) };
+	const paths = acceptanceRunPaths( runDir );
+	if ( entries && entries.length > 0 ) {
+		const realRunDir = fs.realpathSync.native( runDir );
+		const { runDir: _run, ...folders } = paths;
+		if ( ! Object.values( folders ).every( ( folder ) => staysInRun( folder, realRunDir ) ) ) {
+			return { ok: false, problem: 'run-dir-folder-outside' };
+		}
+	}
+	return { ok: true, paths };
 }
 
 /**
@@ -207,14 +265,6 @@ export type DedicatedProfileProblem =
 	| 'profile-in-studio-profile'
 	| 'profile-is-config-directory';
 
-const resolvedPath = ( value: string ) => {
-	try {
-		return fs.realpathSync.native( value );
-	} catch {
-		return path.resolve( value );
-	}
-};
-
 /**
  * Checks, without changing anything, a dedicated test profile a development
  * runner signs in to for testing: absolute, an existing directory, neither
@@ -237,12 +287,7 @@ export function checkDedicatedProfile(
 		return 'profile-not-found';
 	}
 	const profile = resolvedPath( profileDir );
-	const studio = realStudioProfile( home );
-	if (
-		[ studio, resolvedPath( studio ) ].some(
-			( outer ) => isWithin( profileDir, outer ) || isWithin( profile, outer )
-		)
-	) {
+	if ( isInStudioProfile( profileDir, home ) ) {
 		return 'profile-in-studio-profile';
 	}
 	return isWithin( resolvedPath( configDirectory ), profile ) ||

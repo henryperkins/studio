@@ -1,4 +1,5 @@
 import { __, sprintf } from '@wordpress/i18n';
+import { readChatGptContextChoice } from '@studio/agent/protocol/chatgpt';
 import { readLatestRecordedModelId } from '@studio/agent/protocol/models';
 import {
 	AI_PROVIDER_LABELS,
@@ -10,6 +11,7 @@ import {
 	type AiSettings,
 } from '@studio/agent/protocol/providers';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import type { ChatGptAccountState } from '@studio/agent/protocol/chatgpt';
 import type { ChatGptErrorSummary } from '@studio/agent/protocol/chatgpt-errors';
 import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
 
@@ -54,6 +56,25 @@ export interface ConnectionIdentity {
 	displayName?: string;
 }
 
+/**
+ * A connection's identity as an app's renderer is told it: verified by the
+ * host, which keeps the subject to itself.
+ */
+export interface ConnectionIdentityView {
+	verified: true;
+	/** Display only: two accounts can share an email or a name. */
+	email?: string;
+	displayName?: string;
+}
+
+/** Whether the connection has verified who it signs in as: a subject, or the host's word for one. */
+function hasVerifiedIdentity( identity: ConnectionRegistryEntry[ 'identity' ] ): boolean {
+	if ( ! identity ) {
+		return false;
+	}
+	return 'subject' in identity ? Boolean( identity.subject ) : identity.verified === true;
+}
+
 export interface ConnectionRegistryEntry {
 	/** Opaque: compared whole, never parsed. */
 	connectionId: string;
@@ -64,8 +85,8 @@ export interface ConnectionRegistryEntry {
 	 * it ran under, and doesn't continue under another.
 	 */
 	revision: number;
-	/** Null until the connection has verified who it signs in as. */
-	identity: ConnectionIdentity | null;
+	/** Null until the connection has verified who it signs in as. A renderer gets the view. */
+	identity: ConnectionIdentity | ConnectionIdentityView | null;
 	/** Read as disconnected without a verified identity. */
 	authStatus: ConnectionAuthStatus;
 }
@@ -167,7 +188,7 @@ function resolveChatGptConnection(
 	const providerId = 'chatgpt-oauth';
 	const connectionId = record?.provider === providerId ? record.connectionId : undefined;
 	const revision = record?.revision;
-	const modelId = record?.model;
+	const modelId = readChatGptContextChoice( record ).model;
 	if ( typeof connectionId !== 'string' || ! connectionId ) {
 		return { ok: false, error: { code: 'unsupported', providerId } };
 	}
@@ -199,19 +220,57 @@ function resolveChatGptConnection(
 			},
 		};
 	}
-	if ( connection.authStatus !== 'connected' || ! connection.identity?.subject ) {
+	if ( connection.authStatus !== 'connected' || ! hasVerifiedIdentity( connection.identity ) ) {
 		return { ok: false, error: { code: 'disconnected', providerId, connectionId } };
 	}
 	return { ok: true, selection: { connectionId, model: { providerId, modelId }, revision } };
 }
 
-/** What went wrong with a conversation's connection, and what the user can do. */
+/**
+ * Why a turn on another provider can't run in a conversation that ran on a
+ * ChatGPT plan, however its connection is now: it continues only there.
+ */
+export function describeOtherProviderInChatGptChat(): string {
+	return sprintf(
+		/* translators: %s: AI provider name, e.g. "ChatGPT". */
+		__(
+			'This chat ran on a %s plan, so it can’t continue on another provider. Start a new chat to use another provider.'
+		),
+		AI_PROVIDER_LABELS[ 'chatgpt-oauth' ]
+	);
+}
+
+/**
+ * What went wrong with a conversation's connection, and what the user can do.
+ * Given the state of the saved account a disconnected conversation ran on,
+ * says that signing in to that account again continues it: its revision, and
+ * so the conversation, stays as it is.
+ */
 export function describeConnectionSelectionError(
-	error: Pick< ConnectionSelectionError, 'code' | 'providerId' >
+	error: Pick< ConnectionSelectionError, 'code' | 'providerId' >,
+	accountState?: ChatGptAccountState
 ): string {
 	const provider = AI_PROVIDER_LABELS[ error.providerId ];
 	switch ( error.code ) {
 		case 'disconnected':
+			if ( accountState === 'signed-out' ) {
+				return sprintf(
+					/* translators: %s: AI provider name, e.g. "ChatGPT". */
+					__(
+						'The %s account this chat runs on is signed out. Sign in to that account again to continue this chat; the conversation stays as it is.'
+					),
+					provider
+				);
+			}
+			if ( accountState ) {
+				return sprintf(
+					/* translators: %s: AI provider name, e.g. "ChatGPT". */
+					__(
+						'The %s account this chat runs on needs you to sign in again. Sign in to that account again to continue this chat; the conversation stays as it is.'
+					),
+					provider
+				);
+			}
 			return sprintf(
 				/* translators: %s: AI provider name, e.g. "ChatGPT". */
 				__(

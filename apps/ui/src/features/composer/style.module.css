@@ -79,7 +79,9 @@
 	text-wrap: pretty;
 }
 
+/* Part of the dialog's description, but read as what the new chat runs on. */
 .connectionTarget {
+	color: var( --foreground );
 	font-weight: var( --font-weight-medium );
 	overflow-wrap: anywhere;
 }

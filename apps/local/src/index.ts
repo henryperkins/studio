@@ -10,6 +10,7 @@ import {
 	finishChatGptSignIn,
 	readChatGptModels,
 	readChatGptSettings,
+	recheckChatGptSettings,
 	startChatGptSignIn,
 	stopChatGptSignIn,
 } from '@studio/agent/node/chatgpt/settings';
@@ -636,6 +637,12 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 		'/chatgpt',
 		asyncHandler( async ( req: Request, res: Response ) => {
 			res.json( await readChatGptSettings( LOCAL_HOSTNAMES.has( req.hostname ) ) );
+		} )
+	);
+	api.post(
+		'/chatgpt/recheck',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json( await recheckChatGptSettings( LOCAL_HOSTNAMES.has( req.hostname ) ) );
 		} )
 	);
 	api.post(
