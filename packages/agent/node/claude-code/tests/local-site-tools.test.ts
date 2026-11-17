@@ -361,6 +361,17 @@ describe( 'install_taxonomy_scripts on the Claude route', () => {
 		expect( journal ).toEqual( [] );
 	} );
 
+	it( 'copies nothing from a bundled folder the turn can reach, which would no longer be only Studio’s own', async () => {
+		const scriptsFolder = getSkillPath( 'taxonomist', 'scripts' );
+		const { bridge, site, journal } = await setup( ( paths ) => ( {
+			localRoots: [ paths.site, path.dirname( scriptsFolder ) ],
+		} ) );
+		const result = await bridge.invoke( 'install_taxonomy_scripts', { nameOrPath: 'site' } );
+		expect( result.isError ).toBe( true );
+		expect( installed( site ) ).toEqual( [] );
+		expect( journal ).toEqual( [] );
+	} );
+
 	it( 'after a recovery that left operations uncertain, asks first and shows every file it writes', async () => {
 		const { bridge, context, site } = await setup( () => ( { uncertainAfterRecovery: true } ) );
 		expect(
