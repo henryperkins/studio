@@ -1,33 +1,11 @@
-import { createPreviewTool } from './create-preview';
-import { createSiteTool } from './create-site';
 import { bindTool } from './define-tool';
-import { deletePreviewTool } from './delete-preview';
-import { deleteSiteTool } from './delete-site';
 import { runStudioTool } from './execution';
-import { exportSiteTool } from './export-site';
 import { generateImagesTool } from './generate-images';
-import { importSiteTool } from './import-site';
 import { createInspectDesignTool, inspectDesignTool } from './inspect-design';
-import { installTaxonomyScriptsTool } from './install-taxonomy-scripts';
-import { listConnectedRemoteSitesTool } from './list-connected-remote-sites';
-import { listPreviewsTool } from './list-previews';
-import { listSitesTool } from './list-sites';
-import { auditPerformanceTool } from './need-for-speed';
-import { openAnnotationBrowserTool } from './open-annotation-browser';
 import { createPickDesignTool, pickDesignTool } from './pick-design';
-import { pullSiteTool } from './pull-site';
-import { pushSiteTool } from './push-site';
-import { auditSeoTool } from './rank-me-up';
 import { refreshBrowserTool } from './refresh-browser';
-import { scaffoldThemeTool } from './scaffold-theme';
-import { sendFeedbackTool } from './send-feedback';
-import { getSiteInfoTool } from './site-info';
-import { startSiteTool } from './start-site';
-import { stopSiteTool } from './stop-site';
+import { studioToolDefinitions } from './registry';
 import { createTakeScreenshotTool, takeScreenshotTool } from './take-screenshot';
-import { updatePreviewTool } from './update-preview';
-import { validateBlocksTool } from './validate-blocks';
-import { runWpCliTool } from './wp-cli';
 import { wpcomRequestTool } from './wpcom-request';
 import type {
 	AnyStudioAgentTool,
@@ -38,51 +16,8 @@ import type { DesignTracksContext } from '@studio/agent/node/design-tracks';
 import type { StudioAgentHost, StudioAgentUi } from '@studio/agent/node/host';
 import type { StudioToolProgressUpdate } from '@studio/agent/protocol/tool-progress';
 
-/**
- * The registry as a process runs it. Every runtime builds its tools from it,
- * and the Claude route trusts its entries by identity, so outside the test
- * runner it is frozen: nothing can add, replace or remove a tool once the
- * process runs. Under the test runner it stays open, so a test can add a tool
- * of its own and take it out again.
- */
-export function studioToolRegistry(
-	definitions: StudioToolDefinition[],
-	extendable = process.env.VITEST === 'true'
-): StudioToolDefinition[] {
-	return extendable ? definitions : ( Object.freeze( definitions ) as StudioToolDefinition[] );
-}
-
-export const studioToolDefinitions: StudioToolDefinition[] = studioToolRegistry( [
-	createSiteTool,
-	listSitesTool,
-	getSiteInfoTool,
-	startSiteTool,
-	stopSiteTool,
-	deleteSiteTool,
-	createPreviewTool,
-	listPreviewsTool,
-	updatePreviewTool,
-	deletePreviewTool,
-	runWpCliTool,
-	scaffoldThemeTool,
-	pickDesignTool,
-	validateBlocksTool,
-	takeScreenshotTool,
-	inspectDesignTool,
-	generateImagesTool,
-	installTaxonomyScriptsTool,
-	auditPerformanceTool,
-	auditSeoTool,
-	listConnectedRemoteSitesTool,
-	wpcomRequestTool,
-	pushSiteTool,
-	pullSiteTool,
-	importSiteTool,
-	exportSiteTool,
-	openAnnotationBrowserTool,
-	refreshBrowserTool,
-	sendFeedbackTool,
-] );
+// The registry, frozen as a process runs it (`registry.ts`).
+export { studioToolDefinitions };
 
 export interface StudioToolsOptions {
 	// Enable generate_images. Callers resolve isImageGenerationAvailable()

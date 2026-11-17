@@ -1,18 +1,15 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createFakeHost } from '../../tests/fake-host';
 import { defineTool, READ_ONLY, type StudioToolDefinition } from '../define-tool';
-import {
-	resolveStudioToolDefinitions,
-	resolveStudioTools,
-	studioToolDefinitions,
-	studioToolRegistry,
-} from '../index';
+import { resolveStudioToolDefinitions, resolveStudioTools, studioToolDefinitions } from '../index';
 import { runWpCliTool } from '../wp-cli';
 
-const added: StudioToolDefinition[] = [];
-afterEach( () => {
-	for ( const definition of added.splice( 0 ) )
-		studioToolDefinitions.splice( studioToolDefinitions.indexOf( definition ), 1 );
+// The registry a process runs is frozen. This test, like every test that
+// needs a tool of its own, runs against an extendable copy, which only the
+// test runner's module mocking can give.
+vi.mock( '../registry', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('../registry') >();
+	return { ...actual, studioToolDefinitions: [ ...actual.studioToolDefinitions ] };
 } );
 
 const contract = ( name: string ) =>
@@ -25,42 +22,50 @@ describe( 'the Studio tool registry', () => {
 		const host = createFakeHost();
 		const impostor = { ...runWpCliTool } as StudioToolDefinition;
 		studioToolDefinitions.push( impostor );
-		added.push( impostor );
-		expect( () => resolveStudioToolDefinitions( host ) ).toThrow( 'wp_cli' );
-		expect( () => resolveStudioTools( host ) ).toThrow( 'wp_cli' );
-		studioToolDefinitions.splice( studioToolDefinitions.indexOf( impostor ), 1 );
-		added.length = 0;
+		try {
+			expect( () => resolveStudioToolDefinitions( host ) ).toThrow( 'wp_cli' );
+			expect( () => resolveStudioTools( host ) ).toThrow( 'wp_cli' );
+		} finally {
+			studioToolDefinitions.splice( studioToolDefinitions.indexOf( impostor ), 1 );
+		}
 		expect( resolveStudioToolDefinitions( host ).map( ( tool ) => tool.name ) ).toContain(
 			'wp_cli'
 		);
 	} );
 
-	it( 'cannot be changed once the process runs, outside the test runner', () => {
-		const one = contract( 'contract_one' );
-		const two = contract( 'contract_two' );
-		const fixed = studioToolRegistry( [ one ], false );
-		expect( Object.isFrozen( fixed ) ).toBe( true );
-		const attempts: Array< () => unknown > = [
-			() => fixed.push( two ),
-			() => fixed.unshift( two ),
-			() => fixed.splice( 0, 1, two ),
-			() => fixed.pop(),
-			() => ( fixed.length = 0 ),
-			() => {
-				fixed[ 0 ] = two;
-			},
-		];
-		for ( const attempt of attempts ) expect( attempt ).toThrow( TypeError );
-		expect( fixed ).toEqual( [ one ] );
+	it( 'is frozen as the process runs it, whatever the environment says', async () => {
+		vi.stubEnv( 'VITEST', 'true' );
+		try {
+			const registry = await vi.importActual< typeof import('../registry') >( '../registry' );
+			const fixed = registry.studioToolDefinitions;
+			expect( Object.isFrozen( fixed ) ).toBe( true );
+			const two = contract( 'contract_two' );
+			const attempts: Array< () => unknown > = [
+				() => fixed.push( two ),
+				() => fixed.unshift( two ),
+				() => fixed.splice( 0, 1, two ),
+				() => fixed.pop(),
+				() => ( fixed.length = 0 ),
+				() => {
+					fixed[ 0 ] = two;
+				},
+			];
+			for ( const attempt of attempts ) expect( attempt ).toThrow( TypeError );
+			expect( fixed.map( ( tool ) => tool.name ) ).not.toContain( 'contract_two' );
+		} finally {
+			vi.unstubAllEnvs();
+		}
 	} );
 
-	it( 'lets a test add a tool of its own and take it out again', () => {
+	it( 'lets a test add a tool of its own to its copy and take it out again', () => {
 		const one = contract( 'contract_registered' );
-		expect( Object.isFrozen( studioToolRegistry( [], true ) ) ).toBe( false );
 		studioToolDefinitions.push( one );
-		added.push( one );
-		expect(
-			resolveStudioToolDefinitions( createFakeHost() ).map( ( tool ) => tool.name )
-		).toContain( 'contract_registered' );
+		try {
+			expect(
+				resolveStudioToolDefinitions( createFakeHost() ).map( ( tool ) => tool.name )
+			).toContain( 'contract_registered' );
+		} finally {
+			studioToolDefinitions.splice( studioToolDefinitions.indexOf( one ), 1 );
+		}
 	} );
 } );

@@ -30,6 +30,11 @@ const registry = vi.hoisted( () => ( {
 		| undefined
 		| ( ( definitions: StudioToolDefinition[] ) => StudioToolDefinition[] ),
 } ) );
+// The registry is frozen; a test adds a tool of its own to an extendable copy.
+vi.mock( '../../tools/registry', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('../../tools/registry') >();
+	return { ...actual, studioToolDefinitions: [ ...actual.studioToolDefinitions ] };
+} );
 vi.mock( '../../tools', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('../../tools') >();
 	return {

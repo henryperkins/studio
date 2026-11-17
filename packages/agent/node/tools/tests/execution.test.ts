@@ -11,6 +11,12 @@ import {
 import { resolveStudioTools, studioToolDefinitions } from '../index';
 import type { StudioAgentUi } from '../../host';
 
+// The registry is frozen; a test adds a tool of its own to an extendable copy.
+vi.mock( '../registry', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('../registry') >();
+	return { ...actual, studioToolDefinitions: [ ...actual.studioToolDefinitions ] };
+} );
+
 const execution = vi.hoisted( () => ( { runs: [] as string[] } ) );
 vi.mock( '../execution', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('../execution') >();

@@ -52,6 +52,12 @@ vi.mock( '@studio/agent/node/global-instructions', async ( importOriginal ) => (
 	readGlobalInstructions: async () => undefined,
 } ) );
 
+// The registry is frozen; the contract tools are added to an extendable copy.
+vi.mock( '@studio/agent/node/tools/registry', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('@studio/agent/node/tools/registry') >();
+	return { ...actual, studioToolDefinitions: [ ...actual.studioToolDefinitions ] };
+} );
+
 const reply = {
 	role: 'assistant',
 	content: [ { type: 'text', text: 'Done.' } ],
