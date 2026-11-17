@@ -86,6 +86,24 @@
 	padding-inline-start: var( --space-5 );
 }
 
+.items {
+	list-style: decimal;
+}
+
+.items > li {
+	min-width: 0;
+}
+
+.items > li + li {
+	padding-top: var( --space-1_5 );
+	border-top: 1px solid var( --border );
+}
+
+.items > li::marker {
+	color: var( --muted-foreground );
+	font-size: var( --text-xs );
+}
+
 .paths {
 	gap: var( --space-0_5 );
 	padding-inline-start: 0;
