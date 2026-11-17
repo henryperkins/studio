@@ -199,4 +199,27 @@ describe( 'stopping the CLI processes an acceptance run started', () => {
 		expect( await waitUntilGone( [ child, grandchild ] ) ).toEqual( [] );
 		await turn.result;
 	}, 30_000 );
+
+	it( 'marks a tool result whose session file it couldn’t read as unknown, never as not yet persisted', async () => {
+		// A turn that reports one finished tool call over IPC, then exits.
+		fs.writeFileSync(
+			mainScript,
+			`process.send(
+				{
+					type: 'message',
+					timestamp: '',
+					message: { type: 'tool_execution_end', toolCallId: 'g', toolName: 'generate_images', isError: false, result: {} },
+				},
+				() => process.exit( 0 )
+			);`
+		);
+		const turn = processes().startTurn( {
+			...turnOptions( true ),
+			persistenceFile: path.join( base, 'no-such-session.jsonl' ),
+		} );
+		const result = await turn.result;
+		started.push( ...( result.pid === undefined ? [] : [ result.pid ] ) );
+		expect( result.events ).toHaveLength( 1 );
+		expect( result.events[ 0 ].persistedAtReceipt ).toBeNull();
+	}, 30_000 );
 } );

@@ -1713,14 +1713,14 @@ describe( 'ChatGPT acceptance runner', () => {
 		} );
 
 		it( 'passes gate T3 only when the service details arrive before the result is persisted', async () => {
-			const imageTurn = ( persistedAtReceipt: boolean ) => () =>
+			const imageTurn = ( persistedAtReceipt?: boolean | null ) => () =>
 				finishedTurn(
 					turnResult( {
 						events: [
 							toolStart( 'g', 'generate_images', { prompt: 'a plain blue square' } ),
 							{
 								...toolEnd( 'g', 'generate_images', { studioService: { service: 'images' } } ),
-								persistedAtReceipt,
+								...( persistedAtReceipt === undefined ? {} : { persistedAtReceipt } ),
 							},
 							answered( 'DONE' ),
 							completed( 'success' ),
@@ -1757,6 +1757,43 @@ describe( 'ChatGPT acceptance runner', () => {
 				observations: expect.objectContaining( { deliveredBeforePersisted: false } ),
 			} );
 			expect( stageOf( 'blocked-after-sign-out' )[ 0 ].status ).toBe( 'passed' );
+		} );
+
+		it.each( [
+			[ 'the session file couldn’t be read when the result arrived', null ],
+			[ 'no session file was named to read', undefined ],
+		] )( 'fails gate T3, never passes it, when %s', async ( _label, persistedAtReceipt ) => {
+			const { services } = scriptedServices(
+				{ imageServiceConfigured: async () => true },
+				{
+					'gate-t3': () =>
+						finishedTurn(
+							turnResult( {
+								events: [
+									toolStart( 'g', 'generate_images', { prompt: 'a plain blue square' } ),
+									{
+										...toolEnd( 'g', 'generate_images', { studioService: { service: 'images' } } ),
+										...( persistedAtReceipt === undefined ? {} : { persistedAtReceipt } ),
+									},
+									answered( 'DONE' ),
+									completed( 'success' ),
+								],
+							} )
+						),
+				}
+			);
+			expect(
+				await runChatGptAcceptance( savedArgs( '--gates', 'T3' ), dependencies( services ) )
+			).toBe( 1 );
+			expect( stageOf( 'gate-t3-image-service-row' )[ 0 ] ).toMatchObject( {
+				status: 'failed',
+				code: 'session-file-unreadable',
+				observations: expect.objectContaining( {
+					detailsDelivered: true,
+					persistenceChecked: false,
+					deliveredBeforePersisted: false,
+				} ),
+			} );
 		} );
 
 		it( 'blocks gate T2 when no reasoning item was produced, and fails it when one was dropped', async () => {
@@ -3526,7 +3563,9 @@ describe( 'acceptance turn digests', () => {
 		const dir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-acceptance-session-file-' ) );
 		const file = path.join( dir, 'session.jsonl' );
 		try {
-			expect( isToolResultPersisted( file, 'call-1' ) ).toBe( false );
+			// A file it can't read says nothing either way.
+			expect( isToolResultPersisted( file, 'call-1' ) ).toBeNull();
+			expect( isToolResultPersisted( dir, 'call-1' ) ).toBeNull();
 			fs.writeFileSync(
 				file,
 				[

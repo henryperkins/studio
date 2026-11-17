@@ -323,7 +323,8 @@ export interface TurnOptions {
 export interface TimedEvent {
 	receivedAt: number;
 	event: JsonEvent;
-	persistedAtReceipt?: boolean;
+	/** For a tool result: whether the session file held it on arrival; null when unreadable. */
+	persistedAtReceipt?: boolean | null;
 }
 
 export interface TurnResult {
@@ -611,7 +612,7 @@ interface ToolCallDigest {
 	endedAt?: number;
 	isError?: boolean;
 	hasStudioService: boolean;
-	persistedAtReceipt?: boolean;
+	persistedAtReceipt?: boolean | null;
 }
 
 export interface TurnDigest {
@@ -1856,9 +1857,12 @@ const SAVED_STAGES: StageDefinition[] = [
 				( call ) => call.name === 'generate_images'
 			).length;
 			observations.detailsDelivered = generated?.hasStudioService === true;
+			// Read from the session file when the row arrived; no reading is no evidence.
+			observations.persistenceChecked = typeof generated?.persistedAtReceipt === 'boolean';
 			observations.deliveredBeforePersisted = generated?.persistedAtReceipt === false;
 			check( generated !== undefined, 'no-image-generation' );
 			check( observations.detailsDelivered, 'service-details-missing' );
+			check( observations.persistenceChecked, 'session-file-unreadable' );
 			check( observations.deliveredBeforePersisted, 'details-only-after-persisting' );
 		},
 	},
@@ -2893,13 +2897,16 @@ const sleep = ( ms: number, signal?: AbortSignal ) =>
 		);
 	} );
 
-/** Whether the session file already holds the result of a tool call. */
-export function isToolResultPersisted( sessionFile: string, toolCallId: string ): boolean {
+/**
+ * Whether the session file already holds the result of a tool call; null when
+ * the file can't be read, which says nothing either way.
+ */
+export function isToolResultPersisted( sessionFile: string, toolCallId: string ): boolean | null {
 	let text: string;
 	try {
 		text = fs.readFileSync( sessionFile, 'utf8' );
 	} catch {
-		return false;
+		return null;
 	}
 	return text.split( /\r?\n/ ).some( ( line ) => {
 		if ( ! line.includes( toolCallId ) ) {
