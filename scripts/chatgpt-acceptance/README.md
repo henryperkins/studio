@@ -19,7 +19,7 @@ node apps/cli/dist/cli/chatgpt-acceptance.mjs --scenario retire --run-dir <the-p
 | Option | Meaning |
 | --- | --- |
 | `--scenario saved\|session\|provision\|retire` | Required. `saved` starts a run; `session` continues the saved run in the same directory. `provision` makes a dedicated eval profile and `retire` signs it out (see "A dedicated eval profile"). |
-| `--run-dir <path>` | Required. Absolute, outside `~/.studio`. For `saved` and `provision` it must not exist yet or be empty; for `session` it must hold that saved run, and for `retire` that provisioned profile. |
+| `--run-dir <path>` | Required. Absolute, outside `~/.studio`, also once links in either path resolve (a part of the run directory that doesn't exist yet is placed under its nearest existing folder's real path). For `saved` and `provision` it must not exist yet or be empty; for `session` it must hold that saved run, and for `retire` that provisioned profile. |
 | `--live` | Run against the real account. Without it, the runner only checks local prerequisites and prints its plan. |
 | `--model`, `--effort` | `saved` only (`session`, `provision` and `retire` refuse them). Default: the route's first qualified model and its default effort. Anything the route isn't qualified for (`packages/agent/protocol/chatgpt-models.ts`, today `gpt-6-luna` at `low` or `medium`) is refused with the reason. `session` uses the saved run's choice. |
 | `--gates T1,T2,T3,T4` | `saved` only. Optional live gates, skipped (and recorded as skipped) unless named. |

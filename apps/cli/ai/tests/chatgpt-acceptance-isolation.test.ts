@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { applyAcceptanceIsolation } from 'cli/ai/acceptance-isolation';
+import { applyAcceptanceIsolation, checkAcceptanceRunDirectory } from 'cli/ai/acceptance-isolation';
 import { acceptanceChildEnvironment } from 'cli/ai/chatgpt-acceptance';
 
 const cliRoot = path.resolve( import.meta.dirname, '..', '..' );
@@ -147,5 +147,82 @@ describe( 'ChatGPT acceptance child isolation', () => {
 		}
 		expect( php.HOME ).toBe( savedEnv.HOME );
 		expect( php.USERPROFILE ).toBe( savedEnv.USERPROFILE );
+	} );
+} );
+
+describe( 'ChatGPT acceptance run directory', () => {
+	let base: string;
+	let home: string;
+	const links: string[] = [];
+
+	// A directory link that needs no special rights on Windows.
+	const link = ( target: string, at: string ) => {
+		fs.symlinkSync( target, at, process.platform === 'win32' ? 'junction' : 'dir' );
+		links.push( at );
+		return at;
+	};
+
+	beforeEach( () => {
+		base = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-acceptance-run-dir-' ) );
+		home = path.join( base, 'home' );
+	} );
+
+	afterEach( () => {
+		for ( const at of links.splice( 0 ) ) {
+			fs.unlinkSync( at );
+		}
+		fs.rmSync( base, { recursive: true, force: true } );
+	} );
+
+	it( 'refuses a run directory that only a link puts inside the Studio profile, existing or not yet', () => {
+		fs.mkdirSync( path.join( home, '.studio' ), { recursive: true } );
+		const looksSeparate = link( path.join( home, '.studio' ), path.join( base, 'looks-separate' ) );
+		const refused = { ok: false, problem: 'run-dir-in-studio-profile' };
+
+		expect(
+			checkAcceptanceRunDirectory( path.join( looksSeparate, 'new-run' ), {
+				mustBeNew: true,
+				home,
+			} )
+		).toEqual( refused );
+		expect(
+			checkAcceptanceRunDirectory( path.join( looksSeparate, 'not', 'there', 'yet' ), {
+				mustBeNew: true,
+				home,
+			} )
+		).toEqual( refused );
+		fs.mkdirSync( path.join( looksSeparate, 'earlier-run' ) );
+		expect(
+			checkAcceptanceRunDirectory( path.join( looksSeparate, 'earlier-run' ), {
+				mustBeNew: false,
+				home,
+			} )
+		).toEqual( refused );
+	} );
+
+	it( 'refuses a run directory where a linked Studio profile really is', () => {
+		const realProfile = path.join( base, 'elsewhere', 'studio-profile' );
+		fs.mkdirSync( realProfile, { recursive: true } );
+		fs.mkdirSync( home, { recursive: true } );
+		link( realProfile, path.join( home, '.studio' ) );
+
+		expect(
+			checkAcceptanceRunDirectory( path.join( realProfile, 'run' ), { mustBeNew: true, home } )
+		).toEqual( { ok: false, problem: 'run-dir-in-studio-profile' } );
+	} );
+
+	it( 'accepts a run directory outside the Studio profile, through a link that resolves outside too', () => {
+		fs.mkdirSync( path.join( home, '.studio' ), { recursive: true } );
+		const runs = path.join( base, 'runs' );
+		fs.mkdirSync( runs );
+		const linked = link( runs, path.join( base, 'linked-runs' ) );
+
+		const check = checkAcceptanceRunDirectory( path.join( linked, 'run' ), {
+			mustBeNew: true,
+			home,
+		} );
+		expect( check ).toMatchObject( { ok: true } );
+		// The paths it hands on are the ones it was given.
+		expect( check.ok && check.paths.runDir ).toBe( path.join( linked, 'run' ) );
 	} );
 } );
