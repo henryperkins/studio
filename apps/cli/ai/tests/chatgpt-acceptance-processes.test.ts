@@ -200,6 +200,19 @@ describe( 'stopping the CLI processes an acceptance run started', () => {
 		expect( ( await running ).exitCode ).not.toBe( 0 );
 	}, 30_000 );
 
+	it( 'counts and stops only what its own run started, whatever another left running', async () => {
+		const other = processes();
+		const turn = other.startTurn( turnOptions( true ) );
+		const { child, grandchild } = await startedPids();
+
+		expect( await processes().stopOwned() ).toEqual( { stopped: 0, failed: 0 } );
+		expect( isRunning( child ) && isRunning( grandchild ) ).toBe( true );
+
+		expect( await other.stopOwned() ).toEqual( { stopped: 1, failed: 0 } );
+		expect( await waitUntilGone( [ child, grandchild ] ) ).toEqual( [] );
+		await turn.result;
+	}, 30_000 );
+
 	it( 'ends every running tree at once when the runner has to exit before cleanup', async () => {
 		const turn = processes().startTurn( turnOptions( true ) );
 		const { child, grandchild } = await startedPids();

@@ -3059,6 +3059,8 @@ export function createLiveAcceptanceProcesses( {
 	print: ( line: string ) => void;
 } ): AcceptanceProcesses {
 	let sequence = 0;
+	// What this run started and hasn't closed: cleanup stops these, and only these.
+	const owned = new Set< ChildProcess >();
 	let warned = false;
 	const onDescendantsMayRemain = () => {
 		if ( ! warned ) {
@@ -3070,14 +3072,19 @@ export function createLiveAcceptanceProcesses( {
 
 	function track( child: ChildProcess ): Promise< number | null > {
 		runningChildren.add( child );
+		owned.add( child );
+		const forget = () => {
+			runningChildren.delete( child );
+			owned.delete( child );
+		};
 		return new Promise( ( resolve ) => {
 			// After its output and IPC channel close too, so no last event is lost.
 			child.once( 'close', ( code ) => {
-				runningChildren.delete( child );
+				forget();
 				resolve( code );
 			} );
 			child.once( 'error', () => {
-				runningChildren.delete( child );
+				forget();
 				resolve( null );
 			} );
 		} );
@@ -3261,7 +3268,7 @@ export function createLiveAcceptanceProcesses( {
 		async stopOwned() {
 			let stopped = 0;
 			let failed = 0;
-			for ( const child of [ ...runningChildren ] ) {
+			for ( const child of [ ...owned ] ) {
 				if ( await stop( child ) ) {
 					stopped++;
 				} else {
