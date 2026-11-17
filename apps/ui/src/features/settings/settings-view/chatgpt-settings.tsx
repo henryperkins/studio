@@ -97,6 +97,8 @@ export function ChatGptSettingsGroup() {
 			if ( outcome.ok ) {
 				signedIn = outcome.registrationId;
 				setSelectedId( outcome.registrationId );
+				// Including a failed cancel's: the attempt it couldn't stop succeeded.
+				setError( '' );
 				setMessage( __( 'ChatGPT account connected.' ) );
 				setReconsent( false );
 			} else {

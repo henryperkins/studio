@@ -200,6 +200,29 @@ describe( 'ChatGPT account settings', () => {
 		).toHaveTextContent( /Complete sign-in in your browser/ );
 	} );
 
+	it( 'drops a failed cancel’s error once the same attempt connects the account', async () => {
+		const { connector, outcome } = await openSettings();
+		connector.cancelChatGptSignIn.mockRejectedValueOnce(
+			new Error( 'Studio couldn’t complete the ChatGPT action. Try again.' )
+		);
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+		fireEvent.click( await screen.findByRole( 'button', { name: 'Start sign-in' } ) );
+		await waitFor( () => expect( connector.waitForChatGptSignIn ).toHaveBeenCalled() );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Cancel sign-in' } ) );
+		await within( group ).findByRole( 'alert' );
+
+		await act( async () =>
+			outcome.resolve( { ok: true, registrationId: ACCOUNT_A, label: EMAIL, email: EMAIL } )
+		);
+
+		await waitFor( () =>
+			expect(
+				within( group ).getByRole( 'status', { name: 'ChatGPT sign-in status' } )
+			).toHaveTextContent( exactly( 'ChatGPT account connected.' ) )
+		);
+		expect( within( group ).queryByRole( 'alert' ) ).not.toBeInTheDocument();
+	} );
+
 	it( 'says a sign-out that couldn’t clear the sign-in as an error', async () => {
 		const { connector } = await openSettings( { accounts: [ account() ] } );
 		connector.signOutChatGpt.mockResolvedValueOnce( {
