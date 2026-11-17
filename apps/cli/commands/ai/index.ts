@@ -1188,7 +1188,9 @@ export async function runCommand( options: {
 
 			// Match the exact prompt: `/clear foo` falls through to the AI agent
 			// rather than running `/clear`.
-			const cmd = trimmedPrompt.startsWith( '/' ) ? findSlashCommand( trimmedPrompt ) : undefined;
+			const cmd = trimmedPrompt.startsWith( '/' )
+				? await findSlashCommand( trimmedPrompt )
+				: undefined;
 			if ( cmd ) {
 				if ( cmd.handler ) {
 					const result = await cmd.handler( prompt, slashCommandContext );

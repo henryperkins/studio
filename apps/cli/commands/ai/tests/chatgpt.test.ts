@@ -2,7 +2,10 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { readChatGptAccounts } from '@studio/agent/node/chatgpt/account-store';
+import {
+	ChatGptConnectionError,
+	readChatGptAccounts,
+} from '@studio/agent/node/chatgpt/account-store';
 import {
 	beginChatGptTurn,
 	listChatGptConnections,
@@ -38,8 +41,9 @@ import type { StudioAgentTurnConfig } from '@studio/agent/node/runtime';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
 
 vi.mock( '@studio/common/lib/shared-config', () => ( { readAuthToken: async () => null } ) );
+const keychainChecks = vi.hoisted( () => vi.fn( async () => ( { available: true } ) ) );
 vi.mock( '@studio/common/lib/os-credential-store', () => ( {
-	createOsCredentialStore: () => ( { check: async () => ( { available: true } ) } ),
+	createOsCredentialStore: () => ( { check: keychainChecks } ),
 } ) );
 vi.mock( '@studio/agent/node/settings-store', async ( original ) => ( {
 	...( await original< object >() ),
@@ -488,19 +492,42 @@ describe( 'ChatGPT interactive CLI', () => {
 		);
 	} );
 
-	it( 'with ChatGPT off and no saved sign-in, only says ChatGPT isn’t enabled at /chatgpt', async () => {
-		vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
-		vi.mocked( readChatGptAccounts ).mockResolvedValue( [] );
-		const ui = terminal( [ '/chatgpt' ], [] );
+	it.each( [
+		[ 'none saved', async () => [] ],
+		[
+			'only a signed-out one',
+			async () => [ { ...account( A, 'Personal' ), state: 'signed-out' } ],
+		],
+		[
+			'an accounts file it can’t read',
+			async () => {
+				throw new ChatGptConnectionError( 'accounts-unreadable' );
+			},
+		],
+	] )(
+		'with ChatGPT off and no saved sign-in (%s), leaves /chatgpt to the agent as a prompt, as before ChatGPT',
+		async ( _name, accounts ) => {
+			vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', '' );
+			vi.mocked( readChatGptAccounts ).mockImplementation( accounts as () => Promise< [] > );
+			const ui = terminal( [ '/chatgpt' ], [] );
 
-		await runCommand( { adapter: ui } );
+			await runCommand( { adapter: ui } );
 
-		expect( ui.showError ).toHaveBeenCalledWith(
-			'ChatGPT plan connections are not enabled in this app.'
-		);
-		expect( ui.askUser ).not.toHaveBeenCalled();
-		expect( runs ).toHaveLength( 0 );
-	} );
+			expect( ui.showError ).not.toHaveBeenCalled();
+			expect( ui.showInfo ).not.toHaveBeenCalledWith(
+				'ChatGPT plan connections are not enabled in this app.'
+			);
+			expect( ui.askUser ).not.toHaveBeenCalled();
+			expect( runs ).toHaveLength( 1 );
+			expect( runs[ 0 ].config.prompt ).toBe( '/chatgpt' );
+			// Only the accounts index decides: no connection, keychain or sign-in is read.
+			expect( readChatGptAccounts ).toHaveBeenCalledTimes( 1 );
+			expect( listChatGptConnections ).not.toHaveBeenCalled();
+			expect( keychainChecks ).not.toHaveBeenCalled();
+			expect( beginChatGptSignIn ).not.toHaveBeenCalled();
+			expect( signOutChatGpt ).not.toHaveBeenCalled();
+		}
+	);
 
 	it.each( [
 		[ 'an unknown recorded effort', { reasoningEffort: 'future-effort' }, 'future-effort' ],
