@@ -31,6 +31,15 @@ const cases = config.tests.map( ( test ) => ( {
 	checks: [ ...named( config.defaultTest.assert ), ...named( test.assert ) ],
 } ) );
 
+describe( 'the parity script', () => {
+	test( 'runs promptfoo without its cache, so no case is answered from an earlier run’s output', () => {
+		const scripts = JSON.parse(
+			readFileSync( path.join( import.meta.dirname, '..', '..', 'package.json' ), 'utf8' )
+		).scripts;
+		expect( scripts[ 'eval:parity' ] ).toMatch( /\bpromptfoo@\S+ eval\b.* --no-cache\b/ );
+	} );
+} );
+
 describe( 'subscription parity config', () => {
 	test( 'runs the same eval runner as the main suite, one case at a time', () => {
 		expect( config.providers.map( ( provider ) => provider.id ) ).toEqual(

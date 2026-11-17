@@ -8,7 +8,7 @@
 //
 // Use from promptfoo.config.yaml as `type: javascript` with
 // `value: file://outcome.mjs:<check>`; per-case parameters come from `vars`.
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import {
 	findUnsafeText,
 	openAcceptanceEvidence,
@@ -27,7 +27,15 @@ function load( output ) {
 	const marker = String( output ).match( MARKER );
 	if ( ! marker )
 		throw new Error( `no runner result in output: ${ quote( String( output ).slice( 0, 300 ) ) }` );
-	return JSON.parse( readFileSync( marker[ 1 ], 'utf8' ) );
+	return { d: JSON.parse( readFileSync( marker[ 1 ], 'utf8' ) ), file: marker[ 1 ] };
+}
+
+// Whether the runner wrote its result file after this process (promptfoo's
+// evaluation) started. promptfoo's cache can answer a case with an earlier
+// invocation's output, which names an earlier result file; its checks must not
+// add records to that run's summary as if they were this run's.
+function writtenByThisRun( file ) {
+	return statSync( file ).mtimeMs >= Date.now() - process.uptime() * 1000;
 }
 
 const pass = ( reason ) => ( { pass: true, score: 1, reason } );
@@ -124,13 +132,22 @@ function check( name, fn ) {
 		const vars = context?.vars ?? {};
 		let d = null;
 		let verdict;
+		let fromThisRun = true;
 		try {
-			d = load( output );
-			verdict = d.blocked ? blocked( d.blocked ) : fn( d, vars );
+			const loaded = load( output );
+			d = loaded.d;
+			fromThisRun = writtenByThisRun( loaded.file );
+			verdict = ! fromThisRun
+				? fail(
+						'result-not-from-this-run: the runner’s result is not from this run (an earlier run’s output was served), so nothing was recorded in the case’s summary; run promptfoo with --no-cache'
+				  )
+				: d.blocked
+				? blocked( d.blocked )
+				: fn( d, vars );
 		} catch ( error ) {
 			verdict = fail( error instanceof Error ? error.message : String( error ) );
 		}
-		if ( providerQualified( d, vars ) ) recordCheck( d, name, verdict );
+		if ( fromThisRun && providerQualified( d, vars ) ) recordCheck( d, name, verdict );
 		return {
 			...verdict,
 			reason: providerQualified( d, vars )

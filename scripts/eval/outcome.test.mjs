@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, describe, expect, test } from 'vitest';
@@ -579,6 +579,33 @@ describe( 'the records a provider-qualified case’s checks add to its summary',
 				( name ) => `eval-check-${ name.replace( /[A-Z]/g, ( c ) => `-${ c.toLowerCase() }` ) }`
 			)
 		);
+	} );
+
+	test( 'a result that predates this run, as promptfoo’s cache would serve it, fails its check and records nothing', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const result = { success: true, providerRoute: route, textSegments: [ 'WordPress Studio' ] };
+		const evalSummary = startRun( summaries, result );
+		const file = path.join( dir, `result-${ count++ }.json` );
+		writeFileSync( file, JSON.stringify( { ...result, evalSummary } ) );
+		const output = `EVAL_RUNNER_RESULT_FILE=${ file }
+`;
+		// The result of an earlier invocation: older than this process.
+		const earlier = new Date( Date.now() - 3 * 24 * 3600 * 1000 );
+		utimesSync( file, earlier, earlier );
+
+		for ( const check of [ checks.identifiesAsStudio, checks.ranOnRequestedRoute ] ) {
+			const verdict = check( output, { vars } );
+			expect( verdict.pass ).toBe( false );
+			expect( verdict.reason ).toMatch( /^result-not-from-this-run: .*not from this run/ );
+		}
+		// Only the route record the earlier run wrote: the checks appended nothing to it.
+		expect( summaryOf( summaries ).records ).toHaveLength( 1 );
+
+		// The same result made by this run is recorded.
+		const now = new Date();
+		utimesSync( file, now, now );
+		expect( checks.identifiesAsStudio( output, { vars } ).pass ).toBe( true );
+		expect( summaryOf( summaries ).records ).toHaveLength( 2 );
 	} );
 
 	test( 'a case that selects no provider adds nothing', () => {
