@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -42,6 +43,7 @@ import {
 	digestTurnEvents,
 	isToolResultPersisted,
 	isWpCliReadCommand,
+	onAcceptanceSignals,
 	parseChatGptAcceptanceArgs,
 	parseWpPostList,
 	PROVISION_STAGE_NAMES,
@@ -3598,6 +3600,60 @@ describe( 'acceptance turn digests', () => {
 		] );
 		expect( parseWpPostList( 'Error: not a site' ) ).toBeNull();
 		expect( parseWpPostList( '[{"ID":"x"}]' ) ).toBeNull();
+	} );
+} );
+
+describe( 'the signals that stop an acceptance run', () => {
+	// A stand-in for the process, so no real signal reaches the test worker.
+	const signalTarget = () => new EventEmitter() as unknown as Pick< NodeJS.Process, 'on' | 'off' >;
+
+	it.each( [ 'SIGINT', 'SIGTERM', 'SIGHUP' ] as const )(
+		'stops the run and cleans up on %s; a second signal of any kind exits without waiting',
+		( signal ) => {
+			const target = signalTarget();
+			const handler = vi.fn();
+			const forceExit = vi.fn();
+			const stop = onAcceptanceSignals( handler, { target, platform: 'linux', forceExit } );
+
+			( target as unknown as EventEmitter ).emit( signal );
+			expect( handler ).toHaveBeenCalledTimes( 1 );
+			expect( forceExit ).not.toHaveBeenCalled();
+
+			( target as unknown as EventEmitter ).emit( signal === 'SIGINT' ? 'SIGTERM' : 'SIGINT' );
+			expect( handler ).toHaveBeenCalledTimes( 1 );
+			expect( forceExit ).toHaveBeenCalledTimes( 1 );
+			stop();
+		}
+	);
+
+	it( 'listens for Ctrl+Break on Windows only', () => {
+		const windows = signalTarget();
+		const windowsHandler = vi.fn();
+		const stopWindows = onAcceptanceSignals( windowsHandler, {
+			target: windows,
+			platform: 'win32',
+			forceExit: vi.fn(),
+		} );
+		( windows as unknown as EventEmitter ).emit( 'SIGBREAK' );
+		expect( windowsHandler ).toHaveBeenCalledTimes( 1 );
+		stopWindows();
+
+		const linux = signalTarget();
+		onAcceptanceSignals( vi.fn(), { target: linux, platform: 'linux', forceExit: vi.fn() } );
+		expect( ( linux as unknown as EventEmitter ).listenerCount( 'SIGBREAK' ) ).toBe( 0 );
+	} );
+
+	it( 'stops listening for every signal once the run is over', () => {
+		const target = signalTarget();
+		const emitter = target as unknown as EventEmitter;
+		const stop = onAcceptanceSignals( vi.fn(), { target, platform: 'win32', forceExit: vi.fn() } );
+		for ( const signal of [ 'SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK' ] ) {
+			expect( emitter.listenerCount( signal ) ).toBe( 1 );
+		}
+		stop();
+		for ( const signal of [ 'SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK' ] ) {
+			expect( emitter.listenerCount( signal ) ).toBe( 0 );
+		}
 	} );
 } );
 

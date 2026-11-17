@@ -3387,6 +3387,48 @@ async function collectLiveFacts(): Promise< RunFacts > {
 	};
 }
 
+/**
+ * Calls `handler` on the first signal that ends a run: Ctrl+C, a termination
+ * request, a closed terminal and, on Windows, Ctrl+Break; any second one calls
+ * `forceExit`. Returns what stops listening.
+ */
+export function onAcceptanceSignals(
+	handler: () => void,
+	{
+		target,
+		platform,
+		forceExit,
+	}: {
+		target: Pick< NodeJS.Process, 'on' | 'off' >;
+		platform: NodeJS.Platform;
+		forceExit: () => void;
+	}
+): () => void {
+	const signals: NodeJS.Signals[] = [
+		'SIGINT',
+		'SIGTERM',
+		'SIGHUP',
+		...( platform === 'win32' ? [ 'SIGBREAK' as const ] : [] ),
+	];
+	let received = 0;
+	const onSignal = () => {
+		received++;
+		if ( received === 1 ) {
+			handler();
+		} else {
+			forceExit();
+		}
+	};
+	for ( const signal of signals ) {
+		target.on( signal, onSignal );
+	}
+	return () => {
+		for ( const signal of signals ) {
+			target.off( signal, onSignal );
+		}
+	};
+}
+
 /** The dependencies of a real run, from the built CLI's directory. */
 export function createLiveChatGptAcceptanceDependencies(): ChatGptAcceptanceDependencies {
 	return {
@@ -3396,26 +3438,21 @@ export function createLiveChatGptAcceptanceDependencies(): ChatGptAcceptanceDepe
 		collectFacts: collectLiveFacts,
 		configDirectory: getConfigDirectory,
 		processManagerHome: () => PROCESS_MANAGER_HOME,
-		onInterrupt: ( handler ) => {
-			let presses = 0;
-			const onSignal = () => {
-				presses++;
-				if ( presses === 1 ) {
-					handler();
-					return;
-				}
-				// Their own process groups keep the terminal's signal from them on POSIX.
-				endRunningAcceptanceChildren();
-				process.stdout.write(
-					`${ __(
-						'Stopped before cleanup finished. See scripts/chatgpt-acceptance/README.md to stop what this run started.'
-					) }\n`
-				);
-				process.exit( EXIT_INTERRUPTED );
-			};
-			process.on( 'SIGINT', onSignal );
-			return () => process.off( 'SIGINT', onSignal );
-		},
+		onInterrupt: ( handler ) =>
+			onAcceptanceSignals( handler, {
+				target: process,
+				platform: process.platform,
+				forceExit: () => {
+					// Their own process groups keep the terminal's signal from them on POSIX.
+					endRunningAcceptanceChildren();
+					process.stdout.write(
+						`${ __(
+							'Stopped before cleanup finished. See scripts/chatgpt-acceptance/README.md to stop what this run started.'
+						) }\n`
+					);
+					process.exit( EXIT_INTERRUPTED );
+				},
+			} ),
 		createServices: ( { paths } ) => createLiveServices( { paths } ),
 	};
 }
