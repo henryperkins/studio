@@ -1612,9 +1612,13 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 				'Images in tool results are not available on this connection yet'
 			);
 			expect( description ).not.toMatch( /model cannot view|cannot view images/ );
+			// And how to read a skill's "if you can view images" on this connection.
+			const reading =
+				'Where a skill or instruction asks whether you can view images, treat screenshots and other images in tool results as not viewable on this connection; images the user attaches remain visible to you.';
+			expect( description ).toContain( reading );
 			const instructions = String( requests[ 0 ].body.instructions );
 			expect( instructions ).toContain(
-				'Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot.'
+				`Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot. ${ reading }`
 			);
 			expect( instructions ).not.toContain( 'You cannot view the image' );
 			expect( seams.captureScreenshotBuffer ).toHaveBeenCalledWith(
@@ -1628,6 +1632,7 @@ describe( 'a ChatGPT conversation in a real agent session', () => {
 			expect( JSON.stringify( output ) ).toContain(
 				'Images in tool results are not available on this connection yet'
 			);
+			expect( JSON.stringify( output ) ).toContain( reading );
 			expect( JSON.stringify( output ) ).not.toContain( 'cannot view images' );
 			expect( imageCount( requests[ 2 ].body.input ) ).toBe( 0 );
 			expect( ui.showArtifact ).toHaveBeenCalledTimes( 1 );

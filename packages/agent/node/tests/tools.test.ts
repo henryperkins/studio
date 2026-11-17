@@ -332,8 +332,10 @@ describe( 'Studio AI MCP tools', () => {
 		it( 'says the connection doesn’t take images from tools only where it is told so, keeping every other route’s text', async () => {
 			const MODEL_NOTE =
 				'This model cannot view images, so the capture is not shown to you: verify the rendered page with inspect_design.';
-			const CONNECTION_NOTE =
-				'Images in tool results are not available on this connection yet, so the capture is not shown to you: verify the rendered page with inspect_design.';
+			// How to read a skill's "if you can view images" there, since the model does see a user's images.
+			const READING =
+				'Where a skill or instruction asks whether you can view images, treat screenshots and other images in tool results as not viewable on this connection; images the user attaches remain visible to you.';
+			const CONNECTION_NOTE = `Images in tool results are not available on this connection yet, so the capture is not shown to you: verify the rendered page with inspect_design. ${ READING }`;
 			const screenshotWith = async ( options: StudioToolsOptions ) => {
 				mockScreenshotBrowser(
 					createMockPage( { buffer: Buffer.from( 'jpeg' ), documentHeight: 900 } )
@@ -358,12 +360,18 @@ describe( 'Studio AI MCP tools', () => {
 			);
 			expect( model.text ).toContain( MODEL_NOTE );
 			expect( model.images ).toBe( 0 );
+			for ( const text of [ model.description, model.snippet, model.text ] ) {
+				expect( text ).not.toContain( 'asks whether you can view images' );
+			}
 
 			// One that can, as on trunk: the reason is never read then.
 			const vision = await screenshotWith( { visionEnabled: true, toolImagesUnavailable: true } );
 			expect( vision.description ).toContain( 'analyze visually' );
 			expect( vision.description ).not.toContain( 'this connection' );
 			expect( vision.images ).toBe( 1 );
+			for ( const text of [ vision.description, vision.snippet, vision.text ] ) {
+				expect( text ).not.toContain( 'asks whether you can view images' );
+			}
 
 			// A connection that doesn't take images from tools yet.
 			const connection = await screenshotWith( {
@@ -374,7 +382,7 @@ describe( 'Studio AI MCP tools', () => {
 				model.description.replace( MODEL_NOTE, CONNECTION_NOTE )
 			);
 			expect( connection.snippet ).toBe(
-				'Save a full-page screenshot of a URL to a file (supports desktop, mobile, or `viewport: "all"` for both). Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot.'
+				`Save a full-page screenshot of a URL to a file (supports desktop, mobile, or \`viewport: "all"\` for both). Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot. ${ READING }`
 			);
 			expect( connection.text ).toContain( CONNECTION_NOTE );
 			expect( connection.text ).not.toContain( 'cannot view images' );

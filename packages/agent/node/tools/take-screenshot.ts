@@ -56,8 +56,10 @@ function getCaptureListLabel(
 
 const TEXT_ONLY_NOTE =
 	'This model cannot view images, so the capture is not shown to you: verify the rendered page with inspect_design.';
-const NO_TOOL_IMAGES_NOTE =
-	'Images in tool results are not available on this connection yet, so the capture is not shown to you: verify the rendered page with inspect_design.';
+// Skills branch on whether the model can view images; such a model does see a user's.
+const NO_TOOL_IMAGES_READING =
+	'Where a skill or instruction asks whether you can view images, treat screenshots and other images in tool results as not viewable on this connection; images the user attaches remain visible to you.';
+const NO_TOOL_IMAGES_NOTE = `Images in tool results are not available on this connection yet, so the capture is not shown to you: verify the rendered page with inspect_design. ${ NO_TOOL_IMAGES_READING }`;
 
 // Text-only models still get the tool (it sets the theme screenshot) but no
 // image block, which they would otherwise describe without seeing.
@@ -263,7 +265,7 @@ export function createTakeScreenshotTool( {
 			promptSnippet: visionEnabled
 				? 'Take a full-page screenshot of a URL (supports desktop, mobile, or `viewport: "all"` for both). Use this to visually check the site after building it.'
 				: toolImagesUnavailable
-				? 'Save a full-page screenshot of a URL to a file (supports desktop, mobile, or `viewport: "all"` for both). Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot.'
+				? `Save a full-page screenshot of a URL to a file (supports desktop, mobile, or \`viewport: "all"\` for both). Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot. ${ NO_TOOL_IMAGES_READING }`
 				: 'Save a full-page screenshot of a URL to a file (supports desktop, mobile, or `viewport: "all"` for both). You cannot view the image, but it still sets the theme screenshot.',
 		}
 	);
