@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ChatGptSettingsError } from './chatgpt-settings-error';
 import { createIpcConnector } from './ipc';
 import { createLocalConnector } from './local';
 import type { ChatGptSettings } from '@studio/agent/protocol/chatgpt';
@@ -148,6 +149,87 @@ describe( 'ChatGPT connector contracts', () => {
 			await expect( connector.setSessionModel( 'chat', 'balanced' ) ).rejects.toThrowError(
 				new Error( message )
 			);
+		} );
+	} );
+
+	describe( 'a ChatGPT settings read that fails', () => {
+		const REASON = 'Studio couldn’t complete the ChatGPT action. Try again.';
+		const reads = [ 'getChatGptSettings', 'recheckChatGptSettings' ] as const;
+
+		it.each( reads )(
+			'carries the shared module’s message through Desktop IPC (%s)',
+			async ( read ) => {
+				vi.stubGlobal( 'ipcApi', {
+					[ read ]: vi.fn( async () => {
+						throw new Error(
+							`Error invoking remote method '${ read }': ChatGptSettingsError: ${ REASON }`
+						);
+					} ),
+				} );
+				const failure = await createIpcConnector()
+					[ read ]()
+					.catch( ( error: unknown ) => error );
+
+				expect( failure ).toBeInstanceOf( ChatGptSettingsError );
+				expect( failure ).toHaveProperty( 'message', REASON );
+			}
+		);
+
+		it.each( reads )(
+			'carries no module message when Desktop IPC itself fails (%s)',
+			async ( read ) => {
+				vi.stubGlobal( 'ipcApi', {
+					[ read ]: vi.fn( async () => {
+						throw new Error(
+							`Error invoking remote method '${ read }': Error: No handler registered for '${ read }'`
+						);
+					} ),
+				} );
+				const failure = await createIpcConnector()
+					[ read ]()
+					.catch( ( error: unknown ) => error );
+
+				expect( failure ).toBeInstanceOf( Error );
+				expect( failure ).not.toBeInstanceOf( ChatGptSettingsError );
+			}
+		);
+
+		it.each( reads )( 'carries the server’s { error } in studio ui (%s)', async ( read ) => {
+			vi.stubGlobal(
+				'fetch',
+				vi.fn( async () => new Response( JSON.stringify( { error: REASON } ), { status: 400 } ) )
+			);
+			const failure = await createLocalConnector( { apiBaseUrl: 'http://localhost:8081' } )
+				[ read ]()
+				.catch( ( error: unknown ) => error );
+
+			expect( failure ).toBeInstanceOf( ChatGptSettingsError );
+			expect( failure ).toHaveProperty( 'message', REASON );
+		} );
+
+		describe.each( reads )( 'in studio ui, %s', ( read ) => {
+			it.each( [
+				[ 'a proxy’s 502', async () => new Response( 'Bad Gateway', { status: 502 } ) ],
+				[
+					'an error page',
+					async () => new Response( '<html>Internal error</html>', { status: 500 } ),
+				],
+				[ 'a page that isn’t the settings', async () => new Response( '<!doctype html>' ) ],
+				[
+					'the server not answering',
+					async () => {
+						throw new TypeError( 'Failed to fetch' );
+					},
+				],
+			] )( 'carries no module message for %s', async ( _shape, respond ) => {
+				vi.stubGlobal( 'fetch', vi.fn( respond ) );
+				const failure = await createLocalConnector( { apiBaseUrl: 'http://localhost:8081' } )
+					[ read ]()
+					.catch( ( error: unknown ) => error );
+
+				expect( failure ).toBeInstanceOf( Error );
+				expect( failure ).not.toBeInstanceOf( ChatGptSettingsError );
+			} );
 		} );
 	} );
 

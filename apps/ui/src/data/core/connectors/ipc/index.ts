@@ -17,6 +17,7 @@ import { SyncCancelledError } from '@studio/common/lib/sync/cancel';
 import { getFirstInstalledEditor } from '@studio/common/lib/user-settings/editor';
 import { fetchWordPressVersions } from '@studio/common/lib/wordpress-versions';
 import { __ } from '@wordpress/i18n';
+import { ChatGptSettingsError } from '../chatgpt-settings-error';
 import { buildPublishCheckoutUrl } from '../publish-checkout-url';
 import type {
 	AgentApp,
@@ -94,6 +95,20 @@ export function createIpcConnector(): Connector {
 			throw new Error(
 				stripCliErrorEnvelope( stripIpcErrorPrefix( getErrorMessage( error ) ?? String( error ) ) )
 			);
+		}
+	}
+
+	// A ChatGPT settings read carries the shared module's own message only when
+	// the main process refused it with that module's error.
+	async function readChatGptSettings< T >( call: Promise< T > ): Promise< T > {
+		try {
+			return await call;
+		} catch ( error ) {
+			const message = getErrorMessage( error ) ?? String( error );
+			if ( /^Error invoking remote method '[^']+': ChatGptSettingsError: /.test( message ) ) {
+				throw new ChatGptSettingsError( stripIpcErrorPrefix( message ) );
+			}
+			throw new Error( stripCliErrorEnvelope( stripIpcErrorPrefix( message ) ) );
 		}
 	}
 
@@ -710,10 +725,10 @@ export function createIpcConnector(): Connector {
 			return unwrapIpcError( ipcApi.setOpenAiDefaults( update ) );
 		},
 		async getChatGptSettings() {
-			return unwrapIpcError( ipcApi.getChatGptSettings() );
+			return readChatGptSettings( ipcApi.getChatGptSettings() );
 		},
 		async recheckChatGptSettings() {
-			return unwrapIpcError( ipcApi.recheckChatGptSettings() );
+			return readChatGptSettings( ipcApi.recheckChatGptSettings() );
 		},
 		async beginChatGptSignIn( registrationId, options ) {
 			return unwrapIpcError( ipcApi.beginChatGptSignIn( registrationId, options ) );

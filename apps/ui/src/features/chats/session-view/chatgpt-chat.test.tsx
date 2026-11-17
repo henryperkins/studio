@@ -3,13 +3,13 @@ import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/provide
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { getVisibleToasts } from '@/data/app-messages';
+import { ChatGptSettingsError, type AuthUser, type SessionEntry } from '@/data/core';
 import {
 	CHATGPT_MODELS_QUERY_KEY,
 	CHATGPT_SETTINGS_QUERY_KEY,
 } from '@/data/queries/use-chatgpt-settings';
 import { createFakeConnector, makeSession, makeSite, TEST_USER } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
-import type { AuthUser, SessionEntry } from '@/data/core';
 import type { ChatGptAccountView, ChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import type { StudioSessionContextData } from '@studio/agent/protocol/sessions/entry-types';
 
@@ -632,32 +632,50 @@ describe( 'ChatGPT chats', () => {
 		}
 	);
 
-	it( 'says why the ChatGPT accounts couldn’t be checked and retries from the notice, sending nothing meanwhile', async () => {
-		const { connector, queryClient, runs } = await setup();
-		const reason = 'Studio couldn’t complete the ChatGPT action. Try again.';
-		connector.getChatGptSettings.mockRejectedValue( new Error( reason ) );
-		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+	// As each app's connector reports a failed read (pinned in chatgpt-contracts.test.ts).
+	it.each( [
+		{
+			host: 'Desktop, or studio ui with the server’s { error }',
+			failure: () =>
+				new ChatGptSettingsError( 'Studio couldn’t complete the ChatGPT action. Try again.' ),
+			shown: 'Studio couldn’t complete the ChatGPT action. Try again.',
+		},
+		{
+			host: 'studio ui with the server not answering',
+			failure: () => new Error( 'GET /chatgpt failed (502): Bad Gateway' ),
+			shown: 'Try again.',
+		},
+	] )(
+		'says why the ChatGPT accounts couldn’t be checked in $host and retries from the notice, sending nothing meanwhile',
+		async ( { failure, shown } ) => {
+			const { connector, queryClient, runs } = await setup();
+			connector.getChatGptSettings.mockRejectedValue( failure() );
+			await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
 
-		expect(
-			await screen.findByText( `Couldn’t check your ChatGPT accounts. ${ reason }` )
-		).toBeVisible();
-		send( 'Held request' );
-		await act( async () => {} );
-		expect( runs ).toHaveLength( 0 );
+			expect(
+				await screen.findByText( `Couldn’t check your ChatGPT accounts. ${ shown }` )
+			).toBeVisible();
+			expect( screen.queryByText( /GET \/chatgpt|Bad Gateway/ ) ).not.toBeInTheDocument();
+			send( 'Held request' );
+			await act( async () => {} );
+			expect( runs ).toHaveLength( 0 );
 
-		connector.getChatGptSettings.mockImplementation( async () =>
-			structuredClone( connector.state.chatGpt )
-		);
-		fireEvent.click( screen.getByRole( 'button', { name: 'Retry' } ) );
+			connector.getChatGptSettings.mockImplementation( async () =>
+				structuredClone( connector.state.chatGpt )
+			);
+			fireEvent.click( screen.getByRole( 'button', { name: 'Retry' } ) );
 
-		await waitFor( () =>
-			expect( screen.queryByText( /Couldn’t check your ChatGPT accounts/ ) ).not.toBeInTheDocument()
-		);
-		expect( connector.recheckChatGptSettings ).toHaveBeenCalledTimes( 1 );
-		send( 'Following request' );
-		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
-		expect( runs[ 0 ].selection ).toEqual( INITIAL );
-	} );
+			await waitFor( () =>
+				expect(
+					screen.queryByText( /Couldn’t check your ChatGPT accounts/ )
+				).not.toBeInTheDocument()
+			);
+			expect( connector.recheckChatGptSettings ).toHaveBeenCalledTimes( 1 );
+			send( 'Following request' );
+			await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+			expect( runs[ 0 ].selection ).toEqual( INITIAL );
+		}
+	);
 
 	it.each( [
 		[

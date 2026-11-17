@@ -1,12 +1,12 @@
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ChatGptSettingsError, type Connector } from '@/data/core';
 import {
 	CHATGPT_MODELS_QUERY_KEY,
 	CHATGPT_SETTINGS_QUERY_KEY,
 } from '@/data/queries/use-chatgpt-settings';
 import { createFakeConnector, makeSite } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
-import type { Connector } from '@/data/core';
 import type {
 	ChatGptAccountView,
 	ChatGptSettings,
@@ -16,6 +16,33 @@ import type {
 const ACCOUNT_A = 'f84d75a0-4e60-4168-a1ab-3134542c637a';
 const ACCOUNT_B = '1c8e270b-9b5c-4687-b989-de052014b9e8';
 const ATTEMPT = 'b69a1ddf-d1a2-4ff6-b293-75c358ff42df';
+
+// A settings read failing as each app's connector reports it (each connector's
+// side is pinned in chatgpt-contracts.test.ts): the shared module's own message,
+// which is shown, or a transport failure, which isn't.
+const MODULE_REASON = 'Studio couldn’t complete the ChatGPT action. Try again.';
+const READ_FAILURES = [
+	{
+		host: 'Desktop',
+		failure: () => new ChatGptSettingsError( MODULE_REASON ),
+		shown: MODULE_REASON,
+	},
+	{
+		host: 'studio ui, with the server’s { error }',
+		failure: () => new ChatGptSettingsError( MODULE_REASON ),
+		shown: MODULE_REASON,
+	},
+	{
+		host: 'studio ui, with the server not answering',
+		failure: () => new Error( 'GET /chatgpt failed (502): Bad Gateway' ),
+		shown: 'Try again.',
+	},
+	{
+		host: 'studio ui, with the page offline',
+		failure: () => new TypeError( 'Failed to fetch' ),
+		shown: 'Try again.',
+	},
+];
 
 // As Studio saves them: labelled with the email, a second registration of it numbered.
 const EMAIL = 'same@example.test';
@@ -393,18 +420,15 @@ describe( 'ChatGPT account settings', () => {
 		expect( connector.getChatGptSettings.mock.calls.length ).toBeGreaterThan( 3 );
 	} );
 
-	it.each( [
-		[ 'Desktop', 'Studio couldn’t complete the ChatGPT action. Try again.' ],
-		[ 'studio ui', 'GET /chatgpt failed (502): Bad Gateway' ],
-	] )(
-		'shows nothing about ChatGPT while no read has said it is on, when the read fails in %s',
-		async ( _host, reason ) => {
+	it.each( READ_FAILURES )(
+		'shows nothing about ChatGPT while no read has said it is on, when the read fails in $host',
+		async ( { failure } ) => {
 			const logged = vi.spyOn( console, 'error' );
 			const { connector } = await openSettings(
 				{},
 				{
 					getChatGptSettings: async () => {
-						throw new Error( reason );
+						throw failure();
 					},
 				}
 			);
@@ -415,29 +439,26 @@ describe( 'ChatGPT account settings', () => {
 
 			expect( screen.queryByRole( 'group', { name: 'ChatGPT plan' } ) ).not.toBeInTheDocument();
 			expect( screen.queryByText( /ChatGPT accounts/ ) ).not.toBeInTheDocument();
-			expect( screen.queryByText( reason, { exact: false } ) ).not.toBeInTheDocument();
+			expect( screen.queryByText( failure().message, { exact: false } ) ).not.toBeInTheDocument();
 			expect( connector.recheckChatGptSettings ).not.toHaveBeenCalled();
 			expect( logged ).not.toHaveBeenCalled();
 		}
 	);
 
-	it.each( [
-		[ 'Desktop', 'Studio couldn’t complete the ChatGPT action. Try again.' ],
-		[ 'studio ui', 'GET /chatgpt failed (502): Bad Gateway' ],
-	] )(
-		'keeps the last known accounts, marked as possibly out of date, with the reason and a retry when a read fails in %s',
-		async ( _host, reason ) => {
+	it.each( READ_FAILURES )(
+		'keeps the last known accounts, marked as possibly out of date, with the reason and a retry when a read fails in $host',
+		async ( { failure, shown } ) => {
 			const { connector, queryClient, settings } = await openSettings( {
 				accounts: [ account() ],
 			} );
 			const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
 			await within( group ).findByText( 'Connected' );
-			connector.getChatGptSettings.mockRejectedValue( new Error( reason ) );
+			connector.getChatGptSettings.mockRejectedValue( failure() );
 			await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
 
-			expect( await within( group ).findByRole( 'alert' ) ).toHaveTextContent(
-				`Couldn’t check your ChatGPT accounts. ${ reason }`
-			);
+			const alert = await within( group ).findByRole( 'alert' );
+			expect( alert ).toHaveTextContent( `Couldn’t check your ChatGPT accounts. ${ shown }` );
+			expect( group ).not.toHaveTextContent( /GET \/chatgpt|Bad Gateway|Failed to fetch/ );
 			expect( within( group ).getByText( /This status may be out of date\./ ) ).toBeVisible();
 			expect(
 				within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
@@ -461,11 +482,13 @@ describe( 'ChatGPT account settings', () => {
 		const { connector, queryClient } = await openSettings( { accounts: [ account() ] } );
 		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
 		await within( group ).findByText( 'Connected' );
-		connector.getChatGptSettings.mockRejectedValue( new Error( 'First reason.' ) );
+		connector.getChatGptSettings.mockRejectedValue( new ChatGptSettingsError( 'First reason.' ) );
 		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
 		await within( group ).findByRole( 'alert' );
-		connector.recheckChatGptSettings.mockRejectedValue( new Error( 'Recheck reason.' ) );
-		connector.getChatGptSettings.mockRejectedValue( new Error( 'Second reason.' ) );
+		connector.recheckChatGptSettings.mockRejectedValue(
+			new ChatGptSettingsError( 'Recheck reason.' )
+		);
+		connector.getChatGptSettings.mockRejectedValue( new ChatGptSettingsError( 'Second reason.' ) );
 
 		fireEvent.click( within( group ).getByRole( 'button', { name: 'Retry' } ) );
 

@@ -6,6 +6,7 @@ import { createMemoryHistory } from '@tanstack/react-router';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { App } from '@/app';
+import { ChatGptSettingsError, type SessionEntry } from '@/data/core';
 import { createInMemoryConnector, makeSession, makeSite } from '@/test/in-memory-connector';
 import {
 	assistantTextEntry,
@@ -14,7 +15,6 @@ import {
 	toolResultEntry,
 	turnClosedEntry,
 } from '@/test/session-entries';
-import type { SessionEntry } from '@/data/core';
 import type { ChatGptAccountView } from '@studio/agent/protocol/chatgpt';
 import type { ImageServiceState } from '@studio/agent/protocol/image-service';
 
@@ -53,7 +53,7 @@ const chatGpt = {
 };
 let reads = 0;
 const failRead = async (): Promise< never > => {
-	throw new Error( 'Studio couldn’t complete the ChatGPT action. Try again.' );
+	throw new ChatGptSettingsError( 'Studio couldn’t complete the ChatGPT action. Try again.' );
 };
 const imageService: ImageServiceState | undefined =
 	service === 'token'

@@ -4,6 +4,7 @@ import { SyncCancelledError } from '@studio/common/lib/sync/cancel';
 import { fetchWordPressVersions } from '@studio/common/lib/wordpress-versions';
 import { __ } from '@wordpress/i18n';
 import { isShortcut } from '@/lib/keyboard';
+import { ChatGptSettingsError } from '../chatgpt-settings-error';
 import { buildPublishCheckoutUrl } from '../publish-checkout-url';
 import { UnsupportedError } from '../unsupported-error';
 import { readWapuuScore, writeWapuuScore } from '../wapuu-score-storage';
@@ -150,6 +151,33 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			return undefined as T;
 		}
 		return ( await response.json() ) as T;
+	}
+
+	// A ChatGPT settings read, as `api` makes it, except that it carries the shared
+	// module's own message only when the server answered with its `{ error }`. Any
+	// other failure (the server not answering, a proxy's page) is a plain error.
+	async function readChatGptSettings( path: string, init?: RequestInit ) {
+		const response = await fetch( `${ base }${ path }`, {
+			...init,
+			headers: { 'Content-Type': 'application/json' },
+		} );
+		if ( ! response.ok ) {
+			const text = await response.text().catch( () => '' );
+			let reason: unknown;
+			try {
+				reason = ( JSON.parse( text ) as { error?: unknown } | null )?.error;
+			} catch {
+				// Not JSON: not the server's own answer.
+			}
+			if ( typeof reason === 'string' ) {
+				throw new ChatGptSettingsError( stripCliErrorEnvelope( reason ) );
+			}
+			throw new Error(
+				`${ init?.method ?? 'GET' } ${ path } failed (${ response.status }): ${ text }`
+			);
+		}
+		const settings = ( await response.json() ) as ChatGptSettings;
+		return { ...settings, signInSupported: settings.signInSupported && chatGptSignInSupported };
 	}
 
 	// Fetch a server endpoint that returns a file and save it via the browser's
@@ -873,12 +901,10 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			return api< AiSettings >( '/ai-settings' );
 		},
 		async getChatGptSettings() {
-			const settings = await api< ChatGptSettings >( '/chatgpt' );
-			return { ...settings, signInSupported: settings.signInSupported && chatGptSignInSupported };
+			return readChatGptSettings( '/chatgpt' );
 		},
 		async recheckChatGptSettings() {
-			const settings = await api< ChatGptSettings >( '/chatgpt/recheck', { method: 'POST' } );
-			return { ...settings, signInSupported: settings.signInSupported && chatGptSignInSupported };
+			return readChatGptSettings( '/chatgpt/recheck', { method: 'POST' } );
 		},
 		async beginChatGptSignIn( registrationId, options ) {
 			if ( ! chatGptSignInSupported ) {
