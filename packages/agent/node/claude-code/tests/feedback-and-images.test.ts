@@ -562,6 +562,28 @@ describe( 'generate_images on the Claude route', () => {
 			expect( said, answered ).not.toContain( answered );
 	} );
 
+	// `x.png:s.png` names the stream `s.png` of the file `x.png`, which no check
+	// that resolves paths can see. (A `..` segment is no such case for this tool:
+	// the rule and the tool both resolve the path before it is checked or written.)
+	it.runIf( process.platform === 'win32' )(
+		'writes no image named as an NTFS stream of a file in the site, says its form is the reason, and asks, sends and journals nothing',
+		async () => {
+			const { bridge, host, context, journal, site } = await setupImages();
+			const file = `${ path.join( site, 'x.png' ) }:s.png`;
+			const result = await bridge.invoke( 'generate_images', {
+				images: [ { path: file, subject: 'Hero' } ],
+			} );
+			expect( result.isError ).toBe( true );
+			expect( text( result ) ).toContain( 'only by a plain absolute path' );
+			expect( text( result ) ).not.toContain( SITE_FILES );
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( generateImages ).not.toHaveBeenCalled();
+			expect( host.sites.wpCli ).not.toHaveBeenCalled();
+			expect( journal ).toEqual( [] );
+			expect( existsSync( path.join( site, 'x.png' ) ) ).toBe( false );
+		}
+	);
+
 	it( 'adds nothing to a media library whose uploads folder lies outside the site: it deletes the attachments it reserved, says why and generates nothing', async () => {
 		const { bridge, host, site, parent } = await setupImages();
 		reserving( host, '../outside/uploads' );
