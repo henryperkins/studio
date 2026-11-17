@@ -1735,19 +1735,46 @@ describe( 'ChatGPT acceptance runner', () => {
 				stop();
 			} );
 
-			it( 'lets any other write error surface, reported or thrown', () => {
+			it( 'swallows every write error the stream reports, as Node’s own console does', () => {
 				const reported = liveConsole( 'ENOSPC', 'reported' );
-				expect( () => reported.stdout.stream.emit( 'error', writeError( 'ENOSPC' ) ) ).toThrow(
-					'The write failed.'
-				);
-				expect( () => reported.stderr.stream.emit( 'error', writeError( 'ENOSPC' ) ) ).toThrow(
-					'The write failed.'
-				);
-				expect( () => reported.stdout.stream.emit( 'error', writeError( 'EIO' ) ) ).not.toThrow();
-				expect( () => reported.stderr.stream.emit( 'error', writeError( 'EPIPE' ) ) ).not.toThrow();
+				for ( const code of [ 'ENOSPC', 'EAGAIN', 'EIO', 'EPIPE' ] ) {
+					expect( () => reported.stdout.stream.emit( 'error', writeError( code ) ) ).not.toThrow();
+					expect( () => reported.stderr.stream.emit( 'error', writeError( code ) ) ).not.toThrow();
+				}
+			} );
 
+			it.each( [ 'ENOSPC', 'EAGAIN' ] )(
+				'goes on to the end of the run and its cleanup when every write is reported failing with %s',
+				async ( code ) => {
+					const { stdout, stderr, live } = liveConsole( code, 'reported' );
+					const { services, calls } = scriptedServices();
+					const running = runChatGptAcceptance( savedArgs(), {
+						...dependencies( services ),
+						print: live.print,
+						onInterrupt: live.onInterrupt,
+					} );
+					// A console write from any other module, failing the same way.
+					stderr.stream.write( 'A line from another module.\n' );
+
+					expect( await running ).toBe( 0 );
+					expect( stdout.attempts.join( '' ) ).toMatch( /Evidence goes to/ );
+					expect( stderr.attempts ).toHaveLength( 1 );
+					expect( calls.log.indexOf( 'sign-out' ) ).toBeLessThan(
+						calls.log.indexOf( 'remove-vault-key' )
+					);
+					expect( records().at( -1 ) ).toMatchObject( {
+						stage: 'cleanup',
+						status: 'passed',
+						observations: expect.objectContaining( { vaultKeyRemoved: true } ),
+					} );
+				}
+			);
+
+			it( 'lets any other write error its own line’s write throws surface', () => {
 				const thrown = liveConsole( 'ENOSPC', 'thrown' );
 				expect( () => thrown.live.print( 'A line.' ) ).toThrow( 'The write failed.' );
+				expect( () => liveConsole( 'EIO', 'thrown' ).live.print( 'A line.' ) ).not.toThrow();
+				expect( () => liveConsole( 'EPIPE', 'thrown' ).live.print( 'A line.' ) ).not.toThrow();
 			} );
 		} );
 

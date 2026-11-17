@@ -3470,15 +3470,12 @@ export function createLiveChatGptAcceptanceDependencies(
 		exit: ( code ) => process.exit( code ),
 	}
 ): ChatGptAcceptanceDependencies {
-	// For the life of the run, output that can no longer be written never ends
-	// it, so cleanup after a closed terminal runs to its end; any other write
-	// error surfaces as it would without this listener.
+	// For the life of the run, a write the stream reports as failed never ends
+	// it, so cleanup after a closed terminal runs to its end. Every code is
+	// swallowed, as Node's console does while a stream has no listener of its
+	// own: a console write from any module would otherwise end the run.
 	for ( const stream of [ io.stdout, io.stderr ] ) {
-		stream.on( 'error', ( error: unknown ) => {
-			if ( ! isLostOutput( error ) ) {
-				throw error;
-			}
-		} );
+		stream.on( 'error', () => undefined );
 	}
 	const print = ( line: string ) => writeLine( io.stdout, line );
 	return {
