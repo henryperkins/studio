@@ -659,6 +659,15 @@ describe( 'eval harness', () => {
 				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest_route[]=/x', false ],
 				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest[route]=/x', false ],
 				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest_route%00=/x', false ],
+				// An array key's base, and leading whitespace, only the trim and fold branches catch.
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest_route[0]=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest_route[x]=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?%20rest_route[x]=/x', false ],
+				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?rest%20route[x]=/x', false ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts', '?rest_route[0]=/x', false ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts', '?rest_route[x]=/x', false ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts', '?%20rest_route[x]=/x', false ],
+				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts', '?rest.route[x]=/x', false ],
 				// Other queries are unaffected.
 				[ 'public-api.wordpress.com', '/wp/v2/sites/4242/posts', '?context=edit&per_page=5', true ],
 				[ 'staging-4242.wpcomstaging.com', '/wp-json/wp/v2/posts', '?x=rest_route', true ],

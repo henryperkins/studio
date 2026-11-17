@@ -236,11 +236,11 @@ function couldBeRestRouteKey( rawKey: string ): boolean {
 	if ( hasControlCharacter( rawKey ) || hasControlCharacter( key ) ) {
 		return true;
 	}
-	const stripped = key.replace( /^s+/, '' );
+	const stripped = key.replace( /^\s+/, '' );
 	const bracket = stripped.indexOf( '[' );
 	const base = bracket > 0 ? stripped.slice( 0, bracket ) : stripped;
 	return (
-		base.replace( /[.s[]/g, '_' ).toLowerCase() === 'rest_route' ||
+		base.replace( /[.\s[]/g, '_' ).toLowerCase() === 'rest_route' ||
 		key.replace( /[^a-z0-9]/gi, '' ).toLowerCase() === 'restroute'
 	);
 }
