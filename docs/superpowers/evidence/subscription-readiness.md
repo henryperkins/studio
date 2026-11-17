@@ -372,7 +372,7 @@ Required evidence per cell, from the spec: native account lifecycle; authenticat
 
 | # | Provider | Platform cell | Runner | Owner | Status | Test/eval | Evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| C1 | ChatGPT | Windows x64 | This machine (Windows 11 x64) | G3, P3, P4 | partial. Saved-account live run `live-passed`; session-only live `failed`; packaging claimed at an earlier SHA, not re-verified. Native Credential Manager qualification not recorded for `4ae1e38da`. P4a (`4cd82cec9`): credential-free build, static inspection and standalone `--version`/`--help` probe done; unsigned; install, launch, authenticated runs and Desktop e2e open. | none yet beyond A-section tests | Section 2; P4a record below |
+| C1 | ChatGPT | Windows x64 | This machine (Windows 11 x64) | G3, P3, P4 | partial. Saved-account live run `live-passed`; session-only live `failed`; packaging claimed at an earlier SHA, not re-verified. Native Credential Manager qualification not recorded for `4ae1e38da`. P4a second run (`4a8d828cd`, superseding the first run at `4cd82cec9`): credential-free static gates, builds, static inspection and standalone `--version`/`--help` probe done; unsigned; install, launch, authenticated runs and Desktop e2e open. Not qualified. | none yet beyond A-section tests | Section 2; P4a record, second run, below |
 | C2 | ChatGPT | Windows ARM64 | no runner assigned: scheduling blocker | P1, P3, P4 | blocked | none yet | none yet |
 | C3 | ChatGPT | macOS x64 | no runner assigned: scheduling blocker | P3, P4 | blocked | none yet | none yet |
 | C4 | ChatGPT | macOS ARM64 | no runner assigned: scheduling blocker | P3, P4 | blocked | none yet | none yet |
@@ -444,6 +444,8 @@ ChatGPT native storage and browser sign-in, offline part. Commits `ffef17540`, `
 
 ### P4a record: Windows x64, ChatGPT provider, credential-free (November 12, 2026)
 
+**Superseded** by the "P4a record, second run" below, which repeats these steps at the final head `4a8d828cd`. This record is kept as history; its hashes describe artifacts that no longer exist on disk.
+
 **Evidence level reached: credential-free build and static-inspection evidence, plus a lower-level probe (`--version`, `--help`) of the standalone CLI. This is NOT qualification.** Not done, each open: any authenticated run (native Credential Manager storage, sign-in, read/draft/readback/resume, cancel/recovery), installing or updating the app, launching the packaged Desktop app, uninstall behavior, the Desktop and browser end-to-end tests in light and dark, and the other five platform targets. Those need the account owner's consent and a disposable profile or machine; this machine also has the upstream Studio installed, and running the installer or the packaged app would collide with it (same Squirrel id, single-instance lock, `%APPDATA%\Studio`, `wp-studio://` handler). Any later code change invalidates the build evidence below; rebuild and rerun the affected steps.
 
 | Field | Value |
@@ -506,6 +508,70 @@ Every Studio-built executable is **unsigned**. Nothing here is release-ready, an
 **Side effects on the checkout:** the standalone script deletes and reinstalls `apps/cli/node_modules` in place; it was backed up first and restored afterwards (identical to the backup). Built outputs (`apps/cli/dist`, `apps/studio/out`, `apps/studio/dist`, `apps/ui/dist`, `standalone-bundles`) are git-ignored and untracked files were not added.
 
 **Windows x64 ChatGPT cell (C1): P4a reached "credential-free build and static inspection; standalone CLI `--version`/`--help` probe". Not qualified.** The other five ChatGPT cells (C2-C6) stay open: no runner assigned (Windows ARM64 also needs its x64 PHP emulation exercised; Linux needs a Debian/Ubuntu glibc host; macOS needs native runners). Claude cells are out of scope for this record.
+
+### P4a record, second run: Windows x64, ChatGPT provider, credential-free, at the final head (November 17, 2026)
+
+Supersedes the P4a record above, whose source was 116 commits older (94 of them change more than documentation). Same steps and the same limits.
+
+**Evidence level reached: credential-free static gates, builds and static inspection, plus a lower-level probe (`--version`, `--help`, `code --help`) of the standalone CLI. This is NOT qualification.** Not done, each open: any authenticated run (native Credential Manager storage, sign-in, read/draft/readback/resume, cancel/recovery), installing or updating the app, launching the packaged Desktop app, uninstall behavior, the Desktop and browser end-to-end tests in light and dark, release signing, and the other five platform targets. They need the account owner's consent and a disposable profile or machine; this machine has the released Studio installed and in use, and running the installer or the packaged app would collide with it (same Squirrel id, single-instance lock, `%APPDATA%\Studio`, `wp-studio://` handler). Any later code change invalidates the build evidence below.
+
+| Field | Value |
+| --- | --- |
+| Provider | ChatGPT plan (`chatgpt-oauth`), experimental flag `STUDIO_EXPERIMENTAL_CHATGPT` |
+| Source SHA | `4a8d828cd2c072d991e19f2aeabdaa59aae3adf8` (branch `add-chatgpt-plan-provider`; base `trunk` `8672a64e7`). The working tree had uncommitted documentation only: three modified files (`docs/design-docs/chatgpt-provider.md`, `docs/superpowers/README.md`, one plan) and five untracked plans and specs under `docs/superpowers/`. No source file differed from the SHA. |
+| OS, architecture | Windows 11 Pro, 10.0.26320, x64 (`process.arch` `x64`, `PROCESSOR_ARCHITECTURE` `AMD64`), native (not emulated) |
+| Node / npm | 24.22.1 (`.nvmrc` 24.22.1) / 11.13.0; the Node binary bundled in both artifacts is v24.22.1, byte-identical to the first run's |
+| SDK/runtime pair | Not applicable to this provider (no vendor runtime binary). The agent runtime is `@earendil-works/pi-*` 1.5.0, pinned exactly in `apps/cli/package.json` and `packages/agent/package.json`; 1.5.0 is what both artifacts carry. |
+| Environment | `DEV_CONFIG_DIR` and `STUDIO_PROCESS_MANAGER_HOME` pointing at an isolated folder under `%LOCALAPPDATA%` for every step except those noted below; `OPENAI_API_KEY` unset; no `STUDIO_EXPERIMENTAL_*` variable except in the routing step. The machine was shared with another agent working in a different checkout. |
+
+**What ran (command, result, duration):**
+
+| Step | Command | Result |
+| --- | --- | --- |
+| Typecheck | `npm run typecheck` | exit 0 (coordinator's run, same SHA, same environment; duration not recorded) |
+| Knip | `npm run knip` | exit 0 (coordinator's run; duration not recorded) |
+| Full tests | `npm test -- --maxWorkers=2 --tagsFilter='!e2e'` with `DEV_CONFIG_DIR` set, one suite alone on the machine | **coordinator's run**: 544 files (530 passed, 2 failed, 12 skipped); 7,003 tests (6,910 passed, **12 failed**, 81 skipped); 15 m 36 s. The 12 failures are the two environment-artifact files below. |
+| ESLint | the 181 `*.ts/tsx/js/jsx/mjs/cjs` files changed against `trunk` (`git diff --name-only --diff-filter=ACMR 8672a64e7 HEAD`, all present), no `--fix`, `NODE_OPTIONS=--max-old-space-size=8192` | exit 0, 1 m 30 s, no findings |
+| Dependency ranges | `npx vitest run --config scripts/vitest.config.ts scripts/dependency-ranges.test.mjs --maxWorkers=2` | 1 passed, exit 0, 3 s |
+| Environment-artifact files | `npx vitest run --maxWorkers=2 packages/common/lib/tests/shared-config.test.ts apps/cli/commands/tests/pull.test.ts` with `DEV_CONFIG_DIR` unset and `HOME`/`USERPROFILE` pointed at an empty scratch folder (the real `~/.studio` unreachable) | 2 files, 50 tests passed, exit 0, 1 m 18 s. The scratch home was still empty afterwards. |
+| Flag-on routing | the workflow's seven `ROUTING_TESTS` files with `STUDIO_EXPERIMENTAL_CHATGPT=1`, `--tagsFilter='!e2e'`, a scratch config folder as in CI | 7 files, 194 tests passed, exit 0, 13 s (the first run had 144 tests in the same files) |
+| Browser UI | `STUDIO_TARGET=local npm -w @studio/ui run build` (into `apps/ui/dist-local`) | exit 0, 10 s |
+| CLI | `npm run cli:build` | exit 0, 14 s |
+| App package | `STUDIO_PACKAGE_FRESH=1 npm run make:windows-x64` | exit 0, 42 m 10 s; built in a temporary copy of the checkout (`package-in-isolation.ts`, which runs `npm ci` in that copy, not in the checkout), artifacts moved back to `apps/studio/out`, temporary copy removed. Disk free 101 GB before, 100 GB after. |
+| Standalone CLI | `node --experimental-strip-types scripts/create-standalone-bundle.ts win32 x64` | exit 0, 9 m 21 s. The script deletes and reinstalls `apps/cli/node_modules`; it was backed up first and restored afterwards (`diff -r` against the backup: identical, 245 files). |
+
+Deviations: `npm run cli:build:ui` was not used (npm runs scripts through `cmd.exe`, where its POSIX environment prefix fails); its two halves ran instead, as the platform plan allows. `npx eslint` with the 181 paths failed at once with "The command line is too long" (`cmd.exe`'s 8,191-character limit; the list is 8,421 characters), so ESLint's own entry point ran with the same list in one process: `node node_modules/eslint/bin/eslint.js --no-warn-ignored` (ESLint 10.13.0). An operator error was corrected before any build step: a mistaken `npx vitest list --json <path>` wrote its JSON output over the tracked `packages/common/lib/tests/shared-config.test.ts` after the environment-artifact step had run it and before the package build copied the checkout. It was restored from `HEAD` in the checkout and in the packaging copy while `npm ci` was still running there, and then every one of the 2,470 tracked files in the packaging copy was compared byte for byte with the checkout: none differed. Test files are not part of any bundle.
+
+**Test failures (coordinator's full run, `DEV_CONFIG_DIR` set):** `packages/common/lib/tests/shared-config.test.ts` (5) and `apps/cli/commands/tests/pull.test.ts` (7), the same two environment artifacts the first run classified: the first mocks its paths, the second seeds `cli.json` under a faked home that `getConfigDirectory()` never reads while `DEV_CONFIG_DIR` is set. With the variable unset both files pass (row above). CI runs with it unset. No branch defect found; no source change was made.
+
+**Artifacts** (built from the SHA above; paths relative to the checkout, all git-ignored):
+
+| Artifact | Size (bytes) | SHA-256 | Authenticode |
+| --- | --- | --- | --- |
+| `apps/studio/out/make/squirrel.windows/x64/studio-setup.exe` | 386,812,416 | `2a33405d503b22160ee29f77681b9a177a781c1fb51af99b2e074e54abdc79a1` | NotSigned |
+| `apps/studio/out/make/squirrel.windows/x64/studio_app-2.1.1-full.nupkg` | 397,077,882 | `9e2035930d95268b038c8906cc86e9df782aec4245d5dc91d6dfb9851f12ef39` | not applicable |
+| `apps/studio/out/make/squirrel.windows/x64/RELEASES` | 81 | `245752b17770c03aa13542130a2b9a2806618a13ce559c0c2e801a7d1e7af327` | not applicable |
+| `apps/studio/out/Studio-win32-x64/Studio.exe` | 246,633,472 | `56f2827186645b95d8537af1375b6c7c9cd869f9a6ebeaf721fc2b0863bec8c6` | NotSigned |
+| `.../Studio-win32-x64/resources/app.asar` | 60,658,432 | `070f5c7dd2384e56bf0e3c22fa8d67de01545a1bd1e18bffb70a619b98fd5972` | not applicable |
+| `.../resources/bin/studio-cli.exe` (launcher) | 57,529,683 | `5cacd9417825d49506c63bd551eed98d79926e8b48b1d4856d22036a3400a35b` (unchanged from the first run) | NotSigned |
+| `.../resources/bin/node.exe` (bundled Node 24.22.1) | 93,915,464 | `d702daa815eabbff763c7d3808e235cf031cf2ca70211b56847bc72f51e240e5` (unchanged) | Valid (OpenJS Foundation) |
+| `standalone-bundles/studio-cli-win32-x64.tgz` | 131,196,659 | `447586e88104575c8b755088c1dd6e55e8a9bac68ec8afaa1506bda64a8c5c67` (matches the `.sha256` file the script wrote) | not applicable; its `bin/node.exe` is the same file as above, Valid |
+
+Every Studio-built executable is **unsigned**; nothing here is release-ready. Across the unpacked app, every `.exe`, `.dll` and `.node` file was checked: 82 NotSigned (Studio's own files, the PHP build's extension DLLs, third-party native modules), 13 Valid (Node by the OpenJS Foundation; Microsoft runtime DLLs beside PHP, `d3dcompiler_47.dll` and `dxil.dll`), 4 UnknownError (the macOS and Linux native prebuilds `pi-tui` ships, which are not Windows binaries).
+
+**Statically inspected (extracted to a scratch folder or listed; nothing launched, installed or registered):**
+
+- The ChatGPT provider is in all three places. The packaged CLI (`resources/cli`, 149 entries) and the standalone bundle's `cli/` (149 entries) each have 7 bundled modules naming `chatgpt-oauth`, `credential-broker` and `settings-store` among them, and `@earendil-works/pi-*` 1.5.0 plus `playwright`/`playwright-core` in `node_modules`; no `koffi`. The app's main bundle (`dist/main/index.js` in `app.asar`) holds the Desktop side (`chatgpt-oauth`, `chatgpt-accounts`, `chatgpt-credentials`, `chatgpt-vault-key`), and Windows credential storage selects the `password-vault` adapter there. No keychain helper, `libsecret` or `secret-tool` binary is packaged, as expected on Windows.
+- The experimental flag appears once in each of the three bundles, always as `process.env.STUDIO_EXPERIMENTAL_CHATGPT === "1"`, and is assigned nowhere, so it is **off by default** in every artifact. The acceptance runner, which sets the flag in its own process, is built only by the development CLI build (`vite.config.dev.ts`, used by `npm run cli:build`) and is absent from both artifacts.
+- No credential, token, test profile, `.env*`, evidence file, `*.ndjson`, `shared.json`/`cli.json`/`app.json` or `.superpowers` content in the unpacked app, the asar listing (5,636 entries) or the standalone bundle, by name. The name matches are Studio's own code modules (`credential-broker`, `admin-credentials`), WordPress core, phpMyAdmin, Sentry and SDK library files (such as `@anthropic-ai/sdk`'s), and public CA bundles. The Studio-built JavaScript of the three bundles also contains no build-machine home path, no isolated-profile folder name and no `.superpowers` string. Third-party contents were not scanned for secret-shaped strings.
+- `app.asar` is 5.7 MB smaller than the first run's (5,636 entries against 7,172) although no lockfile, app or CLI manifest or Forge configuration changed between the two SHAs. Cause: the packaged app's dependencies are installed at build time by `app:install:bundle` (`npm install --no-package-lock`), which this time resolved `@sentry/electron` 8.4.0 and `@sentry/*` 11.10.0 (first run 8.3.0 and 11.8.0; lockfile 8.2.0 and 11.8.0), and the newer tree no longer pulls in `@babel/*` and its helpers. So the app's third-party contents follow the registry on the build day, not only the source SHA. This is existing packaging behavior, not a change on this branch.
+- The package build ran no installer, registered no protocol handler and did not touch the installed app.
+
+**Probed (lower evidence level):** the bundled `resources/bin/node.exe --version` printed `v24.22.1`. The standalone bundle was extracted to a scratch folder and its own `bin/node.exe cli/main.mjs` run with `DEV_CONFIG_DIR`, `STUDIO_PROCESS_MANAGER_HOME`, `HOME` and `USERPROFILE` in scratch folders and no sign-in: `--version` printed `2.1.1` (exit 0, 5 s); `--help` listed the commands (exit 0, 1 s); `code --help` listed `studio code` and `studio code sessions` with no ChatGPT surface, as designed with the flag off (exit 0, 37 s). The CLI made its own update check over the network (it reported a newer upstream release) and wrote only `cli.json` (no sites, the update-check time) into the scratch config folder; that is not a provider call. No read-only ChatGPT connection-status command exists in the CLI, so no provider probe was run. The real `~/.studio` was listed to depth 3 with sizes and modification times before the first step and after the probe: the two listings are identical (495 entries).
+
+**Side effects on the checkout:** none tracked. Built outputs (`apps/cli/dist`, now the standalone variant from the bundle script; `apps/ui/dist-local`; `apps/studio/out`; `apps/studio/dist`; `standalone-bundles`) are git-ignored and replace the first run's.
+
+**Windows x64 ChatGPT cell (C1): this second run reached "credential-free static gates, build and static inspection; standalone CLI `--version`/`--help` probe" at `4a8d828cd`. Not qualified.** C2-C6 stay open for the reasons in the first record. Claude cells are out of scope.
 
 ## D. Studio tool inventory (counted from code)
 
