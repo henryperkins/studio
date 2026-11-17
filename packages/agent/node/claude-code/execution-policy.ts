@@ -490,6 +490,24 @@ function isImageFileName( name: unknown ): name is string {
 	return typeof name === 'string' && name.length <= 255 && /^[^\\/:\0]+\.png$/i.test( name );
 }
 
+// The attachments a reservation that does not have its shape inserted for the
+// call's images, as far as its output can tell: each entry with an ID of its
+// own and a PNG file named for one of those images, under the name WordPress
+// would give it to keep it unique. An entry named for nothing the call asked
+// for is not this reservation's to delete.
+function insertedFor( reserved: unknown, names: readonly string[] ): number[] {
+	if ( ! Array.isArray( reserved ) ) return [];
+	const stems = names.map( ( name ) => name.replace( /\.png$/i, '' ).toLowerCase() );
+	const ids = new Set< number >();
+	for ( const entry of reserved ) {
+		if ( ! isRecord( entry ) || ! isAttachmentId( entry.id ) || typeof entry.file !== 'string' )
+			continue;
+		const named = /^(.+?)(?:-\d+)?\.png$/i.exec( path.posix.basename( entry.file ) )?.[ 1 ];
+		if ( named && stems.includes( named.toLowerCase() ) ) ids.add( entry.id );
+	}
+	return [ ...ids ];
+}
+
 // What the journal entry of a settling says it settles, by count only.
 function settlingNote( completed: number, removed: number ): string {
 	return `It completes the ${ completed } attachment${
@@ -2162,10 +2180,31 @@ export function createClaudeExecutionPolicy(
 							note: 'It adds an attachment for each image to this site’s media library, in the uploads folder WordPress picks, before the image is made',
 						},
 						async ( current, options ) => {
-							const reserved = readReservedAttachments(
-								await mediaCommand( current!, reserveAttachmentsArgs( requested ), options )
+							const output = await mediaCommand(
+								current!,
+								reserveAttachmentsArgs( requested ),
+								options
 							);
-							if ( ! isReservation( reserved, requested ) ) throw denied();
+							let reserved: unknown;
+							try {
+								reserved = readReservedAttachments( output );
+							} catch {
+								reserved = undefined;
+							}
+							// What this reservation inserted is deleted again whenever it is
+							// refused, and nothing else.
+							const rollBack = ( ids: number[] ) =>
+								ids.length
+									? mediaCommand(
+											current!,
+											finalizeAttachmentsArgs( [], ids ),
+											settlingFence( current!.path )
+									  ).catch( () => undefined )
+									: undefined;
+							if ( ! isReservation( reserved, requested ) ) {
+								await rollBack( insertedFor( reserved, requested ) );
+								throw denied();
+							}
 							const targetSite = actingSite;
 							for ( const { file } of reserved )
 								if (
@@ -2175,14 +2214,7 @@ export function createClaudeExecutionPolicy(
 										path.join( current!.path, file )
 									) )
 								) {
-									await mediaCommand(
-										current!,
-										finalizeAttachmentsArgs(
-											[],
-											reserved.map( ( { id } ) => id )
-										),
-										settlingFence( current!.path )
-									).catch( () => undefined );
+									await rollBack( reserved.map( ( { id } ) => id ) );
 									refuse( toolCallId, REFUSALS.mediaUploads );
 									throw denied();
 								}

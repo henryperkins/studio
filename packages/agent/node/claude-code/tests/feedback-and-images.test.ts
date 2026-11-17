@@ -499,6 +499,59 @@ describe( 'generate_images on the Claude route', () => {
 		expect( existsSync( path.join( parent, 'outside' ) ) ).toBe( false );
 	} );
 
+	it( 'deletes again what a reservation that does not have its shape inserted for the call’s images, and generates nothing', async () => {
+		const reservation = ( entries: unknown ) => ( {
+			exitCode: 0,
+			stdout: typeof entries === 'string' ? entries : JSON.stringify( entries ),
+			stderr: '',
+		} );
+		const entry = ( id: number, name: string, extra: object = {} ) => ( {
+			id,
+			file: `wp-content/uploads/2026/11/${ name }`,
+			url: `http://localhost:8888/wp-content/uploads/2026/11/${ name }`,
+			...extra,
+		} );
+		const cases: Array< [ string, unknown, number[] ] > = [
+			// One attachment for two images.
+			[ 'too few', [ entry( 7, 'hero.png' ) ], [ 7 ] ],
+			// One without its URL, and one under the unique name WordPress gave it.
+			[
+				'no URL',
+				[ entry( 7, 'hero.png', { url: undefined } ), entry( 8, 'buns-1.png' ) ],
+				[ 7, 8 ],
+			],
+			// One named for no image of this call is not this call's to delete.
+			[
+				'a stranger',
+				[ entry( 7, 'hero.png' ), entry( 3, 'other.png' ), entry( 8, 'buns.png' ) ],
+				[ 7, 8 ],
+			],
+			// Nothing it can read names any attachment.
+			[ 'unreadable', 'not json', [] ],
+		];
+		for ( const [ label, entries, deleted ] of cases ) {
+			const { bridge, host, site } = await setupImages();
+			host.sites.wpCli = vi.fn( async ( _site, args ) =>
+				args[ 1 ]?.includes( 'wp_insert_attachment' )
+					? reservation( entries )
+					: { exitCode: 0, stdout: '', stderr: '' }
+			);
+			const uploads = path.join( site, 'wp-content', 'uploads' );
+			const result = await bridge.invoke( 'generate_images', {
+				images: [
+					{ path: path.join( uploads, 'hero.png' ), subject: 'Hero' },
+					{ path: path.join( uploads, 'buns.png' ), subject: 'Buns' },
+				],
+			} );
+			expect( result.isError, label ).toBe( true );
+			const calls = vi.mocked( host.sites.wpCli ).mock.calls;
+			expect( calls.length, label ).toBe( deleted.length ? 2 : 1 );
+			if ( deleted.length )
+				expect( decoded( calls[ 1 ][ 1 ][ 1 ] ), label ).toEqual( { ready: [], failed: deleted } );
+		}
+		expect( generateImages ).not.toHaveBeenCalled();
+	} );
+
 	it( 'still runs no eval through wp_cli, and completes or deletes only attachments the same call reserved in the conversation’s site, once each', async () => {
 		const { bridge, host, policy, localSite, otherSite, other } = await setupImages();
 		reserving( host );
