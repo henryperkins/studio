@@ -154,6 +154,7 @@ describe( 'eval runner entry', () => {
 			exit.mockRestore();
 			stderr.mockRestore();
 			vi.doUnmock( 'cli/ai/eval-port-range' );
+			vi.doUnmock( 'node:fs' );
 		} );
 
 		const left = () =>
@@ -185,6 +186,49 @@ describe( 'eval runner entry', () => {
 				throw new Error( 'cannot load the runner' );
 			} );
 			await expectNothingKept();
+		} );
+
+		const failToClaim = () => {
+			delete process.env.STUDIO_BASE_PORT;
+			vi.doMock( 'cli/ai/eval-port-range', () => ( {
+				claimPortRange: async () => {
+					throw new Error( 'All 100 eval port ranges are held by running processes.' );
+				},
+			} ) );
+		};
+
+		it( 'leaves alone a process manager home it did not make: a default-path case that inherited one', async () => {
+			delete process.env.STUDIO_EVAL_PROVIDER;
+			const inherited = path.join( tmp, 'studio-eval-daemon-inherited' );
+			fs.mkdirSync( inherited );
+			fs.writeFileSync( path.join( inherited, 'daemon.sock' ), 'x' );
+			process.env.STUDIO_PROCESS_MANAGER_HOME = inherited;
+			failToClaim();
+			await import( 'cli/ai/eval-runner-entry' );
+			await vi.waitFor( () => expect( exit ).toHaveBeenCalledWith( 1 ) );
+			expect( fs.readdirSync( inherited ) ).toEqual( [ 'daemon.sock' ] );
+			expect( left() ).toEqual( [ 'studio-eval-daemon-inherited' ] );
+		} );
+
+		it( 'says so, in another fixed sentence with no path, when something could not be removed', async () => {
+			failToClaim();
+			vi.doMock( 'node:fs', async ( importOriginal ) => {
+				const actual = await importOriginal< typeof import('node:fs') >();
+				const rmSync = ( target: fs.PathLike, options?: fs.RmOptions ) => {
+					if ( String( target ).includes( 'studio-eval-sites-' ) ) {
+						throw Object.assign( new Error( 'busy' ), { code: 'EBUSY' } );
+					}
+					return actual.rmSync( target, options );
+				};
+				return { ...actual, rmSync, default: { ...actual, rmSync } };
+			} );
+			await import( 'cli/ai/eval-runner-entry' );
+			await vi.waitFor( () => expect( exit ).toHaveBeenCalledWith( 1 ) );
+			expect( stderr.mock.calls.map( ( call: unknown[] ) => String( call[ 0 ] ) ).join( '' ) ).toBe(
+				'The eval runner could not start, and some of what it made could not be removed.\n'
+			);
+			expect( left() ).toHaveLength( 1 );
+			expect( left()[ 0 ] ).toMatch( /^studio-eval-sites-/ );
 		} );
 	} );
 } );
