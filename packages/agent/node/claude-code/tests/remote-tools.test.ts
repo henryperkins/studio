@@ -886,6 +886,48 @@ describe( 'site_pull on the Claude route', () => {
 	} );
 } );
 
+describe( 'the operations on a remote, after a recovery and when the account changes', () => {
+	const calls: Array< [ string, Record< string, unknown > ] > = [
+		[ 'preview_create', { nameOrPath: 'site' } ],
+		[ 'preview_update', { nameOrPath: 'site', host: own.url } ],
+		[ 'preview_delete', { host: own.url } ],
+		[ 'site_push', { nameOrPath: 'site', remoteSite: '111' } ],
+		[ 'site_pull', { nameOrPath: 'site', remoteSite: '111' } ],
+	];
+	const ran = ( { host }: Fixture ) =>
+		[
+			host.previews.create,
+			host.previews.update,
+			host.previews.delete,
+			host.sync.push,
+			host.sync.pull,
+		].filter( ( spy ) => vi.mocked( spy ).mock.calls.length ).length;
+
+	it( 'asks for each once, as in any turn, in a turn after a recovery that left operations uncertain', async () => {
+		for ( const [ name, args ] of calls ) {
+			const fixture = await setup( () => ( { uncertainAfterRecovery: true } ) );
+			vi.mocked( fixture.host.previews.list ).mockResolvedValue( [ own ] );
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+			expect( ( await fixture.bridge.invoke( name, args ) ).isError, name ).toBe( false );
+			expect( fixture.context.approve, name ).toHaveBeenCalledOnce();
+			expect( ran( fixture ), name ).toBe( 1 );
+		}
+	} );
+
+	it( 'asks nothing and runs nothing once the native account has changed', async () => {
+		for ( const [ name, args ] of calls ) {
+			const fixture = await setup( () => ( {
+				verifyAccount: vi.fn( async () => 'changed' as const ),
+			} ) );
+			vi.mocked( fixture.host.previews.list ).mockResolvedValue( [ own ] );
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+			expect( ( await fixture.bridge.invoke( name, args ) ).isError, name ).toBe( true );
+			expect( fixture.context.approve, name ).not.toHaveBeenCalled();
+			expect( ran( fixture ), name ).toBe( 0 );
+		}
+	} );
+} );
+
 describe( 'site_connected_remote_sites on the Claude route', () => {
 	// The account's own listing of its sites, as WordPress.com answers it: the
 	// site connected to the conversation's site, and another one.
