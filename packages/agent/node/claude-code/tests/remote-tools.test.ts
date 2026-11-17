@@ -1594,6 +1594,20 @@ describe( 'wpcom_request on the Claude route', () => {
 			expect( wpcom.received ).toEqual( [] );
 		} );
 
+		it( 'reports a changed login when it changes while Studio reads the connections', async () => {
+			const { bridge, context, journal } = await setup( live );
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockImplementationOnce( async () => {
+				switchLogin();
+				return connected;
+			} );
+			const result = await bridge.invoke( 'wpcom_request', change );
+			expect( result.isError ).toBe( true );
+			expect( text( result ) ).toContain( LOGIN_REFUSAL );
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( journal ).toEqual( [] );
+			expect( wpcom.received ).toEqual( [] );
+		} );
+
 		it( 'sends no change, and journals none, once the login has changed since the user was asked, even to one that has the same site connected', async () => {
 			const { bridge, context, journal } = await setup( live );
 			vi.mocked( context.approve ).mockImplementationOnce( async () => {

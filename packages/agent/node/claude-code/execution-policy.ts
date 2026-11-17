@@ -1533,25 +1533,25 @@ export function createClaudeExecutionPolicy(
 
 	// Reads what Studio keeps for the login it is signed in with, under that
 	// login: its user id is read before and after, and must be the same, so
-	// what was read is that login's. Undefined when Studio is signed in with no
-	// login, the login changed meanwhile, or the read fails.
+	// what was read is that login's. Null means the login was missing or changed;
+	// undefined means the read itself failed.
 	async function readUnderLogin< T >(
 		read: () => Promise< T >
-	): Promise< { login: number; value: T } | undefined > {
+	): Promise< { login: number; value: T } | null | undefined > {
 		const login = await storedLogin();
-		if ( login === undefined ) return;
+		if ( login === undefined ) return null;
 		try {
 			const value = await read();
-			return ( await storedLogin() ) === login ? { login, value } : undefined;
+			return ( await storedLogin() ) === login ? { login, value } : null;
 		} catch {
-			return;
+			return ( await storedLogin() ) === login ? undefined : null;
 		}
 	}
 
 	// The WordPress.com sites Studio keeps as connected to the site the turn
 	// acts on for the login it is signed in with, and that login.
 	async function loginConnections(): Promise<
-		{ login: number; connections: SyncSite[] } | undefined
+		{ login: number; connections: SyncSite[] } | null | undefined
 	> {
 		const targetSite = actingSite;
 		if ( actingTarget.environment === 'global' || ! targetSite ) return;
@@ -1579,7 +1579,7 @@ export function createClaudeExecutionPolicy(
 			return;
 		}
 		const connected = await loginConnections();
-		if ( connected && connected.login !== login ) {
+		if ( connected === null || ( connected && connected.login !== login ) ) {
 			refuse( toolCallId, REFUSALS.wpcomLogin );
 			return;
 		}
