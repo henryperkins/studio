@@ -607,6 +607,19 @@ describe( 'the records a provider-qualified case’s checks add to its summary',
 		expect( summaryOf( summaries ).records ).toHaveLength( 2 );
 	} );
 
+	test( 'a case that selects no provider is judged as before, whatever the age of its result file', () => {
+		const file = path.join( dir, `result-${ count++ }.json` );
+		writeFileSync(
+			file,
+			JSON.stringify( { success: true, textSegments: [ 'WordPress Studio' ] } )
+		);
+		const earlier = new Date( Date.now() - 3 * 24 * 3600 * 1000 );
+		utimesSync( file, earlier, earlier );
+		const verdict = checks.identifiesAsStudio( `EVAL_RUNNER_RESULT_FILE=${ file }`, { vars: {} } );
+		expect( verdict.pass ).toBe( true );
+		expect( verdict.reason ).not.toMatch( /result-not-from-this-run/ );
+	} );
+
 	test( 'a case that selects no provider adds nothing', () => {
 		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
 		const evalSummary = startRun( summaries, { success: true, providerRoute: route } );

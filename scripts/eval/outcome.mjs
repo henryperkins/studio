@@ -136,7 +136,7 @@ function check( name, fn ) {
 		try {
 			const loaded = load( output );
 			d = loaded.d;
-			fromThisRun = writtenByThisRun( loaded.file );
+			fromThisRun = ! providerQualified( d, vars ) || writtenByThisRun( loaded.file );
 			verdict = ! fromThisRun
 				? fail(
 						'result-not-from-this-run: the runner’s result is not from this run (an earlier run’s output was served), so nothing was recorded in the case’s summary; run promptfoo with --no-cache'
