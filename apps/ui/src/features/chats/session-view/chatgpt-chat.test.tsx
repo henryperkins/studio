@@ -1067,6 +1067,28 @@ describe( 'Starting the site’s new chat on ChatGPT', () => {
 		}
 	);
 
+	it( 'leaves the typed draft on the new chat when its composer goes away before the start ends', async () => {
+		const { connector, history } = await setup( [], false, TEST_USER, '/sites/one/new' );
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		const gate = holdNext( connector, 'setSessionChatGptSelection' );
+		await chooseChatGpt( WORK );
+		await waitFor( () => expect( connector.setSessionChatGptSelection ).toHaveBeenCalled() );
+		const { id } = await connector.createSession.mock.results[ 0 ].value;
+
+		act( () => history.push( '/sessions/chat' ) );
+		await waitFor( () => expect( input() ).toHaveValue( '' ) );
+		await act( async () => gate.resolve() );
+		await act( async () => {} );
+		expect( history.location.pathname ).toBe( '/sessions/chat' );
+
+		act( () => history.push( `/sessions/${ id }` ) );
+		await waitFor( () => expect( history.location.pathname ).toBe( `/sessions/${ id }` ) );
+		await screen.findByRole( 'combobox', { name: 'Message WordPress Studio' } );
+		expect( input() ).toHaveValue( '' );
+		act( () => history.push( '/sites/one/new' ) );
+		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+	} );
+
 	it( 'keeps the Model control busy while the start is pending, so the account it shows is the one pinned', async () => {
 		const { connector } = await setup( [], false, TEST_USER, '/sites/one/new' );
 		const gate = holdNext( connector, 'setSessionChatGptSelection' );

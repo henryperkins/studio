@@ -112,9 +112,13 @@ export function useConnectionSwitch(
 			// One the last attempt made and couldn't put on the account, if any.
 			const summary = started.current ?? ( await connector.createSession( ownerSiteId ) );
 			started.current = summary;
+			// Once the composer is gone, what was typed stays on the new chat.
+			if ( ! mounted.current ) return;
 			await connector.setSessionChatGptSelection( summary.id, selection );
+			if ( ! mounted.current ) return;
 			if ( draft.environment === 'live' ) {
 				await connector.setSessionEnvironment( summary.id, 'live' );
+				if ( ! mounted.current ) return;
 			}
 			started.current = null;
 			primeSessionQueryData( queryClient, summary, [ entry ] );
@@ -122,7 +126,7 @@ export function useConnectionSwitch(
 			saveComposerDraft( summary.id, getComposerDraft( draft.key ) );
 			saveComposerDraft( draft.key, { text: '', attachments: [] } );
 			void queryClient.invalidateQueries( { queryKey: SESSIONS_QUERY_KEY, exact: true } );
-			if ( mounted.current ) onSwitchSession( summary.id );
+			onSwitchSession( summary.id );
 		} finally {
 			saving.current = false;
 			if ( mounted.current ) setStarting( false );
