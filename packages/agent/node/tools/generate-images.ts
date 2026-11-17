@@ -140,6 +140,9 @@ export const generateImagesTool = defineTool(
 			)
 			.then( async ( results ) => {
 				const failures: string[] = [];
+				// A write that fails is reported, as the first to fail, only once every
+				// other write has settled, so none lands after the work has ended.
+				let failedWrite: { error: unknown } | undefined;
 				await Promise.all(
 					results.map( async ( result, index ) => {
 						const target = targets[ index ];
@@ -151,10 +154,15 @@ export const generateImagesTool = defineTool(
 							return;
 						}
 						const file = attachments.get( target.resolvedPath )?.file ?? target.resolvedPath;
-						await fs.mkdir( path.dirname( file ), { recursive: true } );
-						await fs.writeFile( file, result.bytes );
+						try {
+							await fs.mkdir( path.dirname( file ), { recursive: true } );
+							await fs.writeFile( file, result.bytes );
+						} catch ( error ) {
+							failedWrite ??= { error };
+						}
 					} )
 				);
+				if ( failedWrite ) throw failedWrite.error;
 				if ( site ) {
 					const ids = ( ok: boolean ) =>
 						libraryTargets

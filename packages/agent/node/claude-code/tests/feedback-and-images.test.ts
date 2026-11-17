@@ -1,5 +1,14 @@
 import { existsSync } from 'fs';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from 'fs/promises';
+import fsPromises, {
+	mkdir,
+	mkdtemp,
+	readFile,
+	readdir,
+	realpath,
+	rm,
+	symlink,
+	writeFile,
+} from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { getCurrentUserId, readAuthToken } from '@studio/common/lib/shared-config';
@@ -714,6 +723,48 @@ describe( 'generate_images on the Claude route', () => {
 		expect( generateImages ).not.toHaveBeenCalled();
 	} );
 
+	it( 'deletes again, once the call has ended, what such a reservation inserted when deleting it at once failed', async () => {
+		const { bridge, host, journal, site } = await setupImages();
+		let deletions = 0;
+		host.sites.wpCli = vi.fn( async ( _site, args ) => {
+			if ( args[ 1 ]?.includes( 'wp_insert_attachment' ) )
+				return {
+					exitCode: 0,
+					stdout: JSON.stringify( [
+						{
+							id: 7,
+							file: 'wp-content/uploads/2026/11/hero.png',
+							url: 'http://localhost:8888/wp-content/uploads/2026/11/hero.png',
+						},
+					] ),
+					stderr: '',
+				};
+			// The first deletion fails.
+			return { exitCode: deletions++ ? 0 : 1, stdout: '', stderr: '' };
+		} );
+		const uploads = path.join( site, 'wp-content', 'uploads' );
+		const result = await bridge.invoke( 'generate_images', {
+			images: [
+				{ path: path.join( uploads, 'hero.png' ), subject: 'Hero' },
+				{ path: path.join( uploads, 'buns.png' ), subject: 'Buns' },
+			],
+		} );
+		expect( result.isError ).toBe( true );
+		const calls = vi.mocked( host.sites.wpCli ).mock.calls;
+		expect( calls ).toHaveLength( 3 );
+		for ( const call of calls.slice( 1 ) )
+			expect( decoded( call[ 1 ][ 1 ] ) ).toEqual( { ready: [], failed: [ 7 ] } );
+		expect( journaled( journal ) ).toEqual( [
+			[ 'generate_images', 'remote-change' ],
+			[ 'media.reserve', 'local-change' ],
+			[ 'media.finalize', 'local-change' ],
+		] );
+		expect( journal[ 2 ].description ).toContain(
+			'It deletes the 1 attachment of this call that was neither completed nor deleted when the call ended'
+		);
+		expect( generateImages ).not.toHaveBeenCalled();
+	} );
+
 	it( 'still runs no eval through wp_cli, and completes or deletes only attachments the same call reserved in the conversation’s site, once each', async () => {
 		const { bridge, host, policy, localSite, otherSite, other } = await setupImages();
 		reserving( host );
@@ -879,7 +930,7 @@ describe( 'what an approval says is shown', () => {
 	} );
 } );
 
-describe( 'generate_images when its call is cancelled', () => {
+describe( 'generate_images when its call is cancelled, or ends with attachments unsettled', () => {
 	const MONTH = path.join( 'wp-content', 'uploads', '2026', '11' );
 	const decodedData = ( php: string ) =>
 		JSON.parse(
@@ -887,19 +938,33 @@ describe( 'generate_images when its call is cancelled', () => {
 		);
 
 	// WordPress's media library in the conversation's site, as the fixed
-	// commands change it: a reservation inserts a row per name, in this month's
-	// uploads folder, which WordPress creates; a completion marks rows done, a
-	// deletion removes them. `onReserve` runs while the reservation runs.
+	// commands change it, each run once its fence passes, as the CLI host runs
+	// them: a reservation inserts a row per name, in this month's uploads
+	// folder, which WordPress creates, under a name no other row or file has (a
+	// taken name gets a hyphen and digits, as `wp_unique_filename` gives it); a
+	// completion marks rows done; a deletion removes rows and their files, as
+	// `wp_delete_attachment` does. `onReserve` runs while the reservation runs.
 	function mediaLibrary( host: StudioAgentHost, site: string, onReserve?: () => void ) {
 		const rows = new Map< number, { file: string; done: boolean } >();
 		let next = 7;
-		host.sites.wpCli = vi.fn( async ( _site, args ) => {
+		const unique = ( name: string ) => {
+			const taken = ( candidate: string ) =>
+				existsSync( path.join( site, MONTH, candidate ) ) ||
+				[ ...rows.values() ].some( ( row ) => row.file === path.join( site, MONTH, candidate ) );
+			let candidate = name;
+			for ( let suffix = 1; taken( candidate ); suffix++ )
+				candidate = name.replace( /\.png$/, `-${ suffix }.png` );
+			return candidate;
+		};
+		host.sites.wpCli = vi.fn( async ( _site, args, options ) => {
+			await options?.beforeSpawn?.();
 			const php = args[ 1 ] ?? '';
 			const data = decodedData( php );
 			if ( php.includes( 'wp_insert_attachment' ) ) {
 				await mkdir( path.join( site, MONTH ), { recursive: true } );
-				const reserved = ( data as string[] ).map( ( name ) => {
+				const reserved = ( data as string[] ).map( ( requested ) => {
 					const id = next++;
+					const name = unique( requested );
 					rows.set( id, { file: path.join( site, MONTH, name ), done: false } );
 					return {
 						id,
@@ -911,7 +976,11 @@ describe( 'generate_images when its call is cancelled', () => {
 				return { exitCode: 0, stdout: JSON.stringify( reserved ), stderr: '' };
 			}
 			for ( const id of data.ready as number[] ) rows.get( id )!.done = true;
-			for ( const id of data.failed as number[] ) rows.delete( id );
+			for ( const id of data.failed as number[] ) {
+				const row = rows.get( id );
+				rows.delete( id );
+				if ( row ) await rm( row.file, { force: true } );
+			}
 			return { exitCode: 0, stdout: '', stderr: '' };
 		} );
 		return {
@@ -1061,18 +1130,211 @@ describe( 'generate_images when its call is cancelled', () => {
 		);
 	} );
 
+	// What the journal says of the deletion a call's end makes, and of what it left.
+	const DELETED_AT_END = ( count: number ) =>
+		`deletes the ${ count } attachments of this call that were neither completed nor deleted when the call ended, with any image file written for them`;
+	const LEFT_AT_END = ( count: number ) =>
+		`Studio could not delete the ${ count } attachments of this call that were neither completed nor deleted when the call ended`;
+	const leftNotes = ( events: Array< { type: string; message?: string } > ) =>
+		events.flatMap( ( event ) =>
+			event.type === 'tool.progress' && event.message?.startsWith( 'Studio could not delete' )
+				? [ event.message ]
+				: []
+		);
+	// The call is cancelled as the tool, its images written, settles them;
+	// `before` runs first.
+	const cancellingAtFinalize = (
+		policy: Awaited< ReturnType< typeof setupImages > >[ 'policy' ],
+		cancel: AbortController,
+		before: () => Promise< void > = async () => {}
+	) => {
+		const guardHost = policy.guardHost;
+		policy.guardHost = ( ...guarding ) => {
+			const guarded = guardHost( ...guarding );
+			const media = guarded.media!;
+			return {
+				...guarded,
+				media: {
+					...media,
+					finalize: async ( ...settling ) => {
+						cancel.abort();
+						await before();
+						return media.finalize( ...settling );
+					},
+				},
+			};
+		};
+	};
+
+	it( 'deletes, once the call has ended, every attachment it reserved and neither completed nor deleted, with the image written for it, when another image could not be written', async () => {
+		const { bridge, host, journal, events, site } = await setupImages();
+		const library = mediaLibrary( host, site );
+		vi.mocked( generateImages ).mockResolvedValueOnce( [
+			{ ok: true, bytes: PNG },
+			{ ok: true, bytes: PNG },
+		] );
+		const first = path.join( site, MONTH, 'image-0.png' );
+		const second = path.join( site, MONTH, 'image-1.png' );
+		// The second image cannot be written; the first is written only after
+		// that failure, as a write still under way would be.
+		const write = fsPromises.writeFile;
+		let wroteFirst = () => {};
+		const firstWritten = new Promise< void >( ( resolve ) => ( wroteFirst = resolve ) );
+		const writing = vi
+			.spyOn( fsPromises, 'writeFile' )
+			.mockImplementation( async ( ...args: Parameters< typeof write > ) => {
+				if ( args[ 0 ] === second )
+					throw Object.assign( new Error( 'EACCES: permission denied' ), { code: 'EACCES' } );
+				if ( args[ 0 ] === first ) {
+					await new Promise( ( resolve ) => setTimeout( resolve, 200 ) );
+					await write( ...args );
+					wroteFirst();
+					return;
+				}
+				return write( ...args );
+			} );
+		try {
+			const result = await bridge.invoke( 'generate_images', images( site, 2 ) );
+			expect( result.isError ).toBe( true );
+			await firstWritten;
+		} finally {
+			writing.mockRestore();
+		}
+		expect( library.rows.size ).toBe( 0 );
+		await library.isSettled();
+		expect( journal.map( ( entry ) => entry.operation.tool ) ).toEqual( [
+			'generate_images',
+			'media.reserve',
+			'media.finalize',
+		] );
+		expect( settledEntry( journal )?.description ).toContain( DELETED_AT_END( 2 ) );
+		expect( leftNotes( events ) ).toEqual( [] );
+	} );
+
+	it( 'deletes, once the call has ended, the attachments of an image path named twice, and the one file both images were written to', async () => {
+		const { bridge, host, journal, site } = await setupImages();
+		const library = mediaLibrary( host, site );
+		vi.mocked( generateImages ).mockResolvedValueOnce( [
+			{ ok: true, bytes: PNG },
+			{ ok: true, bytes: PNG },
+		] );
+		const hero = path.join( site, 'wp-content', 'uploads', 'hero.png' );
+		const result = await bridge.invoke( 'generate_images', {
+			images: [
+				{ path: hero, subject: 'A café counter at dawn' },
+				{ path: hero, subject: 'Cardamom buns on a tray' },
+			],
+		} );
+		expect( result.isError ).toBe( true );
+		expect( library.rows.size ).toBe( 0 );
+		await library.isSettled();
+		expect( settledEntry( journal )?.description ).toContain( DELETED_AT_END( 2 ) );
+	} );
+
+	it( 'deletes, once the call has ended, the attachments whose completion the user denied in a turn after a recovery, without asking again', async () => {
+		const { bridge, host, context, journal, site } = await setupImages( () => ( {
+			uncertainAfterRecovery: true,
+			approve: vi.fn( async ( request: { operation: { tool: string } } ) =>
+				request.operation.tool === 'media.finalize' ? ( 'deny' as const ) : ( 'allow' as const )
+			),
+		} ) );
+		const library = mediaLibrary( host, site );
+		vi.mocked( generateImages ).mockResolvedValueOnce( [
+			{ ok: true, bytes: PNG },
+			{ ok: false, error: 'Timed out' },
+		] );
+		await bridge.invoke( 'generate_images', images( site, 2 ) );
+		expect(
+			vi.mocked( context.approve ).mock.calls.map( ( [ request ] ) => request.operation.tool )
+		).toEqual( [ 'generate_images', 'media.reserve', 'media.finalize' ] );
+		expect( library.rows.size ).toBe( 0 );
+		await library.isSettled();
+		expect( journal.map( ( entry ) => entry.operation.tool ) ).toEqual( [
+			'generate_images',
+			'media.reserve',
+			'media.finalize',
+		] );
+		expect( settledEntry( journal )?.description ).toContain( DELETED_AT_END( 2 ) );
+	} );
+
+	it( 'deletes, once the call has ended, what a settling that failed left', async () => {
+		const cancel = new AbortController();
+		const { bridge, host, policy, journal, events, site } = await setupImages();
+		const library = mediaLibrary( host, site );
+		vi.mocked( generateImages ).mockResolvedValueOnce( [
+			{ ok: true, bytes: PNG },
+			{ ok: false, error: 'Timed out' },
+		] );
+		// The settling's command fails once; what follows runs as WordPress would.
+		const settles = vi.mocked( host.sites.wpCli ).getMockImplementation()!;
+		let failed = false;
+		host.sites.wpCli = vi.fn( async ( ...args: Parameters< typeof settles > ) => {
+			if ( ! failed && ! args[ 1 ][ 1 ]?.includes( 'wp_insert_attachment' ) ) {
+				failed = true;
+				return { exitCode: 1, stdout: '', stderr: '' };
+			}
+			return settles( ...args );
+		} );
+		cancellingAtFinalize( policy, cancel );
+		await bridge.invoke( 'generate_images', images( site, 2 ), cancel.signal );
+		expect( failed ).toBe( true );
+		expect( library.rows.size ).toBe( 0 );
+		await library.isSettled();
+		expect( journal.map( ( entry ) => entry.operation.tool ) ).toEqual( [
+			'generate_images',
+			'media.reserve',
+			'media.finalize',
+			'media.finalize',
+		] );
+		expect( journal[ 2 ].description ).toContain( 'since the call was cancelled' );
+		expect( settledEntry( journal )?.description ).toContain( DELETED_AT_END( 2 ) );
+		expect( leftNotes( events ) ).toEqual( [] );
+	} );
+
+	it( 'says in the journal how many attachments it left when a settling and the deletion at the call’s end are both refused', async () => {
+		const cancel = new AbortController();
+		const { bridge, host, policy, journal, events, site } = await setupImages();
+		const library = mediaLibrary( host, site );
+		vi.mocked( generateImages ).mockResolvedValueOnce( [
+			{ ok: true, bytes: PNG },
+			{ ok: false, error: 'Timed out' },
+		] );
+		// A WP-CLI configuration of the site's own appears as the call is cancelled.
+		cancellingAtFinalize( policy, cancel, () =>
+			writeFile( path.join( site, 'wp-cli.yml' ), 'require: [ elsewhere.php ]' )
+		);
+		await bridge.invoke( 'generate_images', images( site, 2 ), cancel.signal );
+		// The reservation ran; the settling's command and the deletion's were each
+		// refused by their fence before they started.
+		expect( vi.mocked( host.sites.wpCli ) ).toHaveBeenCalledTimes( 3 );
+		expect( library.rows.size ).toBe( 2 );
+		expect( journal.map( ( entry ) => entry.operation.tool ) ).toEqual( [
+			'generate_images',
+			'media.reserve',
+			'media.finalize',
+			'media.finalize',
+		] );
+		expect( settledEntry( journal )?.description ).toContain( DELETED_AT_END( 2 ) );
+		const left = leftNotes( events );
+		expect( left ).toHaveLength( 1 );
+		expect( left[ 0 ] ).toContain( LEFT_AT_END( 2 ) );
+		expect( left[ 0 ] ).not.toContain( site );
+	} );
+
 	it( 'keeps the turn up after Stop until a settling command it started has ended, however long that takes', async () => {
 		const cancel = new AbortController();
 		const { bridge, host, site } = await setupImages();
 		const library = mediaLibrary( host, site );
 		vi.mocked( generateImages ).mockResolvedValueOnce( [ { ok: true, bytes: PNG } ] );
-		// The settling command hangs until the test lets it end.
+		// The completing command, once its fence has passed, runs until the test
+		// lets it end.
 		let release = () => {};
 		const reserve = vi.mocked( host.sites.wpCli ).getMockImplementation()!;
 		host.sites.wpCli = vi.fn( async ( ...args: Parameters< typeof reserve > ) => {
-			if ( ! args[ 1 ][ 1 ]?.includes( 'wp_insert_attachment' ) )
-				await new Promise< void >( ( resolve ) => ( release = resolve ) );
-			return reserve( ...args );
+			if ( args[ 1 ][ 1 ]?.includes( 'wp_insert_attachment' ) ) return reserve( ...args );
+			await args[ 2 ]?.beforeSpawn?.();
+			await new Promise< void >( ( resolve ) => ( release = resolve ) );
+			return reserve( args[ 0 ], args[ 1 ] );
 		} );
 		let settled = false;
 		const call = bridge

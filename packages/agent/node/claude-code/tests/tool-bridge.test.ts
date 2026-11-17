@@ -517,6 +517,7 @@ function permissivePolicy( names: string[] ) {
 			guarded.push( { toolCallId, host: fenced } );
 			return fenced;
 		} ),
+		endCall: vi.fn( async () => {} ),
 		requestApproval: vi.fn( async () => undefined ),
 		authorizeExecution: vi.fn( async () => false ),
 		refreshAccount: vi.fn( async () => true ),

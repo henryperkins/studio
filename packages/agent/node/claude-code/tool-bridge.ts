@@ -176,6 +176,8 @@ export function createStudioClaudeToolBridge(
 				run = undefined;
 			} finally {
 				call.abort();
+				// What the call left unsettled is undone before its result is heard.
+				await policy.endCall( toolCallId );
 			}
 		}
 		const refused = policy.takeRefusals( toolCallId );

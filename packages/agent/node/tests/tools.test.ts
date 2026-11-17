@@ -874,6 +874,55 @@ describe( 'Studio AI MCP tools', () => {
 		}
 	} );
 
+	it( 'fails its pending work with the error of an image it could not write, still writes the others, and completes or deletes no attachment', async () => {
+		const sitePath = await mkdtemp( path.join( os.tmpdir(), 'studio-generate-images-' ) );
+		const site = { ...mockSite, path: sitePath };
+		const uploads = path.join( sitePath, 'wp-content', 'uploads' );
+		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );
+		// A folder where the reserved file goes: the image cannot be written there.
+		const blocked = path.join( uploads, '2026', '09', 'hero.png' );
+		await mkdir( blocked, { recursive: true } );
+		vi.mocked( host.sites.all ).mockResolvedValue( [ mockSite, site ] );
+		vi.mocked( resolveImageService ).mockResolvedValue( {
+			token: 'test-image-service-token',
+			use: { service: 'wordpress-com', credential: 'environment-token', account: null },
+		} );
+		vi.mocked( generateImages ).mockResolvedValue( [
+			{ ok: true, bytes: Buffer.from( 'jpeg' ) },
+			{ ok: true, bytes: Buffer.from( 'jpeg' ) },
+		] );
+		vi.mocked( host.sites.wpCli ).mockResolvedValueOnce( {
+			exitCode: 0,
+			stdout: JSON.stringify( [
+				{
+					id: 7,
+					file: 'wp-content/uploads/2026/09/hero.png',
+					url: 'http://localhost:8888/wp-content/uploads/2026/09/hero.png',
+				},
+			] ),
+			stderr: '',
+		} );
+
+		try {
+			const result = await getTool( 'generate_images' ).rawHandler( {
+				images: [
+					{ path: path.join( uploads, 'hero.png' ), subject: 'A café counter at dawn' },
+					{ path: themeImage, subject: 'Pebbles on a beach' },
+				],
+			} as never );
+			const failure = await result.pending?.then(
+				() => undefined,
+				( error: unknown ) => error
+			);
+			expect( failure ).toMatchObject( { code: expect.stringMatching( /^E[A-Z]+$/ ) } );
+			expect( ( failure as Error ).message ).toContain( blocked );
+			await vi.waitFor( async () => expect( await readFile( themeImage, 'utf8' ) ).toBe( 'jpeg' ) );
+			expect( host.sites.wpCli ).toHaveBeenCalledOnce();
+		} finally {
+			await rm( sitePath, { recursive: true, force: true } );
+		}
+	} );
+
 	it( 'keeps only which image service made the images and how Studio signed in to it with the result, never the account, out of what the model reads', async () => {
 		const sitePath = await mkdtemp( path.join( os.tmpdir(), 'studio-generate-images-' ) );
 		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );

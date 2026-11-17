@@ -207,6 +207,15 @@ export interface ClaudeExecutionPolicy {
 	 * without a site, and only once that change is journaled.
 	 */
 	guardHost( host: StudioAgentHost, toolCallId: string, signal?: AbortSignal ): StudioAgentHost;
+	/**
+	 * Called once a call has ended, however it ended, its pending work included.
+	 * Deletes what its guarded hosts left unsettled: every media-library
+	 * attachment the call reserved and neither completed nor deleted, with any
+	 * image file written for it, through the media library's fixed command,
+	 * journaled first. A deletion refused or failed is journaled with how many
+	 * attachments it left. Runs after the turn has ended too; never rejects.
+	 */
+	endCall( toolCallId: string ): Promise< void >;
 	requestApproval(
 		operation: ClaudeOperation,
 		toolCallId: string,
@@ -539,6 +548,21 @@ function settlingNote( completed: number, removed: number ): string {
 	} of this call whose image was written and deletes the ${ removed } whose image was not, since the call was cancelled; no further image is requested`;
 }
 
+// What the journal entry of the deletion a call's end makes says it deletes,
+// by count only.
+function endOfCallNote( count: number ): string {
+	return count === 1
+		? 'It deletes the 1 attachment of this call that was neither completed nor deleted when the call ended, with any image file written for it'
+		: `It deletes the ${ count } attachments of this call that were neither completed nor deleted when the call ended, with any image file written for them`;
+}
+
+// What the journal says when that deletion was refused or failed, by count only.
+function leftAtEndNote( count: number ): string {
+	return count === 1
+		? 'Studio could not delete the 1 attachment of this call that was neither completed nor deleted when the call ended; it is left in this site’s media library, with any image file written for it.'
+		: `Studio could not delete the ${ count } attachments of this call that were neither completed nor deleted when the call ended; they are left in this site’s media library, with any image file written for them.`;
+}
+
 function isAttachmentId( id: unknown ): id is number {
 	return Number.isSafeInteger( id ) && ( id as number ) > 0;
 }
@@ -630,6 +654,8 @@ export function createClaudeExecutionPolicy(
 	// The signal each call's guarded host lives by, which aborts once the call
 	// has settled, and the call that is creating a site, if any: one at a time.
 	const callSignals = new Map< string, AbortSignal >();
+	// What each call's guarded hosts do once the call has ended (`endCall`).
+	const callEnds = new Map< string, Set< () => Promise< void > > >();
 	let creatingCall: string | undefined;
 	// The Studio tool each call the policy admitted is a call of, until the
 	// call settles: what a guarded host gives can depend on the tool it serves.
@@ -1878,8 +1904,10 @@ export function createClaudeExecutionPolicy(
 			throw denied();
 		};
 		// The attachments this call reserved in the media library of the site the
-		// turn acts on: only this call completes or deletes them, each once.
+		// turn acts on, and not yet completed or deleted: only this call completes
+		// or deletes them, each once. `reservedIn` is the site they are in.
 		const reservedAttachments = new Set< number >();
+		let reservedIn: HostSite | undefined;
 		// One of the media library's fixed WP-CLI commands, Studio's own code, run
 		// as the turn runs every WP-CLI command, without the site's own code. It
 		// is fenced before it starts, and once started runs to its end whatever
@@ -1909,9 +1937,14 @@ export function createClaudeExecutionPolicy(
 		// others deleted. It belongs to the call the user approved and the journal
 		// admitted, and touches only attachments this call reserved, so neither
 		// signal refuses it and nothing asks. It is journaled first, saying what
-		// it settles, and runs only in the site the turn acts on, still at its
-		// folder.
-		const settle = async ( site: HostSite, completed: number[], removed: number[] ) => {
+		// it settles (`note`), and runs only in the site the turn acts on, still
+		// at its folder.
+		const settle = async (
+			site: HostSite,
+			completed: number[],
+			removed: number[],
+			note = settlingNote( completed.length, removed.length )
+		) => {
 			const targetSite = actingSite;
 			const current = targetSite ? await resolveTarget( host, site.path ) : undefined;
 			if ( ! targetSite || ! current || current.id !== site.id ) throw denied();
@@ -1919,7 +1952,7 @@ export function createClaudeExecutionPolicy(
 			const description = `${ describeClaudeOperation(
 				operationClass,
 				'media.finalize'
-			) }. ${ settlingNote( completed.length, removed.length ) }`;
+			) }. ${ note }`;
 			try {
 				await context.recordOperation( {
 					type: 'operation.authorized',
@@ -1939,6 +1972,28 @@ export function createClaudeExecutionPolicy(
 			);
 			for ( const id of [ ...completed, ...removed ] ) reservedAttachments.delete( id );
 		};
+		// Once the call has ended, however it ended (an image not written, a
+		// completion denied or refused, a settling refused, an image path named
+		// twice), every attachment it reserved and neither completed nor deleted
+		// is deleted, with any image file written for it, as a settling is; what
+		// that leaves, the journal says by count.
+		const endOfCall = async () => {
+			const left = [ ...reservedAttachments ];
+			if ( ! left.length || ! reservedIn ) return;
+			try {
+				await settle( reservedIn, [], left, endOfCallNote( left.length ) );
+			} catch {
+				context.onEvent( {
+					type: 'tool.progress',
+					runId: context.runId,
+					turnId: context.turnId,
+					toolCallId,
+					message: leftAtEndNote( reservedAttachments.size ),
+				} );
+			}
+		};
+		if ( ! callEnds.has( toolCallId ) ) callEnds.set( toolCallId, new Set() );
+		callEnds.get( toolCallId )!.add( endOfCall );
 		// A change of the conversation's site, to a site this turn created: asked
 		// about when the turn asks before every change, journaled, then made.
 		const changeSite = async (
@@ -2220,15 +2275,21 @@ export function createClaudeExecutionPolicy(
 								reserved = undefined;
 							}
 							// What this reservation inserted is deleted again whenever it is
-							// refused, and nothing else.
-							const rollBack = ( ids: number[] ) =>
-								ids.length
-									? mediaCommand(
-											current!,
-											finalizeAttachmentsArgs( [], ids ),
-											settlingFence( current!.path )
-									  ).catch( () => undefined )
-									: undefined;
+							// refused, and nothing else; what that leaves is left to the
+							// call's end, which tries again.
+							const rollBack = async ( ids: number[] ) => {
+								if ( ! ids.length ) return;
+								try {
+									await mediaCommand(
+										current!,
+										finalizeAttachmentsArgs( [], ids ),
+										settlingFence( current!.path )
+									);
+								} catch {
+									for ( const id of ids ) reservedAttachments.add( id );
+									reservedIn = current!;
+								}
+							};
 							if ( ! isReservation( reserved, requested ) ) {
 								await rollBack( insertedFor( reserved, requested ) );
 								throw denied();
@@ -2252,6 +2313,7 @@ export function createClaudeExecutionPolicy(
 								}
 							}
 							for ( const { id } of reserved ) reservedAttachments.add( id );
+							reservedIn = current!;
 							return reserved;
 						}
 					);
@@ -2332,6 +2394,11 @@ export function createClaudeExecutionPolicy(
 		authorizeToolUse,
 		authorizeStudioCall,
 		guardHost,
+		endCall: async ( toolCallId ) => {
+			const ends = callEnds.get( toolCallId );
+			callEnds.delete( toolCallId );
+			for ( const end of ends ?? [] ) await end().catch( () => undefined );
+		},
 		requestApproval,
 		authorizeExecution,
 		refreshAccount: () => accountIsCurrent( false ),
