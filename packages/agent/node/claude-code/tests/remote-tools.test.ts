@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'fs/promises';
 import { createServer } from 'http';
 import os from 'os';
 import path from 'path';
@@ -1550,6 +1550,30 @@ describe( 'wpcom_request on the Claude route', () => {
 			}
 			expect( context.approve ).not.toHaveBeenCalled();
 			expect( wpcom.received ).toEqual( [] );
+		} );
+
+		it( 'are none at all while the payload folder is itself a link, so the files of a site it leads to never pass for payloads', async () => {
+			const { bridge, context, site } = await setup( live );
+			await writeFile( path.join( site, 'page.html' ), '<p>Site</p>' );
+			const folder = payloads();
+			const kept = `${ folder }-kept`;
+			await rename( folder, kept );
+			await symlink( site, folder, 'junction' );
+			try {
+				const result = await bridge.invoke( 'wpcom_request', {
+					siteId: 42,
+					method: 'POST',
+					path: '/pages/4',
+					bodyFiles: { content: 'page.html' },
+				} );
+				expect( result.isError ).toBe( true );
+				expect( text( result ) ).toContain( PAYLOAD_REFUSAL );
+				expect( context.approve ).not.toHaveBeenCalled();
+				expect( wpcom.received ).toEqual( [] );
+			} finally {
+				await rm( folder );
+				await rename( kept, folder );
+			}
 		} );
 
 		it( 'are checked again once the user has answered, so a link planted while the user reads the approval sends nothing', async () => {

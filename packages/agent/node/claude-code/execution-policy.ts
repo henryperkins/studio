@@ -1550,7 +1550,10 @@ export function createClaudeExecutionPolicy(
 
 	// Whether every file a call names in the payload folder exists there once
 	// links and short names are resolved, outside the native configuration and
-	// clear of names that commonly hold credentials.
+	// clear of names that commonly hold credentials. The folder must resolve to
+	// itself: one that is, or lies under, a link leads somewhere else, a site's
+	// folder perhaps, whose files would pass for payloads under a path the
+	// approval would show unresolved.
 	async function inPayloadFolder( {
 		folder,
 		files,
@@ -1559,7 +1562,12 @@ export function createClaudeExecutionPolicy(
 		files: readonly string[];
 	} ): Promise< boolean > {
 		const root = await realpath( folder ).catch( () => undefined );
-		if ( ! root ) return false;
+		const named = path.resolve( folder );
+		if (
+			! root ||
+			( process.platform === 'win32' ? root.toLowerCase() !== named.toLowerCase() : root !== named )
+		)
+			return false;
 		for ( const file of files )
 			if ( ! ( await isAllowedNativePath( file, [ root ], context.workspace.configDirectory ) ) )
 				return false;
