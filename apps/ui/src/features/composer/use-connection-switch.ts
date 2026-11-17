@@ -7,10 +7,9 @@ import { useEffect, useRef, useState } from 'react';
 import { useConnector } from '@/data/core';
 import { primeSessionQueryData, SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
 import { saveSessionSettingChange } from '@/data/session-setting-changes';
-import { saveComposerDraft } from './draft-store';
+import { getComposerDraft, saveComposerDraft } from './draft-store';
 import { createChatGptSelectionEntry } from './use-chatgpt-conversation';
 import type { AiModelId, AiSessionSummary, SessionEntry } from '@/data/core';
-import type { ComposerAttachment } from '@/data/use-composer-attachments';
 import type { ChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
 
@@ -29,6 +28,7 @@ export function useConnectionSwitch(
 	const [ error, setError ] = useState( '' );
 	const saving = useRef( false );
 	const created = useRef< AiSessionSummary | null >( null );
+	const started = useRef< AiSessionSummary | null >( null );
 	const mounted = useRef( true );
 	useEffect( () => {
 		mounted.current = true;
@@ -91,12 +91,7 @@ export function useConnectionSwitch(
 	const startInPlace = async (
 		selection: ChatGptSessionSelection,
 		sessionId: string | undefined,
-		draft: {
-			key?: string;
-			text: string;
-			attachments: ComposerAttachment[];
-			environment: 'local' | 'live';
-		}
+		draft: { key?: string; environment: 'local' | 'live' }
 	): Promise< void > => {
 		const entry = createChatGptSelectionEntry( selection );
 		if ( sessionId ) {
@@ -111,13 +106,17 @@ export function useConnectionSwitch(
 		if ( ! onSwitchSession || saving.current ) return;
 		saving.current = true;
 		try {
-			const summary = await connector.createSession( ownerSiteId );
+			// One the last attempt made and couldn't put on the account, if any.
+			const summary = started.current ?? ( await connector.createSession( ownerSiteId ) );
+			started.current = summary;
 			await connector.setSessionChatGptSelection( summary.id, selection );
 			if ( draft.environment === 'live' ) {
 				await connector.setSessionEnvironment( summary.id, 'live' );
 			}
+			started.current = null;
 			primeSessionQueryData( queryClient, summary, [ entry ] );
-			saveComposerDraft( summary.id, { text: draft.text, attachments: draft.attachments } );
+			// What was typed by now, the store having kept up with the composer.
+			saveComposerDraft( summary.id, getComposerDraft( draft.key ) );
 			saveComposerDraft( draft.key, { text: '', attachments: [] } );
 			void queryClient.invalidateQueries( { queryKey: SESSIONS_QUERY_KEY, exact: true } );
 			if ( mounted.current ) onSwitchSession( summary.id );

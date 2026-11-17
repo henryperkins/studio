@@ -408,12 +408,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 			chatGpt.changeSelection( selection );
 		} else if ( ! chatGpt && canPinChatGptInPlace( entries ?? [] ) ) {
 			connectionSwitch
-				.startInPlace( selection, sessionId, {
-					key: draftKey,
-					text: value,
-					attachments,
-					environment,
-				} )
+				.startInPlace( selection, sessionId, { key: draftKey, environment } )
 				.catch( ( error: unknown ) =>
 					toast.error(
 						sprintf(

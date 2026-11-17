@@ -574,6 +574,35 @@ describe( 'ChatGPT chats', () => {
 		expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
 	} );
 
+	it( 'starts the site’s new chat on one session however often the account had to be chosen', async () => {
+		const { connector, runs } = await setup( [], false, null, '/sites/one/new' );
+		connector.setSessionChatGptSelection.mockRejectedValueOnce(
+			new Error( 'Studio couldn’t save the model for this chat. Try again.' )
+		);
+		fireEvent.change( input(), { target: { value: 'Unsent idea' } } );
+		await chooseChatGpt( WORK );
+		await waitFor( () =>
+			expect(
+				getVisibleToasts().some( ( toast ) =>
+					toast.title.includes( 'Studio couldn’t save the model for this chat. Try again.' )
+				)
+			).toBe( true )
+		);
+		expect( input() ).toHaveValue( 'Unsent idea' );
+
+		await chooseChatGpt( WORK );
+		await waitFor( () =>
+			expect( connector.setSessionChatGptSelection ).toHaveBeenCalledTimes( 2 )
+		);
+		expect( await screen.findByText( `ChatGPT plan · ${ WORK }` ) ).toBeVisible();
+		await waitFor( () => expect( input() ).toHaveValue( 'Unsent idea' ) );
+		expect( connector.createSession ).toHaveBeenCalledTimes( 1 );
+		const { id } = await connector.createSession.mock.results[ 0 ].value;
+		fireEvent.keyDown( input(), { key: 'Enter' } );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( runs[ 0 ] ).toMatchObject( { id, prompt: 'Unsent idea' } );
+	} );
+
 	it( 'still asks to start a new chat once a chat without turns is pinned to another provider', async () => {
 		const { connector } = await setup(
 			[ pin( { provider: 'openai-api-key', model: 'gpt-6-luna' } ) ],
