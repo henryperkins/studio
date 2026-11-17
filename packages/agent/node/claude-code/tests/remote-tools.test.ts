@@ -613,9 +613,24 @@ describe( 'preview_update and preview_delete on the Claude route', () => {
 // staging copy of it (112); another local site is connected to 333.
 const connections = [
 	fakeRemoteSite,
-	{ ...fakeRemoteSite, id: 112, name: 'Staging', url: 'https://staging.example.test' },
+	{
+		...fakeRemoteSite,
+		id: 112,
+		name: 'Staging',
+		url: 'https://staging.example.test',
+		isStaging: true,
+	},
 	{ ...fakeRemoteSite, id: 333, localSiteId: 'other-site', url: 'https://other.example.test' },
 ];
+// What an approval shows of each of the conversation's site's connections.
+const PRODUCTION = {
+	id: 111,
+	name: 'My Production Site',
+	address: 'myprod.wordpress.com',
+	kind: 'production',
+};
+const PRODUCTION_LABEL =
+	'WordPress.com site 111: My Production Site, myprod.wordpress.com, a production site';
 const REMOTE_REFUSAL = 'only when it is connected to this conversation’s site';
 const OPTIONS_REFUSAL = 'only with options from this list';
 
@@ -646,10 +661,14 @@ describe( 'site_push on the Claude route', () => {
 			tool: 'sync.push',
 			operationClass: 'remote-overwrite',
 			args: [
-				{ direction: 'push', remoteSite: 111, overwrites: [ 'the database', 'the plugins' ] },
+				{
+					direction: 'push',
+					remoteSite: PRODUCTION,
+					overwrites: [ 'the database', 'the plugins' ],
+				},
 			],
 			localPaths: [ site ],
-			remote: 'WordPress.com site 111',
+			remote: PRODUCTION_LABEL,
 		} );
 		expect( request.operation.description ).toContain(
 			'replaces what overwrites names on that site'
@@ -676,7 +695,7 @@ describe( 'site_push on the Claude route', () => {
 		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation.args ).toEqual( [
 			{
 				direction: 'push',
-				remoteSite: 111,
+				remoteSite: PRODUCTION,
 				overwrites: [ 'the database and every file in wp-content' ],
 			},
 		] );
@@ -821,9 +840,15 @@ describe( 'site_pull on the Claude route', () => {
 		expect( request.operation ).toMatchObject( {
 			tool: 'sync.pull',
 			operationClass: 'remote-overwrite',
-			args: [ { direction: 'pull', remoteSite: 111, overwrites: [ 'the uploads', 'the themes' ] } ],
+			args: [
+				{
+					direction: 'pull',
+					remoteSite: PRODUCTION,
+					overwrites: [ 'the uploads', 'the themes' ],
+				},
+			],
 			localPaths: [ site ],
-			remote: 'WordPress.com site 111',
+			remote: PRODUCTION_LABEL,
 		} );
 		expect( request.operation.description ).toContain(
 			'replaces what overwrites names in this local site'
@@ -899,6 +924,56 @@ describe( 'site_pull on the Claude route', () => {
 			( await bridge.invoke( 'site_pull', { nameOrPath: 'site', remoteSite: '111' } ) ).isError
 		).toBe( true );
 		expect( host.sync.pull ).not.toHaveBeenCalled();
+	} );
+} );
+
+describe( 'what a push or pull approval shows of the WordPress.com site', () => {
+	it( 'names it as Studio keeps its connection, by its name, address and whether it is a staging or a production site beside its ID, so a production site and its staging copy read differently, and shows no account', async () => {
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		for ( const name of [ 'site_push', 'site_pull' ] ) {
+			const fixture = await setup();
+			for ( const remoteSite of [ '111', 'https://staging.example.test/' ] )
+				expect(
+					( await fixture.bridge.invoke( name, { nameOrPath: 'site', remoteSite } ) ).isError,
+					`${ name } ${ remoteSite }`
+				).toBe( false );
+			const [ production, staging ] = vi
+				.mocked( fixture.context.approve )
+				.mock.calls.map( ( [ request ] ) => request.operation );
+			expect( production.args, name ).toEqual( [
+				expect.objectContaining( { remoteSite: PRODUCTION } ),
+			] );
+			expect( production.remote, name ).toBe( PRODUCTION_LABEL );
+			expect( staging.args, name ).toEqual( [
+				expect.objectContaining( {
+					remoteSite: {
+						id: 112,
+						name: 'Staging',
+						address: 'staging.example.test',
+						kind: 'staging',
+					},
+				} ),
+			] );
+			expect( staging.remote, name ).toBe(
+				'WordPress.com site 112: Staging, staging.example.test, a staging site'
+			);
+			// What a person reads: the approval as the app is given it.
+			const shown = fixture.events
+				.filter( ( event ) => event.type === 'approval.requested' )
+				.map(
+					( event ) => ( event as { operation: { args: string; remote?: string } } ).operation
+				);
+			expect( shown, name ).toHaveLength( 2 );
+			expect( shown[ 0 ].args, name ).toContain( '"kind": "production"' );
+			expect( shown[ 1 ].args, name ).toContain( '"kind": "staging"' );
+			expect( shown[ 0 ].remote, name ).not.toBe( shown[ 1 ].remote );
+			expect( JSON.stringify( [ fixture.events, fixture.journal ] ), name ).not.toContain(
+				LOGIN.accessToken
+			);
+			expect( vi.mocked( fixture.host.sync.push ).mock.calls.length, name ).toBe(
+				name === 'site_push' ? 2 : 0
+			);
+		}
 	} );
 } );
 

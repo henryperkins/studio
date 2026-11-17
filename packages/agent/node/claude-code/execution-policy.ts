@@ -309,6 +309,26 @@ function syncSelection( options: unknown ): string[] | undefined {
 	return items;
 }
 
+// What an approval shows of a WordPress.com site a push or pull syncs with:
+// what Studio's connection record holds of it, its name, its address as the
+// CLI normalizes it and whether it is a staging or a production site, beside
+// its numeric ID. The user's own site, shown to the user; never the account
+// it is connected under.
+function shownConnection( site: SyncSite ) {
+	return {
+		id: site.id,
+		name: String( site.name ).replace( /\s+/g, ' ' ).trim(),
+		address: normalizeSiteAddress( String( site.url ) ),
+		kind: site.isStaging ? ( 'staging' as const ) : ( 'production' as const ),
+	};
+}
+
+// The same, in one line.
+function connectionLabel( site: SyncSite ): string {
+	const { id, name, address, kind } = shownConnection( site );
+	return `WordPress.com site ${ id }: ${ name }, ${ address }, a ${ kind } site`;
+}
+
 function deepFreeze< T >( value: T ): T {
 	if ( value && typeof value === 'object' && ! Object.isFrozen( value ) ) {
 		Object.freeze( value );
@@ -1281,16 +1301,18 @@ export function createClaudeExecutionPolicy(
 				return;
 			}
 			// The approval shows which way the copy goes, the WordPress.com site
-			// and what the copy overwrites where it lands.
+			// as Studio keeps its connection, so a production site and its
+			// staging copy read differently, and what the copy overwrites where
+			// it lands.
 			args = [
 				{
 					direction: request.name === 'sync.pull' ? 'pull' : 'push',
-					remoteSite: wpcomSite.id,
+					remoteSite: shownConnection( wpcomSite ),
 					overwrites: syncOptions.map( ( option ) => SYNC_OVERWRITES[ option ] ),
 				},
 				...args,
 			];
-			remote = `WordPress.com site ${ wpcomSite.id }`;
+			remote = connectionLabel( wpcomSite );
 		}
 		if ( request.defaultPull && isReprintPullEnabled() ) {
 			refuse( toolCallId, REFUSALS.reprintPull );
