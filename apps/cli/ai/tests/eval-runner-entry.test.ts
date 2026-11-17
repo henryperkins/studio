@@ -164,7 +164,7 @@ describe( 'eval runner entry', () => {
 			await vi.waitFor( () => expect( exit ).toHaveBeenCalled() );
 			expect( exit ).toHaveBeenCalledWith( 1 );
 			expect( left() ).toEqual( [] );
-			expect( stderr.mock.calls.map( ( [ text ] ) => String( text ) ).join( '' ) ).toBe(
+			expect( stderr.mock.calls.map( ( call: unknown[] ) => String( call[ 0 ] ) ).join( '' ) ).toBe(
 				`${ fixedMessage }\n`
 			);
 			expect( fs.readdirSync( source ) ).toEqual( [ 'shared.json' ] );
