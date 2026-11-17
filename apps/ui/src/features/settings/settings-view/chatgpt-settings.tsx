@@ -153,16 +153,9 @@ export function ChatGptSettingsGroup() {
 		}
 	};
 
+	// Nothing about ChatGPT shows until a read has said it is on, whatever a failed read says.
 	if ( ! settings.data?.enabled ) {
-		return settings.isError ? (
-			<SettingsGroup title={ __( 'ChatGPT plan' ) }>
-				<SettingsRow title={ __( 'Couldn’t load ChatGPT accounts.' ) }>
-					<Button variant="outline" onClick={ () => void settings.refetch() }>
-						{ __( 'Retry' ) }
-					</Button>
-				</SettingsRow>
-			</SettingsGroup>
-		) : null;
+		return null;
 	}
 	const busy = pending || signingOut;
 	const canSignIn =

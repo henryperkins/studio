@@ -1,5 +1,5 @@
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CHATGPT_SETTINGS_QUERY_KEY } from '@/data/queries/use-chatgpt-settings';
 import { createFakeConnector, makeSite } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
@@ -82,6 +82,7 @@ async function openSettings(
 }
 
 beforeEach( () => localStorage.clear() );
+afterEach( () => vi.restoreAllMocks() );
 
 describe( 'ChatGPT account settings', () => {
 	it( 'shows a pending sign-in and cancels it without connecting an account', async () => {
@@ -207,6 +208,34 @@ describe( 'ChatGPT account settings', () => {
 		expect( connector.recheckChatGptSettings ).toHaveBeenCalledTimes( 1 );
 		expect( connector.getChatGptSettings.mock.calls.length ).toBeGreaterThan( 3 );
 	} );
+
+	it.each( [
+		[ 'Desktop', 'Studio couldn’t complete the ChatGPT action. Try again.' ],
+		[ 'studio ui', 'GET /chatgpt failed (502): Bad Gateway' ],
+	] )(
+		'shows nothing about ChatGPT while no read has said it is on, when the read fails in %s',
+		async ( _host, reason ) => {
+			const logged = vi.spyOn( console, 'error' );
+			const { connector } = await openSettings(
+				{},
+				{
+					getChatGptSettings: async () => {
+						throw new Error( reason );
+					},
+				}
+			);
+
+			await screen.findAllByRole( 'group', { name: 'Providers' } );
+			await waitFor( () => expect( connector.getChatGptSettings ).toHaveBeenCalled() );
+			await act( async () => {} );
+
+			expect( screen.queryByRole( 'group', { name: 'ChatGPT plan' } ) ).not.toBeInTheDocument();
+			expect( screen.queryByText( /ChatGPT accounts/ ) ).not.toBeInTheDocument();
+			expect( screen.queryByText( reason, { exact: false } ) ).not.toBeInTheDocument();
+			expect( connector.recheckChatGptSettings ).not.toHaveBeenCalled();
+			expect( logged ).not.toHaveBeenCalled();
+		}
+	);
 
 	it( 'explains callback-host restrictions and keeps sign-in unavailable', async () => {
 		const { connector } = await openSettings( { signInSupported: false } );
