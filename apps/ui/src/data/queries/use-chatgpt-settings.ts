@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
+import { __, sprintf } from '@wordpress/i18n';
 import { useConnector, type Connector } from '@/data/core';
 import type { ChatGptAccountView, ChatGptSettings } from '@studio/agent/protocol/chatgpt';
 
@@ -14,6 +15,15 @@ export function useChatGptSettings() {
 		retry: false,
 		meta: { persist: false },
 	} );
+}
+
+/** Why the last read of the ChatGPT accounts failed, as Settings and the composer say it. */
+export function describeChatGptSettingsError( error: Error | null ): string {
+	return sprintf(
+		/* translators: %s: why the accounts couldn't be read, ending in a full stop. */
+		__( 'Couldn’t check your ChatGPT accounts. %s' ),
+		error?.message || __( 'Try again.' )
+	);
 }
 
 /**

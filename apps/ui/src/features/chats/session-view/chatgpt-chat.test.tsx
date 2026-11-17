@@ -520,6 +520,33 @@ describe( 'ChatGPT chats', () => {
 		}
 	);
 
+	it( 'says why the ChatGPT accounts couldn’t be checked and retries from the notice, sending nothing meanwhile', async () => {
+		const { connector, queryClient, runs } = await setup();
+		const reason = 'Studio couldn’t complete the ChatGPT action. Try again.';
+		connector.getChatGptSettings.mockRejectedValue( new Error( reason ) );
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+		expect(
+			await screen.findByText( `Couldn’t check your ChatGPT accounts. ${ reason }` )
+		).toBeVisible();
+		send( 'Held request' );
+		await act( async () => {} );
+		expect( runs ).toHaveLength( 0 );
+
+		connector.getChatGptSettings.mockImplementation( async () =>
+			structuredClone( connector.state.chatGpt )
+		);
+		fireEvent.click( screen.getByRole( 'button', { name: 'Retry' } ) );
+
+		await waitFor( () =>
+			expect( screen.queryByText( /Couldn’t check your ChatGPT accounts/ ) ).not.toBeInTheDocument()
+		);
+		expect( connector.recheckChatGptSettings ).toHaveBeenCalledTimes( 1 );
+		send( 'Following request' );
+		await waitFor( () => expect( runs ).toHaveLength( 1 ) );
+		expect( runs[ 0 ].selection ).toEqual( INITIAL );
+	} );
+
 	it( 'holds queued messages after the selected account disconnects, even with another account and an API key', async () => {
 		const { connector, queryClient, runs } = await setup( [ pin( INITIAL ) ], true );
 		send( 'First request' );

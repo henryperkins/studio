@@ -237,6 +237,63 @@ describe( 'ChatGPT account settings', () => {
 		}
 	);
 
+	it.each( [
+		[ 'Desktop', 'Studio couldn’t complete the ChatGPT action. Try again.' ],
+		[ 'studio ui', 'GET /chatgpt failed (502): Bad Gateway' ],
+	] )(
+		'keeps the last known accounts, marked as possibly out of date, with the reason and a retry when a read fails in %s',
+		async ( _host, reason ) => {
+			const { connector, queryClient, settings } = await openSettings( {
+				accounts: [ account() ],
+			} );
+			const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+			await within( group ).findByText( 'Connected' );
+			connector.getChatGptSettings.mockRejectedValue( new Error( reason ) );
+			await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+
+			expect( await within( group ).findByRole( 'alert' ) ).toHaveTextContent(
+				`Couldn’t check your ChatGPT accounts. ${ reason }`
+			);
+			expect( within( group ).getByText( /This status may be out of date\./ ) ).toBeVisible();
+			expect(
+				within( group ).getByRole( 'combobox', { name: 'Saved ChatGPT account' } )
+			).toHaveTextContent( 'Personal' );
+
+			connector.getChatGptSettings.mockImplementation( async () => structuredClone( settings ) );
+			fireEvent.click( within( group ).getByRole( 'button', { name: 'Retry' } ) );
+
+			await waitFor( () =>
+				expect(
+					within( group ).queryByText( /Couldn’t check your ChatGPT accounts/ )
+				).not.toBeInTheDocument()
+			);
+			expect( within( group ).queryByText( /may be out of date/ ) ).not.toBeInTheDocument();
+			expect( within( group ).getByText( 'Connected' ) ).toBeVisible();
+			expect( connector.recheckChatGptSettings ).toHaveBeenCalledTimes( 2 );
+		}
+	);
+
+	it( 'keeps the reason and the retry when the retry fails too', async () => {
+		const { connector, queryClient } = await openSettings( { accounts: [ account() ] } );
+		const group = await screen.findByRole( 'group', { name: 'ChatGPT plan' } );
+		await within( group ).findByText( 'Connected' );
+		connector.getChatGptSettings.mockRejectedValue( new Error( 'First reason.' ) );
+		await act( () => queryClient.refetchQueries( { queryKey: CHATGPT_SETTINGS_QUERY_KEY } ) );
+		await within( group ).findByRole( 'alert' );
+		connector.recheckChatGptSettings.mockRejectedValue( new Error( 'Recheck reason.' ) );
+		connector.getChatGptSettings.mockRejectedValue( new Error( 'Second reason.' ) );
+
+		fireEvent.click( within( group ).getByRole( 'button', { name: 'Retry' } ) );
+
+		await waitFor( () =>
+			expect( within( group ).getByRole( 'alert' ) ).toHaveTextContent(
+				'Couldn’t check your ChatGPT accounts. Second reason.'
+			)
+		);
+		expect( within( group ).getByRole( 'button', { name: 'Retry' } ) ).toBeEnabled();
+		expect( within( group ).getByText( /This status may be out of date\./ ) ).toBeVisible();
+	} );
+
 	it( 'explains callback-host restrictions and keeps sign-in unavailable', async () => {
 		const { connector } = await openSettings( { signInSupported: false } );
 		expect( await screen.findByText( /Open Studio on localhost/ ) ).toBeVisible();

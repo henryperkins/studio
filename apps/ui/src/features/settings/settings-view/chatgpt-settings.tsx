@@ -3,6 +3,7 @@ import { __, sprintf } from '@wordpress/i18n';
 import { useEffect, useRef, useState } from 'react';
 import { useConnector } from '@/data/core';
 import {
+	describeChatGptSettingsError,
 	holdChatGptConnection,
 	refreshChatGptSettings,
 	useChatGptModels,
@@ -40,7 +41,8 @@ export function ChatGptSettingsGroup() {
 		? accounts.find( ( item ) => item.connectionId === selectedId )
 		: accounts[ 0 ];
 	const models = useChatGptModels( account, false );
-	const { mutate: recheck } = useRecheckChatGptSettings();
+	const rechecking = useRecheckChatGptSettings();
+	const { mutate: recheck } = rechecking;
 	const enabled = !! settings.data?.enabled;
 	const rechecked = useRef( false );
 
@@ -200,6 +202,21 @@ export function ChatGptSettingsGroup() {
 				'Use your ChatGPT plan in Studio. Choose the account and model in each chat; usage counts toward that account’s plan limits.'
 			) }
 		>
+			{ settings.isError ? (
+				<SettingsRow
+					title={ __( 'ChatGPT accounts' ) }
+					error={ describeChatGptSettingsError( settings.error ) }
+				>
+					<Button
+						variant="outline"
+						loading={ rechecking.isPending }
+						loadingAnnouncement={ __( 'Checking ChatGPT accounts' ) }
+						onClick={ () => recheck() }
+					>
+						{ __( 'Retry' ) }
+					</Button>
+				</SettingsRow>
+			) : null }
 			{ accounts.length > 0 ? (
 				<SettingsRow
 					title={ __( 'Saved ChatGPT account' ) }
@@ -207,6 +224,9 @@ export function ChatGptSettingsGroup() {
 						account
 							? `${ account.email ?? account.label } · ${ account.connectionId.slice( 0, 8 ) }`
 							: __( 'Choose a saved account.' )
+					}
+					additionalContent={
+						settings.isError ? __( 'This status may be out of date.' ) : undefined
 					}
 					badge={
 						connected ? (
