@@ -499,13 +499,34 @@ describe( 'preview_update and preview_delete on the Claude route', () => {
 			localPaths: [ site ],
 			remote: own.url,
 		} );
-		expect( request.operation.description ).toContain( 'anyone with the preview’s public address' );
+		// `demo.wp.build` is a preview made on Jurassic Ninja, which the CLI
+		// moves to WordPress.com when it updates it.
+		expect( request.operation.description ).toContain(
+			'It moves this preview of the site, made on Jurassic Ninja, to WordPress.com: it makes a new preview there, at a new address, from the site’s current content, its database included, which anyone with the new preview’s public address can see, and deletes the preview at the address shown'
+		);
 		expect( order ).toEqual( [
 			'journal preview_update',
 			'journal previews.update',
 			'host previews.update',
 		] );
 		expect( journal[ 1 ] ).toMatchObject( { requestId: request.requestId } );
+	} );
+
+	it( 'says, for a preview on WordPress.com, that the update replaces what that preview shows, at its address', async () => {
+		const { bridge, host, context } = await setup();
+		const onWpcom = { ...fakePreview, url: 'studio-preview-7.wpcomstaging.com', atomicSiteId: 777 };
+		vi.mocked( host.previews.list ).mockResolvedValue( [ onWpcom ] );
+		const result = await bridge.invoke( 'preview_update', {
+			nameOrPath: 'site',
+			host: onWpcom.url,
+		} );
+		expect( result.isError ).toBe( false );
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		expect( request.operation ).toMatchObject( { args: [ onWpcom.url ], remote: onWpcom.url } );
+		expect( request.operation.description ).toContain(
+			'It replaces what a preview of this site on WordPress.com shows with the site’s current content, its database included, which anyone with the preview’s public address can see'
+		);
+		expect( request.operation.description ).not.toContain( 'Jurassic Ninja' );
 	} );
 
 	it( 'deletes a preview of the conversation’s own site once the user approves it, showing the preview, journaled before the command', async () => {

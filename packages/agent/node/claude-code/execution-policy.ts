@@ -5,6 +5,7 @@ import path from 'path';
 import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
 import { normalizeHostname as normalizeSiteAddress } from '@studio/common/lib/normalize-hostname';
 import { getCurrentUserId } from '@studio/common/lib/shared-config';
+import { isWpcomPreview } from '@studio/common/lib/snapshots';
 import { isReprintPullEnabled } from '@studio/common/lib/sync/reprint-pull';
 import { getCliConfigPath, getSharedConfigPath } from '@studio/common/lib/well-known-paths';
 import {
@@ -418,11 +419,21 @@ interface HostRequest {
 	note?: string;
 }
 
-/** A preview of the site the turn acts on: its address, and the WordPress.com site that holds it. */
+/**
+ * A preview of the site the turn acts on: its address, the site that holds
+ * it, and whether that is a WordPress.com site, as the CLI decides it, rather
+ * than one made on Jurassic Ninja by earlier Studio releases.
+ */
 interface TargetPreview {
 	url: string;
 	atomicSiteId: number;
+	onWpcom: boolean;
 }
+
+// What an update approval says of a preview made on Jurassic Ninja, which the
+// CLI's `preview update` moves to WordPress.com rather than updating it.
+const MOVED_PREVIEW_NOTE =
+	'It moves this preview of the site, made on Jurassic Ninja, to WordPress.com: it makes a new preview there, at a new address, from the site’s current content, its database included, which anyone with the new preview’s public address can see, and deletes the preview at the address shown';
 
 /** What an operation receives in place of what its caller named: the values as checked. */
 interface CheckedHostValues {
@@ -1357,14 +1368,17 @@ export function createClaudeExecutionPolicy(
 				? wpCliOption( request.args, 'post_title' )
 				: undefined;
 		const described = describeClaudeOperation( operationClass, request.name );
-		const note =
-			wpcomSite && syncOptions
-				? syncNote(
-						request.name === 'sync.pull' ? 'sync.pull' : 'sync.push',
-						wpcomSite,
-						syncOptions
-				  )
-				: request.note;
+		let note = request.note;
+		if ( wpcomSite && syncOptions )
+			note = syncNote(
+				request.name === 'sync.pull' ? 'sync.pull' : 'sync.push',
+				wpcomSite,
+				syncOptions
+			);
+		// The CLI updates a preview made on Jurassic Ninja by making a new one on
+		// WordPress.com and deleting it, so the approval says that instead.
+		else if ( request.name === 'previews.update' && preview && ! preview.onWpcom )
+			note = MOVED_PREVIEW_NOTE;
 		const operation: ClaudeOperation = {
 			tool: request.name,
 			operationClass,
@@ -1563,7 +1577,11 @@ export function createClaudeExecutionPolicy(
 			return;
 		return {
 			login: listed.login,
-			preview: { url: matching[ 0 ].url, atomicSiteId: matching[ 0 ].atomicSiteId },
+			preview: {
+				url: matching[ 0 ].url,
+				atomicSiteId: matching[ 0 ].atomicSiteId,
+				onWpcom: isWpcomPreview( matching[ 0 ] ),
+			},
 		};
 	}
 
