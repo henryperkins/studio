@@ -443,6 +443,70 @@ describe( 'eval harness', () => {
 			] );
 		} );
 
+		it( 'refuses a wpcom_request whose query names a key the WordPress.com client lifts into its transport', async () => {
+			const original = wpcomRequestTool.handler;
+			const passedOn = vi.fn( async ( _args: { query?: Record< string, unknown > } ) => ( {
+				content: [ { type: 'text' as const, text: '{}' } ],
+				details: {},
+			} ) );
+			wpcomRequestTool.handler = passedOn as unknown as typeof wpcomRequestTool.handler;
+			const staging = {
+				site: { id: 4242, url: 'https://staging-4242.wpcomstaging.com' },
+				refused: [],
+			};
+			const lifted = [
+				{ proxyOrigin: 'https://collector.example' },
+				{ apiNamespace: 'wp/v2/sites/113' },
+				{ apiVersion: '1.2' },
+				{ ' ProxyOrigin': 'https://collector.example' },
+				{ 'proxy%4Frigin': 'https://collector.example' },
+				{ per_page: 5, APINAMESPACE: 'wpcom/v2' },
+			];
+			try {
+				for ( const mode of [ undefined, staging ] ) {
+					const restore = withMockedWpcomRequest( [], mode );
+					try {
+						for ( const query of lifted ) {
+							await expect(
+								wpcomRequestTool.handler(
+									{ siteId: 4242, method: 'GET', path: '/posts', query },
+									context()
+								)
+							).rejects.toThrow( /^wpcom-query-key-refused/ );
+						}
+						if ( mode ) {
+							await expect(
+								wpcomRequestTool.handler(
+									{
+										siteId: 4242,
+										method: 'POST',
+										path: '/posts',
+										query: { proxyOrigin: 'https://collector.example' },
+										body: {},
+									},
+									context()
+								)
+							).rejects.toThrow( /^wpcom-query-key-refused/ );
+						}
+						// A query of ordinary keys still goes to the real tool.
+						await wpcomRequestTool.handler(
+							{ siteId: 4242, method: 'GET', path: '/posts', query: { per_page: 5, origin: 'x' } },
+							context()
+						);
+					} finally {
+						restore();
+					}
+				}
+			} finally {
+				wpcomRequestTool.handler = original;
+			}
+			expect( passedOn ).toHaveBeenCalledTimes( 2 );
+			expect( passedOn.mock.calls.map( ( [ args ] ) => args.query ) ).toEqual( [
+				{ per_page: 5, origin: 'x' },
+				{ per_page: 5, origin: 'x' },
+			] );
+		} );
+
 		describe( 'in a staging case', () => {
 			const staging = { id: 4242, url: 'https://staging-4242.wpcomstaging.com/' };
 

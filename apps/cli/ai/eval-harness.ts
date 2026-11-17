@@ -282,6 +282,20 @@ function effectiveMethod(
 	return write === undefined ? declared : write.trim().toUpperCase() || 'OTHER';
 }
 
+// The query keys the WordPress.com client takes out of a request's query and
+// into its transport (`wpcom`'s send-request): `proxyOrigin` sends the request,
+// with the login, to another origin, and `apiNamespace` and `apiVersion`
+// change the path it reaches.
+const TRANSPORT_KEYS = new Set( [ 'proxyorigin', 'apinamespace', 'apiversion' ] );
+
+/** Whether a query key, decoded, trimmed and in any case, is one the client lifts into its transport. */
+function isTransportKey( key: string ): boolean {
+	return TRANSPORT_KEYS.has( decodeKey( key ).trim().toLowerCase() );
+}
+
+const transportKeyMessage = () =>
+	'wpcom-query-key-refused: this eval case may not pass proxyOrigin, apiNamespace or apiVersion in a query, so the request was not sent. Use the apiNamespace argument for a namespace.';
+
 /** The query a request path carries: from its first `?` up to any `#`, since a fragment is never sent. */
 function pathQuery( requestPath: string ): string {
 	const [ beforeFragment ] = requestPath.split( '#' );
@@ -306,6 +320,14 @@ export function withMockedWpcomRequest(
 	staging?: { site: StagingSite; refused: WpcomWriteAttempt[] }
 ): () => void {
 	const original = wpcomRequestTool.handler;
+	// Every request this sends to the real tool: never one whose query the
+	// client would lift into its transport.
+	const passOn = ( ...[ args, context ]: Parameters< typeof original > ) => {
+		if ( Object.keys( args.query ?? {} ).some( isTransportKey ) ) {
+			throw new Error( transportKeyMessage() );
+		}
+		return original.call( wpcomRequestTool, args, context );
+	};
 	wpcomRequestTool.handler = async ( args, context ) => {
 		const method = effectiveMethod(
 			args.method,
@@ -313,7 +335,7 @@ export function withMockedWpcomRequest(
 			queryOverrideValues( new URLSearchParams( pathQuery( args.path ) ).entries() )
 		);
 		if ( READ_METHODS.has( method ) ) {
-			return original.call( wpcomRequestTool, args, context );
+			return passOn( args, context );
 		}
 		const call: RemoteCall = {
 			operation: 'wpcom-request',
@@ -329,7 +351,7 @@ export function withMockedWpcomRequest(
 		const designated = args.siteId === staging.site.id && ! args.path.startsWith( '!' );
 		calls.push( { ...call, designated } );
 		if ( designated ) {
-			return original.call( wpcomRequestTool, args, context );
+			return passOn( args, context );
 		}
 		staging.refused.push( {
 			code: STAGING_WRITE_CODE,
