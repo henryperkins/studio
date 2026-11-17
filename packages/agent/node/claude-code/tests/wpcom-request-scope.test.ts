@@ -327,6 +327,35 @@ it( 'refuses every query key that changes where a request goes, its method or it
 		).toMatchObject( { wpcomSiteId: 42 } );
 } );
 
+it( 'refuses in a path what only a query or fragment needs, raw or escaped, so a proxy that decodes a path before splitting it reads the same path', () => {
+	const scope = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
+	for ( const suffix of [
+		'/posts%3Fstatus=draft',
+		'/posts%3fstatus',
+		'/posts%23top',
+		'/posts%26status',
+		'/posts%3Dx',
+		'/posts%3dx',
+		'/posts&status',
+		'/posts=x',
+		'/posts/1&_method=DELETE',
+	] )
+		for ( const method of [ 'GET', 'POST' ] )
+			for ( const path of [ suffix, `!/sites/42${ suffix }` ] )
+				expect( scope( { siteId: 42, method, path } ), `${ method } ${ path }` ).toBeUndefined();
+	// What a route needs stays: escapes of other characters, and `+`, `,`, `:`, `@`.
+	for ( const path of [
+		'/media/caf%C3%A9',
+		'/posts/1:2',
+		'/users/a+b',
+		'/tags/a,b',
+		'/users/@me',
+	] )
+		expect( scope( { siteId: 42, method: 'GET', path } ), path ).toMatchObject( {
+			wpcomSiteId: 42,
+		} );
+} );
+
 it( 'refuses a `.` segment, which the parser would drop from the path it decides on', () => {
 	const scope = CLAUDE_STUDIO_TOOL_RULES.get( 'wpcom_request' )!.remote!;
 	for ( const path of [

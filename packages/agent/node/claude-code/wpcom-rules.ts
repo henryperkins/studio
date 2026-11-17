@@ -99,10 +99,13 @@ export function isRefusedWpcomQueryKey( key: string ): boolean {
 const WPCOM_API_ORIGIN = 'https://public-api.wordpress.com';
 
 // A request path: printable ASCII path characters, and percent-escapes that do
-// not decode to whitespace, a control character, '%', '.', '/' or '\'. No
-// query, fragment, backslash or raw whitespace, and no `.` or `..` segment.
+// not decode to whitespace, a control character, '%', '.', '/' or '\', nor to
+// what only a query or fragment needs, '?', '#', '&' or '='. No query,
+// fragment, '&', '=', backslash or raw whitespace, and no `.` or `..` segment:
+// a proxy that decodes a path before it splits off the query reads the same
+// path.
 const WPCOM_PATH =
-	/^(?:[A-Za-z0-9\-._~!$&'()*+,=:@/]|%(?![01][0-9a-f]|2[05ef]|5c|7f)[0-9a-f]{2})*$/i;
+	/^(?:[A-Za-z0-9\-._~!$'()*+,:@/]|%(?![01][0-9a-f]|2[0356ef]|3[df]|5c|7f)[0-9a-f]{2})*$/i;
 
 function isWpcomPath( value: string ): boolean {
 	if ( ! WPCOM_PATH.test( value ) || value.includes( '..' ) || value.split( '/' ).includes( '.' ) )
