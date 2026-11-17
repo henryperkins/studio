@@ -37,6 +37,7 @@ vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 		...actual,
 		getSharedConfigPath: () =>
 			nodePath.join( nodeOs.tmpdir(), 'studio-claude-no-config', 'shared.json' ),
+		getCliConfigPath: () => nodePath.join( nodeOs.tmpdir(), 'studio-claude-no-config', 'cli.json' ),
 	};
 } );
 

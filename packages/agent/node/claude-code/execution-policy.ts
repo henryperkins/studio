@@ -6,7 +6,7 @@ import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected
 import { normalizeHostname as normalizeSiteAddress } from '@studio/common/lib/normalize-hostname';
 import { getCurrentUserId } from '@studio/common/lib/shared-config';
 import { isReprintPullEnabled } from '@studio/common/lib/sync/reprint-pull';
-import { getSharedConfigPath } from '@studio/common/lib/well-known-paths';
+import { getCliConfigPath, getSharedConfigPath } from '@studio/common/lib/well-known-paths';
 import {
 	escapeClaudeApprovalText,
 	isClaudeReadOnlyClass,
@@ -264,6 +264,8 @@ const REFUSALS = {
 		'Studio changes a WordPress.com site only while it is connected to this conversation’s site under the WordPress.com login Studio is signed in with, as site_connected_remote_sites lists it.',
 	wpcomLogin:
 		'Studio acts on WordPress.com only while it is signed in to WordPress.com, and only under the login it was signed in with when the operation was prepared and the user was asked: an operation whose login changed before it started does not run.',
+	stores:
+		'Studio acts on WordPress.com only while the files where it keeps its WordPress.com login, its connections and its previews lie outside every folder this conversation reaches.',
 	preview:
 		'Studio updates or deletes a preview only when it is one of this conversation’s site’s own previews, named by the address preview_list gives for it.',
 	previewOverwrite:
@@ -1285,9 +1287,13 @@ export function createClaudeExecutionPolicy(
 		}
 		// An operation on WordPress.com is prepared, and so asked about, under
 		// the login Studio is signed in with, and what binds it is read under
-		// that login.
+		// that login, from files that must lie out of the turn's reach.
 		let login: number | undefined;
 		if ( WPCOM_OPERATIONS.has( request.name ) ) {
+			if ( ! ( await storesOutsideReach( 'preview' in request ) ) ) {
+				refuse( toolCallId, REFUSALS.stores );
+				return;
+			}
 			login = await storedLogin();
 			if ( login === undefined ) {
 				refuse( toolCallId, REFUSALS.wpcomLogin );
@@ -1394,6 +1400,22 @@ export function createClaudeExecutionPolicy(
 		if ( ! asksFirst( operationClass ) ) return prepared;
 		const grant = await requestApproval( operation, toolCallId, callSignal );
 		return grant ? { ...prepared, grant } : undefined;
+	}
+
+	// Whether the files Studio decides an operation on WordPress.com by lie out
+	// of the turn's reach, so nothing the conversation writes is read as
+	// Studio's own: its shared configuration, which holds the login and the
+	// connections, and for an operation on a preview, the CLI's configuration,
+	// which holds the previews.
+	async function storesOutsideReach( previews: boolean ): Promise< boolean > {
+		try {
+			return (
+				( await isOutsideReach( getSharedConfigPath(), context.localRoots ) ) &&
+				( ! previews || ( await isOutsideReach( getCliConfigPath(), context.localRoots ) ) )
+			);
+		} catch {
+			return false;
+		}
 	}
 
 	// The WordPress.com login Studio is signed in with, by its user id, read
@@ -1513,15 +1535,20 @@ export function createClaudeExecutionPolicy(
 	// The preview of the site the turn acts on that an address names: the one
 	// preview of that site the host lists at exactly that address, as the CLI
 	// finds a preview by its address, read under the login Studio is signed in
-	// with, which the host lists that site's previews for; and that login.
-	// Undefined for anything else, or when the site or its previews cannot be
-	// read.
+	// with, which the host lists that site's previews for, from a store that
+	// lies out of the turn's reach; and that login. Undefined for anything
+	// else, or when the site or its previews cannot be read.
 	async function targetPreview(
 		host: StudioAgentHost,
 		named: unknown
 	): Promise< { login: number; preview: TargetPreview } | undefined > {
 		const targetSite = actingSite;
-		if ( typeof named !== 'string' || actingTarget.environment === 'global' || ! targetSite )
+		if (
+			typeof named !== 'string' ||
+			actingTarget.environment === 'global' ||
+			! targetSite ||
+			! ( await storesOutsideReach( true ) )
+		)
 			return;
 		const site = await resolveTarget( host, targetSite.path );
 		if ( ! site ) return;
@@ -1596,8 +1623,16 @@ export function createClaudeExecutionPolicy(
 			// path the operation receives must still resolve to itself.
 			if ( prepared.file && ( await conversationFile( prepared.file ) ) !== prepared.file.path )
 				return false;
-			// An operation on WordPress.com runs only under the login it was
+			// An operation on WordPress.com runs only while what it was decided by
+			// is still out of the turn's reach, and under the login it was
 			// prepared, and asked about, under.
+			if (
+				prepared.login !== undefined &&
+				! ( await storesOutsideReach( prepared.preview !== undefined ) )
+			) {
+				refuse( toolCallId, REFUSALS.stores );
+				return false;
+			}
 			if ( prepared.login !== undefined && ( await storedLogin() ) !== prepared.login ) {
 				refuse( toolCallId, REFUSALS.wpcomLogin );
 				return false;

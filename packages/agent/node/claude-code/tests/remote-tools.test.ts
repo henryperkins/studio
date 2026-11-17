@@ -50,6 +50,8 @@ vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 		...actual,
 		getConfigDirectory: () => config.root,
 		getSharedConfigPath: () => path.join( config.root, 'shared.json' ),
+		// The preview store, in a folder of its own so a test can reach it alone.
+		getCliConfigPath: () => path.join( config.root, 'cli', 'cli.json' ),
 		getAiPayloadsPath: () => path.join( config.root, 'tmp', 'ai-payloads' ),
 	};
 } );
@@ -71,6 +73,7 @@ beforeAll( async () => {
 		await mkdtemp( path.join( os.tmpdir(), 'studio-claude-config-' ) )
 	);
 	await mkdir( path.join( config.root, 'tmp', 'ai-payloads' ), { recursive: true } );
+	await mkdir( path.join( config.root, 'cli' ) );
 	const server = createServer( ( request, response ) => {
 		let body = '';
 		request.on( 'data', ( chunk ) => ( body += chunk ) );
@@ -140,6 +143,10 @@ const global = ( paths: { parent: string; config: string } ) => ( {
 const text = ( result: { content: Array< { type: string; text?: string } > } ) =>
 	result.content.map( ( part ) => part.text ?? '' ).join( '\n' );
 
+// What Studio says when a file it decides an operation on WordPress.com by
+// lies where the conversation can write.
+const STORES_REFUSAL =
+	'only while the files where it keeps its WordPress.com login, its connections and its previews lie outside every folder this conversation reaches';
 // What Studio says when the WordPress.com login an operation was prepared
 // under is no longer the one Studio is signed in with, or there is none.
 const LOGIN_REFUSAL = 'only under the login it was signed in with when the operation was prepared';
@@ -617,6 +624,38 @@ describe( 'preview_update and preview_delete on the Claude route', () => {
 			host: own.url,
 		} );
 		expect( beforeStart.isError ).toBe( true );
+		expect( ran ).toBe( false );
+	} );
+
+	it( 'decides by no preview record Studio keeps where the conversation can write, says why and asks nothing, checked again immediately before the command starts', async () => {
+		const store = path.join( config.root, 'cli' );
+		const reaching = await setup( ( paths ) => ( { localRoots: [ paths.site, store ] } ) );
+		vi.mocked( reaching.host.previews.list ).mockResolvedValue( [ own ] );
+		for ( const [ name, args ] of [
+			[ 'preview_update', { nameOrPath: 'site', host: own.url } ],
+			[ 'preview_delete', { host: own.url } ],
+		] as const ) {
+			const refused = await reaching.bridge.invoke( name, args );
+			expect( refused.isError, name ).toBe( true );
+			expect( text( refused ), name ).toContain( STORES_REFUSAL );
+		}
+		expect( reaching.context.approve ).not.toHaveBeenCalled();
+		expect( reaching.host.previews.update ).not.toHaveBeenCalled();
+		expect( reaching.host.previews.delete ).not.toHaveBeenCalled();
+		// The store comes into the turn's reach as the command is about to start.
+		const started = await setup();
+		vi.mocked( started.host.previews.list ).mockResolvedValue( [ own ] );
+		let ran = false;
+		vi.mocked( started.host.previews.delete ).mockImplementation(
+			async ( _hostname, _onProgress, options ) => {
+				( started.context.localRoots as string[] ).push( store );
+				await options?.beforeSpawn?.();
+				ran = true;
+			}
+		);
+		expect( ( await started.bridge.invoke( 'preview_delete', { host: own.url } ) ).isError ).toBe(
+			true
+		);
 		expect( ran ).toBe( false );
 	} );
 
