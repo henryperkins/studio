@@ -20,6 +20,7 @@ import {
 import { describe, expect, it, vi } from 'vitest';
 import { discoverClaudeModels, qualifyClaudeStartup } from '../runtime';
 import { reportedStudioServer } from './fixtures/studio-server';
+import type { ClaudeApprovalRequest } from '../execution-policy';
 import type { OwnershipFailure, ProcessOwner } from '@studio/common/lib/owned-process';
 
 const fakeIdentity = {
@@ -3144,6 +3145,157 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 		} finally {
 			await fixture.cleanup();
 		}
+	} );
+
+	// The post-recovery approval gate, wired as a turn wires it: from the note
+	// the turn's journal gives.
+	describe( 'the approval gate of the turn that carries the note', () => {
+		const NOTICE = 'may already have taken effect';
+		// A recovery as recorded, naming the given operations as uncertain.
+		async function recovered( fixture: Fixture, uncertainOperations: unknown[] ) {
+			const { createNativeSessionStore } = await import( '../sessions' );
+			const dead = { runId: 'dead', turnId: 'dead' };
+			await createNativeSessionStore( fixture.storeRoot ).recordRecovery( 'chat', 'token', [
+				{
+					type: 'turn.terminal',
+					...dead,
+					outcome: { status: 'unknown_process_exit', code: 'recovered' },
+				},
+				{
+					type: 'turn.recovered',
+					...dead,
+					lock: 'e'.repeat( 64 ),
+					invalidatedApprovals: [],
+					uncertainOperations,
+				} as never,
+			] );
+		}
+		const uncertainStart = {
+			toolCallId: 'dead-call',
+			tool: 'sites.start',
+			operationClass: 'local-change',
+			description: 'Change local work: sites.start',
+			evidence: 'authorized',
+		};
+		// A turn in which Claude calls one Studio tool on the conversation's site.
+		async function calling(
+			runtime: Runtime,
+			fixture: Fixture,
+			id: string,
+			name: string,
+			args: Record< string, unknown >
+		) {
+			const { Client } = await import( '@modelcontextprotocol/sdk/client/index.js' );
+			// The SDK's wildcard export resolves at runtime, although the ESLint resolver misses it.
+			// eslint-disable-next-line import-x/no-unresolved
+			const { InMemoryTransport } = await import( '@modelcontextprotocol/sdk/inMemory.js' );
+			const results: unknown[] = [];
+			const query = fakeNativeTurn( fixture.root, {
+				projects: fixture.projects,
+				onTurn: async ( options ) => {
+					const [ clientTransport, serverTransport ] = InMemoryTransport.createLinkedPair();
+					const client = new Client( { name: 'studio-test', version: '1.0.0' } );
+					const server = (
+						options.mcpServers as {
+							studio: { instance: { connect( t: unknown ): Promise< void > } };
+						}
+					 ).studio.instance;
+					await Promise.all( [
+						server.connect( serverTransport ),
+						client.connect( clientTransport ),
+					] );
+					results.push( await client.callTool( { name, arguments: args } ) );
+				},
+			} );
+			const approve = vi.fn( async () => 'allow' as const );
+			const events = await turn( runtime, fixture, id, query, { approve } );
+			expect( events.at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'success' },
+			} );
+			expect( results ).toEqual( [ expect.objectContaining( { isError: false } ) ] );
+			return {
+				note: optionsOf( query ).systemPrompt.append,
+				requests: approve.mock.calls.map(
+					( call ) => ( call as unknown[] )[ 0 ] as ClaudeApprovalRequest
+				),
+			};
+		}
+		async function siteFixture( prefix: string ) {
+			const fixture = await ownedNativeFixture( prefix );
+			vi.mocked( fixture.host.sites.resolve ).mockResolvedValue( {
+				id: 'site',
+				path: fixture.root,
+				name: 'site',
+				url: 'http://localhost',
+				phpVersion: '8.4',
+			} );
+			return fixture;
+		}
+
+		it( 'asks before an unprompted change, saying an interrupted attempt may already have taken effect, and asks nothing in the turn after', async () => {
+			const fixture = await siteFixture( 'claude-gate-uncertain-' );
+			try {
+				const runtime = await import( '../runtime' );
+				await recovered( fixture, [ uncertainStart ] );
+				const gated = await calling( runtime, fixture, 'next', 'site_start', {
+					nameOrPath: 'site',
+				} );
+				expect( gated.note ).toContain( 'may or may not have taken effect' );
+				expect( gated.requests.map( ( request ) => request.operation.tool ) ).toEqual( [
+					'sites.start',
+				] );
+				expect( gated.requests[ 0 ].operation.description ).toContain( NOTICE );
+				expect( fixture.host.sites.start ).toHaveBeenCalledOnce();
+				expect( await noted( fixture ) ).toEqual( [
+					expect.objectContaining( { turnId: 'next' } ),
+				] );
+
+				// The note has been given: the next turn is a normal one.
+				const after = await calling( runtime, fixture, 'after', 'site_start', {
+					nameOrPath: 'site',
+				} );
+				expect( after.note ).not.toContain( 'interrupted' );
+				expect( after.requests ).toEqual( [] );
+				expect( fixture.host.sites.start ).toHaveBeenCalledTimes( 2 );
+			} finally {
+				await fixture.cleanup();
+			}
+		} );
+
+		it( 'asks nothing more when the note names no uncertain operation', async () => {
+			const fixture = await siteFixture( 'claude-gate-settled-' );
+			try {
+				const runtime = await import( '../runtime' );
+				await recovered( fixture, [] );
+				const settled = await calling( runtime, fixture, 'next', 'site_start', {
+					nameOrPath: 'site',
+				} );
+				expect( settled.note ).toContain( 'interrupted' );
+				expect( settled.requests ).toEqual( [] );
+				expect( fixture.host.sites.start ).toHaveBeenCalledOnce();
+			} finally {
+				await fixture.cleanup();
+			}
+		} );
+
+		it( 'leaves an operation that already asks as it was: one approval, with no notice', async () => {
+			const fixture = await siteFixture( 'claude-gate-approval-' );
+			try {
+				const runtime = await import( '../runtime' );
+				await recovered( fixture, [ uncertainStart ] );
+				const deleting = await calling( runtime, fixture, 'next', 'site_delete', {
+					nameOrPath: 'site',
+				} );
+				expect( deleting.requests.map( ( request ) => request.operation.tool ) ).toEqual( [
+					'sites.delete',
+				] );
+				expect( deleting.requests[ 0 ].operation.description ).not.toContain( NOTICE );
+				expect( fixture.host.sites.delete ).toHaveBeenCalledOnce();
+			} finally {
+				await fixture.cleanup();
+			}
+		} );
 	} );
 
 	const apiError = ( sessionId: unknown ) => ( {
