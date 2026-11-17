@@ -2,12 +2,14 @@ import {
 	resolveClaudeSession,
 	type ClaudeEffort,
 	type ClaudeSessionSelection,
+	type ClaudeStudioTarget,
 } from '@studio/agent/protocol/claude-code';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { __ } from '@wordpress/i18n';
 import { useState } from 'react';
 import { useAgentRun } from '@/data/agent-runs/use-agent-run';
 import { useConnector } from '@/data/core';
+import { useSites } from '@/data/queries/use-sites';
 import {
 	saveSessionSettingChange,
 	useEntriesWithSettingChanges,
@@ -21,6 +23,7 @@ import {
 	SelectValue,
 	Textarea,
 } from '@/lib/ui';
+import { ClaudeApprovalCard } from './claude-approval-card';
 import { ClaudeNewChat } from './claude-new-chat';
 import { SessionFrame } from './session-frame';
 import styles from './style.module.css';
@@ -37,6 +40,7 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 	const [ pendingModel, setPendingModel ] = useState< string >();
 	const [ answered, setAnswered ] = useState< string[] >( [] );
 	const run = useAgentRun( sessionId );
+	const sites = useSites();
 	let session: ReturnType< typeof resolveClaudeSession >;
 	try {
 		session = resolveClaudeSession( entries );
@@ -121,6 +125,10 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 			write: () => connector.setClaudeSessionSelection( sessionId, next ),
 		} ).catch( ( failure: Error ) => setError( failure.message ) );
 	};
+	const siteNameOf = ( target: ClaudeStudioTarget ) =>
+		target.environment === 'global'
+			? undefined
+			: sites.data?.find( ( site ) => site.id === target.siteId )?.name;
 	const answer = (
 		event: Extract< BackendTurnEvent, { type: 'approval.requested' } >,
 		value: 'allow' | 'deny'
@@ -276,26 +284,13 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 					return null;
 				} ) }
 				{ pending.map( ( event ) => (
-					<div key={ `${ event.runId }:${ event.requestId }` }>
-						<p>{ event.description }</p>
-						{ event.draft ? (
-							<>
-								<p>
-									{ __( 'Site:' ) } { event.draft.siteName }
-								</p>
-								<p>
-									{ __( 'Draft title:' ) } { event.draft.title }
-								</p>
-								{ event.draft.content !== undefined ? (
-									<pre className={ styles.claudeDraftContent }>{ event.draft.content }</pre>
-								) : null }
-							</>
-						) : null }
-						<Button onClick={ () => answer( event, 'allow' ) }>{ __( 'Allow' ) }</Button>
-						<Button variant="outline" onClick={ () => answer( event, 'deny' ) }>
-							{ __( 'Deny' ) }
-						</Button>
-					</div>
+					<ClaudeApprovalCard
+						key={ `${ event.runId }:${ event.requestId }` }
+						request={ event }
+						siteName={ siteNameOf( event.operation.target ) }
+						onAllow={ () => answer( event, 'allow' ) }
+						onDeny={ () => answer( event, 'deny' ) }
+					/>
 				) ) }
 				{ rebindRequired && session ? (
 					<>

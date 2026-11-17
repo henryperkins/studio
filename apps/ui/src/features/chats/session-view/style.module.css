@@ -234,8 +234,3 @@
 	opacity: 0;
 	pointer-events: none;
 }
-
-.claudeDraftContent {
-	white-space: pre-wrap;
-	overflow-wrap: anywhere;
-}
