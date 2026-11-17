@@ -78,19 +78,42 @@ function sitePorts( registryFile: string ): number[] {
 const text = ( value: unknown ) => ( typeof value === 'string' ? value : undefined );
 
 /**
+ * Whether a case reads the Anthropic API key and the provider setting: one on
+ * the default path (no provider named) and one that selects `anthropic-api-key`.
+ * The provider is named in the environment, in the case's `provider` var, or
+ * both. A case on any other provider never reads them.
+ */
+export function caseUsesAnthropicKey( argv: readonly string[], env: NodeJS.ProcessEnv ): boolean {
+	let vars: unknown;
+	try {
+		vars = JSON.parse( argv[ 4 ] ?? '' )?.vars;
+	} catch {
+		vars = undefined;
+	}
+	const named = [ env.STUDIO_EVAL_PROVIDER, ( vars as { provider?: unknown } | null )?.provider ]
+		.map( ( provider ) => ( typeof provider === 'string' ? provider.trim() : '' ) )
+		.filter( Boolean );
+	return named.length === 0 || named.includes( 'anthropic-api-key' );
+}
+
+/**
  * Makes the case's profile and registry in `tmpdir` and points `env` at them
  * (`DEV_CONFIG_DIR`, which every Studio path helper reads first,
  * `E2E_SHARED_CONFIG_PATH` and `E2E_CLI_CONFIG_PATH`). From the source it
- * takes only a copy of what `shared.json` holds for signing in and choosing
- * the AI provider (the WordPress.com login, the provider and its Anthropic
- * key, read from the source's registry when `shared.json` has neither, as
- * Studio reads them), links to Studio's downloads, and the ports the user's
+ * takes only a copy of what `shared.json` holds for signing in (the
+ * WordPress.com login) and, for a case that uses them (`caseUsesAnthropicKey`),
+ * the AI provider and its Anthropic key (read from the source's registry when
+ * `shared.json` has neither, as Studio reads them), links to Studio's downloads, and the ports the user's
  * sites have. Throws when the source has no readable `shared.json`, leaving
  * nothing behind.
  */
 export function isolateCaseProfile(
 	env: NodeJS.ProcessEnv,
-	{ tmpdir = os.tmpdir(), home = os.homedir() }: { tmpdir?: string; home?: string } = {}
+	{
+		tmpdir = os.tmpdir(),
+		home = os.homedir(),
+		argv = process.argv,
+	}: { tmpdir?: string; home?: string; argv?: readonly string[] } = {}
 ): CaseProfile {
 	const source = sourceConfigDirectory( env, home );
 	const sourceRegistry = sourceRegistryFile( env, source );
@@ -122,8 +145,12 @@ export function isolateCaseProfile(
 			JSON.stringify( {
 				version: shared.version,
 				authToken: shared.authToken,
-				aiProvider: text( legacy.aiProvider ),
-				anthropicApiKey: text( legacy.anthropicApiKey ),
+				...( caseUsesAnthropicKey( argv, env )
+					? {
+							aiProvider: text( legacy.aiProvider ),
+							anthropicApiKey: text( legacy.anthropicApiKey ),
+					  }
+					: {} ),
 			} ),
 			{ mode: 0o600 }
 		);

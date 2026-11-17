@@ -178,4 +178,82 @@ describe( 'an eval case’s own Studio profile', () => {
 		removeCaseProfile( warn );
 		expect( warn ).not.toHaveBeenCalled();
 	} );
+
+	describe( 'the Anthropic API key and the provider setting', () => {
+		const argvFor = ( vars: Record< string, unknown > ) => [
+			'node',
+			'eval-runner.mjs',
+			'Reply READY.',
+			'',
+			JSON.stringify( { vars } ),
+		];
+
+		it.each( [
+			[ 'a chatgpt-oauth selection named by the case', { provider: 'chatgpt-oauth' }, {}, false ],
+			[
+				'a chatgpt-oauth selection named by the environment',
+				{},
+				{ STUDIO_EVAL_PROVIDER: 'chatgpt-oauth' },
+				false,
+			],
+			[ 'a wpcom selection', { provider: 'wpcom' }, {}, false ],
+			[ 'an openai-api-key selection', { provider: 'openai-api-key' }, {}, false ],
+			[
+				'an anthropic-api-key selection named by the case',
+				{ provider: 'anthropic-api-key' },
+				{},
+				true,
+			],
+			[
+				'an anthropic-api-key selection named by the environment',
+				{},
+				{ STUDIO_EVAL_PROVIDER: ' anthropic-api-key ' },
+				true,
+			],
+			[ 'a case on the default path', { model: 'claude-sonnet-4-6' }, {}, true ],
+		] )( 'for %s, the key is copied: %s', async ( _name, vars, extraEnv, copied ) => {
+			writeShared( {
+				version: 1,
+				authToken: { accessToken: 'made-up-login' },
+				aiProvider: 'anthropic-api-key',
+				anthropicApiKey: 'made-up-key',
+			} );
+			const { isolateCaseProfile } = await load();
+			const made = isolateCaseProfile(
+				{ DEV_CONFIG_DIR: source, ...extraEnv },
+				{ tmpdir: path.join( tmp, 'temp' ), argv: argvFor( vars ) }
+			);
+			const onDisk = fs.readFileSync( path.join( made.profile, 'shared.json' ), 'utf8' );
+			expect( JSON.parse( onDisk ) ).toEqual(
+				copied
+					? {
+							version: 1,
+							authToken: { accessToken: 'made-up-login' },
+							aiProvider: 'anthropic-api-key',
+							anthropicApiKey: 'made-up-key',
+					  }
+					: { version: 1, authToken: { accessToken: 'made-up-login' } }
+			);
+			expect( onDisk.includes( 'made-up-key' ) ).toBe( copied );
+		} );
+
+		it( 'copies nothing of the legacy registry’s key into a case that does not use it', async () => {
+			writeShared( { version: 1 } );
+			fs.writeFileSync(
+				path.join( source, 'cli.json' ),
+				JSON.stringify( {
+					aiProvider: 'anthropic-api-key',
+					anthropicApiKey: 'made-up-legacy-key',
+				} )
+			);
+			const { isolateCaseProfile } = await load();
+			const made = isolateCaseProfile(
+				{ DEV_CONFIG_DIR: source },
+				{ tmpdir: path.join( tmp, 'temp' ), argv: argvFor( { provider: 'chatgpt-oauth' } ) }
+			);
+			expect( fs.readFileSync( path.join( made.profile, 'shared.json' ), 'utf8' ) ).not.toContain(
+				'made-up-legacy-key'
+			);
+		} );
+	} );
 } );
