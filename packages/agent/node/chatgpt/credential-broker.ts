@@ -317,6 +317,24 @@ const isSuperseded = ( held: SessionCredentials, account: ChatGptAccount ) =>
 
 const escapeRegExp = ( text: string ) => text.replace( /[.*+?^${}()|[\]\\]/g, '\\$&' );
 
+// A path's name segment ends at a separator, a space, a quote or punctuation.
+const NAME_SEGMENT = '[^\\\\/\\s\'"`‘’“”:;,()<>|[\\]{}]+';
+// The name after a `Users` or `home` segment, in either slash style and any
+// case; words a space apart count as one name when a separator follows them.
+const HOME_SEGMENT = new RegExp(
+	`(^|[\\\\/\\s'"\`‘’“”(])(users|home)([\\\\/])` +
+		`(?:${ NAME_SEGMENT }(?: ${ NAME_SEGMENT })*(?=[\\\\/])|${ NAME_SEGMENT })`,
+	'giu'
+);
+
+function accountHome(): string | undefined {
+	try {
+		return os.userInfo().homedir;
+	} catch {
+		return undefined;
+	}
+}
+
 /**
  * What a keychain tool said, as the user, the transcript and a session file
  * may see it: its first line, without terminal escapes or other control
@@ -330,13 +348,18 @@ function cleanKeychainDetail( text: string ): string | undefined {
 		.replace( /\u001b\[[0-?]*[ -/]*[@-~]/g, '' )
 		.replace( /\t/g, ' ' )
 		.replace( /\p{Cc}/gu, '' );
-	const home = os.homedir();
-	if ( home && home !== path.parse( home ).root ) {
-		const windows = process.platform === 'win32';
+	const windows = process.platform === 'win32';
+	// HOME, and the account's own home where HOME names another.
+	for ( const home of new Set( [ os.homedir(), accountHome() ] ) ) {
+		if ( ! home || home === path.parse( home ).root ) {
+			continue;
+		}
 		for ( const form of new Set( [ home, windows ? home.replace( /\\/g, '/' ) : home ] ) ) {
 			line = line.replace( new RegExp( escapeRegExp( form ), windows ? 'gi' : 'g' ), '~' );
 		}
 	}
+	// Any other spelling of a home: a short name, a share, another case.
+	line = line.replace( HOME_SEGMENT, '$1$2$3~' );
 	line = line.trim();
 	if ( line.length > KEYCHAIN_DETAIL_MAX_LENGTH ) {
 		line = `${ line.slice( 0, KEYCHAIN_DETAIL_MAX_LENGTH - 1 ).trimEnd() }…`;

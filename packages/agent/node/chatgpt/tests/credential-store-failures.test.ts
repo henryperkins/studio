@@ -346,6 +346,95 @@ describe( 'a ChatGPT sign-in when the system keychain fails', () => {
 		}
 	);
 
+	// However the tool spells a user's home, its name never reaches the detail.
+	describe( 'when the keychain tool names a home another way', () => {
+		const detailFor = async ( platform: Platform, said: string ) => {
+			const failed = await createChatGptCredentialBroker( {
+				tokenClient: unreachableTokenService,
+				credentialStore: failingKeychain( platform, answer( 1, said ) ).store,
+			} )
+				.saveSignIn( signIn( 'vault' ) )
+				.catch( ( error: unknown ) => error );
+			expect( failed ).toMatchObject( { code: 'vault-unavailable' } );
+			return ( failed as ChatGptConnectionError ).detail!.replace(
+				/^Couldn't read from the system keychain: /,
+				''
+			);
+		};
+
+		it.each( [
+			[
+				'win32',
+				'an 8.3 short name',
+				'can’t open C:\\Users\\JOHNSM~1\\AppData\\Local\\keys.db',
+				'can’t open C:\\Users\\~\\AppData\\Local\\keys.db',
+			],
+			[
+				'win32',
+				'an administrative share',
+				'can’t open \\\\localhost\\c$\\Users\\john.smith\\AppData\\keys.db',
+				'can’t open \\\\localhost\\c$\\Users\\~\\AppData\\keys.db',
+			],
+			[
+				'win32',
+				'forward slashes and a name with a space',
+				'can’t open C:/USERS/John Smith/AppData/keys.db (denied)',
+				'can’t open C:/USERS/~/AppData/keys.db (denied)',
+			],
+			[
+				'darwin',
+				'a lower-case /users',
+				'can’t open /users/jsmith/Library/Keychains/login.keychain-db',
+				'can’t open /users/~/Library/Keychains/login.keychain-db',
+			],
+			[
+				'darwin',
+				'a home that ends the path',
+				'no keychain for “/Users/jsmith”',
+				'no keychain for “/Users/~”',
+			],
+			[
+				'linux',
+				'a home under /home',
+				'can’t open /home/jsmith/.local/share/keyrings/login.keyring: locked',
+				'can’t open /home/~/.local/share/keyrings/login.keyring: locked',
+			],
+		] as const )(
+			'on %s, writes the name in %s as ~',
+			async ( platform, _spelling, said, clean ) => {
+				expect( await detailFor( platform, said ) ).toBe( clean );
+			}
+		);
+
+		it.each( [ 'darwin', 'linux', 'win32' ] as const )(
+			'on %s, writes the account’s own home as ~ when HOME names another',
+			async ( platform ) => {
+				const accountHome =
+					process.platform === 'win32' ? 'D:\\Profiles\\jsmith' : '/srv/accounts/jsmith';
+				vi.spyOn( os, 'homedir' ).mockReturnValue( path.join( os.tmpdir(), 'another-home' ) );
+				vi.spyOn( os, 'userInfo' ).mockReturnValue( {
+					...os.userInfo(),
+					homedir: accountHome,
+				} );
+
+				const detail = await detailFor(
+					platform,
+					`can’t open ${ path.join( accountHome, 'keys.db' ) }`
+				);
+
+				expect( detail ).toBe( `can’t open ~${ path.sep }keys.db` );
+			}
+		);
+
+		it.each( [ 'darwin', 'linux', 'win32' ] as const )(
+			'on %s, leaves text that names no path as it is',
+			async ( platform ) => {
+				const said = 'secret-tool: Cannot get secret of a locked object (users: 2, home: none)';
+				expect( await detailFor( platform, said ) ).toBe( said );
+			}
+		);
+	} );
+
 	// What a secure sign-in checks before the browser opens: a keychain read,
 	// and the prompt or tool run it may cost, only while a saved sign-in needs the key.
 	it.each( [ 'darwin', 'linux', 'win32' ] as const )(
