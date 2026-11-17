@@ -593,6 +593,189 @@ describe( 'preview_update and preview_delete on the Claude route', () => {
 	} );
 } );
 
+// The conversation's site is connected to `fakeRemoteSite` (111), and a
+// staging copy of it (112); another local site is connected to 333.
+const connections = [
+	fakeRemoteSite,
+	{ ...fakeRemoteSite, id: 112, name: 'Staging', url: 'https://staging.example.test' },
+	{ ...fakeRemoteSite, id: 333, localSiteId: 'other-site', url: 'https://other.example.test' },
+];
+const REMOTE_REFUSAL = 'only when it is connected to this conversation’s site';
+const OPTIONS_REFUSAL = 'only with options from this list';
+
+describe( 'site_push on the Claude route', () => {
+	it( 'pushes the conversation’s site to one of its connected WordPress.com sites, named by its address, once the user approves it, showing the direction, the site and what it overwrites there, journaled before the command', async () => {
+		const fixture = await setup();
+		const { bridge, host, context, journal, events, site, localSite } = fixture;
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		const order = journalOrder( fixture, { 'sync.push': host.sync.push } );
+		expect( bridge.tools ).toContain( 'site_push' );
+		const result = await bridge.invoke( 'site_push', {
+			nameOrPath: 'site',
+			remoteSite: 'https://MyProd.wordpress.com/',
+			options: 'sqls, plugins',
+		} );
+		expect( result.isError ).toBe( false );
+		expect( getConnectedWpcomSitesForLocalSite ).toHaveBeenCalledWith( 'site-123' );
+		expect( host.sync.push ).toHaveBeenCalledWith(
+			localSite,
+			'sqls,plugins',
+			'111',
+			expect.any( Function ),
+			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+		);
+		expect( context.approve ).toHaveBeenCalledOnce();
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		expect( request.operation ).toMatchObject( {
+			tool: 'sync.push',
+			operationClass: 'remote-overwrite',
+			args: [
+				{ direction: 'push', remoteSite: 111, overwrites: [ 'the database', 'the plugins' ] },
+			],
+			localPaths: [ site ],
+			remote: 'WordPress.com site 111',
+		} );
+		expect( request.operation.description ).toContain(
+			'replaces what overwrites names on that site'
+		);
+		expect( order ).toEqual( [ 'journal site_push', 'journal sync.push', 'host sync.push' ] );
+		expect( journal[ 1 ] ).toMatchObject( { requestId: request.requestId } );
+		expect( JSON.stringify( [ journal, events ] ) ).not.toContain( LOGIN.accessToken );
+	} );
+
+	it( 'pushes, in a conversation on the live site, to that site by its ID, everything by default', async () => {
+		const { bridge, host, context } = await setup( () => ( {
+			target: { environment: 'live' as const, siteId: 'site-123', wpcomSiteId: 111 },
+		} ) );
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		const result = await bridge.invoke( 'site_push', { nameOrPath: 'site', remoteSite: '111' } );
+		expect( result.isError ).toBe( false );
+		expect( host.sync.push ).toHaveBeenCalledWith(
+			expect.objectContaining( { id: 'site-123' } ),
+			'all',
+			'111',
+			expect.any( Function ),
+			expect.anything()
+		);
+		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation.args ).toEqual( [
+			{
+				direction: 'push',
+				remoteSite: 111,
+				overwrites: [ 'the database and every file in wp-content' ],
+			},
+		] );
+	} );
+
+	it( 'pushes to no site but a connected one of the conversation’s site, decided by its ID, nor from a conversation without a site, says why and asks nothing', async () => {
+		const onSite = await setup();
+		const onLive = await setup( () => ( {
+			target: { environment: 'live' as const, siteId: 'site-123', wpcomSiteId: 112 },
+		} ) );
+		const unbound = await setup( global );
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( [
+			...connections,
+			// Two connections at one address.
+			{ ...fakeRemoteSite, id: 113, url: 'https://twice.example.test' },
+			{ ...fakeRemoteSite, id: 114, url: 'https://twice.example.test' },
+		] );
+		const calls: Array< [ Fixture, unknown ] > = [
+			[ onSite, '222' ],
+			[ onSite, 'https://unconnected.example.test' ],
+			[ onSite, '333' ],
+			[ onSite, 'https://other.example.test' ],
+			[ onSite, 'https://twice.example.test' ],
+			[ onSite, '0x6f' ],
+			[ onSite, '111.0' ],
+			[ onLive, '111' ],
+		];
+		for ( const [ fixture, remoteSite ] of calls ) {
+			const result = await fixture.bridge.invoke( 'site_push', { nameOrPath: 'site', remoteSite } );
+			expect( result.isError, String( remoteSite ) ).toBe( true );
+			expect( text( result ), String( remoteSite ) ).toContain( REMOTE_REFUSAL );
+		}
+		// The site a call names is refused before any remote is judged.
+		expect(
+			( await onSite.bridge.invoke( 'site_push', { nameOrPath: 'other', remoteSite: '333' } ) )
+				.isError
+		).toBe( true );
+		expect(
+			( await unbound.bridge.invoke( 'site_push', { nameOrPath: 'site', remoteSite: '111' } ) )
+				.isError
+		).toBe( true );
+		for ( const { host, context } of [ onSite, onLive, unbound ] ) {
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( host.sync.push ).not.toHaveBeenCalled();
+		}
+	} );
+
+	it( 'takes only the options the command takes, as the tool describes them, each once, and no remote picked for it', async () => {
+		const { bridge, host, policy, localSite, context } = await setup();
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		for ( const options of [ 'paths', 'all,sqls', 'sqls,sqls', '', ' , ', 'everything', 'SQLS' ] ) {
+			const result = await bridge.invoke( 'site_push', {
+				nameOrPath: 'site',
+				remoteSite: '111',
+				options,
+			} );
+			expect( result.isError, options ).toBe( true );
+			expect( text( result ), options ).toContain( OPTIONS_REFUSAL );
+		}
+		await expect(
+			policy.guardHost( host, 'picker' ).sync.push( localSite, 'all', undefined, () => {} )
+		).rejects.toThrow( 'Denied' );
+		expect( context.approve ).not.toHaveBeenCalled();
+		expect( host.sync.push ).not.toHaveBeenCalled();
+	} );
+
+	it( 'checks the connection again once the user has answered and immediately before the command starts', async () => {
+		const answered = await setup();
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		vi.mocked( answered.context.approve ).mockImplementationOnce( async () => {
+			vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( [] );
+			return 'allow';
+		} );
+		expect(
+			( await answered.bridge.invoke( 'site_push', { nameOrPath: 'site', remoteSite: '111' } ) )
+				.isError
+		).toBe( true );
+		expect( answered.host.sync.push ).not.toHaveBeenCalled();
+		const started = await setup();
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		let ran = false;
+		vi.mocked( started.host.sync.push ).mockImplementation(
+			async ( _site, _options, _remote, _onProgress, fence ) => {
+				vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( [
+					{ ...fakeRemoteSite, localSiteId: 'other-site' },
+				] );
+				await fence?.beforeSpawn?.();
+				ran = true;
+				return fakeRemoteSite;
+			}
+		);
+		expect(
+			( await started.bridge.invoke( 'site_push', { nameOrPath: 'site', remoteSite: '111' } ) )
+				.isError
+		).toBe( true );
+		expect( ran ).toBe( false );
+	} );
+
+	it( 'decides by no connection Studio keeps where the conversation can write, and keeps its archive out of the turn’s reach', async () => {
+		const temporary = await realpath( os.tmpdir() );
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
+		for ( const reach of [ config.root, temporary ] ) {
+			const { bridge, host, context } = await setup( ( paths ) => ( {
+				localRoots: [ paths.site, reach ],
+			} ) );
+			expect(
+				( await bridge.invoke( 'site_push', { nameOrPath: 'site', remoteSite: '111' } ) ).isError,
+				reach
+			).toBe( true );
+			expect( context.approve ).not.toHaveBeenCalled();
+			expect( host.sync.push ).not.toHaveBeenCalled();
+		}
+	} );
+} );
+
 describe( 'site_connected_remote_sites on the Claude route', () => {
 	// The account's own listing of its sites, as WordPress.com answers it: the
 	// site connected to the conversation's site, and another one.

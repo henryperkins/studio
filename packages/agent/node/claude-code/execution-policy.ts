@@ -2,6 +2,9 @@ import { createHash, randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
+import { normalizeHostname as normalizeSiteAddress } from '@studio/common/lib/normalize-hostname';
+import { getSharedConfigPath } from '@studio/common/lib/well-known-paths';
 import {
 	escapeClaudeApprovalText,
 	isClaudeReadOnlyClass,
@@ -247,7 +250,38 @@ const REFUSALS = {
 		'Studio updates a preview only from the site it was made from, so overwrite must be false or left out.',
 	scratch:
 		'Studio runs this operation only while the system’s temporary folder, where its command keeps the archive it sends or receives, lies outside every folder this conversation reaches.',
+	remoteSite:
+		'Studio pushes to or pulls from a WordPress.com site only when it is connected to this conversation’s site, as site_connected_remote_sites lists it, named by its numeric ID or its address; in a conversation on a live site, only that site.',
+	syncOptions:
+		'Studio pushes or pulls only with options from this list, each once, separated by commas: all (alone), sqls, uploads, plugins, themes, contents.',
 } as const;
+
+// What a push or pull with each option overwrites on the side it copies to:
+// the options the CLI's commands take that the tools describe. `paths` is
+// left out: it needs a list of paths no tool passes.
+const SYNC_OVERWRITES: Readonly< Record< string, string > > = Object.freeze( {
+	all: 'the database and every file in wp-content',
+	sqls: 'the database',
+	uploads: 'the uploads',
+	plugins: 'the plugins',
+	themes: 'the themes',
+	contents: 'every file in wp-content',
+} );
+
+// The options a push or pull runs with, as the CLI reads a comma-separated
+// list: each one it takes and the tools describe, once, `all` alone.
+// Undefined for anything else.
+function syncSelection( options: unknown ): string[] | undefined {
+	if ( typeof options !== 'string' ) return;
+	const items = options.split( ',' ).map( ( item ) => item.trim() );
+	if (
+		items.some( ( item ) => ! Object.prototype.hasOwnProperty.call( SYNC_OVERWRITES, item ) ) ||
+		new Set( items ).size !== items.length ||
+		( items.includes( 'all' ) && items.length > 1 )
+	)
+		return;
+	return items;
+}
 
 function deepFreeze< T >( value: T ): T {
 	if ( value && typeof value === 'object' && ! Object.isFrozen( value ) ) {
@@ -298,6 +332,15 @@ interface HostRequest {
 	 * there; that folder must lie outside every folder the turn reaches.
 	 */
 	scratch?: true;
+	/**
+	 * The WordPress.com site a push or pull syncs with, by the numeric ID or
+	 * address the caller named. It must be connected to the site the turn acts
+	 * on, and in a conversation on a live site be that site; the operation
+	 * receives its numeric ID. `syncOptions` come with it.
+	 */
+	wpcomSite?: unknown;
+	/** The sync options as the caller named them; the operation receives them as checked. */
+	syncOptions?: unknown;
 	/** What the approval and the journal say of the operation after its class and name: a fixed sentence. */
 	note?: string;
 }
@@ -312,6 +355,8 @@ interface TargetPreview {
 interface CheckedHostValues {
 	file?: string;
 	preview?: string;
+	wpcomSite?: string;
+	syncOptions?: string;
 }
 
 interface PreparedHostOperation {
@@ -323,6 +368,9 @@ interface PreparedHostOperation {
 	/** The preview as checked. */
 	preview?: TargetPreview;
 	scratch?: true;
+	/** The WordPress.com site and the sync options as checked. */
+	wpcomSite?: number;
+	syncOptions?: string;
 }
 
 const WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
@@ -1035,6 +1083,31 @@ export function createClaudeExecutionPolicy(
 			args = [ preview.url, ...args ];
 			remote = preview.url;
 		}
+		let wpcomSite: number | undefined;
+		let syncOptions: string[] | undefined;
+		if ( 'wpcomSite' in request ) {
+			wpcomSite = await connectedRemote( request.wpcomSite );
+			if ( wpcomSite === undefined ) {
+				refuse( toolCallId, REFUSALS.remoteSite );
+				return;
+			}
+			syncOptions = syncSelection( request.syncOptions );
+			if ( ! syncOptions ) {
+				refuse( toolCallId, REFUSALS.syncOptions );
+				return;
+			}
+			// The approval shows which way the copy goes, the WordPress.com site
+			// and what the copy overwrites where it lands.
+			args = [
+				{
+					direction: request.name === 'sync.pull' ? 'pull' : 'push',
+					remoteSite: wpcomSite,
+					overwrites: syncOptions.map( ( option ) => SYNC_OVERWRITES[ option ] ),
+				},
+				...args,
+			];
+			remote = `WordPress.com site ${ wpcomSite }`;
+		}
 		if ( request.scratch && ! ( await scratchOutsideReach() ) ) {
 			refuse( toolCallId, REFUSALS.scratch );
 			return;
@@ -1070,10 +1143,55 @@ export function createClaudeExecutionPolicy(
 				  }
 				: {} ),
 		};
-		const prepared = { operation, site, file, preview, scratch: request.scratch };
+		const prepared = {
+			operation,
+			site,
+			file,
+			preview,
+			scratch: request.scratch,
+			wpcomSite,
+			syncOptions: syncOptions?.join( ',' ),
+		};
 		if ( ! asksFirst( operationClass ) ) return prepared;
 		const grant = await requestApproval( operation, toolCallId, callSignal );
 		return grant ? { ...prepared, grant } : undefined;
+	}
+
+	// The WordPress.com site a push or pull may sync with, by the numeric ID or
+	// address the caller named, decided as the CLI finds a site by either: one
+	// connected to the site the turn acts on, which in a conversation on a live
+	// site must be that site, read from the connections Studio keeps, which must
+	// lie out of the turn's reach. Its numeric ID, or undefined.
+	async function connectedRemote( named: unknown ): Promise< number | undefined > {
+		const target = actingTarget;
+		const targetSite = actingSite;
+		if ( typeof named !== 'string' || target.environment === 'global' || ! targetSite ) return;
+		try {
+			if ( ! ( await isOutsideReach( getSharedConfigPath(), context.localRoots ) ) ) return;
+			const byId = /^[1-9][0-9]*$/.test( named );
+			const ids = new Set(
+				( await getConnectedWpcomSitesForLocalSite( targetSite.id ) )
+					.filter(
+						( connected ) =>
+							connected.localSiteId === targetSite.id &&
+							( byId
+								? connected.id === Number( named )
+								: normalizeSiteAddress( connected.url ) === normalizeSiteAddress( named ) )
+					)
+					.map( ( connected ) => connected.id )
+			);
+			const [ id ] = ids;
+			if (
+				ids.size !== 1 ||
+				! Number.isSafeInteger( id ) ||
+				id <= 0 ||
+				( target.environment === 'live' && target.wpcomSiteId !== id )
+			)
+				return;
+			return id;
+		} catch {
+			return;
+		}
 	}
 
 	// Whether the system's temporary folder, where a command keeps the archive
@@ -1168,6 +1286,12 @@ export function createClaudeExecutionPolicy(
 			)
 				return false;
 			if ( prepared.scratch && ! ( await scratchOutsideReach() ) ) return false;
+			// And the WordPress.com site: still connected to the site the turn acts on.
+			if (
+				prepared.wpcomSite !== undefined &&
+				( await connectedRemote( String( prepared.wpcomSite ) ) ) !== prepared.wpcomSite
+			)
+				return false;
 			if (
 				prepared.operation.tool === 'sites.wpCli' &&
 				( ! targetSite || ( await hasWpCliOverrides( targetSite.path ) ) )
@@ -1267,7 +1391,12 @@ export function createClaudeExecutionPolicy(
 					},
 				},
 				prepared.operation,
-				{ file: prepared.file?.path, preview: prepared.preview?.url }
+				{
+					file: prepared.file?.path,
+					preview: prepared.preview?.url,
+					wpcomSite: prepared.wpcomSite === undefined ? undefined : String( prepared.wpcomSite ),
+					syncOptions: prepared.syncOptions,
+				}
 			);
 		};
 		// A read a tool makes of a site: of a site it may reach, under the turn's
@@ -1475,11 +1604,28 @@ export function createClaudeExecutionPolicy(
 					),
 			},
 			sync: {
+				// The site the turn acts on, to a WordPress.com site connected to it,
+				// with the options checked; the CLI's `push` receives both as checked,
+				// never a remote left for it to pick.
 				push: ( site, options, remoteSite, onProgress ) =>
 					run(
-						{ name: 'sync.push', site, args: [ options, remoteSite ?? null ], remote: remoteSite },
-						( current, fenceOptions ) =>
-							host.sync.push( current!, options, remoteSite, onProgress, fenceOptions )
+						{
+							name: 'sync.push',
+							site,
+							args: [],
+							wpcomSite: remoteSite,
+							syncOptions: options,
+							scratch: true,
+							note: 'It uploads this local site to one of its connected WordPress.com sites and replaces what overwrites names on that site',
+						},
+						( current, fenceOptions, _operation, checked ) =>
+							host.sync.push(
+								current!,
+								checked.syncOptions!,
+								checked.wpcomSite!,
+								onProgress,
+								fenceOptions
+							)
 					),
 				pull: ( site, options, remoteSite, onProgress ) =>
 					run(

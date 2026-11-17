@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { writeFile } from 'fs/promises';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fakePreview, fakeSite } from '../../tests/fake-host';
+import { fakePreview, fakeRemoteSite, fakeSite } from '../../tests/fake-host';
 import {
 	CLAUDE_NATIVE_TOOL_RULES,
 	CLAUDE_STUDIO_TOOL_RULES,
@@ -31,6 +31,23 @@ vi.mock( 'fs/promises', async ( importOriginal ) => {
 		return handle;
 	};
 	return { ...actual, default: { ...actual, open }, open };
+} );
+
+// The connections Studio keeps: the target site is connected to
+// `fakeRemoteSite`, in a store that lies outside every folder a turn reaches.
+vi.mock( '@studio/common/lib/connected-sites', async () => {
+	const { fakeRemoteSite } = await import( '../../tests/fake-host' );
+	return { getConnectedWpcomSitesForLocalSite: vi.fn( async () => [ fakeRemoteSite ] ) };
+} );
+vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('@studio/common/lib/well-known-paths') >();
+	const { default: nodePath } = await import( 'path' );
+	const { default: nodeOs } = await import( 'os' );
+	return {
+		...actual,
+		getSharedConfigPath: () =>
+			nodePath.join( nodeOs.tmpdir(), 'studio-claude-no-config', 'shared.json' ),
+	};
 } );
 
 // Every rule an operation can run under, enabled whether or not it is
@@ -220,7 +237,10 @@ const HOST_CALLS: Record<
 		host: listingPreview,
 		call: ( host ) => host.previews.delete( fakePreview.url, () => {} ),
 	},
-	'sync.push': { call: ( host ) => host.sync.push( site, 'all', 'remote', () => {} ) },
+	// A WordPress.com site connected to the target site.
+	'sync.push': {
+		call: ( host ) => host.sync.push( site, 'all', String( fakeRemoteSite.id ), () => {} ),
+	},
 	'sync.pull': { call: ( host ) => host.sync.pull( site, 'all', 'remote', () => {} ) },
 };
 

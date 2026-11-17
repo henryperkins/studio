@@ -47,6 +47,23 @@ import type { ClaudeOperation } from '../execution-policy';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
 import type { ClaudeOperationClass } from '@studio/agent/protocol/claude-code';
 
+// The connections Studio keeps: the target site is connected to
+// `fakeRemoteSite`, in a store that lies outside every folder a turn reaches.
+vi.mock( '@studio/common/lib/connected-sites', async () => {
+	const { fakeRemoteSite } = await import( '../../tests/fake-host' );
+	return { getConnectedWpcomSitesForLocalSite: vi.fn( async () => [ fakeRemoteSite ] ) };
+} );
+vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
+	const actual = await importOriginal< typeof import('@studio/common/lib/well-known-paths') >();
+	const { default: nodePath } = await import( 'path' );
+	const { default: nodeOs } = await import( 'os' );
+	return {
+		...actual,
+		getSharedConfigPath: () =>
+			nodePath.join( nodeOs.tmpdir(), 'studio-claude-no-config', 'shared.json' ),
+	};
+} );
+
 const cleanups: Array< () => Promise< void > > = [];
 afterEach( async () => {
 	await Promise.all( cleanups.splice( 0 ).map( ( cleanup ) => cleanup() ) );
@@ -151,7 +168,7 @@ describe( 'Claude tool use at the SDK hook and native permission request', () =>
 			[ 'Task', { prompt: 'anything' } ],
 			[ 'mcp__studio__wp_cli', {}, { name: 'studio', source: 'project' } ],
 			[ 'mcp__studio__wp_cli', {} ],
-			[ 'mcp__studio__site_push', {}, studioServer ],
+			[ 'mcp__studio__send_feedback', {}, studioServer ],
 			[ 'mcp__other__wp_cli', {}, { name: 'other', source: 'sdk' } ],
 		];
 		for ( const [ toolName, input, server ] of denied )
@@ -429,7 +446,7 @@ describe( 'Claude approvals at host execution', () => {
 			} ),
 			expect.any( AbortSignal )
 		);
-		await guarded.sync.push( localSite, 'all', 'remote.example', () => {} );
+		await guarded.sync.push( localSite, 'all', '111', () => {} );
 		await guarded.previews.create( localSite, () => {} );
 		expect( context.approve ).toHaveBeenCalledTimes( 3 );
 		policy.dispose();
