@@ -39,6 +39,9 @@ const feedback = vi.hoisted( () => ( {
 	answer: {} as Record< string, unknown >,
 } ) );
 
+const settledReceipts = ( ids: number[] ) =>
+	ids.map( ( id ) => `studio-media-settled:${ id }\n` ).join( '' );
+
 vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('@studio/common/lib/well-known-paths') >();
 	const nodePath = await import( 'path' );
@@ -328,10 +331,14 @@ describe( 'generate_images on the Claude route', () => {
 		JSON.parse(
 			Buffer.from( /base64_decode\( '([^']+)' \)/.exec( php )![ 1 ], 'base64' ).toString()
 		);
+	const confirmation = ( php: string ) => {
+		const { ready, failed } = decoded( php );
+		return settledReceipts( [ ...ready, ...failed ] );
+	};
 	const SITE_FILES = 'inside the folder of this conversation’s site';
 	// What the uploads check establishes, and only that: not where the uploads are.
 	const UPLOADS_OUTSIDE =
-		'here the folder for this month’s uploads is not an existing folder inside this site’s folder';
+		'the folder for this month’s uploads is not an existing folder inside this site’s folder';
 	const UPLOADS_CAUSE = 'keeps its uploads outside';
 	const ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
 
@@ -348,9 +355,9 @@ describe( 'generate_images on the Claude route', () => {
 		host.sites.wpCli = vi.fn( async ( site, args ) => {
 			const php = args[ 1 ] ?? '';
 			if ( ! php.includes( 'wp_insert_attachment' ) )
-				return { exitCode: 0, stdout: '', stderr: '' };
+				return { exitCode: 0, stdout: confirmation( php ), stderr: '' };
 			await mkdir( made ?? path.join( site.path, folder ), { recursive: true } );
-			const names = decoded( php ) as string[];
+			const names = decoded( php ).names as string[];
 			return {
 				exitCode: 0,
 				stdout: JSON.stringify(
@@ -462,7 +469,10 @@ describe( 'generate_images on the Claude route', () => {
 			expect( options ).toEqual( { beforeSpawn: expect.any( Function ) } );
 		}
 		expect( calls[ 0 ][ 1 ][ 1 ] ).toContain( 'wp_insert_attachment' );
-		expect( decoded( calls[ 0 ][ 1 ][ 1 ] ) ).toEqual( [ 'hero.png', 'buns.png' ] );
+		expect( decoded( calls[ 0 ][ 1 ][ 1 ] ) ).toEqual( {
+			names: [ 'hero.png', 'buns.png' ],
+			site,
+		} );
 		expect( decoded( calls[ 1 ][ 1 ][ 1 ] ) ).toEqual( { ready: [ 7 ], failed: [ 8 ] } );
 		expect( journaled( journal ) ).toEqual( [
 			[ 'generate_images', 'remote-change' ],
@@ -649,6 +659,28 @@ describe( 'generate_images on the Claude route', () => {
 		expect( decoded( calls[ 1 ][ 1 ][ 1 ] ) ).toEqual( { ready: [], failed: [ 7 ] } );
 	} );
 
+	it( 'identifies the reserved file when its path leads outside the site from an existing month folder', async () => {
+		const { bridge, host, site, parent } = await setupImages();
+		const folder = 'wp-content/uploads/2026/11';
+		const outside = path.join( parent, 'outside' );
+		await mkdir( outside );
+		await mkdir( path.join( site, folder ), { recursive: true } );
+		await symlink( outside, path.join( site, folder, 'hero.png' ), 'junction' );
+		reserving( host, folder );
+		const result = await bridge.invoke( 'generate_images', {
+			images: [ { path: path.join( site, 'wp-content', 'uploads', 'hero.png' ), subject: 'Hero' } ],
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain(
+			'could not verify that the reserved file’s path stays inside this site’s folder'
+		);
+		expect( text( result ) ).not.toContain( UPLOADS_OUTSIDE );
+		expect( generateImages ).not.toHaveBeenCalled();
+		const calls = vi.mocked( host.sites.wpCli ).mock.calls;
+		expect( decoded( calls[ 1 ][ 1 ][ 1 ] ) ).toEqual( { ready: [], failed: [ 7 ] } );
+		expect( await readdir( outside ) ).toEqual( [] );
+	} );
+
 	it( 'deletes again what a reservation that does not have its shape inserted for the call’s images, and generates nothing', async () => {
 		const reservation = ( entries: unknown ) => ( {
 			exitCode: 0,
@@ -678,13 +710,19 @@ describe( 'generate_images on the Claude route', () => {
 			],
 			// Nothing it can read names any attachment.
 			[ 'unreadable', 'not json', [] ],
+			[ 'empty', '', [] ],
+			[
+				'truncated after one matching receipt',
+				'studio-media-reserved:0:7:aGVyby5wbmc=\nstudio-media-reserved:1:55:eC5wbmc=\n[{"id":7',
+				[ 7 ],
+			],
 		];
 		for ( const [ label, entries, deleted ] of cases ) {
-			const { bridge, host, site } = await setupImages();
+			const { bridge, host, events, site } = await setupImages();
 			host.sites.wpCli = vi.fn( async ( _site, args ) =>
 				args[ 1 ]?.includes( 'wp_insert_attachment' )
 					? reservation( entries )
-					: { exitCode: 0, stdout: '', stderr: '' }
+					: { exitCode: 0, stdout: confirmation( args[ 1 ] ), stderr: '' }
 			);
 			const uploads = path.join( site, 'wp-content', 'uploads' );
 			const result = await bridge.invoke( 'generate_images', {
@@ -698,9 +736,43 @@ describe( 'generate_images on the Claude route', () => {
 			expect( calls.length, label ).toBe( deleted.length ? 2 : 1 );
 			if ( deleted.length )
 				expect( decoded( calls[ 1 ][ 1 ][ 1 ] ), label ).toEqual( { ready: [], failed: deleted } );
+			const warnings = events.filter(
+				( event ) => event.type === 'tool.progress' && event.unsettledMediaReservations
+			);
+			const remaining = 2 - deleted.length;
+			expect( warnings, label ).toHaveLength( remaining ? 1 : 0 );
+			if ( remaining )
+				expect( warnings[ 0 ], label ).toMatchObject( {
+					unsettledMediaReservations: remaining,
+					message: expect.stringContaining( `outcome of up to ${ remaining } media reservation` ),
+				} );
 		}
 		expect( generateImages ).not.toHaveBeenCalled();
 	} );
+
+	it.each( [ true, false ] )(
+		'warns of a lost reservation command response only after the dispatch fence passed (%s)',
+		async ( passed ) => {
+			const { bridge, host, events, site } = await setupImages();
+			host.sites.wpCli = vi.fn( async ( _site, _args, options ) => {
+				if ( ! passed ) await writeFile( path.join( site, 'wp-cli.yml' ), 'require: []' );
+				await options?.beforeSpawn?.();
+				throw new Error( 'command output lost' );
+			} );
+			const result = await bridge.invoke( 'generate_images', {
+				images: [
+					{ path: path.join( site, 'wp-content', 'uploads', 'hero.png' ), subject: 'Hero' },
+				],
+			} );
+			expect( result.isError ).toBe( true );
+			expect( host.sites.wpCli ).toHaveBeenCalledOnce();
+			const warning = events.find(
+				( event ) => event.type === 'tool.progress' && event.unsettledMediaReservations
+			);
+			if ( passed ) expect( warning ).toMatchObject( { unsettledMediaReservations: 1 } );
+			else expect( warning ).toBeUndefined();
+		}
+	);
 
 	it( 'deletes again what such a reservation inserted for images whose names end in a hyphen and digits, or that WordPress stored under a unique name, and nothing named otherwise', async () => {
 		const requested = [ 'image-0.png', 'image-1.png', 'team-2024.png', 'photo.png' ];
@@ -728,7 +800,7 @@ describe( 'generate_images on the Claude route', () => {
 						entry( 5, 'photo-x.png' ),
 						entry( 6, 'team-2024-copy.png' ),
 				  ] )
-				: '',
+				: confirmation( args[ 1 ] ),
 			stderr: '',
 		} ) );
 		const uploads = path.join( site, 'wp-content', 'uploads' );
@@ -740,6 +812,36 @@ describe( 'generate_images on the Claude route', () => {
 		expect( calls ).toHaveLength( 2 );
 		expect( decoded( calls[ 1 ][ 1 ][ 1 ] ) ).toEqual( { ready: [], failed: [ 7, 8, 9, 10 ] } );
 		expect( generateImages ).not.toHaveBeenCalled();
+	} );
+
+	it( 'rolls back a partial filename claim and reports an unconfirmed placeholder with no attachment ID', async () => {
+		const { bridge, host, events, site } = await setupImages();
+		host.sites.wpCli = vi.fn( async ( _site, args ) => ( {
+			exitCode: 0,
+			stdout: args[ 1 ].includes( 'wp_insert_attachment' )
+				? JSON.stringify( {
+						error: 'insert',
+						reserved: [
+							{ id: 7, file: 'wp-content/uploads/one.png', url: 'http://localhost/one.png' },
+						],
+						unconfirmedFiles: 1,
+				  } )
+				: confirmation( args[ 1 ] ),
+			stderr: '',
+		} ) );
+		const result = await bridge.invoke( 'generate_images', {
+			images: [ 'one.png', 'two.png' ].map( ( name ) => ( {
+				path: path.join( site, 'wp-content', 'uploads', name ),
+				subject: name,
+			} ) ),
+		} );
+		expect( result.isError ).toBe( true );
+		expect( generateImages ).not.toHaveBeenCalled();
+		expect( decoded( vi.mocked( host.sites.wpCli ).mock.calls[ 1 ][ 1 ][ 1 ] ) ).toEqual( {
+			ready: [],
+			failed: [ 7 ],
+		} );
+		expect( events ).toContainEqual( expect.objectContaining( { unsettledMediaReservations: 1 } ) );
 	} );
 
 	it( 'deletes again, once the call has ended, what such a reservation inserted when deleting it at once failed', async () => {
@@ -759,7 +861,9 @@ describe( 'generate_images on the Claude route', () => {
 					stderr: '',
 				};
 			// The first deletion fails.
-			return { exitCode: deletions++ ? 0 : 1, stdout: '', stderr: '' };
+			return deletions++
+				? { exitCode: 0, stdout: confirmation( args[ 1 ] ), stderr: '' }
+				: { exitCode: 1, stdout: '', stderr: '' };
 		} );
 		const uploads = path.join( site, 'wp-content', 'uploads' );
 		const result = await bridge.invoke( 'generate_images', {
@@ -981,7 +1085,7 @@ describe( 'generate_images when its call is cancelled, or ends with attachments 
 			const data = decodedData( php );
 			if ( php.includes( 'wp_insert_attachment' ) ) {
 				await mkdir( path.join( site, MONTH ), { recursive: true } );
-				const reserved = ( data as string[] ).map( ( requested ) => {
+				const reserved = ( data.names as string[] ).map( ( requested ) => {
 					const id = next++;
 					const name = unique( requested );
 					rows.set( id, { file: path.join( site, MONTH, name ), done: false } );
@@ -994,13 +1098,21 @@ describe( 'generate_images when its call is cancelled, or ends with attachments 
 				onReserve?.();
 				return { exitCode: 0, stdout: JSON.stringify( reserved ), stderr: '' };
 			}
-			for ( const id of data.ready as number[] ) rows.get( id )!.done = true;
+			const confirmed: number[] = [];
+			for ( const id of data.ready as number[] ) {
+				rows.get( id )!.done = true;
+				confirmed.push( id );
+			}
 			for ( const id of data.failed as number[] ) {
 				const row = rows.get( id );
-				rows.delete( id );
-				if ( row ) await rm( row.file, { force: true } );
+				if ( ! row ) continue;
+				if ( ! ( data.possiblyCompleted?.includes( id ) && row.done ) ) {
+					rows.delete( id );
+					await rm( row.file, { force: true } );
+				}
+				confirmed.push( id );
 			}
-			return { exitCode: 0, stdout: '', stderr: '' };
+			return { exitCode: 0, stdout: settledReceipts( confirmed ), stderr: '' };
 		} );
 		return {
 			rows,
@@ -1153,10 +1265,11 @@ describe( 'generate_images when its call is cancelled, or ends with attachments 
 	const DELETED_AT_END = ( count: number ) =>
 		`deletes the ${ count } attachments of this call that were neither completed nor deleted when the call ended, with any image file written for them`;
 	const LEFT_AT_END = ( count: number ) =>
-		`Studio could not delete the ${ count } attachments of this call that were neither completed nor deleted when the call ended`;
+		`Studio could not confirm cleanup of ${ count } media reservations when this call ended`;
 	const leftNotes = ( events: Array< { type: string; message?: string } > ) =>
 		events.flatMap( ( event ) =>
-			event.type === 'tool.progress' && event.message?.startsWith( 'Studio could not delete' )
+			event.type === 'tool.progress' &&
+			event.message?.startsWith( 'Studio could not confirm cleanup' )
 				? [ event.message ]
 				: []
 		);
@@ -1338,6 +1451,64 @@ describe( 'generate_images when its call is cancelled, or ends with attachments 
 		expect( left ).toHaveLength( 1 );
 		expect( left[ 0 ] ).toContain( LEFT_AT_END( 2 ) );
 		expect( left[ 0 ] ).not.toContain( site );
+	} );
+
+	it( 'keeps a completed attachment and reports only the deletion still unconfirmed by WordPress', async () => {
+		const { bridge, host, events, site } = await setupImages();
+		const { rows } = mediaLibrary( host, site );
+		const original = vi.mocked( host.sites.wpCli ).getMockImplementation()!;
+		const attempts: number[][] = [];
+		host.sites.wpCli = vi.fn( async ( ...args: Parameters< typeof original > ) => {
+			const php = args[ 1 ][ 1 ];
+			if ( php.includes( 'wp_insert_attachment' ) ) return original( ...args );
+			const data = decodedData( php );
+			attempts.push( data.failed );
+			if ( attempts.length === 1 ) {
+				rows.get( 7 )!.done = true;
+				rows.delete( 8 );
+				const orphan = rows.get( 9 )!.file;
+				await writeFile( orphan, PNG );
+				rows.delete( 9 );
+				return {
+					exitCode: 0,
+					stdout: 'studio-media-settled:7\nstudio-media-settled:8\n',
+					stderr: '',
+				};
+			}
+			return { exitCode: 0, stdout: '', stderr: '' };
+		} );
+		vi.mocked( generateImages ).mockResolvedValueOnce( [
+			{ ok: true, bytes: PNG },
+			{ ok: false, error: 'failed' },
+			{ ok: false, error: 'failed' },
+		] );
+		await bridge.invoke( 'generate_images', images( site, 3 ) );
+		expect( attempts ).toEqual( [ [ 8, 9 ], [ 9 ] ] );
+		expect( events ).toContainEqual( expect.objectContaining( { unsettledMediaReservations: 1 } ) );
+		expect( rows.get( 7 )?.done ).toBe( true );
+		expect( await readFile( path.join( site, MONTH, 'image-2.png' ) ) ).toEqual( PNG );
+	} );
+
+	it( 'preserves a completed image when a command finishes it but loses its output', async () => {
+		const { bridge, host, events, site } = await setupImages();
+		const { rows } = mediaLibrary( host, site );
+		const original = vi.mocked( host.sites.wpCli ).getMockImplementation()!;
+		host.sites.wpCli = vi.fn( async ( ...args: Parameters< typeof original > ) => {
+			const php = args[ 1 ][ 1 ];
+			if ( ! php.includes( 'wp_insert_attachment' ) && decodedData( php ).ready.length ) {
+				rows.get( 7 )!.done = true;
+				return { exitCode: 1, stdout: '', stderr: '' };
+			}
+			return original( ...args );
+		} );
+		vi.mocked( generateImages ).mockResolvedValueOnce( [
+			{ ok: true, bytes: PNG },
+			{ ok: false, error: 'failed' },
+		] );
+		await bridge.invoke( 'generate_images', images( site, 2 ) );
+		expect( [ ...rows.keys() ] ).toEqual( [ 7 ] );
+		expect( await readFile( rows.get( 7 )!.file ) ).toEqual( PNG );
+		expect( leftNotes( events ) ).toEqual( [] );
 	} );
 
 	it( 'keeps the turn up after Stop until a settling command it started has ended, however long that takes', async () => {

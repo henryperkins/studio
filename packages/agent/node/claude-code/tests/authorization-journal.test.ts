@@ -174,7 +174,9 @@ const listingPreview = ( host: StudioAgentHost ) => {
 // WordPress reserving an attachment in the target site's uploads folder, which
 // it makes for this month first.
 const reservingAttachments = ( host: StudioAgentHost ) => {
-	host.sites.wpCli = vi.fn( async ( site ) => {
+	host.sites.wpCli = vi.fn( async ( site, args ) => {
+		if ( args[ 1 ].includes( 'wp_delete_attachment' ) )
+			return { exitCode: 0, stdout: 'studio-media-settled:7\n', stderr: '' };
 		await mkdir( path.join( site.path, 'wp-content', 'uploads', '2026', '11' ), {
 			recursive: true,
 		} );

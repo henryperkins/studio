@@ -14,9 +14,9 @@ import {
 } from '@studio/agent/protocol/claude-code';
 import { getCreatedSiteFromArtifact } from '../sessions/placement';
 import {
-	finalizeAttachmentsArgs,
 	readReservedAttachments,
-	reserveAttachmentsArgs,
+	reserveExclusiveAttachmentsArgs,
+	verifiedFinalizeAttachmentsArgs,
 } from '../tools/media-library';
 import {
 	CLAUDE_ACCOUNT_RECHECK_MS,
@@ -294,7 +294,9 @@ const REFUSALS = {
 	bundledFiles:
 		'Studio copies only the files it ships itself for this tool, from its own folder outside every folder this conversation reaches, and could not read them there, so it copied nothing.',
 	mediaUploads:
-		'Studio adds an image to a site’s media library only when the file it writes for it lies, through every link, inside the site’s own folder and in the folder WordPress made for this month’s uploads; here the folder for this month’s uploads is not an existing folder inside this site’s folder. Studio deletes the attachments it reserved for this call and generates nothing; WordPress may have left an empty folder for this month’s uploads wherever it keeps this site’s uploads.',
+		'Studio adds an image to the media library only in the site’s own uploads folder. Here the folder for this month’s uploads is not an existing folder inside this site’s folder. Studio tries to remove the attachments it reserved for this call and generates nothing. WordPress may have left an empty uploads folder.',
+	mediaFile:
+		'Studio could not verify that the reserved file’s path stays inside this site’s folder through every link. Studio tries to remove the attachments it reserved for this call and generates nothing.',
 } as const;
 
 // What a push or pull with each option overwrites on the side it copies to:
@@ -536,6 +538,20 @@ function insertedFor( reserved: unknown, names: readonly string[] ): number[] {
 	return [ ...ids ];
 }
 
+// WordPress acknowledges each row before looking up its URL or starting the next reservation.
+function acknowledgedReservations( output: string, requested: readonly string[] ): number[] {
+	const ids: number[] = [];
+	for ( const line of output.split( /\r?\n/ ) ) {
+		const match = /^studio-media-reserved:(\d+):(\d+):([a-zA-Z0-9+/=]+)$/.exec( line );
+		if ( ! match ) continue;
+		const name = requested[ Number( match[ 1 ] ) ];
+		const id = Number( match[ 2 ] );
+		if ( name && isAttachmentId( id ) && Buffer.from( name ).toString( 'base64' ) === match[ 3 ] )
+			ids.push( id );
+	}
+	return ids;
+}
+
 // Whether a folder exists as a folder and resolves, through every link, inside
 // `root`.
 async function isMadeFolderInside( root: string, folder: string ): Promise< boolean > {
@@ -563,10 +579,11 @@ function endOfCallNote( count: number ): string {
 }
 
 // What the journal says when that deletion was refused or failed, by count only.
-function leftAtEndNote( count: number ): string {
-	return count === 1
-		? 'Studio could not delete the 1 attachment of this call that was neither completed nor deleted when the call ended; it is left in this site’s media library, with any image file written for it.'
-		: `Studio could not delete the ${ count } attachments of this call that were neither completed nor deleted when the call ended; they are left in this site’s media library, with any image file written for them.`;
+function leftAtEndNote( count: number, unknownOutcome: boolean ): string {
+	const outcome = unknownOutcome ? 'the outcome of up to' : 'cleanup of';
+	return `Studio could not confirm ${ outcome } ${ count } media reservation${
+		count === 1 ? '' : 's'
+	} when this call ended. Check the site’s media library and uploads folder.`;
 }
 
 function isAttachmentId( id: unknown ): id is number {
@@ -575,11 +592,8 @@ function isAttachmentId( id: unknown ): id is number {
 
 // Whether a reservation's output lists, for each name, one attachment of its
 // own: an ID, a PNG file relative to the site's folder, and a URL.
-function isReservation(
-	reserved: unknown,
-	names: readonly string[]
-): reserved is MediaAttachment[] {
-	if ( ! Array.isArray( reserved ) || reserved.length !== names.length ) return false;
+function isReservation( reserved: unknown, count: number ): reserved is MediaAttachment[] {
+	if ( ! Array.isArray( reserved ) || reserved.length !== count ) return false;
 	const ids = new Set< number >();
 	for ( const entry of reserved ) {
 		if (
@@ -1460,8 +1474,6 @@ export function createClaudeExecutionPolicy(
 				wpcomSite,
 				syncOptions
 			);
-		// The CLI updates a preview made on Jurassic Ninja by making a new one on
-		// WordPress.com and deleting it, so the approval says that instead.
 		else if ( request.name === 'previews.update' && preview && ! preview.onWpcom )
 			note = MOVED_PREVIEW_NOTE;
 		const operation: ClaudeOperation = {
@@ -1913,22 +1925,39 @@ export function createClaudeExecutionPolicy(
 		// turn acts on, and not yet completed or deleted: only this call completes
 		// or deletes them, each once. `reservedIn` is the site they are in.
 		const reservedAttachments = new Set< number >();
+		const attemptedCompletions = new Set< number >();
+		let unknownReservations = 0;
 		let reservedIn: HostSite | undefined;
 		// One of the media library's fixed WP-CLI commands, Studio's own code, run
 		// as the turn runs every WP-CLI command, without the site's own code. It
 		// is fenced before it starts, and once started runs to its end whatever
 		// the call's signal says: a reservation cut short would leave attachments
 		// no one knows of, a completion cut short would leave them half done.
-		const mediaCommand = async (
+		const mediaCommand = (
 			site: HostSite,
 			args: string[],
 			{ beforeSpawn }: HostOperationOptions
-		): Promise< string > => {
-			const { exitCode, stdout } = await host.sites.wpCli( site, [ ...args, ...WP_CLI_ISOLATION ], {
-				beforeSpawn,
-			} );
-			if ( exitCode !== 0 ) throw new Error( `WP-CLI exited with code ${ exitCode }` );
-			return stdout;
+		) => host.sites.wpCli( site, [ ...args, ...WP_CLI_ISOLATION ], { beforeSpawn } );
+		const finalizeMedia = async (
+			site: HostSite,
+			ready: number[],
+			failed: number[],
+			options: HostOperationOptions
+		) => {
+			const preserve = failed.filter( ( id ) => attemptedCompletions.has( id ) );
+			for ( const id of ready ) attemptedCompletions.add( id );
+			const { stdout, exitCode } = await mediaCommand(
+				site,
+				verifiedFinalizeAttachmentsArgs( ready, failed, preserve ),
+				options
+			);
+			const receipts = new Set( stdout.split( /\r?\n/ ) );
+			const ids = [ ...ready, ...failed ];
+			for ( const id of ids ) {
+				if ( receipts.has( `studio-media-settled:${ id }` ) ) reservedAttachments.delete( id );
+			}
+			if ( exitCode !== 0 || ids.some( ( id ) => reservedAttachments.has( id ) ) )
+				throw new Error( 'Could not confirm media finalization' );
 		};
 		// The fence of a media command that settles this call's own attachments,
 		// which runs once the call has been cancelled too: only that no WP-CLI
@@ -1971,12 +2000,7 @@ export function createClaudeExecutionPolicy(
 			} catch {
 				throw denied();
 			}
-			await mediaCommand(
-				current,
-				finalizeAttachmentsArgs( completed, removed ),
-				settlingFence( targetSite.path )
-			);
-			for ( const id of [ ...completed, ...removed ] ) reservedAttachments.delete( id );
+			await finalizeMedia( current, completed, removed, settlingFence( targetSite.path ) );
 		};
 		// Once the call has ended, however it ended (an image not written, a
 		// completion denied or refused, a settling refused, an image path named
@@ -1985,16 +2009,18 @@ export function createClaudeExecutionPolicy(
 		// that leaves, the journal says by count.
 		const endOfCall = async () => {
 			const left = [ ...reservedAttachments ];
-			if ( ! left.length || ! reservedIn ) return;
-			try {
-				await settle( reservedIn, [], left, endOfCallNote( left.length ) );
-			} catch {
+			if ( left.length && reservedIn ) {
+				await settle( reservedIn, [], left, endOfCallNote( left.length ) ).catch( () => undefined );
+			}
+			const unresolved = reservedAttachments.size + unknownReservations;
+			if ( unresolved ) {
 				context.onEvent( {
 					type: 'tool.progress',
 					runId: context.runId,
 					turnId: context.turnId,
 					toolCallId,
-					message: leftAtEndNote( reservedAttachments.size ),
+					message: leftAtEndNote( unresolved, unknownReservations > 0 ),
+					unsettledMediaReservations: unresolved,
 				} );
 			}
 		};
@@ -2269,14 +2295,23 @@ export function createClaudeExecutionPolicy(
 							note: 'It adds an attachment for each image to this site’s media library, in the uploads folder WordPress picks, before the image is made',
 						},
 						async ( current, options ) => {
-							const output = await mediaCommand(
+							let dispatched = false;
+							const { stdout, exitCode } = await mediaCommand(
 								current!,
-								reserveAttachmentsArgs( requested ),
-								options
-							);
+								reserveExclusiveAttachmentsArgs( requested, current!.path ),
+								{
+									beforeSpawn: async () => {
+										await options.beforeSpawn?.();
+										dispatched = true;
+									},
+								}
+							).catch( ( error: unknown ) => {
+								if ( dispatched ) unknownReservations += requested.length;
+								throw error;
+							} );
 							let reserved: unknown;
 							try {
-								reserved = readReservedAttachments( output );
+								reserved = readReservedAttachments( stdout );
 							} catch {
 								reserved = undefined;
 							}
@@ -2285,19 +2320,43 @@ export function createClaudeExecutionPolicy(
 							// call's end, which tries again.
 							const rollBack = async ( ids: number[] ) => {
 								if ( ! ids.length ) return;
-								try {
-									await mediaCommand(
-										current!,
-										finalizeAttachmentsArgs( [], ids ),
-										settlingFence( current!.path )
-									);
-								} catch {
-									for ( const id of ids ) reservedAttachments.add( id );
-									reservedIn = current!;
-								}
+								for ( const id of ids ) reservedAttachments.add( id );
+								reservedIn = current!;
+								await finalizeMedia( current!, [], ids, settlingFence( current!.path ) ).catch(
+									() => undefined
+								);
 							};
-							if ( ! isReservation( reserved, requested ) ) {
-								await rollBack( insertedFor( reserved, requested ) );
+							const failure = isRecord( reserved ) ? reserved : undefined;
+							if ( failure ) {
+								const partial = failure.reserved;
+								if (
+									exitCode === 0 &&
+									Array.isArray( partial ) &&
+									partial.length < requested.length &&
+									isReservation( partial, partial.length ) &&
+									( failure.error === 'claim' ||
+										failure.error === 'insert' ||
+										( failure.error === 'uploads-folder' && ! partial.length ) ) &&
+									( failure.unconfirmedFiles === 0 ||
+										( failure.error === 'insert' && failure.unconfirmedFiles === 1 ) )
+								) {
+									unknownReservations += failure.unconfirmedFiles;
+									await rollBack( partial.map( ( { id } ) => id ) );
+									if ( failure.error === 'uploads-folder' )
+										refuse( toolCallId, REFUSALS.mediaUploads );
+									throw denied();
+								}
+								reserved = partial;
+							}
+							if ( failure || exitCode !== 0 || ! isReservation( reserved, requested.length ) ) {
+								const ids = [
+									...new Set( [
+										...acknowledgedReservations( stdout, requested ),
+										...insertedFor( reserved, requested ),
+									] ),
+								];
+								unknownReservations += Math.max( 0, requested.length - ids.length );
+								await rollBack( ids );
 								throw denied();
 							}
 							// The reservation names each file by what follows the site's
@@ -2308,13 +2367,17 @@ export function createClaudeExecutionPolicy(
 							const targetSite = actingSite;
 							for ( const { file } of reserved ) {
 								const written = path.join( current!.path, file );
-								if (
-									! targetSite ||
-									! ( await isInsideCanonicalRoot( targetSite.path, written ) ) ||
+								let refusal: string | undefined;
+								if ( ! targetSite ) refusal = REFUSALS.siteFiles;
+								else if (
 									! ( await isMadeFolderInside( targetSite.path, path.dirname( written ) ) )
-								) {
+								)
+									refusal = REFUSALS.mediaUploads;
+								else if ( ! ( await isInsideCanonicalRoot( targetSite.path, written ) ) )
+									refusal = REFUSALS.mediaFile;
+								if ( refusal ) {
 									await rollBack( reserved.map( ( { id } ) => id ) );
-									refuse( toolCallId, REFUSALS.mediaUploads );
+									refuse( toolCallId, refusal );
 									throw denied();
 								}
 							}
@@ -2348,20 +2411,16 @@ export function createClaudeExecutionPolicy(
 									note: 'It completes the attachments of this site’s images that were made, with their smaller sizes, and deletes those of the images that failed',
 								},
 								async ( current, options ) => {
-									await mediaCommand(
-										current!,
-										finalizeAttachmentsArgs( completed, removed ),
-										options
-									);
-									for ( const id of ids ) reservedAttachments.delete( id );
+									await finalizeMedia( current!, completed, removed, options );
 								}
 							);
 							return;
 						} catch ( error ) {
 							if ( ! operationSignal.aborted ) throw error;
 						}
-					if ( ids.some( ( id ) => reservedAttachments.has( id ) ) )
-						await settle( site, completed, removed );
+					const pending = ( id: number ) => reservedAttachments.has( id );
+					if ( ids.some( pending ) )
+						await settle( site, completed.filter( pending ), removed.filter( pending ) );
 				},
 			},
 			// Makes a site this turn created the conversation's site. The turn's

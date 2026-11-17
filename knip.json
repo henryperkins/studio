@@ -43,7 +43,8 @@
 			"project": "src/**/*.{ts,tsx}"
 		},
 		"packages/agent": {
-			"project": "**/*.ts"
+			"project": "**/*.ts",
+			"ignoreBinaries": ["php"]
 		},
 		"packages/common": {
 			"entry": ["globals.ts"],
