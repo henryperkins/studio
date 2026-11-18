@@ -446,7 +446,10 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 					expect(
 						await policy.authorizeToolUse( {
 							toolName,
-							input: { file_path: file, content: 'changed' },
+							input:
+								toolName === 'Write'
+									? { file_path: file, content: 'changed' }
+									: { file_path: file },
 							toolUseId: `${ toolName }-use`,
 						} )
 					).toBe( true );
@@ -463,7 +466,7 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 					tool: 'Write',
 					operationClass: 'local-change',
 					target,
-					description: 'Change local work: Write',
+					description: expect.stringContaining( 'readme.txt' ),
 					evidence: 'authorized',
 				},
 			],
@@ -471,6 +474,52 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 		const terminal = terminals( await fixture.store.readJournals( 'chat' ) )[ 0 ];
 		expect( ( terminal as { outcome: { message: string } } ).outcome.message ).toContain(
 			'may or may not'
+		);
+	} );
+
+	it( 'names each interrupted native file change in the recovered chat without including file contents', async () => {
+		const fixture = await recoveryFixture();
+		const files: string[] = [];
+		const journal = await journalOf(
+			async ( { policy, site } ) => {
+				for ( const [ index, name ] of [
+					'first  page.md',
+					'second\u200bpage.md',
+					'third.txt',
+				].entries() ) {
+					const file = path.join( site, name );
+					files.push( file );
+					await writeFile( file, 'private before' );
+					const edit = index === 2;
+					const input = edit
+						? { file_path: file, old_string: 'private before', new_string: 'private after' }
+						: { file_path: file, content: 'private after' };
+					expect(
+						await policy.authorizeToolUse( {
+							toolName: edit ? 'Edit' : 'Write',
+							toolUseId: 'file-' + index,
+							input,
+						} )
+					).toBe( true );
+				}
+			},
+			() => ( { uncertainAfterRecovery: true } )
+		);
+		await fixture.deadTurn( { journal } );
+		const recovered = await fixture.recover();
+		if ( recovered.status !== 'recovered' ) throw new Error( 'Expected a recovered turn' );
+		const descriptions = recovered.uncertainOperations.map(
+			getClaudeUncertainOperationDescription
+		);
+		const note = recoveryNote( await fixture.store.readJournals( 'chat' ) );
+		expect( descriptions ).toHaveLength( 3 );
+		const escaped = files.map( ( file ) => JSON.stringify( file ).replace( '\u200b', '\\u200b' ) );
+		for ( const [ index, file ] of escaped.entries() ) {
+			expect( descriptions[ index ] ).toContain( file );
+			expect( note?.text ).toContain( descriptions[ index ] );
+		}
+		expect( [ ...descriptions, note?.text ].join( '\n' ) ).not.toMatch(
+			/private before|private after|\u200b/
 		);
 	} );
 

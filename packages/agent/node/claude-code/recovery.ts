@@ -6,7 +6,10 @@ import {
 	readOwnProcessIdentity,
 } from '@studio/common/lib/owned-process';
 import { __ } from '@wordpress/i18n';
-import { isClaudeReadOnlyClass } from '@studio/agent/protocol/claude-code';
+import {
+	escapeClaudeApprovalText,
+	isClaudeReadOnlyClass,
+} from '@studio/agent/protocol/claude-code';
 import { escapeClaudeJournalText } from './journal-text';
 import { claudeLockDigest } from './run-lock';
 import type { ClaudeRecoveryClaim, ClaudeRunLockRecord } from './run-lock';
@@ -164,10 +167,13 @@ async function uncertainOperationsOf(
 		const tool = typeof operation.tool === 'string' ? operation.tool : '';
 		const key = id ? JSON.stringify( [ id, event.requestId ?? null, tool ] ) : `unnamed ${ index }`;
 		const evidence = event.type === 'operation.authorized' ? 'authorized' : 'requested';
+		const destination = recoveredFileDestination( event );
+		const summary = cleanup ?? ( typeof event.description === 'string' ? event.description : tool );
+		const description = destination ? `${ summary } (${ destination })` : summary;
 		const known = found.get( key );
 		if ( known ) {
 			if ( evidence === 'authorized' ) known.evidence = evidence;
-			if ( cleanup ) known.description = cleanup;
+			if ( cleanup || destination ) known.description = description;
 			continue;
 		}
 		found.set( key, {
@@ -177,7 +183,7 @@ async function uncertainOperationsOf(
 				? { operationClass: operation.operationClass }
 				: {} ),
 			...( operation.target ? { target: operation.target } : {} ),
-			description: cleanup ?? ( typeof event.description === 'string' ? event.description : tool ),
+			description,
 			evidence,
 			...( event.requestId
 				? { requestId: event.requestId, resolved: resolved.has( event.requestId ) }
@@ -219,6 +225,24 @@ async function uncertainOperationsOf(
 			rules.CLAUDE_STUDIO_TOOL_RULES.has( operation.tool )
 		);
 	} );
+}
+
+function recoveredFileDestination(
+	event: Extract< ClaudeJournalEvent, { type: 'operation.authorized' | 'approval.requested' } >
+): string | undefined {
+	if ( event.operation?.tool !== 'Write' && event.operation?.tool !== 'Edit' ) return;
+	let file: unknown;
+	if ( event.type === 'operation.authorized' ) file = event.operation.filePath;
+	else if (
+		Array.isArray( event.operation.localPaths ) &&
+		event.operation.localPaths.length === 1
+	) {
+		file = event.operation.localPaths[ 0 ];
+	}
+	if ( typeof file !== 'string' || ! file ) return;
+	return escapeClaudeApprovalText( JSON.stringify( file ) )
+		.replace( /\u2028/g, '\\u2028' )
+		.replace( /\u2029/g, '\\u2029' );
 }
 
 // What recovery records for the dead turn: each approval it left pending,
