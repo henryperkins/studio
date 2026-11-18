@@ -790,7 +790,7 @@ describe( 'Claude Studio tools that act outside the host', () => {
 	} );
 
 	it( 'names the Studio tools the turn may run, as its selection enables them', async () => {
-		const { policy } = await setup();
+		const { policy } = await setup( () => ( { navigationConfinement: guarded( targetOrigin ) } ) );
 		expect( policy.studioTools ).toEqual( [ ...CLAUDE_ENABLED_TOOLS.studio ] );
 		const only = await setup( () => ( { enabledTools: { native: [], studio: [ 'wp_cli' ] } } ) );
 		expect( only.policy.studioTools ).toEqual( [ 'wp_cli' ] );
@@ -1319,12 +1319,9 @@ describe( 'Claude Studio tools that reach a site by URL', () => {
 		).toBe( true );
 	} );
 
-	it( 'keeps browser tools disabled, without throwing, whatever navigation guard the turn declares', async () => {
+	it( 'refuses browser tools without a verified navigation guard', async () => {
 		const withWpCli = { native: [ 'Read' ], studio: [ ...browserTools, 'wp_cli' ] };
-		const declarations: Array< [ string, unknown ] > = [
-			...unverifiableNavigation( targetOrigin ),
-			[ 'a complete guard', guarded( targetOrigin ) ],
-		];
+		const declarations = unverifiableNavigation( targetOrigin );
 		for ( const [ label, navigationConfinement ] of declarations ) {
 			expect(
 				claudeStudioTools( withWpCli, navigationConfinement as never, targetOrigin ),

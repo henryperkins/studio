@@ -1,4 +1,10 @@
 import {
+	getLocalMediaPath,
+	isRenderableMediaWidget,
+	isStudioChatArtifactData,
+	type StudioChatArtifactData,
+} from '@studio/agent/protocol/chat-artifacts';
+import {
 	resolveClaudeSession,
 	type ClaudeEffort,
 	type ClaudeSessionSelection,
@@ -25,10 +31,40 @@ import {
 } from '@/lib/ui';
 import { ClaudeApprovalCard } from './claude-approval-card';
 import { ClaudeNewChat } from './claude-new-chat';
+import { ChatArtifact } from './conversation';
 import { SessionFrame } from './session-frame';
 import styles from './style.module.css';
 import type { LoadedAiSession, SessionEntry } from '@/data/core';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
+
+function screenshotWidgets( artifact: StudioChatArtifactData, sessionFile: string ) {
+	if ( ! sessionFile.endsWith( '.jsonl' ) ) return [];
+	const sidecar = sessionFile.slice( 0, -'.jsonl'.length ) + '.screenshots';
+	const directoryName = sidecar.split( /[\\/]/ ).at( -1 );
+	return artifact.widgets.flatMap( ( widget ) => {
+		const source = getLocalMediaPath( widget )?.split( /[\\/]/ );
+		const name = source?.at( -1 );
+		if (
+			! isRenderableMediaWidget( widget ) ||
+			! name ||
+			source?.at( -2 ) !== directoryName ||
+			! /^[a-z0-9_-]+\.(png|jpe?g|webp)$/i.test( name )
+		)
+			return [];
+		return [
+			{
+				...widget,
+				widgetProps: {
+					...widget.widgetProps,
+					source: {
+						type: 'local',
+						path: sidecar + ( sessionFile.includes( '\\' ) ? '\\' : '/' ) + name,
+					},
+				},
+			},
+		];
+	} );
+}
 
 export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 	const sessionId = data.summary.id;
@@ -267,6 +303,15 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 		>
 			<div className={ styles.column } data-chat-transcript>
 				{ visibleEvents.map( ( event, index ) => {
+					if ( event.type === 'chat.artifact' && isStudioChatArtifactData( event.artifact ) ) {
+						return (
+							<ChatArtifact
+								key={ event.artifact.id }
+								claudeSessionId={ sessionId }
+								widgets={ screenshotWidgets( event.artifact, data.summary.filePath ) }
+							/>
+						);
+					}
 					if ( event.type === 'turn.prompt' ) return <p key={ index }>{ event.text }</p>;
 					if ( event.type === 'content.confirmed' || event.type === 'content.provisional' )
 						return <p key={ index }>{ event.text }</p>;

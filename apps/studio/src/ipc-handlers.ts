@@ -28,7 +28,7 @@ import {
 	getGlobalInstructionsEnabled as readGlobalInstructionsEnabled,
 	setGlobalInstructionsEnabled as writeGlobalInstructionsEnabled,
 } from '@studio/agent/node/global-instructions';
-import { resolveLocalMediaFile } from '@studio/agent/node/local-media';
+import { openClaudeScreenshot, openLocalMediaFile } from '@studio/agent/node/local-media';
 import { setSessionChatGptSelection } from '@studio/agent/node/sessions/chatgpt-selection';
 import {
 	createHydratedAiSession,
@@ -1220,16 +1220,18 @@ export async function openStudioLogs( _event: IpcMainInvokeEvent ) {
 
 export async function readLocalMediaFile(
 	_event: IpcMainInvokeEvent,
-	path: string
+	path: string,
+	claudeSessionId?: string
 ): Promise< { name: string; mimeType: string; data: ArrayBuffer } > {
-	const media = await resolveLocalMediaFile( path, [
-		getSessionsDirectory(),
-		...( await readSitePaths() ),
-	] );
+	const media =
+		claudeSessionId !== undefined
+			? await openClaudeScreenshot( getSessionsDirectory(), claudeSessionId, path )
+			: await openLocalMediaFile( path, [ getSessionsDirectory(), ...( await readSitePaths() ) ] );
 	if ( ! media ) {
 		throw new Error( 'Local media file not found.' );
 	}
-	const buffer = await fsPromises.readFile( media.path );
+	await using file = media.handle;
+	const buffer = await file.readFile();
 	return {
 		name: nodePath.basename( path ),
 		mimeType: media.mimeType,

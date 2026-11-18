@@ -1,6 +1,8 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { claudeScreenshotDirectory } from '@studio/agent/node/claude-code/screenshot-directory';
+import { createAiSession } from '@studio/agent/node/sessions/store';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { startLocalServer, type LocalServer } from '../index';
 
@@ -40,6 +42,42 @@ const read = ( filePath: string ) =>
 	fetch( `${ server.url }/api/media/read?path=${ encodeURIComponent( filePath ) }` );
 
 describe( 'GET /api/media/read', () => {
+	it( 'serves a Claude screenshot only from the requested conversation when reopening it', async () => {
+		const options = {
+			claude: {
+				binding: {
+					connectionId: 'test',
+					workingDirectory: siteRoot,
+					siteId: null,
+					configDirectory: configDir,
+				},
+				selection: { model: 'fixture', effort: 'medium' as const },
+			},
+		};
+		const one = await createAiSession( sessionsRoot, options );
+		const two = await createAiSession( sessionsRoot, options );
+		const first = path.join(
+			await claudeScreenshotDirectory( sessionsRoot, one.id ),
+			'capture.png'
+		);
+		const second = path.join(
+			await claudeScreenshotDirectory( sessionsRoot, two.id ),
+			'capture.png'
+		);
+		writeFileSync( first, 'first' );
+		writeFileSync( second, 'second' );
+		const readAsFirst = ( file: string ) =>
+			fetch(
+				server.url +
+					'/api/media/read?' +
+					new URLSearchParams( { path: file, claudeSessionId: one.id } )
+			);
+		expect( await ( await readAsFirst( first ) ).text() ).toBe( 'first' );
+		expect( ( await readAsFirst( second ) ).status ).toBe( 404 );
+		const siteImage = path.join( siteRoot, 'capture.png' );
+		writeFileSync( siteImage, 'site' );
+		expect( ( await readAsFirst( siteImage ) ).status ).toBe( 404 );
+	} );
 	it( 'serves a screenshot sidecar image under the sessions root', async () => {
 		const sidecar = path.join( sessionsRoot, '2026', '09', 'session.screenshots' );
 		mkdirSync( sidecar, { recursive: true } );

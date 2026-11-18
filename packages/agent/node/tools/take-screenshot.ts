@@ -1,6 +1,8 @@
 import { copyFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Type } from 'typebox';
+import { writeBrowserToolFile } from '../claude-code/browser-tool-files';
+import { currentClaudeWebCall } from '../claude-code/web-call';
 import { defineTool, LOCAL_CHANGE } from './define-tool';
 import {
 	captureScreenshotBuffer,
@@ -118,8 +120,21 @@ export function createTakeScreenshotTool( {
 		},
 		async ( args, context ) => {
 			try {
+				const web = currentClaudeWebCall();
 				const themeDirectory = args.themeScreenshot && path.resolve( args.themeScreenshot );
-				if ( themeDirectory && ! themeDirectory.startsWith( context.host.sitesRoot + path.sep ) ) {
+				if ( web && themeDirectory ) {
+					if (
+						! web.sitePath ||
+						path.relative(
+							path.join( web.sitePath, 'wp-content', 'themes' ),
+							path.dirname( themeDirectory )
+						) !== ''
+					)
+						throw new Error( 'Choose a theme directory in the selected site.' );
+				} else if (
+					themeDirectory &&
+					! themeDirectory.startsWith( context.host.sitesRoot + path.sep )
+				) {
 					throw new Error(
 						`themeScreenshot must be the absolute path of a theme directory in a Studio site (${ context.host.sitesRoot }/<site>/wp-content/themes/<slug>).`
 					);
@@ -134,61 +149,61 @@ export function createTakeScreenshotTool( {
 				);
 				const captureLabel = getCaptureListLabel( captureTargets );
 				context.onProgress( `Taking ${ captureLabel } screenshot of ${ args.url }…` );
-				const captures = await Promise.all(
-					captureTargets.map( async ( { viewportType, colorScheme } ) => {
-						const capture = await captureScreenshotBuffer( args.url, VIEWPORTS[ viewportType ], {
-							fullPage: true,
-							format: 'jpeg',
-							offset: args.offset,
-							colorScheme,
-							forModel: visionEnabled,
-						} );
-						const screenshotFile = await saveScreenshotFile( context.host, capture.buffer, {
-							viewportType,
-							format: 'jpeg',
-							colorScheme,
-						} );
-						// Progress lines persist in the CLI transcript (but not in the
-						// desktop conversation history, where the inline artifact is the
-						// UI), so this is the terminal user's only handle on the file.
-						context.onProgress(
-							`Saved ${ getCaptureLabel( { viewportType, colorScheme } ) } screenshot to ${
-								screenshotFile.fileUrl
-							}`
-						);
-						return {
-							viewportType,
-							colorScheme,
-							path: screenshotFile.path,
-							buffer: capture.buffer,
-							modelImage: capture.modelImage,
-							documentHeight: capture.documentHeight,
-							capturedHeight: capture.capturedHeight,
-							offset: capture.offset,
-							clipped: capture.clipped,
-							mimeType: screenshotFile.mimeType,
-							mediaWidgetPayload: {
-								type: 'media',
-								widgetProps: {
-									url: screenshotFile.fileUrl,
-									mediaKind: 'image',
-									alt: `Screenshot of ${ args.url } (${ getCaptureLabel( {
-										viewportType,
-										colorScheme,
-									} ) })`,
-									mediaId: null,
-									source: {
-										type: 'local',
-										path: screenshotFile.path,
-										name: screenshotFile.name,
-										mimeType: screenshotFile.mimeType,
-									},
-								},
-							},
-						};
+				const pending = captureTargets.map( ( { viewportType, colorScheme } ) =>
+					captureScreenshotBuffer( args.url, VIEWPORTS[ viewportType ], {
+						fullPage: true,
+						format: 'jpeg',
+						offset: args.offset,
+						colorScheme,
+						forModel: visionEnabled,
 					} )
 				);
-				const describeCapture = ( capture: ( typeof captures )[ number ] ): string => {
+				const images = await Promise.allSettled( pending );
+				web?.check();
+				const failure = images.find( ( image ) => image.status === 'rejected' );
+				if ( failure ) throw failure.reason;
+				const captures = [];
+				for ( const [ index, image ] of images.entries() ) {
+					if ( image.status !== 'fulfilled' ) throw image.reason;
+					const { viewportType, colorScheme } = captureTargets[ index ];
+					const capture = image.value;
+					web?.check();
+					const screenshotFile = await saveScreenshotFile( context.host, capture.buffer, {
+						viewportType,
+						format: 'jpeg',
+						colorScheme,
+					} );
+					if ( screenshotFile.discard ) web?.onDiscard( screenshotFile.discard );
+					captures.push( {
+						viewportType,
+						colorScheme,
+						path: screenshotFile.path,
+						...capture,
+						mimeType: screenshotFile.mimeType,
+						mediaWidgetPayload: {
+							type: 'media',
+							widgetProps: {
+								url: screenshotFile.fileUrl,
+								mediaKind: 'image',
+								alt: `Screenshot of ${ args.url } (${ getCaptureLabel( {
+									viewportType,
+									colorScheme,
+								} ) })`,
+								mediaId: null,
+								source: {
+									type: 'local',
+									path: screenshotFile.path,
+									name: screenshotFile.name,
+									mimeType: screenshotFile.mimeType,
+								},
+							},
+						},
+					} );
+				}
+				const describeCapture = (
+					capture: Awaited< ReturnType< typeof captureScreenshotBuffer > > &
+						( typeof captureTargets )[ number ]
+				): string => {
 					const captureEnd = capture.offset + capture.capturedHeight;
 					const label = getCaptureLabel( capture );
 					const shown = capture.modelImage
@@ -212,7 +227,11 @@ export function createTakeScreenshotTool( {
 				const desktop = captures.find( ( capture ) => capture.viewportType === 'desktop' );
 				if ( themeDirectory && desktop ) {
 					const themeScreenshot = path.join( themeDirectory, 'screenshot.jpg' );
-					await copyFile( desktop.path, themeScreenshot );
+					if ( web?.sitePath ) {
+						await writeBrowserToolFile( web.sitePath, themeScreenshot, desktop.buffer, () =>
+							web.check()
+						);
+					} else await copyFile( desktop.path, themeScreenshot );
 					textLines.push(
 						`Saved the desktop capture as the theme screenshot: ${ themeScreenshot }`
 					);
@@ -232,6 +251,14 @@ export function createTakeScreenshotTool( {
 							( capture ) =>
 								`![Screenshot (${ getCaptureLabel( capture ) })](${ imageLink( capture.path ) })`
 						)
+					);
+				}
+				web?.check();
+				for ( const capture of captures ) {
+					context.onProgress(
+						`Saved ${ getCaptureLabel( capture ) } screenshot to ${
+							capture.mediaWidgetPayload.widgetProps.url
+						}`
 					);
 				}
 				context.onProgress( `Screenshot captured (${ captureLabel })` );

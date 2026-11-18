@@ -547,10 +547,10 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			// back the server-side temp path the path-based operations expect.
 			return uploadFile( file );
 		},
-		async readLocalMediaFile( filePath ): Promise< LocalMediaFile > {
-			const response = await fetch(
-				`${ base }/media/read?path=${ encodeURIComponent( filePath ) }`
-			);
+		async readLocalMediaFile( filePath, claudeSessionId ): Promise< LocalMediaFile > {
+			const query = new URLSearchParams( { path: filePath } );
+			if ( claudeSessionId !== undefined ) query.set( 'claudeSessionId', claudeSessionId );
+			const response = await fetch( `${ base }/media/read?${ query }` );
 			if ( ! response.ok ) {
 				const text = await response.text().catch( () => '' );
 				throw new Error( `GET /media/read failed (${ response.status }): ${ text }` );

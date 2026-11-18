@@ -32,7 +32,8 @@ async function choose( label: string, name: string ) {
 
 async function setupSession(
 	selection: ClaudeSessionSelection = { model: 'model-a', effort: 'medium' },
-	overrides: Partial< Connector > = {}
+	overrides: Partial< Connector > = {},
+	claudeJournal: LoadedAiSession[ 'claudeJournal' ] = []
 ) {
 	const entry = ( customType: string, data: unknown ) =>
 		( {
@@ -54,7 +55,7 @@ async function setupSession(
 			} ),
 			entry( 'studio.claude_selection', selection ),
 		],
-		claudeJournal: [],
+		claudeJournal,
 	};
 	const connector = createFakeConnector(
 		{
@@ -91,6 +92,45 @@ async function setupSession(
 }
 
 describe( 'Claude Code chat', () => {
+	it( 'reopens only local screenshots in this conversation', async () => {
+		const media = ( source: string, alt: string ) => ( {
+			type: 'media',
+			widgetProps: { mediaKind: 'image', source: { type: 'local', path: source }, alt },
+		} );
+		const { connector } = await setupSession( undefined, {}, [
+			[
+				{
+					type: 'chat.artifact',
+					runId: 'run',
+					turnId: 'turn',
+					artifact: {
+						version: 1,
+						id: 'capture',
+						widgets: [
+							media( '/old/sessions/claude-matrix.screenshots/shot.png', 'Home page' ),
+							media( '/sessions/other.screenshots/other.png', 'Other session' ),
+							{
+								type: 'media',
+								widgetProps: {
+									mediaKind: 'image',
+									url: 'https://example.test/remote.png',
+									alt: 'Remote screenshot',
+								},
+							},
+						],
+					},
+				},
+			],
+		] );
+		expect( await screen.findByRole( 'img', { name: 'Home page' } ) ).toBeVisible();
+		expect( connector.readLocalMediaFile ).toHaveBeenCalledExactlyOnceWith(
+			'/sessions/claude-matrix.screenshots/shot.png',
+			'claude-matrix'
+		);
+		expect( screen.queryByAltText( 'Other session' ) ).not.toBeInTheDocument();
+		expect( screen.queryByAltText( 'Remote screenshot' ) ).not.toBeInTheDocument();
+	} );
+
 	it( 'shows its journal and recovery without the Pi composer', async () => {
 		const entry = ( id: string, customType: string, data: unknown ) =>
 			( {

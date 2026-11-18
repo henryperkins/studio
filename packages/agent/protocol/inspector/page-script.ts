@@ -22,7 +22,9 @@ import type { VisualAnnotationTarget } from '@studio/agent/protocol/visual-annot
 export const INSPECTOR_BRIDGE_PREFIX = '__studio-inspector__:';
 export const INSPECTOR_COMMAND_EVENT = '__studio-inspector-command';
 
-export const INSPECTOR_PAGE_SCRIPT = String.raw`
+export function buildInspectorPageScript( trustedBinding?: string ) {
+	const trustedEvent = trustedBinding ? 'if (!e.isTrusted) return;' : '';
+	return String.raw`
 (() => {
 	const KEY = '__studioInspectorDispose';
 	if (typeof window[KEY] === 'function') window[KEY]();
@@ -84,7 +86,11 @@ export const INSPECTOR_PAGE_SCRIPT = String.raw`
 
 	function emit(event) {
 		try {
-			console.log(PREFIX + JSON.stringify(event));
+			${
+				trustedBinding
+					? `window[${ JSON.stringify( trustedBinding ) }](PREFIX + JSON.stringify(event));`
+					: 'console.log(PREFIX + JSON.stringify(event));'
+			}
 		} catch {}
 	}
 	function art(accent, onAccent) {
@@ -207,7 +213,13 @@ export const INSPECTOR_PAGE_SCRIPT = String.raw`
 				marker = document.createElement('button');
 				marker.type = 'button';
 				marker.className = 'enter';
-				marker.innerHTML = '<span class="plus" aria-hidden="true"><svg width="12" height="12" viewBox="${ PLUS_ICON.viewBox }" fill="none"><path d="${ PLUS_ICON.path }" stroke-width="${ PLUS_ICON.strokeWidth }" stroke-linecap="${ PLUS_ICON.strokeLinecap }" stroke="currentColor"/></svg></span><span class="number" aria-hidden="true"></span>';
+				marker.innerHTML = '<span class="plus" aria-hidden="true"><svg width="12" height="12" viewBox="${
+					PLUS_ICON.viewBox
+				}" fill="none"><path d="${ PLUS_ICON.path }" stroke-width="${
+					PLUS_ICON.strokeWidth
+				}" stroke-linecap="${
+					PLUS_ICON.strokeLinecap
+				}" stroke="currentColor"/></svg></span><span class="number" aria-hidden="true"></span>';
 				marker.addEventListener('animationend', (event) => {
 					if (event.target !== marker) return;
 					if (event.animationName === 'marker-out' || event.animationName === 'marker-fade-out') { finishExit(); return; }
@@ -238,6 +250,7 @@ export const INSPECTOR_PAGE_SCRIPT = String.raw`
 			marker.style.left = p.left + 'px';
 			marker.style.top = p.top + 'px';
 			marker.onclick = (e) => {
+				${ trustedEvent }
 				e.preventDefault();
 				e.stopPropagation();
 				hovered = null;
@@ -348,6 +361,7 @@ export const INSPECTOR_PAGE_SCRIPT = String.raw`
 	document.addEventListener(
 		'click',
 		(e) => {
+			${ trustedEvent }
 			if (!state.active || isOwnUi(e)) return;
 			e.preventDefault();
 			e.stopImmediatePropagation();
@@ -361,6 +375,7 @@ export const INSPECTOR_PAGE_SCRIPT = String.raw`
 	document.addEventListener(
 		'keydown',
 		(e) => {
+			${ trustedEvent }
 			if (state.active && e.key === 'Escape') {
 				e.preventDefault();
 				e.stopPropagation();
@@ -396,6 +411,9 @@ export const INSPECTOR_PAGE_SCRIPT = String.raw`
 	};
 })();
 `;
+}
+
+export const INSPECTOR_PAGE_SCRIPT = buildInspectorPageScript();
 
 export type BrowserShortcutCommand = 'back' | 'forward' | 'reload';
 

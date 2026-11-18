@@ -307,8 +307,8 @@ export function createIpcConnector(): Connector {
 			return ( ipcApi.getPathForFile( file ) as string ) ?? '';
 		},
 
-		async readLocalMediaFile( path ): Promise< LocalMediaFile > {
-			return ( await ipcApi.readLocalMediaFile( path ) ) as LocalMediaFile;
+		async readLocalMediaFile( path, claudeSessionId ): Promise< LocalMediaFile > {
+			return ( await ipcApi.readLocalMediaFile( path, claudeSessionId ) ) as LocalMediaFile;
 		},
 
 		async extractBlueprintBundle( file ): Promise< ExtractedBlueprintBundle > {

@@ -524,6 +524,9 @@ function permissivePolicy( names: string[] ) {
 	const controller = new AbortController();
 	const guarded: Array< { toolCallId: string; host: StudioAgentHost } > = [];
 	const policy: ClaudeExecutionPolicy = {
+		webCallOptions: vi.fn( async () => {
+			throw new Error( 'No web call was admitted' );
+		} ),
 		signal: controller.signal,
 		studioTools: names,
 		authorizeToolUse: vi.fn( async () => false ),

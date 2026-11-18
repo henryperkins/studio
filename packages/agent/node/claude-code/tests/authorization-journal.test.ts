@@ -67,8 +67,7 @@ vi.mock( '@studio/common/lib/well-known-paths', async ( importOriginal ) => {
 } );
 
 // Every rule an operation can run under, enabled whether or not it is
-// qualified, as `unqualified-tool-rules.test.ts` does: what is checked here is
-// what each rule's authorization records, not what this build runs.
+// qualified, so the journal contract is exercised before future tools ship.
 vi.mock( '../execution-rules', async ( importOriginal ) => {
 	const actual = await importOriginal< typeof import('../execution-rules') >();
 	const claudeStudioTools: typeof actual.claudeStudioTools = ( enabled, navigation, origin ) =>

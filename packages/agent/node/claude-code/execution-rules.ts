@@ -24,7 +24,7 @@ import { pullSiteTool } from '../tools/pull-site';
 import { pushSiteTool } from '../tools/push-site';
 import { auditSeoTool } from '../tools/rank-me-up';
 import { refreshBrowserTool } from '../tools/refresh-browser';
-import { scaffoldThemeTool } from '../tools/scaffold-theme';
+import { scaffoldThemeSlug, scaffoldThemeTool } from '../tools/scaffold-theme';
 import { sendFeedbackTool } from '../tools/send-feedback';
 import { getSiteInfoTool } from '../tools/site-info';
 import { startSiteTool } from '../tools/start-site';
@@ -90,6 +90,13 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		sendFeedbackTool.name,
 		generateImagesTool.name,
 		'Ls',
+		scaffoldThemeTool.name,
+		validateBlocksTool.name,
+		takeScreenshotTool.name,
+		inspectDesignTool.name,
+		auditPerformanceTool.name,
+		auditSeoTool.name,
+		openAnnotationBrowserTool.name,
 	] ),
 } );
 
@@ -197,12 +204,25 @@ export type ClaudeNavigationConfinement =
 	| { readonly mode: 'none' }
 	| { readonly mode: 'guarded'; readonly guard: ClaudeNavigationGuard | undefined };
 
-/** This build has no navigation guard, so no tool that drives a browser can be enabled. */
+/** Discovery and turns without a guarded Chromium omit browser tools. */
 export const CLAUDE_NAVIGATION_CONFINEMENT: ClaudeNavigationConfinement = Object.freeze( {
 	mode: 'none',
 } );
 
-const NAVIGATION_GUARANTEES = Object.keys( {
+export function claudeBrowserConfinement(
+	targetOrigin: string | null
+): ClaudeNavigationConfinement {
+	return Object.freeze( {
+		mode: 'guarded',
+		guard: Object.freeze( {
+			ruleRevision: CLAUDE_NAVIGATION_RULE_REVISION,
+			targetOrigin,
+			...navigationGuarantees,
+		} ),
+	} );
+}
+
+const navigationGuarantees = {
 	checksEveryRequest: true,
 	checksEveryRedirect: true,
 	appliesOriginRule: true,
@@ -211,10 +231,8 @@ const NAVIGATION_GUARANTEES = Object.keys( {
 	confinesFileDocuments: true,
 	blocksUncheckedChannels: true,
 	failsClosed: true,
-} satisfies Record<
-	Exclude< keyof ClaudeNavigationGuard, 'ruleRevision' | 'targetOrigin' >,
-	true
-> );
+} satisfies Record< Exclude< keyof ClaudeNavigationGuard, 'ruleRevision' | 'targetOrigin' >, true >;
+const NAVIGATION_GUARANTEES = Object.keys( navigationGuarantees );
 const NAVIGATION_GUARD_KEYS: ReadonlySet< string > = new Set( [
 	'ruleRevision',
 	'targetOrigin',
@@ -255,7 +273,7 @@ export function claudeTargetOrigin(
 	target: ClaudeStudioTarget,
 	targetSite: { url?: string } | undefined
 ): string | null {
-	if ( target.environment === 'global' || ! targetSite?.url ) return null;
+	if ( target.environment !== 'local' || ! targetSite?.url ) return null;
 	try {
 		const { origin } = new URL( targetSite.url );
 		return origin === 'null' ? null : origin;
@@ -342,7 +360,9 @@ export type ClaudeChannelBinding =
 	| 'bundled'
 	| 'config'
 	| 'payloads'
-	| 'directoryListing';
+	| 'directoryListing'
+	| 'webRequests'
+	| 'screenshots';
 
 /** For every channel, `false` when the implementation does not use it, or what bounds it. */
 export type ClaudeToolChannelDeclaration = {
@@ -370,6 +390,9 @@ export interface ClaudeStudioToolRule {
 	readonly classify?: ( args: unknown ) => ClaudeOperationClass | undefined;
 	/** Studio's directory listing checks the directory and each returned entry. */
 	readonly directoryListing?: true;
+	/** Direct GETs use the call's destination-specific transport. */
+	readonly webRequests?: true;
+	readonly screenshots?: true;
 	/**
 	 * The local site a call names. It must resolve to the turn's target site; a
 	 * missing reference denies the call.
@@ -492,8 +515,15 @@ function qualified(
 	return { ...rule, qualification: { qualified: true, channels } };
 }
 
-// What a tool that acts on the site it names only through the host uses: host
-// operations, WP-CLI among them, bound to the target site by the host guard.
+// Browser startup reads the pinned Playwright installation and the selected site's TLS trust file.
+const browserChannels = {
+	readsLocalFiles: [ 'navigates' ],
+	drivesBrowser: [ 'navigates' ],
+	requestsNetwork: [ 'navigates' ],
+	spawnsProcess: [ 'navigates' ],
+} as const;
+
+// Operations on the selected site, including WP-CLI, are bound by the host guard.
 const LOCAL_SITE_HOST_CHANNELS: Partial< ClaudeToolChannelDeclaration > = {
 	runsWpCli: [ 'site', 'host' ],
 	callsHostOperation: [ 'site', 'host' ],
@@ -615,62 +645,7 @@ function auditUrls( args: unknown, siteUrl: string | undefined ): string[] | und
 	return [ `${ siteUrl.replace( /\/+$/, '' ) }${ urlPath }` ];
 }
 
-/**
- * A host name as every check compares it: lowercase, without IPv6 brackets and
- * without trailing dots, which name the same host. `URL` has already applied
- * IDNA, so a parsed host name is in its punycode form.
- */
-export function normalizeHostname( hostname: string ): string {
-	return hostname
-		.toLowerCase()
-		.replace( /^\[|\]$/g, '' )
-		.replace( /\.+$/, '' );
-}
-
-/**
- * Whether a host name belongs to this machine or a private network: loopback,
- * private, link-local and unique-local addresses, `localhost` and `.local`.
- */
-export function isLocalHostname( hostname: string ): boolean {
-	const host = normalizeHostname( hostname );
-	if (
-		! host ||
-		host === 'localhost' ||
-		host.endsWith( '.localhost' ) ||
-		host.endsWith( '.local' )
-	)
-		return true;
-	// IPv4-mapped and IPv4-compatible IPv6 addresses carry an IPv4 address.
-	const mapped = /^::(?:ffff:)?(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/.exec(
-		host
-	);
-	const ipv4 = mapped
-		? mapped[ 1 ] ??
-		  [ parseInt( mapped[ 2 ], 16 ), parseInt( mapped[ 3 ], 16 ) ]
-				.flatMap( ( word ) => [ word >> 8, word & 255 ] )
-				.join( '.' )
-		: host;
-	const octets = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec( ipv4 )?.slice( 1 ).map( Number );
-	if ( octets ) {
-		const [ a, b ] = octets;
-		return (
-			a === 0 ||
-			a === 10 ||
-			a === 127 ||
-			( a === 100 && b >= 64 && b <= 127 ) ||
-			( a === 169 && b === 254 ) ||
-			( a === 172 && b >= 16 && b <= 31 ) ||
-			( a === 192 && b === 168 )
-		);
-	}
-	return (
-		host.includes( ':' ) &&
-		( host === '::' ||
-			host === '::1' ||
-			/^f[cd][0-9a-f]{0,2}:/.test( host ) ||
-			/^fe[89ab][0-9a-f]?:/.test( host ) )
-	);
-}
+export { isLocalHostname, normalizeHostname } from './web-hostname';
 
 // Tool annotations describe these tools to hosts; they are hints. The classes
 // here decide, and the tests require each to be at least as strict as the
@@ -817,47 +792,93 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	],
 	[
 		scaffoldThemeTool.name,
-		// Besides the theme files it writes in the site, it downloads the fonts
-		// its DESIGN.md names: a Google Fonts stylesheet, then each font file at
-		// the address that response gives. Nothing in the rule bounds a request
-		// Studio sends outside a browser to an address a response chose.
-		unqualified( onSite( 'local-change' ), [ 'requestsNetwork' ] ),
+		qualified(
+			onSite( 'local-change', {
+				webRequests: true,
+				paths: ( args, folder ) => {
+					if (
+						! folder ||
+						! isRecord( args ) ||
+						typeof args.name !== 'string' ||
+						( args.slug !== undefined && typeof args.slug !== 'string' )
+					)
+						return;
+					const slug = scaffoldThemeSlug( args.name, args.slug );
+					if ( ! /^[a-z0-9][a-z0-9-]*$/.test( slug ) ) return;
+					const themes = path.join( folder, 'wp-content', 'themes' );
+					const paths = [ path.join( folder, 'DESIGN.md' ), path.join( themes, slug ) ];
+					if ( args.parentTheme !== undefined && typeof args.parentTheme !== 'string' ) return;
+					if ( typeof args.parentTheme === 'string' && args.parentTheme.trim() ) {
+						if ( ! /^[a-z0-9][a-z0-9-]*$/.test( args.parentTheme.trim() ) ) return;
+						paths.push( path.join( themes, args.parentTheme.trim(), 'style.css' ) );
+					}
+					return paths;
+				},
+			} ),
+			using( {
+				readsLocalFiles: [ 'paths' ],
+				writesLocalFiles: [ 'paths' ],
+				requestsNetwork: [ 'webRequests' ],
+				runsWpCli: [ 'site', 'host' ],
+				callsHostOperation: [ 'site', 'host' ],
+			} )
+		),
 	],
 	[ pickDesignTool.name, unqualified( studioRule( 'read' ) ) ],
 	[
 		validateBlocksTool.name,
-		// It checks the markup in the named site's block editor, which it opens
-		// signed in, in the shared browser.
-		unqualified(
+		qualified(
 			onSite( 'local-overwrite', {
 				navigates: true,
+				classify: ( args ) =>
+					isRecord( args ) && args.filePath !== undefined ? 'local-overwrite' : 'read',
 				paths: ( args, siteFolder ) => {
 					const file = isRecord( args ) ? args.filePath : undefined;
 					if ( file === undefined ) return [];
 					if ( typeof file !== 'string' || ! siteFolder ) return;
 					return [ path.resolve( siteFolder, file ) ];
 				},
+			} ),
+			using( {
+				...browserChannels,
+				readsLocalFiles: [ 'paths', 'navigates' ],
+				writesLocalFiles: [ 'paths' ],
+				callsHostOperation: [ 'site', 'host' ],
 			} )
 		),
 	],
 	[
 		takeScreenshotTool.name,
-		unqualified(
-			studioRule( 'local-change', {
+		qualified(
+			studioRule( 'local-overwrite', {
+				screenshots: true,
+				classify: ( args ) =>
+					isRecord( args ) && args.themeScreenshot !== undefined
+						? 'local-overwrite'
+						: 'local-change',
 				urls: pageUrls,
 				navigates: true,
 				paths: ( args ) => {
 					const directory = isRecord( args ) ? args.themeScreenshot : undefined;
 					if ( directory === undefined ) return [];
 					if ( typeof directory !== 'string' || ! path.isAbsolute( directory ) ) return;
-					return [ path.resolve( directory ) ];
+					return [ path.resolve( directory, 'screenshot.jpg' ) ];
 				},
+			} ),
+			using( {
+				...browserChannels,
+				readsLocalFiles: [ 'screenshots', 'navigates' ],
+				writesLocalFiles: [ 'screenshots', 'paths' ],
+				callsHostOperation: [ 'host' ],
 			} )
 		),
 	],
 	[
 		inspectDesignTool.name,
-		unqualified( studioRule( 'read', { urls: pageUrls, navigates: true } ) ),
+		qualified(
+			studioRule( 'read', { urls: pageUrls, navigates: true } ),
+			using( browserChannels )
+		),
 	],
 	[
 		generateImagesTool.name,
@@ -912,11 +933,21 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	],
 	[
 		auditPerformanceTool.name,
-		unqualified( onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ) ),
+		qualified(
+			onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ),
+			using( { ...browserChannels, callsHostOperation: [ 'site', 'host' ] } )
+		),
 	],
 	[
 		auditSeoTool.name,
-		unqualified( onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true } ) ),
+		qualified(
+			onSite( 'read', { urls: auditUrls, urlsOnSite: true, navigates: true, webRequests: true } ),
+			using( {
+				...browserChannels,
+				requestsNetwork: [ 'navigates', 'webRequests' ],
+				callsHostOperation: [ 'site', 'host' ],
+			} )
+		),
 	],
 	[
 		listConnectedRemoteSitesTool.name,
@@ -1024,7 +1055,10 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	],
 	[
 		openAnnotationBrowserTool.name,
-		unqualified( studioRule( 'local-change', { urls: pageUrls, navigates: true } ) ),
+		qualified(
+			studioRule( 'local-change', { urls: pageUrls, navigates: true } ),
+			using( browserChannels )
+		),
 	],
 	[
 		refreshBrowserTool.name,
@@ -1378,13 +1412,33 @@ const CHANNEL_BOUNDS: Readonly<
 	>
 > = {
 	readsLocalFiles: {
-		admits: [ 'paths', 'class', 'bundled', 'config', 'payloads', 'directoryListing' ],
-		needs: [ 'paths', 'bundled', 'config', 'payloads', 'directoryListing' ],
+		admits: [
+			'paths',
+			'class',
+			'bundled',
+			'config',
+			'payloads',
+			'directoryListing',
+			'screenshots',
+			'navigates',
+		],
+		needs: [
+			'paths',
+			'bundled',
+			'config',
+			'payloads',
+			'directoryListing',
+			'screenshots',
+			'navigates',
+		],
 	},
-	writesLocalFiles: { admits: [ 'paths', 'class' ], needs: [ 'paths' ] },
+	writesLocalFiles: {
+		admits: [ 'paths', 'class', 'screenshots' ],
+		needs: [ 'paths', 'screenshots' ],
+	},
 	drivesBrowser: { admits: [ 'navigates', 'urls', 'site' ], needs: [ 'navigates' ] },
-	requestsNetwork: { admits: [ 'scope', 'class' ] },
-	spawnsProcess: { admits: [ 'class' ] },
+	requestsNetwork: { admits: [ 'scope', 'class', 'navigates', 'webRequests' ] },
+	spawnsProcess: { admits: [ 'class', 'navigates' ] },
 	runsWpCli: { admits: [ 'host', 'site' ], needs: [ 'host' ] },
 	callsHostOperation: { admits: [ 'host', 'site' ], needs: [ 'host' ] },
 	reachesWpcom: { admits: [ 'scope', 'class', 'host' ] },
@@ -1399,6 +1453,8 @@ const RULE_ELEMENTS: Readonly<
 > = {
 	qualification: 'other',
 	directoryListing: 'mark',
+	webRequests: 'mark',
+	screenshots: 'mark',
 	operationClass: 'other',
 	approval: 'other',
 	classify: 'function',
@@ -1441,6 +1497,10 @@ function ruleHas( rule: Record< string, unknown >, binding: unknown ): boolean {
 			return typeof rule.paths === 'function';
 		case 'urls':
 			return typeof rule.urls === 'function';
+		case 'webRequests':
+			return rule.webRequests === true;
+		case 'screenshots':
+			return rule.screenshots === true && rule.navigates === true;
 		case 'navigates':
 			return rule.navigates === true;
 		case 'scope':
@@ -1504,6 +1564,8 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 	// The declaration has to cover what the rule itself shows the tool does.
 	const covers =
 		( elements.navigates === true ) === used.has( 'drivesBrowser' ) &&
+		( elements.webRequests !== true || used.has( 'requestsNetwork' ) ) &&
+		( elements.screenshots !== true || used.has( 'writesLocalFiles' ) ) &&
 		( elements.remote === undefined || used.has( 'reachesWpcom' ) ) &&
 		( elements.paths === undefined ||
 			used.has( 'readsLocalFiles' ) ||
@@ -1592,6 +1654,16 @@ export function claudeToolInventory(
  * as it is. The canonical description, which every route shares, is unchanged.
  */
 export function claudeRouteNote( name: string ): string | undefined {
+	if ( name === scaffoldThemeTool.name )
+		return 'Studio creates a new theme in the selected local site. External fonts must come from Google Fonts. Activation is limited to the new theme.';
+	const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
+	if ( rule?.navigates && rule.qualification.qualified )
+		return [
+			rule.site
+				? 'Studio opens the selected local site for this call.'
+				: 'Studio can open a public page or the exact origin of the selected local site.',
+			'Each call starts a fresh browser. Authenticated editor requests stay on the selected origin. Pages that require unsupported network access stop the tool.',
+		].join( ' ' );
 	if ( name !== runWpCliTool.name ) return;
 	const commands = wpCliRouteCommands();
 	const groups = [

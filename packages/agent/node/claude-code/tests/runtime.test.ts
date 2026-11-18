@@ -3787,6 +3787,9 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 						);
 					for ( const index of [ 1, 3, 4, 5, 6 ] ) expect( results[ index ] ).toEqual( {} );
 					expect( showArtifact ).toHaveBeenCalledTimes( withUi ? 2 : 0 );
+					expect( events.filter( ( event ) => event.type === 'chat.artifact' ) ).toHaveLength(
+						withUi ? 2 : 0
+					);
 					if ( withUi )
 						expect( showArtifact ).toHaveBeenCalledWith(
 							expect.objectContaining( {
@@ -3796,6 +3799,35 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 							} )
 						);
 					expect( reloadPreview ).not.toHaveBeenCalled();
+				} finally {
+					await fixture.cleanup();
+				}
+			}
+		);
+
+		it.each( [ false, true ] )(
+			'advertises the browser tools for Chromium availability %s',
+			async ( installed ) => {
+				const fixture = await siteFixture( 'claude-browser-inventory-' );
+				try {
+					const runtime = await import( '../runtime' );
+					const query = fakeNativeTurn( fixture.root );
+					const events = await turn( runtime, fixture, 'next', query, {
+						hasChromium: async () => installed,
+					} );
+					expect( events.at( -1 ) ).toMatchObject( { outcome: { status: 'success' } } );
+					const names = reportedTools( optionsOf( query ) );
+					for ( const name of [
+						'take_screenshot',
+						'inspect_design',
+						'validate_blocks',
+						'rank_me_up',
+						'need_for_speed',
+						'open_annotation_browser',
+					] ) {
+						expect( names.includes( 'mcp__studio__' + name ), name ).toBe( installed );
+					}
+					expect( names ).toContain( 'mcp__studio__scaffold_theme' );
 				} finally {
 					await fixture.cleanup();
 				}

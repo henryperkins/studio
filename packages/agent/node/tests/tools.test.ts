@@ -1,4 +1,14 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'fs/promises';
+import {
+	link,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	realpath,
+	rm,
+	stat,
+	writeFile,
+} from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
@@ -7,6 +17,7 @@ import { fetchSyncableSites } from '@studio/common/lib/sync/sync-api';
 import { vi } from 'vitest';
 import { validateBlocks } from '@studio/agent/node/block-validator';
 import { getSharedBrowser } from '@studio/agent/node/browser-utils';
+import { runInClaudeWebCall, type ClaudeWebCall } from '@studio/agent/node/claude-code/web-call';
 import { generateImages, resolveImageService } from '@studio/agent/node/image-generation';
 import {
 	resolveStudioTools,
@@ -976,7 +987,9 @@ describe( 'Studio AI MCP tools', () => {
 		let scaffoldSite: typeof mockSite;
 
 		beforeEach( async () => {
-			tempSiteRoot = await mkdtemp( path.join( os.tmpdir(), 'studio-scaffold-theme-' ) );
+			tempSiteRoot = await realpath(
+				await mkdtemp( path.join( os.tmpdir(), 'studio-scaffold-theme-' ) )
+			);
 			await mkdir( path.join( tempSiteRoot, 'wp-content', 'themes' ), { recursive: true } );
 			scaffoldSite = { ...mockSite, path: tempSiteRoot };
 			vi.mocked( host.sites.resolve ).mockResolvedValue( scaffoldSite );
@@ -1114,6 +1127,91 @@ describe( 'Studio AI MCP tools', () => {
 			expect( getTextContent( result ) ).toContain(
 				'theme.json carries the DESIGN.md tokens under the same names (1 color, 1 font family, 2 text styles, 0 spacing steps), with its fonts downloaded to assets/fonts and declared as fontFace.'
 			);
+		} );
+
+		const guardedScaffold = (
+			get: ClaudeWebCall[ 'get' ],
+			signal = new AbortController().signal
+		) =>
+			runInClaudeWebCall(
+				{
+					get,
+					signal,
+					sitePath: tempSiteRoot,
+					targetOrigin: null,
+					onDiscard: vi.fn(),
+					check: () => signal.throwIfAborted(),
+					newPage: vi.fn(),
+				},
+				() =>
+					getTool( 'scaffold_theme' ).rawHandler( {
+						nameOrPath: scaffoldSite.name,
+						name: 'Example',
+					} as never )
+			);
+
+		it( 'uses scoped CSS and font reads, publishes once, then activates its own slug', async () => {
+			await writeNunitoDesign();
+			vi.mocked( host.sites.isRunning ).mockResolvedValue( true );
+			const font = Buffer.alloc( 48 );
+			font.write( 'wOF2' );
+			font.writeUInt32BE( font.length, 8 );
+			const css =
+				"@font-face {font-family:'Nunito'; font-weight:400; src:url(https://fonts.gstatic.com/s/nunito/v1/example.woff2);}";
+			const get = vi
+				.fn< ClaudeWebCall[ 'get' ] >()
+				.mockResolvedValueOnce( new Response( css ) )
+				.mockResolvedValueOnce( new Response( new Uint8Array( font ) ) );
+			await guardedScaffold( get );
+			expect( get.mock.calls ).toEqual( [
+				[
+					'https://fonts.googleapis.com/css2?family=Nunito:wght@400;700&display=swap',
+					{ purpose: 'font-css', userAgent: expect.any( String ) },
+				],
+				[ 'https://fonts.gstatic.com/s/nunito/v1/example.woff2', { purpose: 'font-file' } ],
+			] );
+			const themes = path.join( tempSiteRoot, 'wp-content/themes' );
+			expect( await readdir( themes ) ).toEqual( [ 'example' ] );
+			expect(
+				await readFile( path.join( themes, 'example/assets/fonts/nunito/nunito-400.woff2' ) )
+			).toEqual( font );
+			expect( host.sites.wpCli ).toHaveBeenCalledWith( scaffoldSite, [
+				'theme',
+				'activate',
+				'example',
+			] );
+		} );
+
+		it( 'removes its staging directory on Stop and preserves the unpublished destination', async () => {
+			await writeNunitoDesign();
+			const controller = new AbortController();
+			const get = async () => {
+				controller.abort( new Error( 'Stopped' ) );
+				controller.signal.throwIfAborted();
+				return new Response();
+			};
+			await expect( guardedScaffold( get, controller.signal ) ).rejects.toThrow( 'Stopped' );
+			expect( await readdir( path.join( tempSiteRoot, 'wp-content/themes' ) ) ).toEqual( [] );
+			expect( host.sites.wpCli ).not.toHaveBeenCalled();
+		} );
+
+		it( 'retains font family settings when Google Fonts is unavailable', async () => {
+			await writeNunitoDesign();
+			const result = await guardedScaffold( async () => new Response( null, { status: 503 } ) );
+			expect( getTextContent( result ) ).toContain( 'without font files' );
+			const theme = path.join( tempSiteRoot, 'wp-content/themes/example' );
+			const json = JSON.parse( await readFile( path.join( theme, 'theme.json' ), 'utf8' ) );
+			expect( json.settings.typography.fontFamilies[ 0 ].fontFace ).toBeUndefined();
+			expect( await readdir( path.join( theme, 'assets/fonts' ) ) ).toEqual( [] );
+		} );
+
+		it( 'refuses linked design input before downloading fonts or creating a theme', async () => {
+			await writeNunitoDesign();
+			await link( path.join( tempSiteRoot, 'DESIGN.md' ), path.join( tempSiteRoot, 'linked.md' ) );
+			const get = vi.fn();
+			await expect( guardedScaffold( get ) ).rejects.toThrow( /ordinary theme files/ );
+			expect( get ).not.toHaveBeenCalled();
+			expect( await readdir( path.join( tempSiteRoot, 'wp-content/themes' ) ) ).toEqual( [] );
 		} );
 
 		it( 'honors an explicit slug argument over the derived one', async () => {

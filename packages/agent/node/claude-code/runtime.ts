@@ -28,6 +28,8 @@ import {
 	CLAUDE_NAVIGATION_CONFINEMENT,
 	CLAUDE_SHELL_CONFINEMENT,
 	claudeNativeTools,
+	claudeBrowserConfinement,
+	claudeTargetOrigin,
 	studioMcpToolName,
 } from './execution-rules';
 import { getClaudeSensitiveReadDenyRules } from './local-paths';
@@ -37,6 +39,7 @@ import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
 import { prepareClaudeShell } from './shell';
 import { createShellDeadlines } from './shell-deadlines';
 import { createStudioClaudeDiscoveryServer, createStudioClaudeToolBridge } from './tool-bridge';
+import { hasClaudeChromium } from './web-transport';
 import type { ClaudeAuthIdentity } from './auth-status';
 import type { ClaudeAccountStatus, ClaudeAccountStatusRequest } from './connection';
 import type { ClaudeAccountCheck, ClaudeApprover, ClaudeToolUse } from './execution-policy';
@@ -244,6 +247,7 @@ interface RuntimeDependencies {
 
 interface RuntimeOptions extends RuntimeDependencies {
 	prepareShell?: typeof prepareClaudeShell;
+	hasChromium?: typeof hasClaudeChromium;
 	storeRoot: string;
 	approve: ClaudeApprover;
 	verifySession?: ( snapshot: ClaudeBackendTurnSnapshot ) => Promise< boolean >;
@@ -988,7 +992,9 @@ export async function runClaudeTurn(
 			isStudioSite: async ( folder ) => Boolean( await host.sites.findByFolder( folder ) ),
 			enabledTools: CLAUDE_ENABLED_TOOLS,
 			shellConfinement: confinement,
-			navigationConfinement: CLAUDE_NAVIGATION_CONFINEMENT,
+			navigationConfinement: ( await ( options.hasChromium ?? hasClaudeChromium )() )
+				? claudeBrowserConfinement( claudeTargetOrigin( target, targetSite ) )
+				: CLAUDE_NAVIGATION_CONFINEMENT,
 			signal: controller.signal,
 			approve: options.approve,
 			approvalTimeoutMs: CLAUDE_APPROVAL_TIMEOUT_MS,
@@ -1040,7 +1046,20 @@ export async function runClaudeTurn(
 		// Studio's image service decides whether the turn offers generate_images,
 		// as it decides it on the Pi route; no model provider's account does.
 		const imageGeneration = await isImageGenerationAvailable().catch( () => false );
-		bridge = createStudioClaudeToolBridge( host, { runId, turnId, policy: guard }, emit, {
+		const ui = host.ui;
+		const toolHost: StudioAgentHost = ui
+			? {
+					...host,
+					ui: {
+						...ui,
+						async showArtifact( artifact ) {
+							await ui.showArtifact( artifact );
+							emit( { type: 'chat.artifact', runId, turnId, artifact } );
+						},
+					},
+			  }
+			: host;
+		bridge = createStudioClaudeToolBridge( toolHost, { runId, turnId, policy: guard }, emit, {
 			imageGeneration,
 		} );
 		const watchConnection = async () => {
@@ -1198,7 +1217,7 @@ export async function runClaudeTurn(
 							hooks: [
 								nativeFileResultHook(
 									guard,
-									host.ui,
+									toolHost.ui,
 									target.environment === 'local' ? targetSite?.path : undefined,
 									prepared.configDirectory,
 									options.storeRoot,

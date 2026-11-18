@@ -4,7 +4,16 @@ vi.mock( '@studio/agent/node/claude-code/studio-surface', () => ( {
 	validateClaudeSendSelection: vi.fn(),
 } ) );
 vi.mock( '@studio/agent/node/claude-code/runtime', () => ( { runClaudeTurn: vi.fn() } ) );
+import { link, mkdir, mkdtemp, rm, stat, writeFile, symlink } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { readChatGptAccount, type ChatGptAccount } from '@studio/agent/node/chatgpt/account-store';
+import { claudeScreenshotDirectory } from '@studio/agent/node/claude-code/screenshot-directory';
+import {
+	createNativeSessionStore,
+	getClaudeSessionStoreRoot,
+} from '@studio/agent/node/claude-code/sessions';
+import { openLocalMediaFile } from '@studio/agent/node/local-media';
 import { runStudioAgentTurn } from '@studio/agent/node/runtime';
 import { resolveResumeSessionContext } from '@studio/agent/node/sessions/context';
 import {
@@ -12,6 +21,7 @@ import {
 	listStudioSessionFiles,
 	openStudioSession,
 } from '@studio/agent/node/sessions/pi-session';
+import { createAiSession, deleteAiSession, loadAiSession } from '@studio/agent/node/sessions/store';
 import {
 	readAiSettings,
 	readAnthropicApiKey,
@@ -21,6 +31,7 @@ import { describeConnectionSelectionError } from '@studio/agent/protocol/connect
 import { createDisconnectedOpenAiSettings } from '@studio/agent/protocol/providers';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { fetchStudioAssistantQuota } from '@studio/common/lib/studio-assistant-quota';
+import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { vi, type Mock } from 'vitest';
 import {
 	isAiProviderReady,
@@ -1124,6 +1135,99 @@ it( 'routes a Claude session resumed by ID and rejects a stale selection', async
 		).rejects.toThrow( 'settings changed' );
 	} finally {
 		output.mockRestore();
+	}
+} );
+
+it( 'saves a screenshot through the forked Claude host, reopens its sidecar, and deletes it with the session', async () => {
+	const fixture = await mkdtemp( path.join( os.tmpdir(), 'studio-claude-screenshot-' ) );
+	const sessions = path.join( fixture, 'sessions' );
+	const descriptor = Object.getOwnPropertyDescriptor( process, 'send' );
+	const send = vi.fn();
+	Object.defineProperty( process, 'send', { configurable: true, value: send } );
+	vi.mocked( getSessionsDirectory ).mockReturnValue( sessions );
+	try {
+		const selection = { model: 'model', effort: 'high' } as const;
+		const { id, filePath } = await createAiSession( sessions, {
+			claude: {
+				binding: {
+					connectionId: 'example',
+					siteId: null,
+					workingDirectory: fixture,
+					configDirectory: fixture,
+				},
+				selection,
+			},
+		} );
+		const directory = filePath.replace( /\.jsonl$/, '.screenshots' );
+		const file = path.join( directory, 'example.png' );
+		const store = createNativeSessionStore( getClaudeSessionStoreRoot( sessions ) );
+		const artifact = {
+			id: 'shot',
+			version: 1 as const,
+			widgets: [
+				{
+					type: 'media',
+					widgetProps: { mediaKind: 'image', source: { type: 'local', path: file } },
+				},
+			],
+		};
+		const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
+		vi.mocked( runClaudeTurn ).mockImplementationOnce( async ( snapshot, host, input ) => {
+			expect( await host.screenshotsDirectory!() ).toBe( directory );
+			await writeFile( file, 'fixture' );
+			await host.ui!.showArtifact( artifact );
+			const event = {
+				type: 'chat.artifact' as const,
+				runId: snapshot.runId,
+				turnId: snapshot.turnId,
+				artifact,
+			};
+			await store.journal( id, snapshot.turnId ).append( event );
+			input.onEvent( event );
+			input.onEvent( {
+				type: 'turn.terminal',
+				runId: snapshot.runId,
+				turnId: snapshot.turnId,
+				outcome: { status: 'success' },
+			} );
+		} );
+		await runCommand( {
+			adapter: new JsonAdapter(),
+			initialMessage: 'View the saved screenshot',
+			initialRunId: 'run',
+			initialTurnId: 'turn',
+			claudeSelection: selection,
+			resumeSession: await loadAiSession( sessions, id ),
+		} );
+		expect( send ).toHaveBeenCalledWith(
+			expect.objectContaining( { type: 'chat.artifact', artifact } )
+		);
+		expect(
+			await createNativeSessionStore( getClaudeSessionStoreRoot( sessions ) ).readJournals( id )
+		).toMatchObject( [ [ { type: 'chat.artifact', artifact } ] ] );
+		const saved = await openLocalMediaFile( file, [ sessions ] );
+		expect( saved ).not.toBeNull();
+		await using handle = saved!.handle;
+		expect( await handle.readFile( 'utf8' ) ).toBe( 'fixture' );
+		await handle.close();
+		const linked = path.join( directory, 'linked.png' );
+		await link( file, linked );
+		expect( await openLocalMediaFile( linked, [ sessions ] ) ).toBeNull();
+		await rm( directory, { recursive: true } );
+		const sibling = path.join( fixture, 'sibling' );
+		await mkdir( sibling );
+		await writeFile( path.join( sibling, 'example.png' ), 'sibling' );
+		await symlink( sibling, directory, 'junction' );
+		await expect( claudeScreenshotDirectory( sessions, id ) ).rejects.toThrow();
+		expect( await openLocalMediaFile( file, [ sessions ] ) ).toBeNull();
+		await deleteAiSession( sessions, id );
+		await expect( stat( directory ) ).rejects.toMatchObject( { code: 'ENOENT' } );
+		expect( ( await stat( sibling ) ).isDirectory() ).toBe( true );
+	} finally {
+		if ( descriptor ) Object.defineProperty( process, 'send', descriptor );
+		else delete process.send;
+		vi.mocked( getSessionsDirectory ).mockReset();
+		await rm( fixture, { recursive: true, force: true } );
 	}
 } );
 

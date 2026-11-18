@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import { createReadStream, createWriteStream, existsSync, mkdtempSync, rm } from 'node:fs';
+import { createWriteStream, existsSync, mkdtempSync, rm } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -29,7 +29,7 @@ import {
 	writeGlobalInstructions,
 } from '@studio/agent/node/global-instructions';
 import { readImageServiceState } from '@studio/agent/node/image-generation';
-import { resolveLocalMediaFile } from '@studio/agent/node/local-media';
+import { openClaudeScreenshot, openLocalMediaFile } from '@studio/agent/node/local-media';
 import { createAgentRunManager } from '@studio/agent/node/run-manager';
 import { setSessionChatGptSelection } from '@studio/agent/node/sessions/chatgpt-selection';
 import {
@@ -1719,14 +1719,16 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 		'/media/read',
 		asyncHandler( async ( req: Request, res: Response ) => {
 			const requested = typeof req.query.path === 'string' ? req.query.path : '';
-			const media = await resolveLocalMediaFile( requested, [
-				sessionsRoot,
-				...( await readSitePaths() ),
-			] );
+			const media =
+				req.query.claudeSessionId !== undefined
+					? typeof req.query.claudeSessionId === 'string' &&
+					  ( await openClaudeScreenshot( sessionsRoot, req.query.claudeSessionId, requested ) )
+					: await openLocalMediaFile( requested, [ sessionsRoot, ...( await readSitePaths() ) ] );
 			if ( ! media ) {
 				res.status( 404 ).json( { error: 'Media not found' } );
 				return;
 			}
+			await using file = media.handle;
 			res.setHeader( 'Content-Type', media.mimeType );
 			res.setHeader( 'Content-Length', media.size );
 			// Session files never change; a site image can be regenerated in place.
@@ -1734,7 +1736,7 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 				'Cache-Control',
 				media.root === sessionsRoot ? 'private, max-age=31536000, immutable' : 'no-cache'
 			);
-			await pipeline( createReadStream( media.path ), res );
+			await pipeline( file.createReadStream(), res );
 		} )
 	);
 

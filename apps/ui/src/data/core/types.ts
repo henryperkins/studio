@@ -282,7 +282,7 @@ export interface Connector {
 	// in the renderer. Returns an empty string when the underlying file lacks
 	// a real path (synthetic blobs, non-Electron environments).
 	getFilePath( file: File ): Promise< string >;
-	readLocalMediaFile( path: string ): Promise< LocalMediaFile >;
+	readLocalMediaFile( path: string, claudeSessionId?: string ): Promise< LocalMediaFile >;
 
 	// Uploads and extracts a Blueprint ZIP bundle to a temp directory and returns the
 	// parsed `blueprint.json`. The caller is responsible for calling

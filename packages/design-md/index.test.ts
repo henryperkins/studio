@@ -158,6 +158,14 @@ describe( 'themeJsonFromDesign', () => {
 } );
 
 describe( 'googleFontsUrl', () => {
+	it( 'keeps a family name containing query punctuation in its own parameter', () => {
+		const url = new URL( googleFontsUrl( [ { fontFamily: 'Studio & Co', fontWeight: 400 } ] )! );
+		expect( [ ...url.searchParams ] ).toEqual( [
+			[ 'family', 'Studio & Co:wght@400' ],
+			[ 'display', 'swap' ],
+		] );
+	} );
+
 	it( 'loads web fonts without sending system font families to Google Fonts', () => {
 		const system = { fontFamily: 'system-ui, sans-serif' };
 		expect( googleFontsUrl( [ system ] ) ).toBeUndefined();

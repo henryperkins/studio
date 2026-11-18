@@ -39,6 +39,8 @@ const STYLE = `
 	.save:hover:not(:disabled) { background: var(--brand-active); }
 	.save:disabled { background: var(--muted); color: var(--text); opacity: 0.5; cursor: default; }
 	.bar { position: fixed; bottom: 16px; left: 50%; display: flex; align-items: center; gap: 4px; padding: 6px; border-radius: 13px; background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px color-mix(in srgb, var(--text) 10%, transparent), 0 1px 3px 0 rgb(0 0 0 / 10%), 0 1px 2px -1px rgb(0 0 0 / 10%); font-size: 13px; pointer-events: auto; transform: translateX(-50%); white-space: nowrap; }
+	.target { overflow: hidden; padding: 6px 10px 0; color: var(--weak); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+	:host([data-separate]) .bar { max-width: calc(100% - 24px); flex-wrap: wrap; justify-content: center; white-space: normal; }
 	.status { padding: 0 8px 0 6px; color: var(--weak); }
 	.bar button { gap: 6px; height: 36px; padding: 0 10px; border-radius: 9px; font-weight: 450; }
 	.cancel:hover { background: var(--hover); }
@@ -83,11 +85,13 @@ export const NOTE_EDITOR_SCRIPT = String.raw`
 	const attach = el('button', { type: 'button', className: 'tool' }, [icon('m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551')]);
 	const remove = el('button', { type: 'button', className: 'tool' }, [icon('M10 11v6M14 11v6M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2')]);
 	const save = el('button', { type: 'button', className: 'save' }, [icon('M12 20L12 5M17 10L12 5L7 10')]);
-	const editor = el('div', { className: 'editor', role: 'group', hidden: true }, [images, input, el('div', { className: 'toolbar' }, [attach, remove, file, save])]);
+	const target = el('div', { className: 'target', hidden: true });
+	const editor = el('div', { className: 'editor', role: 'group', hidden: true }, [target, images, input, el('div', { className: 'toolbar' }, [attach, remove, file, save])]);
 	const status = el('span', { className: 'status' });
 	const cancel = el('button', { type: 'button', className: 'cancel' });
 	const send = el('button', { type: 'button', className: 'send' });
-	const bar = el('div', { className: 'bar', role: 'toolbar' }, [status, cancel, send]);
+	const viewPage = el('button', { type: 'button', className: 'cancel', hidden: true });
+	const bar = el('div', { className: 'bar', role: 'toolbar' }, [status, viewPage, cancel, send]);
 	root.append(editor, bar);
 
 	let note = null;
@@ -150,6 +154,9 @@ export const NOTE_EDITOR_SCRIPT = String.raw`
 				remove.ariaLabel = remove.title = labels.remove;
 				save.ariaLabel = save.title = labels.save;
 				bar.ariaLabel = labels.annotations;
+				host.toggleAttribute('data-separate', !!labels.viewPage);
+				viewPage.hidden = !labels.viewPage;
+				if (labels.viewPage) viewPage.textContent = labels.viewPage;
 				cancel.textContent = labels.cancel;
 				send.textContent = labels.send;
 				send.ariaLabel = labels.sendCount;
@@ -159,6 +166,8 @@ export const NOTE_EDITOR_SCRIPT = String.raw`
 			if ('editing' in detail) {
 				const opened = detail.editing && detail.editing.id !== note?.id;
 				note = detail.editing ? { id: detail.editing.id, images: detail.editing.images } : null;
+				target.textContent = detail.editing?.target || '';
+				target.hidden = !target.textContent;
 				if (opened) input.value = detail.editing.comment;
 				if (note) renderImages();
 				save.disabled = !hasContent();
@@ -194,6 +203,7 @@ export const NOTE_EDITOR_SCRIPT = String.raw`
 	};
 	remove.onclick = () => call({ type: 'delete', id: note.id });
 	save.onclick = () => call({ type: 'save' });
+	viewPage.onclick = () => call({ type: 'view-page' });
 	cancel.onclick = () => call({ type: 'cancel' });
 	send.onclick = () => call({ type: 'send' });
 	new ResizeObserver(place).observe(editor);

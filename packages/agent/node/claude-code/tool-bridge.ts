@@ -8,11 +8,14 @@ import { createClaudeDirectoryListing } from './directory-listing';
 import {
 	CLAUDE_ENABLED_TOOLS,
 	CLAUDE_NAVIGATION_CONFINEMENT,
+	CLAUDE_STUDIO_TOOL_RULES,
 	claudeResultText,
 	claudeRouteNote,
 	claudeStudioTools,
 	isRecord,
 } from './execution-rules';
+import { WebRefusal } from './web-http';
+import { withClaudeWebCall } from './web-transport';
 import type { ClaudeExecutionPolicy } from './execution-policy';
 import type { StudioAgentHost } from '../host';
 import type { StudioToolsOptions } from '../tools';
@@ -115,6 +118,8 @@ function describeNotRun(
 ): string {
 	if ( run?.status === 'invalid-arguments' )
 		return `Invalid arguments for ${ name }: ${ run.problems.join( '; ' ) }.`;
+	if ( run?.status === 'failed' && run.error instanceof WebRefusal )
+		return 'Studio stopped the tool because a browser or network request could not pass its guard.';
 	if ( refused.length ) return `Studio did not run this. ${ refused.join( ' ' ) }`;
 	return 'Studio operation denied or failed.';
 }
@@ -166,6 +171,11 @@ export function createStudioClaudeToolBridge(
 			// settled, however it ended, a tool that kept the host can do nothing
 			// with it.
 			const call = new AbortController();
+			const activity = signal ? AbortSignal.any( [ policy.signal, signal ] ) : policy.signal;
+			const discard: Array< () => Promise< void > | void > = [];
+			const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
+			const web = rule?.navigates || rule?.webRequests;
+			let artifactDelivered = false;
 			try {
 				// The tool reaches the host only as the policy guards it for this call.
 				const guarded = policy.guardHost(
@@ -173,12 +183,36 @@ export function createStudioClaudeToolBridge(
 					toolCallId,
 					signal ? AbortSignal.any( [ signal, call.signal ] ) : call.signal
 				);
-				run = await runStudioTool( bindTool( definition, guarded ), args, {
-					signal: signal ? AbortSignal.any( [ policy.signal, signal ] ) : policy.signal,
+				const bound = bindTool( definition, guarded );
+				let ui = guarded.ui;
+				if ( web ) {
+					const handler = bound.rawHandler;
+					bound.rawHandler = async ( params, ctx ) =>
+						withClaudeWebCall(
+							{
+								...( await policy.webCallOptions( host, toolCallId ) ),
+								onDiscard: ( cleanup ) => discard.push( cleanup ),
+							},
+							() => handler( params, ctx )
+						);
+					if ( guarded.ui ) {
+						const receiver = guarded.ui;
+						ui = {
+							...receiver,
+							async showArtifact( artifact ) {
+								activity.throwIfAborted();
+								await receiver.showArtifact( artifact );
+								artifactDelivered = true;
+							},
+						};
+					}
+				}
+				run = await runStudioTool( bound, args, {
+					signal: activity,
 					authorize: () => policy.authorizeStudioCall( { host, name, args, toolCallId, signal } ),
 					onProgress: ( message, update ) =>
 						onEvent( { type: 'tool.progress', runId, turnId, toolCallId, message, update } ),
-					ui: guarded.ui,
+					ui,
 					completion: {},
 				} );
 			} catch {
@@ -187,6 +221,10 @@ export function createStudioClaudeToolBridge(
 				call.abort();
 				// What the call left unsettled is undone before its result is heard.
 				await policy.endCall( toolCallId );
+			}
+			if ( web && activity.aborted ) run = { status: 'cancelled' };
+			if ( run?.status !== 'completed' && ! artifactDelivered ) {
+				await Promise.allSettled( discard.map( async ( cleanup ) => cleanup() ) );
 			}
 		}
 		const refused = policy.takeRefusals( toolCallId );

@@ -15,6 +15,7 @@ import {
 	validateChatGptSelection,
 } from '@studio/agent/node/chatgpt/settings';
 import { CLAUDE_EXECUTION_POLICY_REVISION } from '@studio/agent/node/claude-code/execution-policy';
+import { claudeScreenshotDirectory } from '@studio/agent/node/claude-code/screenshot-directory';
 import {
 	getClaudeSessionStoreRoot,
 	getClaudeTurnConnectionRevision,
@@ -23,6 +24,7 @@ import {
 	verifyClaudeTurnTarget,
 } from '@studio/agent/node/claude-code/studio-surface';
 import { assertSessionSelection } from '@studio/agent/node/sessions/selection';
+import { appendStudioEntry as appendSavedEntry } from '@studio/agent/node/sessions/store';
 import {
 	readAiSettings,
 	readAnthropicApiKey,
@@ -330,12 +332,15 @@ export async function runCommand( options: {
 } ): Promise< void > {
 	const ui = options.adapter;
 	const isJsonMode = ui instanceof JsonAdapter;
+	let claudeConversationId: string | undefined;
 	const host: StudioAgentHost = {
 		...cliAgentHost,
 		// Persist screenshots next to the session file (`<session>.screenshots/`)
 		// so artifacts in the transcript keep rendering after OS temp cleanup;
 		// `deleteAiSession` removes the sidecar together with the session.
 		screenshotsDirectory: async () => {
+			if ( claudeConversationId )
+				return claudeScreenshotDirectory( getSessionsDirectory(), claudeConversationId );
 			const sm = await ensureSession();
 			const sessionFile = sm.getSessionFile();
 			if ( ! sessionFile?.endsWith( '.jsonl' ) ) {
@@ -347,13 +352,21 @@ export async function runCommand( options: {
 			ui instanceof JsonAdapter
 				? async ( site ) => {
 						ui.activeSite = site;
-						await append( ( sm ) =>
-							appendStudioEntry( sm, 'studio.site_selected', {
-								siteName: site.name,
-								sitePath: site.path,
-								siteId: site.id,
-							} )
-						);
+						const selected = {
+							siteName: site.name,
+							sitePath: site.path,
+							siteId: site.id,
+						};
+						if ( claudeConversationId ) {
+							await appendSavedEntry(
+								getSessionsDirectory(),
+								claudeConversationId,
+								'studio.site_selected',
+								selected
+							);
+						} else {
+							await append( ( sm ) => appendStudioEntry( sm, 'studio.site_selected', selected ) );
+						}
 				  }
 				: undefined,
 		// Forked by a Studio app, which shows the conversation.
@@ -361,7 +374,9 @@ export async function runCommand( options: {
 			typeof process.send === 'function'
 				? {
 						showArtifact: async ( artifact ) => {
-							await append( ( sm ) => appendStudioEntry( sm, 'studio.chat_artifact', artifact ) );
+							// Claude persists this event in its ordered turn journal.
+							if ( ! claudeConversationId )
+								await append( ( sm ) => appendStudioEntry( sm, 'studio.chat_artifact', artifact ) );
 							emitEvent( { type: 'chat.artifact', timestamp: new Date().toISOString(), artifact } );
 						},
 						reloadPreview: () =>
@@ -416,6 +431,7 @@ export async function runCommand( options: {
 		const turnId = options.initialTurnId ?? randomUUID();
 		const conversationId = options.resumeSession?.summary.id ?? resumedById!.getSessionId();
 		await validateClaudeSendSelection( getSessionsDirectory(), conversationId, selection );
+		claudeConversationId = conversationId;
 		const connectionRevision = await getClaudeTurnConnectionRevision( claude.binding.connectionId );
 		const approvals = createClaudeApprovalRouter( {
 			viaIpc: typeof process.send === 'function',

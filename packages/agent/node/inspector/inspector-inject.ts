@@ -23,6 +23,8 @@ import {
 	parseInspectorMessage,
 	type InspectorEvent,
 } from '@studio/agent/protocol/inspector/page-script';
+import { currentClaudeWebCall } from '../claude-code/web-call';
+import { runGuardedPicker } from './guarded-picker';
 import { NOTE_EDITOR_BINDING, NOTE_EDITOR_EVENT, NOTE_EDITOR_SCRIPT } from './note-editor';
 import type { VisualAnnotation } from '@studio/agent/protocol/visual-annotations';
 
@@ -39,8 +41,9 @@ interface Anchor {
 }
 
 interface Session {
-	browser: Browser;
+	browser?: Browser;
 	page: Page;
+	editor?: Page;
 	notes: BrowserAnnotation[];
 	savedIds: Set< string >;
 	editingId: string | null;
@@ -106,13 +109,16 @@ async function render( current: Session, withEditor = true ): Promise< void > {
 	if ( ! withEditor ) {
 		return;
 	}
-	await dispatch( page, NOTE_EDITOR_EVENT, {
+	await dispatch( current.editor ?? page, NOTE_EDITOR_EVENT, {
 		anchor: current.anchor,
 		count,
 		editing: note
 			? {
 					id: note.id,
 					comment: note.comment,
+					...( current.editor && {
+						target: [ current.page.url(), note.selector ].filter( Boolean ).join( ' · ' ),
+					} ),
 					images: note.images.map( ( image ) => ( {
 						id: image.id,
 						name: image.name,
@@ -130,6 +136,7 @@ async function render( current: Session, withEditor = true ): Promise< void > {
 			removeImage: __( 'Remove attachment' ),
 			save: __( 'Save annotation (Enter)' ),
 			cancel: __( 'Cancel' ),
+			...( current.editor && { viewPage: __( 'Choose an element' ) } ),
 			send: __( 'Send' ),
 			/* translators: %d: number of annotations. */
 			sendCount: sprintf( _n( 'Send %d annotation', 'Send %d annotations', count ), count ),
@@ -161,17 +168,20 @@ function onInspectorEvent( current: Session, event: InspectorEvent ): void {
 			current.editingId = id;
 			current.anchor = event.anchor;
 			void render( current );
+			void current.editor?.bringToFront().catch( () => undefined );
 			return;
 		}
 		case 'edit':
 			closeEditor( current, event.id );
 			current.anchor = event.anchor;
 			void render( current );
+			void current.editor?.bringToFront().catch( () => undefined );
 			return;
 		case 'anchor':
 			if ( event.id === current.editingId ) {
 				current.anchor = event.anchor;
-				void dispatch( current.page, NOTE_EDITOR_EVENT, { anchor: event.anchor } );
+				if ( ! current.editor )
+					void dispatch( current.page, NOTE_EDITOR_EVENT, { anchor: event.anchor } );
 			}
 			return;
 		case 'escape':
@@ -261,6 +271,9 @@ function onEditorAction( current: Session, action: unknown ): void {
 			if ( notes.length ) current.finish( notes );
 			return;
 		}
+		case 'view-page':
+			if ( current.editor ) void current.page.bringToFront().catch( () => undefined );
+			return;
 		case 'cancel':
 			current.finish( null );
 	}
@@ -282,6 +295,43 @@ export async function annotateInBrowser(
 	siteUrl: string,
 	timeoutMs = 30 * 60 * 1000
 ): Promise< BrowserAnnotation[] | null > {
+	const call = currentClaudeWebCall();
+	if ( call ) {
+		return runGuardedPicker(
+			siteUrl,
+			timeoutMs,
+			call,
+			async ( page, editor, finish, bindPicker ) => {
+				const current: Session = {
+					page,
+					editor,
+					notes: [],
+					savedIds: new Set(),
+					editingId: null,
+					anchor: null,
+					finish,
+				};
+				await editor.exposeBinding( NOTE_EDITOR_BINDING, ( source, action: unknown ) => {
+					call.check();
+					if (
+						source.page === editor &&
+						source.frame === editor.mainFrame() &&
+						editor.url() === 'about:blank'
+					)
+						onEditorAction( current, action );
+				} );
+				await editor.evaluate( ( title ) => {
+					document.title = title;
+					document.documentElement.style.colorScheme = 'light dark';
+				}, __( 'Studio annotations' ) );
+				await editor.evaluate( NOTE_EDITOR_SCRIPT );
+				await bindPicker(
+					( event ) => onInspectorEvent( current, event ),
+					() => render( current )
+				);
+			}
+		);
+	}
 	if ( session ) {
 		await session.page.bringToFront().catch( () => undefined );
 		await inject( session ).catch( () => undefined );

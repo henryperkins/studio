@@ -1,8 +1,9 @@
 import { randomUUID } from 'crypto';
+import { mkdir, writeFile } from 'fs/promises';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fakeSite } from '../../tests/fake-host';
-import { CLAUDE_NAVIGATION_RULE_REVISION } from '../execution-rules';
+import { claudeStudioTools, CLAUDE_NAVIGATION_RULE_REVISION } from '../execution-rules';
 import {
 	completeGuard,
 	createPolicyFixture,
@@ -11,22 +12,58 @@ import {
 	targetOrigin,
 } from './fixtures/execution-policy';
 
-// The rules written for Studio tools that are not qualified to run. No host
-// declaration, confinement or guard enables such a tool, so this file alone
-// replaces the gate with the part a qualified tool still has to pass: a rule,
-// and for a browser tool a verified navigation guard. That keeps the rules
-// exercised as the starting point of each tool's qualification. Nothing here
-// says what this build runs; `tool-qualification.test.ts` holds the real gate.
-vi.mock( '../execution-rules', async ( importOriginal ) => {
-	const actual = await importOriginal< typeof import('../execution-rules') >();
-	const claudeStudioTools: typeof actual.claudeStudioTools = ( enabled, navigation, origin ) =>
-		enabled.studio.filter( ( name ) => {
-			const rule = actual.CLAUDE_STUDIO_TOOL_RULES.get( name );
-			return (
-				!! rule && ( ! rule.navigates || actual.isVerifiedNavigationGuard( navigation, origin ) )
-			);
-		} );
-	return { ...actual, claudeStudioTools };
+it( 'binds web access to an admitted, current call on the exact registered site', async () => {
+	const { policy, host, localSite, otherSite } = await setup( () => ( {
+		navigationConfinement: guarded( targetOrigin ),
+	} ) );
+	const controller = new AbortController();
+	const call = 'inspect';
+	policy.guardHost( host, call, controller.signal );
+	await expect( policy.webCallOptions( host, call ) ).rejects.toThrow();
+	expect(
+		await policy.authorizeStudioCall( {
+			host,
+			name: 'inspect_design',
+			args: { url: targetOrigin },
+			toolCallId: call,
+		} )
+	).toBe( true );
+	const options = await policy.webCallOptions( host, call );
+	expect( options ).toMatchObject( {
+		targetOrigin,
+		sitePath: localSite.path,
+		localSiteUrls: [ localSite.url, otherSite.url ],
+	} );
+	vi.mocked( host.sites.all ).mockResolvedValueOnce( [
+		{ ...localSite, url: 'http://localhost:9999' },
+	] );
+	await expect( policy.webCallOptions( host, call ) ).rejects.toThrow();
+	controller.abort();
+	expect( options.signal.aborted ).toBe( true );
+	await expect( policy.webCallOptions( host, call ) ).rejects.toThrow();
+} );
+
+it( 'permits scaffolding to activate only the theme created by that call, once', async () => {
+	const { policy, host, localSite } = await setup();
+	const fenced = policy.guardHost( host, 'theme' );
+	expect(
+		await policy.authorizeStudioCall( {
+			host,
+			name: 'scaffold_theme',
+			args: { nameOrPath: 'site', name: 'A theme' },
+			toolCallId: 'theme',
+		} )
+	).toBe( true );
+	await expect(
+		fenced.sites.wpCli( localSite, [ 'theme', 'activate', 'other' ] )
+	).rejects.toThrow();
+	await expect(
+		fenced.sites.wpCli( localSite, [ 'theme', 'activate', 'a-theme' ] )
+	).resolves.toMatchObject( { exitCode: 0 } );
+	await expect(
+		fenced.sites.wpCli( localSite, [ 'theme', 'activate', 'a-theme' ] )
+	).rejects.toThrow();
+	expect( host.sites.wpCli ).toHaveBeenCalledTimes( 1 );
 } );
 
 const cleanups: Array< () => Promise< void > > = [];
@@ -45,16 +82,15 @@ const pageTools = [ 'take_screenshot', 'inspect_design', 'open_annotation_browse
 const auditTools = [ 'need_for_speed', 'rank_me_up' ];
 const browserTools = [ ...pageTools, ...auditTools ];
 
-describe( 'Unqualified Claude Studio tools', () => {
-	it( 'are all refused by the real gate, which this file replaces', async () => {
-		const actual =
-			await vi.importActual< typeof import('../execution-rules') >( '../execution-rules' );
-		const exercised = [ ...new Set( [ ...offHostTools, ...browserTools ] ) ];
-		for ( const origin of [ targetOrigin, null ] )
-			expect(
-				actual.claudeStudioTools( { native: [], studio: exercised }, guarded( origin ), origin )
-			).toEqual( [] );
-	} );
+it( 'requires Chromium for the six page tools and admits the guarded scaffold independently', () => {
+	const exercised = [ ...new Set( [ ...offHostTools, ...browserTools ] ) ];
+	for ( const origin of [ targetOrigin, null ] ) {
+		const enabled = { native: [], studio: exercised };
+		expect( claudeStudioTools( enabled, { mode: 'none' }, origin ) ).toEqual( [
+			'scaffold_theme',
+		] );
+		expect( claudeStudioTools( enabled, guarded( origin ), origin ) ).toEqual( exercised );
+	}
 } );
 
 describe( 'Rules for Claude Studio tools that act outside the host', () => {
@@ -71,6 +107,8 @@ describe( 'Rules for Claude Studio tools that act outside the host', () => {
 		expect( await call( 'scaffold_theme', { nameOrPath: 'other', name: 'Theme' } ) ).toBe( false );
 		expect( await call( 'scaffold_theme', { name: 'Theme' } ) ).toBe( false );
 		expect( context.approve ).not.toHaveBeenCalled();
+		await mkdir( path.join( site, 'templates' ) );
+		await writeFile( path.join( site, 'templates', 'index.html' ), '<!-- wp:paragraph /-->' );
 		expect(
 			await call( 'validate_blocks', { nameOrPath: 'site', filePath: 'templates/index.html' } )
 		).toBe( true );
@@ -90,9 +128,9 @@ describe( 'Rules for Claude Studio tools that act outside the host', () => {
 		).toBe( false );
 		expect( await call( 'take_screenshot', { url: 'http://localhost:8888' } ) ).toBe( true );
 		expect( context.approve ).toHaveBeenCalledOnce();
-		// An approval of a rule that names files shows them, so a call whose rule
-		// names none at approval time is refused rather than asked about blind.
-		expect( await call( 'validate_blocks', { nameOrPath: 'site' } ) ).toBe( false );
+		expect(
+			await call( 'validate_blocks', { nameOrPath: 'site', content: '<!-- wp:paragraph /-->' } )
+		).toBe( true );
 		expect( context.approve ).toHaveBeenCalledOnce();
 	} );
 

@@ -19,6 +19,7 @@ import {
 	reserveExclusiveAttachmentsArgs,
 	verifiedFinalizeAttachmentsArgs,
 } from '../tools/media-library';
+import { scaffoldThemeSlug } from '../tools/scaffold-theme';
 import { splitCommandArgs } from '../tools/wp-cli';
 import { isClaudeDirectoryListInput } from './directory-listing';
 import {
@@ -57,6 +58,7 @@ import type {
 	ClaudeNavigationConfinement,
 	ClaudeShellConfinement,
 } from './execution-rules';
+import type { ClaudeWebScope } from './web-call';
 import type { WpCliFileArgument } from './wp-cli-rules';
 import type { HostOperationOptions, HostSite, MediaAttachment, StudioAgentHost } from '../host';
 import type {
@@ -78,7 +80,7 @@ import type { SyncSite } from '@studio/common/types/sync';
  */
 
 /** Changes whenever what this policy allows changes; turns and approvals carry it. */
-export const CLAUDE_EXECUTION_POLICY_REVISION = 4;
+export const CLAUDE_EXECUTION_POLICY_REVISION = 5;
 
 /** One operation as it will run. An approval covers exactly this, for one call. */
 export interface ClaudeOperation {
@@ -246,6 +248,7 @@ export interface ClaudeExecutionPolicy {
 	): Promise< { path: string } | { refusal: string } >;
 	/** A Studio MCP tool call, before its handler runs. */
 	authorizeStudioCall( call: ClaudeStudioCall ): Promise< boolean >;
+	webCallOptions( host: StudioAgentHost, toolCallId: string ): Promise< ClaudeWebScope >;
 	/**
 	 * The host a Studio tool call runs against: every operation with an effect is
 	 * fenced. Once `signal` or the turn aborts, it refuses every host operation
@@ -739,6 +742,7 @@ export function createClaudeExecutionPolicy(
 	// The Studio tool each call the policy admitted is a call of, until the
 	// call settles: what a guarded host gives can depend on the tool it serves.
 	const admittedCalls = new Map< string, string >();
+	const themeActivations = new Map< string, string >();
 	const refusals = new Map< string, Set< string > >();
 	const refuse = ( toolCallId: string, reason: string ) => {
 		if ( ! refusals.has( toolCallId ) ) refusals.set( toolCallId, new Set() );
@@ -781,6 +785,7 @@ export function createClaudeExecutionPolicy(
 			grants.clear();
 			refusals.clear();
 			admittedCalls.clear();
+			themeActivations.clear();
 			nativeUses.clear();
 		},
 		{ once: true }
@@ -1355,6 +1360,12 @@ export function createClaudeExecutionPolicy(
 		if ( callSignal?.aborted ) return false;
 		const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
 		if ( ! rule || ! studioTools.has( name ) ) return false;
+		if (
+			( rule.navigates || rule.webRequests ) &&
+			rule.site &&
+			actingTarget.environment !== 'local'
+		)
+			return false;
 		if ( rule.directoryListing ) {
 			if ( ! isClaudeDirectoryListInput( args ) ) {
 				refuse( toolCallId, INVALID_NATIVE_INPUT );
@@ -1427,7 +1438,27 @@ export function createClaudeExecutionPolicy(
 		// the payload folder.
 		const filesHold = async () => {
 			const folder = actingSite?.path;
-			for ( const file of localPaths )
+			for ( const file of localPaths ) {
+				if ( name === 'take_screenshot' || name === 'validate_blocks' ) {
+					if ( ! folder || actingTarget.environment !== 'local' ) return false;
+					const thumbnail = name === 'take_screenshot';
+					if (
+						thumbnail &&
+						path.dirname( path.dirname( file ) ) !== path.join( folder, 'wp-content', 'themes' )
+					)
+						return false;
+					const checked = await checkClaudeNativePath(
+						thumbnail ? 'Write' : 'Edit',
+						file,
+						[ folder ],
+						context.workspace.configDirectory,
+						context.isStudioSite
+					);
+					if ( 'refusal' in checked || path.relative( checked.path, file ) !== '' ) {
+						refuse( toolCallId, 'refusal' in checked ? checked.refusal : REFUSALS.siteFiles );
+						return false;
+					}
+				}
 				if ( ! folder || ! ( await isInsideCanonicalRoot( folder, file ) ) ) {
 					refuse(
 						toolCallId,
@@ -1437,6 +1468,7 @@ export function createClaudeExecutionPolicy(
 					);
 					return false;
 				}
+			}
 			if ( rule.bundled && ! ( await isBundledFolder( rule.bundled(), context.localRoots ) ) ) {
 				refuse( toolCallId, REFUSALS.bundledFiles );
 				return false;
@@ -1521,7 +1553,12 @@ export function createClaudeExecutionPolicy(
 		else {
 			// An approval shows the files the rule names; one that names none for
 			// this call would ask about files without showing them.
-			if ( rule.paths && ! localPaths.length ) return false;
+			if (
+				rule.paths &&
+				! localPaths.length &&
+				! ( rule.screenshots && operationClass === 'local-change' )
+			)
+				return false;
 			authorized = await approveOnce(
 				{
 					tool: name,
@@ -1543,8 +1580,20 @@ export function createClaudeExecutionPolicy(
 		// returns. Like the fence before a command starts, this comes after the
 		// call is journaled.
 		const admitted = authorized && ( await filesHold() ) && ( await loginHolds() );
-		if ( admitted && ! signal.aborted && ! callSignal?.aborted )
+		if ( admitted && ! signal.aborted && ! callSignal?.aborted ) {
 			admittedCalls.set( toolCallId, name );
+			if (
+				name === 'scaffold_theme' &&
+				isRecord( args ) &&
+				args.activate !== false &&
+				typeof args.name === 'string'
+			) {
+				themeActivations.set(
+					toolCallId,
+					scaffoldThemeSlug( args.name, typeof args.slug === 'string' ? args.slug : undefined )
+				);
+			}
+		}
 		return admitted;
 	}
 
@@ -1554,7 +1603,18 @@ export function createClaudeExecutionPolicy(
 		toolCallId: string,
 		callSignal?: AbortSignal
 	): Promise< PreparedHostOperation | undefined > {
-		if ( request.name === 'sites.wpCli' && admittedCalls.get( toolCallId ) !== 'wp_cli' ) return;
+		if ( request.name === 'sites.wpCli' && admittedCalls.get( toolCallId ) !== 'wp_cli' ) {
+			const slug = themeActivations.get( toolCallId );
+			if (
+				! slug ||
+				request.args.length !== 3 ||
+				request.args[ 0 ] !== 'theme' ||
+				request.args[ 1 ] !== 'activate' ||
+				request.args[ 2 ] !== slug
+			)
+				return;
+			themeActivations.delete( toolCallId );
+		}
 		const wpCli = request.name === 'sites.wpCli' ? inspectWpCliArgs( request.args ) : undefined;
 		if ( wpCli && 'refusal' in wpCli ) {
 			refuse( toolCallId, wpCli.refusal );
@@ -2118,6 +2178,7 @@ export function createClaudeExecutionPolicy(
 					if ( callSignals.get( toolCallId ) === operationSignal ) {
 						callSignals.delete( toolCallId );
 						admittedCalls.delete( toolCallId );
+						themeActivations.delete( toolCallId );
 					}
 				},
 				{ once: true }
@@ -2760,6 +2821,36 @@ export function createClaudeExecutionPolicy(
 		takeNativeFileWrite,
 		resolveListingPath,
 		authorizeStudioCall,
+		webCallOptions: async ( host, toolCallId ) => {
+			const name = admittedCalls.get( toolCallId );
+			const rule = name && CLAUDE_STUDIO_TOOL_RULES.get( name );
+			const signal = callSignals.get( toolCallId );
+			if (
+				! rule ||
+				! ( rule.navigates || rule.webRequests ) ||
+				! signal ||
+				! ( await checkpoint( signal ) )
+			)
+				throw denied();
+			const local = actingTarget.environment === 'local' ? actingSite : undefined;
+			const sites = await host.sites.all();
+			if ( local ) {
+				const site = sites.find( ( candidate ) => candidate.id === local.id );
+				if (
+					! site ||
+					( await realpath( site.path ) ) !== local.path ||
+					( targetOrigin && new URL( site.url ).origin !== targetOrigin )
+				)
+					throw denied();
+			}
+			signal.throwIfAborted();
+			return {
+				signal,
+				targetOrigin: local ? targetOrigin : null,
+				sitePath: local?.path,
+				localSiteUrls: sites.map( ( site ) => site.url ),
+			};
+		},
 		guardHost,
 		endCall: async ( toolCallId ) => {
 			const ends = callEnds.get( toolCallId );

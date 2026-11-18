@@ -14,7 +14,6 @@ import { createSkillTool } from '../../tools/skill';
 import {
 	CLAUDE_ENABLED_TOOLS,
 	CLAUDE_NATIVE_TOOL_RULES,
-	CLAUDE_NAVIGATION_CONFINEMENT,
 	CLAUDE_SHELL_CONFINEMENT,
 	CLAUDE_STUDIO_TOOL_RULES,
 	claudeNativeTools,
@@ -22,7 +21,7 @@ import {
 	isQualifiedStudioRule,
 } from '../execution-rules';
 import { createStudioClaudeMcpServer, createStudioClaudeToolBridge } from '../tool-bridge';
-import { createPolicyFixture, targetOrigin } from './fixtures/execution-policy';
+import { createPolicyFixture, guarded, targetOrigin } from './fixtures/execution-policy';
 import type {
 	AgentSessionEvent,
 	CreateAgentSessionOptions,
@@ -36,7 +35,7 @@ import type {
 // actually enables and what the Claude bridge actually lists.
 
 // The steps that still qualify a tool, each named by at least one.
-const STEPS = [ 'C2b', 'C2c' ] as const;
+const STEPS = [ 'C2c' ] as const;
 type Step = ( typeof STEPS )[ number ];
 type ClaudeStatus =
 	// Bridged from the registry and qualified by the policy.
@@ -62,12 +61,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_delete: { status: 'bridged' },
 	site_import: { status: 'bridged' },
 	site_export: { status: 'bridged' },
-	scaffold_theme: {
-		status: 'unqualified',
-		step: 'C2b',
-		reason:
-			'Downloads a stylesheet and fonts from the network. This step needs the navigation and request guard.',
-	},
+	scaffold_theme: { status: 'bridged' },
 	install_taxonomy_scripts: { status: 'bridged' },
 	refresh_browser: { status: 'absent', capability: 'ui' },
 	site_list: { status: 'bridged' },
@@ -81,12 +75,12 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	site_pull: { status: 'bridged' },
 	send_feedback: { status: 'bridged' },
 	generate_images: { status: 'absent', capability: 'imageService' },
-	take_screenshot: { status: 'unqualified', step: 'C2b', reason: BROWSER },
-	inspect_design: { status: 'unqualified', step: 'C2b', reason: BROWSER },
-	validate_blocks: { status: 'unqualified', step: 'C2b', reason: BROWSER },
-	need_for_speed: { status: 'unqualified', step: 'C2b', reason: BROWSER },
-	rank_me_up: { status: 'unqualified', step: 'C2b', reason: BROWSER },
-	open_annotation_browser: { status: 'unqualified', step: 'C2b', reason: BROWSER },
+	take_screenshot: { status: 'bridged' },
+	inspect_design: { status: 'bridged' },
+	validate_blocks: { status: 'bridged' },
+	need_for_speed: { status: 'bridged' },
+	rank_me_up: { status: 'bridged' },
+	open_annotation_browser: { status: 'bridged' },
 	AskUserQuestion: {
 		status: 'unqualified',
 		step: 'C2c',
@@ -272,7 +266,9 @@ async function listed( server: ReturnType< typeof createStudioClaudeMcpServer > 
 // capabilities, under this build's policy. The image service is resolved as a
 // Claude turn resolves it, by the function the Pi route asks.
 async function claudeToolNames( scenario: Scenario ): Promise< string[] > {
-	const fixture = await createPolicyFixture();
+	const fixture = await createPolicyFixture( () => ( {
+		navigationConfinement: guarded( targetOrigin ),
+	} ) );
 	try {
 		if ( scenario.ui ) fixture.host.ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
 		mocks.imageService = scenario.imageService;
@@ -320,7 +316,7 @@ const statuses = () => Object.entries( CLAUDE_TOOL_STATUS );
 const isBridged = ( status: ClaudeStatus ) =>
 	status.status === 'bridged' || status.status === 'absent';
 const enabledStudio = () =>
-	claudeStudioTools( CLAUDE_ENABLED_TOOLS, CLAUDE_NAVIGATION_CONFINEMENT, targetOrigin );
+	claudeStudioTools( CLAUDE_ENABLED_TOOLS, guarded( targetOrigin ), targetOrigin );
 const enabledNative = () =>
 	claudeNativeTools( CLAUDE_ENABLED_TOOLS, { mode: 'approval-only' }, path.resolve( 'workspace' ) );
 

@@ -78,8 +78,49 @@ const throughHost = {
 	runsWpCli: [ 'site', 'host' ],
 	callsHostOperation: [ 'site', 'host' ],
 };
+const browserChannels = {
+	...noChannels,
+	readsLocalFiles: [ 'navigates' ],
+	drivesBrowser: [ 'navigates' ],
+	requestsNetwork: [ 'navigates' ],
+	spawnsProcess: [ 'navigates' ],
+};
+const browserNames = [
+	'take_screenshot',
+	'inspect_design',
+	'open_annotation_browser',
+	'validate_blocks',
+	'need_for_speed',
+	'rank_me_up',
+];
 // The tools this build qualifies, each with the channels it declares.
 const QUALIFIED: Record< string, Record< string, unknown > > = {
+	scaffold_theme: {
+		...throughHost,
+		readsLocalFiles: [ 'paths' ],
+		writesLocalFiles: [ 'paths' ],
+		requestsNetwork: [ 'webRequests' ],
+	},
+	take_screenshot: {
+		...browserChannels,
+		readsLocalFiles: [ 'screenshots', 'navigates' ],
+		writesLocalFiles: [ 'screenshots', 'paths' ],
+		callsHostOperation: [ 'host' ],
+	},
+	inspect_design: browserChannels,
+	open_annotation_browser: browserChannels,
+	validate_blocks: {
+		...browserChannels,
+		readsLocalFiles: [ 'paths', 'navigates' ],
+		writesLocalFiles: [ 'paths' ],
+		callsHostOperation: [ 'site', 'host' ],
+	},
+	need_for_speed: { ...browserChannels, callsHostOperation: [ 'site', 'host' ] },
+	rank_me_up: {
+		...browserChannels,
+		requestsNetwork: [ 'navigates', 'webRequests' ],
+		callsHostOperation: [ 'site', 'host' ],
+	},
 	Ls: { ...noChannels, readsLocalFiles: [ 'directoryListing' ] },
 	wp_cli: { ...noChannels, runsWpCli: [ 'site', 'host' ], callsHostOperation: [ 'host' ] },
 	site_info: throughHost,
@@ -169,10 +210,45 @@ const SHARED_CONFIG_SAVE = {
 	files: [ '../common/lib/hide-dir-windows.ts' ],
 	why: 'shared-config runs `attrib` only when it saves into a folder it has just created; the tool only reads the stored login (`readAuthToken`)',
 };
+const UNUSED_WP_CLI = {
+	channels: [ 'runsWpCli' ],
+	files: [ 'node/tools/utils.ts' ],
+	why: 'The tool uses the shared result helpers and never invokes runWpCli.',
+};
 const UNREACHED: Record<
 	string,
 	ReadonlyArray< { channels: string[]; files: string[]; why: string } >
 > = {
+	inspect_design: [
+		UNUSED_WP_CLI,
+		{
+			channels: [ 'callsHostOperation' ],
+			files: [ 'node/tools/utils.ts', 'node/screenshot-storage.ts' ],
+			why: 'Inspection uses result formatting and media emulation. It neither runs WP-CLI nor saves a screenshot.',
+		},
+	],
+	open_annotation_browser: [
+		UNUSED_WP_CLI,
+		{
+			channels: [ 'callsHostOperation' ],
+			files: [
+				'node/tools/utils.ts',
+				'protocol/inspector/page-script.ts',
+				'node/inspector/note-editor.ts',
+			],
+			why: 'Annotation uses result formatting. In the editor and picker, host names a DOM element.',
+		},
+	],
+	scaffold_theme: [
+		{
+			channels: [ 'spawnsProcess' ],
+			files: [ '../common/lib/owned-process.ts' ],
+			why: 'Scaffolding uses the path-containment predicate. It never opens a Claude session or identifies an owner process.',
+		},
+	],
+	need_for_speed: [ UNUSED_WP_CLI ],
+	rank_me_up: [ UNUSED_WP_CLI ],
+	validate_blocks: [ UNUSED_WP_CLI ],
 	site_list: [
 		SHARED_CONFIG_SAVE,
 		// It reaches WordPress.com only through the host's `wpcom.sites`, which
@@ -302,7 +378,12 @@ describe( 'Claude Studio tool qualification', () => {
 		for ( const origin of [ targetOrigin, null ] )
 			for ( const navigation of navigations )
 				for ( const studio of hostLists ) {
-					const expected = studio.filter( isQualifiedName );
+					const expected = studio.filter(
+						( name ) =>
+							isQualifiedName( name ) &&
+							( ! browserNames.includes( name ) ||
+								isVerifiedNavigationGuard( navigation as never, origin ) )
+					);
 					expect( claudeStudioTools( { native, studio }, navigation as never, origin ) ).toEqual(
 						expected
 					);
@@ -960,8 +1041,10 @@ describe( 'Claude Studio tools that drive a browser', () => {
 			expect.arrayContaining( [ [ 'drivesBrowser' ], [ 'readsLocalFiles', 'writesLocalFiles' ] ] )
 		);
 		const enabled = { native: [], studio: [ 'present_design_options', 'take_screenshot' ] };
-		for ( const navigation of [ { mode: 'none' }, guarded( targetOrigin ) ] )
-			expect( claudeStudioTools( enabled, navigation as never, targetOrigin ) ).toEqual( [] );
+		expect( claudeStudioTools( enabled, { mode: 'none' }, targetOrigin ) ).toEqual( [] );
+		expect( claudeStudioTools( enabled, guarded( targetOrigin ), targetOrigin ) ).toEqual( [
+			'take_screenshot',
+		] );
 	} );
 
 	it( 'declares, for each qualified tool, every channel its module shows', () => {
@@ -985,7 +1068,15 @@ describe( 'Claude Studio tools that drive a browser', () => {
 						);
 						continue;
 					}
-					expect( used, `${ name } shows ${ explained.join( ' or ' ) }` ).toBe( true );
+					expect
+						.soft(
+							used,
+							`${ name } shows ${ explained.join( ' or ' ) } in ${ evidenceFiles(
+								module,
+								explained
+							).join( ', ' ) }`
+						)
+						.toBe( true );
 				}
 				// An entry for code the tool no longer links, or for a channel that
 				// explains what it shows, is out of date.
