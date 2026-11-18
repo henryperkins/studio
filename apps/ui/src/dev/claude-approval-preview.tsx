@@ -1,7 +1,10 @@
 import '@/lib/theme/tokens.css';
 import '@/lib/theme/base.css';
 import '@/index.css';
-import { escapeClaudeApprovalText } from '@studio/agent/protocol/claude-code';
+import {
+	escapeClaudeApprovalText,
+	getClaudeApprovalDisplayArgs,
+} from '@studio/agent/protocol/claude-code';
 import { useState } from 'react';
 import { ClaudeApprovalCard } from '@/features/chats/session-view/claude-approval-card';
 import { renderPlayground } from './playground';
@@ -18,6 +21,8 @@ import type {
 type Request = Extract< BackendTurnEvent, { type: 'approval.requested' } >;
 
 const SITE = { id: 'harbor-bakery', name: 'Harbor Bakery', path: '/sites/harbor-bakery' };
+const AFTER_RECOVERY =
+	'The previous turn was interrupted, so an attempt it made may already have taken effect.';
 
 const approval = (
 	requestId: string,
@@ -26,7 +31,8 @@ const approval = (
 		args: unknown;
 		target?: BackendApprovalOperation[ 'target' ];
 		localPaths?: string[];
-	}
+	},
+	draft?: Request[ 'draft' ]
 ): Request => ( {
 	type: 'approval.requested',
 	runId: 'run',
@@ -37,15 +43,24 @@ const approval = (
 	operation: {
 		...operation,
 		target: operation.target ?? { environment: 'local', siteId: SITE.id },
-		args: escapeClaudeApprovalText( JSON.stringify( operation.args, null, 2 ) ),
+		args: escapeClaudeApprovalText(
+			JSON.stringify( getClaudeApprovalDisplayArgs( operation.tool, operation.args ), null, 2 )
+		),
 		localPaths: ( operation.localPaths ?? [] ).map( escapeClaudeApprovalText ),
 	},
+	...( draft ? { draft } : {} ),
 } );
 
-const push = ( requestId: string, remoteSite: Record< string, string | number > ) =>
-	approval(
+const push = (
+	requestId: string,
+	remoteSite: { id: number; name: string; address: string; kind: 'production' | 'staging' }
+) => {
+	const destination = `a ${ remoteSite.kind } site, ${
+		remoteSite.address
+	}, named ${ JSON.stringify( remoteSite.name ) }`;
+	return approval(
 		requestId,
-		`Change or delete work on WordPress.com: sync.push. It uploads this local site to the connected WordPress.com site ${ remoteSite.id } (${ remoteSite.name }, ${ remoteSite.address }, a ${ remoteSite.kind } site) with the options all, replacing the database and every file in wp-content on that site. If it is interrupted, the import of what it uploaded may still be running on WordPress.com`,
+		`Change or delete work on WordPress.com: sync.push. It uploads this local site to the connected WordPress.com site ${ remoteSite.id } (${ destination }) with the options all, replacing the database and every file in wp-content on that site. If it is interrupted, the import of what it uploaded may still be running on WordPress.com`,
 		{
 			tool: 'sync.push',
 			operationClass: 'remote-overwrite',
@@ -57,9 +72,24 @@ const push = ( requestId: string, remoteSite: Record< string, string | number > 
 				},
 			],
 			localPaths: [ SITE.path ],
-			remote: `WordPress.com site ${ remoteSite.id }: ${ remoteSite.name }, ${ remoteSite.address }, a ${ remoteSite.kind } site`,
+			remote: `WordPress.com site ${ remoteSite.id }: ${ destination }`,
 		}
 	);
+};
+
+const siteDelete = ( requestId: string, deleteFiles: boolean ) =>
+	approval( requestId, 'Change or delete local work: sites.delete', {
+		tool: 'sites.delete',
+		operationClass: 'local-overwrite',
+		args: [ deleteFiles ],
+		localPaths: [ SITE.path ],
+	} );
+
+const draft = {
+	siteName: SITE.name,
+	title: 'Saturday bake sale',
+	content: 'The bread counter opens at nine.',
+};
 
 const FEEDBACK =
 	'Send a message outside Studio: send_feedback. It sends the type and message shown, with a line naming this Studio version and operating system, to the WordPress Studio team at Automattic through WordPress.com, signed in as the WordPress.com account Studio is logged in to';
@@ -76,6 +106,48 @@ const images = [
 ];
 
 const samples: Array< { key: string; title: string; request: Request } > = [
+	{
+		key: 'delete-files',
+		title: 'Delete the site and its files',
+		request: siteDelete( 'delete-files', true ),
+	},
+	{
+		key: 'keep-files',
+		title: 'Delete the site and keep its files',
+		request: siteDelete( 'keep-files', false ),
+	},
+	{
+		key: 'create',
+		title: 'Create a site after a recovery',
+		request: approval( 'create', `Change local work: sites.create. ${ AFTER_RECOVERY }`, {
+			tool: 'sites.create',
+			operationClass: 'local-change',
+			target: { environment: 'global' },
+			args: [ SITE.name, SITE.path ],
+			localPaths: [ SITE.path ],
+		} ),
+	},
+	{
+		key: 'wp-cli',
+		title: 'Create a draft with WP-CLI',
+		request: approval(
+			'wp-cli',
+			'Create a draft post on the current local site',
+			{
+				tool: 'sites.wpCli',
+				operationClass: 'command',
+				args: [
+					'post',
+					'create',
+					'--post_status=draft',
+					`--post_title=${ draft.title }`,
+					`--post_content=${ draft.content }`,
+				],
+				localPaths: [ SITE.path ],
+			},
+			draft
+		),
+	},
 	{
 		key: 'wpcom',
 		title: 'A WordPress.com request that changes the live site',
@@ -136,7 +208,7 @@ const samples: Array< { key: string; title: string; request: Request } > = [
 				type: 'bug',
 				message: `${ 'The preview kept the old header after I changed the theme, and reloading did not help. '.repeat(
 					24
-				) }\n\nSteps: open the site, change the theme, open the preview.\n${ 'https://harborbakery.example.test/a/very/long/address/that/has/no/spaces/in/it/at/all/'.repeat(
+				) }\n\nThe old header included these lines:\nRemote\nWordPress.com site 4242\n\nSteps: open the site, change the theme, open the preview.\n${ 'https://harborbakery.example.test/a/very/long/address/that/has/no/spaces/in/it/at/all/'.repeat(
 					3
 				) }`,
 			},
@@ -159,11 +231,12 @@ const samples: Array< { key: string; title: string; request: Request } > = [
 	{
 		key: 'recovery',
 		title: 'A local change after a recovery',
-		request: approval(
-			'recovery',
-			'Change local work: sites.start. The previous turn was interrupted, so an attempt it made may already have taken effect.',
-			{ tool: 'sites.start', operationClass: 'local-change', args: [], localPaths: [ SITE.path ] }
-		),
+		request: approval( 'recovery', `Change local work: sites.start. ${ AFTER_RECOVERY }`, {
+			tool: 'sites.start',
+			operationClass: 'local-change',
+			args: [],
+			localPaths: [ SITE.path ],
+		} ),
 	},
 ];
 

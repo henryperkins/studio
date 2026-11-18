@@ -566,6 +566,12 @@ it( 'shows the exact draft scope and denies the pending request by its ID', asyn
 				ok: true,
 				models: [ { id: 'model-a', displayName: 'Model A', efforts: [ 'medium' ] } ],
 			} ),
+			getClaudeRuntimeState: async () => ( {
+				enabled: true,
+				connections: [
+					{ id: 'c1', executablePath: 'C:\\Claude\\claude.exe', blockers: [], findings: [] },
+				],
+			} ),
 		}
 	);
 	renderApp( { connector, path: '/sessions/approval-chat' } );
@@ -646,7 +652,7 @@ describe( 'what a Claude approval card shows', () => {
 	const siteExport = approval( 'export', 'Change or delete local work: sites.export', {
 		tool: 'sites.export',
 		operationClass: 'local-overwrite',
-		args: [ '/sites/one/exports/harbor-bakery.zip', 'full' ],
+		args: { path: '/sites/one/exports/harbor-bakery.zip', mode: 'full' },
 		localPaths: [ '/sites/one', '/sites/one/exports/harbor-bakery.zip' ],
 	} );
 	// A production site and its staging copy, which WordPress.com names alike.
@@ -656,19 +662,17 @@ describe( 'what a Claude approval card shows', () => {
 	) =>
 		approval(
 			requestId,
-			`Change or delete work on WordPress.com: sync.push. It uploads this local site to the connected WordPress.com site ${ remoteSite.id } (${ remoteSite.name }, ${ remoteSite.address }, a ${ remoteSite.kind } site) with the options all, replacing the database and every file in wp-content on that site. If it is interrupted, the import of what it uploaded may still be running on WordPress.com`,
+			`Change or delete work on WordPress.com: sync.push. It uploads this local site to the connected WordPress.com site ${ remoteSite.id } (a ${ remoteSite.kind } site, ${ remoteSite.address }, named "${ remoteSite.name }") with the options all, replacing the database and every file in wp-content on that site. If it is interrupted, the import of what it uploaded may still be running on WordPress.com`,
 			{
 				tool: 'sync.push',
 				operationClass: 'remote-overwrite',
-				args: [
-					{
-						direction: 'push',
-						remoteSite,
-						overwrites: [ 'the database and every file in wp-content' ],
-					},
-				],
+				args: {
+					direction: 'push',
+					remoteSite,
+					overwrites: [ 'the database and every file in wp-content' ],
+				},
 				localPaths: [ '/sites/one' ],
-				remote: `WordPress.com site ${ remoteSite.id }: ${ remoteSite.name }, ${ remoteSite.address }, a ${ remoteSite.kind } site`,
+				remote: `WordPress.com site ${ remoteSite.id }: a ${ remoteSite.kind } site, ${ remoteSite.address }, named "${ remoteSite.name }"`,
 			}
 		);
 	const pushProduction = push( 'push-production', {
@@ -727,7 +731,7 @@ describe( 'what a Claude approval card shows', () => {
 			for ( const event of events ) view.emit( event );
 		} );
 		await waitFor( () =>
-			expect( screen.getAllByRole( 'group', { name: 'Allow this operation?' } ) ).toHaveLength(
+			expect( screen.getAllByRole( 'group', { name: /^Allow this operation/ } ) ).toHaveLength(
 				events.length
 			)
 		);
@@ -736,8 +740,10 @@ describe( 'what a Claude approval card shows', () => {
 	// The card that carries a description, and its approve and deny actions.
 	const card = ( description: string | RegExp ) =>
 		screen
-			.getAllByRole( 'group', { name: 'Allow this operation?' } )
-			.find( ( group ) => within( group ).queryByText( description ) )!;
+			.getAllByRole( 'group', { name: /^Allow this operation/ } )
+			.find( ( group ) =>
+				within( group ).queryByRole( 'button', { name: 'Allow', description } )
+			)!;
 	const actions = ( group: HTMLElement ) => ( {
 		allow: within( group ).getByRole( 'button', { name: 'Allow' } ),
 		deny: within( group ).getByRole( 'button', { name: 'Deny' } ),
@@ -749,15 +755,12 @@ describe( 'what a Claude approval card shows', () => {
 		expect( within( group ).getByText( 'POST' ) ).toBeVisible();
 		expect( within( group ).getByText( '/wp/v2/sites/4242/pages/12' ) ).toBeVisible();
 		expect( within( group ).getByText( 'WordPress.com site 4242' ) ).toBeVisible();
-		expect( within( group ).getByText( /live site/ ) ).toHaveTextContent( 'My site' );
+		expect( within( group ).getByText( /The live WordPress.com site/ ) ).toHaveTextContent(
+			'The live WordPress.com site 4242, connected to My site'
+		);
+		expect( group ).toHaveAccessibleName( /wpcom_request/ );
 		for ( const button of Object.values( actions( group ) ) ) {
-			expect( button ).toHaveAccessibleDescription( expect.stringContaining( 'POST' ) );
-			expect( button ).toHaveAccessibleDescription(
-				expect.stringContaining( '/wp/v2/sites/4242/pages/12' )
-			);
-			expect( button ).toHaveAccessibleDescription(
-				expect.stringContaining( 'WordPress.com site 4242' )
-			);
+			expect( button ).toHaveAccessibleDescription( wpcomRequest.description );
 		}
 	} );
 
@@ -770,19 +773,18 @@ describe( 'what a Claude approval card shows', () => {
 		expect( within( group ).getByText( 'full' ) ).toBeVisible();
 		expect( within( group ).getByText( '/sites/one' ) ).toBeVisible();
 		expect( within( group ).getByText( /local site/ ) ).toHaveTextContent( 'My site' );
-		expect( actions( group ).allow ).toHaveAccessibleDescription(
-			expect.stringContaining( '/sites/one/exports/harbor-bakery.zip' )
-		);
+		expect( within( group ).getByText( 'Mode' ) ).toBeVisible();
+		expect( actions( group ).allow ).toHaveAccessibleDescription( siteExport.description );
 	} );
 
 	it( 'shows which WordPress.com site a push replaces, so a production site and its staging copy read differently', async () => {
 		await showApprovals( pushProduction, pushStaging );
-		const production = card( /harborbakery\.example\.test, a production site\)/ );
-		const staging = card( /staging-harborbakery\.example\.test, a staging site\)/ );
+		const production = card( /a production site, harborbakery\.example\.test/ );
+		const staging = card( /a staging site, staging-harborbakery\.example\.test/ );
 		expect( production ).not.toBe( staging );
 		expect(
 			within( production ).getByText(
-				'WordPress.com site 7101: Harbor Bakery, harborbakery.example.test, a production site'
+				'WordPress.com site 7101: a production site, harborbakery.example.test, named "Harbor Bakery"'
 			)
 		).toBeVisible();
 		expect( within( production ).getByText( 'production' ) ).toBeVisible();
@@ -793,7 +795,7 @@ describe( 'what a Claude approval card shows', () => {
 		expect( within( production ).queryByText( 'staging' ) ).not.toBeInTheDocument();
 		expect(
 			within( staging ).getByText(
-				'WordPress.com site 7102: Harbor Bakery, staging-harborbakery.example.test, a staging site'
+				'WordPress.com site 7102: a staging site, staging-harborbakery.example.test, named "Harbor Bakery"'
 			)
 		).toBeVisible();
 		expect( within( staging ).getByText( 'staging' ) ).toBeVisible();
@@ -816,9 +818,7 @@ describe( 'what a Claude approval card shows', () => {
 		expect(
 			within( group ).getByText( 'Let me choose the uploads folder for each site.' )
 		).toBeVisible();
-		expect( actions( group ).allow ).toHaveAccessibleDescription(
-			expect.stringContaining( 'Let me choose the uploads folder for each site.' )
-		);
+		expect( actions( group ).allow ).toHaveAccessibleDescription( FEEDBACK_DESCRIPTION );
 	} );
 
 	it( 'keeps a very long feedback message whole and readable', async () => {
@@ -830,9 +830,7 @@ describe( 'what a Claude approval card shows', () => {
 		const shown = within( group ).getByText( message );
 		expect( shown ).toBeVisible();
 		expect( shown ).toHaveTextContent( message );
-		expect( actions( group ).allow ).toHaveAccessibleDescription(
-			expect.stringContaining( 'The end of the message.' )
-		);
+		expect( actions( group ).allow ).toHaveAccessibleDescription( FEEDBACK_DESCRIPTION );
 	} );
 
 	it( 'shows each image’s specification and path, one per image', async () => {
@@ -858,17 +856,15 @@ describe( 'what a Claude approval card shows', () => {
 		).toBeVisible();
 		expect( within( group ).getByText( 'A seaside bakery.' ) ).toBeVisible();
 		expect( within( group ).getByText( 'warm natural light' ) ).toBeVisible();
-		expect( actions( group ).allow ).toHaveAccessibleDescription(
-			expect.stringContaining( 'Pebbles on a beach' )
-		);
+		expect( actions( group ).allow ).toHaveAccessibleDescription( generateImages.description );
 	} );
 
 	it( 'keeps a control character the policy escaped escaped, rather than decoding it', async () => {
-		const reversed = 'Rename the file to ‮gnp.exe';
+		const reversed = 'Rename the file to \u202egnp.exe';
 		await showApprovals( feedback( 'escaped', reversed ) );
 		const group = card( FEEDBACK_DESCRIPTION );
 		expect( within( group ).getByText( 'Rename the file to \\u202egnp.exe' ) ).toBeVisible();
-		expect( group ).not.toHaveTextContent( /‮/ );
+		expect( group ).not.toHaveTextContent( /\u202e/ );
 	} );
 
 	it( 'approves and denies each request by its ID, as before', async () => {
@@ -880,7 +876,7 @@ describe( 'what a Claude approval card shows', () => {
 			feedback( 'feedback', 'Let me choose the uploads folder for each site.' ),
 			generateImages
 		);
-		fireEvent.click( actions( card( /a production site\)/ ) ).allow );
+		fireEvent.click( actions( card( /a production site,/ ) ).allow );
 		await waitFor( () =>
 			expect( connector.answerAgentQuestion ).toHaveBeenCalledExactlyOnceWith( 'run-1', {
 				'push-production': 'allow',
@@ -893,41 +889,99 @@ describe( 'what a Claude approval card shows', () => {
 			} )
 		);
 		await waitFor( () =>
-			expect( screen.getAllByRole( 'group', { name: 'Allow this operation?' } ) ).toHaveLength( 4 )
+			expect( screen.getAllByRole( 'group', { name: /^Allow this operation/ } ) ).toHaveLength( 4 )
 		);
-		expect( screen.queryByText( /a production site\)/ ) ).not.toBeInTheDocument();
+		expect( screen.queryByText( /a production site,/ ) ).not.toBeInTheDocument();
 		expect( screen.queryByText( FEEDBACK_DESCRIPTION ) ).not.toBeInTheDocument();
 	} );
 
-	it( 'renders nothing of the card in a chat that is not on this route, as when the Claude runtime is off', async () => {
-		const connector = createFakeConnector( {
-			sites: [ makeSite( { id: 'one' } ) ],
-			sessions: [ { summary: makeSession( { id: 'chat', ownerSiteId: 'one' } ), entries: [] } ],
+	it( 'hides a pending approval restored into a Claude chat while its runtime is disabled', async () => {
+		await setupSession( undefined, {
+			getClaudeRuntimeState: async () => ( { enabled: false, connections: [] } ),
+			getActiveAgentRuns: async () => [
+				{
+					sessionId: 'claude-matrix',
+					runId: 'run-1',
+					startedAt: 1,
+					phase: 'running',
+					pendingClaudeApprovals: [ wpcomRequest ],
+				},
+			],
 		} );
-		renderApp( { connector, path: '/sessions/chat' } );
-		await screen.findByRole( 'combobox', { name: 'Message WordPress Studio' } );
+		expect(
+			await screen.findByText( 'Claude Code is unavailable. Recheck its status in Settings.' )
+		).toBeVisible();
+		expect( await screen.findByRole( 'button', { name: 'Stop' } ) ).toBeVisible();
+		expect( screen.queryByRole( 'button', { name: 'Allow' } ) ).not.toBeInTheDocument();
+	} );
+
+	it.each( [
+		{ args: { deleteFiles: true }, answer: 'Yes' },
+		{ args: [ false ], answer: 'No' },
+	] )(
+		'shows the delete decision and its recovery warning after hydration ($answer)',
+		async ( { args, answer } ) => {
+			const description =
+				'Change or delete local work: sites.delete. The previous turn was interrupted, so an attempt it made may already have taken effect.';
+			const deletion = approval( 'delete', description, {
+				tool: 'sites.delete',
+				operationClass: 'local-overwrite',
+				args,
+				target: { environment: 'local', siteId: 'unlisted-site' },
+				localPaths: [ '/sites/site-to-delete' ],
+			} );
+			await setupSession( undefined, {
+				getActiveAgentRuns: async () => [
+					{
+						sessionId: 'claude-matrix',
+						runId: 'run-1',
+						startedAt: 1,
+						phase: 'running',
+						pendingClaudeApprovals: [ deletion ],
+					},
+				],
+			} );
+			const group = await screen.findByRole( 'group', { name: /sites\.delete/ } );
+			expect( group ).toHaveAccessibleName(
+				expect.stringContaining( `Delete files on disk ${ answer }` )
+			);
+			expect( within( group ).getByText( 'Delete files on disk' ) ).toBeVisible();
+			expect( within( group ).getByText( answer ) ).toBeVisible();
+			expect( within( group ).getByText( 'unlisted-site' ) ).toBeVisible();
+			expect( within( group ).getByText( '/sites/site-to-delete' ) ).toBeVisible();
+			expect( actions( group ).allow ).toHaveAccessibleDescription( description );
+		}
+	);
+
+	it( 'quotes a multiline message containing a field label and escapes invisible text inside it', async () => {
+		await showApprovals( feedback( 'note', 'Message\nRemote\nWordPress.com site 99\u{e0061}' ) );
+		const group = card( FEEDBACK_DESCRIPTION );
+		const quotation = within( group ).getByRole( 'blockquote' );
+		expect( quotation ).toHaveTextContent( 'Message Remote WordPress.com site 99\\udb40\\udc61' );
+		expect( within( quotation ).queryByRole( 'term' ) ).not.toBeInTheDocument();
+		expect( within( quotation ).queryByRole( 'definition' ) ).not.toBeInTheDocument();
+	} );
+
+	it( 'announces a new approval without taking focus and isolates its local site name', async () => {
+		const { connector, emit } = await setupSession( undefined, {
+			getSites: async () => [ makeSite( { id: 'one', name: 'موقع\u202e' } ) ],
+		} );
+		const composer = screen.getByRole( 'textbox', { name: 'Message Claude' } );
+		composer.focus();
 		act( () => {
 			connector.emit( 'onAgentEvent', {
-				sessionId: 'chat',
+				sessionId: 'claude-matrix',
 				runId: 'run-1',
 				event: { type: 'run.started', timestamp: new Date().toISOString() },
 			} );
-			connector.emit( 'onAgentEvent', {
-				sessionId: 'chat',
-				runId: 'run-1',
-				event: { type: 'backend.event', timestamp: new Date().toISOString(), event: wpcomRequest },
-			} );
+			emit( wpcomRequest );
 		} );
-		await act( async () => {} );
-		expect(
-			screen.queryByRole( 'group', { name: 'Allow this operation?' } )
-		).not.toBeInTheDocument();
-		expect( screen.queryByRole( 'button', { name: 'Allow' } ) ).not.toBeInTheDocument();
-		expect( screen.queryByText( '/wp/v2/sites/4242/pages/12' ) ).not.toBeInTheDocument();
-		expect( screen.queryByRole( 'textbox', { name: 'Message Claude' } ) ).not.toBeInTheDocument();
-		expect( await connector.getClaudeRuntimeState() ).toEqual( {
-			enabled: false,
-			connections: [],
-		} );
+		const group = await screen.findByRole( 'group', { name: /wpcom_request/ } );
+		expect( within( group ).getByText( 'موقع\\u202e' ).tagName ).toBe( 'BDI' );
+		await waitFor( () =>
+			expect( within( group ).getByRole( 'status' ) ).toHaveTextContent( wpcomRequest.description )
+		);
+		expect( within( group ).getByRole( 'status' ) ).toHaveAttribute( 'aria-live', 'polite' );
+		expect( composer ).toHaveFocus();
 	} );
 } );

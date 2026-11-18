@@ -88,6 +88,7 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 	const visibleEvents = events.filter( ( _event, index ) => visible.has( index ) );
 	const pending = run.pendingClaudeApprovals.filter(
 		( event ) =>
+			state.data?.enabled &&
 			event.runId === run.runId &&
 			! answered.includes( `${ event.runId }:${ event.requestId }` ) &&
 			! events.some(

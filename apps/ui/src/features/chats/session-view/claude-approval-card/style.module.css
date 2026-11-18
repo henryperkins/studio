@@ -43,7 +43,7 @@
 }
 
 .label {
-	color: var( --muted-foreground );
+	color: var( --foreground );
 	font-size: var( --text-xs );
 	line-height: var( --text-xs--line-height );
 }
@@ -53,11 +53,24 @@
 	margin: 0;
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
+	unicode-bidi: isolate;
 }
 
 .text {
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
+}
+
+.quotation {
+	min-width: 0;
+	margin: 0;
+	padding: var( --space-2 ) var( --space-3 );
+	border: 1px solid var( --border );
+	border-radius: var( --radius-md );
+	background: var( --muted );
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	unicode-bidi: isolate;
 }
 
 .code,
@@ -74,7 +87,7 @@
 }
 
 .none {
-	color: var( --muted-foreground );
+	color: var( --foreground );
 }
 
 .items,
@@ -94,18 +107,18 @@
 	min-width: 0;
 }
 
-.items > li + li {
+.items > li + li,
+.paths > li + li {
 	padding-top: var( --space-1_5 );
 	border-top: 1px solid var( --border );
 }
 
 .items > li::marker {
-	color: var( --muted-foreground );
+	color: var( --foreground );
 	font-size: var( --text-xs );
 }
 
 .paths {
-	gap: var( --space-0_5 );
 	padding-inline-start: 0;
 	list-style: none;
 }

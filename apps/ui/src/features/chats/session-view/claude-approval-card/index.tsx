@@ -1,7 +1,11 @@
-import { escapeClaudeApprovalText } from '@studio/agent/protocol/claude-code';
-import { __, sprintf } from '@wordpress/i18n';
-import { useId, type ReactNode } from 'react';
-import { Button } from '@/lib/ui';
+import {
+	escapeClaudeApprovalText,
+	getClaudeApprovalDisplayArgs,
+} from '@studio/agent/protocol/claude-code';
+import { createInterpolateElement } from '@wordpress/element';
+import { __, _x, sprintf } from '@wordpress/i18n';
+import { useEffect, useId, useState, type ReactNode } from 'react';
+import { Button, VisuallyHidden } from '@/lib/ui';
 import styles from './style.module.css';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 import type { ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
@@ -13,89 +17,118 @@ type ClaudeApprovalRequest = Extract< BackendTurnEvent, { type: 'approval.reques
 function getFieldLabel( name: string ): string {
 	switch ( name ) {
 		case 'method':
-			return __( 'Method' );
+			return _x( 'Method', 'Claude approval field label' );
 		case 'path':
-			return __( 'Path' );
+			return _x( 'Path', 'Claude approval field label' );
 		case 'type':
-			return __( 'Type' );
+			return _x( 'Type', 'Claude approval field label' );
 		case 'message':
-			return __( 'Message' );
+			return _x( 'Message', 'Claude approval field label' );
 		case 'images':
-			return __( 'Images' );
+			return _x( 'Images', 'Claude approval field label' );
 		case 'subject':
-			return __( 'Subject' );
+			return _x( 'Subject', 'Claude approval field label' );
 		case 'pageContext':
-			return __( 'Page context' );
+			return _x( 'Page context', 'Claude approval field label' );
 		case 'style':
-			return __( 'Style' );
+			return _x( 'Style', 'Claude approval field label' );
 		case 'aspectRatio':
-			return __( 'Aspect ratio' );
+			return _x( 'Aspect ratio', 'Claude approval field label' );
 		case 'siteContext':
-			return __( 'Site context' );
+			return _x( 'Site context', 'Claude approval field label' );
 		case 'imageGrade':
-			return __( 'Image grade' );
+			return _x( 'Image grade', 'Claude approval field label' );
 		case 'direction':
-			return __( 'Direction' );
+			return _x( 'Direction', 'Claude approval field label' );
 		case 'remoteSite':
-			return __( 'WordPress.com site' );
+			return _x( 'WordPress.com site', 'Claude approval field label' );
 		case 'overwrites':
-			return __( 'Replaces' );
+			return _x( 'Replaces', 'Claude approval field label' );
 		case 'id':
-			return __( 'ID' );
+			return _x( 'ID', 'Claude approval field label' );
 		case 'name':
-			return __( 'Name' );
+			return _x( 'Name', 'Claude approval field label' );
 		case 'address':
-			return __( 'Address' );
+			return _x( 'Address', 'Claude approval field label' );
 		case 'kind':
-			return __( 'Kind' );
+			return _x( 'Kind', 'Claude approval field label' );
+		case 'deleteFiles':
+			return _x( 'Delete files on disk', 'Claude approval field label' );
+		case 'mode':
+			return _x( 'Mode', 'Claude approval field label' );
+		case 'command':
+			return _x( 'Command', 'Claude approval field label' );
+		case 'siteId':
+			return _x( 'Site ID', 'Claude approval field label' );
+		case 'fileNames':
+			return _x( 'File names', 'Claude approval field label' );
+		case 'ready':
+			return _x( 'Completed attachments', 'Claude approval field label' );
+		case 'failed':
+			return _x( 'Failed attachments', 'Claude approval field label' );
 		default:
 			return escapeClaudeApprovalText( name );
 	}
 }
 
-function getTargetLabel( target: ClaudeStudioTarget, siteName?: string ): string {
+function getTargetLabel( target: ClaudeStudioTarget, siteName?: string ): ReactNode {
 	if ( target.environment === 'global' ) return __( 'Studio as a whole, not one site' );
-	const site = escapeClaudeApprovalText( siteName ?? target.siteId );
+	const local = <ShownText value={ siteName ?? target.siteId } />;
 	if ( target.environment === 'live' )
-		return sprintf(
-			/* translators: 1: a site's name, 2: the numeric ID of its WordPress.com site. */
-			__( '%1$s, the live site on WordPress.com (site %2$s)' ),
-			site,
-			String( target.wpcomSiteId )
+		return createInterpolateElement(
+			/* translators: <remote/> is the WordPress.com site ID. <local/> is the connected local site's name. */
+			__( 'The live WordPress.com site <remote/>, connected to <local/>' ),
+			{ remote: <bdi>{ target.wpcomSiteId }</bdi>, local }
 		);
-	return sprintf(
-		/* translators: %s: a site's name. */
-		__( '%s, the local site' ),
-		site
+	return createInterpolateElement(
+		/* translators: <local/> is the local site's name. */
+		__( '<local/>, the local site' ),
+		{ local }
 	);
 }
 
 // The arguments arrive as escaped JSON. Parsing turns an escape back into the
 // character it stands for, so every string is escaped again before it is shown.
-function parseArguments( args: string ): { value: unknown } | undefined {
+function parseArguments( tool: string, args: string ): { value: unknown } | undefined {
 	try {
-		return { value: JSON.parse( args ) as unknown };
+		return { value: getClaudeApprovalDisplayArgs( tool, JSON.parse( args ) as unknown ) };
 	} catch {
 		return undefined;
 	}
 }
 
-function Field( { label, children }: { label: string; children: ReactNode } ) {
+function Field( { id, label, children }: { id?: string; label: string; children: ReactNode } ) {
 	return (
-		<div className={ styles.field }>
+		<div id={ id } className={ styles.field }>
 			<dt className={ styles.label }>{ label }</dt>
 			<dd className={ styles.value }>{ children }</dd>
 		</div>
 	);
 }
 
+function ShownText( { value }: { value: string } ) {
+	const text = escapeClaudeApprovalText( value );
+	return /[\n\u2028\u2029]/u.test( text ) ? (
+		<blockquote className={ styles.quotation } dir="auto">
+			{ text }
+		</blockquote>
+	) : (
+		<bdi className={ styles.text }>{ text }</bdi>
+	);
+}
+
 function ShownValue( { value }: { value: unknown } ) {
-	if ( typeof value === 'string' )
-		return <span className={ styles.text }>{ escapeClaudeApprovalText( value ) }</span>;
-	if ( value === null || typeof value !== 'object' )
-		return <span className={ styles.text }>{ String( value ) }</span>;
+	if ( typeof value === 'string' ) return <ShownText value={ value } />;
+	if ( typeof value === 'boolean' )
+		return (
+			<bdi>
+				{ value ? _x( 'Yes', 'Claude approval value' ) : _x( 'No', 'Claude approval value' ) }
+			</bdi>
+		);
+	if ( value === null || typeof value !== 'object' ) return <bdi>{ String( value ) }</bdi>;
 	if ( Array.isArray( value ) ) {
-		if ( ! value.length ) return <span className={ styles.none }>{ __( 'None' ) }</span>;
+		if ( ! value.length )
+			return <bdi className={ styles.none }>{ _x( 'None', 'Claude approval value' ) }</bdi>;
 		if ( value.length === 1 ) return <ShownValue value={ value[ 0 ] } />;
 		return (
 			<ol className={ styles.items }>
@@ -108,7 +141,8 @@ function ShownValue( { value }: { value: unknown } ) {
 		);
 	}
 	const entries = Object.entries( value );
-	if ( ! entries.length ) return <span className={ styles.none }>{ __( 'None' ) }</span>;
+	if ( ! entries.length )
+		return <bdi className={ styles.none }>{ _x( 'None', 'Claude approval value' ) }</bdi>;
 	return (
 		<dl className={ styles.nested }>
 			{ entries.map( ( [ name, item ] ) => (
@@ -138,19 +172,38 @@ export function ClaudeApprovalCard( {
 } ) {
 	const id = useId();
 	const { operation, draft } = request;
-	const args = parseArguments( operation.args );
-	const described = `${ id }-description ${ id }-details`;
+	const args = parseArguments( operation.tool, operation.args );
+	const description = escapeClaudeApprovalText( request.description );
+	const [ announced, setAnnounced ] = useState( false );
+	useEffect( () => {
+		const frame = requestAnimationFrame( () => setAnnounced( true ) );
+		return () => cancelAnimationFrame( frame );
+	}, [] );
+	const described = `${ id }-description`;
+	const labels = [ `${ id }-title`, `${ id }-tool` ];
+	if ( operation.remote ) labels.push( `${ id }-remote` );
+	if ( operation.tool === 'sites.delete' ) labels.push( `${ id }-details` );
 	return (
-		<div role="group" aria-labelledby={ `${ id }-title` } className={ styles.card }>
+		<div role="group" aria-labelledby={ labels.join( ' ' ) } className={ styles.card }>
+			<VisuallyHidden role="status" aria-live="polite">
+				{ announced &&
+					sprintf(
+						/* translators: %s describes the operation awaiting approval. */
+						__( 'Approval requested. %s' ),
+						description
+					) }
+			</VisuallyHidden>
 			<p id={ `${ id }-title` } className={ styles.title }>
 				{ __( 'Allow this operation?' ) }
 			</p>
 			<p id={ `${ id }-description` } className={ styles.description }>
-				{ request.description }
+				{ description }
 			</p>
-			<dl id={ `${ id }-details` } className={ styles.fields }>
-				<Field label={ __( 'Operation' ) }>
-					<span className={ styles.code }>{ operation.tool }</span>
+			<dl className={ styles.fields }>
+				<Field label={ _x( 'Operation', 'Claude approval field label' ) }>
+					<bdi id={ `${ id }-tool` } className={ styles.code }>
+						{ escapeClaudeApprovalText( operation.tool ) }
+					</bdi>
 				</Field>
 				<Field label={ __( 'Acts on' ) }>{ getTargetLabel( operation.target, siteName ) }</Field>
 				{ operation.localPaths.length ? (
@@ -158,31 +211,41 @@ export function ClaudeApprovalCard( {
 						<ul className={ styles.paths }>
 							{ operation.localPaths.map( ( localPath, index ) => (
 								<li key={ index } className={ styles.code }>
-									{ localPath }
+									<ShownText value={ localPath } />
 								</li>
 							) ) }
 						</ul>
 					</Field>
 				) : null }
 				{ operation.remote ? (
-					<Field label={ __( 'Remote' ) }>
-						<span className={ styles.text }>{ operation.remote }</span>
+					<Field label={ _x( 'Remote', 'Claude approval field label' ) }>
+						<div id={ `${ id }-remote` }>
+							<ShownText value={ operation.remote } />
+						</div>
 					</Field>
 				) : null }
-				<Field label={ __( 'Details' ) }>
+				<Field id={ `${ id }-details` } label={ _x( 'Details', 'Claude approval field label' ) }>
 					{ args ? (
 						<ShownValue value={ args.value } />
 					) : (
-						<pre className={ styles.raw }>{ operation.args }</pre>
+						<div className={ styles.raw }>
+							<ShownText value={ operation.args } />
+						</div>
 					) }
 				</Field>
 				{ draft ? (
 					<>
-						<Field label={ __( 'Site' ) }>{ draft.siteName }</Field>
-						<Field label={ __( 'Draft title' ) }>{ draft.title }</Field>
+						<Field label={ _x( 'Site', 'Claude approval field label' ) }>
+							<ShownText value={ draft.siteName } />
+						</Field>
+						<Field label={ __( 'Draft title' ) }>
+							<ShownText value={ draft.title } />
+						</Field>
 						{ draft.content !== undefined ? (
-							<Field label={ __( 'Content' ) }>
-								<pre className={ styles.raw }>{ draft.content }</pre>
+							<Field label={ _x( 'Content', 'Claude approval field label' ) }>
+								<div className={ styles.raw }>
+									<ShownText value={ draft.content } />
+								</div>
 							</Field>
 						) : null }
 					</>
