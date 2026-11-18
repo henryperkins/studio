@@ -1,4 +1,4 @@
-import { writeFile } from 'fs/promises';
+import { link, mkdir, symlink, writeFile } from 'fs/promises';
 import path from 'path';
 import { Type } from 'typebox';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -74,6 +74,29 @@ async function setup(
 	return { ...fixture, bridge, approve };
 }
 describe( 'Claude Studio tool boundary (mock host)', () => {
+	it( 'lists the workspace, including empty directories, without following outside links or showing protected files', async () => {
+		const { bridge, site, other, approve } = await setup();
+		await mkdir( path.join( site, 'empty' ) );
+		await writeFile( path.join( site, '.visible' ), '' );
+		await writeFile( path.join( site, '.env' ), 'private' );
+		await symlink( other, path.join( site, 'external' ), 'junction' );
+		await writeFile( path.join( other, 'sample.txt' ), 'sample' );
+		await link( path.join( other, 'sample.txt' ), path.join( site, 'alias.txt' ) );
+		const listing = await bridge.invoke( 'Ls', {} );
+		expect( listing.isError ).toBe( false );
+		expect( listing.content ).toEqual( [ { type: 'text', text: '.visible\nempty/' } ] );
+		const empty = await bridge.invoke( 'Ls', { path: 'empty' } );
+		expect( empty.content ).toEqual( [ { type: 'text', text: '(empty directory)' } ] );
+		const limited = await bridge.invoke( 'Ls', { path: '.', limit: 1 } );
+		expect( limited.content[ 0 ] ).toMatchObject( {
+			type: 'text',
+			text: expect.stringContaining( '1 entries limit reached' ),
+		} );
+		expect( ( await bridge.invoke( 'Ls', { path: other } ) ).isError ).toBe( true );
+		expect( ( await bridge.invoke( 'Ls', { path: site, extra: true } ) ).isError ).toBe( true );
+		expect( ( await bridge.invoke( 'Ls', { limit: -1 } ) ).isError ).toBe( true );
+		expect( approve ).not.toHaveBeenCalled();
+	} );
 	it( 'runs canonical local read and denies other routes and invalid schema', async () => {
 		const { host, bridge } = await setup();
 		expect(
@@ -508,6 +531,9 @@ function permissivePolicy( names: string[] ) {
 		signal: controller.signal,
 		studioTools: names,
 		authorizeToolUse: vi.fn( async () => false ),
+		decideToolUse: vi.fn( async () => ( { allowed: false as const, reason: 'Unavailable' } ) ),
+		takeNativeFileWrite: () => undefined,
+		resolveListingPath: async () => ( { refusal: 'Unavailable' } ),
 		authorizeStudioCall: vi.fn( async () => true ),
 		guardHost: vi.fn( ( host: StudioAgentHost, toolCallId: string ) => {
 			const fenced: StudioAgentHost = {

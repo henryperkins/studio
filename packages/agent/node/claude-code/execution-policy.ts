@@ -19,6 +19,7 @@ import {
 	reserveExclusiveAttachmentsArgs,
 	verifiedFinalizeAttachmentsArgs,
 } from '../tools/media-library';
+import { isClaudeDirectoryListInput } from './directory-listing';
 import {
 	CLAUDE_ACCOUNT_RECHECK_MS,
 	CLAUDE_NATIVE_TOOL_RULES,
@@ -29,7 +30,7 @@ import {
 	claudeStudioTools,
 	claudeTargetOrigin,
 	describeClaudeOperation,
-	isContainedPattern,
+	getClaudeNativePayloadRefusal,
 	isLocalHostname,
 	isRecord,
 	normalizeHostname,
@@ -38,6 +39,7 @@ import {
 } from './execution-rules';
 import { escapeClaudeJournalText } from './journal-text';
 import {
+	checkClaudeNativePath,
 	isAllowedNativePath,
 	isBundledFolder,
 	isInside,
@@ -47,6 +49,7 @@ import {
 	resolveAllowedNewPath,
 	resolveAllowedPath,
 } from './local-paths';
+import { plainData } from './plain-data';
 import { classifyWpCliArgs, hasWpCliOverrides, wpCliOption } from './wp-cli-rules';
 import type {
 	ClaudeEnabledTools,
@@ -73,7 +76,7 @@ import type { SyncSite } from '@studio/common/types/sync';
  */
 
 /** Changes whenever what this policy allows changes; turns and approvals carry it. */
-export const CLAUDE_EXECUTION_POLICY_REVISION = 1;
+export const CLAUDE_EXECUTION_POLICY_REVISION = 2;
 
 /** One operation as it will run. An approval covers exactly this, for one call. */
 export interface ClaudeOperation {
@@ -85,6 +88,8 @@ export interface ClaudeOperation {
 	/** The local site its arguments name. */
 	readonly siteId?: string;
 	readonly localPaths: readonly string[];
+	/** The checked destination of a native Write or Edit. */
+	readonly filePath?: string;
 	/** The remote resource it reaches, for display. */
 	readonly remote?: string;
 	readonly description: string;
@@ -131,6 +136,7 @@ export interface ClaudeExecutionContext {
 	targetSite?: { id: string; path: string; url?: string };
 	/** Canonical folders native file tools may reach. */
 	localRoots: readonly string[];
+	isStudioSite: ( folder: string ) => Promise< boolean >;
 	enabledTools: ClaudeEnabledTools;
 	/** How the turn's launch confines shell commands. */
 	shellConfinement: ClaudeShellConfinement;
@@ -182,6 +188,33 @@ export interface ClaudeToolUse {
 	mcpServer?: { name: string; source: string };
 }
 
+type ToolDenial = { allowed: false; reason: string };
+type ToolDecision = { allowed: true; input: Record< string, unknown > } | ToolDenial;
+type NativeAdmission = { allowed: true; path?: string } | ToolDenial;
+type NativeUse = {
+	inputHash: string;
+	checkedHash?: string;
+	answer: Promise< NativeAdmission >;
+	cancel: AbortController;
+	writtenFile?: string;
+	target: ClaudeStudioTarget;
+};
+
+const denyTool = ( reason = 'Tool unavailable.' ): ToolDenial => ( { allowed: false, reason } );
+const INVALID_NATIVE_INPUT = 'Use only the input fields and values supported for this tool.';
+const DIFFERENT_NATIVE_USE = 'Start a new tool call when changing the tool or its input.';
+const FILE_CHANGED = 'The file destination changed. Check its location and start a new tool call.';
+const isNativeWrite = ( name: string ) => name === 'Write' || name === 'Edit';
+function nativeInputHash( tool: string, input: unknown ): string | undefined {
+	try {
+		return createHash( 'sha256' )
+			.update( canonicalJson( [ tool, input ] ) )
+			.digest( 'hex' );
+	} catch {
+		return undefined;
+	}
+}
+
 export interface ClaudeStudioCall {
 	/** The unguarded host, used to resolve the site the call names. */
 	host: StudioAgentHost;
@@ -202,6 +235,12 @@ export interface ClaudeExecutionPolicy {
 	 * caller's own: when it aborts, the decision is deny.
 	 */
 	authorizeToolUse( use: ClaudeToolUse, signal?: AbortSignal ): Promise< boolean >;
+	decideToolUse( use: ClaudeToolUse, signal?: AbortSignal ): Promise< ToolDecision >;
+	takeNativeFileWrite( toolUseId: string, toolName: string, input: unknown ): string | undefined;
+	resolveListingPath(
+		file?: string,
+		entry?: boolean
+	): Promise< { path: string } | { refusal: string } >;
 	/** A Studio MCP tool call, before its handler runs. */
 	authorizeStudioCall( call: ClaudeStudioCall ): Promise< boolean >;
 	/**
@@ -710,9 +749,8 @@ export function createClaudeExecutionPolicy(
 		tool: string,
 		shell?: ClaudeShellConfinement
 	) => noticed( operationClass, describeClaudeOperation( operationClass, tool, shell ) );
-	// A tool use is asked about at most once, whether by the hook or by the
-	// permission request, so a hook that times out cannot be answered later.
-	const askedToolUses = new Set< string >();
+	// The permission callback and the pre-tool hook can both ask about one SDK use.
+	const nativeUses = new Map< string, NativeUse | ToolDenial >();
 	const nativeTools = new Set(
 		claudeNativeTools(
 			context.enabledTools,
@@ -730,6 +768,7 @@ export function createClaudeExecutionPolicy(
 			grants.clear();
 			refusals.clear();
 			admittedCalls.clear();
+			nativeUses.clear();
 		},
 		{ once: true }
 	);
@@ -965,7 +1004,11 @@ export function createClaudeExecutionPolicy(
 				getClaudeApprovalDisplayArgs( operation.tool, operation.args ),
 				escapeClaudeApprovalText
 			),
-			approvalEvent( request, operation.args, escapeClaudeJournalText )
+			approvalEvent(
+				request,
+				operation.filePath ? { file_path: operation.filePath } : operation.args,
+				escapeClaudeJournalText
+			)
 		);
 		const allowed = await awaitAnswer( request, callSignal );
 		context.onEvent( { type: 'approval.resolved', ...ids } );
@@ -998,7 +1041,7 @@ export function createClaudeExecutionPolicy(
 	// before its result is recorded. What cannot be recorded does not run, and
 	// the turn stops, since it could no longer account for what it runs.
 	async function admit(
-		operation: Pick< ClaudeOperation, 'tool' | 'operationClass' | 'description' >,
+		operation: Pick< ClaudeOperation, 'tool' | 'operationClass' | 'description' | 'filePath' >,
 		toolCallId: string | undefined,
 		callSignal?: AbortSignal,
 		requestId?: string
@@ -1016,6 +1059,7 @@ export function createClaudeExecutionPolicy(
 					tool: escapeClaudeJournalText( operation.tool ),
 					operationClass: operation.operationClass,
 					target: { ...actingTarget },
+					...( operation.filePath ? { filePath: operation.filePath } : {} ),
 				},
 				description: escapeClaudeJournalText( operation.description ),
 			} );
@@ -1044,66 +1088,167 @@ export function createClaudeExecutionPolicy(
 		);
 	}
 
-	async function authorizeToolUse(
+	async function decideToolUse(
 		use: ClaudeToolUse,
 		callSignal?: AbortSignal
-	): Promise< boolean > {
-		const { toolName, input, mcpServer } = use;
-		if ( callSignal?.aborted ) return false;
+	): Promise< ToolDecision > {
+		const { toolName, toolUseId, mcpServer } = use;
+		if ( signal.aborted ) return denyTool();
+		const known = toolUseId ? nativeUses.get( toolUseId ) : undefined;
+		if ( known && 'reason' in known ) return known;
+		const reject = ( reason?: string ) => {
+			const denial = denyTool( reason );
+			if ( toolUseId && ! known ) nativeUses.set( toolUseId, denial );
+			return denial;
+		};
+		if ( callSignal?.aborted ) return reject();
+		const input = plainData( use.input );
+		if ( ! input ) return reject( INVALID_NATIVE_INPUT );
+		const rule = CLAUDE_NATIVE_TOOL_RULES.get( toolName );
 		if ( toolName.startsWith( 'mcp__' ) ) {
 			const name = studioToolName( toolName );
-			// The Studio guard for its tools runs where they execute; this only
-			// admits Studio's own in-process server.
-			return (
-				!! name &&
-				mcpServer?.name === 'studio' &&
-				mcpServer.source === 'sdk' &&
-				studioTools.has( name ) &&
-				CLAUDE_STUDIO_TOOL_RULES.has( name ) &&
-				( await checkpoint( callSignal ) )
-			);
-		}
-		const rule = CLAUDE_NATIVE_TOOL_RULES.get( toolName );
-		if ( ! rule || ! nativeTools.has( toolName ) || ! isRecord( input ) ) return false;
-		if ( rule.accepts && ! rule.accepts( input ) ) return false;
-		if (
-			rule.patterns?.some(
-				( field ) => input[ field ] !== undefined && ! isContainedPattern( input[ field ] )
+			if (
+				! name ||
+				mcpServer?.name !== 'studio' ||
+				mcpServer.source !== 'sdk' ||
+				! studioTools.has( name )
 			)
-		)
-			return false;
-		let localPaths = [ context.workspace.workingDirectory ];
-		if ( rule.path ) {
-			const value = input[ rule.path.field ];
-			if ( value !== undefined || rule.path.required ) {
-				if (
-					typeof value !== 'string' ||
-					! ( await isAllowedNativePath(
-						value,
-						context.localRoots,
-						context.workspace.configDirectory,
-						rule.path.allowRoot
-					) )
-				)
-					return false;
-				localPaths = [ value ];
-			}
+				return reject();
+			// The Studio call's own guard checks its input where the handler runs.
+			const studioRule = CLAUDE_STUDIO_TOOL_RULES.get( name );
+			if ( ! studioRule ) return reject();
+			if ( studioRule.directoryListing && ! isClaudeDirectoryListInput( input ) )
+				return reject( INVALID_NATIVE_INPUT );
+		} else {
+			if ( ! rule || ! nativeTools.has( toolName ) || mcpServer ) return reject();
+			if ( rule.accepts && ! rule.accepts( input ) ) return reject( INVALID_NATIVE_INPUT );
+			const payloadRefusal = getClaudeNativePayloadRefusal( toolName, input );
+			if ( payloadRefusal ) return reject( payloadRefusal );
 		}
-		const operation = {
-			tool: toolName,
-			operationClass: rule.operationClass,
-			description: describe(
-				rule.operationClass,
+
+		const pathField = rule?.path?.field;
+		const file = pathField ? input[ pathField ] ?? context.workspace.workingDirectory : undefined;
+		const checkPath = async (): Promise< NativeAdmission > => {
+			if ( ! pathField ) return { allowed: true };
+			if (
+				typeof file !== 'string' ||
+				( rule?.path?.required && input[ pathField ] === undefined )
+			)
+				return denyTool( INVALID_NATIVE_INPUT );
+			const result = await checkClaudeNativePath(
 				toolName,
-				rule.shell ? context.shellConfinement : undefined
-			),
+				file,
+				context.localRoots,
+				context.workspace.configDirectory,
+				context.isStudioSite,
+				context.workspace.workingDirectory
+			);
+			return 'refusal' in result
+				? denyTool( result.refusal )
+				: { allowed: true, path: result.path };
 		};
-		if ( ! asksFirst( rule.operationClass ) )
-			return ( await checkpoint( callSignal ) ) && admit( operation, use.toolUseId, callSignal );
-		const toolUseId = use.toolUseId;
-		if ( ! toolUseId || askedToolUses.has( toolUseId ) ) return false;
-		askedToolUses.add( toolUseId );
-		return approveOnce( { ...operation, args: input, localPaths }, toolUseId, callSignal );
+		const checkedInput = ( destination?: string ) =>
+			pathField && destination ? { ...input, [ pathField ]: destination } : input;
+		const ask = rule !== undefined && asksFirst( rule.operationClass );
+		const decide = async ( caller: AbortSignal ): Promise< NativeAdmission > => {
+			const checked = await checkPath();
+			if ( ! checked.allowed ) return checked;
+			if ( ! ( await checkpoint( caller ) ) ) return denyTool();
+			if ( ! rule ) return checked;
+			const operation: ClaudeOperation = {
+				tool: toolName,
+				operationClass: rule.operationClass,
+				args: checkedInput( checked.path ),
+				localPaths: [ checked.path ?? context.workspace.workingDirectory ],
+				...( isNativeWrite( toolName ) ? { filePath: checked.path } : {} ),
+				description: describe(
+					rule.operationClass,
+					toolName,
+					rule.shell ? context.shellConfinement : undefined
+				),
+			};
+			let refusal: ToolDenial | undefined;
+			const stillBound = async () => {
+				const latest = await checkPath();
+				if ( ! latest.allowed ) refusal = latest;
+				else if ( latest.path !== checked.path ) refusal = denyTool( FILE_CHANGED );
+				return ! refusal;
+			};
+			const admitted = ask
+				? !! toolUseId && ( await approveOnce( operation, toolUseId, caller, stillBound ) )
+				: await admit( operation, toolUseId, caller );
+			if ( ! admitted )
+				return refusal ?? denyTool( ask ? 'The operation was not approved.' : undefined );
+			if ( isNativeWrite( toolName ) && ! ( await stillBound() ) )
+				return refusal ?? denyTool( FILE_CHANGED );
+			return checked;
+		};
+
+		const signature = nativeInputHash( toolName, input );
+		if ( ! signature ) return reject( INVALID_NATIVE_INPUT );
+		if ( known && signature !== known.inputHash && signature !== known.checkedHash )
+			return denyTool( DIFFERENT_NATIVE_USE );
+		const cancel = known?.cancel ?? new AbortController();
+		const stop = () => cancel.abort();
+		callSignal?.addEventListener( 'abort', stop, { once: true } );
+		const entry: NativeUse = known ?? {
+			inputHash: signature,
+			answer: decide( cancel.signal ),
+			cancel,
+			target: actingTarget,
+		};
+		if ( toolUseId && ! known ) nativeUses.set( toolUseId, entry );
+		let decision: NativeAdmission;
+		try {
+			decision = await entry.answer;
+		} finally {
+			callSignal?.removeEventListener( 'abort', stop );
+		}
+		if ( ! decision.allowed ) return decision;
+		if ( known ) {
+			if ( entry.target !== actingTarget || ! ( await checkpoint( callSignal, ask ) ) )
+				return denyTool();
+			const checked = await checkPath();
+			if ( ! checked.allowed ) return checked;
+			if ( decision.path !== checked.path ) return denyTool( FILE_CHANGED );
+		}
+		if ( signal.aborted || cancel.signal.aborted || callSignal?.aborted ) return denyTool();
+		const normalized = checkedInput( decision.path );
+		if ( ! known ) {
+			entry.checkedHash = nativeInputHash( toolName, normalized );
+			if ( isNativeWrite( toolName ) ) entry.writtenFile = decision.path;
+		}
+		return { allowed: true, input: normalized };
+	}
+
+	function takeNativeFileWrite( id: string, name: string, input: unknown ): string | undefined {
+		const entry = nativeUses.get( id );
+		if (
+			! entry ||
+			'reason' in entry ||
+			! entry.writtenFile ||
+			! isNativeWrite( name ) ||
+			signal.aborted
+		)
+			return;
+		const signature = nativeInputHash( name, input );
+		if ( ! signature || ( signature !== entry.inputHash && signature !== entry.checkedHash ) )
+			return;
+		const file = entry.writtenFile;
+		nativeUses.set( id, denyTool( 'This file change has already finished.' ) );
+		return file;
+	}
+
+	async function resolveListingPath( file?: string, entry = false ) {
+		if ( signal.aborted ) return { refusal: 'The turn has ended.' };
+		return checkClaudeNativePath(
+			entry ? 'LsEntry' : 'Ls',
+			file ?? context.workspace.workingDirectory,
+			context.localRoots,
+			context.workspace.configDirectory,
+			context.isStudioSite,
+			context.workspace.workingDirectory
+		);
 	}
 
 	// Resolves a site reference and requires it to be the turn's target site,
@@ -1171,6 +1316,17 @@ export function createClaudeExecutionPolicy(
 		if ( callSignal?.aborted ) return false;
 		const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );
 		if ( ! rule || ! studioTools.has( name ) ) return false;
+		if ( rule.directoryListing ) {
+			if ( ! isClaudeDirectoryListInput( args ) ) {
+				refuse( toolCallId, INVALID_NATIVE_INPUT );
+				return false;
+			}
+			const checked = await resolveListingPath( args.path );
+			if ( 'refusal' in checked ) {
+				refuse( toolCallId, checked.refusal );
+				return false;
+			}
+		}
 		const siteRefused = rule.withoutSite ? siteRefusal( rule.createsSite === true ) : undefined;
 		if ( siteRefused ) {
 			refuse( toolCallId, siteRefused );
@@ -2476,7 +2632,11 @@ export function createClaudeExecutionPolicy(
 	return {
 		signal,
 		studioTools: Object.freeze( [ ...studioTools ] ),
-		authorizeToolUse,
+		authorizeToolUse: async ( use, callSignal ) =>
+			( await decideToolUse( use, callSignal ) ).allowed,
+		decideToolUse,
+		takeNativeFileWrite,
+		resolveListingPath,
 		authorizeStudioCall,
 		guardHost,
 		endCall: async ( toolCallId ) => {

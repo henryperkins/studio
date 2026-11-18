@@ -179,6 +179,7 @@ export async function createPolicyFixture(
 		workspace: { siteId: fakeSite.id, workingDirectory: site, configDirectory: config },
 		targetSite: { id: fakeSite.id, path: site, url: fakeSite.url },
 		localRoots: [ site ],
+		isStudioSite: async ( folder ) => !! ( await host.sites.findByFolder( folder ) ),
 		enabledTools: CLAUDE_ENABLED_TOOLS,
 		shellConfinement: { mode: 'none' },
 		navigationConfinement: { mode: 'none' },

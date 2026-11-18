@@ -112,10 +112,11 @@ function linked( entry: string ): Pick< StudioToolModule, 'files' | 'packages' |
 	};
 }
 
-/** Every module directly under `tools/` that defines a tool, with all it links. */
+/** Registry tool definitions and the Claude directory-listing adapter, with all they link. */
 export function studioToolModules(): StudioToolModule[] {
 	return readdirSync( toolsDirectory )
 		.filter( ( name ) => name.endsWith( '.ts' ) )
+		.concat( '../claude-code/directory-listing.ts' )
 		.map( ( name ) => {
 			const file = path.join( toolsDirectory, name );
 			return { file: name, names: scan( file ).tools, ...linked( file ) };

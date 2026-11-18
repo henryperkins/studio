@@ -30,6 +30,8 @@ import {
 	claudeNativeTools,
 	studioMcpToolName,
 } from './execution-rules';
+import { getClaudeSensitiveReadDenyRules } from './local-paths';
+import { nativeFileResultHook } from './native-file-results';
 import { isClaudeExecutableUnchanged } from './platform';
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
 import { createStudioClaudeDiscoveryServer, createStudioClaudeToolBridge } from './tool-bridge';
@@ -261,13 +263,16 @@ interface NativeLaunch {
 	onOwned: ( owned: OwnedProcess ) => void;
 	/** Said to Claude for this turn only, after Studio's standing instructions. */
 	instructions?: string;
+	additionalDirectories?: string[];
 }
 
 const STUDIO_INSTRUCTIONS =
 	'Work only in the current local WordPress site. Use Studio tools for WordPress operations. Do not publish or access production.';
 
-const oneLine = ( text: unknown ) =>
-	escapeClaudeApprovalText( String( text ) ).replace( /\s+/g, ' ' ).trim();
+const oneLine = ( text: unknown, preserveSpaces = false ) =>
+	escapeClaudeApprovalText( String( text ) )
+		.replace( preserveSpaces ? /[\n\t\u2028\u2029]+/gu : /\s+/gu, ' ' )
+		.trim();
 
 /**
  * What the first turn after a recovery tells Claude, once: that the previous
@@ -297,7 +302,7 @@ export function recoveryNote(
 						const tool = oneLine( operation.tool );
 						let description = tool;
 						if ( typeof operation.description === 'string' )
-							description = oneLine( operation.description );
+							description = oneLine( operation.description, tool === 'Write' || tool === 'Edit' );
 						else if ( operation.evidence === 'started' )
 							description = `Run an operation Studio does not recognize: ${ tool }`;
 						return description.includes( tool )
@@ -367,6 +372,13 @@ function nativeLaunchOptions(
 		strictMcpConfig: true,
 		settingSources: [],
 		settings: {
+			permissions: {
+				deny: getClaudeSensitiveReadDenyRules(),
+				blockReadsOutsideWorkingDirectories: true,
+				blockWritesOutsideWorkingDirectories: true,
+				workingDirectoriesAsGiven: [ prepared.cwd, ...( launch.additionalDirectories ?? [] ) ],
+				additionalDirectories: launch.additionalDirectories ?? [],
+			},
 			autoMemoryEnabled: false,
 			disableClaudeAiConnectors: true,
 			enabledPlugins: {
@@ -900,6 +912,9 @@ export async function runClaudeTurn(
 				} );
 			input.onEvent( event );
 		};
+		const additionalDirectories =
+			targetSite && targetSite.path !== prepared.cwd ? [ targetSite.path ] : [];
+		const roots = [ prepared.cwd, ...additionalDirectories ];
 		policy = createClaudeExecutionPolicy( {
 			runId,
 			turnId,
@@ -913,10 +928,8 @@ export async function runClaudeTurn(
 				configDirectory: prepared.configDirectory,
 			},
 			targetSite,
-			localRoots:
-				targetSite && targetSite.path !== prepared.cwd
-					? [ prepared.cwd, targetSite.path ]
-					: [ prepared.cwd ],
+			localRoots: roots,
+			isStudioSite: async ( folder ) => Boolean( await host.sites.findByFolder( folder ) ),
 			enabledTools: CLAUDE_ENABLED_TOOLS,
 			shellConfinement: CLAUDE_SHELL_CONFINEMENT,
 			navigationConfinement: CLAUDE_NAVIGATION_CONFINEMENT,
@@ -997,6 +1010,7 @@ export async function runClaudeTurn(
 				...nativeLaunchOptions( prepared, controller, {
 					owner: processOwner,
 					supervise: true,
+					additionalDirectories,
 					onRequested: () => {
 						spawnRequested = true;
 					},
@@ -1032,13 +1046,15 @@ export async function runClaudeTurn(
 				mcpServers: { studio: bridge.server },
 				// The hook and the permission request each apply the whole policy, so
 				// a native allow rule that skips one cannot skip the Studio guard.
-				canUseTool: async ( name, toolInput, { mcpServer, toolUseID, signal } ) =>
-					( await guard.authorizeToolUse(
+				canUseTool: async ( name, toolInput, { mcpServer, toolUseID, signal } ) => {
+					const decision = await guard.decideToolUse(
 						{ toolName: name, input: toolInput, toolUseId: toolUseID, mcpServer },
 						signal
-					) )
-						? { behavior: 'allow', updatedInput: toolInput }
-						: { behavior: 'deny', message: 'Tool unavailable.' },
+					);
+					return decision.allowed
+						? { behavior: 'allow', updatedInput: decision.input }
+						: { behavior: 'deny', message: decision.reason };
+				},
 				hooks: {
 					PreToolUse: [
 						{
@@ -1049,24 +1065,47 @@ export async function runClaudeTurn(
 							// asked about again.
 							timeout: CLAUDE_HOOK_TIMEOUT_SECONDS,
 							hooks: [
-								async ( hook, _toolUseId, context ) => ( {
-									hookSpecificOutput: {
-										hookEventName: 'PreToolUse',
-										permissionDecision:
-											hook.hook_event_name === 'PreToolUse' &&
-											( await guard.authorizeToolUse(
-												{
-													toolName: hook.tool_name,
-													input: hook.tool_input,
-													toolUseId: hook.tool_use_id,
-													mcpServer: hook.mcp_server,
-												},
-												context?.signal
-											) )
-												? 'allow'
-												: 'deny',
-									},
-								} ),
+								async ( hook, _toolUseId, context ) => {
+									if ( hook.hook_event_name !== 'PreToolUse' ) return { decision: 'block' };
+									const decision = await guard.decideToolUse(
+										{
+											toolName: hook.tool_name,
+											input: hook.tool_input,
+											toolUseId: hook.tool_use_id,
+											mcpServer: hook.mcp_server,
+										},
+										context?.signal
+									);
+									return {
+										hookSpecificOutput: decision.allowed
+											? {
+													hookEventName: 'PreToolUse',
+													permissionDecision: 'allow',
+													updatedInput: decision.input,
+											  }
+											: {
+													hookEventName: 'PreToolUse',
+													permissionDecision: 'deny',
+													permissionDecisionReason: decision.reason,
+											  },
+									};
+								},
+							],
+						},
+					],
+					PostToolUse: [
+						{
+							matcher: 'Write|Edit',
+							hooks: [
+								nativeFileResultHook(
+									guard,
+									host.ui,
+									target.environment === 'local' ? targetSite?.path : undefined,
+									prepared.configDirectory,
+									options.storeRoot,
+									( toolCallId ) =>
+										emit( { type: 'tool.result', runId, turnId, toolCallId, isError: false } )
+								),
 							],
 						},
 					],
@@ -1123,7 +1162,10 @@ export async function runClaudeTurn(
 					message.permissionMode !== 'default' ||
 					! isQualifiedClaudePlugins( message.plugins ) ||
 					message.plugin_errors?.length ||
-					message.tools.some( ( name ) => ! inventory.includes( name ) ) ||
+					! isRegisteredInventory(
+						message.tools.map( ( name ) => ( { name } ) ),
+						inventory
+					) ||
 					message.cwd !== prepared.cwd ||
 					message.apiKeySource !== 'none' ||
 					message.claude_code_version !== QUALIFIED_CLAUDE_CODE_VERSION ||

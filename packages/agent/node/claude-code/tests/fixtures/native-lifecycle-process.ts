@@ -2,6 +2,7 @@ import { once } from 'events';
 import path from 'path';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
 import { inspectClaudeExecutable } from '../../discovery';
+import { CLAUDE_EXECUTION_POLICY_REVISION } from '../../execution-policy';
 import { runClaudeTurn } from '../../runtime';
 import type { StudioAgentHost } from '../../../host';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
@@ -61,7 +62,7 @@ async function main() {
 			runId: 'run',
 			turnId: 'turn',
 			effort: 'medium',
-			permissionPolicyRevision: 1,
+			permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 			target: { environment: 'local' as const, siteId: 'site' },
 			selection: {
 				connectionId: 'offline',

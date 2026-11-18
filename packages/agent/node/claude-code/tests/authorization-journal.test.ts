@@ -460,11 +460,16 @@ describe( 'what the policy journals before an operation that does more than read
 						tool: name,
 						operationClass: CLAUDE_NATIVE_TOOL_RULES.get( name )!.operationClass,
 						target: local,
+						...( name === 'Write' || name === 'Edit'
+							? { filePath: path.join( fixture.site, 'readme.txt' ) }
+							: {} ),
 					},
 				} ),
 			] );
 			expect( JSON.stringify( fixture.journal ) ).not.toContain( 'secret' );
-			expect( JSON.stringify( fixture.journal ) ).not.toContain( fixture.site );
+			if ( name !== 'Write' && name !== 'Edit' ) {
+				expect( JSON.stringify( fixture.journal ) ).not.toContain( fixture.site );
+			}
 		}
 	);
 
@@ -725,7 +730,7 @@ describe( 'the journal entry that lets an operation run, on disk', () => {
 		expect(
 			await native.policy.authorizeToolUse( {
 				toolName: 'Write',
-				input: { file_path: path.join( native.site, 'readme.txt' ) },
+				input: { file_path: path.join( native.site, 'readme.txt' ), content: 'text' },
 				toolUseId: 'write',
 			} )
 		).toBe( false );
@@ -734,7 +739,7 @@ describe( 'the journal entry that lets an operation run, on disk', () => {
 		expect(
 			await synced.policy.authorizeToolUse( {
 				toolName: 'Write',
-				input: { file_path: path.join( synced.site, 'readme.txt' ) },
+				input: { file_path: path.join( synced.site, 'readme.txt' ), content: 'text' },
 				toolUseId: 'write',
 			} )
 		).toBe( true );

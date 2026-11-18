@@ -1,6 +1,15 @@
-import { lstat, realpath } from 'fs/promises';
+import { lstat, realpath, stat } from 'fs/promises';
 import path from 'path';
+import {
+	getAppConfigPath,
+	getCliConfigPath,
+	getConfigDirectory,
+	getSessionsDirectory,
+	getSharedConfigPath,
+} from '@studio/common/lib/well-known-paths';
+import { getFileWriteRefusal } from '../runtime/tool-safety';
 import { getSkillsRoot } from '../skills';
+import { getClaudeGlobalWorkspace, getClaudeSessionStoreRoot } from './sessions';
 
 export function isInside( root: string, candidate: string ): boolean {
 	const relative = path.relative( root, candidate );
@@ -12,14 +21,40 @@ export function isInside( root: string, candidate: string ): boolean {
 	);
 }
 
+const sensitiveNames = [
+	'.env',
+	'.env.*',
+	'wp-config.php',
+	'.ssh',
+	'database',
+	'*secret*',
+	'*credential*',
+	'*.pem',
+	'*.key',
+	'*.p12',
+	'*.pfx',
+];
+const sensitiveComponents = sensitiveNames.map(
+	( name ) =>
+		new RegExp( '^' + name.replace( /\./g, '\\.' ).replace( /\*/g, '[\\s\\S]*' ) + '$', 'i' )
+);
+
 function isSensitivePath( candidate: string ): boolean {
 	return candidate
 		.split( /[\\/]/ )
-		.some( ( part ) =>
-			/^(?:\.env(?:\..*)?|wp-config\.php|\.credentials(?:\..*)?|\.ssh|database|.*secret.*|.*credential.*|.*\.(?:pem|key|p12|pfx))$/i.test(
-				part
-			)
+		.some( ( part ) => sensitiveComponents.some( ( name ) => name.test( part ) ) );
+}
+
+/** Deny matching files and entire matching directories even on case-sensitive volumes. */
+export function getClaudeSensitiveReadDenyRules(): string[] {
+	return sensitiveNames.flatMap( ( name ) => {
+		const pattern = name.replace(
+			/[a-z]/g,
+			( letter ) => `[${ letter }${ letter.toUpperCase() }]`
 		);
+		const spellings = pattern.startsWith( '*' ) ? [ pattern, '.' + pattern ] : [ pattern ];
+		return spellings.flatMap( ( entry ) => [ `Read(**/${ entry })`, `Read(**/${ entry }/**)` ] );
+	} );
 }
 
 // Whether a path is one these checks judge: absolute, with no `..` segment by
@@ -144,6 +179,146 @@ export async function resolveAllowedNewPath(
 		! isSensitivePath( resolved )
 		? resolved
 		: undefined;
+}
+
+const nativeRefusals = {
+	path: 'Use an absolute path inside the conversation’s folders without a parent traversal.',
+	link: 'This link cannot be resolved inside the conversation’s folders. Use a file or folder directly inside them.',
+	hardLink:
+		'Choose a file with only one hard link. This file also has another name, which may be outside the conversation.',
+	windows:
+		'Choose a plain Windows filename without a reserved device name, stream, trailing dot or trailing space.',
+	protected:
+		'Choose a path outside native or Studio configuration and files that may hold credentials.',
+	folder: 'Choose an existing directory inside the conversation’s folders.',
+	file: 'Choose a regular file inside the conversation’s folders.',
+	core: 'A WordPress update replaces this Studio site’s core files. Make the change in wp-content/ in a theme or plugin.',
+};
+
+function isReservedWindowsPath( file: string ): boolean {
+	if (
+		/^[\\/]{2}[?.][\\/]/.test( file ) ||
+		file.replace( /^[a-z]:(?=[\\/])/i, '' ).includes( ':' )
+	)
+		return true;
+	return file
+		.split( /[\\/]/ )
+		.some(
+			( part ) =>
+				part !== '.' &&
+				part !== '..' &&
+				( /[. ]$/.test( part ) ||
+					/^(?:con|prn|aux|nul|clock\$|conin\$|conout\$|(?:com|lpt)[1-9¹²³]) *(?:\.|$)/i.test(
+						part
+					) )
+		);
+}
+
+/** Checks the destination used by the SDK, including a new file's nearest existing parent. */
+export async function checkClaudeNativePath(
+	tool: string,
+	file: string,
+	roots: readonly string[],
+	configDirectory: string,
+	isStudioSite: ( folder: string ) => Promise< boolean >,
+	workingDirectory?: string
+): Promise< { path: string } | { refusal: string } > {
+	const writes = tool === 'Write' || tool === 'Edit';
+	const requiresFile = writes || tool === 'Read';
+	const requiresFolder = tool === 'Glob' || tool === 'Ls';
+	const search = requiresFolder || tool === 'Grep';
+	if ( process.platform === 'win32' ) {
+		if ( isReservedWindowsPath( file ) ) return { refusal: nativeRefusals.windows };
+		// Resolving an unselected UNC share would initiate a network request.
+		if ( /^[\\/]/.test( file ) ) {
+			const selectedShare =
+				/^[\\/]{2}[^\\/]+[\\/][^\\/]+/.test( file ) &&
+				roots.some( ( root ) => isInside( root, file ) );
+			if ( ! selectedShare ) return { refusal: nativeRefusals.path };
+		}
+	}
+	if (
+		! path.isAbsolute( file ) &&
+		search &&
+		workingDirectory &&
+		path.isAbsolute( workingDirectory )
+	) {
+		if ( ! file || file.split( /[\\/]/ ).includes( '..' ) || /^[a-z]:/i.test( file ) )
+			return { refusal: nativeRefusals.path };
+		file = path.join( workingDirectory, file );
+	}
+	if ( ! isJudgeable( file ) ) return { refusal: nativeRefusals.path };
+	const resolved = await resolveDeepest( file );
+	if ( ! resolved ) return { refusal: nativeRefusals.link };
+	if ( ! roots.some( ( root ) => isInside( root, resolved ) ) ) {
+		return {
+			refusal: roots.some( ( root ) => isInside( root, file ) )
+				? nativeRefusals.link
+				: nativeRefusals.path,
+		};
+	}
+	if (
+		( requiresFile || tool === 'LsEntry' ) &&
+		roots.some( ( root ) => path.relative( root, resolved ) === '' )
+	)
+		return { refusal: nativeRefusals.file };
+	if (
+		isSensitivePath( file ) ||
+		isSensitivePath( resolved ) ||
+		isInside( configDirectory, resolved )
+	)
+		return { refusal: nativeRefusals.protected };
+	let info;
+	try {
+		info = await stat( resolved );
+	} catch ( error ) {
+		if ( ! writes || ! isMissing( error ) )
+			return { refusal: requiresFolder ? nativeRefusals.folder : nativeRefusals.file };
+	}
+	if ( requiresFolder && ! info?.isDirectory() ) return { refusal: nativeRefusals.folder };
+	if ( info && ! info.isFile() && ( requiresFile || ! info.isDirectory() ) )
+		return { refusal: nativeRefusals.file };
+	if ( info?.isFile() && info.nlink > 1 ) return { refusal: nativeRefusals.hardLink };
+	const recursive = ( tool === 'Glob' || tool === 'Grep' ) && info?.isDirectory();
+	if ( recursive && isInside( resolved, configDirectory ) )
+		return { refusal: nativeRefusals.protected };
+
+	const sessions = getSessionsDirectory();
+	const nativeStore = getClaudeSessionStoreRoot( sessions );
+	const global = getClaudeGlobalWorkspace( nativeStore );
+	const studioRoots = await Promise.all(
+		[ getConfigDirectory(), sessions, nativeStore ].map( resolveDeepest )
+	);
+	if (
+		studioRoots.some(
+			( root ) =>
+				! root || isInside( root, resolved ) || ( recursive && isInside( resolved, root ) )
+		)
+	) {
+		// The global conversation works in its own designated subfolder of Studio's store.
+		const canonicalGlobal = await resolveDeepest( global );
+		if (
+			! isInside( global, resolved ) ||
+			! roots.some( ( root ) => path.relative( root, global ) === '' ) ||
+			! canonicalGlobal ||
+			path.relative( global, canonicalGlobal ) !== ''
+		)
+			return { refusal: nativeRefusals.protected };
+	}
+	const stores = [ getSharedConfigPath(), getCliConfigPath(), getAppConfigPath() ];
+	const reach = writes ? roots : [ resolved ];
+	if (
+		! ( await Promise.all( stores.map( ( store ) => isOutsideReach( store, reach ) ) ) ).every(
+			Boolean
+		)
+	)
+		return { refusal: nativeRefusals.protected };
+	if (
+		writes &&
+		( await getFileWriteRefusal( tool, { path: resolved }, roots[ 0 ], isStudioSite ) )
+	)
+		return { refusal: nativeRefusals.core };
+	return { path: resolved };
 }
 
 /**

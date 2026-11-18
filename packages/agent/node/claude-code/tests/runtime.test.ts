@@ -18,9 +18,12 @@ import {
 	type FakeChild,
 } from '@studio/common/lib/tests/fixtures/owned-process-seams';
 import { describe, expect, it, vi } from 'vitest';
+import { CLAUDE_EXECUTION_POLICY_REVISION } from '../execution-policy';
+import { getClaudeSensitiveReadDenyRules } from '../local-paths';
 import { discoverClaudeModels, qualifyClaudeStartup } from '../runtime';
 import { reportedStudioServer } from './fixtures/studio-server';
 import type { ClaudeApprovalRequest } from '../execution-policy';
+import type { Options } from '@anthropic-ai/claude-agent-sdk/core';
 import type { OwnershipFailure, ProcessOwner } from '@studio/common/lib/owned-process';
 
 // Whether Studio's image service is available, as a turn asks: off unless a
@@ -40,6 +43,41 @@ const fakeIdentity = {
 	changed: '0',
 	sha256: '',
 };
+
+function reportedTools( options: Record< string, unknown > ) {
+	return [
+		...( options.tools as string[] ),
+		...reportedStudioServer( options ).tools.map( ( { name } ) => `mcp__studio__${ name }` ),
+	];
+}
+
+function nativeCallbacks( options: Record< string, unknown >, tool: string, toolUseId: string ) {
+	const { canUseTool, hooks } = options as Options;
+	const signal = new AbortController().signal;
+	const hookInput = {
+		session_id: 'native',
+		transcript_path: '',
+		cwd: String( options.cwd ),
+		tool_name: tool,
+		tool_use_id: toolUseId,
+	};
+	return {
+		permission: ( input: Record< string, unknown > ) =>
+			canUseTool!( tool, input, { toolUseID: toolUseId, requestId: toolUseId, signal } ),
+		before: ( input: Record< string, unknown > ) =>
+			hooks!.PreToolUse![ 0 ].hooks[ 0 ](
+				{ ...hookInput, hook_event_name: 'PreToolUse', tool_input: input },
+				toolUseId,
+				{ signal }
+			),
+		after: ( input: Record< string, unknown >, output: unknown ) =>
+			hooks!.PostToolUse![ 0 ].hooks[ 0 ](
+				{ ...hookInput, hook_event_name: 'PostToolUse', tool_input: input, tool_response: output },
+				toolUseId,
+				{ signal }
+			),
+	};
+}
 
 // A native executable on disk, so the identity check before every spawn holds.
 async function nativeExecutable( directory: string ) {
@@ -434,7 +472,7 @@ it.each( [ 'missing native reference', 'moved workspace' ] )(
 						revision: 1,
 					},
 					effort: 'medium',
-					permissionPolicyRevision: 1,
+					permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 					target: { environment: 'local' as const, siteId: 'site' },
 					workspace: {
 						conversationId: 'chat',
@@ -533,7 +571,7 @@ it( 'resumes the exact native session after restart with the next model and effo
 								session_id: sessionId,
 								permissionMode: 'default',
 								plugins: [],
-								tools: [ 'Read', 'mcp__studio__wp_cli' ],
+								tools: reportedTools( input.options ),
 								cwd: root,
 								apiKeySource: 'none',
 								claude_code_version: '2.1.319',
@@ -563,7 +601,7 @@ it( 'resumes the exact native session after restart with the next model and effo
 					runId: model,
 					turnId: model,
 					effort,
-					permissionPolicyRevision: 1,
+					permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 					target: { environment: 'local' as const, siteId: 'site' },
 					selection: {
 						connectionId: 'native',
@@ -674,7 +712,7 @@ it.each( [ true, false ] )(
 									session_id: sessionId,
 									permissionMode: 'default',
 									plugins: [],
-									tools: [ 'Read', 'mcp__studio__wp_cli' ],
+									tools: reportedTools( input.options ),
 									cwd: root,
 									apiKeySource: 'none',
 									claude_code_version: '2.1.319',
@@ -700,7 +738,7 @@ it.each( [ true, false ] )(
 					runId: 'run',
 					turnId: 'turn',
 					effort: 'medium',
-					permissionPolicyRevision: 1,
+					permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 					target: { environment: 'local' as const, siteId: 'site' },
 					selection: {
 						connectionId: 'native',
@@ -805,7 +843,7 @@ it( 'releases no prompt and reports startup failure even if closing the SDK thro
 			revision: 1,
 		},
 		effort: 'medium',
-		permissionPolicyRevision: 1,
+		permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 		target: { environment: 'local' as const, siteId: 'site' },
 		workspace: {
 			conversationId: 'chat',
@@ -878,7 +916,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 					revision: 1,
 				},
 				effort: 'medium',
-				permissionPolicyRevision: 1,
+				permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 				target: { environment: 'local' as const, siteId: 'site' },
 				workspace: {
 					conversationId: 'chat',
@@ -922,7 +960,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 								session_id: input.options.sessionId,
 								permissionMode: 'default',
 								plugins: [],
-								tools: [ 'Read', 'mcp__studio__wp_cli' ],
+								tools: reportedTools( input.options ),
 								cwd: root,
 								apiKeySource: 'none',
 								claude_code_version: '2.1.319',
@@ -1006,7 +1044,7 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 				cwd: root,
 				model: 'sonnet',
 				effort: 'medium',
-				tools: [ 'Read' ],
+				tools: expect.arrayContaining( [ 'Read', 'Grep', 'Glob', 'Write', 'Edit' ] ),
 				permissionMode: 'default',
 				settingSources: [],
 			} );
@@ -1053,7 +1091,7 @@ it( 'denies native tools until system init has been verified (mock SDK)', async 
 				revision: 1,
 			},
 			effort: 'medium',
-			permissionPolicyRevision: 1,
+			permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 			target: { environment: 'local' as const, siteId: 'site' },
 			workspace: {
 				conversationId: 'chat',
@@ -1287,6 +1325,7 @@ function fakeNativeTurn(
 	cwd: string,
 	{
 		onTurn = async () => {},
+		inventory = reportedTools,
 		account = () => ( {
 			email: 'user@example.com',
 			subscriptionType: 'max',
@@ -1304,6 +1343,7 @@ function fakeNativeTurn(
 		],
 	}: {
 		onTurn?: ( options: Record< string, unknown > ) => Promise< void >;
+		inventory?: ( options: Record< string, unknown > ) => string[];
 		account?: () => Record< string, string >;
 		projects?: string;
 		answer?: ( sessionId: unknown ) => Array< Record< string, unknown > >;
@@ -1340,7 +1380,7 @@ function fakeNativeTurn(
 							session_id: sessionId,
 							permissionMode: 'default',
 							plugins: [],
-							tools: [ 'Read', 'mcp__studio__wp_cli' ],
+							tools: inventory( input.options ),
 							cwd,
 							apiKeySource: 'none',
 							claude_code_version: '2.1.319',
@@ -1371,10 +1411,18 @@ it( 'runs a global conversation only in the dedicated global workspace (mock SDK
 		const elsewhere = path.join( root, 'elsewhere' );
 		await fs.mkdir( elsewhere );
 		const host = createFakeHost();
-		host.sites.all = async () => [];
+		host.sites.all = async () => [
+			{
+				id: 'selected',
+				name: 'Selected',
+				path: elsewhere,
+				url: 'http://localhost',
+				phpVersion: '8.4',
+			},
+		];
 		const native = await nativeExecutable( root );
 		const query = fakeNativeTurn( workspace );
-		const run = async ( conversationId: string, workingDirectory: string ) => {
+		const run = async ( conversationId: string, workingDirectory: string, siteId?: string ) => {
 			const events: Array< { type: string; outcome?: unknown } > = [];
 			await runClaudeTurn(
 				{
@@ -1382,14 +1430,14 @@ it( 'runs a global conversation only in the dedicated global workspace (mock SDK
 					runId: conversationId,
 					turnId: conversationId,
 					effort: 'medium',
-					permissionPolicyRevision: 1,
+					permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 					selection: {
 						connectionId: 'native',
 						model: { providerId: 'claude-code', modelId: 'sonnet' },
 						revision: 1,
 					},
 					workspace: { conversationId, siteId: null, workingDirectory, configDirectory: root },
-					target: { environment: 'global' },
+					target: siteId ? { environment: 'local', siteId } : { environment: 'global' },
 				},
 				host,
 				{
@@ -1421,11 +1469,28 @@ it( 'runs a global conversation only in the dedicated global workspace (mock SDK
 			type: 'turn.terminal',
 			outcome: { status: 'success' },
 		} );
-		expect( query.mock.calls[ 0 ][ 0 ].options ).toMatchObject( { cwd: workspace } );
+		expect( query.mock.calls[ 0 ][ 0 ].options ).toMatchObject( {
+			cwd: workspace,
+			settings: {
+				permissions: { workingDirectoriesAsGiven: [ workspace ], additionalDirectories: [] },
+			},
+		} );
+		expect( ( await run( 'selected-site', workspace, 'selected' ) ).at( -1 ) ).toMatchObject( {
+			outcome: { status: 'success' },
+		} );
+		expect( query.mock.calls[ 1 ][ 0 ].options ).toMatchObject( {
+			cwd: workspace,
+			settings: {
+				permissions: {
+					workingDirectoriesAsGiven: [ workspace, elsewhere ],
+					additionalDirectories: [ elsewhere ],
+				},
+			},
+		} );
 		expect( await run( 'moved', elsewhere ) ).toMatchObject( [
 			{ type: 'turn.terminal', outcome: { code: 'rebind_required' } },
 		] );
-		expect( query ).toHaveBeenCalledOnce();
+		expect( query ).toHaveBeenCalledTimes( 2 );
 	} finally {
 		await fs.rm( root, { recursive: true, force: true } );
 	}
@@ -1471,10 +1536,15 @@ it( 'routes the SDK hook and native permission request through the execution pol
 				const permission = options.canUseTool as Permission;
 				const signal = new AbortController().signal;
 				decisions.push( ( await hook( 'Read', readme ) ).hookSpecificOutput );
-				decisions.push( ( await permission( 'Read', readme, { signal } ) ).behavior );
+				decisions.push(
+					( await permission( 'Read', readme, { signal, toolUseID: 'Read' } ) ).behavior
+				);
 				decisions.push(
 					( await hook( 'Write', { ...readme, content: 'changed' } ) ).hookSpecificOutput
 				);
+				const invalid = { ...readme, content: 'changed', ignored: true };
+				decisions.push( ( await hook( 'Write', invalid ) ).hookSpecificOutput );
+				decisions.push( await permission( 'Write', invalid, { signal, toolUseID: 'Write' } ) );
 				decisions.push(
 					(
 						await permission(
@@ -1497,7 +1567,7 @@ it( 'routes the SDK hook and native permission request through the execution pol
 				runId: 'run',
 				turnId: 'turn',
 				effort: 'medium',
-				permissionPolicyRevision: 1,
+				permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 				selection: {
 					connectionId: 'native',
 					model: { providerId: 'claude-code', modelId: 'sonnet' },
@@ -1533,7 +1603,15 @@ it( 'routes the SDK hook and native permission request through the execution pol
 		);
 		const allow = { hookEventName: 'PreToolUse', permissionDecision: 'allow' };
 		const deny = { hookEventName: 'PreToolUse', permissionDecision: 'deny' };
-		expect( decisions ).toEqual( [ allow, 'allow', deny, 'deny', deny ] );
+		expect( decisions ).toMatchObject( [
+			allow,
+			'allow',
+			allow,
+			{ ...deny, permissionDecisionReason: expect.stringMatching( /field|argument|input/i ) },
+			{ behavior: 'deny', message: expect.stringMatching( /field|argument|input/i ) },
+			'deny',
+			deny,
+		] );
 	} finally {
 		await fs.rm( root, { recursive: true, force: true } );
 	}
@@ -1571,7 +1649,7 @@ function turnSnapshot( root: string, config: string, id: string, revision = 1 ) 
 		runId: id,
 		turnId: id,
 		effort: 'medium',
-		permissionPolicyRevision: 1,
+		permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 		selection: {
 			connectionId: 'native',
 			model: { providerId: 'claude-code' as const, modelId: 'sonnet' },
@@ -2135,7 +2213,7 @@ function spawningNativeTurn(
 							session_id: options.sessionId,
 							permissionMode: 'default',
 							plugins: [],
-							tools: [ 'Read', 'mcp__studio__wp_cli' ],
+							tools: reportedTools( input.options ),
 							cwd,
 							apiKeySource: 'none',
 							claude_code_version: '2.1.319',
@@ -3485,6 +3563,188 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 			} );
 			return fixture;
 		}
+
+		it.each( [ 'ordinary', 'settled', 'allowed', 'denied' ] as const )(
+			'binds both native file callbacks to one decision and journals the path before a %s write',
+			async ( state ) => {
+				const fixture = await siteFixture( 'claude-native-files-' );
+				try {
+					const runtime = await import( '../runtime' );
+					const { createNativeSessionStore } = await import( '../sessions' );
+					const store = createNativeSessionStore( fixture.storeRoot );
+					if ( state !== 'ordinary' )
+						await recovered( fixture, state === 'settled' ? [] : [ uncertainStart ] );
+					const approve = vi.fn(
+						async (): Promise< 'allow' | 'deny' > => ( state === 'denied' ? 'deny' : 'allow' )
+					);
+					const file = path.join( fixture.root, 'readme.txt' );
+					const decisions: unknown[] = [];
+					const records: unknown[] = [];
+					const query = fakeNativeTurn( fixture.root, {
+						onTurn: async ( options ) => {
+							for ( const name of [ 'Write', 'Edit' ] ) {
+								const calls = nativeCallbacks( options, name, name );
+								const args =
+									name === 'Write'
+										? { file_path: file, content: 'private text' }
+										: { file_path: file, old_string: 'old', new_string: 'private text' };
+								if ( name === 'Write' )
+									decisions.push( await calls.before( args ), await calls.permission( args ) );
+								else decisions.push( await calls.permission( args ), await calls.before( args ) );
+								records.push(
+									...( await store.journal( 'chat', 'next' ).read() ).filter(
+										( e ) => e.type === 'operation.authorized' && e.operation.tool === name
+									)
+								);
+							}
+						},
+					} );
+					const events = await turn( runtime, fixture, 'next', query, { approve } );
+					expect( events.at( -1 ) ).toMatchObject( { outcome: { status: 'success' } } );
+					const behavior = state === 'denied' ? 'deny' : 'allow';
+					const hook = { hookSpecificOutput: { permissionDecision: behavior } };
+					expect( decisions ).toMatchObject( [ hook, { behavior }, { behavior }, hook ] );
+					const asked = state === 'allowed' || state === 'denied';
+					expect( approve ).toHaveBeenCalledTimes( asked ? 2 : 0 );
+					expect( records ).toMatchObject(
+						state === 'denied'
+							? []
+							: [ 'Write', 'Edit' ].map( ( tool ) => ( {
+									operation: { tool, operationClass: 'local-change', filePath: file },
+							  } ) )
+					);
+					expect( JSON.stringify( records ) ).not.toContain( 'private text' );
+				} finally {
+					await fixture.cleanup();
+				}
+			}
+		);
+
+		it.each( [ true, false ] )(
+			'offers a DESIGN.md preview after an admitted native change with UI %s',
+			async ( withUi ) => {
+				const fixture = await siteFixture( 'claude-design-offer-' );
+				try {
+					const { link, mkdir, symlink } = await import( 'fs/promises' );
+					const runtime = await import( '../runtime' );
+					const { DESIGN_SYSTEM_PREVIEW_PATH } = await import( '../../../protocol/chat-artifacts' );
+					await mkdir( path.join( fixture.root, 'wp-content' ) );
+					const block = path.join( fixture.root, 'wp-includes', 'blocks', 'group' );
+					await mkdir( block, { recursive: true } );
+					await writeFile(
+						path.join( block, 'block.json' ),
+						'{"attributes":{"layout":{"type":"object"}}}'
+					);
+					const outside = path.join( fixture.config, 'block-metadata' );
+					await mkdir( outside );
+					await writeFile(
+						path.join( outside, 'block.json' ),
+						'{"attributes":{"privateAttribute":{"type":"string"}}}'
+					);
+					await symlink( outside, path.join( block, '..', 'quote' ), 'junction' );
+					const linked = path.join( block, '..', 'verse' );
+					await mkdir( linked );
+					await link( path.join( outside, 'block.json' ), path.join( linked, 'block.json' ) );
+					const showArtifact = vi.fn();
+					const reloadPreview = vi.fn();
+					if ( withUi ) fixture.host.ui = { showArtifact, reloadPreview };
+					const results: unknown[] = [];
+					const file = path.join( fixture.root, 'DESIGN.md' );
+					await writeFile( file, 'old' );
+					const query = fakeNativeTurn( fixture.root, {
+						onTurn: async ( options ) => {
+							const text = '<!-- wp:group /--><!-- wp:quote /--><!-- wp:verse /-->';
+							for ( const [ name, staged ] of [
+								[ 'Write', false ],
+								[ 'Edit', false ],
+								[ 'Write', true ],
+							] as const ) {
+								const calls = nativeCallbacks( options, name, name + staged );
+								const args =
+									name === 'Write'
+										? { file_path: file, content: text }
+										: { file_path: file, old_string: 'old', new_string: text };
+								const output =
+									name === 'Write'
+										? { filePath: file, type: 'update', content: text, staged }
+										: { filePath: file, oldString: 'old', newString: text, staged };
+								await calls.permission( args );
+								results.push(
+									await calls.after( args, output ),
+									await calls.after( args, output )
+								);
+							}
+							const unapproved = nativeCallbacks( options, 'Write', 'unapproved' );
+							results.push(
+								await unapproved.after(
+									{ file_path: file, content: text },
+									{ filePath: file, type: 'update', content: text }
+								)
+							);
+						},
+					} );
+					const events = await turn( runtime, fixture, 'next', query );
+					expect( events.at( -1 ) ).toMatchObject( { outcome: { status: 'success' } } );
+					expect( events.filter( ( event ) => event.type === 'tool.result' ) ).toHaveLength( 3 );
+					expect( results ).toHaveLength( 7 );
+					expect( JSON.stringify( results[ 0 ] ) ).toContain( 'core/group settings' );
+					expect( JSON.stringify( results ) ).not.toContain( 'privateAttribute' );
+					expect( JSON.stringify( results[ 2 ] ) ).not.toContain( 'core/group settings' );
+					for ( const index of [ 0, 2 ] )
+						expect( JSON.stringify( results[ index ] ).includes( '[Design System]' ) ).toBe(
+							withUi
+						);
+					for ( const index of [ 1, 3, 4, 5, 6 ] ) expect( results[ index ] ).toEqual( {} );
+					expect( showArtifact ).toHaveBeenCalledTimes( withUi ? 2 : 0 );
+					if ( withUi )
+						expect( showArtifact ).toHaveBeenCalledWith(
+							expect.objectContaining( {
+								widgets: [
+									{ type: 'site-preview', widgetProps: { path: DESIGN_SYSTEM_PREVIEW_PATH } },
+								],
+							} )
+						);
+					expect( reloadPreview ).not.toHaveBeenCalled();
+				} finally {
+					await fixture.cleanup();
+				}
+			}
+		);
+
+		it( 'rejects a native startup missing an offered file tool', async () => {
+			const fixture = await siteFixture( 'claude-missing-native-' );
+			try {
+				const runtime = await import( '../runtime' );
+				const query = fakeNativeTurn( fixture.root, {
+					inventory: ( options ) => reportedTools( options ).filter( ( name ) => name !== 'Edit' ),
+				} );
+				const events = await turn( runtime, fixture, 'next', query );
+				expect( events.at( -1 ) ).toMatchObject( {
+					type: 'turn.terminal',
+					outcome: { status: 'error' },
+				} );
+				expect( optionsOf( query ) ).toMatchObject( {
+					settings: {
+						permissions: {
+							deny: getClaudeSensitiveReadDenyRules(),
+							blockReadsOutsideWorkingDirectories: true,
+							blockWritesOutsideWorkingDirectories: true,
+							workingDirectoriesAsGiven: [ fixture.root ],
+							additionalDirectories: [],
+						},
+					},
+				} );
+				expect( ( optionsOf( query ).tools as string[] ).slice().sort() ).toEqual( [
+					'Edit',
+					'Glob',
+					'Grep',
+					'Read',
+					'Write',
+				] );
+			} finally {
+				await fixture.cleanup();
+			}
+		} );
 
 		it( 'asks before an unprompted change, saying an interrupted attempt may already have taken effect, and asks nothing in the turn after', async () => {
 			const fixture = await siteFixture( 'claude-gate-uncertain-' );

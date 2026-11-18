@@ -6,6 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 // eslint-disable-next-line import-x/no-unresolved
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { prepareProcessOwner } from '@studio/common/lib/owned-process';
+import { CLAUDE_EXECUTION_POLICY_REVISION } from '../../execution-policy';
 import { runClaudeTurn } from '../../runtime';
 import { reportedStudioServer } from './studio-server';
 import type { StudioAgentHost } from '../../../host';
@@ -88,7 +89,7 @@ async function main() {
 			runId: 'run',
 			turnId: 'turn',
 			effort: 'medium',
-			permissionPolicyRevision: 1,
+			permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
 			target: { environment: 'local' as const, siteId: 'site' },
 			selection: {
 				connectionId: 'offline',
@@ -193,7 +194,12 @@ async function main() {
 								session_id: options.sessionId,
 								permissionMode: 'default',
 								plugins: [],
-								tools: [ 'Read', 'mcp__studio__wp_cli' ],
+								tools: [
+									...( Array.isArray( options.tools ) ? options.tools : [] ),
+									...reportedStudioServer( options ).tools.map(
+										( tool ) => `mcp__studio__${ tool.name }`
+									),
+								],
 								cwd: site,
 								apiKeySource: 'none',
 								claude_code_version: '2.1.319',

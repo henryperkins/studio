@@ -74,6 +74,7 @@ const throughHost = {
 };
 // The tools this build qualifies, each with the channels it declares.
 const QUALIFIED: Record< string, Record< string, unknown > > = {
+	Ls: { ...noChannels, readsLocalFiles: [ 'directoryListing' ] },
 	wp_cli: { ...noChannels, runsWpCli: [ 'site', 'host' ], callsHostOperation: [ 'host' ] },
 	site_info: throughHost,
 	site_start: throughHost,
@@ -858,7 +859,7 @@ describe( 'Claude Studio tool qualification', () => {
 			claudeStudioTools( all, guarded( targetOrigin ), targetOrigin ),
 			claudeNativeTools( all, { mode: 'none' }, path.resolve( 'workspace' ) ),
 		];
-		const unconfinedNative = [ 'Read', 'Grep', 'Glob', 'LS', 'Write', 'Edit', 'MultiEdit' ];
+		const unconfinedNative = [ 'Read', 'Grep', 'Glob', 'Write', 'Edit', 'MultiEdit' ];
 		expect( enabledNow() ).toEqual( [ qualifiedTools(), unconfinedNative ] );
 		expect( rule( 'pick_design' ).qualification ).toEqual( { qualified: false } );
 

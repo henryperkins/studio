@@ -14,6 +14,7 @@ import { studioToolDefinitions } from '../../tools';
 import { createAskUserQuestionTool } from '../../tools/ask-user-question';
 import { createPresentDesignOptionsTool } from '../../tools/present-design-options';
 import { createSkillTool } from '../../tools/skill';
+import { createClaudeDirectoryListing } from '../directory-listing';
 import { CLAUDE_EXECUTION_POLICY_REVISION } from '../execution-policy';
 import {
 	CLAUDE_ACCOUNT_RECHECK_MS,
@@ -105,7 +106,10 @@ describe( 'Claude operation classes', () => {
 			if ( destructiveHint || ( openWorldHint && ! readOnlyHint ) )
 				expect( requiresClaudeApproval( rule!.operationClass ), definition.name ).toBe( true );
 		}
-		const names = new Set( definitions.map( ( definition ) => definition.name ) );
+		const names = new Set( [
+			...definitions.map( ( definition ) => definition.name ),
+			createClaudeDirectoryListing().name,
+		] );
 		for ( const name of CLAUDE_STUDIO_TOOL_RULES.keys() )
 			expect( names.has( name ) || ( name === 'Skill' && ! skill ), name ).toBe( true );
 	} );
@@ -142,9 +146,7 @@ describe( 'Claude operation classes', () => {
 		expect( CLAUDE_STUDIO_TOOL_RULES.get( 'site_push' )?.operationClass ).toBe(
 			'remote-overwrite'
 		);
-		// Native tools are those the proof of concept ran; Studio tools are enabled
-		// as `tool-qualification.test.ts` qualifies them.
-		expect( CLAUDE_ENABLED_TOOLS.native ).toEqual( [ 'Read' ] );
+		expect( CLAUDE_ENABLED_TOOLS.native ).toEqual( [ 'Read', 'Grep', 'Glob', 'Write', 'Edit' ] );
 	} );
 
 	it( 'classifies a WordPress.com request by its method, never by its annotation alone', () => {
@@ -171,7 +173,7 @@ describe( 'Claude tool use at the SDK hook and native permission request', () =>
 			[ 'Read', { file_path: path.join( site, '..', 'config' ) } ],
 			[ 'Read', { file_path: 'readme.txt' } ],
 			[ 'Read', 'readme.txt' ],
-			[ 'Write', { file_path: path.join( site, 'readme.txt' ), content: 'changed' } ],
+			[ 'Write', { file_path: path.join( site, '.env' ), content: 'changed' } ],
 			[ 'Bash', { command: 'echo hi' } ],
 			[ 'WebFetch', { url: 'https://example.com' } ],
 			[ 'Task', { prompt: 'anything' } ],
@@ -652,7 +654,11 @@ describe( 'Claude targets', () => {
 		await writeFile( path.join( site, 'readme.txt' ), 'fixture' );
 		await writeFile( path.join( parent, 'elsewhere.txt' ), 'fixture' );
 		const read = ( file: string ) =>
-			policy.authorizeToolUse( { toolName: 'Read', input: { file_path: file }, toolUseId: 'use' } );
+			policy.authorizeToolUse( {
+				toolName: 'Read',
+				input: { file_path: file },
+				toolUseId: randomUUID(),
+			} );
 		expect( await read( path.join( parent, 'workspace', 'notes.md' ) ) ).toBe( true );
 		expect( await read( path.join( site, 'readme.txt' ) ) ).toBe( true );
 		expect( await read( path.join( parent, 'elsewhere.txt' ) ) ).toBe( false );
@@ -865,7 +871,7 @@ describe( 'Claude shell confinement', () => {
 		const workspace = unconfined.site;
 		expect(
 			claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, workspace )
-		).toEqual( [ 'Read' ] );
+		).toEqual( [ 'Read', 'Grep', 'Glob', 'Write', 'Edit' ] );
 		expect( claudeNativeTools( shell, { mode: 'none' }, workspace ) ).toEqual( [ 'Read' ] );
 		expect( await unconfined.policy.authorizeToolUse( echo( 'use' ) ) ).toBe( false );
 		expect( unconfined.context.approve ).not.toHaveBeenCalled();
@@ -1034,13 +1040,13 @@ describe( 'Claude shell confinement', () => {
 			);
 	} );
 
-	it( 'in approval-only mode asks for every command, says it is unconfined, and never reuses an answer', async () => {
+	it( 'in approval-only mode asks for each command use and shares its answer across callbacks', async () => {
 		const { policy, context, events } = await setup( () => ( {
 			enabledTools: shell,
 			shellConfinement: { mode: 'approval-only' },
 		} ) );
 		expect( await policy.authorizeToolUse( echo( 'use-1' ) ) ).toBe( true );
-		expect( await policy.authorizeToolUse( echo( 'use-1' ) ) ).toBe( false );
+		expect( await policy.authorizeToolUse( echo( 'use-1' ) ) ).toBe( true );
 		expect( await policy.authorizeToolUse( echo( 'use-2' ) ) ).toBe( true );
 		expect( await policy.authorizeToolUse( echo() ) ).toBe( false );
 		expect( context.approve ).toHaveBeenCalledTimes( 2 );

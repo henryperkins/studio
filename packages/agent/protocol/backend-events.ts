@@ -178,13 +178,19 @@ export interface ClaudeRecoveryJournalEvent extends BackendTurnIds {
  * operation it reaches, so a recovery can name it if the turn ends before its
  * result is recorded. Journal-only and display-safe: the tool, its class, the
  * turn's target and the description an approval shows; never the operation's
- * arguments, file contents, paths or account details.
+ * arguments, file contents or account details. Native Write and Edit also
+ * record their checked destination.
  */
 export interface ClaudeOperationJournalEvent extends BackendTurnIds, ToolCall {
 	type: 'operation.authorized';
 	/** The approval it runs under, when it needed one. */
 	requestId?: string;
-	operation: { tool: string; operationClass: ClaudeOperationClass; target: ClaudeStudioTarget };
+	operation: {
+		tool: string;
+		operationClass: ClaudeOperationClass;
+		target: ClaudeStudioTarget;
+		filePath?: string;
+	};
 	description: string;
 }
 

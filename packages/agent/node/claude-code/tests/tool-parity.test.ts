@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { BUILTIN_TOOL_NAMES } from '@anthropic-ai/claude-agent-sdk/core';
 import { SessionManager } from '@earendil-works/pi-coding-agent';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
@@ -39,7 +40,7 @@ const STEPS = [ 'C2b', 'C2c' ] as const;
 type Step = ( typeof STEPS )[ number ];
 type ClaudeStatus =
 	// Bridged from the registry and qualified by the policy.
-	| { status: 'bridged' }
+	| { status: 'bridged'; piBuiltin?: true }
 	// Claude Code's own tool of that name stands for it, and the policy enables it.
 	| { status: 'native'; native: string }
 	// Bridged and qualified like `bridged`, but registered only for a host with
@@ -51,7 +52,6 @@ type ClaudeStatus =
 	| { status: 'unqualified'; step: Step; reason: string; native?: string };
 
 const BROWSER = 'Drives a browser; needs the navigation guard (contract revision 2)';
-const NATIVE = 'Native equivalent not qualified: argument and write-path adaptation';
 
 const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	wp_cli: { status: 'bridged' },
@@ -108,17 +108,17 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 		reason: 'Skills and their capability gates are not bridged yet',
 	},
 	Read: { status: 'native', native: 'Read' },
-	Write: { status: 'unqualified', step: 'C2b', reason: NATIVE, native: 'Write' },
-	Edit: { status: 'unqualified', step: 'C2b', reason: NATIVE, native: 'Edit' },
+	Write: { status: 'native', native: 'Write' },
+	Edit: { status: 'native', native: 'Edit' },
 	Bash: {
 		status: 'unqualified',
 		step: 'C2b',
 		reason: 'Needs a verified shell confinement',
 		native: 'Bash',
 	},
-	Grep: { status: 'unqualified', step: 'C2b', reason: NATIVE, native: 'Grep' },
-	Glob: { status: 'unqualified', step: 'C2b', reason: NATIVE, native: 'Glob' },
-	Ls: { status: 'unqualified', step: 'C2b', reason: NATIVE, native: 'LS' },
+	Grep: { status: 'native', native: 'Grep' },
+	Glob: { status: 'native', native: 'Glob' },
+	Ls: { status: 'bridged', piBuiltin: true },
 };
 
 // The host capabilities that change which tools a Pi turn registers.
@@ -378,6 +378,7 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 					expect( isQualifiedStudioRule( rule ), name ).toBe( true );
 					break;
 				case 'native':
+					expect( BUILTIN_TOOL_NAMES, name ).toContain( status.native );
 					expect( CLAUDE_NATIVE_TOOL_RULES.has( status.native ), name ).toBe( true );
 					expect( native, name ).toContain( status.native );
 					break;
@@ -441,7 +442,9 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 		] );
 		// Anything else a Pi turn registers is one of pi's own file tools.
 		const piFileTools = statuses().flatMap( ( [ name, status ] ) =>
-			'native' in status && status.native ? [ name ] : []
+			( 'native' in status && status.native ) || ( status.status === 'bridged' && status.piBuiltin )
+				? [ name ]
+				: []
 		);
 		expect( registered().filter( ( name ) => ! studioDefined.has( name ) ) ).toEqual(
 			piFileTools.sort()

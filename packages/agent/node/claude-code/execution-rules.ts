@@ -1,7 +1,9 @@
 import { readdirSync } from 'fs';
 import path from 'path';
 import { getSharedConfigPath } from '@studio/common/lib/well-known-paths';
+import { z } from 'zod';
 import { IMAGE_NOT_GENERATED_CANCELLED } from '../image-generation';
+import { getPayloadLimitViolation } from '../runtime/tool-safety';
 import { getSkillPath } from '../skills';
 import { createPreviewTool } from '../tools/create-preview';
 import { createSiteTool } from '../tools/create-site';
@@ -38,6 +40,13 @@ import { classifyWpCliArgs, wpCliRouteCommands } from './wp-cli-rules';
 import { wpcomBodyFiles, wpcomScope } from './wpcom-rules';
 import type { SandboxSettings } from '@anthropic-ai/claude-agent-sdk/core';
 import type {
+	FileEditInput,
+	FileReadInput,
+	FileWriteInput,
+	GlobInput,
+	GrepInput,
+} from '@anthropic-ai/claude-agent-sdk/sdk-tools';
+import type {
 	ClaudeHostOperationName,
 	ClaudeOperationClass,
 	ClaudeStudioTarget,
@@ -57,7 +66,7 @@ export interface ClaudeEnabledTools {
  * qualified.
  */
 export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
-	native: Object.freeze( [ 'Read' ] ),
+	native: Object.freeze( [ 'Read', 'Grep', 'Glob', 'Write', 'Edit' ] ),
 	studio: Object.freeze( [
 		runWpCliTool.name,
 		getSiteInfoTool.name,
@@ -80,6 +89,7 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		createSiteTool.name,
 		sendFeedbackTool.name,
 		generateImagesTool.name,
+		'Ls',
 	] ),
 } );
 
@@ -331,7 +341,8 @@ export type ClaudeChannelBinding =
 	| 'host'
 	| 'bundled'
 	| 'config'
-	| 'payloads';
+	| 'payloads'
+	| 'directoryListing';
 
 /** For every channel, `false` when the implementation does not use it, or what bounds it. */
 export type ClaudeToolChannelDeclaration = {
@@ -357,6 +368,8 @@ export interface ClaudeStudioToolRule {
 	readonly operationClass: ClaudeOperationClass;
 	/** Narrows the class from a call's arguments; undefined denies the call. */
 	readonly classify?: ( args: unknown ) => ClaudeOperationClass | undefined;
+	/** Studio's directory listing checks the directory and each returned entry. */
+	readonly directoryListing?: true;
 	/**
 	 * The local site a call names. It must resolve to the turn's target site; a
 	 * missing reference denies the call.
@@ -666,6 +679,13 @@ export function isLocalHostname( hostname: string ): boolean {
 // Only a qualified tool can be enabled. The rules of the unqualified tools are
 // where each one's qualification starts, not a claim that they are complete.
 export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule > = ruleTable( [
+	[
+		'Ls',
+		qualified(
+			studioRule( 'read', { directoryListing: true } ),
+			using( { readsLocalFiles: [ 'directoryListing' ] } )
+		),
+	],
 	[
 		createSiteTool.name,
 		// It creates a site with the CLI's own command, in Studio's sites folder
@@ -1067,8 +1087,6 @@ export interface ClaudeNativeToolRule {
 		readonly required: boolean;
 		readonly allowRoot: boolean;
 	};
-	/** Input fields holding a file pattern, which must stay under the searched folder. */
-	readonly patterns?: readonly string[];
 	/** Rejects input the policy cannot bound. */
 	readonly accepts?: ( input: Record< string, unknown > ) => boolean;
 	/** Runs an unstructured command; it can be enabled only under a verified confinement. */
@@ -1153,14 +1171,109 @@ export function isContainedPattern( pattern: unknown ): boolean {
 const filePath = { field: 'file_path', required: true, allowRoot: false } as const;
 const searchPath = { field: 'path', required: false, allowRoot: true } as const;
 
+// The SDK's sdk-tools.d.ts defines the file operations. It has no native LS.
+const globPattern = z.string().refine( isContainedPattern );
+const count = z.number().int().nonnegative().optional();
+const read = z.strictObject( {
+	file_path: z.string(),
+	offset: count,
+	limit: count,
+	// The runtime interprets the page selection within the already checked file.
+	pages: z.string().optional(),
+	allow_large: z.boolean().optional(),
+} satisfies Record< keyof FileReadInput, z.ZodType > );
+const grep = z.strictObject( {
+	pattern: z.string(),
+	path: z.string().optional(),
+	glob: globPattern.optional(),
+	type: z
+		.string()
+		.regex( /^[a-zA-Z0-9][a-zA-Z0-9_+.-]*$/ )
+		.optional(),
+	output_mode: z.enum( [ 'content', 'files_with_matches', 'count' ] ).optional(),
+	'-B': count,
+	'-A': count,
+	'-C': count,
+	context: count,
+	head_limit: count,
+	offset: count,
+	'-n': z.boolean().optional(),
+	'-i': z.boolean().optional(),
+	'-o': z.boolean().optional(),
+	multiline: z.boolean().optional(),
+} satisfies Record< keyof GrepInput, z.ZodType > );
+const glob = z.strictObject( {
+	pattern: globPattern,
+	path: z.string().optional(),
+} satisfies Record< keyof GlobInput, z.ZodType > );
+const write = z.strictObject( {
+	file_path: z.string(),
+	content: z.string(),
+} satisfies Record< keyof FileWriteInput, z.ZodType > );
+const edit = z
+	.strictObject( {
+		file_path: z.string(),
+		old_string: z.string(),
+		new_string: z.string(),
+		replace_all: z.boolean().optional(),
+	} satisfies Record< keyof FileEditInput, z.ZodType > )
+	.refine( ( input ) => input.old_string !== input.new_string );
+
+export function getClaudeNativePayloadRefusal(
+	toolName: string,
+	input: Record< string, unknown >
+): string | undefined {
+	if ( toolName !== 'Write' && toolName !== 'Edit' ) return;
+	const payload =
+		toolName === 'Write'
+			? input
+			: { edits: [ { oldText: input.old_string, newText: input.new_string } ] };
+	if ( getPayloadLimitViolation( toolName, payload ) )
+		return 'Split the file change into smaller Write or Edit calls within Studio’s 14 KiB limit.';
+}
+
 export const CLAUDE_NATIVE_TOOL_RULES: ReadonlyMap< string, ClaudeNativeToolRule > =
 	ruleTable< ClaudeNativeToolRule >( [
-		[ 'Read', { operationClass: 'read', path: filePath } ],
-		[ 'Grep', { operationClass: 'read', path: searchPath, patterns: [ 'glob' ] } ],
-		[ 'Glob', { operationClass: 'read', path: searchPath, patterns: [ 'pattern' ] } ],
-		[ 'LS', { operationClass: 'read', path: { ...searchPath, required: true } } ],
-		[ 'Write', { operationClass: 'local-change', path: filePath } ],
-		[ 'Edit', { operationClass: 'local-change', path: filePath } ],
+		[
+			'Read',
+			{
+				operationClass: 'read',
+				path: filePath,
+				accepts: ( input ) => read.safeParse( input ).success,
+			},
+		],
+		[
+			'Grep',
+			{
+				operationClass: 'read',
+				path: searchPath,
+				accepts: ( input ) => grep.safeParse( input ).success,
+			},
+		],
+		[
+			'Glob',
+			{
+				operationClass: 'read',
+				path: searchPath,
+				accepts: ( input ) => glob.safeParse( input ).success,
+			},
+		],
+		[
+			'Write',
+			{
+				operationClass: 'local-change',
+				path: filePath,
+				accepts: ( input ) => write.safeParse( input ).success,
+			},
+		],
+		[
+			'Edit',
+			{
+				operationClass: 'local-change',
+				path: filePath,
+				accepts: ( input ) => edit.safeParse( input ).success,
+			},
+		],
 		[ 'MultiEdit', { operationClass: 'local-change', path: filePath } ],
 		[ 'Bash', { operationClass: 'command', accepts: isBoundedShellInput, shell: true } ],
 	] );
@@ -1256,8 +1369,8 @@ const CHANNEL_BOUNDS: Readonly<
 	>
 > = {
 	readsLocalFiles: {
-		admits: [ 'paths', 'class', 'bundled', 'config', 'payloads' ],
-		needs: [ 'paths', 'bundled', 'config', 'payloads' ],
+		admits: [ 'paths', 'class', 'bundled', 'config', 'payloads', 'directoryListing' ],
+		needs: [ 'paths', 'bundled', 'config', 'payloads', 'directoryListing' ],
 	},
 	writesLocalFiles: { admits: [ 'paths', 'class' ], needs: [ 'paths' ] },
 	drivesBrowser: { admits: [ 'navigates', 'urls', 'site' ], needs: [ 'navigates' ] },
@@ -1276,6 +1389,7 @@ const RULE_ELEMENTS: Readonly<
 	Record< keyof ClaudeStudioToolRule, 'function' | 'mark' | 'text' | 'other' >
 > = {
 	qualification: 'other',
+	directoryListing: 'mark',
 	operationClass: 'other',
 	approval: 'other',
 	classify: 'function',
@@ -1337,6 +1451,8 @@ function ruleHas( rule: Record< string, unknown >, binding: unknown ): boolean {
 			return typeof rule.config === 'function';
 		case 'payloads':
 			return typeof rule.payloads === 'function';
+		case 'directoryListing':
+			return rule.directoryListing === true && rule.operationClass === 'read';
 		default:
 			return false;
 	}
@@ -1386,6 +1502,7 @@ function qualifiedElements( rule: unknown ): Record< string, unknown > | undefin
 		( elements.bundled === undefined || used.has( 'readsLocalFiles' ) ) &&
 		( elements.config === undefined || used.has( 'readsLocalFiles' ) ) &&
 		( elements.payloads === undefined || used.has( 'readsLocalFiles' ) ) &&
+		( elements.directoryListing !== true || used.has( 'readsLocalFiles' ) ) &&
 		( elements.urls === undefined ||
 			used.has( 'drivesBrowser' ) ||
 			used.has( 'requestsNetwork' ) ) &&

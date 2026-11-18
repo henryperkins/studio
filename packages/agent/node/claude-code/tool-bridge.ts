@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { resolveStudioToolDefinitions } from '../tools';
 import { bindTool } from '../tools/define-tool';
 import { runStudioTool } from '../tools/execution';
+import { createClaudeDirectoryListing } from './directory-listing';
 import {
 	CLAUDE_ENABLED_TOOLS,
 	CLAUDE_NAVIGATION_CONFINEMENT,
@@ -20,6 +21,7 @@ import type { StudioToolRun } from '../tools/execution';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 
 type BridgeResult = { content: ToolResult[ 'content' ]; isError: boolean };
+const directoryListing = createClaudeDirectoryListing();
 
 /**
  * What the Claude route offers the registry, as the Pi route passes a turn's
@@ -45,10 +47,13 @@ export function claudeStudioToolCandidates(
 	host: Pick< StudioAgentHost, 'ui' >,
 	capabilities: ClaudeStudioToolCapabilities = {}
 ): StudioToolDefinition[] {
-	return resolveStudioToolDefinitions( host, {
-		...CLAUDE_STUDIO_TOOL_CAPABILITIES,
-		imageGeneration: capabilities.imageGeneration === true,
-	} );
+	return [
+		...resolveStudioToolDefinitions( host, {
+			...CLAUDE_STUDIO_TOOL_CAPABILITIES,
+			imageGeneration: capabilities.imageGeneration === true,
+		} ),
+		directoryListing,
+	];
 }
 
 /**
@@ -138,9 +143,13 @@ export function createStudioClaudeToolBridge(
 	const { runId, turnId, policy } = turn;
 	const enabled = new Set( policy.studioTools );
 	const registry = claudeStudioToolCandidates( host, options );
-	const tools = ( options.candidates ?? registry ).filter(
-		( definition ) => registry.includes( definition ) && enabled.has( definition.name )
-	);
+	const tools = ( options.candidates ?? registry )
+		.filter( ( definition ) => registry.includes( definition ) && enabled.has( definition.name ) )
+		.map( ( definition ) =>
+			definition === directoryListing
+				? createClaudeDirectoryListing( policy.resolveListingPath )
+				: definition
+		);
 	const active = new Set< Promise< unknown > >();
 	async function execute(
 		name: string,
