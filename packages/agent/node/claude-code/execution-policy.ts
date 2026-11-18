@@ -10,6 +10,7 @@ import { isReprintPullEnabled } from '@studio/common/lib/sync/reprint-pull';
 import { getCliConfigPath, getSharedConfigPath } from '@studio/common/lib/well-known-paths';
 import {
 	escapeClaudeApprovalText,
+	getClaudeApprovalDisplayArgs,
 	isClaudeReadOnlyClass,
 } from '@studio/agent/protocol/claude-code';
 import { getCreatedSiteFromArtifact } from '../sessions/placement';
@@ -35,6 +36,7 @@ import {
 	requiresClaudeApproval,
 	studioToolName,
 } from './execution-rules';
+import { escapeClaudeJournalText } from './journal-text';
 import {
 	isAllowedNativePath,
 	isBundledFolder,
@@ -50,15 +52,17 @@ import type {
 	ClaudeEnabledTools,
 	ClaudeNavigationConfinement,
 	ClaudeShellConfinement,
-	HostOperationName,
 } from './execution-rules';
 import type { HostOperationOptions, HostSite, MediaAttachment, StudioAgentHost } from '../host';
 import type {
-	BackendApprovalOperation,
 	BackendTurnEvent,
 	ClaudeOperationJournalEvent,
 } from '@studio/agent/protocol/backend-events';
-import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
+import type {
+	ClaudeHostOperationName,
+	ClaudeOperationClass,
+	ClaudeStudioTarget,
+} from '@studio/agent/protocol/claude-code';
 import type { SyncSite } from '@studio/common/types/sync';
 
 /**
@@ -105,6 +109,8 @@ export type ClaudeApprover = (
 	signal: AbortSignal
 ) => Promise< 'allow' | 'deny' >;
 
+type ApprovalEvent = Extract< BackendTurnEvent, { type: 'approval.requested' } >;
+
 /** An allowed approval, usable once for its exact operation. */
 export interface ClaudeApprovalGrant {
 	readonly requestId: string;
@@ -144,7 +150,8 @@ export interface ClaudeExecutionContext {
 	now: () => number;
 	/** The conversation still has the turn's native binding and this persisted target. */
 	verifyTarget: ( expected: ClaudeStudioTarget ) => Promise< boolean >;
-	onEvent: ( event: BackendTurnEvent ) => void;
+	/** An approval's display fields and its stored encoding can differ. */
+	onEvent: ( event: BackendTurnEvent, journalEvent?: ApprovalEvent ) => void;
 	/**
 	 * Writes an entry to the turn's journal and resolves once it is on disk.
 	 * Every operation that does more than read is recorded this way before it runs.
@@ -396,7 +403,7 @@ interface HostFile< Path = unknown > {
 }
 
 interface HostRequest {
-	name: HostOperationName;
+	name: ClaudeHostOperationName;
 	site?: HostSite;
 	args: unknown[];
 	localPaths?: string[];
@@ -853,14 +860,37 @@ export function createClaudeExecutionPolicy(
 			.digest( 'hex' );
 	}
 
-	function display( operation: ClaudeOperation ): BackendApprovalOperation {
+	function approvalEvent(
+		request: ClaudeApprovalRequest,
+		args: unknown,
+		escape: ( text: string ) => string
+	): ApprovalEvent {
+		const { runId, turnId, toolCallId, requestId, target, operation } = request;
+		const { draft } = operation;
 		return {
-			tool: escapeClaudeApprovalText( operation.tool ),
-			operationClass: operation.operationClass,
-			target: { ...actingTarget },
-			args: escapeClaudeApprovalText( JSON.stringify( operation.args, null, 2 ) ?? 'null' ),
-			localPaths: operation.localPaths.map( escapeClaudeApprovalText ),
-			...( operation.remote ? { remote: escapeClaudeApprovalText( operation.remote ) } : {} ),
+			type: 'approval.requested',
+			runId,
+			turnId,
+			toolCallId,
+			requestId,
+			description: escape( operation.description ),
+			operation: {
+				tool: escape( operation.tool ),
+				operationClass: operation.operationClass,
+				target: { ...target },
+				args: escape( JSON.stringify( args, null, 2 ) ?? 'null' ),
+				localPaths: operation.localPaths.map( escape ),
+				...( operation.remote ? { remote: escape( operation.remote ) } : {} ),
+			},
+			...( draft
+				? {
+						draft: {
+							siteName: escape( draft.siteName ),
+							title: escape( draft.title ),
+							content: draft.content === undefined ? undefined : escape( draft.content ),
+						},
+				  }
+				: {} ),
 		};
 	}
 
@@ -929,24 +959,14 @@ export function createClaudeExecutionPolicy(
 			toolCallId,
 			requestId: request.requestId,
 		};
-		context.onEvent( {
-			type: 'approval.requested',
-			...ids,
-			description: escapeClaudeApprovalText( operation.description ),
-			operation: display( operation ),
-			...( operation.draft
-				? {
-						draft: {
-							siteName: escapeClaudeApprovalText( operation.draft.siteName ),
-							title: escapeClaudeApprovalText( operation.draft.title ),
-							content:
-								operation.draft.content === undefined
-									? undefined
-									: escapeClaudeApprovalText( operation.draft.content ),
-						},
-				  }
-				: {} ),
-		} );
+		context.onEvent(
+			approvalEvent(
+				request,
+				getClaudeApprovalDisplayArgs( operation.tool, operation.args ),
+				escapeClaudeApprovalText
+			),
+			approvalEvent( request, operation.args, escapeClaudeJournalText )
+		);
 		const allowed = await awaitAnswer( request, callSignal );
 		context.onEvent( { type: 'approval.resolved', ...ids } );
 		if ( ! allowed ) refuse( toolCallId, REFUSALS.notApproved );
@@ -993,11 +1013,11 @@ export function createClaudeExecutionPolicy(
 				toolCallId,
 				...( requestId ? { requestId } : {} ),
 				operation: {
-					tool: escapeClaudeApprovalText( operation.tool ),
+					tool: escapeClaudeJournalText( operation.tool ),
 					operationClass: operation.operationClass,
 					target: { ...actingTarget },
 				},
-				description: escapeClaudeApprovalText( operation.description ),
+				description: escapeClaudeJournalText( operation.description ),
 			} );
 		} catch {
 			controller.abort();
@@ -1995,7 +2015,7 @@ export function createClaudeExecutionPolicy(
 					turnId: context.turnId,
 					toolCallId,
 					operation: { tool: 'media.finalize', operationClass, target: { ...actingTarget } },
-					description: escapeClaudeApprovalText( description ),
+					description: escapeClaudeJournalText( description ),
 				} );
 			} catch {
 				throw denied();

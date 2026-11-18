@@ -8,6 +8,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { fakeRemoteSite, fakePreview } from '../../tests/fake-host';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
+import type { ClaudeExecutionContext } from '../execution-policy';
 import type { AddressInfo } from 'net';
 
 // The tools that look beyond the conversation's own site or reach WordPress.com,
@@ -508,7 +509,7 @@ describe( 'preview_update and preview_delete on the Claude route', () => {
 		const shown = fixture.events.find( ( event ) => event.type === 'approval.requested' ) as {
 			operation: { args: string; remote?: string };
 		};
-		expect( JSON.parse( shown.operation.args ) ).toEqual( [ own.url ] );
+		expect( JSON.parse( shown.operation.args ) ).toEqual( { address: own.url } );
 		expect( shown.operation.remote ).toBe( own.url );
 		expect( order ).toEqual( [
 			'journal preview_update',
@@ -1057,6 +1058,50 @@ describe( 'site_pull on the Claude route', () => {
 } );
 
 describe( 'what a push or pull approval shows of the WordPress.com site', () => {
+	it( 'reveals invisible title characters in the pending approval and keeps the journal encoding for the same push', async () => {
+		const title = 'My\u200bShop\u202e';
+		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( [
+			{ ...fakeRemoteSite, name: title },
+		] );
+		const onEvent = vi.fn< ClaudeExecutionContext[ 'onEvent' ] >();
+		const { bridge, journal, context } = await setup( () => ( { onEvent } ) );
+		expect(
+			( await bridge.invoke( 'site_push', { nameOrPath: 'site', remoteSite: '111' } ) ).isError
+		).toBe( false );
+		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
+		const pair = onEvent.mock.calls.find( ( [ event ] ) => event.type === 'approval.requested' );
+		const displayed = pair?.[ 0 ];
+		const stored = pair?.[ 1 ];
+		expect( request.operation.description ).toContain( title );
+		const storedDescription = request.operation.description.replace( '\u202e', '\\u202e' );
+		const storedRemote = request.operation.remote!.replace( '\u202e', '\\u202e' );
+		expect( displayed ).toMatchObject( {
+			requestId: request.requestId,
+			description: storedDescription.replace( '\u200b', '\\u200b' ),
+			operation: {
+				remote: storedRemote.replace( '\u200b', '\\u200b' ),
+				args: expect.stringContaining( 'My\\u200bShop\\u202e' ),
+			},
+		} );
+		expect( stored ).toMatchObject( {
+			requestId: request.requestId,
+			description: storedDescription,
+			operation: {
+				remote: storedRemote,
+				args: JSON.stringify( request.operation.args, null, 2 ).replace( '\u202e', '\\u202e' ),
+			},
+		} );
+		expect( journal[ 1 ] ).toEqual( {
+			type: 'operation.authorized',
+			runId: request.runId,
+			turnId: request.turnId,
+			toolCallId: request.toolCallId,
+			requestId: request.requestId,
+			operation: { tool: 'sync.push', operationClass: 'remote-overwrite', target: request.target },
+			description: storedDescription,
+		} );
+	} );
+
 	it( 'names it as Studio keeps its connection, by its name, address and whether it is a staging or a production site beside its ID, so a production site and its staging copy read differently, and shows no account', async () => {
 		vi.mocked( getConnectedWpcomSitesForLocalSite ).mockResolvedValue( connections );
 		for ( const name of [ 'site_push', 'site_pull' ] ) {

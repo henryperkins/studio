@@ -35,6 +35,53 @@ export type ClaudeOperationClass =
 	| 'external-message'
 	| 'command';
 
+// Studio presents these arguments in approvals. The host executes the original values.
+const HOST_APPROVAL_ARGUMENTS = {
+	'sites.create': [ 'name', 'path' ],
+	'sites.start': [],
+	'sites.stop': [],
+	'sites.delete': [ 'deleteFiles' ],
+	'sites.import': [ 'path' ],
+	'sites.export': [ 'path', 'mode' ],
+	'sites.wpCli': 'command',
+	'previews.create': [],
+	'previews.update': [ 'address' ],
+	'previews.delete': [ 'address' ],
+	'sync.push': 'named',
+	'sync.pull': 'named',
+	'media.reserve': [ 'fileNames' ],
+	'media.finalize': 'named',
+	selectSite: [ 'siteId' ],
+	'ui.showArtifact': [ 'siteId' ],
+} as const;
+
+export type ClaudeHostOperationName = keyof typeof HOST_APPROVAL_ARGUMENTS;
+
+/** Also accepts the positional arguments retained in older approval events. */
+export function getClaudeApprovalDisplayArgs( tool: string, args: unknown ): unknown {
+	if (
+		! Array.isArray( args ) ||
+		! Object.prototype.hasOwnProperty.call( HOST_APPROVAL_ARGUMENTS, tool )
+	) {
+		return args;
+	}
+	const fields = HOST_APPROVAL_ARGUMENTS[ tool as ClaudeHostOperationName ];
+	if ( fields === 'command' ) {
+		return args.every( ( arg ) => typeof arg === 'string' ) ? { command: args } : args;
+	}
+	if ( fields === 'named' ) {
+		const [ value ] = args;
+		return args.length === 1 &&
+			value !== null &&
+			typeof value === 'object' &&
+			! Array.isArray( value )
+			? value
+			: args;
+	}
+	if ( fields.length !== args.length ) return args;
+	return Object.fromEntries( fields.map( ( name, index ) => [ name, args[ index ] ] ) );
+}
+
 /** Whether an operation of this class only reads. Studio journals every other one before it runs. */
 export function isClaudeReadOnlyClass( operationClass: unknown ): boolean {
 	return operationClass === 'read' || operationClass === 'remote-read';
@@ -147,9 +194,9 @@ export function getClaudeUncertainOperationDescription(
 		return sprintf(
 			/* translators: %s: the name of a tool Studio does not recognize. */
 			__( 'Run an operation Studio does not recognize: %s' ),
-			operation.tool
+			escapeClaudeApprovalText( operation.tool )
 		);
-	return operation.description ?? operation.tool;
+	return escapeClaudeApprovalText( operation.description ?? operation.tool );
 }
 
 /** What recovering a locked Claude conversation did. Serializable, for every Studio app. */
@@ -433,9 +480,17 @@ export function isClaudeModelId( value: unknown ): value is string {
 }
 
 export function escapeClaudeApprovalText( value: string ): string {
+	// Keep short script joins and emoji selectors. Encode UTF-16 units so that
+	// even supplementary characters can be read back from an approval's JSON.
 	return value.replace(
-		/(?![\n\t])[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu,
-		( character ) => '\\u' + character.charCodeAt( 0 ).toString( 16 ).padStart( 4, '0' )
+		/((?:\u200c|\u200d|\ufe0e|\ufe0f)+)|(?![\n\t])[\p{Cc}\p{Default_Ignorable_Code_Point}]/gu,
+		( hidden: string, joins: string | undefined ) => {
+			if ( joins && joins.length < 3 ) return joins;
+			return hidden
+				.split( '' )
+				.map( ( unit ) => '\\u' + unit.charCodeAt( 0 ).toString( 16 ).padStart( 4, '0' ) )
+				.join( '' );
+		}
 	);
 }
 

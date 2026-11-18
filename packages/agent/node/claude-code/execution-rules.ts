@@ -37,7 +37,11 @@ import { hasOnlyKeys, hasOwn, plainData, plainList, plainStrings } from './plain
 import { classifyWpCliArgs, wpCliRouteCommands } from './wp-cli-rules';
 import { wpcomBodyFiles, wpcomScope } from './wpcom-rules';
 import type { SandboxSettings } from '@anthropic-ai/claude-agent-sdk/core';
-import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
+import type {
+	ClaudeHostOperationName,
+	ClaudeOperationClass,
+	ClaudeStudioTarget,
+} from '@studio/agent/protocol/claude-code';
 
 // What each operation is, independent of any turn. The execution policy applies
 // these rules immediately before execution.
@@ -1543,30 +1547,8 @@ export function studioToolName( name: string ): string | undefined {
 	return name.startsWith( STUDIO_MCP_PREFIX ) ? name.slice( STUDIO_MCP_PREFIX.length ) : undefined;
 }
 
-export type HostOperationName =
-	| 'sites.create'
-	| 'sites.start'
-	| 'sites.stop'
-	| 'sites.delete'
-	| 'sites.import'
-	| 'sites.export'
-	| 'sites.wpCli'
-	| 'previews.create'
-	| 'previews.update'
-	| 'previews.delete'
-	| 'sync.push'
-	| 'sync.pull'
-	// The media library's fixed WP-CLI commands, for `generate_images`.
-	| 'media.reserve'
-	| 'media.finalize'
-	// Changes of the conversation's site: making a site the turn created the
-	// conversation's site, and showing that site in the conversation, which the
-	// app then keeps the conversation with.
-	| 'selectSite'
-	| 'ui.showArtifact';
-
 export const HOST_OPERATION_CLASSES: Readonly<
-	Record< Exclude< HostOperationName, 'sites.wpCli' >, ClaudeOperationClass >
+	Record< Exclude< ClaudeHostOperationName, 'sites.wpCli' >, ClaudeOperationClass >
 > = {
 	'sites.create': 'local-change',
 	'sites.start': 'local-change',

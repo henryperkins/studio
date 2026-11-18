@@ -200,11 +200,13 @@ const HOST_CALLS: Record<
 		host?: ( host: StudioAgentHost, paths: Paths ) => void;
 		before?: ( host: StudioAgentHost, paths: Paths ) => Promise< unknown >;
 		call: ( host: StudioAgentHost, paths: Paths ) => Promise< unknown >;
+		shown: ( paths: Paths ) => unknown;
 		runs?: string;
 	}
 > = {
 	selectSite: {
 		global: true,
+		shown: () => ( { siteId: 'new-site' } ),
 		host: knowingCreatedSite,
 		before: creatingSite,
 		call: async ( host, paths ) => {
@@ -218,6 +220,7 @@ const HOST_CALLS: Record<
 	},
 	'ui.showArtifact': {
 		global: true,
+		shown: () => ( { siteId: 'new-site' } ),
 		host: knowingCreatedSite,
 		before: creatingSite,
 		call: async ( host, paths ) => {
@@ -240,48 +243,64 @@ const HOST_CALLS: Record<
 	},
 	'sites.create': {
 		global: true,
+		shown: ( paths ) => ( { name: 'New', path: path.join( paths.parent, 'new' ) } ),
 		call: ( host, paths ) => host.sites.create( 'New', path.join( paths.parent, 'new' ), () => {} ),
 	},
-	'sites.start': { call: ( host ) => host.sites.start( site, () => {} ) },
-	'sites.stop': { call: ( host ) => host.sites.stop( site, () => {} ) },
-	'sites.delete': { call: ( host ) => host.sites.delete( site, false, () => {} ) },
+	'sites.start': { call: ( host ) => host.sites.start( site, () => {} ), shown: () => ( {} ) },
+	'sites.stop': { call: ( host ) => host.sites.stop( site, () => {} ), shown: () => ( {} ) },
+	'sites.delete': {
+		call: ( host ) => host.sites.delete( site, false, () => {} ),
+		shown: () => ( { deleteFiles: false } ),
+	},
 	'sites.import': {
+		shown: ( paths ) => ( { path: path.join( paths.site, 'readme.txt' ) } ),
 		// The backup it reads must exist in the conversation's folders.
 		call: ( host, paths ) =>
 			host.sites.import( site, path.join( paths.site, 'readme.txt' ), () => {} ),
 	},
 	'sites.export': {
+		shown: ( paths ) => ( { path: path.join( paths.site, 'a.zip' ), mode: 'full' } ),
 		call: ( host, paths ) =>
 			host.sites.export( site, path.join( paths.site, 'a.zip' ), 'full', () => {} ),
 	},
 	'sites.wpCli': {
+		shown: () => ( { command: [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ] } ),
 		call: ( host ) =>
 			host.sites.wpCli( site, [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ] ),
 	},
-	'previews.create': { call: ( host ) => host.previews.create( site, () => {} ) },
+	'previews.create': {
+		call: ( host ) => host.previews.create( site, () => {} ),
+		shown: () => ( {} ),
+	},
 	// A preview of the target site, which the host lists for it.
 	'previews.update': {
+		shown: () => ( { address: fakePreview.url } ),
 		host: listingPreview,
 		call: ( host ) => host.previews.update( site, fakePreview.url, false, () => {} ),
 	},
 	'previews.delete': {
+		shown: () => ( { address: fakePreview.url } ),
 		host: listingPreview,
 		call: ( host ) => host.previews.delete( fakePreview.url, () => {} ),
 	},
 	// A WordPress.com site connected to the target site.
 	'sync.push': {
+		shown: () => ( { direction: 'push', ...shownConnection } ),
 		call: ( host ) => host.sync.push( site, 'all', String( fakeRemoteSite.id ), () => {} ),
 	},
 	'sync.pull': {
+		shown: () => ( { direction: 'pull', ...shownConnection } ),
 		call: ( host ) => host.sync.pull( site, 'all', String( fakeRemoteSite.id ), () => {} ),
 	},
 	// The media library's fixed WP-CLI commands, which run through `sites.wpCli`.
 	'media.reserve': {
+		shown: () => ( { fileNames: [ 'hero.png' ] } ),
 		host: reservingAttachments,
 		runs: 'sites.wpCli',
 		call: ( host ) => host.media!.reserve( site, [ 'hero.png' ] ),
 	},
 	'media.finalize': {
+		shown: () => ( { ready: [ 7 ], failed: [] } ),
 		host: reservingAttachments,
 		runs: 'sites.wpCli',
 		before: ( host ) => host.media!.reserve( site, [ 'hero.png' ] ),
@@ -289,11 +308,45 @@ const HOST_CALLS: Record<
 	},
 };
 
+const shownConnection = {
+	remoteSite: {
+		id: 111,
+		name: 'My Production Site',
+		address: 'myprod.wordpress.com',
+		kind: 'production',
+	},
+	overwrites: [ 'the database and every file in wp-content' ],
+};
+
 async function setup( ...args: Parameters< typeof createPolicyFixture > ) {
 	const fixture = await createPolicyFixture( ...args );
 	cleanups.push( fixture.cleanup );
 	await writeFile( path.join( fixture.site, 'readme.txt' ), 'fixture' );
 	return fixture;
+}
+
+async function setupHostCall( name: string, uncertainAfterRecovery = false ) {
+	const test = HOST_CALLS[ name ];
+	const fixture = await setup( ( paths ) => ( {
+		uncertainAfterRecovery,
+		...( test.global
+			? {
+					target: { environment: 'global' as const },
+					targetSite: undefined,
+					workspace: {
+						siteId: null,
+						workingDirectory: paths.parent,
+						configDirectory: paths.config,
+					},
+			  }
+			: {} ),
+	} ) );
+	test.host?.( fixture.host, fixture );
+	const guardedHost = fixture.policy.guardHost( fixture.host, 'call' );
+	await test.before?.( guardedHost, fixture );
+	fixture.journal.length = 0;
+	fixture.events.length = 0;
+	return { ...fixture, guardedHost };
 }
 
 // The rules that can let a call do more than read: by their class, or, for a
@@ -419,23 +472,7 @@ describe( 'what the policy journals before an operation that does more than read
 		'journals the host operation %s before the host runs it',
 		async ( name ) => {
 			const order: string[] = [];
-			const fixture = await setup( ( paths ) =>
-				HOST_CALLS[ name ].global
-					? {
-							target: { environment: 'global' },
-							targetSite: undefined,
-							workspace: {
-								siteId: null,
-								workingDirectory: paths.parent,
-								configDirectory: paths.config,
-							},
-					  }
-					: {}
-			);
-			HOST_CALLS[ name ].host?.( fixture.host, fixture );
-			const guarded = fixture.policy.guardHost( fixture.host, 'call' );
-			await HOST_CALLS[ name ].before?.( guarded, fixture );
-			fixture.journal.length = 0;
+			const fixture = await setupHostCall( name );
 			const record = fixture.context.recordOperation;
 			fixture.context.recordOperation = async ( event ) => {
 				order.push( `journal ${ event.operation.tool }` );
@@ -452,7 +489,7 @@ describe( 'what the policy journals before an operation that does more than read
 				order.push( `host ${ name }` );
 				return result?.( ...args );
 			} );
-			await HOST_CALLS[ name ].call( guarded, fixture );
+			await HOST_CALLS[ name ].call( fixture.guardedHost, fixture );
 			expect( order ).toEqual( [ `journal ${ name }`, `host ${ name }` ] );
 			expect( fixture.journal ).toEqual( [
 				expect.objectContaining( {
@@ -468,6 +505,19 @@ describe( 'what the policy journals before an operation that does more than read
 				} ),
 			] );
 			expect( JSON.stringify( fixture.journal ) ).not.toContain( fixture.site );
+		}
+	);
+
+	it.each( Object.keys( HOST_CALLS ) )(
+		'names the arguments shown for %s when it asks',
+		async ( name ) => {
+			const fixture = await setupHostCall( name, true );
+			await HOST_CALLS[ name ].call( fixture.guardedHost, fixture );
+			const shown = fixture.events.find( ( event ) => event.type === 'approval.requested' );
+			expect( shown?.operation.tool ).toBe( name );
+			expect( shown && JSON.parse( shown.operation.args ) ).toEqual(
+				HOST_CALLS[ name ].shown( fixture )
+			);
 		}
 	);
 

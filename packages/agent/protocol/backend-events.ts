@@ -104,7 +104,7 @@ export interface BackendApprovalOperation {
 	tool: string;
 	operationClass: ClaudeOperationClass;
 	target: ClaudeStudioTarget;
-	/** The exact arguments, as escaped JSON. */
+	/** Escaped JSON of the arguments shown to the user, with names for known host argument positions. */
 	args: string;
 	localPaths: string[];
 	remote?: string;

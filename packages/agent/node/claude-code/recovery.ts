@@ -6,10 +6,8 @@ import {
 	readOwnProcessIdentity,
 } from '@studio/common/lib/owned-process';
 import { __ } from '@wordpress/i18n';
-import {
-	escapeClaudeApprovalText,
-	isClaudeReadOnlyClass,
-} from '@studio/agent/protocol/claude-code';
+import { isClaudeReadOnlyClass } from '@studio/agent/protocol/claude-code';
+import { escapeClaudeJournalText } from './journal-text';
 import { claudeLockDigest } from './run-lock';
 import type { ClaudeRecoveryClaim, ClaudeRunLockRecord } from './run-lock';
 import type { createNativeSessionStore } from './sessions';
@@ -197,7 +195,7 @@ async function uncertainOperationsOf(
 	const rules = started.length || shared ? await import( './execution-rules' ) : undefined;
 	for ( const { event, index } of started ) {
 		if ( rules?.isKnownClaudeTool( event.name ) ) continue;
-		const tool = escapeClaudeApprovalText( String( event.name ) );
+		const tool = escapeClaudeJournalText( String( event.name ) );
 		const id = idOf( event );
 		// Its kind is the evidence: each app words it in its own language.
 		found.set( id ? JSON.stringify( [ id, null, tool ] ) : `unnamed ${ index }`, {

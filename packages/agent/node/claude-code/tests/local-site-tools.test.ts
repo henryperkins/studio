@@ -189,13 +189,27 @@ describe( 'site_delete on the Claude route', () => {
 			[ 'site_delete', 'local-overwrite' ],
 			[ 'sites.delete', 'local-overwrite' ],
 		] );
-		expect( journal[ 1 ].requestId ).toBe( request.requestId );
+		expect( journal[ 1 ] ).toEqual( {
+			type: 'operation.authorized',
+			runId: request.runId,
+			turnId: request.turnId,
+			toolCallId: request.toolCallId,
+			requestId: request.requestId,
+			operation: {
+				tool: 'sites.delete',
+				operationClass: 'local-overwrite',
+				target: request.target,
+			},
+			description: request.operation.description,
+		} );
 	} );
 
 	it( 'moves the files to the trash by default, as on every route, and says so in the approval', async () => {
-		const { bridge, context } = await setup();
+		const { bridge, context, events } = await setup();
 		await bridge.invoke( 'site_delete', { nameOrPath: 'site' } );
 		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation.args ).toEqual( [ true ] );
+		const shown = events.find( ( event ) => event.type === 'approval.requested' );
+		expect( shown && JSON.parse( shown.operation.args ) ).toEqual( { deleteFiles: true } );
 	} );
 
 	it( 'deletes nothing the user denies, and says so', async () => {

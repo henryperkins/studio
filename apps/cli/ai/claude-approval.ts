@@ -1,5 +1,8 @@
 import { createInterface } from 'node:readline/promises';
-import { escapeClaudeApprovalText } from '@studio/agent/protocol/claude-code';
+import {
+	escapeClaudeApprovalText,
+	getClaudeApprovalDisplayArgs,
+} from '@studio/agent/protocol/claude-code';
 import { __ } from '@wordpress/i18n';
 import type { ClaudeApprover } from '@studio/agent/node/claude-code/execution-policy';
 
@@ -23,7 +26,7 @@ export function getTerminalClaudeApprover(): ClaudeApprover | undefined {
 							target,
 							localPaths: operation.localPaths,
 							remote: operation.remote,
-							args: operation.args,
+							args: getClaudeApprovalDisplayArgs( operation.tool, operation.args ),
 						},
 						null,
 						2

@@ -3467,6 +3467,7 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 			} );
 			expect( results ).toEqual( [ expect.objectContaining( { isError: false } ) ] );
 			return {
+				events,
 				note: optionsOf( query ).systemPrompt.append,
 				requests: approve.mock.calls.map(
 					( call ) => ( call as unknown[] )[ 0 ] as ClaudeApprovalRequest
@@ -3532,7 +3533,7 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 		} );
 
 		it( 'leaves an operation that already asks as it was: one approval, with no notice', async () => {
-			const fixture = await siteFixture( 'claude-gate-approval-' );
+			const fixture = await siteFixture( 'claude-gate-\u200bapproval-' );
 			try {
 				const runtime = await import( '../runtime' );
 				await recovered( fixture, [ uncertainStart ] );
@@ -3544,6 +3545,38 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 				] );
 				expect( deleting.requests[ 0 ].operation.description ).not.toContain( NOTICE );
 				expect( fixture.host.sites.delete ).toHaveBeenCalledOnce();
+				const { requestId } = deleting.requests[ 0 ];
+				expect( deleting.events ).toContainEqual(
+					expect.objectContaining( {
+						type: 'approval.requested',
+						requestId,
+						operation: expect.objectContaining( {
+							args: JSON.stringify( { deleteFiles: true }, null, 2 ),
+							localPaths: [ fixture.root.replace( '\u200b', '\\u200b' ) ],
+						} ),
+					} )
+				);
+				const { createNativeSessionStore } = await import( '../sessions' );
+				const journal = (
+					await createNativeSessionStore( fixture.storeRoot ).readJournals( 'chat' )
+				).flat();
+				expect( journal ).toContainEqual(
+					expect.objectContaining( {
+						type: 'approval.requested',
+						requestId,
+						operation: expect.objectContaining( {
+							args: JSON.stringify( [ true ], null, 2 ),
+							localPaths: [ fixture.root ],
+						} ),
+					} )
+				);
+				expect( journal ).toContainEqual(
+					expect.objectContaining( {
+						type: 'operation.authorized',
+						requestId,
+						description: deleting.requests[ 0 ].operation.description,
+					} )
+				);
 			} finally {
 				await fixture.cleanup();
 			}

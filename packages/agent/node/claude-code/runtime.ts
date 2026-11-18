@@ -6,6 +6,7 @@ import { __ } from '@wordpress/i18n';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
 import {
+	escapeClaudeApprovalText,
 	isClaudeEffort,
 	isClaudeModelId,
 	isClaudeTargetAllowed,
@@ -265,7 +266,8 @@ interface NativeLaunch {
 const STUDIO_INSTRUCTIONS =
 	'Work only in the current local WordPress site. Use Studio tools for WordPress operations. Do not publish or access production.';
 
-const oneLine = ( text: unknown ) => String( text ).replace( /\s+/g, ' ' ).trim();
+const oneLine = ( text: unknown ) =>
+	escapeClaudeApprovalText( String( text ) ).replace( /\s+/g, ' ' ).trim();
 
 /**
  * What the first turn after a recovery tells Claude, once: that the previous
@@ -884,14 +886,14 @@ export async function runClaudeTurn(
 				() => {}
 			);
 		};
-		const emit = ( event: BackendTurnEvent ) => {
+		const emit = ( event: BackendTurnEvent, journalEvent: BackendTurnEvent = event ) => {
 			if ( event.type === 'turn.terminal' ) {
 				if ( event.outcome.status === 'success' ) markNoteGiven();
 				terminal ??= event;
 				return;
 			}
 			journalWork = journalWork
-				.then( () => journal!.append( event ) )
+				.then( () => journal!.append( journalEvent ) )
 				.catch( () => {
 					journalFailed = true;
 					cancel();

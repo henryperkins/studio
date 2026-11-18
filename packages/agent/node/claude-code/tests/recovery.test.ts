@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'fs/p
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { getClaudeUncertainOperationDescription } from '@studio/agent/protocol/claude-code';
 import { fakeSite } from '../../tests/fake-host';
 import { createClaudeEventAdapter } from '../event-adapter';
 import { recoverClaudeRun } from '../recovery';
@@ -69,7 +70,7 @@ async function journalOf(
 ): Promise< ClaudeTurnJournalEvent[] > {
 	const events: ClaudeTurnJournalEvent[] = [];
 	const fixture = await createPolicyFixture( ( paths ) => ( {
-		onEvent: ( event ) => events.push( event ),
+		onEvent: ( event, journalEvent ) => events.push( journalEvent ?? event ),
 		recordOperation: async ( event ) => {
 			events.push( event );
 		},
@@ -484,7 +485,7 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 					...ids,
 					toolCallId: 'earlier',
 					requestId: 'earlier-request',
-					description: 'Create a draft post on the current local site',
+					description: 'Create a draft post on My\u200bShop',
 					operation: {
 						tool: 'sites.wpCli',
 						operationClass: 'command',
@@ -494,7 +495,7 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 					},
 				},
 				{ type: 'approval.resolved', ...ids, toolCallId: 'earlier', requestId: 'earlier-request' },
-				{ type: 'tool.started', ...ids, toolCallId: 'unknown', name: 'future_tool' },
+				{ type: 'tool.started', ...ids, toolCallId: 'unknown', name: 'future\u200b_tool' },
 				{ type: 'tool.started', ...ids, toolCallId: 'known-read', name: 'site_info' },
 			],
 		} );
@@ -507,12 +508,13 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 					tool: 'sites.wpCli',
 					operationClass: 'command',
 					evidence: 'requested',
+					description: 'Create a draft post on My\u200bShop',
 					requestId: 'earlier-request',
 					resolved: true,
 				},
 				{
 					toolCallId: 'unknown',
-					tool: 'future_tool',
+					tool: 'future\u200b_tool',
 					evidence: 'started',
 				},
 			],
@@ -522,6 +524,21 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 		// Its kind is the evidence; the apps word it in their own language.
 		expect( unknown ).not.toHaveProperty( 'description' );
 		expect( result.status === 'recovered' && result.uncertainOperations ).toHaveLength( 2 );
+		if ( result.status !== 'recovered' ) throw new Error( 'Expected a recovered turn' );
+		expect( result.uncertainOperations.map( getClaudeUncertainOperationDescription ) ).toEqual( [
+			'Create a draft post on My\\u200bShop',
+			'Run an operation Studio does not recognize: future\\u200b_tool',
+		] );
+		const journals = await fixture.store.readJournals( 'chat' );
+		const recorded = journals.flat().find( ( event ) => event.type === 'turn.recovered' );
+		expect( recorded?.uncertainOperations.map( ( operation ) => operation.description ?? operation.tool ) ).toEqual( [
+			'Create a draft post on My\u200bShop',
+			'future\u200b_tool',
+		] );
+		const note = recoveryNote( journals );
+		expect( note?.text ).toContain( 'My\\u200bShop' );
+		expect( note?.text ).toContain( 'future\\u200b_tool' );
+		expect( note?.text ).not.toContain( '\u200b' );
 	} );
 
 	it( 'reports one operation for a tool call journaled at the tool and at its host operation, the host one, and never merges entries that name no tool call', async () => {

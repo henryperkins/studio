@@ -4,7 +4,10 @@ import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DESIGN_SYSTEM_PREVIEW_PATH } from '@studio/agent/protocol/chat-artifacts';
-import { resolveClaudeSession } from '@studio/agent/protocol/claude-code';
+import {
+	getClaudeApprovalDisplayArgs,
+	resolveClaudeSession,
+} from '@studio/agent/protocol/claude-code';
 import { getCreatedSiteFromArtifact } from '../../sessions/placement';
 import { fakeSite } from '../../tests/fake-host';
 import { studioToolDefinitions } from '../../tools';
@@ -347,6 +350,40 @@ describe( 'Claude approvals at host execution', () => {
 		expect( await policy.authorizeExecution( exact!, operation, 'call' ) ).toBe( false );
 		expect( context.approve ).toHaveBeenCalledTimes( 3 );
 	} );
+
+	it( 'authorizes only the original host arguments even when the display names them', async () => {
+		const { policy, events } = await setup();
+		const operation: ClaudeOperation = {
+			tool: 'sites.delete',
+			operationClass: 'local-overwrite',
+			args: [ false ],
+			localPaths: [],
+			description: 'Delete the site',
+		};
+		const first = await policy.requestApproval( operation, 'call' );
+		const shown = events.find( ( event ) => event.type === 'approval.requested' );
+		const displayArgs = shown && JSON.parse( shown.operation.args );
+		expect( displayArgs ).toEqual( { deleteFiles: false } );
+		expect(
+			await policy.authorizeExecution( first!, { ...operation, args: displayArgs }, 'call' )
+		).toBe( false );
+		const second = await policy.requestApproval( operation, 'call' );
+		expect( await policy.authorizeExecution( second!, operation, 'call' ) ).toBe( true );
+	} );
+
+	it.each( [
+		{ tool: 'sites.delete', args: { deleteFiles: true } },
+		{ tool: 'sites.export', args: [ 'unidentified' ] },
+		{ tool: 'sites.wpCli', args: [ 'post', 1 ] },
+		{ tool: 'sync.push', args: [ 'unidentified' ] },
+		{ tool: 'unknown.tool', args: [ 'unidentified' ] },
+		{ tool: 'constructor', args: [ 'unidentified' ] },
+	] )(
+		'retains existing named fields and unrecognized argument shapes for $tool',
+		( { tool, args } ) => {
+			expect( getClaudeApprovalDisplayArgs( tool, args ) ).toBe( args );
+		}
+	);
 
 	it( 'does not run a denied draft, expires an unanswered one and ignores its late allow', async () => {
 		let release!: ( answer: 'allow' ) => void;
