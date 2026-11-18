@@ -8,7 +8,7 @@
  * names, and permalink URL.
  *
  * Usage:
- *   studio wp eval-file export-posts.php
+ *   studio wp eval-file export-posts.php [output.json]
  *
  * Environment variables:
  *   TAXONOMIST_OUTPUT  Path for the output JSON file.
@@ -17,7 +17,7 @@
  * @package Taxonomist
  */
 
-$output_file = getenv( 'TAXONOMIST_OUTPUT' ) ? getenv( 'TAXONOMIST_OUTPUT' ) : '/tmp/taxonomist-export.json';
+$output_file = $args[0] ?? ( getenv( 'TAXONOMIST_OUTPUT' ) ?: '/tmp/taxonomist-export.json' );
 
 // phpcs:disable WordPress.WP.AlternativeFunctions.file_system_operations_fopen
 // phpcs:disable WordPress.WP.AlternativeFunctions.file_system_operations_fwrite

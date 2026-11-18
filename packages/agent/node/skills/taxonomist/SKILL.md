@@ -85,12 +85,7 @@ Save the output to `taxonomist-data/export/categories.json`.
 
 Use `wp_cli`:
 ```
-eval-file tmp/taxonomist/export-posts.php
-```
-
-With the environment variable:
-```
-TAXONOMIST_OUTPUT={site_path}/taxonomist-data/export/posts.json
+eval-file tmp/taxonomist/export-posts.php taxonomist-data/export/posts.json
 ```
 
 ### Post-export summary
@@ -108,12 +103,7 @@ Create a full taxonomy snapshot before any analysis.
 
 Use `wp_cli`:
 ```
-eval-file tmp/taxonomist/backup.php
-```
-
-With the environment variable:
-```
-TAXONOMIST_OUTPUT={site_path}/taxonomist-data/backups/pre-analysis-{timestamp}.json
+eval-file tmp/taxonomist/backup.php taxonomist-data/backups/pre-analysis-{timestamp}.json
 ```
 
 ## Step 4: Analyze
@@ -220,24 +210,16 @@ Prepare the suggestions JSON file from the approved plan, then run the apply scr
 First, do a **preview** (dry run) using `wp_cli`:
 
 ```
-eval-file tmp/taxonomist/apply-changes.php
-```
-
-With environment variables:
-```
-TAXONOMIST_SUGGESTIONS={site_path}/taxonomist-data/results/suggestions.json
-TAXONOMIST_LOG={site_path}/taxonomist-data/logs/changes-{timestamp}.tsv
-TAXONOMIST_MODE=preview
+eval-file tmp/taxonomist/apply-changes.php taxonomist-data/results/suggestions.json taxonomist-data/logs/preview-{timestamp}.tsv preview
 ```
 
 Show the user the preview results. **Use `AskUserQuestion` to confirm** before applying. After they confirm, run again with:
 
 ```
-TAXONOMIST_SUGGESTIONS={site_path}/taxonomist-data/results/suggestions.json
-TAXONOMIST_LOG={site_path}/taxonomist-data/logs/changes-{timestamp}.tsv
-TAXONOMIST_MODE=apply
-TAXONOMIST_REMOVE_CATS=uncategorized
+eval-file tmp/taxonomist/apply-changes.php taxonomist-data/results/suggestions.json taxonomist-data/logs/changes-{timestamp}.tsv apply
 ```
+
+If the plan includes removing categories from posts, append the same comma-separated list of category slugs to both commands. Check the site's default category first and leave it out of the list.
 
 ## Step 9: Verify
 
@@ -253,12 +235,7 @@ After applying changes:
 If the user wants to undo all changes, use `wp_cli`:
 
 ```
-eval-file tmp/taxonomist/restore.php
-```
-
-With environment variable:
-```
-TAXONOMIST_BACKUP={site_path}/taxonomist-data/backups/pre-analysis-{timestamp}.json
+eval-file tmp/taxonomist/restore.php taxonomist-data/backups/pre-analysis-{timestamp}.json
 ```
 
 ## Important Notes

@@ -147,7 +147,7 @@ Based on the metrics, suggest specific actions. Route each fix through whatever 
   - *Plugins refused*: set the title via theme `wp_title()` and description via a `<meta>` tag in `header.php` / a block theme template part.
 - **Missing canonical**: Any SEO plugin (Jetpack, Yoast, Rank Math, AIOSEO) handles this automatically once active. Without one, add `<link rel="canonical" href="<?php echo esc_url( wp_get_canonical_url() ); ?>">` to the head.
 - **Wrong h1 count**: Audit the active block theme's templates — site title is often wrapped in an `h1` on every page. Use `h2` for the site title on inner pages, reserve `h1` for the page title. This is a theme fix; no SEO plugin will correct it.
-- **Missing alt text**: Content fix, not a plugin fix. Run `wp media list --field=ID` and update via `wp post update`, or train content editors to add alt text on upload.
+- **Missing alt text**: List attachments with `wp post list --post_type=attachment --field=ID` and set the text with `wp post meta update <attachment-id> _wp_attachment_image_alt "<description>"`. Content editors can also add alt text on upload.
 - **Missing OG / Twitter tags**:
   - *Jetpack active + `seo-tools` on*: OG/Twitter should already be emitted — re-check the HTML; if still missing, inspect for a conflicting plugin stripping them.
   - *Jetpack active + `seo-tools` off*: enable the module.

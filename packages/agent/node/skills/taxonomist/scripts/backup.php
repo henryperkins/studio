@@ -7,7 +7,7 @@
  * to the pre-change state.
  *
  * Usage:
- *   studio wp eval-file backup.php
+ *   studio wp eval-file backup.php [backup.json]
  *
  * Environment variables:
  *   TAXONOMIST_OUTPUT  Path for the backup JSON file.
@@ -16,7 +16,7 @@
  * @package Taxonomist
  */
 
-$output_file = getenv( 'TAXONOMIST_OUTPUT' ) ? getenv( 'TAXONOMIST_OUTPUT' ) : '/tmp/taxonomist-backup.json';
+$output_file = $args[0] ?? ( getenv( 'TAXONOMIST_OUTPUT' ) ?: '/tmp/taxonomist-backup.json' );
 
 $terms     = get_terms(
 	array(
