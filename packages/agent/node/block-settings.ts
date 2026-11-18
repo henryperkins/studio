@@ -33,11 +33,15 @@ function describeAttribute( name: string, attribute: BlockAttribute ): string {
 // stored in the block comment. Attributes read from the block's HTML
 // (`source`) are its content, and `__unstable`/`__experimental` ones are
 // internal, so both are left out.
-function describeCoreBlockSettings( blocksDir: string, slug: string ): string | undefined {
+function describeCoreBlockSettings(
+	blocksDir: string,
+	slug: string,
+	readText: ( file: string ) => string
+): string | undefined {
 	const file = path.join( blocksDir, slug, 'block.json' );
 	let attributes: Record< string, BlockAttribute >;
 	try {
-		attributes = JSON.parse( readFileSync( file, 'utf8' ) ).attributes ?? {};
+		attributes = JSON.parse( readText( file ) ).attributes ?? {};
 	} catch {
 		return undefined;
 	}
@@ -53,7 +57,10 @@ function describeCoreBlockSettings( blocksDir: string, slug: string ): string | 
 // Returns a function that, given a tool result's text, describes the settings
 // of each core block type that appears in it. Each block type is described
 // once per tracker.
-export function createBlockSettingsNotes( blocksDir: string ): ( text: string ) => string {
+export function createBlockSettingsNotes(
+	blocksDir: string,
+	readText: ( file: string ) => string = ( file ) => readFileSync( file, 'utf8' )
+): ( text: string ) => string {
 	const described = new Set< string >();
 	return ( text ) => {
 		const notes: string[] = [];
@@ -63,7 +70,7 @@ export function createBlockSettingsNotes( blocksDir: string ): ( text: string ) 
 				continue;
 			}
 			described.add( slug );
-			const note = describeCoreBlockSettings( blocksDir, slug );
+			const note = describeCoreBlockSettings( blocksDir, slug, readText );
 			if ( note ) {
 				notes.push( note );
 			}
