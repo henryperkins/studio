@@ -17,8 +17,9 @@ import type { AddressInfo } from 'node:net';
 import type { Page } from 'playwright';
 
 const servers: Server[] = [];
-async function fixture( handle: RequestListener ): Promise< string > {
+async function fixture( handle: RequestListener, connected?: () => void ): Promise< string > {
 	const server = createServer( handle );
+	if ( connected ) server.on( 'connection', connected );
 	servers.push( server );
 	server.listen( 0, '127.0.0.1' );
 	await once( server, 'listening' );
@@ -212,25 +213,24 @@ browserTest(
 browserTest.each( [ 'redirect', 'asset' ] )(
 	'isolates another origin on a real Chromium %s request',
 	async ( kind ) => {
-		let hits = 0;
-		const other = await fixture( ( _req, res ) => {
-			hits++;
-			res.end( 'fixture' );
-		} );
+		const deniedConnection = vi.fn();
+		const selectedConnection = vi.fn();
+		const other = await fixture( ( _req, res ) => res.end( 'fixture' ), deniedConnection );
 		const site = await fixture( ( _req, res ) => {
 			if ( kind === 'redirect' ) res.writeHead( 302, { Location: other + '/fixture' } ).end();
 			else
 				res
 					.writeHead( 200, { 'Content-Type': 'text/html' } )
 					.end( '<img src="' + other + '/fixture">' );
-		} );
+		}, selectedConnection );
 		await expect(
 			withClaudeWebCall( scope( site ), async () => {
 				const page = await currentClaudeWebCall()!.newPage();
 				await page.goto( site, { waitUntil: 'load' } );
 			} )
 		).rejects.toThrow( 'Studio refused' );
-		expect( hits ).toBe( 0 );
+		expect( selectedConnection ).toHaveBeenCalled();
+		expect( deniedConnection ).not.toHaveBeenCalled();
 	},
 	30000
 );
