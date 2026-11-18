@@ -16,6 +16,7 @@ import {
 	listChatGptConnections,
 	type ChatGptTurnHandle,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { isCompleteClaudeAnswer } from '@studio/agent/node/claude-code/questions';
 import {
 	answerOpenAiSessionKeyRequest,
 	getOpenAiSessionKeyForkEnvironment,
@@ -62,6 +63,8 @@ interface AgentRun {
 	terminal?: Extract< BackendTurnEvent, { type: 'turn.terminal' } >;
 	pendingClaudeApprovals: Extract< BackendTurnEvent, { type: 'approval.requested' } >[];
 	seenClaudeApprovals: Set< string >;
+	pendingClaudeQuestions: NonNullable< ActiveAgentRun[ 'pendingClaudeQuestions' ] >;
+	seenClaudeQuestions: Set< string >;
 	pendingQuestions: NonNullable< ActiveAgentRun[ 'pendingQuestions' ] >;
 	chatGptTurn: Pick< ChatGptTurnHandle, 'signal' | 'end' > | null;
 }
@@ -112,7 +115,7 @@ export interface AgentRunManager {
 	startAgentRun( options: StartAgentRunOptions ): { runId: string };
 	listActiveAgentRuns(): ActiveAgentRun[];
 	interruptAgentRun( runId: string ): void;
-	answerAgentRun( runId: string, answers: Record< string, string > ): void;
+	answerAgentRun( runId: string, answers: Record< string, string >, requestId?: string ): boolean;
 }
 
 const INTERRUPT_FORCE_KILL_TIMEOUT_MS = 2000;
@@ -330,6 +333,8 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			pendingQuestions: [],
 			pendingClaudeApprovals: [],
 			seenClaudeApprovals: new Set(),
+			pendingClaudeQuestions: [],
+			seenClaudeQuestions: new Set(),
 			claude: !! claudeSelection,
 			turnId,
 			chatGptTurn: null,
@@ -408,6 +413,19 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 					if ( event.event.type === 'turn.terminal' ) {
 						run.terminal = event.event;
 						run.pendingClaudeApprovals = [];
+						run.pendingClaudeQuestions = [];
+					}
+					if ( event.event.type === 'question.asked' ) {
+						const request = event.event;
+						if ( run.seenClaudeQuestions.has( request.requestId ) ) return;
+						run.seenClaudeQuestions.add( request.requestId );
+						run.pendingClaudeQuestions.push( request );
+					}
+					if ( event.event.type === 'question.resolved' ) {
+						const { requestId } = event.event;
+						run.pendingClaudeQuestions = run.pendingClaudeQuestions.filter(
+							( request ) => request.requestId !== requestId
+						);
 					}
 				}
 				enqueueJsonEvent( run, event );
@@ -492,6 +510,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			phase: run.interrupted ? 'interrupting' : 'running',
 			pendingQuestions: run.pendingQuestions,
 			pendingClaudeApprovals: run.claude ? run.pendingClaudeApprovals : undefined,
+			pendingClaudeQuestions: run.claude ? run.pendingClaudeQuestions : undefined,
 		} ) );
 	}
 
@@ -502,6 +521,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 		}
 		run.interrupted = true;
 		run.pendingClaudeApprovals = [];
+		run.pendingClaudeQuestions = [];
 		run.interruptAttempts += 1;
 		if ( ! run.claude && runsBySessionId.get( run.sessionId ) === run ) {
 			runsBySessionId.delete( run.sessionId );
@@ -535,13 +555,33 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 		if ( ! run.claude ) run.child.kill( 'SIGKILL' );
 	}
 
-	function answerAgentRun( runId: string, answers: Record< string, string > ): void {
+	function answerAgentRun(
+		runId: string,
+		answers: Record< string, string >,
+		requestId?: string
+	): boolean {
 		const run = runsById.get( runId );
 		if ( ! run || ! run.child.connected ) {
-			return;
+			return false;
+		}
+		if ( requestId !== undefined ) {
+			if ( ! run.claude || run.interrupted || run.terminal ) return false;
+			const pending = run.pendingClaudeQuestions.find( ( item ) => item.requestId === requestId );
+			if ( ! pending || ! isCompleteClaudeAnswer( pending, answers ) ) return false;
+			run.child.send( {
+				type: 'question.answer',
+				runId,
+				turnId: pending.turnId,
+				requestId,
+				answers,
+			} );
+			run.pendingClaudeQuestions = run.pendingClaudeQuestions.filter(
+				( item ) => item !== pending
+			);
+			return true;
 		}
 		if ( run.claude ) {
-			if ( run.interrupted || run.terminal ) return;
+			if ( run.interrupted || run.terminal ) return false;
 			const accepted: Record< string, string > = {};
 			for ( const pending of run.pendingClaudeApprovals ) {
 				if ( answers[ pending.requestId ] === 'allow' || answers[ pending.requestId ] === 'deny' )
@@ -550,11 +590,13 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			run.pendingClaudeApprovals = run.pendingClaudeApprovals.filter(
 				( pending ) => ! ( pending.requestId in accepted )
 			);
-			if ( Object.keys( accepted ).length ) run.child.send( { type: 'answer', answers: accepted } );
-			return;
+			if ( ! Object.keys( accepted ).length ) return false;
+			run.child.send( { type: 'answer', answers: accepted } );
+			return true;
 		}
 		run.child.send( { type: 'answer', answers } );
 		run.pendingQuestions = [];
+		return true;
 	}
 
 	return { startAgentRun, listActiveAgentRuns, interruptAgentRun, answerAgentRun };

@@ -1,6 +1,6 @@
 import { createHash } from 'crypto';
 import { EventEmitter } from 'events';
-import { mkdtemp, realpath, rm, stat, writeFile } from 'fs/promises';
+import { mkdtemp, readFile, realpath, rm, stat, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { PassThrough } from 'stream';
@@ -28,6 +28,10 @@ import type { OwnershipFailure, ProcessOwner } from '@studio/common/lib/owned-pr
 
 // Whether Studio's image service is available, as a turn asks: off unless a
 // test says otherwise, so no turn here reads a stored login.
+vi.mock( '@studio/agent/node/global-instructions', async ( importOriginal ) => ( {
+	...( await importOriginal< object >() ),
+	readGlobalInstructions: async () => 'Use the saved Studio writing style.',
+} ) );
 const imageService = vi.hoisted( () => ( { available: false } ) );
 vi.mock( '@studio/agent/node/image-generation', async ( importOriginal ) => ( {
 	...( await importOriginal< object >() ),
@@ -784,7 +788,8 @@ it.each( [ true, false ] )(
 			expect( registered ).toContain( 'wp_cli' );
 			expect( registered.includes( 'generate_images' ) ).toBe( available );
 			const { append } = launched!.systemPrompt as { append: string };
-			expect( append ).not.toMatch( /image|imagery/i );
+			expect( append.includes( 'mcp__studio__generate_images' ) ).toBe( available );
+			expect( append.includes( 'no image generation service' ) ).toBe( ! available );
 		} finally {
 			imageService.available = false;
 			await fs.rm( root, { recursive: true, force: true } );
@@ -3295,13 +3300,14 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 		id: string,
 		query: Query,
 		overrides: Partial< Parameters< Runtime[ 'runClaudeTurn' ] >[ 3 ] > = {},
-		signal = new AbortController().signal
+		signal = new AbortController().signal,
+		prompt = 'hello'
 	) {
 		const events: Array< { type: string; outcome?: { status: string; code?: string } } > = [];
 		await runtime.runClaudeTurn(
 			turnSnapshot( fixture.root, fixture.config, id ),
 			fixture.host,
-			{ prompt: 'hello', signal, onEvent: ( event ) => events.push( event ) },
+			{ prompt, signal, onEvent: ( event ) => events.push( event ) },
 			{
 				storeRoot: fixture.storeRoot,
 				approve: async () => 'allow',
@@ -3481,7 +3487,7 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 			const started = optionsOf( fresh );
 			expect( started.resume ).toBeUndefined();
 			expect( typeof started.sessionId ).toBe( 'string' );
-			const note = started.systemPrompt.append;
+			const note = started.systemPrompt.append.split( 'Studio note: ' ).at( -1 );
 			expect( note ).toContain( 'interrupted' );
 			expect( note ).not.toMatch( /may or may not|inspect/i );
 			expect( await noted( fixture ) ).toEqual( [
@@ -3654,6 +3660,87 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 			} );
 			return fixture;
 		}
+
+		it( 'delivers the Studio contact-form runbook over MCP before the first native write', async () => {
+			const fixture = await siteFixture( 'claude-skill-routing-' );
+			try {
+				const runtime = await import( '../runtime' );
+				const { createNativeSessionStore } = await import( '../sessions' );
+				const { Client } = await import( '@modelcontextprotocol/sdk/client/index.js' );
+				// eslint-disable-next-line import-x/no-unresolved
+				const { InMemoryTransport } = await import( '@modelcontextprotocol/sdk/inMemory.js' );
+				const file = path.join( fixture.root, 'form.html' );
+				const args = { file_path: file, content: '<!-- wp:jetpack/contact-form /-->' };
+				const query = fakeNativeTurn( fixture.root, {
+					onTurn: async ( options ) => {
+						const append = ( options.systemPrompt as { append: string } ).append;
+						expect( append ).toContain( 'Use the saved Studio writing style.' );
+						expect( append ).toContain( 'mcp__studio__Skill' );
+						expect( append ).toMatch(
+							/forms[^.]*load plugin-recommendations[^.]*before the first write/i
+						);
+						const [ caller, receiver ] = InMemoryTransport.createLinkedPair();
+						const client = new Client( { name: 'studio-test', version: '1' } );
+						const { studio } = options.mcpServers as {
+							studio: { instance: { connect( t: unknown ): Promise< void > } };
+						};
+						await Promise.all( [ studio.instance.connect( receiver ), client.connect( caller ) ] );
+						try {
+							const result = await client.callTool( {
+								name: 'Skill',
+								arguments: { name: 'plugin-recommendations' },
+							} );
+							expect( result ).toMatchObject( {
+								isError: false,
+								content: [
+									{ type: 'text', text: expect.stringContaining( 'jetpack/contact-form' ) },
+								],
+							} );
+							const calls = nativeCallbacks( options, 'Write', 'first-write' );
+							expect( await calls.before( args ) ).toMatchObject( {
+								hookSpecificOutput: { permissionDecision: 'allow' },
+							} );
+							expect( await calls.permission( args ) ).toMatchObject( { behavior: 'allow' } );
+							await writeFile( file, args.content );
+							await calls.after( args, { type: 'create', filePath: file, content: args.content } );
+						} finally {
+							await client.close();
+						}
+					},
+				} );
+				const events = await turn(
+					runtime,
+					fixture,
+					'skill',
+					query,
+					{},
+					undefined,
+					'Add a contact form to my site.'
+				);
+				expect( events.at( -1 ) ).toMatchObject( { outcome: { status: 'success' } } );
+				const journal = await createNativeSessionStore( fixture.storeRoot )
+					.journal( 'chat', 'skill' )
+					.read();
+				const started = journal.find( ( e ) => e.type === 'tool.started' && e.name === 'Skill' );
+				expect( started?.type ).toBe( 'tool.started' );
+				const loaded = journal.findIndex(
+					( e ) =>
+						e.type === 'tool.result' &&
+						started?.type === 'tool.started' &&
+						e.toolCallId === started.toolCallId &&
+						e.skillName === 'plugin-recommendations' &&
+						! e.isError
+				);
+				const written = journal.findIndex(
+					( e ) => e.type === 'operation.authorized' && e.operation.tool === 'Write'
+				);
+				expect( loaded ).toBeGreaterThanOrEqual( 0 );
+				expect( written ).toBeGreaterThan( loaded );
+				expect( await readFile( file, 'utf8' ) ).toBe( args.content );
+			} finally {
+				await fixture.cleanup();
+			}
+		} );
 
 		it.each( [ 'ordinary', 'settled', 'allowed', 'denied' ] as const )(
 			'binds both native file callbacks to one decision and journals the path before a %s write',

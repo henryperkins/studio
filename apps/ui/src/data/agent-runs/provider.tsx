@@ -83,6 +83,8 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 	// Bumped by every change to a session's run, so a snapshot of active runs
 	// requested before the change doesn't overwrite it when it lands.
 	const sessionRevisionsRef = useRef< Map< string, number > >( new Map() );
+	const refreshActiveRunsRef = useRef< ( () => void ) | null >( null );
+	const questionsDuringSnapshotRef = useRef< Set< string > | null >( null );
 	const streamingRepliesRef = useRef< Map< string, StreamingReply > >( new Map() );
 
 	const dispatchSession = useCallback(
@@ -133,15 +135,22 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 		const syncActiveRuns = async () => {
 			const version = ++snapshotVersion;
 			const revisions = new Map( sessionRevisionsRef.current );
+			const changedQuestions = new Set< string >();
+			questionsDuringSnapshotRef.current = changedQuestions;
 			const unchanged = ( sessionId: string ) =>
+				! changedQuestions.has( sessionId ) &&
 				( revisions.get( sessionId ) ?? 0 ) ===
-				( sessionRevisionsRef.current.get( sessionId ) ?? 0 );
+					( sessionRevisionsRef.current.get( sessionId ) ?? 0 );
 			let runs: ActiveAgentRun[];
 			try {
 				runs = await connector.getActiveAgentRuns();
 			} catch {
-				// A failed snapshot should not break normal live event handling.
+				if ( ! cancelled && version === snapshotVersion && changedQuestions.size )
+					void syncActiveRuns();
 				return;
+			} finally {
+				if ( questionsDuringSnapshotRef.current === changedQuestions )
+					questionsDuringSnapshotRef.current = null;
 			}
 			if ( cancelled || version !== snapshotVersion ) {
 				return;
@@ -158,6 +167,13 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 			}
 			for ( const run of runs ) {
 				if ( ! unchanged( run.sessionId ) ) {
+					const current = stateStore.getState()[ run.sessionId ];
+					if (
+						run.pendingClaudeQuestions?.length &&
+						current?.runId === run.runId &&
+						current.phase === 'running'
+					)
+						changedQuestions.add( run.sessionId );
 					continue;
 				}
 				subscribedRunIdsBySessionRef.current.set( run.sessionId, run.runId );
@@ -168,10 +184,15 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					interrupting: run.phase === 'interrupting',
 					pendingQuestions: run.pendingQuestions,
 					pendingClaudeApprovals: run.pendingClaudeApprovals ?? [],
+					pendingClaudeQuestions: run.pendingClaudeQuestions ?? [],
 				} );
 			}
+			// A question may arrive before this provider knows the run ID, or while
+			// restoring an older unanswered batch. Read both from the owner again.
+			if ( changedQuestions.size ) void syncActiveRuns();
 		};
 
+		refreshActiveRunsRef.current = syncActiveRuns;
 		void syncActiveRuns();
 		const unsubscribe = connector.onConnectionRestored?.( () => {
 			void syncActiveRuns();
@@ -184,6 +205,8 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 		} );
 		return () => {
 			cancelled = true;
+			refreshActiveRunsRef.current = null;
+			questionsDuringSnapshotRef.current = null;
 			unsubscribe?.();
 		};
 	}, [ connector, dispatchSession, queryClient, stateStore ] );
@@ -223,6 +246,21 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 				return;
 			}
 
+			if (
+				payload.event.type === 'backend.event' &&
+				payload.event.event.runId === payload.runId &&
+				( payload.event.event.type === 'question.asked' ||
+					payload.event.event.type === 'question.resolved' )
+			) {
+				if ( questionsDuringSnapshotRef.current ) {
+					questionsDuringSnapshotRef.current.add( payload.sessionId );
+				} else if (
+					payload.event.event.type === 'question.asked' &&
+					stateStore.getState()[ payload.sessionId ]?.runId !== payload.runId
+				) {
+					refreshActiveRunsRef.current?.();
+				}
+			}
 			const subscribedRunId = subscribedRunIdsBySessionRef.current.get( payload.sessionId );
 			if ( subscribedRunId && payload.runId !== subscribedRunId ) {
 				return;
@@ -294,6 +332,8 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 						stateStore.getState()[ payload.sessionId ]?.runId === payload.runId &&
 						( event.event.type === 'approval.requested' ||
 							event.event.type === 'approval.resolved' ||
+							event.event.type === 'question.asked' ||
+							event.event.type === 'question.resolved' ||
 							event.event.type === 'turn.terminal' )
 					) {
 						dispatchSession( payload.sessionId, { type: 'claude_event', event: event.event } );

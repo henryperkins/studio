@@ -111,15 +111,17 @@ export function listActiveAgentRuns( requester?: WebContents ): ActiveAgentRun[]
 		);
 }
 
-export function interruptAgentRun( runId: string ): void {
+export function interruptAgentRun( runId: string, requester?: WebContents ): void {
+	if ( claudeRunCleanup.has( runId ) && runWebContents.get( runId ) !== requester ) return;
 	runManager.interruptAgentRun( runId );
 }
 
 export function answerAgentRun(
 	runId: string,
 	answers: Record< string, string >,
-	requester?: WebContents
-): void {
-	if ( claudeRunCleanup.has( runId ) && runWebContents.get( runId ) !== requester ) return;
-	runManager.answerAgentRun( runId, answers );
+	requester?: WebContents,
+	requestId?: string
+): boolean {
+	if ( claudeRunCleanup.has( runId ) && runWebContents.get( runId ) !== requester ) return false;
+	return runManager.answerAgentRun( runId, answers, requestId );
 }

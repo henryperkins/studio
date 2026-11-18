@@ -2648,6 +2648,11 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 	} );
 
 	api.post( '/runs/:runId/interrupt', ( req: Request, res: Response ) => {
+		const owner = claudeRunClients.get( req.params.runId );
+		if ( owner && ( owner !== req.body?.clientId || ! claudeClients.has( owner ) ) ) {
+			res.sendStatus( 403 );
+			return;
+		}
 		runManager.interruptAgentRun( req.params.runId );
 		res.sendStatus( 204 );
 	} );
@@ -2658,8 +2663,15 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 			res.sendStatus( 403 );
 			return;
 		}
-		const { answers } = req.body as { answers?: Record< string, string > };
-		runManager.answerAgentRun( req.params.runId, answers ?? {} );
+		const { answers, requestId } = req.body as {
+			answers?: Record< string, string >;
+			requestId?: string;
+		};
+		const accepted = runManager.answerAgentRun( req.params.runId, answers ?? {}, requestId );
+		if ( requestId !== undefined && ! accepted ) {
+			res.status( 409 ).json( { error: 'This question is no longer waiting for that answer.' } );
+			return;
+		}
 		res.sendStatus( 204 );
 	} );
 

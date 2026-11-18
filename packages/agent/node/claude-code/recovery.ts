@@ -263,10 +263,16 @@ async function planRecovery(
 		Extract< BackendTurnEvent, { type: 'approval.requested' } >
 	>();
 	const resolved = new Set< string >();
+	const pendingQuestions = new Map<
+		string,
+		Extract< BackendTurnEvent, { type: 'question.asked' } >
+	>();
 	for ( const event of events ) {
 		if ( event.type === 'approval.requested' && ! requested.has( event.requestId ) )
 			requested.set( event.requestId, event );
 		if ( event.type === 'approval.resolved' ) resolved.add( event.requestId );
+		if ( event.type === 'question.asked' ) pendingQuestions.set( event.requestId, event );
+		if ( event.type === 'question.resolved' ) pendingQuestions.delete( event.requestId );
 	}
 	const pending = [ ...requested.values() ].filter(
 		( event ) => ! resolved.has( event.requestId )
@@ -282,6 +288,13 @@ async function planRecovery(
 	};
 	return {
 		events: [
+			...[ ...pendingQuestions.values() ].map( ( { requestId, toolCallId } ) => ( {
+				type: 'question.resolved' as const,
+				...ids,
+				toolCallId,
+				requestId,
+				answers: null,
+			} ) ),
 			...pending.map( ( event ) => ( {
 				type: 'approval.resolved' as const,
 				...ids,

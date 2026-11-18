@@ -621,8 +621,8 @@ export function createIpcConnector(): Connector {
 			await ipcApi.interruptAiAgentRun( runId );
 		},
 
-		async answerAgentQuestion( runId, answers ) {
-			await ipcApi.answerAiAgentQuestion( runId, answers );
+		async answerAgentQuestion( runId, answers, requestId ) {
+			await ipcApi.answerAiAgentQuestion( runId, answers, requestId );
 		},
 
 		onAgentEvent( listener ) {

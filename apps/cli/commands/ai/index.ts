@@ -92,6 +92,10 @@ import {
 } from 'cli/ai/auth';
 import { runsOnChatGpt } from 'cli/ai/chatgpt';
 import { createClaudeApprovalRouter, getTerminalClaudeApprover } from 'cli/ai/claude-approval';
+import {
+	createClaudeQuestionRouter,
+	getTerminalClaudeQuestionAsker,
+} from 'cli/ai/claude-questions';
 import { cliAgentHost } from 'cli/ai/host';
 import { emitEvent } from 'cli/ai/json-events';
 import { type AiOutputAdapter, JsonAdapter } from 'cli/ai/output-adapter';
@@ -121,6 +125,7 @@ import { Logger, LoggerError } from 'cli/logger';
 import { StudioArgv } from 'cli/types';
 import type { SessionManager } from '@earendil-works/pi-coding-agent';
 import type { ClaudeApprover } from '@studio/agent/node/claude-code/execution-policy';
+import type { ClaudeQuestionAsker } from '@studio/agent/node/claude-code/questions';
 import type {
 	StudioCustomEntryDataMap,
 	StudioCustomEntryType,
@@ -309,6 +314,7 @@ async function resolveChatGptConnection( sm: SessionManager ): Promise< Connecti
 export async function runCommand( options: {
 	adapter: AiOutputAdapter;
 	approveClaude?: ClaudeApprover;
+	askClaude?: ClaudeQuestionAsker;
 	startupSignal?: AbortSignal;
 	initialMessage?: string;
 	initialTurnId?: string;
@@ -437,6 +443,19 @@ export async function runCommand( options: {
 			viaIpc: typeof process.send === 'function',
 			local: options.approveClaude,
 		} );
+		const preAnswered: ClaudeQuestionAsker | undefined =
+			ui instanceof JsonAdapter && ui.permissionResponse
+				? async () => {
+						const answers = ui.permissionResponse;
+						ui.permissionResponse = null;
+						if ( ! answers ) throw new Error( 'No further answers were supplied for this turn.' );
+						return answers;
+				  }
+				: undefined;
+		const questions = createClaudeQuestionRouter(
+			typeof process.send === 'function',
+			options.askClaude ?? preAnswered
+		);
 		const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
 		const claudeAgent = createAgent( {
 			host,
@@ -444,6 +463,7 @@ export async function runCommand( options: {
 				runClaudeTurn( snapshot, host, input, {
 					storeRoot: getClaudeSessionStoreRoot( getSessionsDirectory() ),
 					approve: approvals.approve,
+					askUser: questions.ask,
 					verifySession: ( turn ) => verifyClaudeTurnSession( getSessionsDirectory(), turn ),
 					verifyTarget: ( turn, expected ) =>
 						verifyClaudeTurnTarget( getSessionsDirectory(), turn, expected ),
@@ -480,14 +500,22 @@ export async function runCommand( options: {
 		);
 		const onMessage = ( value: unknown ) => {
 			if ( ! value || typeof value !== 'object' ) return;
-			const message = value as { type?: string; answers?: unknown };
-			if ( message.type === 'interrupt' ) void turn.interrupt();
+			const message = value as {
+				type?: string;
+				answers?: unknown;
+				requestId?: unknown;
+				runId?: unknown;
+				turnId?: unknown;
+			};
+			if ( message.type === 'interrupt' ) interrupt();
+			if ( message.type === 'question.answer' ) questions.answer( message );
 			if ( message.type === 'answer' && message.answers && typeof message.answers === 'object' )
 				approvals.answer( message.answers as Record< string, unknown > );
 		};
 		const interrupt = () => {
-			approvals.cancelAll();
 			void turn.interrupt();
+			questions.cancelAll();
+			approvals.cancelAll();
 		};
 		process.on( 'message', onMessage );
 		process.on( 'disconnect', interrupt );
@@ -503,6 +531,7 @@ export async function runCommand( options: {
 			process.off( 'SIGINT', interrupt );
 			options.startupSignal?.removeEventListener( 'abort', interrupt );
 			approvals.cancelAll();
+			questions.cancelAll();
 		}
 		return;
 	}
@@ -1436,6 +1465,7 @@ export const registerCommand = ( yargs: StudioArgv ) => {
 				await runCommand( {
 					adapter,
 					approveClaude: typedArgv.json ? undefined : getTerminalClaudeApprover(),
+					askClaude: typedArgv.json ? undefined : getTerminalClaudeQuestionAsker(),
 					initialMessage,
 					resumeSessionId: typedArgv.resumeSession,
 					showLegacyCommandNotice: argv._[ 0 ] === 'ai',

@@ -1,9 +1,16 @@
 import { randomUUID } from 'crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk/core';
 import { z } from 'zod';
 import { resolveStudioToolDefinitions } from '../tools';
+import { createAskUserQuestionTool } from '../tools/ask-user-question';
 import { bindTool } from '../tools/define-tool';
 import { runStudioTool } from '../tools/execution';
+import {
+	createPresentDesignOptionsTool,
+	DesignPreviewInputError,
+} from '../tools/present-design-options';
+import { createSkillTool } from '../tools/skill';
 import { createClaudeDirectoryListing } from './directory-listing';
 import {
 	CLAUDE_ENABLED_TOOLS,
@@ -14,11 +21,13 @@ import {
 	claudeStudioTools,
 	isRecord,
 } from './execution-rules';
+import { ClaudeQuestionInputError } from './questions';
+import { currentClaudeWebCall } from './web-call';
 import { WebRefusal } from './web-http';
 import { withClaudeWebCall } from './web-transport';
+import type { AskUserQuestion } from '../types';
 import type { ClaudeExecutionPolicy } from './execution-policy';
 import type { StudioAgentHost } from '../host';
-import type { StudioToolsOptions } from '../tools';
 import type { StudioToolDefinition, ToolResult } from '../tools/define-tool';
 import type { StudioToolRun } from '../tools/execution';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
@@ -26,21 +35,16 @@ import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 type BridgeResult = { content: ToolResult[ 'content' ]; isError: boolean };
 const directoryListing = createClaudeDirectoryListing();
 
-/**
- * What the Claude route offers the registry, as the Pi route passes a turn's
- * capabilities. Claude's models see images. Questions and design choices are
- * not bridged yet (C2c). `generate_images` is offered only to a turn that
- * found Studio's image service (`ClaudeStudioToolCapabilities`).
- */
-const CLAUDE_STUDIO_TOOL_CAPABILITIES: StudioToolsOptions = Object.freeze( {
-	visionEnabled: true,
-	canAskUser: false,
-	imageGeneration: false,
-	wpcomRequest: true,
-} );
+type Present = (
+	questions: AskUserQuestion[],
+	onPresented?: () => void
+) => Promise< Record< string, string > >;
 
-/** What a turn found that changes the tools it offers. */
 export interface ClaudeStudioToolCapabilities {
+	bundled?: boolean;
+	onAskUser?: Present;
+	designPreviews?: boolean;
+	browserTools?: boolean;
 	/** Studio's image service is available (`isImageGenerationAvailable`), as the Pi route asks. */
 	imageGeneration?: boolean;
 }
@@ -50,11 +54,29 @@ export function claudeStudioToolCandidates(
 	host: Pick< StudioAgentHost, 'ui' >,
 	capabilities: ClaudeStudioToolCapabilities = {}
 ): StudioToolDefinition[] {
+	const { onAskUser } = capabilities;
+	const canAskUser = Boolean( onAskUser );
+	const designPreviews = Boolean( onAskUser && host.ui && capabilities.designPreviews );
+	const imageGeneration = capabilities.imageGeneration === true;
+	const skill =
+		capabilities.bundled === false
+			? null
+			: createSkillTool( {
+					canAskUser,
+					designPreviews,
+					imageGeneration,
+					browserTools: capabilities.browserTools === true,
+			  } );
 	return [
 		...resolveStudioToolDefinitions( host, {
-			...CLAUDE_STUDIO_TOOL_CAPABILITIES,
-			imageGeneration: capabilities.imageGeneration === true,
-		} ),
+			visionEnabled: true,
+			wpcomRequest: true,
+			imageGeneration,
+			canAskUser,
+		} ).filter( ( item ) => capabilities.bundled !== false || item.name !== 'pick_design' ),
+		...( onAskUser ? [ createAskUserQuestionTool( onAskUser ) ] : [] ),
+		...( onAskUser && designPreviews ? [ createPresentDesignOptionsTool( { onAskUser } ) ] : [] ),
+		...( skill ? [ skill ] : [] ),
 		directoryListing,
 	];
 }
@@ -121,10 +143,23 @@ function describeNotRun(
 	if ( run?.status === 'failed' && run.error instanceof WebRefusal )
 		return 'Studio stopped the tool because a browser or network request could not pass its guard.';
 	if ( refused.length ) return `Studio did not run this. ${ refused.join( ' ' ) }`;
+	if (
+		run?.status === 'failed' &&
+		( run.error instanceof ClaudeQuestionInputError ||
+			run.error instanceof DesignPreviewInputError )
+	)
+		return run.error.message;
 	return 'Studio operation denied or failed.';
 }
 
-export interface ClaudeStudioToolBridgeOptions extends ClaudeStudioToolCapabilities {
+export interface ClaudeStudioToolBridgeOptions
+	extends Omit< ClaudeStudioToolCapabilities, 'onAskUser' | 'browserTools' > {
+	ask?: (
+		questions: AskUserQuestion[],
+		signal: AbortSignal,
+		toolCallId: string,
+		onPresented?: () => void
+	) => ReturnType< Present >;
 	/**
 	 * Narrows the tools a call can name before the policy selects; by default the
 	 * host's candidates. Only those candidates' own definitions count: the policy
@@ -147,7 +182,25 @@ export function createStudioClaudeToolBridge(
 ) {
 	const { runId, turnId, policy } = turn;
 	const enabled = new Set( policy.studioTools );
-	const registry = claudeStudioToolCandidates( host, options );
+	const calls = new AsyncLocalStorage< { signal: AbortSignal; toolCallId: string } >();
+	const ask = options.ask;
+	const registry = claudeStudioToolCandidates( host, {
+		...options,
+		designPreviews:
+			options.designPreviews !== false &&
+			Boolean( host.screenshotsDirectory ) &&
+			enabled.has( 'present_design_options' ),
+		browserTools: enabled.has( 'inspect_design' ),
+		onAskUser:
+			ask &&
+			( ( questions, onPresented ) => {
+				const call = calls.getStore();
+				if ( ! call ) throw new Error( 'Question outside its tool call' );
+				const signal = currentClaudeWebCall()?.signal ?? call.signal;
+				signal.throwIfAborted();
+				return ask( questions, signal, call.toolCallId, onPresented );
+			} ),
+	} );
 	const tools = ( options.candidates ?? registry )
 		.filter( ( definition ) => registry.includes( definition ) && enabled.has( definition.name ) )
 		.map( ( definition ) =>
@@ -207,14 +260,16 @@ export function createStudioClaudeToolBridge(
 						};
 					}
 				}
-				run = await runStudioTool( bound, args, {
-					signal: activity,
-					authorize: () => policy.authorizeStudioCall( { host, name, args, toolCallId, signal } ),
-					onProgress: ( message, update ) =>
-						onEvent( { type: 'tool.progress', runId, turnId, toolCallId, message, update } ),
-					ui,
-					completion: {},
-				} );
+				run = await calls.run( { signal: activity, toolCallId }, () =>
+					runStudioTool( bound, args, {
+						signal: activity,
+						authorize: () => policy.authorizeStudioCall( { host, name, args, toolCallId, signal } ),
+						onProgress: ( message, update ) =>
+							onEvent( { type: 'tool.progress', runId, turnId, toolCallId, message, update } ),
+						ui,
+						completion: {},
+					} )
+				);
 			} catch {
 				run = undefined;
 			} finally {
@@ -222,7 +277,8 @@ export function createStudioClaudeToolBridge(
 				// What the call left unsettled is undone before its result is heard.
 				await policy.endCall( toolCallId );
 			}
-			if ( web && activity.aborted ) run = { status: 'cancelled' };
+			if ( activity.aborted && ( web || name === 'AskUserQuestion' ) )
+				run = { status: 'cancelled' };
 			if ( run?.status !== 'completed' && ! artifactDelivered ) {
 				await Promise.allSettled( discard.map( async ( cleanup ) => cleanup() ) );
 			}
@@ -235,7 +291,17 @@ export function createStudioClaudeToolBridge(
 				content: [ { type: 'text', text: describeNotRun( name, run, refused ) } ],
 			};
 		}
-		onEvent( { type: 'tool.result', runId, turnId, toolCallId, isError: false } );
+		onEvent( {
+			type: 'tool.result',
+			runId,
+			turnId,
+			toolCallId,
+			isError: false,
+			// Only a successful Skill call has passed the installed catalog's enum.
+			...( name === 'Skill' && isRecord( args ) && typeof args.name === 'string'
+				? { skillName: args.name }
+				: {} ),
+		} );
 		const content = run.result.content.map( ( part ) =>
 			part.type === 'text' ? { ...part, text: claudeResultText( name, args, part.text ) } : part
 		);

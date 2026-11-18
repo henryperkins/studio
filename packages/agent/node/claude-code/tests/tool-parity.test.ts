@@ -34,9 +34,6 @@ import type {
 // Claude route below, and that status must be what the Claude execution policy
 // actually enables and what the Claude bridge actually lists.
 
-// The steps that still qualify a tool, each named by at least one.
-const STEPS = [ 'C2c' ] as const;
-type Step = ( typeof STEPS )[ number ];
 type ClaudeStatus =
 	// Bridged from the registry and qualified by the policy.
 	| { status: 'bridged'; piBuiltin?: true }
@@ -45,12 +42,7 @@ type ClaudeStatus =
 	// Bridged and qualified like `bridged`, but registered only for a host with
 	// `capability`: neither route lists it without it, and Claude lists it in
 	// exactly the scenarios where Pi does.
-	| { status: 'absent'; capability: Capability }
-	// Not enabled yet: why, and the step that qualifies it. `native` names the
-	// Claude Code tool that would stand for it.
-	| { status: 'unqualified'; step: Step; reason: string; native?: string };
-
-const BROWSER = 'Drives a browser; needs the navigation guard (contract revision 2)';
+	| { status: 'absent'; capability: Capability };
 
 const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	wp_cli: { status: 'bridged' },
@@ -81,26 +73,10 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	need_for_speed: { status: 'bridged' },
 	rank_me_up: { status: 'bridged' },
 	open_annotation_browser: { status: 'bridged' },
-	AskUserQuestion: {
-		status: 'unqualified',
-		step: 'C2c',
-		reason: 'The Claude route has no question channel yet',
-	},
-	present_design_options: {
-		status: 'unqualified',
-		step: 'C2c',
-		reason: `Design choices need the question channel; ${ BROWSER }`,
-	},
-	pick_design: {
-		status: 'unqualified',
-		step: 'C2c',
-		reason: 'Design choice; offers options to pick only with a question channel',
-	},
-	Skill: {
-		status: 'unqualified',
-		step: 'C2c',
-		reason: 'Skills and their capability gates are not bridged yet',
-	},
+	AskUserQuestion: { status: 'absent', capability: 'questions' },
+	present_design_options: { status: 'absent', capability: 'questions' },
+	pick_design: { status: 'bridged' },
+	Skill: { status: 'bridged' },
 	Read: { status: 'native', native: 'Read' },
 	Write: { status: 'native', native: 'Write' },
 	Edit: { status: 'native', native: 'Edit' },
@@ -270,13 +246,20 @@ async function claudeToolNames( scenario: Scenario ): Promise< string[] > {
 		navigationConfinement: guarded( targetOrigin ),
 	} ) );
 	try {
-		if ( scenario.ui ) fixture.host.ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
+		if ( scenario.ui ) {
+			fixture.host.ui = { showArtifact: vi.fn(), reloadPreview: vi.fn() };
+			fixture.host.screenshotsDirectory = () =>
+				path.join( fixture.parent, 'conversation.screenshots' );
+		}
 		mocks.imageService = scenario.imageService;
 		const bridge = createStudioClaudeToolBridge(
 			fixture.host,
 			{ runId: 'run', turnId: 'turn', policy: fixture.policy },
 			() => {},
-			{ imageGeneration: await isImageGenerationAvailable() }
+			{
+				imageGeneration: await isImageGenerationAvailable(),
+				ask: scenario.questions ? async () => ( {} ) : undefined,
+			}
 		);
 		try {
 			return await listed( bridge.server );
@@ -365,16 +348,6 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 
 	it( 'gives every registered tool exactly one status, and no status to a tool the Pi route never registers', () => {
 		expect( Object.keys( CLAUDE_TOOL_STATUS ).sort() ).toEqual( registered() );
-		const named = new Set< Step >();
-		for ( const [ name, status ] of statuses() ) {
-			if ( status.status === 'unqualified' ) {
-				expect( status.reason.length, name ).toBeGreaterThan( 0 );
-				expect( STEPS, name ).toContain( status.step );
-				named.add( status.step );
-			}
-		}
-		// A step no tool waits for is done, and named nowhere.
-		expect( [ ...STEPS ] ).toEqual( STEPS.filter( ( step ) => named.has( step ) ) );
 	} );
 
 	it( 'marks qualified exactly what the execution policy enables, and nothing it does not', () => {
@@ -393,13 +366,6 @@ describe( 'Studio tools on the Claude route, against the Pi route’s registry',
 					expect( CLAUDE_NATIVE_TOOL_RULES.has( status.native ), name ).toBe( true );
 					expect( native, name ).toContain( status.native );
 					break;
-				default:
-					expect( studio, name ).not.toContain( name );
-					if ( rule ) expect( isQualifiedStudioRule( rule ), name ).toBe( false );
-					if ( status.status === 'unqualified' && status.native ) {
-						expect( CLAUDE_NATIVE_TOOL_RULES.has( status.native ), name ).toBe( true );
-						expect( native, name ).not.toContain( status.native );
-					}
 			}
 		}
 		// Whatever the policy enables, the table marks as bridged, or as absent

@@ -51,7 +51,7 @@ wp_cli eval 'foreach (\WP_Block_Type_Registry::get_instance()->get_all_registere
 
 4. If you expect a plugin block but it is missing, check whether the plugin uses modules or feature flags, then activate the relevant module.
 5. Use the registered block in editable block markup.
-6. Validate generated block markup with `validate_blocks`, passing `filePath` when the content lives in a file so safe editor fixes are applied automatically.
+{{#browserTools}}6. Validate generated block markup with `validate_blocks`, passing `filePath` when the content lives in a file so safe editor fixes are applied automatically.{{else}}6. Review generated block markup and identify outstanding live editor checks.{{/browserTools}}
 
 ## WooCommerce Shop Sites
 
@@ -83,12 +83,12 @@ wp_cli option update woocommerce_default_country "US:CA"
 
 4. Add products that match what the shop actually sells. Create real, contextual products - coffee products for a coffee shop, books for a bookstore, plants for a plant store - rather than generic placeholders. Only fall back to generic sample products when the shop's niche is genuinely unknown. Populate the catalog first: create each product with its core details (name, type, price, description, category) right away so the shop is functional, then enrich them with images. Sourcing images is the slowest part - never let it block products from being created, and never skip product creation because images are not ready yet.
 
-Products should ideally have a real, relevant image, and a storefront with product images looks far more complete than one with placeholder thumbnails. **Do not pass remote image URLs via `--images` with `src`.** WooCommerce derives the upload filename from the URL's basename, and the extension-less CDN URLs most image hosts return (e.g. `https://images.unsplash.com/photo-1589924691995-400dc9ecc119?w=600`) are rejected with `Invalid image: Sorry, you are not allowed to upload this file type`. Instead, put each image in the media library and reference its attachment ID: when `generate_images` is available, generate the product images under the site's `wp-content/uploads/` (see the `imagery` skill), which adds them to the media library and reports each attachment ID; otherwise download each image to the site with a real extension and import it. The WooCommerce CLI requires a `--user`:
+Products should ideally have a real, relevant image, and a storefront with product images looks far more complete than one with placeholder thumbnails. **Do not pass remote image URLs via `--images` with `src`.** WooCommerce derives the upload filename from the URL's basename, and the extension-less CDN URLs most image hosts return (e.g. `https://images.unsplash.com/photo-1589924691995-400dc9ecc119?w=600`) are rejected with `Invalid image: Sorry, you are not allowed to upload this file type`. Instead, put each image in the media library and reference its attachment ID: {{#imageGeneration}}when `generate_images` is available, generate the product images under the site's `wp-content/uploads/` (see the `imagery` skill), which adds them to the media library and reports each attachment ID; otherwise download each image to the site with a real extension and import it.{{else}}use existing site images from the media library, or import a local product image the user supplied.{{/imageGeneration}} The WooCommerce CLI requires a `--user`:
 
 ```text
-# Without generate_images: download the image to the site's uploads with a real .jpg/.png/.webp name (use the Bash tool with the site path from site_info), then import it for its attachment ID:
+{{#imageGeneration}}# Without generate_images: download the image to the site's uploads with a real .jpg/.png/.webp name (use the Bash tool with the site path from site_info), then import it for its attachment ID:
 #   curl -L "<image-url>" -o "<site-path>/wp-content/uploads/premium-dog-food.jpg"
-wp_cli media import wp-content/uploads/premium-dog-food.jpg --porcelain
+{{/imageGeneration}}wp_cli media import wp-content/uploads/premium-dog-food.jpg --porcelain
 wp_cli wc product create --name="Premium Dog Food" --type=simple --regular_price=42 --status=publish --description="High-protein, grain-free kibble made with real chicken." --images='[{"id":<attachmentId>}]' --categories='[{"id":N}]' --user=admin
 ```
 
@@ -178,7 +178,7 @@ Sensei works fully on a local site. Course delivery, lessons, quizzes, and stude
 - Courses and lessons are custom post types (`course`, `lesson`). Create them with `wp_cli post create --post_type=course …` / `--post_type=lesson …`, or in the editor. Quizzes and questions (`quiz`, `question` post types) are managed through the Sensei quiz block inside a lesson — do not create them directly via `wp_cli post create`.
 - Build course and lesson pages from Sensei's registered blocks rather than plain markup. Discover them with the block-registry command from the Discovery Workflow (filter on `sensei-lms/`). Common ones: `sensei-lms/course-outline`, `sensei-lms/course-progress`, `sensei-lms/button-take-course`, `sensei-lms/lesson-actions`, `sensei-lms/quiz`, and `sensei-lms/learner-courses`.
 - Activating Sensei creates the Courses page and core Sensei pages automatically; wire a "Courses" link into the primary navigation.
-- Validate any block markup you generate with `validate_blocks`.
+{{#browserTools}}- Validate any block markup you generate with `validate_blocks`.{{else}}- Review the block markup and identify outstanding live editor checks.{{/browserTools}}
 
 ## Crowdsignal (polls, surveys, ratings)
 
@@ -188,7 +188,7 @@ For polls, surveys, ratings, NPS, feedback prompts, or applause/reactions, use C
 wp_cli plugin install crowdsignal-forms --activate
 ```
 
-Registered blocks: `crowdsignal-forms/poll`, `crowdsignal-forms/vote` (with `crowdsignal-forms/vote-item` children), `crowdsignal-forms/feedback`, `crowdsignal-forms/nps`, and `crowdsignal-forms/applause`. These register and stay editable on a local site, so use them in block markup and validate with `validate_blocks`.
+{{#browserTools}}Registered blocks: `crowdsignal-forms/poll`, `crowdsignal-forms/vote` (with `crowdsignal-forms/vote-item` children), `crowdsignal-forms/feedback`, `crowdsignal-forms/nps`, and `crowdsignal-forms/applause`. These register and stay editable on a local site, so use them in block markup and validate with `validate_blocks`.{{else}}Registered blocks include `crowdsignal-forms/poll`, `crowdsignal-forms/vote` and `crowdsignal-forms/feedback`. Verify the saved content in the editor.{{/browserTools}}
 
 Storing real responses requires a free Crowdsignal.com account and API key (the plugin's Settings → Crowdsignal connection); the blocks render and remain editable without it, but won't record results until connected. Mention this when the user expects live results. For a simple contact or data-collection form (not a poll/survey), prefer Jetpack Forms instead.
 
@@ -230,4 +230,4 @@ Then activate the needed module:
 wp_cli jetpack module activate <slug>
 ```
 
-3. Use the registered block in page markup and validate with `validate_blocks`, passing `filePath` when possible.
+{{#browserTools}}3. Use the registered block in page markup and validate with `validate_blocks`, passing `filePath` when possible.{{else}}3. Use the registered block in page markup and identify outstanding live editor checks.{{/browserTools}}

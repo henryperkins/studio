@@ -125,7 +125,7 @@ export type BackendTurnEvent = BackendTurnIds &
 				/** Set by Studio when cleanup of a Claude call's image reservations could not be confirmed. */
 				unsettledMediaReservations?: number;
 		  } & ToolCall )
-		| ( { type: 'tool.result'; message?: string; isError: boolean } & ToolCall )
+		| ( { type: 'tool.result'; message?: string; isError: boolean; skillName?: string } & ToolCall )
 		| ( {
 				type: 'approval.requested';
 				requestId: string;
@@ -136,6 +136,7 @@ export type BackendTurnEvent = BackendTurnIds &
 		| ( { type: 'approval.resolved'; requestId: string } & ToolCall )
 		| {
 				type: 'question.asked';
+				toolCallId?: string;
 				requestId: string;
 				questions: Array< {
 					question: string;
@@ -143,6 +144,12 @@ export type BackendTurnEvent = BackendTurnIds &
 					multiSelect?: boolean;
 					allowFreeForm?: boolean;
 				} >;
+		  }
+		| {
+				type: 'question.resolved';
+				toolCallId?: string;
+				requestId: string;
+				answers: Record< string, string > | null;
 		  }
 		| { type: 'chat.artifact'; artifact: StudioChatArtifactData }
 		| { type: 'preview.reload' }

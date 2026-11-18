@@ -20,5 +20,6 @@ export interface ActiveAgentRun {
 	startedAt: number;
 	phase: 'running' | 'interrupting';
 	pendingClaudeApprovals?: Extract< BackendTurnEvent, { type: 'approval.requested' } >[];
+	pendingClaudeQuestions?: Extract< BackendTurnEvent, { type: 'question.asked' } >[];
 	pendingQuestions?: Extract< JsonEvent, { type: 'question.asked' } >[ 'questions' ];
 }

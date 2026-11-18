@@ -462,18 +462,21 @@ export async function setAiSessionEnvironment(
 }
 
 export async function interruptAiAgentRun(
-	_event: IpcMainInvokeEvent,
+	event: IpcMainInvokeEvent,
 	runId: string
 ): Promise< void > {
-	interruptAgentRun( runId );
+	interruptAgentRun( runId, event.sender );
 }
 
 export async function answerAiAgentQuestion(
 	event: IpcMainInvokeEvent,
 	runId: string,
-	answers: Record< string, string >
+	answers: Record< string, string >,
+	requestId?: string
 ): Promise< void > {
-	answerAgentRun( runId, answers, event.sender );
+	const accepted = answerAgentRun( runId, answers, event.sender, requestId );
+	if ( requestId !== undefined && ! accepted )
+		throw new Error( __( 'This question is no longer waiting for that answer.' ) );
 }
 
 export async function getWordPressSkillsStatusAllSites(

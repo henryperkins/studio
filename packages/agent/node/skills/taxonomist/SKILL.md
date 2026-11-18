@@ -182,14 +182,14 @@ Then show the **full dry run** — a table of every post that would change, show
 
 ## Step 6: Review
 
-**CRITICAL: You MUST use the `AskUserQuestion` tool here to get explicit approval before proceeding.** Do NOT continue to Step 7 without the user's explicit "yes" or approval.
+**CRITICAL: You MUST {{#canAskUser}}use the `AskUserQuestion` tool here{{else}}ask in your reply and wait{{/canAskUser}} to get explicit approval before proceeding.** Do NOT continue to Step 7 without the user's explicit "yes" or approval.
 
-Present the plan, then use `AskUserQuestion` with options like:
+Present the plan, then {{#canAskUser}}use `AskUserQuestion`{{else}}ask in your reply{{/canAskUser}} with options like:
 - "Approve and apply changes"
 - "I want to adjust some categories first"
 - "Cancel — don't make any changes"
 
-If the user wants adjustments, iterate on the plan and use `AskUserQuestion` again for each revision until they approve.
+If the user wants adjustments, iterate on the plan and {{#canAskUser}}use `AskUserQuestion` again{{else}}ask again in your reply{{/canAskUser}} for each revision until they approve.
 
 ## Step 7: Apply Descriptions
 
@@ -213,7 +213,7 @@ First, do a **preview** (dry run) using `wp_cli`:
 eval-file tmp/taxonomist/apply-changes.php taxonomist-data/results/suggestions.json taxonomist-data/logs/preview-{timestamp}.tsv preview
 ```
 
-Show the user the preview results. **Use `AskUserQuestion` to confirm** before applying. After they confirm, run again with:
+Show the user the preview results. **{{#canAskUser}}Use `AskUserQuestion` to confirm{{else}}Ask for confirmation in your reply and wait{{/canAskUser}}** before applying. After they confirm, run again with:
 
 ```
 eval-file tmp/taxonomist/apply-changes.php taxonomist-data/results/suggestions.json taxonomist-data/logs/changes-{timestamp}.tsv apply

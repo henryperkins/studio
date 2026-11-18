@@ -7,6 +7,7 @@ import { validateStudioVisualAnnotations } from '@studio/agent/protocol/visual-a
 import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { __ } from '@wordpress/i18n';
 import { getTerminalClaudeApprover } from 'cli/ai/claude-approval';
+import { getTerminalClaudeQuestionAsker } from 'cli/ai/claude-questions';
 import { JsonAdapter } from 'cli/ai/output-adapter';
 import { AiChatUI } from 'cli/ai/ui';
 import { runCommand as runAiCommand } from 'cli/commands/ai';
@@ -14,6 +15,7 @@ import { chooseSessionForAction } from 'cli/commands/ai/sessions/helpers';
 import { Logger, LoggerError } from 'cli/logger';
 import { StudioArgv } from 'cli/types';
 import type { ClaudeApprover } from '@studio/agent/node/claude-code/execution-policy';
+import type { ClaudeQuestionAsker } from '@studio/agent/node/claude-code/questions';
 import type { StudioAiSessionInputPayload } from '@studio/agent/protocol/chat-images';
 import type { AiOutputAdapter } from 'cli/ai/output-adapter';
 
@@ -39,6 +41,7 @@ export async function runCommand(
 	sessionIdOrPrefix?: string,
 	options: {
 		approveClaude?: ClaudeApprover;
+		askClaude?: ClaudeQuestionAsker;
 		message?: string;
 		displayMessage?: string;
 		inputPayloadPath?: string;
@@ -98,6 +101,7 @@ export async function runCommand(
 		await runAiCommand( {
 			adapter,
 			approveClaude: options.approveClaude,
+			askClaude: options.askClaude,
 			startupSignal: startup.signal,
 			resumeSession: session,
 			initialMessage: inputPayload?.prompt ?? options.message,
@@ -165,6 +169,7 @@ export const registerCommand = ( yargs: StudioArgv ) => {
 				};
 				await runCommand( typedArgv.id, {
 					approveClaude: typedArgv.json ? undefined : getTerminalClaudeApprover(),
+					askClaude: typedArgv.json ? undefined : getTerminalClaudeQuestionAsker(),
 					message: typedArgv.message,
 					displayMessage: typedArgv.displayMessage,
 					inputPayloadPath: typedArgv.inputPayload,

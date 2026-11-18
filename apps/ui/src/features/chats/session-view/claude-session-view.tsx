@@ -30,7 +30,9 @@ import {
 	Textarea,
 } from '@/lib/ui';
 import { ClaudeApprovalCard } from './claude-approval-card';
+import { claudeMediaPath } from './claude-media-path';
 import { ClaudeNewChat } from './claude-new-chat';
+import { ClaudeQuestionBatch } from './claude-question-batch';
 import { ChatArtifact } from './conversation';
 import { SessionFrame } from './session-frame';
 import styles from './style.module.css';
@@ -38,19 +40,9 @@ import type { LoadedAiSession, SessionEntry } from '@/data/core';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 
 function screenshotWidgets( artifact: StudioChatArtifactData, sessionFile: string ) {
-	if ( ! sessionFile.endsWith( '.jsonl' ) ) return [];
-	const sidecar = sessionFile.slice( 0, -'.jsonl'.length ) + '.screenshots';
-	const directoryName = sidecar.split( /[\\/]/ ).at( -1 );
 	return artifact.widgets.flatMap( ( widget ) => {
-		const source = getLocalMediaPath( widget )?.split( /[\\/]/ );
-		const name = source?.at( -1 );
-		if (
-			! isRenderableMediaWidget( widget ) ||
-			! name ||
-			source?.at( -2 ) !== directoryName ||
-			! /^[a-z0-9_-]+\.(png|jpe?g|webp)$/i.test( name )
-		)
-			return [];
+		const path = claudeMediaPath( sessionFile, getLocalMediaPath( widget ) );
+		if ( ! isRenderableMediaWidget( widget ) || ! path ) return [];
 		return [
 			{
 				...widget,
@@ -58,7 +50,7 @@ function screenshotWidgets( artifact: StudioChatArtifactData, sessionFile: strin
 					...widget.widgetProps,
 					source: {
 						type: 'local',
-						path: sidecar + ( sessionFile.includes( '\\' ) ? '\\' : '/' ) + name,
+						path,
 					},
 				},
 			},
@@ -106,9 +98,29 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 		! catalog.isFetching &&
 		catalog.data.ok;
 	const events = ( data.claudeJournal ?? [] ).flat();
+	const questionKey = ( event: { runId: string; turnId: string; requestId: string } ) =>
+		JSON.stringify( [ event.runId, event.turnId, event.requestId ] );
+	const asked = new Set< string >();
+	const liveQuestions = new Set( run.pendingClaudeQuestions.map( questionKey ) );
+	const resolutions = new Map<
+		string,
+		Extract< BackendTurnEvent, { type: 'question.resolved' } >
+	>();
+	const terminal = new Map<
+		string,
+		Extract< BackendTurnEvent, { type: 'turn.terminal' } >[ 'outcome' ][ 'status' ]
+	>();
+	const transcript = [ ...events, ...run.pendingClaudeQuestions ];
 	const content = new Map< string, { index: number; sequence: number } >();
 	const visible = new Set< number >();
-	for ( const [ index, event ] of events.entries() ) {
+	for ( const [ index, event ] of transcript.entries() ) {
+		if ( event.type === 'question.asked' ) {
+			const key = questionKey( event );
+			if ( asked.has( key ) ) continue;
+			asked.add( key );
+		}
+		if ( event.type === 'question.resolved' ) resolutions.set( questionKey( event ), event );
+		if ( event.type === 'turn.terminal' ) terminal.set( event.runId, event.outcome.status );
 		if ( event.type !== 'content.provisional' && event.type !== 'content.confirmed' ) {
 			visible.add( index );
 			continue;
@@ -121,7 +133,7 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 		visible.add( index );
 		content.set( key, { index, sequence } );
 	}
-	const visibleEvents = events.filter( ( _event, index ) => visible.has( index ) );
+	const visibleEvents = transcript.filter( ( _event, index ) => visible.has( index ) );
 	const pending = run.pendingClaudeApprovals.filter(
 		( event ) =>
 			state.data?.enabled &&
@@ -303,6 +315,30 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 		>
 			<div className={ styles.column } data-chat-transcript>
 				{ visibleEvents.map( ( event, index ) => {
+					if ( event.type === 'question.asked' ) {
+						const key = questionKey( event );
+						return (
+							<ClaudeQuestionBatch
+								key={ key }
+								request={ event }
+								sessionId={ sessionId }
+								sessionFile={ data.summary.filePath }
+								resolution={ resolutions.get( key ) }
+								active={
+									!! state.data?.enabled &&
+									run.runId === event.runId &&
+									run.isRunning &&
+									! run.isInterrupting &&
+									! terminal.has( event.runId ) &&
+									liveQuestions.has( key )
+								}
+								cancelled={
+									( run.runId === event.runId && run.isInterrupting ) ||
+									terminal.get( event.runId ) === 'interrupted'
+								}
+							/>
+						);
+					}
 					if ( event.type === 'chat.artifact' && isStudioChatArtifactData( event.artifact ) ) {
 						return (
 							<ChatArtifact

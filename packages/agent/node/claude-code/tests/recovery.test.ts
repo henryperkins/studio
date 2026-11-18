@@ -322,6 +322,35 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 		)();
 	} );
 
+	it( 'closes only unanswered question batches when recovering a dead owner', async () => {
+		const fixture = await recoveryFixture();
+		const asked = {
+			type: 'question.asked' as const,
+			...ids,
+			toolCallId: 'tool',
+			requestId: 'asked',
+			questions: [],
+		};
+		const answered = { ...asked, requestId: 'answered' };
+		await fixture.deadTurn( {
+			journal: [
+				asked,
+				answered,
+				{
+					type: 'question.resolved',
+					...ids,
+					requestId: answered.requestId,
+					answers: { 'Style?': 'A' },
+				},
+			],
+		} );
+		expect( ( await fixture.recover() ).status ).toBe( 'recovered' );
+		const journals = await fixture.store.readJournals( 'chat' );
+		expect( journals[ 1 ].filter( ( event ) => event.type === 'question.resolved' ) ).toEqual( [
+			{ type: 'question.resolved', ...ids, toolCallId: 'tool', requestId: 'asked', answers: null },
+		] );
+	} );
+
 	it( 'recovers a turn that never started its native process without asking about any', async () => {
 		const fixture = await recoveryFixture();
 		await fixture.deadTurn( { stage: 'locked' } );

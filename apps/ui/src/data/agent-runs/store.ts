@@ -38,6 +38,7 @@ export interface AgentRunState {
 	pendingQuestions: PendingQuestion[];
 	pendingAnswers: Record< string, string >;
 	pendingClaudeApprovals: Extract< BackendTurnEvent, { type: 'approval.requested' } >[];
+	pendingClaudeQuestions: Extract< BackendTurnEvent, { type: 'question.asked' } >[];
 	queuedPrompts: QueuedPrompt[];
 }
 
@@ -49,6 +50,7 @@ export const initialAgentRunState: AgentRunState = {
 	pendingQuestions: [],
 	pendingAnswers: {},
 	pendingClaudeApprovals: [],
+	pendingClaudeQuestions: [],
 	queuedPrompts: [],
 };
 
@@ -60,6 +62,7 @@ export type AgentRunAction =
 			interrupting: boolean;
 			pendingQuestions?: PendingQuestion[];
 			pendingClaudeApprovals?: AgentRunState[ 'pendingClaudeApprovals' ];
+			pendingClaudeQuestions?: AgentRunState[ 'pendingClaudeQuestions' ];
 	  }
 	| { type: 'send_pending'; startedAt: number }
 	| { type: 'send_start'; runId: string; startedAt: number }
@@ -85,27 +88,36 @@ function resolveRunStartedAt( state: AgentRunState, runId: string, startedAt: nu
 
 function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentRunState {
 	switch ( action.type ) {
-		case 'hydrate_active_run':
+		case 'hydrate_active_run': {
+			const windingDown =
+				action.interrupting || ( state.runId === action.runId && state.phase === 'winding_down' );
+			const pending = < T extends { runId: string } >(
+				snapshot: T[] | undefined,
+				previous: T[]
+			): T[] =>
+				windingDown
+					? []
+					: ( snapshot ?? previous ).filter( ( event ) => event.runId === action.runId );
 			return {
 				...state,
-				phase:
-					action.interrupting || ( state.runId === action.runId && state.phase === 'winding_down' )
-						? 'winding_down'
-						: 'running',
+				phase: windingDown ? 'winding_down' : 'running',
 				runId: action.runId,
 				startedAt: resolveRunStartedAt( state, action.runId, action.startedAt ),
-				isInterrupting: action.interrupting,
+				isInterrupting:
+					action.interrupting || ( state.runId === action.runId && state.isInterrupting ),
 				pendingQuestions: action.pendingQuestions?.length
 					? action.pendingQuestions
 					: state.pendingQuestions,
-				pendingClaudeApprovals:
-					action.interrupting || ( state.runId === action.runId && state.phase === 'winding_down' )
-						? []
-						: (
-								action.pendingClaudeApprovals ??
-								( state.runId === action.runId ? state.pendingClaudeApprovals : [] )
-						  ).filter( ( approval ) => approval.runId === action.runId ),
+				pendingClaudeApprovals: pending(
+					action.pendingClaudeApprovals,
+					state.pendingClaudeApprovals
+				),
+				pendingClaudeQuestions: pending(
+					action.pendingClaudeQuestions,
+					state.pendingClaudeQuestions
+				),
 			};
+		}
 		case 'send_pending':
 			return {
 				...state,
@@ -114,6 +126,7 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 				startedAt: action.startedAt,
 				isInterrupting: false,
 				pendingClaudeApprovals: [],
+				pendingClaudeQuestions: [],
 			};
 		case 'send_start':
 			return {
@@ -130,6 +143,7 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 				pendingQuestions: [],
 				pendingAnswers: {},
 				pendingClaudeApprovals: [],
+				pendingClaudeQuestions: [],
 			};
 		case 'run_ended':
 			// Preserve the queue across run boundaries so staged follow-ups
@@ -146,6 +160,7 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 				pendingQuestions: [],
 				pendingAnswers: {},
 				pendingClaudeApprovals: [],
+				pendingClaudeQuestions: [],
 			};
 		case 'questions_added':
 			return {
@@ -185,7 +200,17 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 					),
 				};
 			}
-			if ( event.type === 'turn.terminal' ) return { ...state, pendingClaudeApprovals: [] };
+			if ( event.type === 'question.asked' || event.type === 'question.resolved' ) {
+				const pending = state.pendingClaudeQuestions.filter(
+					( item ) => item.requestId !== event.requestId || item.turnId !== event.turnId
+				);
+				return {
+					...state,
+					pendingClaudeQuestions: event.type === 'question.asked' ? [ ...pending, event ] : pending,
+				};
+			}
+			if ( event.type === 'turn.terminal' )
+				return { ...state, pendingClaudeApprovals: [], pendingClaudeQuestions: [] };
 			return state;
 		}
 		case 'queue_append':
@@ -203,8 +228,11 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 }
 
 export function hasUnansweredQuestion( state: AgentRunState ): boolean {
-	return state.pendingQuestions.some(
-		( pendingQuestion ) => typeof state.pendingAnswers[ pendingQuestion.question ] !== 'string'
+	return (
+		state.pendingClaudeQuestions.length > 0 ||
+		state.pendingQuestions.some(
+			( pendingQuestion ) => typeof state.pendingAnswers[ pendingQuestion.question ] !== 'string'
+		)
 	);
 }
 

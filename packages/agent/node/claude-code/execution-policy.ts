@@ -80,7 +80,7 @@ import type { SyncSite } from '@studio/common/types/sync';
  */
 
 /** Changes whenever what this policy allows changes; turns and approvals carry it. */
-export const CLAUDE_EXECUTION_POLICY_REVISION = 5;
+export const CLAUDE_EXECUTION_POLICY_REVISION = 6;
 
 /** One operation as it will run. An approval covers exactly this, for one call. */
 export interface ClaudeOperation {

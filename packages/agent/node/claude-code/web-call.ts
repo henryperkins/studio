@@ -14,6 +14,7 @@ export interface ClaudeWebPageOptions {
 	documentOrigin?: string;
 	allowAutoLogin?: boolean;
 	trustedEditor?: boolean;
+	designPreview?: { html: string; images: ReadonlyMap< string, { mime: string; bytes: Buffer } > };
 }
 
 export type ClaudeWebPageSettings = Pick<

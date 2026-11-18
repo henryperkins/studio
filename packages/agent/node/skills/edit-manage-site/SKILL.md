@@ -18,10 +18,10 @@ For any change to content, templates, or the theme, load the `visual-design` ski
 
 - Before editing an existing theme's template or part, check for a copy saved in the Site Editor (`post list --post_type=wp_template,wp_template_part`): WordPress renders that saved copy instead of the file, so if one exists, make the change in the saved copy too, keep the user's other edits, and tell the user.
 - Change an installed third-party theme only through a child theme, following the `block-content` skill's theme-file rules.
-- Validate every template, part, and piece of content you write with validate_blocks before it reaches the site.
+{{#browserTools}}- Validate every template, part, and piece of content you write with validate_blocks before it reaches the site.{{else}}- Review the changed block markup and record which files still need live editor validation.{{/browserTools}}
 
 ## 3. Check and report
 
-Take one screenshot of the page you changed and compare it with what you intended; fix real defects. For a larger visual change, load the `visual-polish` skill instead. Then tell the user what changed and where to see it.
+{{#browserTools}}Take one screenshot of the page you changed and compare it with what you intended; fix real defects. For a larger visual change, load the `visual-polish` skill instead. Then tell the user what changed and where to see it.{{else}}Review the changed files and content. Tell the user where to see the result and which visual checks remain.{{/browserTools}}
 
 To share or publish the site, preview_create makes a temporary preview site, and site_push publishes it to WordPress.com (its description says how to confirm the target).

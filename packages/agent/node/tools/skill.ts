@@ -1,10 +1,10 @@
 import { Type } from 'typebox';
 import { renderDesignCatalogIndex } from '@studio/agent/node/design-catalog';
-import { findSkill, loadSkills } from '@studio/agent/node/skills';
+import { findSkill, loadSkills, type SkillCapabilities } from '@studio/agent/node/skills';
 import { defineTool, READ_ONLY, type StudioToolDefinition } from './define-tool';
 
-export function renderSkill( name: string ): string {
-	const skill = findSkill( name );
+export function renderSkill( name: string, capabilities?: SkillCapabilities ): string {
+	const skill = findSkill( name, capabilities );
 	if ( ! skill ) {
 		throw new Error( `Unknown skill: ${ name }` );
 	}
@@ -13,8 +13,8 @@ export function renderSkill( name: string ): string {
 
 // Returns `null` when no skills are discovered so the caller skips
 // registering the tool entirely.
-export function createSkillTool(): StudioToolDefinition | null {
-	const skills = loadSkills();
+export function createSkillTool( capabilities?: SkillCapabilities ): StudioToolDefinition | null {
+	const skills = loadSkills( capabilities );
 	if ( skills.length === 0 ) return null;
 
 	const skillIndex = skills.map( ( s ) => `- ${ s.name }: ${ s.description }` ).join( '\n' );
@@ -27,7 +27,7 @@ export function createSkillTool(): StudioToolDefinition | null {
 			name: Type.Enum( names, { description: 'The name of the skill to load.' } ),
 		},
 		async ( args ) => ( {
-			content: [ { type: 'text' as const, text: renderSkill( args.name ) } ],
+			content: [ { type: 'text' as const, text: renderSkill( args.name, capabilities ) } ],
 		} ),
 		{ annotations: READ_ONLY }
 	);

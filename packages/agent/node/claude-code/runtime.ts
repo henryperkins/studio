@@ -1,8 +1,10 @@
 import { randomUUID } from 'crypto';
 import { realpath } from 'fs/promises';
+import path from 'node:path';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk/core';
 import { prepareProcessOwner, readOwnProcessIdentity } from '@studio/common/lib/owned-process';
 import { __ } from '@wordpress/i18n';
+import { readGlobalInstructions } from '@studio/agent/node/global-instructions';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
 import {
@@ -11,6 +13,7 @@ import {
 	isClaudeModelId,
 	isClaudeTargetAllowed,
 } from '@studio/agent/protocol/claude-code';
+import { getSkillsRoot, loadSkills } from '../skills';
 import { claudeAccountKey, compareClaudeExecutionAuth, isSameClaudeAccount } from './auth-status';
 import {
 	claudeConnectionRevision,
@@ -32,9 +35,11 @@ import {
 	claudeTargetOrigin,
 	studioMcpToolName,
 } from './execution-rules';
-import { getClaudeSensitiveReadDenyRules } from './local-paths';
+import { buildClaudeInstructions, claudeSkillCommand } from './instructions';
+import { getClaudeSensitiveReadDenyRules, isBundledFolder } from './local-paths';
 import { nativeFileResultHook } from './native-file-results';
 import { isClaudeExecutableUnchanged } from './platform';
+import { askClaudeQuestions, type ClaudeQuestionAsker } from './questions';
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
 import { prepareClaudeShell } from './shell';
 import { createShellDeadlines } from './shell-deadlines';
@@ -246,6 +251,7 @@ interface RuntimeDependencies {
 }
 
 interface RuntimeOptions extends RuntimeDependencies {
+	askUser?: ClaudeQuestionAsker;
 	prepareShell?: typeof prepareClaudeShell;
 	hasChromium?: typeof hasClaudeChromium;
 	storeRoot: string;
@@ -275,9 +281,6 @@ interface NativeLaunch {
 	additionalDirectories?: string[];
 	shell?: PreparedClaudeShell;
 }
-
-const STUDIO_INSTRUCTIONS =
-	'Work only in the current local WordPress site. Use Studio tools for WordPress operations. Do not publish or access production.';
 
 const oneLine = ( text: unknown, preserveSpaces = false ) =>
 	escapeClaudeApprovalText( String( text ) )
@@ -416,7 +419,7 @@ function nativeLaunchOptions(
 		systemPrompt: {
 			type: 'preset',
 			preset: 'claude_code',
-			append: [ STUDIO_INSTRUCTIONS, launch.instructions ].filter( Boolean ).join( '\n\n' ),
+			append: launch.instructions ?? 'Use Studio tools for WordPress operations.',
 		},
 	};
 }
@@ -1047,6 +1050,14 @@ export async function runClaudeTurn(
 		// as it decides it on the Pi route; no model provider's account does.
 		const imageGeneration = await isImageGenerationAvailable().catch( () => false );
 		const ui = host.ui;
+		const askUser = options.askUser;
+		const screenshotDirectory =
+			ui && askUser && guard.studioTools.includes( 'present_design_options' )
+				? await Promise.resolve()
+						.then( () => host.screenshotsDirectory?.() )
+						.catch( () => null )
+				: null;
+		const bundled = await isBundledFolder( getSkillsRoot(), roots );
 		const toolHost: StudioAgentHost = ui
 			? {
 					...host,
@@ -1061,7 +1072,38 @@ export async function runClaudeTurn(
 			: host;
 		bridge = createStudioClaudeToolBridge( toolHost, { runId, turnId, policy: guard }, emit, {
 			imageGeneration,
+			designPreviews: Boolean( screenshotDirectory && path.isAbsolute( screenshotDirectory ) ),
+			bundled,
+			ask:
+				askUser &&
+				( ( questions, signal, toolCallId, onPresented ) =>
+					askClaudeQuestions(
+						{ runId, turnId, toolCallId },
+						questions,
+						signal,
+						askUser,
+						async ( event ) => {
+							await journalOnly( event );
+							if ( event.type === 'question.asked' ) onPresented?.();
+							input.onEvent( event );
+						}
+					) ),
 		} );
+		const skills = bridge.tools.includes( 'Skill' )
+			? loadSkills( {
+					canAskUser: bridge.tools.includes( 'AskUserQuestion' ),
+					browserTools: bridge.tools.includes( 'inspect_design' ),
+					designPreviews: bridge.tools.includes( 'present_design_options' ),
+					imageGeneration,
+			  } ).map( ( skill ) => skill.name )
+			: [];
+		const instructions = buildClaudeInstructions(
+			bridge.tools,
+			skills,
+			target,
+			await readGlobalInstructions().catch( () => undefined )
+		);
+		const prompt = claudeSkillCommand( input.prompt, skills );
 		const watchConnection = async () => {
 			const unchanged = ( await verifyConnection() ) && ( await guard.refreshAccount() );
 			if ( controller.signal.aborted || ! unchanged ) return;
@@ -1078,7 +1120,7 @@ export async function runClaudeTurn(
 					role: 'user',
 					content: images.length
 						? [
-								{ type: 'text', text: input.prompt },
+								{ type: 'text', text: prompt },
 								...images.map( ( image ) => ( {
 									type: 'image' as const,
 									source: {
@@ -1088,7 +1130,7 @@ export async function runClaudeTurn(
 									},
 								} ) ),
 						  ]
-						: input.prompt,
+						: prompt,
 				},
 				parent_tool_use_id: null,
 				session_id: session.nativeSessionId,
@@ -1123,7 +1165,7 @@ export async function runClaudeTurn(
 					onRequested: () => {
 						spawnRequested = true;
 					},
-					instructions: note?.text,
+					instructions: [ instructions, note?.text ].filter( Boolean ).join( '\n\n' ),
 					onOwned: ( started ) => {
 						owned = started;
 						ownership = started.ready().then(

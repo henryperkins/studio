@@ -4,7 +4,7 @@ import { getSharedConfigPath } from '@studio/common/lib/well-known-paths';
 import { z } from 'zod';
 import { IMAGE_NOT_GENERATED_CANCELLED } from '../image-generation';
 import { getPayloadLimitViolation } from '../runtime/tool-safety';
-import { getSkillPath } from '../skills';
+import { getSkillPath, getSkillsRoot } from '../skills';
 import { createPreviewTool } from '../tools/create-preview';
 import { createSiteTool } from '../tools/create-site';
 import { deletePreviewTool } from '../tools/delete-preview';
@@ -90,6 +90,10 @@ export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
 		sendFeedbackTool.name,
 		generateImagesTool.name,
 		'Ls',
+		pickDesignTool.name,
+		'AskUserQuestion',
+		'present_design_options',
+		'Skill',
 		scaffoldThemeTool.name,
 		validateBlocksTool.name,
 		takeScreenshotTool.name,
@@ -501,13 +505,6 @@ function onSite(
 	return studioRule( operationClass, { site: namedSite, ...options } );
 }
 
-function unqualified(
-	rule: StudioRuleElements,
-	unbound?: readonly ClaudeToolChannel[]
-): ClaudeStudioToolRule {
-	return { ...rule, qualification: unbound ? { qualified: false, unbound } : { qualified: false } };
-}
-
 function qualified(
 	rule: StudioRuleElements,
 	channels: ClaudeToolChannelDeclaration
@@ -824,7 +821,13 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 			} )
 		),
 	],
-	[ pickDesignTool.name, unqualified( studioRule( 'read' ) ) ],
+	[
+		pickDesignTool.name,
+		qualified(
+			studioRule( 'read', { bundled: () => getSkillPath( 'visual-design' ) } ),
+			using( { readsLocalFiles: [ 'bundled' ] } )
+		),
+	],
 	[
 		validateBlocksTool.name,
 		qualified(
@@ -1092,19 +1095,25 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 		),
 	],
 	// Tools built by factories for the host's capabilities.
-	[ 'AskUserQuestion', unqualified( studioRule( 'read' ) ) ],
-	[ 'Skill', unqualified( studioRule( 'read' ) ) ],
+	[ 'AskUserQuestion', qualified( studioRule( 'read' ), using( {} ) ) ],
+	[
+		'Skill',
+		qualified(
+			studioRule( 'read', { bundled: getSkillsRoot } ),
+			using( { readsLocalFiles: [ 'bundled' ] } )
+		),
+	],
 	[
 		'present_design_options',
-		// It renders HTML the model supplies: it writes that HTML to a file in the
-		// host's screenshot folder, loads the file in the shared browser, and
-		// first reads every image the HTML names by absolute path or `file:` URL.
-		// No argument names those files, so nothing in the rule bounds either
-		// file channel yet.
-		unqualified( studioRule( 'local-change', { navigates: true } ), [
-			'readsLocalFiles',
-			'writesLocalFiles',
-		] ),
+		qualified(
+			studioRule( 'local-change', { navigates: true, screenshots: true } ),
+			using( {
+				...browserChannels,
+				readsLocalFiles: [ 'screenshots', 'navigates' ],
+				writesLocalFiles: [ 'screenshots' ],
+				callsHostOperation: [ 'host' ],
+			} )
+		),
 	],
 ] );
 
@@ -1654,6 +1663,10 @@ export function claudeToolInventory(
  * as it is. The canonical description, which every route shares, is unchanged.
  */
 export function claudeRouteNote( name: string ): string | undefined {
+	if ( name === 'present_design_options' )
+		return 'Studio renders inert previews and saves their images with this conversation. Use assets in the selected site or supported fonts.';
+	if ( name === 'site_push' )
+		return 'Studio can push only to a remote already connected to the selected local site, after approval.';
 	if ( name === scaffoldThemeTool.name )
 		return 'Studio creates a new theme in the selected local site. External fonts must come from Google Fonts. Activation is limited to the new theme.';
 	const rule = CLAUDE_STUDIO_TOOL_RULES.get( name );

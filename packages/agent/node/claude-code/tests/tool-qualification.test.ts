@@ -86,6 +86,7 @@ const browserChannels = {
 	spawnsProcess: [ 'navigates' ],
 };
 const browserNames = [
+	'present_design_options',
 	'take_screenshot',
 	'inspect_design',
 	'open_annotation_browser',
@@ -95,6 +96,15 @@ const browserNames = [
 ];
 // The tools this build qualifies, each with the channels it declares.
 const QUALIFIED: Record< string, Record< string, unknown > > = {
+	AskUserQuestion: noChannels,
+	Skill: { ...noChannels, readsLocalFiles: [ 'bundled' ] },
+	pick_design: { ...noChannels, readsLocalFiles: [ 'bundled' ] },
+	present_design_options: {
+		...browserChannels,
+		readsLocalFiles: [ 'screenshots', 'navigates' ],
+		writesLocalFiles: [ 'screenshots' ],
+		callsHostOperation: [ 'host' ],
+	},
 	scaffold_theme: {
 		...throughHost,
 		readsLocalFiles: [ 'paths' ],
@@ -219,6 +229,20 @@ const UNREACHED: Record<
 	string,
 	ReadonlyArray< { channels: string[]; files: string[]; why: string } >
 > = {
+	pick_design: [
+		UNUSED_WP_CLI,
+		{
+			channels: [ 'requestsNetwork', 'reachesWpcom' ],
+			files: [ '../common/lib/record-tracks-event.ts' ],
+			why: 'The picker imports event names. Claude supplies no Tracks context and the guarded host refuses Tracks calls.',
+		},
+		{
+			channels: [ 'callsHostOperation' ],
+			files: [ 'node/design-tracks.ts', 'node/tools/utils.ts' ],
+			why: 'The picker calls textResult and passes an absent Tracks context; neither runs a host operation.',
+		},
+	],
+	present_design_options: [ UNUSED_WP_CLI ],
 	inspect_design: [
 		UNUSED_WP_CLI,
 		{
@@ -925,7 +949,7 @@ describe( 'Claude Studio tool qualification', () => {
 			() => table.clear(),
 			() => Object.assign( table, { get: () => forged } ),
 			() => Object.assign( rule( 'pick_design' ), forged ),
-			() => ( rule( 'pick_design' ).qualification.qualified = true ),
+			() => ( rule( 'pick_design' ).qualification.qualified = false ),
 			() =>
 				Object.defineProperty( rule( 'pick_design' ), 'qualification', {
 					value: forged.qualification,
@@ -948,7 +972,10 @@ describe( 'Claude Studio tool qualification', () => {
 		];
 		const unconfinedNative = [ 'Read', 'Grep', 'Glob', 'Write', 'Edit', 'MultiEdit' ];
 		expect( enabledNow() ).toEqual( [ qualifiedTools(), unconfinedNative ] );
-		expect( rule( 'pick_design' ).qualification ).toEqual( { qualified: false } );
+		expect( rule( 'pick_design' ).qualification ).toEqual( {
+			qualified: true,
+			channels: QUALIFIED.pick_design,
+		} );
 
 		// Values planted on the prototype every plain object shares are not declarations.
 		const planted: Record< string, unknown > = {
@@ -1027,12 +1054,12 @@ describe( 'Claude Studio tools that drive a browser', () => {
 				).toBe( linksBrowser( module ) );
 	} );
 
-	it( 'gates present_design_options and leaves it unqualified, with the channels nothing binds on record', () => {
+	it( 'requires guarded Chromium and confined screenshot storage for design previews', () => {
 		const rule = CLAUDE_STUDIO_TOOL_RULES.get( 'present_design_options' )!;
 		expect( rule.navigates ).toBe( true );
 		expect( rule.qualification ).toEqual( {
-			qualified: false,
-			unbound: [ 'readsLocalFiles', 'writesLocalFiles' ],
+			qualified: true,
+			channels: QUALIFIED.present_design_options,
 		} );
 		const module = studioToolModules().find( ( item ) =>
 			item.names.includes( 'present_design_options' )
@@ -1043,6 +1070,7 @@ describe( 'Claude Studio tools that drive a browser', () => {
 		const enabled = { native: [], studio: [ 'present_design_options', 'take_screenshot' ] };
 		expect( claudeStudioTools( enabled, { mode: 'none' }, targetOrigin ) ).toEqual( [] );
 		expect( claudeStudioTools( enabled, guarded( targetOrigin ), targetOrigin ) ).toEqual( [
+			'present_design_options',
 			'take_screenshot',
 		] );
 	} );

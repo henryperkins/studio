@@ -2,6 +2,7 @@ import { constants } from 'node:fs';
 import { access, readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { createDesignPreviewResponder, DESIGN_PREVIEW_URL } from './design-preview-resource';
 import { runInClaudeWebCall } from './web-call';
 import { checkedWebUrl, guardedWebGet, isWebRedirect, requestWebHop, WebRefusal } from './web-http';
 import type {
@@ -133,8 +134,23 @@ export async function withClaudeWebCall< T >(
 		if ( ! browsers.has( headed ) ) browsers.set( headed, launch( headed ) );
 		const browser = await browsers.get( headed )!;
 		signal.throwIfAborted();
+		const preview =
+			options.designPreview &&
+			createDesignPreviewResponder(
+				options.designPreview,
+				( url, purpose ) =>
+					guardedWebGet(
+						url,
+						scope,
+						{ purpose, userAgent: 'Mozilla/5.0 AppleWebKit/537.36 Chrome/156.0.0.0 Safari/537.36' },
+						AbortSignal.any( [ signal, AbortSignal.timeout( 2500 ) ] ),
+						consumeBytes
+					),
+				signal
+			);
 		const context = await browser.newContext( {
 			...settings,
+			javaScriptEnabled: ! preview,
 			serviceWorkers: 'block',
 			acceptDownloads: false,
 			offline: true,
@@ -257,6 +273,13 @@ export async function withClaudeWebCall< T >(
 			const deadline = AbortSignal.any( [ signal, AbortSignal.timeout( 20000 ) ] );
 			try {
 				signal.throwIfAborted();
+				if ( preview ) {
+					if ( request.method !== 'GET' ) throw new WebRefusal( 'design previews are read-only' );
+					const response = await preview( request.url, resourceType, event.frameId === mainFrame );
+					signal.throwIfAborted();
+					await session.send( 'Fetch.fulfillRequest', { requestId, ...response } );
+					return;
+				}
 				if ( options.trustedEditor ) throw new WebRefusal( 'the annotation editor is offline' );
 				if ( ++requests > 1500 ) throw new WebRefusal( 'the page exceeded the request limit' );
 				const top = resourceType === 'Document' && event.frameId === mainFrame;
@@ -387,6 +410,7 @@ export async function withClaudeWebCall< T >(
 		page.on( 'framenavigated', ( frame ) => {
 			const url = frame.url();
 			if (
+				( preview && url !== DESIGN_PREVIEW_URL && url !== 'about:blank' ) ||
 				( options.trustedEditor && url !== 'about:blank' ) ||
 				( ! options.trustedEditor && ! /^(?:https?:|about:(?:blank|srcdoc)$)/.test( url ) )
 			)

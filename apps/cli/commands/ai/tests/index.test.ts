@@ -1078,6 +1078,112 @@ it( 'routes marked Claude sessions before Pi provider selection', async () => {
 	}
 } );
 
+it.each( [ 'answer', 'interrupt' ] )(
+	'routes %s to a waiting Claude tool on the forked CLI',
+	async ( action ) => {
+		const { askClaudeQuestions } = await import( '@studio/agent/node/claude-code/questions' );
+		const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
+		const descriptor = Object.getOwnPropertyDescriptor( process, 'send' );
+		const exitCode = process.exitCode;
+		const reply = { 'Pick?': 'B' };
+		const record = vi.fn();
+		const listeners = process.listenerCount( 'message' );
+		const send = vi.fn( ( message ) => {
+			if ( message.event?.type !== 'question.asked' ) return;
+			const { requestId, runId, turnId } = message.event;
+			setImmediate( () => {
+				process.emit( 'message', { type: 'answer', answers: reply }, undefined );
+				process.emit(
+					'message',
+					action === 'interrupt'
+						? { type: 'interrupt' }
+						: { type: 'question.answer', requestId, runId, turnId, answers: reply },
+					undefined
+				);
+			} );
+		} );
+		Object.defineProperty( process, 'send', { configurable: true, value: send } );
+		const selection = { model: 'model', effort: 'high' } as const;
+		try {
+			vi.mocked( runClaudeTurn ).mockImplementationOnce(
+				async ( snapshot, _host, input, options ) => {
+					const { runId, turnId } = snapshot;
+					const pending = askClaudeQuestions(
+						{ runId, turnId, toolCallId: 'call' },
+						[
+							{
+								question: 'Pick?',
+								options: [
+									{ label: 'A', description: 'First' },
+									{ label: 'B', description: 'Second' },
+								],
+							},
+						],
+						input.signal,
+						options.askUser!,
+						( event ) => {
+							record( event );
+							input.onEvent( event );
+						}
+					);
+					if ( action === 'answer' ) await expect( pending ).resolves.toEqual( reply );
+					else await expect( pending ).rejects.toMatchObject( { name: 'AbortError' } );
+					input.onEvent( {
+						type: 'turn.terminal',
+						runId,
+						turnId,
+						outcome: { status: input.signal.aborted ? 'interrupted' : 'success' },
+					} );
+				}
+			);
+			await runCommand( {
+				adapter: new JsonAdapter(),
+				initialMessage: 'Ask me',
+				initialRunId: 'run',
+				initialTurnId: 'turn',
+				claudeSelection: selection,
+				resumeSession: {
+					summary: { id: 'session' },
+					entries: [
+						{
+							type: 'custom',
+							customType: 'studio.claude_binding',
+							data: {
+								connectionId: 'connection',
+								siteId: 'site',
+								workingDirectory: 'workspace',
+								configDirectory: 'config',
+							},
+						},
+						{ type: 'custom', customType: 'studio.claude_selection', data: selection },
+					],
+				} as never,
+			} );
+			expect( record ).toHaveBeenCalledWith(
+				expect.objectContaining( {
+					type: 'question.resolved',
+					runId: 'run',
+					turnId: 'turn',
+					answers: action === 'answer' ? reply : null,
+				} )
+			);
+			expect( send ).toHaveBeenCalledWith(
+				expect.objectContaining( {
+					event: expect.objectContaining( {
+						type: 'turn.terminal',
+						outcome: { status: action === 'interrupt' ? 'interrupted' : 'success' },
+					} ),
+				} )
+			);
+			expect( process.listenerCount( 'message' ) ).toBe( listeners );
+		} finally {
+			if ( descriptor ) Object.defineProperty( process, 'send', descriptor );
+			else delete process.send;
+			process.exitCode = exitCode;
+		}
+	}
+);
+
 it( 'routes a Claude session resumed by ID and rejects a stale selection', async () => {
 	const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
 	const entries = [

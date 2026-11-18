@@ -840,12 +840,15 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			} );
 		},
 		async interruptAgentRun( runId ) {
-			await api( `/runs/${ encodeURIComponent( runId ) }/interrupt`, { method: 'POST' } );
+			await api( `/runs/${ encodeURIComponent( runId ) }/interrupt`, {
+				method: 'POST',
+				body: JSON.stringify( { clientId } ),
+			} );
 		},
-		async answerAgentQuestion( runId, answers ) {
+		async answerAgentQuestion( runId, answers, requestId ) {
 			await api( `/runs/${ encodeURIComponent( runId ) }/answer`, {
 				method: 'POST',
-				body: JSON.stringify( { answers, clientId } ),
+				body: JSON.stringify( { answers, requestId, clientId } ),
 			} );
 		},
 		onAgentEvent( listener ) {

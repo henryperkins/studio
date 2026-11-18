@@ -474,7 +474,11 @@ export interface Connector {
 	// Point the session's next turn at its local site or its connected live site.
 	setSessionEnvironment( sessionId: string, environment: 'local' | 'live' ): Promise< void >;
 	interruptAgentRun( runId: string ): Promise< void >;
-	answerAgentQuestion( runId: string, answers: Record< string, string > ): Promise< void >;
+	answerAgentQuestion(
+		runId: string,
+		answers: Record< string, string >,
+		requestId?: string
+	): Promise< void >;
 	onAgentEvent( listener: ( event: AgentRunEvent ) => void ): () => void;
 	// Fires when a dropped event stream reconnects, so listeners can re-read what they missed.
 	onConnectionRestored?( listener: () => void ): () => void;

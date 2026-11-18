@@ -1,4 +1,5 @@
 import { escapeClaudeApprovalText } from '@studio/agent/protocol/claude-code';
+import { SKIPPED_QUESTION } from '@studio/agent/protocol/tools';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import { SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
@@ -192,6 +193,212 @@ describe( 'Claude Code chat', () => {
 		expect( await screen.findByRole( 'button', { name: 'New Claude Code chat' } ) ).toBeVisible();
 		expect( screen.getByLabelText( 'Message Claude' ) ).toBeVisible();
 		expect( screen.queryByRole( 'combobox', { name: /environment/i } ) ).not.toBeInTheDocument();
+	} );
+} );
+
+describe( 'Claude questions', () => {
+	const base = {
+		runId: 'question-run',
+		turnId: 'question-turn',
+		toolCallId: 'question-call',
+		requestId: 'batch-1',
+	};
+	const option = ( label: string ) => ( { label, description: label + ' description' } );
+	const request: Extract< BackendTurnEvent, { type: 'question.asked' } > = {
+		type: 'question.asked',
+		...base,
+		questions: [
+			{
+				question: 'Which sections?',
+				multiSelect: true,
+				options: [ option( 'News' ), option( 'Contact' ) ],
+			},
+			{
+				question: 'What tone?',
+				allowFreeForm: true,
+				options: [ option( 'Quiet' ), option( 'Loud' ) ],
+			},
+			{ question: 'Add a footer?', options: [ option( 'Yes' ), option( 'No' ) ] },
+		],
+	};
+	const active = ( pendingClaudeQuestions: Array< typeof request > ) => [
+		{
+			sessionId: 'claude-matrix',
+			runId: request.runId,
+			startedAt: 1,
+			phase: 'running' as const,
+			pendingClaudeQuestions,
+		},
+	];
+
+	it( 'recovers a question that arrives before a cold snapshot identifies its run', async () => {
+		const first = deferred< Awaited< ReturnType< Connector[ 'getActiveAgentRuns' ] > > >();
+		const { connector, emit } = await setupSession( undefined, {
+			getActiveAgentRuns: () => first.promise,
+		} );
+		connector.getActiveAgentRuns.mockResolvedValue( active( [ request ] ) );
+		act( () => emit( request ) );
+		expect( await screen.findByRole( 'checkbox', { name: 'News' } ) ).toBeDisabled();
+		await act( async () => first.resolve( [] ) );
+		await waitFor( () => expect( screen.getByRole( 'checkbox', { name: 'News' } ) ).toBeEnabled() );
+		expect( connector.getActiveAgentRuns ).toHaveBeenCalledTimes( 2 );
+	} );
+	it( 'restores an older unanswered batch alongside a live question arriving during reconnect', async () => {
+		const second = {
+			...request,
+			requestId: 'new-request',
+			questions: [ { question: 'Title?', options: [ option( 'Hello' ) ] } ],
+		};
+		const { connector, emit } = await setupSession( undefined, {
+			getActiveAgentRuns: async () => active( [] ),
+		} );
+		const delayed = deferred< Awaited< ReturnType< Connector[ 'getActiveAgentRuns' ] > > >();
+		connector.getActiveAgentRuns
+			.mockReturnValueOnce( delayed.promise )
+			.mockResolvedValue( active( [ request, second ] ) );
+		act( () => connector.emit( 'onConnectionRestored' ) );
+		act( () => emit( second ) );
+		expect( screen.getByRole( 'radio', { name: 'Hello' } ) ).toBeEnabled();
+		await act( async () => delayed.resolve( active( [ request ] ) ) );
+		await waitFor( () => expect( screen.getByRole( 'checkbox', { name: 'News' } ) ).toBeEnabled() );
+		expect( screen.getByRole( 'radio', { name: 'Hello' } ) ).toBeEnabled();
+		expect( connector.getActiveAgentRuns ).toHaveBeenCalledTimes( 3 );
+	} );
+
+	it( 'submits a restored batch once with multi-select, free text and skip', async () => {
+		const { connector, emit } = await setupSession(
+			undefined,
+			{ getActiveAgentRuns: async () => active( [ request ] ) },
+			[ [ request ] ]
+		);
+		act( () => emit( request ) );
+		expect( await screen.findAllByRole( 'group', { name: 'Which sections?' } ) ).toHaveLength( 1 );
+		fireEvent.click( screen.getByRole( 'checkbox', { name: 'News' } ) );
+		fireEvent.click( screen.getByRole( 'checkbox', { name: 'Contact' } ) );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Next' } ) );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Write an answer' } ) );
+		fireEvent.change( screen.getByRole( 'textbox', { name: 'Your answer' } ), {
+			target: { value: 'Like a letter from a friend' },
+		} );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Next' } ) );
+		expect( connector.answerAgentQuestion ).not.toHaveBeenCalled();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Skip' } ) );
+		await waitFor( () =>
+			expect( connector.answerAgentQuestion ).toHaveBeenCalledExactlyOnceWith(
+				request.runId,
+				{
+					'Which sections?': 'News, Contact',
+					'What tone?': 'Like a letter from a friend',
+					'Add a footer?': SKIPPED_QUESTION,
+				},
+				request.requestId
+			)
+		);
+		expect( await screen.findByText( 'Skipped' ) ).toBeVisible();
+		expect( screen.getByText( 'Like a letter from a friend' ) ).toBeVisible();
+	} );
+
+	it( 'keeps stale journals read-only, recovers new questions on reconnect, and cancels them on Stop', async () => {
+		const { connector, session, emit } = await setupSession( undefined, {}, [ [ request ] ] );
+		expect( screen.getByRole( 'checkbox', { name: 'News' } ) ).toBeDisabled();
+		connector.getActiveAgentRuns.mockResolvedValue( active( [ request ] ) );
+		act( () => connector.emit( 'onConnectionRestored' ) );
+		await waitFor( () => expect( screen.getByRole( 'checkbox', { name: 'News' } ) ).toBeEnabled() );
+		const snapshot = deferred< Awaited< ReturnType< Connector[ 'getActiveAgentRuns' ] > > >();
+		connector.getActiveAgentRuns.mockReturnValueOnce( snapshot.promise );
+		act( () => connector.emit( 'onConnectionRestored' ) );
+		fireEvent.click( screen.getByRole( 'checkbox', { name: 'News' } ) );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Stop' } ) );
+		await waitFor( () =>
+			expect( connector.interruptAgentRun ).toHaveBeenCalledExactlyOnceWith( request.runId )
+		);
+		await act( async () => snapshot.resolve( active( [ request ] ) ) );
+		expect( await screen.findByText( 'Question cancelled' ) ).toBeVisible();
+		expect( screen.queryByRole( 'button', { name: 'Next' } ) ).not.toBeInTheDocument();
+		const resolved = { type: 'question.resolved' as const, ...base, answers: null };
+		connector.getSession.mockResolvedValue( {
+			...session,
+			claudeJournal: [ [ request, resolved ] ],
+		} );
+		connector.getActiveAgentRuns.mockResolvedValue( [] );
+		await act( async () => connector.emit( 'onConnectionRestored' ) );
+		await waitFor( () =>
+			expect( screen.queryByRole( 'button', { name: 'Stop' } ) ).not.toBeInTheDocument()
+		);
+		act( () => emit( request ) );
+		expect( screen.getByRole( 'checkbox', { name: 'News' } ) ).toBeDisabled();
+		expect( connector.answerAgentQuestion ).not.toHaveBeenCalled();
+	} );
+
+	it( 'keeps simultaneous batches with the same question text independent and retries a failed redraw', async () => {
+		const redraw = 'Show me other options';
+		const design = {
+			...request,
+			questions: [ { question: 'Design?', options: [ option( 'One' ), option( redraw ) ] } ],
+		};
+		const second = { ...design, requestId: 'batch-2' };
+		const { connector, emit } = await setupSession( undefined, {
+			getActiveAgentRuns: async () => active( [ design, second ] ),
+		} );
+		const groups = await screen.findAllByRole( 'group', { name: 'Design?' } );
+		connector.answerAgentQuestion.mockRejectedValueOnce( new Error( 'Connection lost' ) );
+		fireEvent.click( within( groups[ 0 ] ).getByRole( 'radio', { name: redraw } ) );
+		expect( await screen.findByText( 'Connection lost' ) ).toBeVisible();
+		fireEvent.click( within( groups[ 0 ] ).getByRole( 'radio', { name: redraw } ) );
+		await waitFor( () =>
+			expect( connector.answerAgentQuestion.mock.calls ).toEqual( [
+				[ request.runId, { 'Design?': redraw }, design.requestId ],
+				[ request.runId, { 'Design?': redraw }, design.requestId ],
+			] )
+		);
+		act( () => emit( { type: 'question.resolved', ...base, answers: { 'Design?': redraw } } ) );
+		fireEvent.click( within( groups[ 1 ] ).getByRole( 'radio', { name: 'One' } ) );
+		await waitFor( () =>
+			expect( connector.answerAgentQuestion ).toHaveBeenLastCalledWith(
+				request.runId,
+				{ 'Design?': 'One' },
+				second.requestId
+			)
+		);
+	} );
+
+	it( 'reopens the saved choices and zooms only previews belonging to this conversation', async () => {
+		const path = '/old/root/claude-matrix.screenshots/';
+		const design = {
+			...request,
+			questions: [
+				{
+					question: 'Pick a design',
+					options: [
+						{ ...option( 'Blue' ), image: path + 'blue.png' },
+						{ ...option( 'Red' ), image: path + 'red.png' },
+						{ ...option( 'Foreign' ), image: '/other/session.screenshots/foreign.png' },
+						option( 'Show me other options' ),
+					],
+				},
+			],
+		};
+		const { connector } = await setupSession( undefined, {}, [
+			[
+				design,
+				{
+					type: 'question.resolved',
+					...base,
+					answers: { 'Pick a design': 'Show me other options' },
+				},
+			],
+		] );
+		expect( screen.getByRole( 'radio', { name: 'Show me other options' } ) ).toBeChecked();
+		expect( screen.getByRole( 'radio', { name: 'Blue' } ) ).toBeDisabled();
+		fireEvent.click( screen.getByRole( 'button', { name: 'View Blue larger' } ) );
+		expect( await screen.findByRole( 'img', { name: 'Blue' } ) ).toBeVisible();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Next option' } ) );
+		expect( await screen.findByRole( 'img', { name: 'Red' } ) ).toBeVisible();
+		expect( screen.queryByRole( 'button', { name: 'Choose' } ) ).not.toBeInTheDocument();
+		expect( connector.readLocalMediaFile.mock.calls ).toEqual( [
+			[ '/sessions/claude-matrix.screenshots/blue.png', 'claude-matrix' ],
+			[ '/sessions/claude-matrix.screenshots/red.png', 'claude-matrix' ],
+		] );
 	} );
 } );
 

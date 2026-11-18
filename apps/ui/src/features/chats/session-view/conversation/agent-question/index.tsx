@@ -12,6 +12,7 @@ export const AgentQuestionBatch = memo( function AgentQuestionBatch( {
 	questions,
 	pendingQuestions,
 	pendingAnswers,
+	claudeSessionId,
 	freeFormQuestion,
 	onAnswer,
 	onChooseFreeForm,
@@ -21,9 +22,10 @@ export const AgentQuestionBatch = memo( function AgentQuestionBatch( {
 	questions: AgentQuestionRenderItem[];
 	pendingQuestions: Set< string >;
 	pendingAnswers: Record< string, string >;
-	freeFormQuestion: string | null;
+	claudeSessionId?: string;
+	freeFormQuestion?: string | null;
 	onAnswer: ( question: string, label: string ) => void;
-	onChooseFreeForm: ( question: string ) => void;
+	onChooseFreeForm?: ( question: string ) => void;
 } & Joined ) {
 	const [ page, setPage ] = useState< number | null >( null );
 	const [ drafts, setDrafts ] = useState< Record< string, string[] > >( {} );
@@ -31,10 +33,13 @@ export const AgentQuestionBatch = memo( function AgentQuestionBatch( {
 	const activeQuestionRef = useRef< HTMLFieldSetElement | null >( null );
 	const shouldFocusActiveQuestionRef = useRef( false );
 	const pickedLabel = ( question: AgentQuestionRenderItem ) =>
-		pendingAnswers[ question.question ] ?? question.pickedLabel;
+		Object.prototype.hasOwnProperty.call( pendingAnswers, question.question )
+			? pendingAnswers[ question.question ]
+			: question.pickedLabel;
 	const unanswered = questions
 		.map( ( question, index ) =>
-			pendingQuestions.has( question.question ) && ! pendingAnswers[ question.question ]
+			pendingQuestions.has( question.question ) &&
+			! Object.prototype.hasOwnProperty.call( pendingAnswers, question.question )
 				? index
 				: -1
 		)
@@ -69,12 +74,13 @@ export const AgentQuestionBatch = memo( function AgentQuestionBatch( {
 				{ questions.map( ( question, index ) => (
 					<AgentQuestion
 						key={ question.key }
+						claudeSessionId={ claudeSessionId }
 						question={ question.question }
 						options={ question.options }
 						multiSelect={ question.multiSelect }
 						isInteractive={ false }
 						pickedLabel={ pickedLabel( question ) }
-						onChooseFreeForm={ () => onChooseFreeForm( question.question ) }
+						onChooseFreeForm={ () => onChooseFreeForm?.( question.question ) }
 						joinedAbove={ joinedAbove || index > 0 }
 						joinedBelow={ joinedBelow || index < questions.length - 1 }
 					/>
@@ -110,6 +116,7 @@ export const AgentQuestionBatch = memo( function AgentQuestionBatch( {
 	return (
 		<AgentQuestion
 			key={ question.key }
+			claudeSessionId={ claudeSessionId }
 			ref={ activeQuestionRef }
 			tabIndex={ -1 }
 			question={ question.question }
@@ -126,9 +133,10 @@ export const AgentQuestionBatch = memo( function AgentQuestionBatch( {
 				}
 			} }
 			freeFormActive={ freeFormQuestion === question.question }
-			onChooseFreeForm={ () => onChooseFreeForm( question.question ) }
+			onChooseFreeForm={ () => onChooseFreeForm?.( question.question ) }
 			onAnswer={ () => submit( selection.length ? selection.join( ', ' ) : SKIPPED_QUESTION ) }
 			onSkip={ () => submit( SKIPPED_QUESTION ) }
+			onTypedAnswer={ claudeSessionId && question.allowFreeForm ? submit : undefined }
 			onBack={ activeIndex > 0 ? () => goToPage( activeIndex - 1 ) : undefined }
 			submitLabel={ isLastQuestion ? __( 'Done' ) : __( 'Next' ) }
 			pager={
