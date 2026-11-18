@@ -455,6 +455,7 @@ describe( 'what the policy journals before an operation that does more than read
 				await fixture.policy.authorizeToolUse( {
 					toolName: name,
 					input: NATIVE_USES[ name ]( fixture ),
+					cwd: fixture.site,
 					toolUseId: 'tool-use',
 				} )
 			).toBe( true );

@@ -152,6 +152,7 @@ export function unverifiableNavigation( origin: string | null ): Array< [ string
 export async function createPolicyFixture(
 	overrides: ( paths: {
 		site: string;
+		other: string;
 		config: string;
 		parent: string;
 	} ) => Partial< ClaudeExecutionContext > = () => ( {} )
@@ -213,7 +214,7 @@ export async function createPolicyFixture(
 		recordOperation: async ( event ) => {
 			journal.push( event );
 		},
-		...overrides( { site, config, parent } ),
+		...overrides( { site, other, config, parent } ),
 	};
 	return {
 		policy: createClaudeExecutionPolicy( context ),

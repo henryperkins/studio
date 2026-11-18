@@ -110,12 +110,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 	Read: { status: 'native', native: 'Read' },
 	Write: { status: 'native', native: 'Write' },
 	Edit: { status: 'native', native: 'Edit' },
-	Bash: {
-		status: 'unqualified',
-		step: 'C2b',
-		reason: 'Needs a verified shell confinement',
-		native: 'Bash',
-	},
+	Bash: { status: 'native', native: 'Bash' },
 	Grep: { status: 'native', native: 'Grep' },
 	Glob: { status: 'native', native: 'Glob' },
 	Ls: { status: 'bridged', piBuiltin: true },
@@ -327,9 +322,19 @@ const isBridged = ( status: ClaudeStatus ) =>
 const enabledStudio = () =>
 	claudeStudioTools( CLAUDE_ENABLED_TOOLS, CLAUDE_NAVIGATION_CONFINEMENT, targetOrigin );
 const enabledNative = () =>
-	claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, path.resolve( 'workspace' ) );
+	claudeNativeTools( CLAUDE_ENABLED_TOOLS, { mode: 'approval-only' }, path.resolve( 'workspace' ) );
 
 describe( 'Studio tools on the Claude route, against the Pi route’s registry', () => {
+	it( 'omits Bash when the turn cannot prepare a shell', () => {
+		expect(
+			claudeNativeTools(
+				CLAUDE_ENABLED_TOOLS,
+				CLAUDE_SHELL_CONFINEMENT,
+				path.resolve( 'workspace' )
+			)
+		).toEqual( enabledNative().filter( ( name ) => name !== 'Bash' ) );
+	} );
+
 	it( 'classifies the shared WordPress tool by the command and selected arguments', () => {
 		const rule = CLAUDE_STUDIO_TOOL_RULES.get( 'wp_cli' )!;
 		const classify = ( command: string ) => rule.classify!( { nameOrPath: 'site', command } );

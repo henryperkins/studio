@@ -21,6 +21,14 @@ import { glob } from 'glob';
 import { getSiteUrl } from 'cli/lib/cli-config/sites';
 import { getWordPressVersionFromInstallation } from 'cli/lib/dependency-management/wordpress';
 import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
+import {
+	appendTransferFile,
+	checkSiteTransferTree,
+	checkTransferFile,
+	hasSiteTransferScope,
+	openTransferFile,
+	requirePlainTransferEntry,
+} from 'cli/lib/site-transfer-paths';
 import { ensureSqliteIntegrationForImportedSite } from 'cli/lib/sqlite-integration';
 import { LoggerError } from 'cli/logger';
 import { ImportExportEventEmitter } from '../../events';
@@ -41,6 +49,7 @@ const prefixedLegacyMuPluginNames = LEGACY_MU_PLUGIN_FILENAMES.map(
 
 export class DefaultExporter extends ImportExportEventEmitter implements Exporter {
 	private archiveBuilder!: Archiver;
+	private archiveIdentity?: { dev: bigint; ino: bigint };
 	private backup: BackupContents;
 	private readonly options: ExportOptions;
 
@@ -119,26 +128,34 @@ export class DefaultExporter extends ImportExportEventEmitter implements Exporte
 	}
 
 	async export(): Promise< void > {
+		await checkSiteTransferTree( this.options.site.path );
 		this.emit( ExportEvents.EXPORT_START );
-		const output = fs.createWriteStream( this.options.backupFile );
+		await using handle = hasSiteTransferScope()
+			? await openTransferFile( this.options.backupFile, true )
+			: await fsPromises.open( this.options.backupFile, 'w' );
+		this.archiveIdentity = await handle.stat( { bigint: true } );
+		const output = handle.createWriteStream();
 		this.archiveBuilder = this.createArchiveBuilder();
 
 		const archiveClosedPromise = this.setupArchiveListeners( output );
 
 		this.archiveBuilder.pipe( output );
 
-		try {
-			this.addWpConfig();
+		const writeArchive = async () => {
+			await this.addWpConfig();
 			await this.addWpContent();
 			await this.addDatabase();
 			const studioJsonPath = await this.createStudioJsonFile();
 			this.archiveBuilder.file( studioJsonPath, { name: 'meta.json' } );
 			await this.archiveBuilder.finalize();
 			this.emit( ExportEvents.BACKUP_CREATE_COMPLETE );
-			await archiveClosedPromise;
+		};
+		try {
+			await Promise.all( [ writeArchive(), archiveClosedPromise ] );
 			this.emit( ExportEvents.EXPORT_COMPLETE );
 		} catch ( error ) {
 			this.archiveBuilder.abort();
+			output.destroy();
 			this.emit( ExportEvents.EXPORT_ERROR, createExportErrorPayload( error ) );
 			throw error;
 		} finally {
@@ -176,12 +193,28 @@ export class DefaultExporter extends ImportExportEventEmitter implements Exporte
 			} );
 
 			this.archiveBuilder.on( 'error', reject );
+			output.on( 'error', ( error ) => {
+				reject( error );
+				if ( hasSiteTransferScope() ) this.archiveBuilder.destroy( error );
+			} );
 		} );
 	}
 
-	private addWpConfig(): void {
+	private async addWpConfig(): Promise< void > {
 		const wpConfigPath = path.join( this.options.site.path, 'wp-config.php' );
 		if ( fs.existsSync( wpConfigPath ) ) {
+			if ( hasSiteTransferScope() ) {
+				await using config = await openTransferFile( wpConfigPath );
+				const raw = await config.readFile( 'utf8' );
+				const content = hasDefaultDbBlock( raw ) ? removeDbConstants( raw ) : raw;
+				this.archiveBuilder.append(
+					this.options.stripStudioWpConfigConstants
+						? stripStudioWpConfigConstants( content )
+						: content,
+					{ name: 'wp-config.php' }
+				);
+				return;
+			}
 			const content = fs.readFileSync( wpConfigPath, 'utf-8' );
 			if ( hasDefaultDbBlock( content ) ) {
 				const modifiedContent = removeDbConstants( content );
@@ -213,7 +246,9 @@ export class DefaultExporter extends ImportExportEventEmitter implements Exporte
 
 		if ( Array.isArray( pathsToArchive ) ) {
 			for ( const itemPath of pathsToArchive ) {
+				requirePlainTransferEntry( itemPath.split( path.sep ).join( '/' ) );
 				const fullPath = path.join( this.options.site.path, 'wp-content', itemPath );
+				await checkTransferFile( fullPath, true );
 				const archivePath = path.join( 'wp-content', itemPath );
 
 				if ( ! fs.existsSync( fullPath ) ) {
@@ -234,7 +269,12 @@ export class DefaultExporter extends ImportExportEventEmitter implements Exporte
 					) {
 						continue;
 					}
-					this.archiveBuilder.file( fullPath, { name: archivePath } );
+					await appendTransferFile(
+						this.archiveBuilder,
+						fullPath,
+						{ name: archivePath },
+						this.archiveIdentity
+					);
 				}
 			}
 		}
@@ -253,7 +293,7 @@ export class DefaultExporter extends ImportExportEventEmitter implements Exporte
 		const relativePaths = await glob( '**/*', {
 			cwd: dirPath,
 			dot: true,
-			follow: true,
+			follow: ! hasSiteTransferScope(),
 			nodir: true,
 			// Keep entry names forward-slashed on Windows
 			posix: true,
@@ -272,9 +312,25 @@ export class DefaultExporter extends ImportExportEventEmitter implements Exporte
 			) {
 				continue;
 			}
+			if ( hasSiteTransferScope() ) {
+				await appendTransferFile(
+					this.archiveBuilder,
+					fullEntryPathOnDisk,
+					{
+						name: entryPathRelativeToArchiveRoot,
+					},
+					this.archiveIdentity
+				);
+				continue;
+			}
 			try {
 				const resolvedPath = fs.realpathSync( fullEntryPathOnDisk );
-				this.archiveBuilder.file( resolvedPath, { name: entryPathRelativeToArchiveRoot } );
+				await appendTransferFile(
+					this.archiveBuilder,
+					resolvedPath,
+					{ name: entryPathRelativeToArchiveRoot },
+					this.archiveIdentity
+				);
 			} catch ( error ) {
 				// Dangling symlink. Skip it rather than aborting the whole archive.
 				console.warn( `Skipping ${ entryPathRelativeToArchiveRoot }: ${ error }` );

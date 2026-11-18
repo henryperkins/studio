@@ -1,7 +1,8 @@
 import { execFile, fork, spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import { once } from 'events';
-import { mkdir, mkdtemp, realpath, rm } from 'fs/promises';
+import { existsSync } from 'fs';
+import { mkdir, mkdtemp, readFile, realpath, rm } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
@@ -24,6 +25,10 @@ const exec = promisify( execFile );
 const LIFETIME = 45_000;
 // The unrelated process outlives the whole suite, and still ends on its own.
 const SENTINEL_LIFETIME = 300_000;
+const bashExecutable =
+	process.platform === 'win32'
+		? path.join( process.env.ProgramFiles ?? 'C:\\Program Files', 'Git', 'usr', 'bin', 'bash.exe' )
+		: '/bin/bash';
 
 // An ES module bundle of a fixture, written under the repository's
 // node_modules so its external packages resolve from there.
@@ -235,22 +240,141 @@ describe( 'native lifecycle with an owned process tree (Node test processes)', (
 		() => interrupt( 'kill-keeper' ),
 		90_000
 	);
+
+	async function runBash( scenario: string ) {
+		const directory = await realpath( await mkdtemp( path.join( root, 'shell ' ) ) );
+		const site = path.join( directory, 'site' );
+		await Promise.all( [ mkdir( site ), mkdir( path.join( directory, 'config' ) ) ] );
+		const runner = fork(
+			owner.file,
+			[ nativeFixture, marker, String( LIFETIME ), directory, bashExecutable, scenario ],
+			{
+				env: {
+					PATH: process.env.PATH,
+					SYSTEMROOT: process.env.SYSTEMROOT,
+					WINDIR: process.env.WINDIR,
+					COMSPEC: process.env.COMSPEC,
+					PATHEXT: process.env.PATHEXT,
+					TEMP: os.tmpdir(),
+					TMP: os.tmpdir(),
+					HOME: directory,
+					USERPROFILE: directory,
+					NODE_PATH: path.resolve( 'node_modules' ),
+					DEV_CONFIG_DIR: path.join( directory, 'config' ),
+				},
+				execArgv: [],
+				stdio: [ 'ignore', 'ignore', 'ignore', 'ipc' ],
+			}
+		);
+		return { runner, directory, site, exited: once( runner, 'exit' ) };
+	}
+
+	it.skipIf( ! existsSync( bashExecutable ) )(
+		'finishes a turn after the approved Bash command writes the requested file',
+		async () => {
+			const { runner, site, exited } = await runBash( 'completed' );
+			try {
+				const report = await nextMessage( runner, 'done', 60_000 );
+				await exited;
+				const events = report.events as BackendTurnEvent[];
+				expect( events.filter( ( event ) => event.type === 'tool.result' ) ).toEqual( [
+					expect.objectContaining( { toolCallId: 'writer', isError: false } ),
+				] );
+				expect( events.at( -1 ) ).toMatchObject( {
+					type: 'turn.terminal',
+					outcome: { status: 'success' },
+				} );
+				expect( await readFile( path.join( site, 'approved.txt' ), 'utf8' ) ).toBe( 'approved' );
+				await expect( readFile( path.join( site, 'denied.txt' ) ) ).rejects.toMatchObject( {
+					code: 'ENOENT',
+				} );
+			} finally {
+				if ( runner.exitCode === null && runner.signalCode === null ) runner.kill( 'SIGKILL' );
+				await exited;
+			}
+		},
+		90_000
+	);
+
+	it
+		.skipIf( ! existsSync( bashExecutable ) )
+		.each( [ 'stop', 'timeout', 'early success', 'invalid result', 'sandbox override' ] )(
+		'ends an approved Bash command and its writer on %s, leaving the denied file absent',
+		async ( scenario ) => {
+			const { runner, site, directory, exited } = await runBash( scenario );
+			try {
+				const { shell, writer } = await nextMessage( runner, 'bash-started', 60_000 );
+				const finished = nextMessage( runner, 'done' );
+				void finished.catch( () => {} );
+				const pids = [ Number( shell ), Number( writer ) ];
+				expect( await readFile( path.join( site, 'approved.txt' ), 'utf8' ) ).toBe( 'approved' );
+				await expect( readFile( path.join( site, 'denied.txt' ) ) ).rejects.toMatchObject( {
+					code: 'ENOENT',
+				} );
+				const processes = await identities( pids );
+				expect( processes.map( ( process ) => process.pid ) ).toEqual( pids );
+				if ( scenario === 'stop' ) runner.send( 'abort' );
+				if ( [ 'early success', 'invalid result', 'sandbox override' ].includes( scenario ) )
+					runner.send( 'return-success' );
+				const report = await finished;
+				await exited;
+				const events = report.events as BackendTurnEvent[];
+				expect( events.filter( ( event ) => event.type === 'tool.result' ) ).toEqual( [] );
+				expect(
+					events
+						.filter( ( event ) => event.type === 'approval.requested' )
+						.map( ( event ) => event.toolCallId )
+				).toEqual( [ 'denied', 'writer' ] );
+				expect( events.filter( ( event ) => event.type === 'turn.terminal' ) ).toEqual( [
+					expect.objectContaining( {
+						outcome: expect.objectContaining( {
+							status: 'interrupted',
+							...( scenario === 'timeout'
+								? { message: expect.stringContaining( 'time limit' ) }
+								: {} ),
+						} ),
+					} ),
+				] );
+				expect( await goneWithin( processes, 5_000 ) ).toEqual( [] );
+				const heartbeat = path.join( site, 'heartbeat.txt' );
+				const before = await readFile( heartbeat, 'utf8' );
+				await new Promise( ( resolve ) => setTimeout( resolve, 150 ) );
+				expect( await readFile( heartbeat, 'utf8' ) ).toBe( before );
+				expect( before.length ).toBeGreaterThan( 0 );
+				const store = createNativeSessionStore( path.join( directory, 'store' ) );
+				await (
+					await store.lockTurn( 'chat' )
+				)();
+			} finally {
+				if ( runner.exitCode === null && runner.signalCode === null ) runner.kill( 'SIGKILL' );
+				await exited;
+			}
+		},
+		90_000
+	);
 } );
 
 // The resolved message of `type` from a forked test process.
 function nextMessage(
 	child: ReturnType< typeof fork >,
-	type: string
+	type: string,
+	timeout = 30_000
 ): Promise< Record< string, unknown > > {
 	return new Promise( ( resolve, reject ) => {
-		const timer = setTimeout( () => reject( new Error( `No ${ type } message` ) ), 30_000 );
+		const timer = setTimeout( () => reject( new Error( `No ${ type } message` ) ), timeout );
+		const onExit = () => {
+			clearTimeout( timer );
+			reject( new Error( `Fixture exited before sending ${ type }` ) );
+		};
 		const listen = ( message: Record< string, unknown > ) => {
 			if ( message?.type !== type ) return;
 			clearTimeout( timer );
 			child.off( 'message', listen );
+			child.off( 'exit', onExit );
 			resolve( message );
 		};
 		child.on( 'message', listen );
+		child.once( 'exit', onExit );
 	} );
 }
 

@@ -25,6 +25,8 @@ export interface HostSite {
 export interface HostOperationOptions {
 	signal?: AbortSignal;
 	beforeSpawn?: () => Promise< void >;
+	/** When set, archive and copy operations refuse filesystem and archive links. */
+	siteTransfer?: { site: string; archive?: string };
 }
 
 export interface WpCliOutput {

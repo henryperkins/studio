@@ -78,7 +78,7 @@ import type { SyncSite } from '@studio/common/types/sync';
  */
 
 /** Changes whenever what this policy allows changes; turns and approvals carry it. */
-export const CLAUDE_EXECUTION_POLICY_REVISION = 3;
+export const CLAUDE_EXECUTION_POLICY_REVISION = 4;
 
 /** One operation as it will run. An approval covers exactly this, for one call. */
 export interface ClaudeOperation {
@@ -187,6 +187,7 @@ export interface ClaudeToolUse {
 	toolName: string;
 	input: unknown;
 	toolUseId?: string;
+	cwd?: string;
 	mcpServer?: { name: string; source: string };
 }
 
@@ -340,6 +341,8 @@ const REFUSALS = {
 		'Studio pushes or pulls only with options from this list, each once, separated by commas: all (alone), sqls, uploads, plugins, themes, contents.',
 	reprintPull:
 		'On this route Studio pulls a site only with its default engine; the Reprint pull (STUDIO_ENABLE_PULL_REPRINT) keeps its state in .studio/pulls under the home folder, whatever Studio’s configuration folder is, and this route does not bind that folder.',
+	linkedTransfer:
+		'Use an archive and site containing ordinary files and folders. Studio refuses links and special files during this transfer.',
 	siteFiles:
 		'A file this tool writes must be an absolute path inside the folder of this conversation’s site, through every link it passes.',
 	bundledFiles:
@@ -1138,7 +1141,31 @@ export function createClaudeExecutionPolicy(
 
 		const pathField = rule?.path?.field;
 		const file = pathField ? input[ pathField ] ?? context.workspace.workingDirectory : undefined;
+		const shellRoots =
+			rule?.shell && context.shellConfinement.mode === 'sandbox' ? context.localRoots : undefined;
 		const checkPath = async (): Promise< NativeAdmission > => {
+			if ( rule?.shell ) {
+				const cwd = use.cwd;
+				const bound = context.workspace.workingDirectory;
+				if (
+					typeof cwd !== 'string' ||
+					! path.isAbsolute( cwd ) ||
+					path.relative( bound, cwd ) !== '' ||
+					( await realpath( cwd ).catch( () => undefined ) ) !== bound
+				) {
+					return denyTool(
+						'Start the shell command in the working directory of this conversation.'
+					);
+				}
+				for ( const root of shellRoots ?? [] ) {
+					if ( root !== bound && ( await realpath( root ).catch( () => undefined ) ) !== root ) {
+						return denyTool(
+							'The shell workspace changed. Start a new turn to check its folders.'
+						);
+					}
+				}
+				return { allowed: true, path: bound };
+			}
 			if ( ! pathField ) return { allowed: true };
 			if (
 				typeof file !== 'string' ||
@@ -1169,7 +1196,9 @@ export function createClaudeExecutionPolicy(
 				tool: toolName,
 				operationClass: rule.operationClass,
 				args: checkedInput( checked.path ),
-				localPaths: [ checked.path ?? context.workspace.workingDirectory ],
+				localPaths: shellRoots
+					? [ ...new Set( [ context.workspace.workingDirectory, ...shellRoots ] ) ]
+					: [ checked.path ?? context.workspace.workingDirectory ],
 				...( isNativeWrite( toolName ) ? { filePath: checked.path } : {} ),
 				description: describe(
 					rule.operationClass,
@@ -1189,7 +1218,7 @@ export function createClaudeExecutionPolicy(
 				: await admit( operation, toolUseId, caller );
 			if ( ! admitted )
 				return refusal ?? denyTool( ask ? 'The operation was not approved.' : undefined );
-			if ( isNativeWrite( toolName ) && ! ( await stillBound() ) )
+			if ( ( isNativeWrite( toolName ) || rule.shell ) && ! ( await stillBound() ) )
 				return refusal ?? denyTool( FILE_CHANGED );
 			return checked;
 		};
@@ -2122,6 +2151,10 @@ export function createClaudeExecutionPolicy(
 				prepared.site,
 				{
 					signal: operationSignal,
+					...( prepared.site &&
+						( request.scratch || request.file ) && {
+							siteTransfer: { site: prepared.site.path, archive: prepared.file?.path },
+						} ),
 					beforeSpawn: async () => {
 						if ( ! ( await fence( host, prepared, toolCallId, callSignal ) ) ) throw denied();
 					},
@@ -2133,7 +2166,17 @@ export function createClaudeExecutionPolicy(
 					wpcomSite: prepared.wpcomSite === undefined ? undefined : String( prepared.wpcomSite.id ),
 					syncOptions: prepared.syncOptions,
 				}
-			);
+			).catch( ( error: unknown ) => {
+				let detail = error;
+				while ( detail instanceof Error ) {
+					if ( 'code' in detail && detail.code === 'unsafe_site_transfer' ) {
+						refuse( toolCallId, REFUSALS.linkedTransfer );
+						break;
+					}
+					detail = 'previousError' in detail ? detail.previousError : undefined;
+				}
+				throw error;
+			} );
 		};
 		// A read a tool makes of a site: of a site it may reach, under the turn's
 		// authority, while the call lives.

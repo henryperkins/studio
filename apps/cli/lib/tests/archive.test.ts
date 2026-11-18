@@ -34,6 +34,7 @@ describe( 'Archive Module', () => {
 		directory: ReturnType< typeof vi.fn >;
 		file: ReturnType< typeof vi.fn >;
 		finalize: ReturnType< typeof vi.fn >;
+		abort: ReturnType< typeof vi.fn >;
 		on: ReturnType< typeof vi.fn >;
 	} {
 		return {
@@ -47,6 +48,7 @@ describe( 'Archive Module', () => {
 			directory: vi.fn().mockReturnThis(),
 			file: vi.fn().mockReturnThis(),
 			finalize: vi.fn().mockResolvedValue( undefined ),
+			abort: vi.fn(),
 			on: vi.fn().mockReturnThis(),
 		};
 	}

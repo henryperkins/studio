@@ -29,6 +29,7 @@ import { connectToDaemon, disconnectFromDaemon } from 'cli/lib/daemon-client';
 import { pullSelectionFromSyncOptions } from 'cli/lib/pull/pull-selection';
 import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
 import { STUDIO_SITES_ROOT } from 'cli/lib/site-paths';
+import { withSiteTransfer } from 'cli/lib/site-transfer-paths';
 import { getSnapshotsFromConfig } from 'cli/lib/snapshots';
 import { parseSyncOptions } from 'cli/lib/sync-api';
 import { getTracksOrigin, recordTracksEvent } from 'cli/lib/tracks';
@@ -84,9 +85,14 @@ async function fenced< T >(
 	run: () => Promise< T >
 ): Promise< T > {
 	options?.signal?.throwIfAborted();
-	await options?.beforeSpawn?.();
-	options?.signal?.throwIfAborted();
-	return run();
+	const start = async () => {
+		await options?.beforeSpawn?.();
+		options?.signal?.throwIfAborted();
+		return run();
+	};
+	return options?.siteTransfer
+		? withSiteTransfer( { ...options.siteTransfer, signal: options.signal }, start )
+		: start();
 }
 
 async function withDaemon< T >( fn: () => Promise< T > ): Promise< T > {

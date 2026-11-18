@@ -9,6 +9,12 @@ import {
 	getBundledWxrImportScriptPath,
 } from 'cli/lib/dependency-management/paths';
 import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
+import {
+	checkTransferFile,
+	copyTransferFile,
+	createTransferDirectory,
+	hasSiteTransferScope,
+} from 'cli/lib/site-transfer-paths';
 import { LoggerError } from 'cli/logger';
 import { ImportExportEventEmitter } from '../../events';
 import { BackupContents } from '../types';
@@ -47,7 +53,11 @@ export class WxrImporter extends ImportExportEventEmitter implements Importer {
 			throw error;
 		}
 
-		const stagingDir = path.join( site.path, IMPORT_STAGING_SUBDIR );
+		await using privateStaging = hasSiteTransferScope()
+			? await createTransferDirectory( site.path, IMPORT_STAGING_SUBDIR + '-' )
+			: undefined;
+		const stagingDir = privateStaging?.path ?? path.join( site.path, IMPORT_STAGING_SUBDIR );
+		const copyFile = privateStaging ? copyTransferFile : fs.promises.copyFile;
 		const stagedWxrName = 'import.xml';
 		const stagedScriptName = 'import-wxr.php';
 
@@ -57,15 +67,13 @@ export class WxrImporter extends ImportExportEventEmitter implements Importer {
 			// Studio's wp-cli can't `eval-file` arbitrary host paths — the file must live
 			// inside the site VFS (mounted at /wordpress). Stage the WXR and the driver
 			// script under the site root and reference them with paths relative to it.
-			await ensureDir( stagingDir );
-			await fs.promises.copyFile( wxrFile, path.join( stagingDir, stagedWxrName ) );
-			await fs.promises.copyFile(
-				getBundledWxrImportScriptPath(),
-				path.join( stagingDir, stagedScriptName )
-			);
+			if ( ! privateStaging ) await ensureDir( stagingDir );
+			await copyFile( wxrFile, path.join( stagingDir, stagedWxrName ) );
+			await copyFile( getBundledWxrImportScriptPath(), path.join( stagingDir, stagedScriptName ) );
 
-			const scriptRelPath = `${ IMPORT_STAGING_SUBDIR }/${ stagedScriptName }`;
-			const wxrRelPath = `${ IMPORT_STAGING_SUBDIR }/${ stagedWxrName }`;
+			const stagingName = path.basename( stagingDir );
+			const scriptRelPath = `${ stagingName }/${ stagedScriptName }`;
+			const wxrRelPath = `${ stagingName }/${ stagedWxrName }`;
 
 			this.emit( ImportEvents.IMPORT_DATABASE_START );
 
@@ -117,7 +125,11 @@ export class WxrImporter extends ImportExportEventEmitter implements Importer {
 			);
 			throw error;
 		} finally {
-			await fs.promises.rm( stagingDir, { recursive: true, force: true } ).catch( () => undefined );
+			if ( ! privateStaging ) {
+				await fs.promises
+					.rm( stagingDir, { recursive: true, force: true } )
+					.catch( () => undefined );
+			}
 		}
 	}
 
@@ -126,7 +138,9 @@ export class WxrImporter extends ImportExportEventEmitter implements Importer {
 	protected async ensureWordPressImporterPlugin( site: SiteData ): Promise< void > {
 		const pluginsDir = path.join( site.path, 'wp-content', 'plugins' );
 		const destDir = path.join( pluginsDir, WORDPRESS_IMPORTER_PLUGIN_SLUG );
+		await checkTransferFile( pluginsDir, true );
 		await ensureDir( pluginsDir );
+		await checkTransferFile( destDir, true );
 		await fs.promises.rm( destDir, { recursive: true, force: true } );
 		await fs.promises.cp( getBundledWordPressImporterPath(), destDir, { recursive: true } );
 	}

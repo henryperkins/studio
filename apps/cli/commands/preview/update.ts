@@ -1,16 +1,15 @@
 import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { SNAPSHOT_EVENTS } from '@studio/common/lib/cli-events';
 import { normalizeHostname } from '@studio/common/lib/normalize-hostname';
 import { getSnapshotLink, isSnapshotExpired, isWpcomPreview } from '@studio/common/lib/snapshots';
 import { PreviewCommandLoggerAction as LoggerAction } from '@studio/common/logger-actions';
 import { Snapshot } from '@studio/common/types/snapshot';
 import { __, _n, sprintf } from '@wordpress/i18n';
-import { cleanup, archiveSiteContent } from 'cli/lib/archive';
+import { archiveSiteContent } from 'cli/lib/archive';
 import { getSiteByFolder } from 'cli/lib/cli-config/sites';
 import { countSitePreviews } from 'cli/lib/cli-config/snapshots';
 import { emitCliEvent } from 'cli/lib/daemon-client';
+import { preparePreviewArchive } from 'cli/lib/preview-archive';
 import {
 	deleteSnapshotSite,
 	getLivePreviewSite,
@@ -68,10 +67,8 @@ export async function runCommand(
 	overwrite: boolean,
 	logger: Logger< LoggerAction > = new Logger< LoggerAction >()
 ): Promise< Snapshot > {
-	const archivePath = path.join(
-		os.tmpdir(),
-		`${ path.basename( siteFolder ) }-${ Date.now() }.zip`
-	);
+	await using archive = await preparePreviewArchive( siteFolder );
+	const archivePath = archive.path;
 	const startedAt = Date.now();
 	let siteId: string | undefined;
 	let preview: Snapshot | undefined;
@@ -213,8 +210,6 @@ export async function runCommand(
 		throw error instanceof LoggerError
 			? error
 			: new LoggerError( __( 'Failed to update preview site' ), error );
-	} finally {
-		void cleanup( archivePath );
 	}
 }
 

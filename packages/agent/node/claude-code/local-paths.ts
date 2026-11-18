@@ -21,7 +21,7 @@ export function isInside( root: string, candidate: string ): boolean {
 	);
 }
 
-const sensitiveNames = [
+export const claudeSensitiveNames = Object.freeze( [
 	'.env',
 	'.env.*',
 	'wp-config.php',
@@ -33,8 +33,8 @@ const sensitiveNames = [
 	'*.key',
 	'*.p12',
 	'*.pfx',
-];
-const sensitiveComponents = sensitiveNames.map(
+] );
+const sensitiveComponents = claudeSensitiveNames.map(
 	( name ) =>
 		new RegExp( '^' + name.replace( /\./g, '\\.' ).replace( /\*/g, '[\\s\\S]*' ) + '$', 'i' )
 );
@@ -45,16 +45,16 @@ function isSensitivePath( candidate: string ): boolean {
 		.some( ( part ) => sensitiveComponents.some( ( name ) => name.test( part ) ) );
 }
 
+export function getCredentialNameGlobs( name: string ): string[] {
+	const pattern = name.replace( /[a-z]/g, ( letter ) => `[${ letter }${ letter.toUpperCase() }]` );
+	return pattern.startsWith( '*' ) ? [ pattern, '.' + pattern ] : [ pattern ];
+}
+
 /** Deny matching files and entire matching directories even on case-sensitive volumes. */
 export function getClaudeSensitiveReadDenyRules(): string[] {
-	return sensitiveNames.flatMap( ( name ) => {
-		const pattern = name.replace(
-			/[a-z]/g,
-			( letter ) => `[${ letter }${ letter.toUpperCase() }]`
-		);
-		const spellings = pattern.startsWith( '*' ) ? [ pattern, '.' + pattern ] : [ pattern ];
-		return spellings.flatMap( ( entry ) => [ `Read(**/${ entry })`, `Read(**/${ entry }/**)` ] );
-	} );
+	return claudeSensitiveNames
+		.flatMap( getCredentialNameGlobs )
+		.flatMap( ( entry ) => [ `Read(**/${ entry })`, `Read(**/${ entry }/**)` ] );
 }
 
 // Whether a path is one these checks judge: absolute, with no `..` segment by

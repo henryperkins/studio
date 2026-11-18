@@ -18,6 +18,13 @@ import trash from 'trash';
 import { SiteData } from 'cli/lib/cli-config/core';
 import { ensureWpConfig } from 'cli/lib/native-php/site-setup';
 import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
+import {
+	checkTransferFile,
+	copyTransferFile,
+	createTransferDirectory,
+	hasSiteTransferScope,
+	requirePlainTransferEntry,
+} from 'cli/lib/site-transfer-paths';
 import { keepSqliteIntegrationUpdated } from 'cli/lib/sqlite-integration';
 import { summarizeWpCliStderr } from 'cli/lib/wp-cli-stderr';
 import { LoggerError } from 'cli/logger';
@@ -95,10 +102,16 @@ abstract class BaseImporter extends ImportExportEventEmitter implements Importer
 		const sortedSqlFiles = sqlFiles.sort( ( a, b ) => a.localeCompare( b ) );
 		let processedFiles = 0;
 		const totalFiles = sortedSqlFiles.length;
+		await using scratch = hasSiteTransferScope()
+			? await createTransferDirectory( site.path, '.studio-sql-' )
+			: undefined;
 
 		for ( const sqlFile of sortedSqlFiles ) {
-			const sqlTempFile = `${ generateBackupFilename( 'sql' ) }.sql`;
+			const sqlTempFile = scratch
+				? path.posix.join( path.basename( scratch.path ), 'import.sql' )
+				: `${ generateBackupFilename( 'sql' ) }.sql`;
 			const tmpPath = path.join( site.path, sqlTempFile );
+			let moved = false;
 			processedFiles++;
 
 			this.emit( ImportEvents.IMPORT_DATABASE_PROGRESS, {
@@ -108,7 +121,10 @@ abstract class BaseImporter extends ImportExportEventEmitter implements Importer
 			} );
 
 			try {
+				await checkTransferFile( sqlFile );
+				await checkTransferFile( tmpPath, true );
 				await move( sqlFile, tmpPath );
+				moved = true;
 				await this.prepareSqlFile( tmpPath );
 
 				await using command = await runWpCliCommand(
@@ -142,7 +158,7 @@ abstract class BaseImporter extends ImportExportEventEmitter implements Importer
 					);
 				}
 			} finally {
-				await this.safelyDeletePath( tmpPath );
+				if ( moved ) await this.safelyDeletePath( tmpPath );
 			}
 		}
 
@@ -205,6 +221,7 @@ abstract class BaseBackupImporter extends BaseImporter {
 	protected abstract parseMetaFile( site: SiteData ): Promise< MetaFileData | undefined >;
 
 	protected async createEmptyDatabase( dbPath: string ): Promise< void > {
+		await checkTransferFile( dbPath, true );
 		await fs.promises.writeFile( dbPath, '' );
 	}
 
@@ -243,14 +260,21 @@ abstract class BaseBackupImporter extends BaseImporter {
 		}
 	}
 
+	private async copyFile( source: string, dest: string ) {
+		return hasSiteTransferScope()
+			? copyTransferFile( source, dest )
+			: fs.promises.copyFile( source, dest );
+	}
+
 	protected async importWpConfig( site: SiteData ): Promise< void > {
 		const wpConfigPath = path.join( site.path, 'wp-config.php' );
 		const wpConfigSamplePath = path.join( site.path, 'wp-config-sample.php' );
+		await checkTransferFile( wpConfigPath, true );
 
 		if ( this.backup.wpConfig ) {
-			await fs.promises.copyFile( this.backup.wpConfig, wpConfigPath );
+			await this.copyFile( this.backup.wpConfig, wpConfigPath );
 		} else if ( ! fs.existsSync( wpConfigPath ) && fs.existsSync( wpConfigSamplePath ) ) {
-			await fs.promises.copyFile( wpConfigSamplePath, wpConfigPath );
+			await this.copyFile( wpConfigSamplePath, wpConfigPath );
 		}
 
 		if ( ! site.runtimeBlueprintPath ) {
@@ -291,9 +315,11 @@ abstract class BaseBackupImporter extends BaseImporter {
 					file
 				);
 
+				requirePlainTransferEntry( relativePath.split( path.sep ).join( '/' ) );
 				const destPath = path.join( wpContentDestDir, relativePath );
+				await checkTransferFile( destPath, true );
 				await ensureDir( path.dirname( destPath ) );
-				await fs.promises.copyFile( file, destPath );
+				await this.copyFile( file, destPath );
 
 				processedItems++;
 
@@ -474,6 +500,8 @@ export class WpressImporter extends BaseBackupImporter {
 
 	protected async prepareSqlFile( tmpPath: string ): Promise< void > {
 		const tempOutputPath = `${ tmpPath }.tmp`;
+		await checkTransferFile( tmpPath );
+		await checkTransferFile( tempOutputPath, true );
 		const readStream = fs.createReadStream( tmpPath, 'utf8' );
 		const writeStream = fs.createWriteStream( tempOutputPath, 'utf8' );
 

@@ -66,7 +66,7 @@ export interface ClaudeEnabledTools {
  * qualified.
  */
 export const CLAUDE_ENABLED_TOOLS: ClaudeEnabledTools = Object.freeze( {
-	native: Object.freeze( [ 'Read', 'Grep', 'Glob', 'Write', 'Edit' ] ),
+	native: Object.freeze( [ 'Read', 'Grep', 'Glob', 'Write', 'Edit', 'Bash' ] ),
 	studio: Object.freeze( [
 		runWpCliTool.name,
 		getSiteInfoTool.name,
@@ -122,7 +122,7 @@ export type ClaudeShellConfinement =
 	| { readonly mode: 'approval-only' }
 	| { readonly mode: 'sandbox'; readonly sandbox: SandboxSettings | undefined };
 
-/** This build configures no shell confinement, so no shell tool can be enabled. */
+/** Used during discovery and when the turn has no qualified shell. */
 export const CLAUDE_SHELL_CONFINEMENT: ClaudeShellConfinement = Object.freeze( { mode: 'none' } );
 
 /**
@@ -1088,7 +1088,7 @@ export interface ClaudeNativeToolRule {
 	readonly shell?: true;
 }
 
-const SHELL_TIMEOUT_LIMIT_MS = 10 * 60 * 1000;
+export const SHELL_TIMEOUT_LIMIT_MS = 10 * 60 * 1000;
 
 // A shell command is never judged safe by its text: every call needs approval
 // of the exact command. These bounds keep it in the foreground, where the turn's
@@ -1106,7 +1106,7 @@ function isBoundedShellInput( input: Record< string, unknown > ): boolean {
 		Object.keys( rest ).length === 0 &&
 		typeof command === 'string' &&
 		command.trim().length > 0 &&
-		command.length <= 10000 &&
+		! command.includes( '\0' ) &&
 		( timeout === undefined ||
 			( Number.isInteger( timeout ) &&
 				( timeout as number ) > 0 &&
@@ -1218,6 +1218,7 @@ export function getClaudeNativePayloadRefusal(
 	toolName: string,
 	input: Record< string, unknown >
 ): string | undefined {
+	if ( toolName === 'Bash' ) return getPayloadLimitViolation( toolName, input );
 	if ( toolName !== 'Write' && toolName !== 'Edit' ) return;
 	const payload =
 		toolName === 'Write'
@@ -1284,8 +1285,10 @@ const SANDBOX_KEYS: ReadonlySet< string > = new Set( [
 	'autoAllowBashIfSandboxed',
 	'allowUnsandboxedCommands',
 	'filesystem',
+	'network',
 ] );
 const SANDBOX_FILESYSTEM_KEYS: ReadonlySet< string > = new Set( [
+	'allowRead',
 	'allowWrite',
 	'denyWrite',
 	'denyRead',
@@ -1312,6 +1315,14 @@ export function isVerifiedShellConfinement(
 		return false;
 	const sandbox = plainData( declared.sandbox );
 	if ( ! sandbox || ! hasOnlyKeys( sandbox, SANDBOX_KEYS ) ) return false;
+	const network = plainData( sandbox.network );
+	if (
+		! network ||
+		Object.keys( network ).length !== 2 ||
+		network.strictAllowlist !== true ||
+		plainStrings( network.allowedDomains )?.length !== 0
+	)
+		return false;
 	const filesystem = sandbox.filesystem === undefined ? {} : plainData( sandbox.filesystem );
 	if ( ! filesystem || ! hasOnlyKeys( filesystem, SANDBOX_FILESYSTEM_KEYS ) ) return false;
 	const lists = new Map(
@@ -1319,10 +1330,13 @@ export function isVerifiedShellConfinement(
 	);
 	return (
 		sandbox.enabled === true &&
-		( sandbox.failIfUnavailable === undefined || sandbox.failIfUnavailable === true ) &&
+		sandbox.failIfUnavailable === true &&
 		sandbox.allowUnsandboxedCommands === false &&
 		sandbox.autoAllowBashIfSandboxed === false &&
 		[ ...lists.values() ].every( ( list ) => !! list ) &&
+		( lists.get( 'allowRead' ) ?? [] ).every(
+			( root ) => root === workspace && path.isAbsolute( root )
+		) &&
 		( lists.get( 'allowWrite' ) ?? [] ).every(
 			( root ) => path.isAbsolute( root ) && isInside( workspace, path.resolve( root ) )
 		)
@@ -1730,8 +1744,8 @@ export function describeClaudeOperation(
 	shell?: ClaudeShellConfinement
 ): string {
 	if ( shell?.mode === 'sandbox' )
-		return `Run a command in a sandbox that can write only in the workspace: ${ tool }`;
+		return `Run ${ tool } in a sandbox. The command starts in the first folder shown and can write in the listed folders and to temporary files.`;
 	if ( shell )
-		return `Run a command that is not confined to the workspace: it can read and change anything your account can: ${ tool }`;
+		return `Run ${ tool } with your account’s permissions. The command can read and change files outside this workspace.`;
 	return `${ CLASS_DESCRIPTIONS[ operationClass ] }: ${ tool }`;
 }

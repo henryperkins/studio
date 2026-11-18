@@ -34,13 +34,17 @@ import { getClaudeSensitiveReadDenyRules } from './local-paths';
 import { nativeFileResultHook } from './native-file-results';
 import { isClaudeExecutableUnchanged } from './platform';
 import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
+import { prepareClaudeShell } from './shell';
+import { createShellDeadlines } from './shell-deadlines';
 import { createStudioClaudeDiscoveryServer, createStudioClaudeToolBridge } from './tool-bridge';
 import type { ClaudeAuthIdentity } from './auth-status';
 import type { ClaudeAccountStatus, ClaudeAccountStatusRequest } from './connection';
-import type { ClaudeAccountCheck, ClaudeApprover } from './execution-policy';
+import type { ClaudeAccountCheck, ClaudeApprover, ClaudeToolUse } from './execution-policy';
 import type { ClaudeExecutableIdentity } from './platform';
+import type { PreparedClaudeShell } from './shell';
+import type { ShellApprovalCallback, ShellStopReason } from './shell-deadlines';
 import type { StudioAgentHost } from '../host';
-import type { Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk/core';
+import type { HookCallback, Options, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk/core';
 import type {
 	BackendTurnEvent,
 	ClaudeBackendTurnSnapshot,
@@ -239,6 +243,7 @@ interface RuntimeDependencies {
 }
 
 interface RuntimeOptions extends RuntimeDependencies {
+	prepareShell?: typeof prepareClaudeShell;
 	storeRoot: string;
 	approve: ClaudeApprover;
 	verifySession?: ( snapshot: ClaudeBackendTurnSnapshot ) => Promise< boolean >;
@@ -264,6 +269,7 @@ interface NativeLaunch {
 	/** Said to Claude for this turn only, after Studio's standing instructions. */
 	instructions?: string;
 	additionalDirectories?: string[];
+	shell?: PreparedClaudeShell;
 }
 
 const STUDIO_INSTRUCTIONS =
@@ -334,7 +340,22 @@ function nativeLaunchOptions(
 	controller: AbortController,
 	launch: NativeLaunch
 ): Options {
-	const env = { ...prepared.env, CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1' };
+	const confinement = launch.shell?.confinement ?? CLAUDE_SHELL_CONFINEMENT;
+	const tools = claudeNativeTools( CLAUDE_ENABLED_TOOLS, confinement, prepared.cwd );
+	const bash = tools.includes( 'Bash' );
+	const env: NodeJS.ProcessEnv = { ...prepared.env, CLAUDE_CODE_STARTUP_FAILURE_RESULTS: '1' };
+	if ( bash ) {
+		const overrides = {
+			...launch.shell?.env,
+			CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: '1',
+			CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
+		};
+		if ( process.platform === 'win32' )
+			for ( const name of Object.keys( env ) )
+				if ( Object.prototype.hasOwnProperty.call( overrides, name.toUpperCase() ) )
+					delete env[ name ];
+		Object.assign( env, overrides );
+	}
 	return {
 		abortController: controller,
 		pathToClaudeCodeExecutable: prepared.executablePath,
@@ -365,10 +386,8 @@ function nativeLaunchOptions(
 			owned.child.stderr.resume();
 			return owned.child;
 		},
-		tools: claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, prepared.cwd ),
-		...( CLAUDE_SHELL_CONFINEMENT.mode === 'sandbox'
-			? { sandbox: CLAUDE_SHELL_CONFINEMENT.sandbox }
-			: {} ),
+		tools,
+		...( bash && confinement.mode === 'sandbox' ? { sandbox: confinement.sandbox } : {} ),
 		strictMcpConfig: true,
 		settingSources: [],
 		settings: {
@@ -637,6 +656,7 @@ export async function runClaudeTurn(
 	input.signal.addEventListener( 'abort', cancel, { once: true } );
 	const timer = setTimeout( cancel, 30 * 60 * 1000 );
 	let release: ( () => Promise< void > ) | undefined;
+	let shell: PreparedClaudeShell | undefined;
 	let native: ReturnType< typeof sdkQuery > | undefined;
 	let owner: ProcessOwner | undefined;
 	let owned: OwnedProcess | undefined;
@@ -652,11 +672,31 @@ export async function runClaudeTurn(
 		openGate = resolve;
 	} );
 	let terminal: TerminalEvent | undefined;
-	let stopReason: 'detached' | 'account' | 'account-unverified' | undefined;
-	const stop = ( reason: 'detached' | 'account' | 'account-unverified' ) => {
+	type StopReason =
+		| 'detached'
+		| 'account'
+		| 'account-unverified'
+		| 'shell-unsettled'
+		| ShellStopReason;
+	let stopReason: StopReason | undefined;
+	const stop = ( reason: StopReason ) => {
 		stopReason ??= reason;
 		cancel();
 	};
+	const shellDeadlines = createShellDeadlines( ( reason ) => {
+		if ( ! controller.signal.aborted ) stop( reason );
+	} );
+	let shutdown: Promise< boolean > | undefined;
+	const stopProcess = ( process: OwnedProcess ) =>
+		( shutdown ??= process.shutdown().catch( () => false ) );
+	controller.signal.addEventListener(
+		'abort',
+		() => {
+			// A shell can leave child processes even after it returns a result.
+			if ( shellDeadlines.used && owned ) void stopProcess( owned );
+		},
+		{ once: true }
+	);
 	let connectionWatch: ReturnType< typeof setTimeout > | undefined;
 	const failIfSuccessful = () => {
 		if ( ! terminal || terminal.outcome.status === 'success' ) terminal = fail();
@@ -900,6 +940,11 @@ export async function runClaudeTurn(
 		};
 		const emit = ( event: BackendTurnEvent, journalEvent: BackendTurnEvent = event ) => {
 			if ( event.type === 'turn.terminal' ) {
+				if ( event.outcome.status === 'success' && shellDeadlines.running ) {
+					stop( 'shell-unsettled' );
+					terminal ??= { ...event, outcome: { status: 'interrupted' } };
+					return;
+				}
 				if ( event.outcome.status === 'success' ) markNoteGiven();
 				terminal ??= event;
 				return;
@@ -915,6 +960,17 @@ export async function runClaudeTurn(
 		const additionalDirectories =
 			targetSite && targetSite.path !== prepared.cwd ? [ targetSite.path ] : [];
 		const roots = [ prepared.cwd, ...additionalDirectories ];
+		if ( target.environment === 'local' || target.environment === 'global' ) {
+			shell = await ( options.prepareShell ?? prepareClaudeShell )( {
+				cwd: prepared.cwd,
+				site: targetSite?.path,
+				configDirectory: prepared.configDirectory,
+				storeRoot: options.storeRoot,
+				env: prepared.env,
+				signal: controller.signal,
+			} );
+		}
+		const confinement = shell?.confinement ?? CLAUDE_SHELL_CONFINEMENT;
 		policy = createClaudeExecutionPolicy( {
 			runId,
 			turnId,
@@ -931,7 +987,7 @@ export async function runClaudeTurn(
 			localRoots: roots,
 			isStudioSite: async ( folder ) => Boolean( await host.sites.findByFolder( folder ) ),
 			enabledTools: CLAUDE_ENABLED_TOOLS,
-			shellConfinement: CLAUDE_SHELL_CONFINEMENT,
+			shellConfinement: confinement,
 			navigationConfinement: CLAUDE_NAVIGATION_CONFINEMENT,
 			signal: controller.signal,
 			approve: options.approve,
@@ -948,6 +1004,39 @@ export async function runClaudeTurn(
 			uncertainAfterRecovery: note?.uncertain === true,
 		} );
 		const guard = policy;
+		const decideToolUse = async (
+			use: ClaudeToolUse,
+			source: ShellApprovalCallback,
+			signal?: AbortSignal
+		) => {
+			const decision = await guard.decideToolUse( use, signal );
+			if (
+				decision.allowed &&
+				use.toolName === 'Bash' &&
+				( ! use.toolUseId || ! shellDeadlines.start( use.toolUseId, decision.input, source ) )
+			)
+				return { allowed: false as const, reason: 'Start a new Bash tool call for each command.' };
+			return decision;
+		};
+		const shellResult: HookCallback = async ( hook, _id, { signal } ) => {
+			if (
+				controller.signal.aborted ||
+				signal.aborted ||
+				( hook.hook_event_name !== 'PostToolUse' && hook.hook_event_name !== 'PostToolUseFailure' )
+			)
+				return {};
+			const outcome = shellDeadlines.settle( hook );
+			if ( outcome ) {
+				emit( {
+					type: 'tool.result',
+					runId,
+					turnId,
+					toolCallId: hook.tool_use_id,
+					isError: outcome === 'failure',
+				} );
+			}
+			return {};
+		};
 		// Studio's image service decides whether the turn offers generate_images,
 		// as it decides it on the Pi route; no model provider's account does.
 		const imageGeneration = await isImageGenerationAvailable().catch( () => false );
@@ -1011,6 +1100,7 @@ export async function runClaudeTurn(
 					owner: processOwner,
 					supervise: true,
 					additionalDirectories,
+					shell,
 					onRequested: () => {
 						spawnRequested = true;
 					},
@@ -1047,8 +1137,15 @@ export async function runClaudeTurn(
 				// The hook and the permission request each apply the whole policy, so
 				// a native allow rule that skips one cannot skip the Studio guard.
 				canUseTool: async ( name, toolInput, { mcpServer, toolUseID, signal } ) => {
-					const decision = await guard.decideToolUse(
-						{ toolName: name, input: toolInput, toolUseId: toolUseID, mcpServer },
+					const decision = await decideToolUse(
+						{
+							toolName: name,
+							input: toolInput,
+							toolUseId: toolUseID,
+							mcpServer,
+							cwd: prepared.cwd,
+						},
+						'canUseTool',
 						signal
 					);
 					return decision.allowed
@@ -1067,13 +1164,15 @@ export async function runClaudeTurn(
 							hooks: [
 								async ( hook, _toolUseId, context ) => {
 									if ( hook.hook_event_name !== 'PreToolUse' ) return { decision: 'block' };
-									const decision = await guard.decideToolUse(
+									const decision = await decideToolUse(
 										{
 											toolName: hook.tool_name,
 											input: hook.tool_input,
 											toolUseId: hook.tool_use_id,
 											mcpServer: hook.mcp_server,
+											cwd: hook.cwd,
 										},
+										'PreToolUse',
 										context?.signal
 									);
 									return {
@@ -1108,7 +1207,9 @@ export async function runClaudeTurn(
 								),
 							],
 						},
+						{ matcher: 'Bash', hooks: [ shellResult ] },
 					],
+					PostToolUseFailure: [ { matcher: 'Bash', hooks: [ shellResult ] } ],
 				},
 			},
 		} );
@@ -1146,7 +1247,7 @@ export async function runClaudeTurn(
 		// What the native runtime may name at its start: the native tools the turn
 		// enables and the Studio tools its own server lists.
 		const inventory = [
-			...claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, prepared.cwd ),
+			...claudeNativeTools( CLAUDE_ENABLED_TOOLS, confinement, prepared.cwd ),
 			...bridge.tools.map( studioMcpToolName ),
 		];
 		for await ( const message of native ) {
@@ -1197,6 +1298,7 @@ export async function runClaudeTurn(
 		// then a bounded wait and escalation within the owned tree only.
 		policy?.dispose();
 		openGate( false );
+		shellDeadlines.dispose();
 		controller.abort();
 		clearTimeout( connectionWatch );
 		try {
@@ -1207,7 +1309,7 @@ export async function runClaudeTurn(
 		// The run lock is released only on proof that nothing of the run remains.
 		let stopped = true;
 		try {
-			if ( owned ) stopped = await owned.shutdown();
+			if ( owned ) stopped = await stopProcess( owned );
 			else {
 				await owner?.dispose();
 				// The SDK was started but never asked the spawn hook for its
@@ -1216,6 +1318,13 @@ export async function runClaudeTurn(
 			}
 		} catch {
 			stopped = false;
+		}
+		if ( stopped && shell?.dispose ) {
+			try {
+				await shell.dispose();
+			} catch {
+				failIfSuccessful();
+			}
 		}
 		// Every bridged call ends first, with any command it started: Stop
 		// interrupts no started command, so the terminal event and the release of
@@ -1242,6 +1351,18 @@ export async function runClaudeTurn(
 				terminal.outcome.code = 'account_unverified';
 				terminal.outcome.message =
 					'Studio could not verify the Claude account, so this turn stopped. Check the Claude Code sign-in and send again.';
+			} else if ( stopReason === 'shell-timeout' ) {
+				terminal.outcome.message =
+					'The approved Bash command exceeded its time limit. Studio stopped the turn.';
+			} else if ( stopReason === 'shell-background' ) {
+				terminal.outcome.message =
+					'The Bash command continued in the background. Studio stopped the turn.';
+			} else if ( stopReason === 'shell-unsettled' ) {
+				terminal.outcome.message =
+					'Claude Code ended the turn before confirming that the Bash command finished. Studio stopped the command.';
+			} else if ( stopReason === 'shell-unverified' ) {
+				terminal.outcome.message =
+					'Studio stopped the turn because Claude Code could not confirm the Bash command finished under the approved settings.';
 			} else terminal.outcome.message = 'Claude Code was detached during this turn.';
 		}
 		if ( ! stopped ) terminal = unconfirmed( terminal );

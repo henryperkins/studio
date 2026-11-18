@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -152,7 +152,14 @@ describe( 'Claude operation classes', () => {
 		expect( CLAUDE_STUDIO_TOOL_RULES.get( 'site_push' )?.operationClass ).toBe(
 			'remote-overwrite'
 		);
-		expect( CLAUDE_ENABLED_TOOLS.native ).toEqual( [ 'Read', 'Grep', 'Glob', 'Write', 'Edit' ] );
+		expect( CLAUDE_ENABLED_TOOLS.native ).toEqual( [
+			'Read',
+			'Grep',
+			'Glob',
+			'Write',
+			'Edit',
+			'Bash',
+		] );
 	} );
 
 	it( 'classifies a WordPress.com request by its method, never by its annotation alone', () => {
@@ -232,9 +239,10 @@ describe( 'Claude tool use at the SDK hook and native permission request', () =>
 			shellConfinement: { mode: 'approval-only' },
 		} ) );
 		const input = { command: 'echo hi', description: 'Say hi' };
-		expect( await policy.authorizeToolUse( { toolName: 'Bash', input, toolUseId: 'use-1' } ) ).toBe(
-			true
-		);
+		const cwd = context.workspace.workingDirectory;
+		expect(
+			await policy.authorizeToolUse( { toolName: 'Bash', input, toolUseId: 'use-1', cwd } )
+		).toBe( true );
 		expect( context.approve ).toHaveBeenCalledOnce();
 		const request = vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ];
 		expect( request.operation ).toMatchObject( {
@@ -248,21 +256,27 @@ describe( 'Claude tool use at the SDK hook and native permission request', () =>
 			toolCallId: 'use-1',
 			operation: { tool: 'Bash', operationClass: 'command' },
 		} );
-		for ( const unbounded of [
+		for ( const [ index, unbounded ] of [
 			{ command: 'echo hi', run_in_background: true },
 			{ command: 'echo hi', timeout: 60 * 60 * 1000 },
 			{ command: 'echo hi', dangerouslyDisableSandbox: true },
 			{ command: '   ' },
+			{ command: 'echo\0hi' },
 			{ command: 'echo hi', unexpected: true },
-		] )
+		].entries() )
 			expect(
-				await policy.authorizeToolUse( { toolName: 'Bash', input: unbounded, toolUseId: 'use-2' } )
+				await policy.authorizeToolUse( {
+					toolName: 'Bash',
+					input: unbounded,
+					toolUseId: 'invalid-' + index,
+					cwd,
+				} )
 			).toBe( false );
 		expect( context.approve ).toHaveBeenCalledOnce();
 		vi.mocked( context.approve ).mockResolvedValueOnce( 'deny' );
-		expect( await policy.authorizeToolUse( { toolName: 'Bash', input, toolUseId: 'use-3' } ) ).toBe(
-			false
-		);
+		expect(
+			await policy.authorizeToolUse( { toolName: 'Bash', input, toolUseId: 'use-3', cwd } )
+		).toBe( false );
 	} );
 } );
 
@@ -863,14 +877,54 @@ describe( 'Claude native search tools', () => {
 
 describe( 'Claude shell confinement', () => {
 	const shell = { native: [ 'Read', 'Bash' ], studio: [] };
-	const echo = ( toolUseId?: string ) => ( {
+	const echo = ( cwd: string, toolUseId?: string ) => ( {
 		toolName: 'Bash',
 		input: { command: 'echo hi' },
+		cwd,
 		toolUseId,
+	} );
+
+	it( 'binds each shell decision to the actual starting directory, including duplicate callbacks', async () => {
+		const { policy, context, site, other } = await setup( () => ( {
+			enabledTools: shell,
+			shellConfinement: { mode: 'approval-only' },
+		} ) );
+		expect( await policy.authorizeToolUse( { ...echo( site, 'missing' ), cwd: undefined } ) ).toBe(
+			false
+		);
+		expect( await policy.authorizeToolUse( echo( other, 'other' ) ) ).toBe( false );
+		expect( await policy.authorizeToolUse( echo( site, 'one' ) ) ).toBe( true );
+		expect( await policy.authorizeToolUse( echo( other, 'one' ) ) ).toBe( false );
+		expect( context.approve ).toHaveBeenCalledOnce();
+		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation.localPaths ).toEqual( [
+			site,
+		] );
+	} );
+
+	it( 'checks the shared UTF-8 byte limit before asking for a command', async () => {
+		const { policy, context, site } = await setup( () => ( {
+			enabledTools: shell,
+			shellConfinement: { mode: 'approval-only' },
+		} ) );
+		const command = 'é'.repeat( 4096 );
+		const use = echo( site, 'fits' );
+		expect( await policy.authorizeToolUse( { ...use, input: { command } } ) ).toBe( true );
+		const tooLong = await policy.decideToolUse( {
+			...use,
+			toolUseId: 'large',
+			input: { command: command + 'a' },
+		} );
+		expect( tooLong ).toMatchObject( {
+			allowed: false,
+			reason: expect.stringContaining( '8192 bytes' ),
+		} );
+		expect( context.approve ).toHaveBeenCalledOnce();
 	} );
 
 	const confinedSandbox = {
 		enabled: true,
+		failIfUnavailable: true,
+		network: { strictAllowlist: true, allowedDomains: [] },
 		allowUnsandboxedCommands: false,
 		autoAllowBashIfSandboxed: false,
 	};
@@ -883,7 +937,7 @@ describe( 'Claude shell confinement', () => {
 			claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, workspace )
 		).toEqual( [ 'Read', 'Grep', 'Glob', 'Write', 'Edit' ] );
 		expect( claudeNativeTools( shell, { mode: 'none' }, workspace ) ).toEqual( [ 'Read' ] );
-		expect( await unconfined.policy.authorizeToolUse( echo( 'use' ) ) ).toBe( false );
+		expect( await unconfined.policy.authorizeToolUse( echo( workspace, 'use' ) ) ).toBe( false );
 		expect( unconfined.context.approve ).not.toHaveBeenCalled();
 		for ( const sandbox of [
 			undefined,
@@ -894,6 +948,13 @@ describe( 'Claude shell confinement', () => {
 			{ ...confinedSandbox, autoAllowBashIfSandboxed: true },
 			{ ...confinedSandbox, allowUnsandboxedCommands: true },
 			{ ...confinedSandbox, failIfUnavailable: false },
+			{ ...confinedSandbox, failIfUnavailable: undefined },
+			{ ...confinedSandbox, network: undefined },
+			{
+				...confinedSandbox,
+				network: { strictAllowlist: true, allowedDomains: [ 'example.test' ] },
+			},
+			{ ...confinedSandbox, network: { strictAllowlist: false, allowedDomains: [] } },
 			{ ...confinedSandbox, excludedCommands: [ '*' ] },
 			{ ...confinedSandbox, excludedCommands: [] },
 			{ ...confinedSandbox, allowNestedUserNamespaces: true },
@@ -919,11 +980,14 @@ describe( 'Claude shell confinement', () => {
 				enabledTools: shell,
 				shellConfinement: declared,
 			} ) );
-			expect( await unconfigured.policy.authorizeToolUse( echo( 'use' ) ) ).toBe( false );
+			expect( await unconfigured.policy.authorizeToolUse( echo( unconfigured.site, 'use' ) ) ).toBe(
+				false
+			);
 			expect( unconfigured.context.approve ).not.toHaveBeenCalled();
 		}
 		const confined = await setup( ( paths ) => ( {
 			enabledTools: shell,
+			localRoots: [ paths.site, paths.other ],
 			shellConfinement: {
 				mode: 'sandbox',
 				sandbox: {
@@ -936,11 +1000,30 @@ describe( 'Claude shell confinement', () => {
 		expect( claudeNativeTools( shell, confined.context.shellConfinement, confined.site ) ).toEqual(
 			[ 'Read', 'Bash' ]
 		);
-		expect( await confined.policy.authorizeToolUse( echo( 'use' ) ) ).toBe( true );
+		expect( await confined.policy.authorizeToolUse( echo( confined.site, 'use' ) ) ).toBe( true );
 		expect( confined.context.approve ).toHaveBeenCalledOnce();
 		expect(
+			vi.mocked( confined.context.approve ).mock.calls[ 0 ][ 0 ].operation.localPaths
+		).toEqual( [ confined.site, confined.other ] );
+		expect(
 			vi.mocked( confined.context.approve ).mock.calls[ 0 ][ 0 ].operation.description
-		).toMatch( /in a sandbox that can write only in the workspace/ );
+		).toMatch( /sandbox.*temporary files/ );
+	} );
+
+	it( 'refuses a sandbox whose additional working directory is redirected during approval', async () => {
+		const { policy, site, journal } = await setup( ( paths ) => ( {
+			enabledTools: shell,
+			shellConfinement: { mode: 'sandbox', sandbox: confinedSandbox },
+			localRoots: [ paths.site, paths.other ],
+			approve: async () => {
+				const moved = path.join( paths.parent, 'moved' );
+				await rename( paths.other, moved );
+				await symlink( moved, paths.other, 'junction' );
+				return 'allow';
+			},
+		} ) );
+		expect( await policy.authorizeToolUse( echo( site, 'redirected' ) ) ).toBe( false );
+		expect( journal ).toHaveLength( 0 );
 	} );
 
 	it( 'verifies a shell confinement only from plain data, and never throws on a malformed one', () => {
@@ -955,6 +1038,7 @@ describe( 'Claude shell confinement', () => {
 		for ( const declared of [
 			{ mode: 'approval-only' },
 			confined( sandbox ),
+			confined( { ...confinedSandbox, filesystem: { allowRead: [ workspace ] } } ),
 			confined( Object.freeze( sandbox ) ),
 			Object.assign( Object.create( null ), { mode: 'approval-only' } ),
 		] )
@@ -1055,17 +1139,18 @@ describe( 'Claude shell confinement', () => {
 			enabledTools: shell,
 			shellConfinement: { mode: 'approval-only' },
 		} ) );
-		expect( await policy.authorizeToolUse( echo( 'use-1' ) ) ).toBe( true );
-		expect( await policy.authorizeToolUse( echo( 'use-1' ) ) ).toBe( true );
-		expect( await policy.authorizeToolUse( echo( 'use-2' ) ) ).toBe( true );
-		expect( await policy.authorizeToolUse( echo() ) ).toBe( false );
+		const cwd = context.workspace.workingDirectory;
+		expect( await policy.authorizeToolUse( echo( cwd, 'use-1' ) ) ).toBe( true );
+		expect( await policy.authorizeToolUse( echo( cwd, 'use-1' ) ) ).toBe( true );
+		expect( await policy.authorizeToolUse( echo( cwd, 'use-2' ) ) ).toBe( true );
+		expect( await policy.authorizeToolUse( echo( cwd ) ) ).toBe( false );
 		expect( context.approve ).toHaveBeenCalledTimes( 2 );
 		expect( vi.mocked( context.approve ).mock.calls[ 0 ][ 0 ].operation.description ).toMatch(
-			/not confined to the workspace/
+			/can read and change files outside this workspace/
 		);
 		expect( events[ 0 ] ).toMatchObject( {
 			type: 'approval.requested',
-			description: expect.stringMatching( /not confined to the workspace/ ),
+			description: expect.stringMatching( /can read and change files outside this workspace/ ),
 		} );
 	} );
 } );
@@ -1089,7 +1174,7 @@ describe( 'Claude approvals that outlive their caller', () => {
 			} ),
 		} ) );
 		const hook = new AbortController();
-		const use = { toolName: 'Bash', input: { command: 'echo hi' }, toolUseId: 'use' };
+		const use = { toolName: 'Bash', input: { command: 'echo hi' }, toolUseId: 'use', cwd: site };
 		const pending = policy.authorizeToolUse( use, hook.signal );
 		await vi.waitFor( () => expect( approvalSignal ).toBeDefined() );
 		hook.abort();

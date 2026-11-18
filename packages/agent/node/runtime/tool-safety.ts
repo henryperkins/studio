@@ -105,6 +105,14 @@ export function getPayloadLimitViolation( toolName: string, params: unknown ): s
 
 const CORE_ROOT_FILE = /^(index|xmlrpc|wp-(?!config\b)[a-z-]+)\.php$/;
 
+export function isWordPressCoreRelativePath( name: string ): boolean {
+	return (
+		name.startsWith( 'wp-includes/' ) ||
+		name.startsWith( 'wp-admin/' ) ||
+		CORE_ROOT_FILE.test( name )
+	);
+}
+
 function resolveToolPath( filePath: string, cwd: string ): string {
 	const withoutAt = filePath.replace( /^@/, '' );
 	const expanded =
@@ -152,11 +160,7 @@ export async function getFileWriteRefusal(
 		return undefined;
 	}
 	const relativePath = path.relative( root, absolutePath ).split( path.sep ).join( '/' );
-	const isCore =
-		relativePath.startsWith( 'wp-includes/' ) ||
-		relativePath.startsWith( 'wp-admin/' ) ||
-		CORE_ROOT_FILE.test( relativePath );
-	if ( ! isCore || ! ( await isStudioSite( root ) ) ) {
+	if ( ! isWordPressCoreRelativePath( relativePath ) || ! ( await isStudioSite( root ) ) ) {
 		return undefined;
 	}
 	return `Not run: ${ relativePath } is this Studio site's copy of WordPress core, which a WordPress update replaces. Read it as reference. Make the change in wp-content/ (a theme, child theme, or plugin).`;

@@ -256,7 +256,10 @@ describe( 'site_import on the Claude route', () => {
 			expect.objectContaining( { id: fakeSite.id } ),
 			backup,
 			expect.any( Function ),
-			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+			expect.objectContaining( {
+				beforeSpawn: expect.any( Function ),
+				siteTransfer: { site, archive: backup },
+			} )
 		);
 		expect( journaled( journal ) ).toEqual( [
 			[ 'site_import', 'local-overwrite' ],
@@ -307,12 +310,29 @@ describe( 'site_export on the Claude route', () => {
 			exportFile,
 			'full',
 			expect.any( Function ),
-			expect.objectContaining( { beforeSpawn: expect.any( Function ) } )
+			expect.objectContaining( {
+				beforeSpawn: expect.any( Function ),
+				siteTransfer: { site, archive: exportFile },
+			} )
 		);
 		expect( journaled( journal ) ).toEqual( [
 			[ 'site_export', 'local-overwrite' ],
 			[ 'sites.export', 'local-overwrite' ],
 		] );
+	} );
+
+	it( 'explains a linked archive source or destination without exposing its path', async () => {
+		const { bridge, host, site } = await setup();
+		host.sites.export = vi
+			.fn()
+			.mockRejectedValue( Object.assign( new Error( site ), { code: 'unsafe_site_transfer' } ) );
+		const result = await bridge.invoke( 'site_export', {
+			nameOrPath: 'site',
+			exportFile: path.join( site, 'backup.zip' ),
+		} );
+		expect( result.isError ).toBe( true );
+		expect( text( result ) ).toContain( 'refuses links and special files' );
+		expect( text( result ) ).not.toContain( site );
 	} );
 
 	it( 'writes nowhere outside the conversation’s folders, by any path, and says why without the path', async () => {

@@ -2235,6 +2235,94 @@ function spawningNativeTurn(
 	);
 }
 
+it.each( [ 'sandbox', 'approval-only', 'none', 'live' ] as const )(
+	'uses the turn’s %s shell mode for the launch, inventory and permission hook',
+	async ( mode ) => {
+		const { runClaudeTurn } = await import( '../runtime' );
+		const fixture = await ownedNativeFixture( 'claude-bash-' );
+		const sandbox = {
+			enabled: true,
+			failIfUnavailable: true,
+			autoAllowBashIfSandboxed: false,
+			allowUnsandboxedCommands: false,
+			network: { strictAllowlist: true, allowedDomains: [] },
+			filesystem: { allowWrite: [], denyWrite: [ fixture.config ], denyRead: [ fixture.config ] },
+		};
+		const confinement =
+			mode === 'sandbox'
+				? ( { mode, sandbox } as const )
+				: { mode: mode === 'live' ? ( 'approval-only' as const ) : mode };
+		const dispose = vi.fn( async () => {} );
+		const prepareShell = vi.fn( async () => ( { confinement, env: {}, dispose } ) );
+		const approve = vi.fn( async () => 'deny' as const );
+		let offered: unknown;
+		let shellSettings: unknown;
+		let environment: unknown;
+		let answer: unknown;
+		let staleCwd: unknown;
+		try {
+			const query = spawningNativeTurn( fixture.root, async ( options ) => {
+				offered = ( options.tools as string[] ).includes( 'Bash' );
+				shellSettings = options.sandbox;
+				environment = options.env;
+				const hook = ( options as Options ).hooks!.PreToolUse![ 0 ].hooks[ 0 ];
+				const input = {
+					hook_event_name: 'PreToolUse' as const,
+					session_id: 'native',
+					transcript_path: '',
+					tool_name: 'Bash',
+					tool_input: { command: 'pwd' },
+				};
+				const context = { signal: new AbortController().signal };
+				staleCwd = await hook(
+					{ ...input, tool_use_id: 'stale', cwd: fixture.config },
+					'stale',
+					context
+				);
+				answer = await hook(
+					{ ...input, tool_use_id: 'current', cwd: fixture.root },
+					'current',
+					context
+				);
+				return 'result';
+			} );
+			const snapshot = turnSnapshot( fixture.root, fixture.config, 'shell' );
+			await runClaudeTurn(
+				mode === 'live'
+					? { ...snapshot, target: { environment: 'live', siteId: 'site', wpcomSiteId: 42 } }
+					: snapshot,
+				fixture.host,
+				{ prompt: 'Hello', signal: new AbortController().signal, onEvent: () => {} },
+				{
+					...fixture,
+					prepareShell,
+					approve,
+					verifyTarget: async () => true,
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+				}
+			);
+			const enabled = mode === 'sandbox' || mode === 'approval-only';
+			expect( offered ).toBe( enabled );
+			expect( shellSettings ).toEqual( mode === 'sandbox' ? sandbox : undefined );
+			expect( prepareShell ).toHaveBeenCalledTimes( mode === 'live' ? 0 : 1 );
+			expect( dispose ).toHaveBeenCalledTimes( mode === 'live' ? 0 : 1 );
+			expect( environment ).toEqual(
+				enabled
+					? expect.objectContaining( {
+							CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR: '1',
+							CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
+					  } )
+					: expect.not.objectContaining( { CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1' } )
+			);
+			expect( staleCwd ).toMatchObject( { hookSpecificOutput: { permissionDecision: 'deny' } } );
+			expect( answer ).toMatchObject( { hookSpecificOutput: { permissionDecision: 'deny' } } );
+			expect( approve ).toHaveBeenCalledTimes( enabled ? 1 : 0 );
+		} finally {
+			await fixture.cleanup();
+		}
+	}
+);
+
 it( 'on cancel ends the pending approval before the native process hears of it, then stops the owned tree, and runs no queued host operation (mock SDK)', async () => {
 	const { runClaudeTurn } = await import( '../runtime' );
 	const { createNativeSessionStore } = await import( '../sessions' );

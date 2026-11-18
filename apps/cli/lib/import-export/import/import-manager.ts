@@ -8,6 +8,11 @@ import {
 } from '@studio/common/lib/import-export-events';
 import { __ } from '@wordpress/i18n';
 import { SiteData } from 'cli/lib/cli-config/core';
+import {
+	checkSiteTransferTree,
+	copyTransferFile,
+	hasSiteTransferScope,
+} from 'cli/lib/site-transfer-paths';
 import { resetSqliteJournalModeToRollback } from 'cli/lib/sqlite-journal-mode';
 import { LoggerError } from 'cli/logger';
 import { ImportExportEventEmitter } from '../events';
@@ -59,7 +64,27 @@ class BackupImporter extends ImportExportEventEmitter implements Importer {
 	}
 
 	async import( site: SiteData ): Promise< ImporterResult > {
-		const backupHandler = BackupHandlerFactory.create( this.backupFile );
+		if ( ! hasSiteTransferScope() ) return this.importArchive( site, this.backupFile );
+		// The handlers reopen the archive during detection, validation and extraction.
+		// All three must consume the same file that passed the link checks.
+		const directory = await fs.promises.mkdtemp( path.join( os.tmpdir(), 'studio_import-' ) );
+		try {
+			const archive = {
+				...this.backupFile,
+				path: path.join( directory, path.basename( this.backupFile.path ) ),
+			};
+			await copyTransferFile( this.backupFile.path, archive.path );
+			return await this.importArchive( site, archive );
+		} finally {
+			await fs.promises.rm( directory, { recursive: true, force: true } );
+		}
+	}
+
+	private async importArchive(
+		site: SiteData,
+		archive: BackupArchiveInfo
+	): Promise< ImporterResult > {
+		const backupHandler = BackupHandlerFactory.create( archive );
 		if ( ! backupHandler ) {
 			throw new LoggerError(
 				__( 'No suitable backup handler found for the provided backup file' ),
@@ -73,7 +98,7 @@ class BackupImporter extends ImportExportEventEmitter implements Importer {
 		);
 
 		try {
-			const fileList = await backupHandler.listFiles( this.backupFile );
+			const fileList = await backupHandler.listFiles( archive );
 			this.emit( ValidatorEvents.IMPORT_VALIDATION_START );
 			const importer = selectImporter( fileList, extractionDirectory, this.importerOptions );
 
@@ -95,7 +120,7 @@ class BackupImporter extends ImportExportEventEmitter implements Importer {
 			}
 
 			try {
-				await backupHandler.extractFiles( this.backupFile, extractionDirectory );
+				await backupHandler.extractFiles( archive, extractionDirectory );
 			} catch ( error ) {
 				// Tag extraction failures for analytics at the single funnel every backup handler
 				// passes through, so the `extract` code is attached in both IPC and logger modes.
@@ -107,6 +132,7 @@ class BackupImporter extends ImportExportEventEmitter implements Importer {
 				throw new LoggerError( __( 'Failed to extract backup' ), error, 'extract' );
 			}
 
+			await checkSiteTransferTree( site.path );
 			const result = await importer.import( site );
 
 			// Normalize the freshly written database before the caller restarts the

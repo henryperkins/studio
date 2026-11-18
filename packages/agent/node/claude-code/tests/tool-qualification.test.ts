@@ -62,7 +62,13 @@ const noChannels: Record< string, unknown > = Object.fromEntries(
 );
 const verifiedSandbox = {
 	mode: 'sandbox' as const,
-	sandbox: { enabled: true, allowUnsandboxedCommands: false, autoAllowBashIfSandboxed: false },
+	sandbox: {
+		enabled: true,
+		failIfUnavailable: true,
+		allowUnsandboxedCommands: false,
+		autoAllowBashIfSandboxed: false,
+		network: { strictAllowlist: true, allowedDomains: [] },
+	},
 };
 const allStudioTools = () => [ ...CLAUDE_STUDIO_TOOL_RULES.keys() ];
 

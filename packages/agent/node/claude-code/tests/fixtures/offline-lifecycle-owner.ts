@@ -8,6 +8,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { prepareProcessOwner } from '@studio/common/lib/owned-process';
 import { CLAUDE_EXECUTION_POLICY_REVISION } from '../../execution-policy';
 import { runClaudeTurn } from '../../runtime';
+import { exerciseApprovedBash } from './bash-lifecycle';
 import { reportedStudioServer } from './studio-server';
 import type { StudioAgentHost } from '../../../host';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
@@ -17,7 +18,7 @@ import type { ChildProcess, ChildProcessWithoutNullStreams } from 'child_process
 // process in place of the vendor executable and an SDK stand-in that drives
 // it: after init it asks for a draft, whose approval never arrives, and then
 // waits for the test to act.
-const [ nativeFixture, marker, lifetime, root ] = process.argv.slice( 2 );
+const [ nativeFixture, marker, lifetime, root, bash, scenario ] = process.argv.slice( 2 );
 setTimeout( () => process.exit( 1 ), Number( lifetime ) + 15_000 ).unref();
 const site = path.join( root, 'site' );
 const config = path.join( root, 'config' );
@@ -27,13 +28,18 @@ const wpCli: unknown[] = [];
 let approvalCancelled = false;
 let child: ChildProcessWithoutNullStreams | undefined;
 let closeNative: () => void = () => {};
+let emitSuccess: () => void;
+const earlySuccess = new Promise< void >( ( resolve ) => {
+	emitSuccess = resolve;
+} );
 
 const env: NodeJS.ProcessEnv = {};
 for ( const [ name, value ] of Object.entries( process.env ) )
 	if ( /^(PATH|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|TEMP|TMP|HOME)$/i.test( name ) )
 		env[ name ] = value;
 
-const found = statSync( process.execPath, { bigint: true } );
+const executable = bash || process.execPath;
+const found = statSync( executable, { bigint: true } );
 const siteRecord = {
 	id: 'site',
 	path: site,
@@ -64,6 +70,7 @@ const recording = ( ( ...args: Parameters< typeof spawn > ) => {
 process.on( 'message', ( command ) => {
 	if ( command === 'abort' ) controller.abort();
 	if ( command === 'close' ) closeNative();
+	if ( command === 'return-success' ) emitSuccess();
 	if ( command === 'eof' ) child?.stdin.end();
 	if ( command === 'kill-native' ) child?.kill( 'SIGKILL' );
 	// This process's own unreaped child.
@@ -108,7 +115,8 @@ async function main() {
 		{
 			storeRoot: path.join( root, 'store' ),
 			prepareOwner: () => prepareProcessOwner( { spawn: recording } ),
-			approve: ( _request, signal ) => {
+			approve: ( request, signal ) => {
+				if ( bash ) return Promise.resolve( request.toolCallId === 'writer' ? 'allow' : 'deny' );
 				signal.addEventListener(
 					'abort',
 					() => {
@@ -124,12 +132,16 @@ async function main() {
 				state: 'signed-in',
 				identity: { email: 'user@example.com', subscriptionType: 'max' },
 			} ),
-			connection: async () => ( { id: 'offline', executablePath: process.execPath } ),
+			connection: async () => ( { id: 'offline', executablePath: executable } ),
+			prepareShell: async () => ( {
+				confinement: bash ? { mode: 'approval-only' } : { mode: 'none' },
+				env: {},
+			} ),
 			prepare: async () => ( {
 				ok: true,
-				executablePath: process.execPath,
+				executablePath: executable,
 				executableIdentity: {
-					path: process.execPath,
+					path: executable,
 					size: Number( found.size ),
 					device: found.dev.toString(),
 					inode: found.ino.toString(),
@@ -147,7 +159,9 @@ async function main() {
 				const options = input.options!;
 				child = options.spawnClaudeCodeProcess!( {
 					command: options.pathToClaudeCodeExecutable!,
-					args: [ nativeFixture, 'tree', marker, lifetime ],
+					args: bash
+						? [ '--noprofile', '--norc', '-s' ]
+						: [ nativeFixture, 'tree', marker, lifetime ],
 					cwd: options.cwd,
 					env: options.env!,
 					signal: new AbortController().signal,
@@ -160,9 +174,11 @@ async function main() {
 						resolve();
 					};
 					native.once( 'exit', () => resolve() );
-					options.abortController!.signal.addEventListener( 'abort', () => resolve(), {
-						once: true,
-					} );
+					// The Bash fixture reports a stopped command only once its process actually exits.
+					if ( ! bash )
+						options.abortController!.signal.addEventListener( 'abort', () => resolve(), {
+							once: true,
+						} );
 				} );
 				return {
 					initializationResult: async () => ( {
@@ -206,6 +222,14 @@ async function main() {
 								model: 'sonnet',
 								mcp_servers: [ { name: 'studio', status: 'connected', source: 'sdk' } ],
 							};
+							if ( bash ) {
+								await exerciseApprovedBash( options, native, ready, scenario, earlySuccess );
+								if ( scenario === 'early success' ) await earlySuccess;
+								if ( scenario === 'early success' || scenario === 'completed' ) {
+									yield { type: 'result', subtype: 'success', is_error: false, num_turns: 1 };
+								} else await ended;
+								return;
+							}
 							const [ , treePid, shellPid, leafPid ] = ( await ready ).split( ' ' );
 							process.send?.( {
 								type: 'native',
