@@ -9,7 +9,12 @@ import {
 	HOST_OPERATION_CLASSES,
 } from '../execution-rules';
 import { createNativeSessionStore } from '../sessions';
-import { createPolicyFixture, guarded, targetOrigin } from './fixtures/execution-policy';
+import {
+	admitWpCliRead,
+	createPolicyFixture,
+	guarded,
+	targetOrigin,
+} from './fixtures/execution-policy';
 import type { StudioAgentHost } from '../../host';
 import type { ClaudeOperationClass, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 import type { Mock } from 'vitest';
@@ -342,6 +347,7 @@ async function setupHostCall( name: string, uncertainAfterRecovery = false ) {
 			: {} ),
 	} ) );
 	test.host?.( fixture.host, fixture );
+	if ( name === 'sites.wpCli' ) await admitWpCliRead( fixture.policy, fixture.host );
 	const guardedHost = fixture.policy.guardHost( fixture.host, 'call' );
 	await test.before?.( guardedHost, fixture );
 	fixture.journal.length = 0;
@@ -504,7 +510,7 @@ describe( 'what the policy journals before an operation that does more than read
 						tool: name,
 						operationClass:
 							name === 'sites.wpCli'
-								? 'command'
+								? 'local-change'
 								: HOST_OPERATION_CLASSES[ name as keyof typeof HOST_OPERATION_CLASSES ],
 					} ),
 				} ),
@@ -527,7 +533,10 @@ describe( 'what the policy journals before an operation that does more than read
 	);
 
 	it( 'names the approval an approved operation runs under, and describes it as the approval did', async () => {
-		const { policy, host, journal, context } = await setup();
+		const { policy, host, journal, context } = await setup( () => ( {
+			uncertainAfterRecovery: true,
+		} ) );
+		await admitWpCliRead( policy, host );
 		await policy
 			.guardHost( host, 'call' )
 			.sites.wpCli( site, [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ] );
@@ -536,7 +545,7 @@ describe( 'what the policy journals before an operation that does more than read
 			expect.objectContaining( {
 				toolCallId: 'call',
 				requestId: request.requestId,
-				description: 'Create a draft post on the current local site',
+				description: expect.stringContaining( 'Create a draft post on the current local site' ),
 			} ),
 		] );
 	} );
@@ -557,12 +566,13 @@ describe( 'what the policy journals before an operation that does more than read
 				toolUseId: 'read',
 			} )
 		).toBe( true );
+		await admitWpCliRead( policy, host );
 		await policy.guardHost( host, 'call' ).sites.wpCli( site, [ 'option', 'get', 'blogname' ] );
 		expect( host.sites.wpCli ).toHaveBeenCalledOnce();
 		expect( journal ).toEqual( [] );
 	} );
 
-	it( 'journals nothing at the tool for a WP-CLI call that only reads, and journals one it cannot place as a command', async () => {
+	it( 'journals local and unrecognized commands under their own classes and skips reads', async () => {
 		const { policy, host, journal } = await setup();
 		const call = ( command: string, toolCallId: string ) =>
 			policy.authorizeStudioCall( {
@@ -576,13 +586,14 @@ describe( 'what the policy journals before an operation that does more than read
 		expect( journal ).toEqual( [] );
 		expect( await call( 'plugin install hello-dolly', 'install' ) ).toBe( true );
 		expect( await call( 'post   list --format=json', 'formatted' ) ).toBe( true );
+		expect( await call( 'example-plugin report', 'plugin' ) ).toBe( true );
 		expect( journal ).toEqual( [
 			expect.objectContaining( {
 				toolCallId: 'install',
-				operation: expect.objectContaining( { tool: 'wp_cli', operationClass: 'command' } ),
+				operation: expect.objectContaining( { tool: 'wp_cli', operationClass: 'local-change' } ),
 			} ),
 			expect.objectContaining( {
-				toolCallId: 'formatted',
+				toolCallId: 'plugin',
 				operation: expect.objectContaining( { tool: 'wp_cli', operationClass: 'command' } ),
 			} ),
 		] );
@@ -616,7 +627,10 @@ describe( 'what the policy journals before an operation that does more than read
 		expect( journal ).toEqual( [
 			expect.objectContaining( {
 				toolCallId: 'call',
-				operation: expect.objectContaining( { tool: 'sites.wpCli', operationClass: 'command' } ),
+				operation: expect.objectContaining( {
+					tool: 'sites.wpCli',
+					operationClass: 'local-change',
+				} ),
 			} ),
 		] );
 	} );
@@ -627,11 +641,12 @@ describe( 'what the policy journals before an operation that does more than read
 			host,
 			site: folder,
 		} = await setup( () => ( {
-			enabledTools: { native: [ 'Write' ], studio: [ 'scaffold_theme' ] },
+			enabledTools: { native: [ 'Write' ], studio: [ 'scaffold_theme', 'wp_cli' ] },
 			recordOperation: async () => {
 				throw new Error( 'The disk is full' );
 			},
 		} ) );
+		await admitWpCliRead( policy, host );
 		expect(
 			await policy.authorizeToolUse( {
 				toolName: 'Write',
@@ -693,6 +708,7 @@ describe( 'the journal entry that lets an operation run, on disk', () => {
 			};
 		} );
 		await turn.append( { type: 'turn.prompt', ...ids, text: 'Write a draft' } );
+		await admitWpCliRead( fixture.policy, fixture.host );
 		return { ...fixture, turn };
 	}
 

@@ -2275,7 +2275,7 @@ it( 'on cancel ends the pending approval before the native process hears of it, 
 					name: 'wp_cli',
 					arguments: {
 						nameOrPath: 'site',
-						command: 'post create --post_status=draft --post_title=Hello',
+						command: 'post delete 1',
 					},
 				} )
 				.catch( () => {} );
@@ -2361,7 +2361,7 @@ it( 'ends a turn stopped while a bridged command runs only once that command has
 		vi.mocked( fixture.host.sites.wpCli ).mockImplementation( async () => {
 			turn.abort();
 			await new Promise< void >( ( resolve ) => ( finish = resolve ) );
-			return { exitCode: 0, stdout: 'Success: Created post 5.', stderr: '' };
+			return { exitCode: 0, stdout: 'Success.', stderr: '' };
 		} );
 		const query = spawningNativeTurn( fixture.root, async ( options ) => {
 			const stopped = new Promise< void >( ( resolve ) =>
@@ -2382,7 +2382,7 @@ it( 'ends a turn stopped while a bridged command runs only once that command has
 					name: 'wp_cli',
 					arguments: {
 						nameOrPath: 'site',
-						command: 'post create --post_status=draft --post_title=Hello',
+						command: 'post delete 1',
 					},
 				} )
 				.catch( () => {} );
@@ -2499,7 +2499,10 @@ it( 'has an operation’s authorization on disk in the turn’s journal before t
 		expect( onDisk ).toContainEqual(
 			expect.objectContaining( {
 				type: 'operation.authorized',
-				operation: expect.objectContaining( { tool: 'sites.wpCli', operationClass: 'command' } ),
+				operation: expect.objectContaining( {
+					tool: 'sites.wpCli',
+					operationClass: 'local-change',
+				} ),
 				description: 'Create a draft post on the current local site',
 			} )
 		);
@@ -3260,7 +3263,7 @@ describe( 'the turns after a recovery (mock SDK)', () => {
 				return { exitCode: 0, stdout: '', stderr: '' };
 			} );
 			const runtime = await import( '../runtime' );
-			// The first turn dies while the draft the user allowed is being created.
+			// The first turn dies while its ordinary draft is being created.
 			const dying = fakeNativeTurn( fixture.root, {
 				projects: fixture.projects,
 				onTurn: async ( options ) => {

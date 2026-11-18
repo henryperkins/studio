@@ -888,12 +888,21 @@ describe( 'generate_images on the Claude route', () => {
 		expect( generateImages ).not.toHaveBeenCalled();
 	} );
 
-	it( 'still runs no eval through wp_cli, and completes or deletes only attachments the same call reserved in the conversation’s site, once each', async () => {
-		const { bridge, host, policy, localSite, otherSite, other } = await setupImages();
+	it( 'keeps general PHP approval separate from the attachments a call may reserve and finalize', async () => {
+		const approve = vi.fn( async () => 'deny' as const );
+		const { bridge, host, policy, localSite, otherSite, other } = await setupImages( () => ( {
+			approve,
+		} ) );
 		reserving( host );
 		expect(
 			( await bridge.invoke( 'wp_cli', { nameOrPath: 'site', command: "eval 'echo 1;'" } ) ).isError
 		).toBe( true );
+		expect( approve ).toHaveBeenCalledWith(
+			expect.objectContaining( {
+				operation: expect.objectContaining( { tool: 'sites.wpCli', operationClass: 'command' } ),
+			} ),
+			expect.anything()
+		);
 		const guarded = policy.guardHost( host, 'call' );
 		await expect(
 			guarded.sites.wpCli( localSite, reserveAttachmentsArgs( [ 'x.png' ] ) )

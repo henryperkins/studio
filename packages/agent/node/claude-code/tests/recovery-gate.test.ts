@@ -2,7 +2,7 @@ import { writeFile } from 'fs/promises';
 import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { recoveryNote } from '../runtime';
-import { createPolicyFixture } from './fixtures/execution-policy';
+import { admitWpCliRead, createPolicyFixture } from './fixtures/execution-policy';
 import type { ClaudeJournalEvent } from '@studio/agent/protocol/backend-events';
 
 // The first turn after a recovery that left operations uncertain asks before
@@ -58,6 +58,7 @@ describe( 'the approval gate after a recovery with uncertain operations', () => 
 
 	it( 'leaves reads unprompted', async () => {
 		const { policy, host, context, localSite, site } = await setup( true );
+		await admitWpCliRead( policy, host, 'read' );
 		await policy
 			.guardHost( host, 'read' )
 			.sites.wpCli( localSite, [ 'option', 'get', 'blogname' ] );

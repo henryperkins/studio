@@ -1,20 +1,37 @@
 import { mkdir, mkdtemp, realpath, rm } from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import { vi } from 'vitest';
+import { expect, vi } from 'vitest';
 import { createFakeHost, fakeSite } from '../../../tests/fake-host';
 import {
 	CLAUDE_EXECUTION_POLICY_REVISION,
 	createClaudeExecutionPolicy,
 } from '../../execution-policy';
 import { CLAUDE_ENABLED_TOOLS, CLAUDE_NAVIGATION_RULE_REVISION } from '../../execution-rules';
-import type { ClaudeExecutionContext } from '../../execution-policy';
+import type { StudioAgentHost } from '../../../host';
+import type { ClaudeExecutionContext, ClaudeExecutionPolicy } from '../../execution-policy';
 import type {
 	BackendTurnEvent,
 	ClaudeOperationJournalEvent,
 } from '@studio/agent/protocol/backend-events';
 
 export const targetOrigin = new URL( fakeSite.url ).origin;
+
+// Host-level tests exercise the second authorization, after the bridge has admitted its tool.
+export async function admitWpCliRead(
+	policy: ClaudeExecutionPolicy,
+	host: StudioAgentHost,
+	toolCallId = 'call'
+) {
+	expect(
+		await policy.authorizeStudioCall( {
+			host,
+			name: 'wp_cli',
+			args: { nameOrPath: 'site', command: 'post list' },
+			toolCallId,
+		} )
+	).toBe( true );
+}
 
 // Everything a browser-layer guard must guarantee before a tool may drive a browser.
 export const navigationGuarantees = [

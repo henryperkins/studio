@@ -427,7 +427,7 @@ describe( 'recovery once the owner is gone (Node test processes)', () => {
 				turnId: 'turn',
 				recordedTerminal: true,
 				invalidatedApprovals: [ ( requested as { requestId: string } ).requestId ],
-				// The tool call was authorized and journaled; the draft it asked for
+				// The tool call was authorized and journaled; the deletion it requested
 				// was waiting for its approval, and is what the call is reported as.
 				uncertainOperations: [
 					expect.objectContaining( {

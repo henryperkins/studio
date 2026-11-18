@@ -1151,19 +1151,19 @@ describe( 'site_create on the Claude route', () => {
 		expect( context.approve ).not.toHaveBeenCalled();
 		// A command asks, as on the conversation's own site, and its approval
 		// names the site it now works on.
-		const draft = await bridge.invoke( 'wp_cli', {
+		const deletion = await bridge.invoke( 'wp_cli', {
 			...onCreated,
-			command: 'post create --post_status=draft --post_title=Hello',
+			command: 'post delete 1',
 		} );
-		expect( draft.isError ).toBe( false );
+		expect( deletion.isError ).toBe( false );
 		const [ request ] = vi.mocked( context.approve ).mock.calls[ 0 ];
 		expect( request.target ).toEqual( { environment: 'local', siteId: site.id } );
 		expect( request.operation.localPaths ).toEqual( [ created ] );
 		expect( journaled( journal ) ).toEqual( [
 			[ 'site_start', 'local-change' ],
 			[ 'sites.start', 'local-change' ],
-			[ 'wp_cli', 'command' ],
-			[ 'sites.wpCli', 'command' ],
+			[ 'wp_cli', 'local-overwrite' ],
+			[ 'sites.wpCli', 'local-overwrite' ],
 		] );
 
 		// Another site the host knows is still out of reach.

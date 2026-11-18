@@ -223,9 +223,10 @@ export async function checkClaudeNativePath(
 	isStudioSite: ( folder: string ) => Promise< boolean >,
 	workingDirectory?: string
 ): Promise< { path: string } | { refusal: string } > {
-	const writes = tool === 'Write' || tool === 'Edit';
-	const requiresFile = writes || tool === 'Read';
-	const requiresFolder = tool === 'Glob' || tool === 'Ls';
+	const outputDirectory = tool === 'WpCliWriteDirectory';
+	const writes = tool === 'Write' || tool === 'Edit' || outputDirectory;
+	const requiresFile = tool === 'Write' || tool === 'Edit' || tool === 'Read';
+	const requiresFolder = outputDirectory || tool === 'Glob' || tool === 'Ls';
 	const search = requiresFolder || tool === 'Grep';
 	if ( process.platform === 'win32' ) {
 		if ( isReservedWindowsPath( file ) ) return { refusal: nativeRefusals.windows };
@@ -315,7 +316,13 @@ export async function checkClaudeNativePath(
 		return { refusal: nativeRefusals.protected };
 	if (
 		writes &&
-		( await getFileWriteRefusal( tool, { path: resolved }, roots[ 0 ], isStudioSite ) )
+		// An export names its directory; WordPress chooses the file name under it.
+		( await getFileWriteRefusal(
+			'Write',
+			{ path: outputDirectory ? path.join( resolved, 'export.xml' ) : resolved },
+			roots[ 0 ],
+			isStudioSite
+		) )
 	)
 		return { refusal: nativeRefusals.core };
 	return { path: resolved };

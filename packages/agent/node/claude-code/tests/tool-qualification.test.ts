@@ -912,7 +912,7 @@ describe( 'Claude Studio tool qualification', () => {
 			false,
 			false,
 			elements.map( ( key ) => ( key === 'classify' ? 'function' : 'undefined' ) ),
-			'command',
+			'local-change',
 			elements.map( () => 'undefined' ),
 		] );
 	} );

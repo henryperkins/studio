@@ -104,11 +104,11 @@ describe( 'Claude Studio tool boundary (mock host)', () => {
 				.isError
 		).not.toBe( true );
 		for ( const command of [
-			'post delete 1',
-			'option get smtp_password',
+			'package list',
+			'cli update',
 			'option get blogname --url=https://example.com',
 			'post create file.txt --post_status=draft',
-			'post create --post_status=publish',
+			'post list --prompt',
 		] ) {
 			expect( ( await bridge.invoke( 'wp_cli', { nameOrPath: 'site', command } ) ).isError ).toBe(
 				true
@@ -119,11 +119,11 @@ describe( 'Claude Studio tool boundary (mock host)', () => {
 		);
 		expect( host.sites.wpCli ).toHaveBeenCalledTimes( 1 );
 	} );
-	it( 'requires approval immediately before bounded draft creation and rejects cancellation', async () => {
+	it( 'requires approval immediately before a deletion and rejects cancellation', async () => {
 		const denied = await setup( vi.fn( async () => 'deny' as const ) );
 		const args = {
 			nameOrPath: 'site',
-			command: 'post create --post_status=draft --post_title=Hello',
+			command: 'post delete 1',
 		};
 		expect( ( await denied.bridge.invoke( 'wp_cli', args ) ).isError ).toBe( true );
 		expect( denied.host.sites.wpCli ).not.toHaveBeenCalled();
@@ -150,19 +150,15 @@ describe( 'what the model hears of a call Studio did not run', () => {
 		expect( host.sites.wpCli ).not.toHaveBeenCalled();
 	} );
 
-	it( 'says that a WP-CLI command is outside what this route runs, without repeating it', async () => {
+	it( 'explains a refused site redirect without repeating its value', async () => {
 		const { bridge, host } = await setup();
 		const result = await bridge.invoke( 'wp_cli', {
 			nameOrPath: 'site',
-			command: 'plugin install secret-plugin',
+			command: 'plugin list --ssh=private-host',
 		} );
 		expect( result.isError ).toBe( true );
-		expect( text( result ) ).toContain(
-			'This WP-CLI command is outside what Studio runs on the Claude route.'
-		);
-		// It names what the route does run, as the tool's description there does.
-		expect( text( result ) ).toContain( claudeRouteNote( 'wp_cli' ) );
-		expect( text( result ) ).not.toContain( 'secret-plugin' );
+		expect( text( result ) ).toMatch( /site|host|redirect/i );
+		expect( text( result ) ).not.toContain( 'private-host' );
 		expect( host.sites.wpCli ).not.toHaveBeenCalled();
 	} );
 
@@ -170,7 +166,7 @@ describe( 'what the model hears of a call Studio did not run', () => {
 		const { bridge, host } = await setup( vi.fn( async () => 'deny' as const ) );
 		const result = await bridge.invoke( 'wp_cli', {
 			nameOrPath: 'site',
-			command: 'post create --post_status=draft --post_title=Hello',
+			command: 'post delete 1',
 		} );
 		expect( result.isError ).toBe( true );
 		expect( text( result ) ).toContain( 'The user did not approve this operation' );
@@ -209,7 +205,7 @@ it( 'blocks WP-CLI environment overrides before reaching the host', async () => 
 	expect( host.sites.wpCli ).not.toHaveBeenCalled();
 } );
 
-it( 'expires a pending draft approval, rejects a late allow, and exposes the exact proposed arguments', async () => {
+it( 'expires a pending deletion approval, rejects a late allow, and exposes the exact proposed arguments', async () => {
 	let release!: ( value: 'allow' ) => void;
 	const approve = vi.fn(
 		( ..._args: Parameters< ClaudeApprover > ) =>
@@ -220,7 +216,7 @@ it( 'expires a pending draft approval, rejects a late allow, and exposes the exa
 	const { bridge, host } = await setup( approve );
 	const pending = bridge.invoke( 'wp_cli', {
 		nameOrPath: 'site',
-		command: 'post create --post_status=draft --post_title=Hello',
+		command: 'post delete 1',
 	} );
 	await new Promise( ( resolve ) => setTimeout( resolve, 150 ) );
 	expect( ( await pending ).isError ).toBe( true );
@@ -228,7 +224,7 @@ it( 'expires a pending draft approval, rejects a late allow, and exposes the exa
 	await Promise.resolve();
 	expect( host.sites.wpCli ).not.toHaveBeenCalled();
 	expect( approve.mock.calls[ 0 ][ 0 ] ).toMatchObject( {
-		operation: { args: [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ] },
+		operation: { args: [ 'post', 'delete', '1' ] },
 	} );
 } );
 
@@ -241,7 +237,7 @@ it( 'does not mutate when the connection is detached after approval', async () =
 		(
 			await bridge.invoke( 'wp_cli', {
 				nameOrPath: 'site',
-				command: 'post create --post_status=draft --post_title=Hello',
+				command: 'post delete 1',
 			} )
 		).isError
 	).toBe( true );
@@ -262,7 +258,7 @@ it( 'denies a host operation when cancellation arrives during the final connecti
 		(
 			await bridge.invoke( 'wp_cli', {
 				nameOrPath: 'site',
-				command: 'post create --post_status=draft --post_title=Hello',
+				command: 'post delete 1',
 			} )
 		).isError
 	).toBe( true );
@@ -361,7 +357,7 @@ it( 'cancels a pending approval when the SDK cancels the MCP call', async () => 
 	const call = new AbortController();
 	const pending = bridge.invoke(
 		'wp_cli',
-		{ nameOrPath: 'site', command: 'post create --post_status=draft --post_title=Hello' },
+		{ nameOrPath: 'site', command: 'post delete 1' },
 		call.signal
 	);
 	await vi.waitFor( () => expect( approvalSignal ).toBeDefined() );

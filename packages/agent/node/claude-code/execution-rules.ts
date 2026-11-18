@@ -792,20 +792,15 @@ export const CLAUDE_STUDIO_TOOL_RULES: ReadonlyMap< string, ClaudeStudioToolRule
 	],
 	[
 		runWpCliTool.name,
-		// The tool only resolves the site it names and hands the command to the
-		// host, which classifies the command, binds it to the target and asks.
-		// The call itself is a read only when the host would take its command for
-		// one; anything else is a command. The host operation is classified and
-		// journaled on its own arguments, whatever this says.
+		// The host independently classifies the arguments that actually reach WP-CLI.
 		qualified(
 			onSite( 'command', {
 				approval: 'host',
 				classify: ( args ) => {
 					const command = isRecord( args ) ? args.command : undefined;
-					return typeof command === 'string' &&
-						classifyWpCliArgs( splitCommandArgs( command ) ) === 'read'
-						? 'read'
-						: 'command';
+					return typeof command === 'string'
+						? classifyWpCliArgs( splitCommandArgs( command ) )
+						: undefined;
 				},
 			} ),
 			{
@@ -1584,14 +1579,23 @@ export function claudeToolInventory(
  */
 export function claudeRouteNote( name: string ): string | undefined {
 	if ( name !== runWpCliTool.name ) return;
-	const commands = wpCliRouteCommands().map( ( { usage, operationClass } ) =>
-		requiresClaudeApproval( operationClass )
-			? `\`${ usage }\` (once the user approves it)`
-			: `\`${ usage }\``
-	);
-	return `On this route Studio runs only these WP-CLI commands, in exactly these forms: ${ commands.join(
-		'; '
-	) }. It refuses every other command and option.`;
+	const commands = wpCliRouteCommands();
+	const groups = [
+		[ 'read', 'Read' ],
+		[ 'local-change', 'Change the local site' ],
+		[ 'local-overwrite', 'Ask before deleting or replacing local work' ],
+		[ 'command', 'Ask before running the command' ],
+	] as const;
+	const descriptions = groups.map( ( [ operationClass, label ] ) => {
+		const forms = commands.filter( ( row ) => row.operationClass === operationClass );
+		return label + ': ' + forms.map( ( { usage } ) => `\`${ usage }\`` ).join( ', ' ) + '.';
+	} );
+	return [
+		'Studio runs WP-CLI on the selected local site. Use literal arguments. Pass site-local paths for files.',
+		...descriptions,
+		'Other commands or unrecognized options require approval for the full argument list. Studio has not checked what an unrecognized command reads or writes. Redirecting the site, loading external configuration, interactive prompts and WP-CLI management are refused.',
+		'After an interrupted operation with uncertain effects, ordinary changes also require approval.',
+	].join( '\n' );
 }
 
 // Why an image failed, as this route tells Claude: of the image service's

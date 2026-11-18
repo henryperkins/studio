@@ -19,6 +19,7 @@ import {
 	reserveExclusiveAttachmentsArgs,
 	verifiedFinalizeAttachmentsArgs,
 } from '../tools/media-library';
+import { splitCommandArgs } from '../tools/wp-cli';
 import { isClaudeDirectoryListInput } from './directory-listing';
 import {
 	CLAUDE_ACCOUNT_RECHECK_MS,
@@ -26,7 +27,6 @@ import {
 	CLAUDE_STUDIO_TOOL_RULES,
 	HOST_OPERATION_CLASSES,
 	claudeNativeTools,
-	claudeRouteNote,
 	claudeStudioTools,
 	claudeTargetOrigin,
 	describeClaudeOperation,
@@ -50,12 +50,14 @@ import {
 	resolveAllowedPath,
 } from './local-paths';
 import { plainData } from './plain-data';
-import { classifyWpCliArgs, hasWpCliOverrides, wpCliOption } from './wp-cli-rules';
+import { checkWpCliPaths } from './wp-cli-paths';
+import { hasWpCliOverrides, inspectWpCliArgs, wpCliOption } from './wp-cli-rules';
 import type {
 	ClaudeEnabledTools,
 	ClaudeNavigationConfinement,
 	ClaudeShellConfinement,
 } from './execution-rules';
+import type { WpCliFileArgument } from './wp-cli-rules';
 import type { HostOperationOptions, HostSite, MediaAttachment, StudioAgentHost } from '../host';
 import type {
 	BackendTurnEvent,
@@ -76,7 +78,7 @@ import type { SyncSite } from '@studio/common/types/sync';
  */
 
 /** Changes whenever what this policy allows changes; turns and approvals carry it. */
-export const CLAUDE_EXECUTION_POLICY_REVISION = 2;
+export const CLAUDE_EXECUTION_POLICY_REVISION = 3;
 
 /** One operation as it will run. An approval covers exactly this, for one call. */
 export interface ClaudeOperation {
@@ -290,7 +292,10 @@ export interface ClaudeExecutionPolicy {
 
 /** The fixed sentences `takeRefusals` gives. */
 const REFUSALS = {
-	wpCli: 'This WP-CLI command is outside what Studio runs on the Claude route.',
+	wpCliConfig:
+		'WP-CLI configuration or environment overrides may change the target or load other code. Remove the overrides to run this command on the selected site.',
+	wpCliFilesChanged:
+		'A file argument no longer resolves to its checked location. Inspect the file and request the command again.',
 	notApproved: 'The user did not approve this operation, or did not answer in time.',
 	outsideFolders:
 		'A file Studio reads or writes for this operation must be an absolute path inside the site’s folder or this conversation’s workspace, and not one that holds credentials.',
@@ -515,6 +520,11 @@ interface PreparedHostOperation {
 	site?: HostSite;
 	/** The file as checked. */
 	file?: HostFile< string >;
+	wpCliFiles?: {
+		input: readonly string[];
+		files: readonly WpCliFileArgument[];
+		paths: readonly string[];
+	};
 	/** The preview as checked. */
 	preview?: TargetPreview;
 	scratch?: true;
@@ -526,7 +536,7 @@ interface PreparedHostOperation {
 	login?: number;
 }
 
-const WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
+const MEDIA_WP_CLI_ISOLATION = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
 
 // The host operations that act on WordPress.com under the login Studio is
 // signed in with: the CLI's commands read that login as they start. Each runs
@@ -1348,7 +1358,13 @@ export function createClaudeExecutionPolicy(
 			else settled.addEventListener( 'abort', done, { once: true } );
 		}
 		const operationClass = rule.classify ? rule.classify( args ) : rule.operationClass;
-		if ( ! operationClass ) return false;
+		if ( ! operationClass ) {
+			if ( name === 'wp_cli' && isRecord( args ) && typeof args.command === 'string' ) {
+				const inspection = inspectWpCliArgs( splitCommandArgs( args.command ) );
+				if ( 'refusal' in inspection ) refuse( toolCallId, inspection.refusal );
+			}
+			return false;
+		}
 		let site: HostSite | undefined;
 		if ( rule.site ) {
 			const reference = rule.site( args );
@@ -1509,15 +1525,17 @@ export function createClaudeExecutionPolicy(
 		toolCallId: string,
 		callSignal?: AbortSignal
 	): Promise< PreparedHostOperation | undefined > {
-		const operationClass =
-			request.name === 'sites.wpCli'
-				? classifyWpCliArgs( request.args )
-				: HOST_OPERATION_CLASSES[ request.name ];
-		if ( ! operationClass ) {
-			if ( request.name === 'sites.wpCli' )
-				refuse( toolCallId, `${ REFUSALS.wpCli } ${ claudeRouteNote( 'wp_cli' ) }` );
+		if ( request.name === 'sites.wpCli' && admittedCalls.get( toolCallId ) !== 'wp_cli' ) return;
+		const wpCli = request.name === 'sites.wpCli' ? inspectWpCliArgs( request.args ) : undefined;
+		if ( wpCli && 'refusal' in wpCli ) {
+			refuse( toolCallId, wpCli.refusal );
 			return;
 		}
+		const operationClass =
+			request.name === 'sites.wpCli'
+				? wpCli?.operationClass
+				: HOST_OPERATION_CLASSES[ request.name ];
+		if ( ! operationClass ) return;
 		let site: HostSite | undefined;
 		const localPaths = [ ...( request.localPaths ?? [] ) ];
 		if ( request.site ) {
@@ -1548,6 +1566,32 @@ export function createClaudeExecutionPolicy(
 		}
 		let args = request.args;
 		let file: HostFile< string > | undefined;
+		let wpCliFiles: PreparedHostOperation[ 'wpCliFiles' ];
+		if ( wpCli ) {
+			const sitePath = actingSite?.path;
+			if ( ! sitePath || ! site ) return;
+			if ( await hasWpCliOverrides( sitePath ) ) {
+				refuse( toolCallId, REFUSALS.wpCliConfig );
+				return;
+			}
+			if ( wpCli.files.length ) {
+				const input = request.args as readonly string[];
+				const checked = await checkWpCliPaths(
+					input,
+					wpCli.files,
+					sitePath,
+					context.workspace.configDirectory,
+					context.isStudioSite
+				);
+				if ( 'refusal' in checked ) {
+					refuse( toolCallId, checked.refusal );
+					return;
+				}
+				args = checked.args;
+				localPaths.push( ...checked.paths );
+				wpCliFiles = { input, files: wpCli.files, paths: checked.paths };
+			}
+		}
 		if ( request.file ) {
 			const checked = await conversationFile( request.file );
 			if ( ! checked ) {
@@ -1637,13 +1681,9 @@ export function createClaudeExecutionPolicy(
 			return;
 		}
 		if ( ! ( await checkpoint( callSignal ) ) ) return;
-		// The only WP-CLI command this build runs with approval is the bounded draft.
-		const draftTitle =
-			request.name === 'sites.wpCli' && operationClass === 'command'
-				? wpCliOption( request.args, 'post_title' )
-				: undefined;
+		const draftTitle = wpCli?.draft ? wpCliOption( request.args, 'post_title' ) : undefined;
 		const described = describeClaudeOperation( operationClass, request.name );
-		let note = request.note;
+		let note = wpCli?.reason ?? request.note;
 		if ( wpcomSite && syncOptions )
 			note = syncNote(
 				request.name === 'sync.pull' ? 'sync.pull' : 'sync.push',
@@ -1661,14 +1701,17 @@ export function createClaudeExecutionPolicy(
 			remote,
 			description:
 				draftTitle !== undefined && site
-					? 'Create a draft post on the current local site'
+					? noticed( operationClass, 'Create a draft post on the current local site' )
 					: noticed( operationClass, note ? `${ described }. ${ note }` : described ),
 			...( draftTitle !== undefined && site
 				? {
 						draft: {
 							siteName: site.name,
 							title: draftTitle,
-							content: wpCliOption( request.args, 'post_content' ),
+							// WP-CLI uses the positional body file in preference to --post_content.
+							...( wpCli?.files.length
+								? {}
+								: { content: wpCliOption( request.args, 'post_content' ) } ),
 						},
 				  }
 				: {} ),
@@ -1677,6 +1720,7 @@ export function createClaudeExecutionPolicy(
 			operation,
 			site,
 			file,
+			wpCliFiles,
 			preview,
 			scratch: request.scratch,
 			wpcomSite,
@@ -1914,6 +1958,28 @@ export function createClaudeExecutionPolicy(
 			// path the operation receives must still resolve to itself.
 			if ( prepared.file && ( await conversationFile( prepared.file ) ) !== prepared.file.path )
 				return false;
+			if ( prepared.wpCliFiles ) {
+				if ( ! targetSite ) return false;
+				const { input, files, paths } = prepared.wpCliFiles;
+				const latest = await checkWpCliPaths(
+					input,
+					files,
+					targetSite.path,
+					context.workspace.configDirectory,
+					context.isStudioSite
+				);
+				if ( 'refusal' in latest ) {
+					refuse( toolCallId, latest.refusal );
+					return false;
+				}
+				if (
+					canonicalJson( latest.args ) !== canonicalJson( prepared.operation.args ) ||
+					canonicalJson( latest.paths ) !== canonicalJson( paths )
+				) {
+					refuse( toolCallId, REFUSALS.wpCliFilesChanged );
+					return false;
+				}
+			}
 			// An operation on WordPress.com runs only while what it was decided by
 			// is still out of the turn's reach, and under the login it was
 			// prepared, and asked about, under.
@@ -1954,6 +2020,13 @@ export function createClaudeExecutionPolicy(
 			if (
 				WP_CLI_OPERATIONS.has( prepared.operation.tool ) &&
 				( ! targetSite || ( await hasWpCliOverrides( targetSite.path ) ) )
+			) {
+				refuse( toolCallId, REFUSALS.wpCliConfig );
+				return false;
+			}
+			if (
+				prepared.operation.tool === 'sites.wpCli' &&
+				( ! ( await checkpoint( callSignal ) ) || actingSite !== targetSite )
 			)
 				return false;
 		} catch {
@@ -2105,7 +2178,7 @@ export function createClaudeExecutionPolicy(
 		let unknownReservations = 0;
 		let reservedIn: HostSite | undefined;
 		// One of the media library's fixed WP-CLI commands, Studio's own code, run
-		// as the turn runs every WP-CLI command, without the site's own code. It
+		// without loading the site's plugins or themes. It
 		// is fenced before it starts, and once started runs to its end whatever
 		// the call's signal says: a reservation cut short would leave attachments
 		// no one knows of, a completion cut short would leave them half done.
@@ -2113,7 +2186,7 @@ export function createClaudeExecutionPolicy(
 			site: HostSite,
 			args: string[],
 			{ beforeSpawn }: HostOperationOptions
-		) => host.sites.wpCli( site, [ ...args, ...WP_CLI_ISOLATION ], { beforeSpawn } );
+		) => host.sites.wpCli( site, [ ...args, ...MEDIA_WP_CLI_ISOLATION ], { beforeSpawn } );
 		const finalizeMedia = async (
 			site: HostSite,
 			ready: number[],
@@ -2322,12 +2395,18 @@ export function createClaudeExecutionPolicy(
 							host.sites.export( current!, checked.file!, mode, onProgress, options )
 					),
 				wpCli: ( site, args ) =>
-					run( { name: 'sites.wpCli', site, args: [ ...args ] }, ( current, options, operation ) =>
-						host.sites.wpCli(
-							current!,
-							[ ...( operation.args as readonly string[] ), ...WP_CLI_ISOLATION ],
-							options
-						)
+					run(
+						{ name: 'sites.wpCli', site, args: [ ...args ] },
+						( current, options, operation ) => {
+							const checked = [ ...( operation.args as readonly string[] ) ];
+							const endOfOptions = checked.indexOf( '--' );
+							checked.splice(
+								endOfOptions < 0 ? checked.length : endOfOptions,
+								0,
+								'--skip-packages'
+							);
+							return host.sites.wpCli( current!, checked, options );
+						}
 					),
 			},
 			previews: {
@@ -2429,7 +2508,7 @@ export function createClaudeExecutionPolicy(
 			},
 			// The media library's fixed operations, for `generate_images`: in the
 			// site the turn acts on only, each WP-CLI command Studio's own code,
-			// journaled before it runs. `sites.wpCli` still refuses `eval`.
+			// journaled before it runs. This tool has no general WP-CLI permission.
 			media: {
 				siteContaining: async ( files ) => {
 					const targetSite = actingSite;

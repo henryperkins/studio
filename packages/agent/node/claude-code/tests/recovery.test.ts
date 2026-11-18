@@ -91,7 +91,7 @@ async function journalOf(
 
 const hangs = () => new Promise< never >( () => {} );
 
-// A draft whose approval is still waiting for its answer.
+// A draft awaiting approval in a turn that follows an uncertain recovery.
 const pendingDraft = () =>
 	journalOf(
 		async ( { bridge, events } ) => {
@@ -100,16 +100,19 @@ const pendingDraft = () =>
 				expect( events.some( ( event ) => event.type === 'approval.requested' ) ).toBe( true )
 			);
 		},
-		() => ( { approve: hangs, approvalTimeoutMs: 60_000 } )
+		() => ( { uncertainAfterRecovery: true, approve: hangs, approvalTimeoutMs: 60_000 } )
 	);
 
 // A draft the user allowed, whose WP-CLI command was still running.
 const runningDraft = () =>
-	journalOf( async ( { bridge, host } ) => {
-		vi.mocked( host.sites.wpCli ).mockImplementation( hangs );
-		void bridge.invoke( 'wp_cli', draft );
-		await vi.waitFor( () => expect( host.sites.wpCli ).toHaveBeenCalled() );
-	} );
+	journalOf(
+		async ( { bridge, host } ) => {
+			vi.mocked( host.sites.wpCli ).mockImplementation( hangs );
+			void bridge.invoke( 'wp_cli', draft );
+			await vi.waitFor( () => expect( host.sites.wpCli ).toHaveBeenCalled() );
+		},
+		() => ( { uncertainAfterRecovery: true } )
+	);
 
 const idsOf = ( events: ClaudeTurnJournalEvent[] ) => ( {
 	toolCallId: (
@@ -269,9 +272,9 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 			{
 				toolCallId,
 				tool: 'sites.wpCli',
-				operationClass: 'command',
+				operationClass: 'local-change',
 				target,
-				description: 'Create a draft post on the current local site',
+				description: expect.stringMatching( /Create a draft post.*may already have taken effect/ ),
 				evidence: 'requested',
 				requestId,
 				resolved: false,
@@ -382,9 +385,11 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 				{
 					toolCallId,
 					tool: 'sites.wpCli',
-					operationClass: 'command',
+					operationClass: 'local-change',
 					target,
-					description: 'Create a draft post on the current local site',
+					description: expect.stringMatching(
+						/Create a draft post.*may already have taken effect/
+					),
 					evidence: 'authorized',
 					requestId,
 					resolved: true,

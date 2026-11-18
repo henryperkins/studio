@@ -229,7 +229,7 @@ async function main() {
 									name: 'wp_cli',
 									arguments: {
 										nameOrPath: 'site',
-										command: 'post create --post_status=draft --post_title=Hello',
+										command: 'post delete 1',
 									},
 								} )
 								.catch( () => {} );

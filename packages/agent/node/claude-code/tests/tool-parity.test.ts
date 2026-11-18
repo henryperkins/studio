@@ -66,7 +66,7 @@ const CLAUDE_TOOL_STATUS: Record< string, ClaudeStatus > = {
 		status: 'unqualified',
 		step: 'C2b',
 		reason:
-			'Requests the network itself: it downloads the fonts its DESIGN.md names from Google Fonts, then font files at addresses the stylesheet response gives, which no binding bounds outside a browser yet (a request guard, with the navigation guard). Its theme activation also runs `theme activate`, which this route’s WP-CLI rules refuse',
+			'Downloads a stylesheet and fonts from the network. This step needs the navigation and request guard.',
 	},
 	install_taxonomy_scripts: { status: 'bridged' },
 	refresh_browser: { status: 'absent', capability: 'ui' },
@@ -330,6 +330,16 @@ const enabledNative = () =>
 	claudeNativeTools( CLAUDE_ENABLED_TOOLS, CLAUDE_SHELL_CONFINEMENT, path.resolve( 'workspace' ) );
 
 describe( 'Studio tools on the Claude route, against the Pi route’s registry', () => {
+	it( 'classifies the shared WordPress tool by the command and selected arguments', () => {
+		const rule = CLAUDE_STUDIO_TOOL_RULES.get( 'wp_cli' )!;
+		const classify = ( command: string ) => rule.classify!( { nameOrPath: 'site', command } );
+		expect( classify( 'post list --post_type=page --format=json' ) ).toBe( 'read' );
+		expect( classify( 'theme activate studio-theme' ) ).toBe( 'local-change' );
+		expect( classify( 'post delete 7' ) ).toBe( 'local-overwrite' );
+		expect( classify( 'custom-plugin report' ) ).toBe( 'command' );
+		expect( classify( 'post list --ssh=other-host' ) ).toBeUndefined();
+	} );
+
 	it( 'reads the registry from real Pi turns, capability-dependent factories included', () => {
 		const all = registered();
 		// The registry and the factories that capabilities add.

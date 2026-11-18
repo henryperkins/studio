@@ -38,6 +38,7 @@ import {
 import { createNativeSessionStore } from '../sessions';
 import {
 	Declared,
+	admitWpCliRead,
 	completeGuard,
 	createPolicyFixture,
 	guarded,
@@ -85,7 +86,12 @@ async function setup( ...args: Parameters< typeof createPolicyFixture > ) {
 }
 
 const draftArgs = [ 'post', 'create', '--post_status=draft', '--post_title=Hello' ];
-const skipFlags = [ '--skip-packages', '--skip-plugins', '--skip-themes' ];
+const deleteArgs = [ 'post', 'delete', '1' ];
+async function setupWpCli( ...args: Parameters< typeof createPolicyFixture > ) {
+	const fixture = await setup( ...args );
+	await admitWpCliRead( fixture.policy, fixture.host );
+	return fixture;
+}
 const studioServer = { name: 'studio', source: 'sdk' };
 
 describe( 'Claude operation classes', () => {
@@ -261,8 +267,10 @@ describe( 'Claude tool use at the SDK hook and native permission request', () =>
 } );
 
 describe( 'Claude approvals at host execution', () => {
-	it( 'approves exactly the proposed draft once, before the CLI command, after the SDK allowed the tool', async () => {
-		const { policy, context, host, localSite, events, site } = await setup();
+	it( 'approves a recovery draft once at the host after the SDK allows the tool', async () => {
+		const { policy, context, host, localSite, events, site } = await setupWpCli( () => ( {
+			uncertainAfterRecovery: true,
+		} ) );
 		expect(
 			await policy.authorizeToolUse( {
 				toolName: 'mcp__studio__wp_cli',
@@ -285,7 +293,7 @@ describe( 'Claude approvals at host execution', () => {
 			target: { environment: 'local', siteId: fakeSite.id },
 			operation: {
 				tool: 'sites.wpCli',
-				operationClass: 'command',
+				operationClass: 'local-change',
 				args: draftArgs,
 				siteId: fakeSite.id,
 				localPaths: [ site ],
@@ -296,7 +304,7 @@ describe( 'Claude approvals at host execution', () => {
 		expect( host.sites.wpCli ).toHaveBeenCalledOnce();
 		const [ ranOn, ranArgs, options ] = vi.mocked( host.sites.wpCli ).mock.calls[ 0 ];
 		expect( ranOn.id ).toBe( fakeSite.id );
-		expect( ranArgs ).toEqual( [ ...draftArgs, ...skipFlags ] );
+		expect( ranArgs ).toEqual( [ ...draftArgs, '--skip-packages' ] );
 		await expect( options?.beforeSpawn?.() ).resolves.toBeUndefined();
 		expect( events.map( ( event ) => event.type ) ).toEqual( [
 			'approval.requested',
@@ -307,19 +315,21 @@ describe( 'Claude approvals at host execution', () => {
 			toolCallId: 'call',
 			operation: {
 				tool: 'sites.wpCli',
-				operationClass: 'command',
+				operationClass: 'local-change',
 				target: { environment: 'local', siteId: fakeSite.id },
 			},
 			draft: { siteName: 'My Site', title: 'Hello' },
 		} );
 	} );
 
-	it( 'runs allowlisted reads without asking and refuses other sites and commands outside this build', async () => {
-		const { policy, context, host, localSite } = await setup();
+	it( 'runs recognized reads without asking and refuses other sites or a redirected command', async () => {
+		const { policy, context, host, localSite } = await setupWpCli();
 		const guarded = policy.guardHost( host, 'call' );
 		await guarded.sites.wpCli( localSite, [ 'post', 'list' ] );
 		expect( context.approve ).not.toHaveBeenCalled();
-		await expect( guarded.sites.wpCli( localSite, [ 'post', 'delete', '1' ] ) ).rejects.toThrow();
+		await expect(
+			guarded.sites.wpCli( localSite, [ 'post', 'list', '--url=other' ] )
+		).rejects.toThrow();
 		await expect(
 			guarded.sites.wpCli( { ...localSite, id: 'other' }, [ 'post', 'list' ] )
 		).rejects.toThrow();
@@ -387,9 +397,9 @@ describe( 'Claude approvals at host execution', () => {
 		}
 	);
 
-	it( 'does not run a denied draft, expires an unanswered one and ignores its late allow', async () => {
+	it( 'does not run a denied deletion, expires an unanswered one and ignores its late allow', async () => {
 		let release!: ( answer: 'allow' ) => void;
-		const { policy, host, localSite, events, context } = await setup( () => ( {
+		const { policy, host, localSite, events, context } = await setupWpCli( () => ( {
 			approve: vi
 				.fn()
 				.mockResolvedValueOnce( 'deny' )
@@ -401,8 +411,8 @@ describe( 'Claude approvals at host execution', () => {
 				),
 		} ) );
 		const guarded = policy.guardHost( host, 'call' );
-		await expect( guarded.sites.wpCli( localSite, draftArgs ) ).rejects.toThrow();
-		await expect( guarded.sites.wpCli( localSite, draftArgs ) ).rejects.toThrow();
+		await expect( guarded.sites.wpCli( localSite, deleteArgs ) ).rejects.toThrow();
+		await expect( guarded.sites.wpCli( localSite, deleteArgs ) ).rejects.toThrow();
 		expect( vi.mocked( context.approve ).mock.calls[ 1 ][ 1 ].aborted ).toBe( true );
 		release( 'allow' );
 		await new Promise( ( resolve ) => setTimeout( resolve, 10 ) );
@@ -416,14 +426,14 @@ describe( 'Claude approvals at host execution', () => {
 	} );
 
 	it( 'does not run an approved operation when the target changed after Send', async () => {
-		const { policy, host, localSite, context, site } = await setup();
+		const { policy, host, localSite, context, site } = await setupWpCli();
 		await writeFile( path.join( site, 'readme.txt' ), 'fixture' );
 		vi.mocked( context.approve ).mockImplementationOnce( async () => {
 			vi.mocked( context.verifyTarget ).mockResolvedValue( false );
 			return 'allow';
 		} );
 		const guarded = policy.guardHost( host, 'call' );
-		await expect( guarded.sites.wpCli( localSite, draftArgs ) ).rejects.toThrow();
+		await expect( guarded.sites.wpCli( localSite, deleteArgs ) ).rejects.toThrow();
 		vi.mocked( context.verifyTarget ).mockResolvedValue( true );
 		await expect( guarded.sites.wpCli( localSite, [ 'post', 'list' ] ) ).rejects.toThrow();
 		expect(
@@ -437,13 +447,13 @@ describe( 'Claude approvals at host execution', () => {
 	} );
 
 	it( 'does not run an approved operation when the connection changed before execution', async () => {
-		const { policy, host, localSite, context } = await setup();
+		const { policy, host, localSite, context } = await setupWpCli();
 		vi.mocked( context.approve ).mockImplementationOnce( async () => {
 			vi.mocked( context.stillConnected ).mockResolvedValue( false );
 			return 'allow';
 		} );
 		await expect(
-			policy.guardHost( host, 'call' ).sites.wpCli( localSite, draftArgs )
+			policy.guardHost( host, 'call' ).sites.wpCli( localSite, deleteArgs )
 		).rejects.toThrow();
 		expect( host.sites.wpCli ).not.toHaveBeenCalled();
 	} );
@@ -451,7 +461,7 @@ describe( 'Claude approvals at host execution', () => {
 	it( 'invalidates a pending approval when the turn is cancelled, so a later reply cannot run it', async () => {
 		let reply!: ( answer: 'allow' ) => void;
 		let approvalSignal: AbortSignal | undefined;
-		const { policy, host, localSite, controller, events } = await setup( () => ( {
+		const { policy, host, localSite, controller, events } = await setupWpCli( () => ( {
 			approvalTimeoutMs: 60_000,
 			approve: vi.fn(
 				( _request, signal: AbortSignal ) =>
@@ -461,7 +471,7 @@ describe( 'Claude approvals at host execution', () => {
 					} )
 			),
 		} ) );
-		const pending = policy.guardHost( host, 'call' ).sites.wpCli( localSite, draftArgs );
+		const pending = policy.guardHost( host, 'call' ).sites.wpCli( localSite, deleteArgs );
 		await vi.waitFor( () => expect( approvalSignal ).toBeDefined() );
 		controller.abort();
 		await expect( pending ).rejects.toThrow();
@@ -1103,7 +1113,7 @@ describe( 'Claude approvals that outlive their caller', () => {
 
 	it( 'cancels a Studio tool approval when its MCP call is cancelled', async () => {
 		let approvalSignal: AbortSignal | undefined;
-		const { policy, host, localSite } = await setup( () => ( {
+		const { policy, host, localSite } = await setupWpCli( () => ( {
 			approvalTimeoutMs: 60_000,
 			approve: vi.fn( ( _request, signal: AbortSignal ) => {
 				approvalSignal = signal;
@@ -1113,7 +1123,7 @@ describe( 'Claude approvals that outlive their caller', () => {
 		const call = new AbortController();
 		const pending = policy
 			.guardHost( host, 'call', call.signal )
-			.sites.wpCli( localSite, draftArgs );
+			.sites.wpCli( localSite, deleteArgs );
 		await vi.waitFor( () => expect( approvalSignal ).toBeDefined() );
 		call.abort();
 		await expect( pending ).rejects.toThrow();
@@ -1125,21 +1135,21 @@ describe( 'Claude approvals that outlive their caller', () => {
 
 describe( 'Claude account changes', () => {
 	it( 'asks for nothing and runs nothing once the native account changed', async () => {
-		const before = await setup();
+		const before = await setupWpCli();
 		vi.mocked( before.context.verifyAccount ).mockResolvedValue( 'changed' );
 		await expect(
-			before.policy.guardHost( before.host, 'call' ).sites.wpCli( before.localSite, draftArgs )
+			before.policy.guardHost( before.host, 'call' ).sites.wpCli( before.localSite, deleteArgs )
 		).rejects.toThrow();
 		expect( before.context.approve ).not.toHaveBeenCalled();
 		expect( before.policy.signal.aborted ).toBe( true );
 
-		const during = await setup();
+		const during = await setupWpCli();
 		vi.mocked( during.context.approve ).mockImplementationOnce( async () => {
 			vi.mocked( during.context.verifyAccount ).mockResolvedValue( 'changed' );
 			return 'allow';
 		} );
 		await expect(
-			during.policy.guardHost( during.host, 'call' ).sites.wpCli( during.localSite, draftArgs )
+			during.policy.guardHost( during.host, 'call' ).sites.wpCli( during.localSite, deleteArgs )
 		).rejects.toThrow();
 		expect( during.host.sites.wpCli ).not.toHaveBeenCalled();
 		expect( during.policy.signal.aborted ).toBe( true );
@@ -1386,14 +1396,14 @@ describe( 'Claude account checks during a turn', () => {
 
 	it( 'ends a pending approval when a periodic check finds another account', async () => {
 		let approvalSignal: AbortSignal | undefined;
-		const { policy, host, localSite, context, clock } = await setup( () => ( {
+		const { policy, host, localSite, context, clock } = await setupWpCli( () => ( {
 			approvalTimeoutMs: 60_000,
 			approve: vi.fn( ( _request, signal: AbortSignal ) => {
 				approvalSignal = signal;
 				return new Promise< 'allow' >( () => {} );
 			} ),
 		} ) );
-		const pending = policy.guardHost( host, 'call' ).sites.wpCli( localSite, draftArgs );
+		const pending = policy.guardHost( host, 'call' ).sites.wpCli( localSite, deleteArgs );
 		await vi.waitFor( () => expect( approvalSignal ).toBeDefined() );
 		expect( await policy.refreshAccount() ).toBe( true );
 		clock.now = CLAUDE_ACCOUNT_RECHECK_MS;
