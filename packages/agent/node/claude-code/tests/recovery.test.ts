@@ -531,10 +531,9 @@ describe( 'recovering a conversation whose run outlived its owner', () => {
 		] );
 		const journals = await fixture.store.readJournals( 'chat' );
 		const recorded = journals.flat().find( ( event ) => event.type === 'turn.recovered' );
-		expect( recorded?.uncertainOperations.map( ( operation ) => operation.description ?? operation.tool ) ).toEqual( [
-			'Create a draft post on My\u200bShop',
-			'future\u200b_tool',
-		] );
+		expect(
+			recorded?.uncertainOperations.map( ( operation ) => operation.description ?? operation.tool )
+		).toEqual( [ 'Create a draft post on My\u200bShop', 'future\u200b_tool' ] );
 		const note = recoveryNote( journals );
 		expect( note?.text ).toContain( 'My\\u200bShop' );
 		expect( note?.text ).toContain( 'future\\u200b_tool' );
