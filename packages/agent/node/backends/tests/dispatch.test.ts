@@ -156,6 +156,48 @@ describe( 'dispatching a Claude turn', () => {
 		] );
 	} );
 
+	it.each( [ 'interrupted', 'error' ] as const )(
+		'keeps an unconfirmed %s outcome from the stopped owner after cleanup',
+		async ( status ) => {
+			const started = deferred();
+			const received = deferred();
+			const cleanup = deferred();
+			const outcome = {
+				status,
+				code: 'process_unconfirmed' as const,
+				message: 'Studio could not confirm shutdown.',
+			};
+			const { handle, events } = start( async ( { runId, turnId }, { signal, onEvent } ) => {
+				signal.addEventListener(
+					'abort',
+					() => {
+						const terminal = { type: 'turn.terminal' as const, runId, turnId, outcome };
+						const foreign = { ...outcome, message: 'Another owner.' };
+						onEvent( { ...terminal, runId: 'old-run', outcome: foreign } );
+						onEvent( { ...terminal, turnId: 'old-turn', outcome: foreign } );
+						onEvent( { ...terminal, outcome: { status: 'success' } } );
+						onEvent( { type: 'tool.started', runId, turnId, toolCallId: 'late', name: 'Read' } );
+						onEvent( terminal );
+						received.resolve();
+					},
+					{ once: true }
+				);
+				started.resolve();
+				await cleanup.promise;
+			} );
+			await started.promise;
+			const stopped = handle.interrupt();
+			await received.promise;
+			expect( events ).toEqual( [] );
+			cleanup.resolve();
+			await stopped;
+			await expect( handle.result ).resolves.toEqual( outcome );
+			expect( events ).toEqual( [
+				{ type: 'turn.terminal', runId: 'run-1', turnId: 'turn-1', outcome },
+			] );
+		}
+	);
+
 	it( 'retains the selection at Send across an awaited tool and uses the new selection next turn', async () => {
 		const selection = initial();
 		const tool = deferred();

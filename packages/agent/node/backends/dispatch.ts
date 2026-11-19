@@ -100,11 +100,20 @@ function runClaudeBackendTurn(
 	let terminal: BackendTurnOutcome | undefined;
 
 	const receiveEvent = ( event: BackendTurnEvent ) => {
-		if ( terminal || signal.aborted || event.runId !== runId || event.turnId !== turnId ) {
+		if ( terminal || event.runId !== runId || event.turnId !== turnId ) {
 			return;
 		}
 		if ( event.type === 'turn.terminal' ) {
-			terminal = { ...event.outcome };
+			const { status, code } = event.outcome;
+			// The native owner verifies process shutdown during cleanup, after Stop.
+			const shutdownUnconfirmed =
+				code === 'process_unconfirmed' && ( status === 'interrupted' || status === 'error' );
+			if ( ! signal.aborted || shutdownUnconfirmed ) {
+				terminal = { ...event.outcome };
+			}
+			return;
+		}
+		if ( signal.aborted ) {
 			return;
 		}
 		if ( event.type === 'content.provisional' || event.type === 'content.confirmed' ) {
