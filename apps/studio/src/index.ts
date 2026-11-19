@@ -247,14 +247,16 @@ async function appBoot() {
 
 	setupUpdates();
 
-	if ( process.defaultApp ) {
-		if ( process.argv.length >= 2 ) {
-			app.setAsDefaultProtocolClient( PROTOCOL_PREFIX, process.execPath, [
-				path.resolve( process.argv[ 1 ] ),
-			] );
+	if ( ! process.env.E2E ) {
+		if ( process.defaultApp ) {
+			if ( process.argv.length >= 2 ) {
+				app.setAsDefaultProtocolClient( PROTOCOL_PREFIX, process.execPath, [
+					path.resolve( process.argv[ 1 ] ),
+				] );
+			}
+		} else {
+			app.setAsDefaultProtocolClient( PROTOCOL_PREFIX );
 		}
-	} else {
-		app.setAsDefaultProtocolClient( PROTOCOL_PREFIX );
 	}
 
 	// Forces all renderers to be sandboxed. IPC is the only way render processes will

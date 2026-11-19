@@ -18,17 +18,13 @@ import * as Sentry from '@sentry/electron/main';
 import { recordAnnotationSubmitted } from '@studio/agent/node/annotation-tracks';
 import {
 	configureClaudeRuntime as configureClaudeRuntimeOnHost,
-	createClaudeSession as createClaudeSessionOnHost,
 	discardClaudeChatFile as discardClaudeChatFileOnHost,
 	startWithClaudeChatFiles,
 	stageClaudeChatFile as stageClaudeChatFileOnHost,
 	setClaudeSessionTarget as setClaudeSessionTargetOnHost,
-	recoverClaudeSession as recoverClaudeSessionOnHost,
-	getClaudeModelCatalog as getClaudeModelCatalogOnHost,
 	getClaudeRuntimeState as getClaudeRuntimeStateOnHost,
-	setClaudeSessionSelection as setClaudeSessionSelectionOnHost,
-	validateClaudeSendSelection,
-} from '@studio/agent/node/claude-code/studio-surface';
+	validateClaudeSendWithCatalog,
+} from '@studio/agent/node/claude-code/studio-host';
 import {
 	getGlobalInstructionsEnabled as readGlobalInstructionsEnabled,
 	setGlobalInstructionsEnabled as writeGlobalInstructionsEnabled,
@@ -188,6 +184,12 @@ import {
 } from 'src/main-window';
 import { popupMenu, setupMenu } from 'src/menu';
 import {
+	createClaudeSessionViaCli,
+	recoverClaudeSessionViaCli,
+	getClaudeModelCatalogViaCli,
+	setClaudeSelectionViaCli,
+} from 'src/modules/ai-agent/claude-commands';
+import {
 	answerAgentRun,
 	interruptAgentRun,
 	listActiveAgentRuns,
@@ -330,14 +332,14 @@ export async function getClaudeModelCatalog(
 	connectionId: string,
 	siteId?: string
 ) {
-	return getClaudeModelCatalogOnHost( connectionId, siteId );
+	return getClaudeModelCatalogViaCli( connectionId, siteId );
 }
 
 export async function createClaudeSession(
 	_event: IpcMainInvokeEvent,
 	request: CreateClaudeSessionRequest
 ) {
-	return createClaudeSessionOnHost( getSessionsDirectory(), request );
+	return createClaudeSessionViaCli( request );
 }
 
 export async function setClaudeSessionTarget(
@@ -370,7 +372,7 @@ export async function stageClaudeChatFile(
 }
 
 export async function recoverClaudeSession( _event: IpcMainInvokeEvent, sessionId: string ) {
-	return recoverClaudeSessionOnHost( sessionId );
+	return recoverClaudeSessionViaCli( sessionId );
 }
 
 export async function setClaudeSessionSelection(
@@ -378,7 +380,7 @@ export async function setClaudeSessionSelection(
 	sessionId: string,
 	selection: ClaudeSessionSelection
 ) {
-	await setClaudeSessionSelectionOnHost( getSessionsDirectory(), sessionId, selection );
+	await setClaudeSelectionViaCli( sessionId, selection );
 }
 
 export async function createAiSession(
@@ -428,12 +430,12 @@ export async function continueAiSession(
 	} = {}
 ): Promise< { runId: string } > {
 	const images = validateStudioChatImages( options.images );
-	const claudeSelection = await validateClaudeSendSelection(
+	const claudeSelection = await validateClaudeSendWithCatalog(
 		getSessionsDirectory(),
 		sessionId,
 		options.claudeSelection,
 		options.claudeContext,
-		images.length > 0
+		images.length > 0 ? getClaudeModelCatalogViaCli : undefined
 	);
 	const files = validateStudioChatFiles( options.files );
 	const visualAnnotations = validateStudioVisualAnnotations( options.visualAnnotations, images );

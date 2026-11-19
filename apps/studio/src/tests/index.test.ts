@@ -177,6 +177,20 @@ afterAll( () => {
 } );
 
 describe( 'App initialization', () => {
+	it( 'leaves the operating system protocol handler alone in an isolated E2E run', async () => {
+		vi.stubEnv( 'E2E', 'true' );
+		try {
+			mockElectron();
+			vi.resetModules();
+			const { app } = await import( 'electron' );
+			await import( '../index' );
+			expect( app.setAsDefaultProtocolClient ).not.toHaveBeenCalled();
+			expect( app.enableSandbox ).toHaveBeenCalled();
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	} );
+
 	it( 'should identify YouTube embed requests with the Studio referrer', async () => {
 		const { mockedEvents } = mockElectron();
 		vi.resetModules();

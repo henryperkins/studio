@@ -1,5 +1,9 @@
 // @vitest-environment node
-import { recoverClaudeSession } from '@studio/agent/node/claude-code/studio-surface';
+import {
+	getClaudeModelCatalog,
+	createClaudeSession,
+	recoverClaudeSession,
+} from '@studio/agent/node/claude-code/studio-surface';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import yargs from 'yargs';
 import { registerCommand } from '../claude';
@@ -41,6 +45,32 @@ async function run( args: string[] ) {
 	expect( exit ).not.toHaveBeenCalled();
 	return { stdout: stdout.join( '' ), stderr: stderr.join( '' ), error };
 }
+
+it( 'uses the global workspace without --site and keeps an explicit local site', async () => {
+	vi.mocked( getClaudeModelCatalog ).mockResolvedValue( { ok: true, models: [] } );
+	expect( ( await run( [ 'claude', 'models', '--connection=account' ] ) ).error ).toBeUndefined();
+	expect( getClaudeModelCatalog ).toHaveBeenCalledWith( 'account', undefined );
+	expect(
+		( await run( [ 'claude', 'models', '--connection=account', '--site=local' ] ) ).error
+	).toBeUndefined();
+	expect( getClaudeModelCatalog ).toHaveBeenCalledWith( 'account', 'local' );
+	expect(
+		(
+			await run( [
+				'claude',
+				'new',
+				'--connection=account',
+				'--model=claude-model',
+				'--effort=high',
+			] )
+		).error
+	).toBeUndefined();
+	expect( createClaudeSession ).toHaveBeenCalledWith( expect.any( String ), {
+		connectionId: 'account',
+		siteId: undefined,
+		selection: { model: 'claude-model', effort: 'high' },
+	} );
+} );
 
 describe( 'studio code claude recover', () => {
 	afterEach( () => {

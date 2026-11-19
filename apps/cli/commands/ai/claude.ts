@@ -12,6 +12,7 @@ import {
 } from '@studio/agent/protocol/claude-code';
 import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { __ } from '@wordpress/i18n';
+import { Logger } from 'cli/logger';
 import type { StudioArgv } from 'cli/types';
 
 export const registerCommand = ( yargs: StudioArgv ) =>
@@ -72,13 +73,13 @@ export const registerCommand = ( yargs: StudioArgv ) =>
 				case 'models':
 					result = await getClaudeModelCatalog(
 						requireValue( argv.connection, 'connection' ),
-						requireValue( argv.site, 'site' )
+						argv.site === undefined ? undefined : requireValue( argv.site, 'site' )
 					);
 					break;
 				case 'new':
 					result = await createClaudeSession( getSessionsDirectory(), {
 						connectionId: requireValue( argv.connection, 'connection' ),
-						siteId: requireValue( argv.site, 'site' ),
+						siteId: argv.site === undefined ? undefined : requireValue( argv.site, 'site' ),
 						selection: parseClaudeSessionSelection( { model: argv.model, effort: argv.effort } ),
 					} );
 					break;
@@ -104,6 +105,7 @@ export const registerCommand = ( yargs: StudioArgv ) =>
 					break;
 				}
 			}
+			new Logger().reportResult( result );
 			process.stdout.write( JSON.stringify( result, null, 2 ) + '\n' );
 		},
 	} );
