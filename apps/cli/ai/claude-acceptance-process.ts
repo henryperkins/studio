@@ -136,14 +136,11 @@ function observeChild(
 		{ name: string; native: boolean; result: boolean; ended: boolean }
 	>();
 	const seenRequests = new Set< string >();
-	const pendingApprovals = new Map<
-		string,
-		{ toolCallId: string; decision: ClaudeAcceptanceApproval[ 'decision' ] }
-	>();
+	const pendingApprovals = new Map< string, string >();
 	let pendingQuestion: { requestId: string; toolCallId: string } | undefined;
 	let promptSeen = false;
 	let terminalSeen = false;
-	let stopRequested = false;
+	let stoppedRequestId: string | undefined;
 	let grace: NodeJS.Timeout | undefined;
 
 	const send = ( message: object, delivered?: () => void ) => {
@@ -173,7 +170,7 @@ function observeChild(
 
 	function start( toolCallId: string, name: string, native: boolean ) {
 		const index = expectedTools.indexOf( name );
-		if ( index < 0 || ! hasId( toolCallId ) || calls.has( toolCallId ) || stopRequested )
+		if ( index < 0 || ! hasId( toolCallId ) || calls.has( toolCallId ) || stoppedRequestId )
 			return fail( 'unexpected-tool' );
 		expectedTools.splice( index, 1 );
 		calls.set( toolCallId, { name, native, result: false, ended: false } );
@@ -230,7 +227,7 @@ function observeChild(
 				const call = calls.get( event.toolCallId );
 				if ( ! call || call.result ) return fail( 'unexpected-tool' );
 				if ( event.type === 'tool.result' ) {
-					if ( typeof event.isError !== 'boolean' || ( stopRequested && ! event.isError ) )
+					if ( typeof event.isError !== 'boolean' || ( stoppedRequestId && ! event.isError ) )
 						return fail( 'unexpected-tool' );
 					call.result = true;
 					observations.toolResults++;
@@ -246,7 +243,7 @@ function observeChild(
 					call.name !== plan.toolName ||
 					call.result ||
 					call.ended ||
-					stopRequested ||
+					stoppedRequestId ||
 					! UUID.test( event.requestId ) ||
 					seenRequests.has( event.requestId ) ||
 					pendingApprovals.size ||
@@ -254,14 +251,18 @@ function observeChild(
 				)
 					return fail( 'unexpected-approval' );
 				seenRequests.add( event.requestId );
-				pendingApprovals.set( event.requestId, {
-					toolCallId: event.toolCallId,
-					decision: plan.decision,
-				} );
+				pendingApprovals.set( event.requestId, event.toolCallId );
 				observations.approvalRequests++;
 				if ( plan.decision === 'interrupt' ) {
-					stopRequested = true;
-					send( { type: 'interrupt' } );
+					stoppedRequestId = event.requestId;
+					// These messages use the same FIFO IPC channel. The CLI's interrupt
+					// handler synchronously revokes every approval before it handles the next message.
+					send( { type: 'interrupt' }, () => {
+						if ( result.failure ) return;
+						send( { type: 'answer', answers: { [ event.requestId ]: 'allow' } }, () => {
+							observations.lateAnswerSent = true;
+						} );
+					} );
 				} else {
 					send( { type: 'answer', answers: { [ event.requestId ]: plan.decision } } );
 				}
@@ -269,16 +270,9 @@ function observeChild(
 			}
 			case 'approval.resolved': {
 				const pending = pendingApprovals.get( event.requestId );
-				if ( ! pending || pending.toolCallId !== event.toolCallId )
-					return fail( 'unexpected-approval' );
+				if ( ! pending || pending !== event.toolCallId ) return fail( 'unexpected-approval' );
 				pendingApprovals.delete( event.requestId );
 				observations.approvalsResolved++;
-				if ( pending.decision === 'interrupt' ) {
-					// Seeing the closure first ensures this exercises an expired approval.
-					send( { type: 'answer', answers: { [ event.requestId ]: 'allow' } }, () => {
-						observations.lateAnswerSent = true;
-					} );
-				}
 				break;
 			}
 			case 'question.asked': {
@@ -291,7 +285,7 @@ function observeChild(
 					call.ended ||
 					call.name !== plan.toolName ||
 					pendingQuestion ||
-					stopRequested ||
+					stoppedRequestId ||
 					observations.questionAnswered ||
 					! UUID.test( event.requestId ) ||
 					seenRequests.has( event.requestId ) ||
@@ -326,10 +320,15 @@ function observeChild(
 				observations.terminalSuccess = event.outcome?.status === 'success';
 				observations.terminalInterrupted = event.outcome?.status === 'interrupted';
 				if (
-					! ( stopRequested ? observations.terminalInterrupted : observations.terminalSuccess ) ||
+					! ( stoppedRequestId
+						? observations.terminalInterrupted
+						: observations.terminalSuccess ) ||
 					event.outcome.code
 				)
 					return fail( 'unexpected-terminal' );
+				// Dispatch suppresses approval.resolved after Stop; its interrupted
+				// terminal closes the pending display request. Keep the observed count exact.
+				if ( stoppedRequestId ) pendingApprovals.delete( stoppedRequestId );
 				break;
 			case 'content.provisional':
 			case 'context.compacted':
@@ -377,16 +376,16 @@ function observeChild(
 			clearTimeout( grace );
 			options.signal?.removeEventListener( 'abort', abort );
 			child.off( 'message', onMessage );
-			observations.exitMatched = terminalSeen && ! signal && code === ( stopRequested ? 1 : 0 );
+			observations.exitMatched = terminalSeen && ! signal && code === ( stoppedRequestId ? 1 : 0 );
 			if (
 				! promptSeen ||
 				! terminalSeen ||
 				pendingApprovals.size ||
 				pendingQuestion ||
 				observations.approvalRequests !== approvals.length ||
-				( stopRequested && ! observations.lateAnswerSent ) ||
+				( stoppedRequestId && ! observations.lateAnswerSent ) ||
 				( options.question && ! observations.questionAnswered ) ||
-				( ! stopRequested &&
+				( ! stoppedRequestId &&
 					[ ...calls.values() ].some( ( call ) => ( call.native ? ! call.ended : ! call.result ) ) )
 			) {
 				result.failure ??= 'missing-evidence';

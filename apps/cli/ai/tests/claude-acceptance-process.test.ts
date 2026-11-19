@@ -285,29 +285,34 @@ describe( 'Claude acceptance fork', () => {
 		] );
 	} );
 
-	it( 'sends Stop, observes approval closure, then sends its expired answer to that owner', async () => {
-		plan( 'interrupt' );
-		await fixture(
-			[ start, ask ],
-			[
-				'if(message.type === "interrupt"){ emit(' + JSON.stringify( resolved ) + '); return; }',
-				'if(message.type === "answer"){ terminal("interrupted"); end(1); }',
-			].join( '\n' )
-		);
-		expect( await runClaudeAcceptanceTurn( options ) ).toMatchObject( {
-			ok: true,
-			observations: {
-				terminalInterrupted: true,
-				exitMatched: true,
-				approvalsResolved: 1,
-				lateAnswerSent: true,
-			},
-		} );
-		expect( await received() ).toEqual( [
-			{ type: 'interrupt' },
-			{ type: 'answer', answers: { [ requestId ]: 'allow' } },
-		] );
-	} );
+	it.each( [ false, true ] )(
+		'delivers the expired Allow after Stop on the same IPC channel (closure frame %s)',
+		async ( emitsClosure ) => {
+			plan( 'interrupt' );
+			await fixture(
+				[ start, ask ],
+				[
+					'if(message.type === "interrupt"){ process.stopped = true; ' +
+						( emitsClosure ? 'emit(' + JSON.stringify( resolved ) + ');' : '' ) +
+						' return; }',
+					'if(message.type === "answer"){ terminal(process.stopped ? "interrupted" : "error"); end(1); }',
+				].join( '\n' )
+			);
+			expect( await runClaudeAcceptanceTurn( options ) ).toMatchObject( {
+				ok: true,
+				observations: {
+					terminalInterrupted: true,
+					exitMatched: true,
+					approvalsResolved: emitsClosure ? 1 : 0,
+					lateAnswerSent: true,
+				},
+			} );
+			expect( await received() ).toEqual( [
+				{ type: 'interrupt' },
+				{ type: 'answer', answers: { [ requestId ]: 'allow' } },
+			] );
+		}
+	);
 
 	it( 'answers the exact question in its own run and verifies the resolution', async () => {
 		const answers = { 'Private question?': 'A' };
