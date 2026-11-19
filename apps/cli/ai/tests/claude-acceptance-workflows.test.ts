@@ -112,7 +112,9 @@ async function exercise( fault?: Fault ) {
 		const stopped = decision === 'interrupt';
 		const prompt = options.payload.prompt!;
 		if ( calls === 1 ) {
-			expect( prompt ).toContain( `Set nameOrPath to its Studio ID ${ JSON.stringify( site.id ) }.` );
+			expect( prompt ).toContain(
+				`Set nameOrPath to its Studio ID ${ JSON.stringify( site.id ) }.`
+			);
 		} else if ( approval ) {
 			expect( prompt ).toContain( `Set nameOrPath to ${ JSON.stringify( site.name ) }.` );
 		}

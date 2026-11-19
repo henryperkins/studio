@@ -227,7 +227,9 @@ export async function runClaudeAcceptanceWorkflows(
 		const command = argv.map( ( arg ) => ( arg === metaArg ? `'${ arg }'` : arg ) ).join( ' ' );
 		const before = await readPosts( input );
 		const { evidence, result } = await turn(
-			`On the current local site, call Studio wp_cli exactly once. Set nameOrPath to ${ JSON.stringify( input.site.name ) }. Use this literal command:\n${ command }\nKeep every argument as written. After it returns, report the outcome briefly. A denial is final; do not retry or use other tools.`,
+			`On the current local site, call Studio wp_cli exactly once. Set nameOrPath to ${ JSON.stringify(
+				input.site.name
+			) }. Use this literal command:\n${ command }\nKeep every argument as written. After it returns, report the outcome briefly. A denial is final; do not retry or use other tools.`,
 			[ 'wp_cli' ],
 			[
 				{
@@ -292,7 +294,9 @@ export async function runClaudeAcceptanceWorkflows(
 		await stage( 'site-read', async () => {
 			await input.runCli( [ 'wp', '--path', input.site.path, 'option', 'add', OPTION, marker ] );
 			const { evidence, result } = await turn(
-				`Use Studio wp_cli exactly once to run "option get ${ OPTION }" on the selected local site. Set nameOrPath to its Studio ID ${ JSON.stringify( input.site.id ) }. Reply with only the value returned. Use no other tools.`,
+				`Use Studio wp_cli exactly once to run "option get ${ OPTION }" on the selected local site. Set nameOrPath to its Studio ID ${ JSON.stringify(
+					input.site.id
+				) }. Reply with only the value returned. Use no other tools.`,
 				[ 'wp_cli' ]
 			);
 			verifyTurn( result, observations );
