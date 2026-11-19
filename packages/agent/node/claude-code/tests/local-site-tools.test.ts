@@ -1218,6 +1218,21 @@ describe( 'site_create on the Claude route', () => {
 		);
 	} );
 
+	it( 'resolves the id of a site created by a global turn only after binding it', async () => {
+		const { bridge, host, site } = await setupGlobal();
+		const resolve = vi.mocked( host.sites.resolve );
+		const resolveNameOrPath = resolve.getMockImplementation()!;
+		resolve.mockImplementation( async ( reference ) => {
+			if ( reference === site.id ) throw new Error( 'Unknown site' );
+			return resolveNameOrPath( reference );
+		} );
+		const read = () => bridge.invoke( 'site_info', { nameOrPath: site.id } );
+		expect( ( await read() ).isError ).toBe( true );
+		expect( ( await bridge.invoke( 'site_create', { name: site.name } ) ).isError ).toBe( false );
+		expect( ( await read() ).isError ).toBe( false );
+		expect( host.sites.status ).toHaveBeenCalledExactlyOnceWith( site );
+	} );
+
 	it( 'creates no second site in the turn that made one the conversation’s site, says why, and journals nothing for it', async () => {
 		const { bridge, host, journal } = await setupGlobal();
 		expect( ( await bridge.invoke( 'site_create', { name: 'My Coffee Shop' } ) ).isError ).toBe(

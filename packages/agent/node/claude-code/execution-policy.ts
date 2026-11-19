@@ -1315,7 +1315,11 @@ export function createClaudeExecutionPolicy(
 		const targetSite = actingSite;
 		if ( target.environment === 'global' || ! targetSite ) return;
 		try {
-			const current = await host.sites.resolve( reference );
+			// The turn names its selected site by id. Look up that binding by its
+			// verified folder; the host's ordinary resolver accepts names and paths.
+			const nameOrPath =
+				target.environment === 'local' && reference === target.siteId ? targetSite.path : reference;
+			const current = await host.sites.resolve( nameOrPath );
 			if (
 				current.id !== target.siteId ||
 				current.id !== targetSite.id ||
@@ -2125,7 +2129,10 @@ export function createClaudeExecutionPolicy(
 			}
 			if (
 				prepared.operation.tool === 'sites.wpCli' &&
-				( ! ( await checkpoint( callSignal ) ) || actingSite !== targetSite )
+				( ! targetSite ||
+					! ( await resolveTarget( host, targetSite.path ) ) ||
+					! ( await checkpoint( callSignal ) ) ||
+					actingSite !== targetSite )
 			)
 				return false;
 		} catch {
@@ -2463,6 +2470,11 @@ export function createClaudeExecutionPolicy(
 			sites: {
 				...host.sites,
 				resolve: async ( reference ) => {
+					if ( actingTarget.environment === 'local' ) {
+						const current = await resolveTarget( host, reference );
+						if ( ! current ) throw denied();
+						return current;
+					}
 					const site = await host.sites.resolve( reference );
 					if ( ! ( await isReachableSite( site ) ) ) throw denied();
 					return site;

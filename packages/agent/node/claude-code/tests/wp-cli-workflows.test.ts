@@ -40,6 +40,51 @@ async function setup( recovery = false, answer: ClaudeApprover = async () => 'al
 }
 
 describe( 'WP-CLI on the Claude route', () => {
+	it( 'accepts the selected site id, name or path through a host that only resolves names and paths', async () => {
+		const { localSite, otherSite, host, invoke, wpCli } = await setup();
+		vi.mocked( host.sites.resolve ).mockImplementation( async ( reference ) => {
+			if ( reference === localSite.path || reference === localSite.name ) return localSite;
+			if ( reference === otherSite.path || reference === otherSite.name ) return otherSite;
+			throw new Error( 'Unknown site' );
+		} );
+		for ( const reference of [ localSite.id, localSite.name, localSite.path ] ) {
+			expect( ( await invoke( 'option get blogname', reference ) ).isError ).toBe( false );
+		}
+		for ( const reference of [ otherSite.id, otherSite.name, otherSite.path ] ) {
+			expect( ( await invoke( 'option get blogname', reference ) ).isError ).toBe( true );
+		}
+		expect( wpCli ).toHaveBeenCalledTimes( 3 );
+		expect( host.sites.resolve ).not.toHaveBeenCalledWith( localSite.id );
+		expect( host.sites.resolve ).toHaveBeenCalledWith( localSite.path );
+	} );
+
+	it( 'refuses the id when the selected registration changes between preflight and the guarded lookup', async () => {
+		const { localSite, otherSite, host, invoke, wpCli } = await setup();
+		vi.mocked( host.sites.resolve )
+			.mockResolvedValueOnce( localSite )
+			.mockResolvedValue( { ...localSite, id: otherSite.id } );
+		expect( ( await invoke( 'option get blogname', localSite.id ) ).isError ).toBe( true );
+		expect( wpCli ).not.toHaveBeenCalled();
+	} );
+
+	it.each( [ 'id', 'path' ] as const )(
+		'refuses a registration with a changed %s immediately before WP-CLI spawns',
+		async ( field ) => {
+			const { localSite, otherSite, host, invoke, wpCli } = await setup();
+			const spawned = vi.fn();
+			wpCli.mockImplementationOnce( async ( _site, _args, options ) => {
+				const changed = { ...localSite, [ field ]: otherSite[ field ] };
+				vi.mocked( host.sites.resolve ).mockResolvedValue( changed );
+				await options?.beforeSpawn?.();
+				spawned();
+				return { exitCode: 0, stdout: 'Ran', stderr: '' };
+			} );
+			expect( ( await invoke( 'option get blogname', localSite.id ) ).isError ).toBe( true );
+			expect( wpCli ).toHaveBeenCalledOnce();
+			expect( spawned ).not.toHaveBeenCalled();
+		}
+	);
+
 	it.each( wpCliRouteCommands().map( ( row ) => [ row.usage, row ] as const ) )(
 		'runs the documented example for %s through the shared tool',
 		async ( _usage, row ) => {
