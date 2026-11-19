@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { appendFile, mkdtemp, readdir, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
@@ -35,6 +35,15 @@ type Fault =
 	| 'same-owner'
 	| 'lost-history'
 	| 'no-late-answer'
+	| 'missing-journal'
+	| 'unreadable-journal'
+	| 'wrong-stopped-call'
+	| 'wrong-stopped-request'
+	| 'out-of-order-stop'
+	| 'wrong-stopped-run'
+	| 'ambiguous-interrupt'
+	| 'authorized-stopped-call'
+	| 'successful-stopped-call'
 	| 'observer-error'
 	| 'cancel-before-start';
 
@@ -56,7 +65,9 @@ async function exercise( fault?: Fault ) {
 		site,
 		claude: { binding, selection },
 	} );
-	await createNativeSessionStore( getClaudeSessionStoreRoot( sessionsRoot ) ).create( {
+	const storeRoot = getClaudeSessionStoreRoot( sessionsRoot );
+	const store = createNativeSessionStore( storeRoot );
+	await store.create( {
 		...binding,
 		backend: 'claude-code',
 		conversationId: sessionId,
@@ -178,6 +189,68 @@ async function exercise( fault?: Fault ) {
 			}
 			if ( decision === 'allow' && fault === 'side-effect' ) posts[ 0 ].post_content = 'Changed';
 			if ( ! stopped ) wpResult( fault === 'wrong-id' ? '3' : '2\\u000d\n', decision === 'deny' );
+			else {
+				const requestId = randomUUID();
+				const started = { ...ids, type: 'tool.started', toolCallId, name: 'wp_cli' } as const;
+				const requested = {
+					...ids,
+					type: 'approval.requested',
+					requestId,
+					toolCallId,
+					description: 'Review',
+					operation: approval.operation,
+				} as const;
+				options.onEvent?.( started );
+				options.onEvent?.( requested );
+				if ( fault !== 'missing-journal' ) {
+					const journal = store.journal( sessionId, ids.turnId );
+					const closed = {
+						...ids,
+						type: 'approval.resolved',
+						requestId: fault === 'wrong-stopped-request' ? randomUUID() : requestId,
+						toolCallId: fault === 'wrong-stopped-call' ? randomUUID() : toolCallId,
+					} as const;
+					await journal.append( started );
+					if ( fault === 'out-of-order-stop' ) await journal.append( closed );
+					await journal.append( {
+						...requested,
+						operation: { ...approval.operation, args: JSON.stringify( argv ) },
+					} );
+					if ( fault !== 'out-of-order-stop' ) await journal.append( closed );
+					if ( fault === 'authorized-stopped-call' )
+						await journal.append( {
+							...ids,
+							type: 'operation.authorized',
+							description: 'WP-CLI',
+							requestId,
+							toolCallId,
+							operation: approval.operation,
+						} );
+					await journal.append( {
+						...ids,
+						type: 'tool.result',
+						toolCallId,
+						isError: fault !== 'successful-stopped-call',
+					} );
+					await journal.append( {
+						...ids,
+						type: 'turn.terminal',
+						runId: fault === 'wrong-stopped-run' ? randomUUID() : ids.runId,
+						outcome: {
+							status: 'interrupted',
+							...( fault === 'ambiguous-interrupt'
+								? { code: 'process_unconfirmed' as const }
+								: {} ),
+						},
+					} );
+					if ( fault === 'unreadable-journal' ) {
+						const file = ( await readdir( storeRoot ) ).find( ( name ) =>
+							name.endsWith( '.journal.jsonl' )
+						)!;
+						await appendFile( path.join( storeRoot, file ), 'unsafe-fixture-value\n' );
+					}
+				}
+			}
 		} else {
 			expect( prompt ).not.toContain( storedMarker );
 			if ( calls === 1 ) {
@@ -199,7 +272,7 @@ async function exercise( fault?: Fault ) {
 				terminalInterrupted: stopped,
 				exitMatched: true,
 				approvalRequests: approval ? 1 : 0,
-				approvalsResolved: approval ? 1 : 0,
+				approvalsResolved: approval && ! stopped ? 1 : 0,
 				lateAnswerSent: stopped && fault !== 'no-late-answer',
 				questionAnswered: false,
 				confirmedBlocks: 1,
@@ -262,6 +335,13 @@ it( 'checks the WordPress rows, exact permission, saved selection and native his
 		returnedIdMatches: true,
 		metadataMatches: true,
 	} );
+	expect( stages.at( -1 )?.observations ).toMatchObject( {
+		approvalsResolved: 0,
+		journalApprovalClosed: true,
+		journalInterrupted: true,
+		authorizedWpCliOperations: 0,
+		stoppedToolSuccesses: 0,
+	} );
 } );
 
 it.each( [
@@ -276,6 +356,15 @@ it.each( [
 	[ 'lost-history', 'fresh-owner-resume', 'resume-mismatch' ],
 	[ 'no-late-answer', 'stop-pending-approval', 'missing-late-answer' ],
 	[ 'stopped-write', 'stop-pending-approval', 'stopped-draft-written' ],
+	[ 'missing-journal', 'stop-pending-approval', 'stop-journal-mismatch' ],
+	[ 'unreadable-journal', 'stop-pending-approval', 'stop-journal-mismatch' ],
+	[ 'wrong-stopped-call', 'stop-pending-approval', 'stop-journal-mismatch' ],
+	[ 'wrong-stopped-request', 'stop-pending-approval', 'stop-journal-mismatch' ],
+	[ 'out-of-order-stop', 'stop-pending-approval', 'stop-journal-mismatch' ],
+	[ 'wrong-stopped-run', 'stop-pending-approval', 'stop-journal-mismatch' ],
+	[ 'ambiguous-interrupt', 'stop-pending-approval', 'stop-journal-mismatch' ],
+	[ 'authorized-stopped-call', 'stop-pending-approval', 'stop-journal-mismatch' ],
+	[ 'successful-stopped-call', 'stop-pending-approval', 'stop-journal-mismatch' ],
 	[ 'observer-error', 'denied-draft', 'workflow-error' ],
 	[ 'cancel-before-start', 'site-read', 'cancelled' ],
 ] as const )( 'rejects %s and stops at %s', async ( fault, name, code ) => {

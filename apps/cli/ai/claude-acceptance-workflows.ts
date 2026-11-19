@@ -121,15 +121,19 @@ async function readSession( input: ClaudeAcceptanceWorkflowInput ) {
 	};
 }
 
+type ApprovalRequest = Extract< BackendTurnEvent, { type: 'approval.requested' } >;
+
 function observeTurn() {
 	const calls = new Set< string >();
 	const results: Array< { isError: boolean; value?: string } > = [];
+	let approval: ApprovalRequest | undefined;
 	let lastText = '';
 	return {
 		onEvent( event: BackendTurnEvent ) {
 			if ( event.type === 'content.confirmed' && event.blockType === 'text' )
 				lastText = event.text.trim();
 			if ( event.type === 'tool.started' && event.name === 'wp_cli' ) calls.add( event.toolCallId );
+			if ( event.type === 'approval.requested' && calls.has( event.toolCallId ) ) approval = event;
 			if ( event.type === 'tool.result' && calls.has( event.toolCallId ) ) {
 				// The Studio bridge escapes CR in Windows WP-CLI output before display.
 				results.push( {
@@ -139,6 +143,7 @@ function observeTurn() {
 			}
 		},
 		textMatches: ( expected: string ) => lastText === expected,
+		approval: () => approval,
 		result: () => ( calls.size === 1 && results.length === 1 ? results[ 0 ] : undefined ),
 	};
 }
@@ -151,6 +156,68 @@ function fixtureValue() {
 }
 
 type Turn = Awaited< ReturnType< typeof runClaudeAcceptanceTurn > >;
+
+async function verifyStoppedJournal(
+	input: ClaudeAcceptanceWorkflowInput,
+	result: Turn,
+	approval: ApprovalRequest | undefined,
+	observations: Observations
+) {
+	const failure = 'stop-journal-mismatch';
+	check(
+		approval && approval.runId === result.runId && approval.turnId === result.turnId,
+		failure
+	);
+	try {
+		const events = await createNativeSessionStore( getClaudeSessionStoreRoot( input.sessionsRoot ) )
+			.journal( input.sessionId, result.turnId )
+			.read();
+		check(
+			events.every( ( event ) => event.runId === result.runId && event.turnId === result.turnId ),
+			failure
+		);
+		const milestones = events.filter(
+			( event ) =>
+				event.type === 'approval.requested' ||
+				event.type === 'approval.resolved' ||
+				event.type === 'turn.terminal'
+		);
+		const [ request, resolved, terminal ] = milestones;
+		observations.journalApprovalClosed =
+			milestones.length === 3 &&
+			request?.type === 'approval.requested' &&
+			request.requestId === approval.requestId &&
+			request.toolCallId === approval.toolCallId &&
+			request.operation.tool === 'sites.wpCli' &&
+			request.operation.operationClass === 'command' &&
+			isDeepStrictEqual( request.operation.target, approval.operation.target ) &&
+			resolved?.type === 'approval.resolved' &&
+			resolved.requestId === approval.requestId &&
+			resolved.toolCallId === approval.toolCallId;
+		observations.journalInterrupted =
+			terminal?.type === 'turn.terminal' &&
+			terminal.outcome.status === 'interrupted' &&
+			terminal.outcome.code === undefined;
+		observations.authorizedWpCliOperations = events.filter(
+			( event ) => event.type === 'operation.authorized' && event.operation.tool === 'sites.wpCli'
+		).length;
+		observations.stoppedToolSuccesses = events.filter(
+			( event ) =>
+				event.type === 'tool.result' &&
+				event.toolCallId === approval.toolCallId &&
+				event.isError !== true
+		).length;
+		check(
+			observations.journalApprovalClosed &&
+				observations.journalInterrupted &&
+				observations.authorizedWpCliOperations === 0 &&
+				observations.stoppedToolSuccesses === 0,
+			failure
+		);
+	} catch {
+		throw new WorkflowFailure( failure );
+	}
+}
 
 function verifyTurn( result: Turn, observations: Observations, interrupted = false ) {
 	Object.assign( observations, result.observations );
@@ -260,6 +327,7 @@ export async function runClaudeAcceptanceWorkflows(
 		if ( decision === 'interrupt' ) {
 			check( result.observations.lateAnswerSent, 'missing-late-answer' );
 			check( added.length === 0, 'stopped-draft-written' );
+			await verifyStoppedJournal( input, result, evidence.approval(), observations );
 			return;
 		}
 		check( result.observations.approvalsResolved === 1, 'unresolved-approval' );
