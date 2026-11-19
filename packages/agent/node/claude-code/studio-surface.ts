@@ -3,13 +3,20 @@ import { mkdir } from 'fs/promises';
 import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
 import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { readSite } from '@studio/common/sites/site-path';
+import { __ } from '@wordpress/i18n';
 import {
+	assertClaudeSendContext,
 	isSameClaudeTarget,
 	parseClaudeSessionSelection,
 	resolveClaudeSession,
 } from '@studio/agent/protocol/claude-code';
-import { createHydratedAiSession, reconcileSessionEnvironment } from '../sessions/manage';
+import {
+	createHydratedAiSession,
+	reconcileSessionEnvironment,
+	setClaudeSessionTarget as writeClaudeSessionTarget,
+} from '../sessions/manage';
 import { appendStudioEntry, loadAiSession } from '../sessions/store';
+import { startWithClaudeAttachments } from './attachments';
 import {
 	claudeConnectionRevision,
 	disconnectClaudeConnection,
@@ -23,14 +30,18 @@ import { currentClaudeHost, isClaudeRuntimeSurfaceEnabled } from './platform';
 import { recoverClaudeRun } from './recovery';
 import {
 	createNativeSessionStore,
+	getClaudeAttachmentDirectory,
 	getClaudeGlobalWorkspace,
 	getClaudeSessionStoreRoot,
 } from './sessions';
+import { discardClaudeAttachment, stageClaudeAttachment } from './stage-attachment';
 import type { ClaudeSignInRefusalReason } from './connection';
 import type { ClaudeSignInActionReason } from './platform';
 import type { ClaudeBackendTurnSnapshot } from '@studio/agent/protocol/backend-events';
+import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type {
 	ClaudeModelCatalog,
+	ClaudeSendContext,
 	ClaudeRecoveryResult,
 	ClaudeRuntimeAction,
 	ClaudeRuntimeState,
@@ -67,7 +78,13 @@ export async function getClaudeRuntimeState(): Promise< ClaudeRuntimeState > {
 					: [ ...new Set( [ executable.reason, ...status.blockers ] ) ];
 				return {
 					...connection,
-					version: executable.ok ? executable.version : undefined,
+					revision: claudeConnectionRevision( connection ),
+					version: executable.ok ? executable.version : executable.executable?.version,
+					supportedVersions: executable.ok
+						? [ executable.qualification.record.runtimeVersion ]
+						: executable.qualification?.state === 'unqualified'
+						? executable.qualification.supportedRuntimeVersions
+						: undefined,
 					authMethod: status.auth?.method,
 					blockers,
 					findings: status.findings ?? [],
@@ -157,9 +174,10 @@ async function getModelCatalog(
 /** Models a connection offers in a site's workspace, or the global one without a site. */
 export function getClaudeModelCatalog(
 	connectionId: string,
-	siteId?: string | null
+	siteId?: string | null,
+	root = getSessionsDirectory()
 ): Promise< ClaudeModelCatalog > {
-	return getModelCatalog( connectionId, siteId, getSessionsDirectory() );
+	return getModelCatalog( connectionId, siteId, root );
 }
 
 function requireSupportedSelection(
@@ -223,9 +241,11 @@ export async function createClaudeSession( root: string, request: CreateClaudeSe
  * replayed. When ownership or the native binding cannot be proven, nothing
  * changes and the result says why.
  */
-export async function recoverClaudeSession( sessionId: string ): Promise< ClaudeRecoveryResult > {
+export async function recoverClaudeSession(
+	sessionId: string,
+	root = getSessionsDirectory()
+): Promise< ClaudeRecoveryResult > {
 	if ( ! isClaudeRuntimeEnabled() ) return { status: 'blocked', reason: 'runtime-disabled' };
-	const root = getSessionsDirectory();
 	let binding;
 	try {
 		const { summary, entries } = await loadAiSession( root, sessionId );
@@ -236,6 +256,39 @@ export async function recoverClaudeSession( sessionId: string ): Promise< Claude
 	}
 	if ( ! binding ) return { status: 'blocked', reason: 'not-claude-session' };
 	return recoverClaudeRun( createNativeSessionStore( getClaudeSessionStoreRoot( root ) ), binding );
+}
+
+export function setClaudeSessionTarget(
+	root: string,
+	sessionId: string,
+	expected: ClaudeStudioTarget,
+	target: ClaudeStudioTarget
+) {
+	requireClaudeRuntime();
+	return writeClaudeSessionTarget( root, sessionId, expected, target );
+}
+
+export const discardClaudeChatFile = discardClaudeAttachment;
+
+export function startWithClaudeChatFiles< T >(
+	root: string,
+	sessionId: string,
+	files: StudioChatFileAttachment[] | undefined,
+	start: () => T
+) {
+	const directory = getClaudeAttachmentDirectory( getClaudeSessionStoreRoot( root ), sessionId );
+	return startWithClaudeAttachments( directory, files, start );
+}
+
+export function stageClaudeChatFile(
+	root: string,
+	sessionId: string,
+	name: string,
+	size: number,
+	source: Parameters< typeof stageClaudeAttachment >[ 4 ]
+) {
+	requireClaudeRuntime();
+	return stageClaudeAttachment( root, sessionId, name, size, source );
 }
 
 export async function setClaudeSessionSelection(
@@ -260,19 +313,29 @@ export async function setClaudeSessionSelection(
 export async function validateClaudeSendSelection(
 	root: string,
 	sessionId: string,
-	rawSelection: unknown
+	rawSelection: unknown,
+	expected?: ClaudeSendContext,
+	requiresImageInput = false
 ) {
 	const session = await loadAiSession( root, sessionId );
 	const context = resolveClaudeSession( session.entries );
 	if ( ! context ) {
 		if ( session.summary.backend === 'claude-code' )
 			throw new Error( 'The Claude Code workspace binding is missing.' );
-		if ( rawSelection !== undefined ) throw new Error( 'This chat does not use Claude Code.' );
+		if ( rawSelection !== undefined || expected !== undefined )
+			throw new Error( 'This chat does not use Claude Code.' );
 		if ( session.summary.activeEnvironment === 'live' )
 			await reconcileSessionEnvironment( root, sessionId );
 		return;
 	}
 	requireClaudeRuntime();
+	assertClaudeSendContext( expected, context );
+	if (
+		expected?.revision !== undefined &&
+		expected.revision !== ( await getClaudeTurnConnectionRevision( context.binding.connectionId ) )
+	) {
+		throw new Error( __( 'The Claude connection changed. Review the account and send again.' ) );
+	}
 	const selected = parseClaudeSessionSelection( rawSelection );
 	if (
 		selected.model !== context.selection.model ||
@@ -280,7 +343,21 @@ export async function validateClaudeSendSelection(
 	) {
 		throw new Error( 'Claude Code settings changed. Reload this chat and send again.' );
 	}
+	if ( requiresImageInput ) {
+		const catalog = await getModelCatalog(
+			context.binding.connectionId,
+			context.binding.siteId,
+			root
+		);
+		requireSupportedSelection( catalog, selected );
+		if ( catalog.models.find( ( model ) => model.id === selected.model )?.imageInput !== true )
+			throw new Error(
+				__( 'Choose a model that supports images before sending these attachments' )
+			);
+	}
 	const { target } = context;
+	if ( target.environment !== 'global' && ! ( await readSite( target.siteId ) ) )
+		throw new Error( __( 'The local site this chat works on is unavailable.' ) );
 	if (
 		target.environment === 'live' &&
 		! ( await getConnectedWpcomSitesForLocalSite( target.siteId ) ).some(

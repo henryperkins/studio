@@ -952,7 +952,12 @@ it.each( [ 'unexpected-model', 'eof', 'process-failure' ] )(
 					} ),
 					mcpServerStatus: async () => [ reportedStudioServer( input.options ) ],
 					supportedModels: async () => [
-						{ value: 'sonnet', displayName: 'Sonnet', supportedEffortLevels: [ 'medium' ] },
+						{
+							value: 'sonnet',
+							resolvedModel: 'claude-sonnet-5',
+							displayName: 'Sonnet',
+							supportedEffortLevels: [ 'medium' ],
+						},
 					],
 					close: () => {},
 					async *[ Symbol.asyncIterator ]() {
@@ -2187,6 +2192,78 @@ async function ownedNativeFixture(
 		} ),
 	};
 }
+
+it( 'admits only submitted conversation files across native resume and journals the display copy', async () => {
+	const { runClaudeTurn } = await import( '../runtime' );
+	const { getClaudeAttachmentDirectory, createNativeSessionStore } = await import( '../sessions' );
+	const fs = await import( 'node:fs/promises' );
+	const { join } = await import( 'node:path' );
+	const { randomUUID } = await import( 'node:crypto' );
+	const fixture = await ownedNativeFixture( 'claude-attached-file-' );
+	try {
+		const directory = getClaudeAttachmentDirectory( fixture.storeRoot, 'chat' );
+		await fs.mkdir( directory, { recursive: true } );
+		const picked = join( directory, randomUUID() + '.md' ),
+			draft = join( directory, randomUUID() + '.md' );
+		await Promise.all( [ picked, draft ].map( ( file ) => fs.writeFile( file, 'Brief' ) ) );
+		const decisions: string[] = [];
+		const query = fakeNativeTurn( fixture.root, {
+			projects: fixture.projects,
+			onTurn: async ( opts ) => {
+				expect( ( opts as Options ).settings ).toMatchObject( {
+					permissions: { additionalDirectories: expect.arrayContaining( [ directory ] ) },
+				} );
+				for ( const [ i, file ] of [ picked, draft ].entries() ) {
+					const decision = await nativeCallbacks( opts, 'Read', 'read-' + i ).permission( {
+						file_path: file,
+					} );
+					expect( decision ).toBeTruthy();
+					decisions.push( decision?.behavior ?? 'unresolved' );
+				}
+			},
+		} );
+		for ( const id of [ 'first', 'next' ] ) {
+			const events: import('@studio/agent/protocol/backend-events').BackendTurnEvent[] = [];
+			await runClaudeTurn(
+				turnSnapshot( fixture.root, fixture.config, id ),
+				fixture.host,
+				{
+					prompt: 'Model-only annotation context',
+					displayMessage: 'Please check this',
+					...( id === 'first'
+						? {
+								files: [ { id: 'brief', name: 'Brief.md', path: picked } ],
+								visualAnnotations: [ { comment: 'Update the cover' } ],
+						  }
+						: {} ),
+					signal: new AbortController().signal,
+					onEvent: ( event ) => events.push( event ),
+				},
+				{
+					...fixture,
+					query: query as unknown as typeof import('@anthropic-ai/claude-agent-sdk/core').query,
+					verifyTarget: async () => true,
+					approve: async () => 'deny',
+				}
+			);
+			expect( events.at( -1 ) ).toMatchObject( {
+				type: 'turn.terminal',
+				outcome: { status: 'success' },
+			} );
+		}
+		expect( decisions ).toEqual( [ 'allow', 'deny', 'allow', 'deny' ] );
+		const journals = await createNativeSessionStore( fixture.storeRoot ).readJournals( 'chat' );
+		expect( journals[ 0 ][ 0 ] ).toMatchObject( {
+			type: 'turn.prompt',
+			text: 'Please check this',
+			attachments: [ { kind: 'file', name: 'Brief.md' } ],
+			visualAnnotations: [ { comment: 'Update the cover' } ],
+		} );
+		expect( JSON.stringify( journals ) ).not.toContain( 'Model-only' );
+	} finally {
+		await fixture.cleanup();
+	}
+} );
 
 // A mock SDK that launches its process the way the real one does, unless
 // `launch` is false, then runs `onTurn` after init.

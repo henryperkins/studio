@@ -19,7 +19,6 @@ import {
 	type ReactNode,
 } from 'react';
 import { useAgentRun } from '@/data/agent-runs/use-agent-run';
-import { toast } from '@/data/app-messages';
 import { useAiSettings } from '@/data/queries/use-ai-settings';
 import { useStudioAssistantQuota } from '@/data/queries/use-assistant-quota';
 import { useAuthUser } from '@/data/queries/use-auth-user';
@@ -46,18 +45,6 @@ import { useSiteSelectionTime } from '@/data/use-open-site';
 import { SessionUIProvider, useOptionalSessionPreviewUI } from '@/data/use-session-ui';
 import { useStartSiteWithChat } from '@/data/use-start-site-with-chat';
 import {
-	getSiteAnnotations,
-	hasAnnotationContent,
-	removeAnnotations,
-	stageAnnotations,
-	subscribeAnnotationSend,
-	annotationSubmission,
-} from '@/features/annotations';
-import {
-	formatComposerTextQuote,
-	watchComposerTextQuote,
-} from '@/features/chats/composer-text-quote';
-import {
 	Composer,
 	ComposerSkeleton,
 	pendingPromptSlot,
@@ -78,6 +65,7 @@ import { SessionFrame } from './session-frame';
 import { SessionHeader } from './session-header';
 import styles from './style.module.css';
 import { useAnchoredScroll } from './use-anchored-scroll';
+import { useComposerPreviewActions } from './use-composer-preview-actions';
 import { useMarkChatRead } from './use-mark-chat-read';
 import { useSendSiteDraft } from './use-send-site-draft';
 import { useSessionCommands } from './use-session-commands';
@@ -92,10 +80,18 @@ interface SessionViewProps {
 
 export function SessionView( props: SessionViewProps ) {
 	const { data } = useSession( props.sessionId );
-	if ( data?.summary.backend === 'claude-code' ) return <ClaudeSessionView data={ data } />;
 	return (
 		<SessionUIProvider>
-			<SessionViewContent { ...props } />
+			{ data?.summary.backend === 'claude-code' ? (
+				<ClaudeSessionView
+					key={ data.summary.id }
+					data={ data }
+					headerStart={ props.headerStart }
+					hideHeader={ props.hideHeader }
+				/>
+			) : (
+				<SessionViewContent { ...props } />
+			) }
 		</SessionUIProvider>
 	);
 }
@@ -240,13 +236,7 @@ function SessionViewContent( {
 			}
 		} );
 	}, [ router, sessionId, siteId ] );
-	useEffect(
-		() =>
-			watchComposerTextQuote( ( text ) => {
-				composerRef.current?.appendDraft( formatComposerTextQuote( text ) );
-			} ),
-		[]
-	);
+
 	const chooseFreeFormAnswer = useCallback(
 		( question: string ) => {
 			// Retract any option already picked for this question: the typed reply
@@ -290,7 +280,9 @@ function SessionViewContent( {
 		content: data,
 		paused: pendingQuestions.length > 0,
 	} );
-	useSessionCommands( sessionId );
+	useSessionCommands(
+		sessionSummary && sessionSummary.backend !== 'claude-code' ? sessionId : undefined
+	);
 	const canTogglePreview = !! ownerSite && effectiveEnvironment === 'local';
 	const annotationSiteId = canTogglePreview ? ownerSite.id : undefined;
 
@@ -394,30 +386,13 @@ function SessionViewContent( {
 		} );
 	}, [ isChatReady, pendingPrompt, sendMessage, sessionId ] );
 
-	// Notes sent from the preview land in the composer, then go out with its
-	// draft, or alone when they were sent directly. Direct sends join the queue
-	// while the agent works.
-	useEffect( () => {
-		if ( ! isChatReady || ! annotationSiteId ) return;
-		return subscribeAnnotationSend( annotationSiteId, ( { noteIds } ) => {
-			if ( ! noteIds ) stageAnnotations( annotationSiteId );
-			if ( composerBusy && ! noteIds ) return;
-			if ( ! noteIds ) {
-				return composerRef.current?.send();
-			}
-			const notes = getSiteAnnotations( annotationSiteId ).notes.filter(
-				( note ) => noteIds.includes( note.id ) && hasAnnotationContent( note )
-			);
-			try {
-				const { prompt, options } = annotationSubmission( '', [], notes );
-				return sendMessage( prompt, options )
-					.then( () => removeAnnotations( annotationSiteId, noteIds ) )
-					.catch( () => undefined );
-			} catch ( error ) {
-				toast.error( ( error as Error ).message );
-			}
-		} );
-	}, [ annotationSiteId, composerBusy, isChatReady, sendMessage ] );
+	useComposerPreviewActions(
+		composerRef,
+		annotationSiteId,
+		composerBusy,
+		isChatReady,
+		sendMessage
+	);
 
 	// Fade the composer and prompts in only right after the entitlement check
 	// resolves; ordinary session loads and switches render instantly. The
@@ -505,7 +480,9 @@ function SessionViewContent( {
 						! showEmpty && fadeAfterQuotaCheck && styles.fadeInQuick
 					) }
 				>
-					{ ! sessionId && siteId ? <ClaudeNewChat siteId={ siteId } /> : null }
+					{ ! hasActiveRun && (
+						<ClaudeNewChat siteId={ ownerSite?.id } fromExistingChat={ !! sessionId } />
+					) }
 					<QueuedPrompts
 						prompts={ queuedPrompts }
 						onRemove={ removeQueuedPrompt }

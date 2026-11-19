@@ -623,7 +623,8 @@ describe( 'every bridged call', () => {
 		const bridge = createStudioClaudeToolBridge(
 			createFakeHost(),
 			{ runId: 'run', turnId: 'turn', policy },
-			( event ) => events.push( event )
+			( event ) => events.push( event ),
+			{ toolResultImages: true }
 		);
 		const result = await bridge.invoke( 'contract_one', { label: 'a' } );
 		expect( result ).toEqual( {

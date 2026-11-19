@@ -353,6 +353,7 @@ export async function recoverClaudeRun(
 			none: 'not-locked',
 			legacy: 'legacy-lock',
 			held: 'lock-not-a-run',
+			'changing-target': 'target-change-in-progress',
 			unreadable: 'lock-unreadable',
 		} as const;
 		return { status: 'blocked', reason: reasons[ inspected.state ] };

@@ -35,7 +35,7 @@ import type {
 	StudioAiSessionInputPayload,
 	StudioChatImage,
 } from '@studio/agent/protocol/chat-images';
-import type { ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
+import type { ClaudeSendContext, ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
 import type { JsonEvent } from '@studio/agent/protocol/json-events';
 import type { StudioVisualAnnotationSummary } from '@studio/agent/protocol/visual-annotations';
 
@@ -101,6 +101,7 @@ export interface AgentRunManagerConfig {
 }
 
 export interface StartAgentRunOptions {
+	claudeContext?: ClaudeSendContext;
 	claudeSelection?: ClaudeSessionSelection;
 	turnId?: string;
 	sessionId: string;
@@ -262,6 +263,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			files = [],
 			visualAnnotations,
 			claudeSelection,
+			claudeContext,
 		} = options;
 		const turnId = options.turnId ?? ( claudeSelection ? crypto.randomUUID() : undefined );
 
@@ -286,6 +288,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 						turnId,
 						runId,
 						claudeSelection,
+						claudeContext,
 				  } )
 				: undefined;
 		const args = [ 'code', 'sessions', 'resume', sessionId ];

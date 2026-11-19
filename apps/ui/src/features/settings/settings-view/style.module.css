@@ -36,6 +36,11 @@
 	text-wrap: pretty;
 }
 
+.settingsRow [data-slot='field-label'],
+.settingsRow .rowDescription {
+	overflow-wrap: anywhere;
+}
+
 .rowLead {
 	display: flex;
 	flex: 1 1 auto;
@@ -317,6 +322,7 @@
 
 .keyForm {
 	display: flex;
+	flex-wrap: wrap;
 	align-items: center;
 	gap: var( --space-1 );
 }

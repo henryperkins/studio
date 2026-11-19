@@ -21,6 +21,7 @@ import {
 } from '../tools/media-library';
 import { scaffoldThemeSlug } from '../tools/scaffold-theme';
 import { splitCommandArgs } from '../tools/wp-cli';
+import { isStoredClaudeAttachment } from './attachments';
 import { isClaudeDirectoryListInput } from './directory-listing';
 import {
 	CLAUDE_ACCOUNT_RECHECK_MS,
@@ -140,6 +141,8 @@ export interface ClaudeExecutionContext {
 	targetSite?: { id: string; path: string; url?: string };
 	/** Canonical folders native file tools may reach. */
 	localRoots: readonly string[];
+	attachmentDirectory?: string;
+	submittedAttachments?: ReadonlySet< string >;
 	isStudioSite: ( folder: string ) => Promise< boolean >;
 	enabledTools: ClaudeEnabledTools;
 	/** How the turn's launch confines shell commands. */
@@ -1177,6 +1180,13 @@ export function createClaudeExecutionPolicy(
 				( rule?.path?.required && input[ pathField ] === undefined )
 			)
 				return denyTool( INVALID_NATIVE_INPUT );
+			if (
+				toolName === 'Read' &&
+				context.attachmentDirectory &&
+				context.submittedAttachments?.has( path.basename( file ) ) &&
+				( await isStoredClaudeAttachment( context.attachmentDirectory, file ) )
+			)
+				return { allowed: true, path: file };
 			const result = await checkClaudeNativePath(
 				toolName,
 				file,

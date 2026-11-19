@@ -34,6 +34,50 @@ describe( 'Claude SDK event adapter (mock SDK messages)', () => {
 	} );
 } );
 
+it( 'keeps native work display-only and excludes task output paths, result bodies and SDK metadata', () => {
+	const events: BackendTurnEvent[] = [];
+	const adapter = createClaudeEventAdapter( 'run', 'turn', ( event ) => events.push( event ) );
+	const complete = {
+		type: 'system',
+		subtype: 'task_notification',
+		uuid: 'done',
+		task_id: 'bg',
+		status: 'completed',
+		summary: 'private',
+		output_file: 'private',
+	};
+	adapter.accept( {
+		type: 'system',
+		subtype: 'compact_boundary',
+		uuid: 'compacted',
+		compact_metadata: { summary: 'private' },
+	} );
+	adapter.accept( { type: 'system', subtype: 'task_started', uuid: 'started', task_id: 'bg' } );
+	adapter.accept( complete );
+	adapter.accept( complete );
+	adapter.accept( {
+		type: 'assistant',
+		uuid: 'native',
+		message: {
+			id: 'm',
+			content: [ { type: 'tool_use', id: 'read', name: 'Read', input: { file_path: 'private' } } ],
+		},
+	} );
+	adapter.accept( {
+		type: 'user',
+		message: { content: [ { type: 'tool_result', tool_use_id: 'read', content: 'private' } ] },
+	} );
+	expect( events.map( ( event ) => event.type ) ).toEqual( [
+		'context.compacted',
+		'task.status',
+		'task.status',
+		'native.call',
+		'native.call',
+	] );
+	expect( events.at( -1 ) ).toMatchObject( { name: 'Read', state: 'succeeded' } );
+	expect( JSON.stringify( events ) ).not.toContain( 'private' );
+} );
+
 it( 'reconciles a complete assistant block before its stop and ignores replayed frames', () => {
 	const events: BackendTurnEvent[] = [];
 	const adapter = createClaudeEventAdapter( 'run', 'turn', ( event ) => events.push( event ) );

@@ -101,6 +101,12 @@ export async function readAiSessionSummaryFromEntries(
 			assistantReplyPreview = replyPreview;
 		}
 
+		if ( isClaude && isStudioCustomEntryOfType( entry, 'studio.claude_target_cleared' ) ) {
+			selectedSiteName = undefined;
+			activeEnvironment = 'local';
+			lastSelectedWpcomSiteId = undefined;
+			continue;
+		}
 		if ( isStudioCustomEntryOfType( entry, 'studio.site_selected' ) ) {
 			const data = entry.data;
 			if ( ! data ) continue;

@@ -47,6 +47,8 @@ import {
 } from '@studio/agent/protocol/chatgpt-models';
 import {
 	resolveClaudeSession,
+	assertClaudeSendContext,
+	type ClaudeSendContext,
 	type ClaudeSessionSelection,
 } from '@studio/agent/protocol/claude-code';
 import {
@@ -320,6 +322,7 @@ export async function runCommand( options: {
 	initialTurnId?: string;
 	initialRunId?: string;
 	claudeSelection?: ClaudeSessionSelection;
+	claudeContext?: ClaudeSendContext;
 	initialDisplayMessage?: string;
 	initialImages?: StudioChatImage[];
 	initialFiles?: StudioChatFileAttachment[];
@@ -414,6 +417,7 @@ export async function runCommand( options: {
 	if (
 		! claude &&
 		( options.claudeSelection !== undefined ||
+			options.claudeContext !== undefined ||
 			options.resumeSession?.summary.backend === 'claude-code' ||
 			( savedHeader &&
 				'studioBackend' in savedHeader &&
@@ -422,6 +426,7 @@ export async function runCommand( options: {
 		throw new Error( 'The Claude Code workspace binding is missing.' );
 	}
 	if ( claude ) {
+		assertClaudeSendContext( options.claudeContext, claude );
 		const selection = options.claudeSelection ?? claude.selection;
 		if (
 			selection.model !== claude.selection.model ||
@@ -429,16 +434,30 @@ export async function runCommand( options: {
 		) {
 			throw new Error( 'Claude session settings changed before the turn started.' );
 		}
-		if ( ! options.initialMessage?.trim() )
-			throw new Error( 'A message is required for a Claude turn.' );
-		if ( options.initialFiles?.length || options.initialVisualAnnotations?.length )
-			throw new Error( 'File attachments are not supported for Claude turns.' );
+		if (
+			! options.initialMessage?.trim() &&
+			! options.initialImages?.length &&
+			! options.initialFiles?.length &&
+			! options.initialVisualAnnotations?.length
+		)
+			throw new Error( __( 'A message or attachment is required for a Claude turn.' ) );
 		const runId = options.initialRunId ?? randomUUID();
 		const turnId = options.initialTurnId ?? randomUUID();
 		const conversationId = options.resumeSession?.summary.id ?? resumedById!.getSessionId();
-		await validateClaudeSendSelection( getSessionsDirectory(), conversationId, selection );
+		await validateClaudeSendSelection(
+			getSessionsDirectory(),
+			conversationId,
+			selection,
+			options.claudeContext,
+			Boolean( options.initialImages?.length )
+		);
 		claudeConversationId = conversationId;
 		const connectionRevision = await getClaudeTurnConnectionRevision( claude.binding.connectionId );
+		if (
+			options.claudeContext?.revision !== undefined &&
+			options.claudeContext.revision !== connectionRevision
+		)
+			throw new Error( __( 'The Claude connection changed. Review the account and send again.' ) );
 		const approvals = createClaudeApprovalRouter( {
 			viaIpc: typeof process.send === 'function',
 			local: options.approveClaude,
@@ -486,7 +505,10 @@ export async function runCommand( options: {
 			},
 			{
 				backend: 'claude-code',
-				prompt: options.initialMessage,
+				prompt: options.initialMessage ?? '',
+				displayMessage: options.initialDisplayMessage,
+				files: options.initialFiles,
+				visualAnnotations: options.initialVisualAnnotations,
 				images: options.initialImages,
 				onEvent: ( event ) => {
 					if ( isJsonMode )

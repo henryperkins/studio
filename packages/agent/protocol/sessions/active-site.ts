@@ -18,6 +18,7 @@ export function resolveActiveSiteFromEntries(
 	let state: ResolvedActiveSite | undefined;
 
 	for ( const entry of entries ) {
+		if ( isStudioCustomEntryOfType( entry, 'studio.claude_target_cleared' ) ) state = undefined;
 		if ( ! isStudioCustomEntryOfType( entry, 'studio.site_selected' ) ) continue;
 		const data = entry.data;
 		if ( ! data ) continue;

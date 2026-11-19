@@ -2,14 +2,96 @@ import { randomUUID } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import {
+	getClaudeModelCatalog,
+	recoverClaudeSession,
+	discardClaudeChatFile,
+	stageClaudeChatFile,
+	setClaudeSessionTarget,
+} from '@studio/agent/node/claude-code/studio-surface';
 import { expect, it, vi } from 'vitest';
 import { startLocalServer } from '../index';
 import type { ActiveAgentRun } from '@studio/agent/protocol/agent-events';
 
 vi.mock( '@studio/agent/node/claude-code/studio-surface', async ( importOriginal ) => ( {
 	...( await importOriginal< typeof import('@studio/agent/node/claude-code/studio-surface') >() ),
+	discardClaudeChatFile: vi.fn().mockResolvedValue( undefined ),
+	stageClaudeChatFile: vi.fn(
+		async (
+			_root: string,
+			_id: string,
+			_name: string,
+			_size: number,
+			stream: AsyncIterable< Buffer >
+		) => {
+			const chunks: Buffer[] = [];
+			for await ( const chunk of stream ) chunks.push( chunk );
+			return '/staged/' + Buffer.concat( chunks ).toString( 'hex' );
+		}
+	),
+	setClaudeSessionTarget: vi.fn(),
+	getClaudeModelCatalog: vi.fn( async () => ( { ok: true, models: [] } ) ),
+	recoverClaudeSession: vi.fn( async () => ( { status: 'blocked', reason: 'owner-alive' } ) ),
 	validateClaudeSendSelection: async () => ( { model: 'model', effort: 'high' } ),
 } ) );
+
+it( 'uses this server’s configured sessions root for global catalogs and recovery', async () => {
+	const root = await mkdtemp( path.join( os.tmpdir(), 'studio-claude-global-' ) );
+	const server = await startLocalServer( {
+		port: 0,
+		cliBinary: process.execPath,
+		sessionsRoot: root,
+		sitesRoot: root,
+	} );
+	try {
+		const api = server.url + '/api';
+		expect( ( await fetch( api + '/claude-code/account/models' ) ).status ).toBe( 200 );
+		expect( getClaudeModelCatalog ).toHaveBeenCalledWith( 'account', undefined, root );
+		expect( ( await fetch( api + '/claude-code/account/models/site' ) ).status ).toBe( 200 );
+		expect( getClaudeModelCatalog ).toHaveBeenCalledWith( 'account', 'site', root );
+		const from = { environment: 'global' },
+			to = { environment: 'local', siteId: 'site' };
+		const change = await fetch( api + '/sessions/chat/claude-target', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify( { expected: from, target: to } ),
+		} );
+		expect( change.status ).toBe( 204 );
+		expect( setClaudeSessionTarget ).toHaveBeenCalledWith( root, 'chat', from, to );
+		const upload = await fetch( api + '/sessions/chat/claude-attachments?name=notes.md&size=5', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/octet-stream' },
+			body: 'notes',
+		} );
+		expect( await upload.json() ).toEqual( { path: '/staged/6e6f746573' } );
+		expect( stageClaudeChatFile ).toHaveBeenCalledWith(
+			root,
+			'chat',
+			'notes.md',
+			5,
+			expect.anything()
+		);
+		const discarded = await fetch( api + '/sessions/chat/claude-attachments', {
+			method: 'DELETE',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify( { path: '/staged/6e6f746573' } ),
+		} );
+		expect( discarded.status ).toBe( 204 );
+		expect( discardClaudeChatFile ).toHaveBeenCalledWith( root, 'chat', '/staged/6e6f746573' );
+		const empty = await fetch( api + '/sessions/chat/claude-attachments?name=empty&size=0', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/octet-stream' },
+			body: Buffer.alloc( 0 ),
+		} );
+		expect( await empty.json() ).toEqual( { path: '/staged/' } );
+		const response = await fetch( api + '/sessions/chat/claude-recovery', { method: 'POST' } );
+		expect( await response.json() ).toEqual( { status: 'blocked', reason: 'owner-alive' } );
+		expect( recoverClaudeSession ).toHaveBeenCalledWith( 'chat', root );
+	} finally {
+		await server.close();
+		await rm( root, { recursive: true, force: true } );
+	}
+} );
 
 it( 'reconnects to the owner’s active question, scopes replies and Stop, and ends a detached run', async () => {
 	const root = await mkdtemp( path.join( os.tmpdir(), 'studio-question-routes-' ) );

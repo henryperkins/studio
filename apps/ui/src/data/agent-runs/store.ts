@@ -4,7 +4,9 @@ import type {
 	StudioVisualAnnotationSummary,
 } from '@/data/core';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
-import type { ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
+import type { ClaudeSendContext, ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
+import type { ComposerImageAttachment } from '@studio/agent/protocol/composer-attachments';
+import type { VisualAnnotation } from '@studio/agent/protocol/visual-annotations';
 
 export interface PendingQuestion {
 	question: string;
@@ -12,7 +14,12 @@ export interface PendingQuestion {
 }
 
 export interface SendMessageOptions {
+	annotationDraft?: {
+		text: string;
+		notes: ( VisualAnnotation & { images: ComposerImageAttachment[] } )[];
+	};
 	claudeSelection?: ClaudeSessionSelection;
+	claudeContext?: ClaudeSendContext;
 	displayMessage?: string;
 	images?: StudioChatImage[];
 	files?: StudioChatFileAttachment[];
@@ -20,6 +27,7 @@ export interface SendMessageOptions {
 }
 
 export interface QueuedPrompt extends SendMessageOptions {
+	failure?: string;
 	id: string;
 	prompt: string;
 }
@@ -77,6 +85,8 @@ export type AgentRunAction =
 	| { type: 'queue_append'; prompt: QueuedPrompt }
 	| { type: 'queue_remove'; id: string }
 	| { type: 'queue_shift' }
+	| { type: 'queue_failed'; id: string; failure: string }
+	| { type: 'queue_restore'; prompt: QueuedPrompt }
 	| { type: 'queue_clear' };
 
 function resolveRunStartedAt( state: AgentRunState, runId: string, startedAt: number ): number {
@@ -222,6 +232,15 @@ function agentRunReducer( state: AgentRunState, action: AgentRunAction ): AgentR
 			};
 		case 'queue_shift':
 			return { ...state, queuedPrompts: state.queuedPrompts.slice( 1 ) };
+		case 'queue_restore':
+			return { ...state, queuedPrompts: [ action.prompt, ...state.queuedPrompts ] };
+		case 'queue_failed':
+			return {
+				...state,
+				queuedPrompts: state.queuedPrompts.map( ( item ) =>
+					item.id === action.id ? { ...item, failure: action.failure } : item
+				),
+			};
 		case 'queue_clear':
 			return { ...state, queuedPrompts: [] };
 	}

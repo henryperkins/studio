@@ -285,8 +285,8 @@ export async function inspectClaudeConnection( executablePath: string, configDir
 		config: { mode: result.configMode, directory: result.configDirectory },
 		auth: { qualified: true, method: 'claude.ai' },
 		managedPolicy: result.managedPolicy,
-		findings: result.findings,
-		blockers: [ 'runtime-inventory-unverified' ],
+		findings: [ ...result.findings, 'workspace-model-check-required' ],
+		blockers: [],
 	};
 }
 export async function getClaudeConnections(): Promise< ClaudeConnection[] > {

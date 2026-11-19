@@ -16,6 +16,7 @@ export function createClaudeEventAdapter(
 	let messageId: string | undefined;
 	let openIndex: number | undefined;
 	const frames = new Set< string >();
+	const nativeCalls = new Map< string, string >();
 	type StreamBlock = {
 		text: string;
 		sequence: number;
@@ -27,6 +28,55 @@ export function createClaudeEventAdapter(
 	return {
 		accept( message: ObjectValue ) {
 			if ( terminal ) return;
+			if (
+				message.type === 'system' &&
+				typeof message.uuid === 'string' &&
+				! frames.has( message.uuid )
+			) {
+				if ( message.subtype === 'compact_boundary' ) {
+					frames.add( message.uuid );
+					onEvent( { type: 'context.compacted', runId, turnId, eventId: message.uuid } );
+				} else if (
+					typeof message.task_id === 'string' &&
+					( message.subtype === 'task_started' || message.subtype === 'task_notification' )
+				) {
+					const status = message.subtype === 'task_started' ? 'running' : message.status;
+					if (
+						status === 'running' ||
+						status === 'completed' ||
+						status === 'failed' ||
+						status === 'stopped'
+					) {
+						frames.add( message.uuid );
+						onEvent( {
+							type: 'task.status',
+							runId,
+							turnId,
+							taskId: message.task_id,
+							...( typeof message.run_id === 'string' ? { taskRunId: message.run_id } : {} ),
+							status,
+						} );
+					}
+				}
+			}
+			if ( message.type === 'user' ) {
+				const blocks = object( message.message )?.content;
+				if ( Array.isArray( blocks ) )
+					for ( const part of blocks ) {
+						const block = object( part );
+						if ( block?.type !== 'tool_result' || typeof block.tool_use_id !== 'string' ) continue;
+						const name = nativeCalls.get( block.tool_use_id );
+						if ( name && nativeCalls.delete( block.tool_use_id ) )
+							onEvent( {
+								type: 'native.call',
+								runId,
+								turnId,
+								toolCallId: block.tool_use_id,
+								name,
+								state: block.is_error === true ? 'failed' : 'succeeded',
+							} );
+					}
+			}
 			if ( message.type === 'rate_limit_event' ) {
 				const rate = object( message.rate_limit_info );
 				if (
@@ -112,6 +162,23 @@ export function createClaudeEventAdapter(
 				let blocks = messages.get( id );
 				for ( const [ position, rawBlock ] of content.entries() ) {
 					const block = object( rawBlock );
+					if (
+						block?.type === 'tool_use' &&
+						typeof block.id === 'string' &&
+						typeof block.name === 'string' &&
+						[ 'Read', 'Grep', 'Glob', 'Write', 'Edit', 'Bash' ].includes( block.name ) &&
+						! nativeCalls.has( block.id )
+					) {
+						nativeCalls.set( block.id, block.name );
+						onEvent( {
+							type: 'native.call',
+							runId,
+							turnId,
+							toolCallId: block.id,
+							name: block.name,
+							state: 'started',
+						} );
+					}
 					const text =
 						block?.type === 'text'
 							? block.text

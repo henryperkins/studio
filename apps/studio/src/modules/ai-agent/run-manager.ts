@@ -4,7 +4,7 @@ import { getBundledNodeBinaryPath, getCliPath } from 'src/storage/paths';
 import type { ActiveAgentRun } from '@studio/agent/protocol/agent-events';
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
-import type { ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
+import type { ClaudeSendContext, ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
 import type { StudioVisualAnnotationSummary } from '@studio/agent/protocol/visual-annotations';
 import type { WebContents } from 'electron';
 
@@ -50,6 +50,7 @@ const runManager = createAgentRunManager( {
 
 export interface StartAgentRunOptions {
 	turnId?: string;
+	claudeContext?: ClaudeSendContext;
 	claudeSelection?: ClaudeSessionSelection;
 	sessionId: string;
 	prompt: string;
@@ -71,6 +72,7 @@ export function startAgentRun( options: StartAgentRunOptions ): { runId: string 
 		webContents,
 		turnId,
 		claudeSelection,
+		claudeContext,
 	} = options;
 	// `startAgentRun` forks the child and returns its id synchronously; the
 	// child's first event arrives async (next tick), so registering the route
@@ -86,6 +88,7 @@ export function startAgentRun( options: StartAgentRunOptions ): { runId: string 
 		visualAnnotations,
 		turnId,
 		claudeSelection,
+		claudeContext,
 	} );
 	runWebContents.set( result.runId, webContents );
 	// Abort the run if the window that started it goes away.

@@ -145,6 +145,12 @@
 	isolation: isolate;
 }
 
+.claudeComposer {
+	background: var( --chat );
+	border-radius: var( --radius-lg );
+	overflow-wrap: anywhere;
+}
+
 .conversationSpacing {
 	padding-top: var( --space-4 );
 	padding-bottom: 30px;

@@ -6,6 +6,7 @@ import { prepareProcessOwner, readOwnProcessIdentity } from '@studio/common/lib/
 import { __ } from '@wordpress/i18n';
 import { readGlobalInstructions } from '@studio/agent/node/global-instructions';
 import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
+import { buildChatAttachmentSummaries } from '@studio/agent/protocol/chat-attachments';
 import { validateStudioChatImages } from '@studio/agent/protocol/chat-images';
 import {
 	escapeClaudeApprovalText,
@@ -13,7 +14,13 @@ import {
 	isClaudeModelId,
 	isClaudeTargetAllowed,
 } from '@studio/agent/protocol/claude-code';
+import { AI_MODELS, aiModelSupportsImages } from '@studio/agent/protocol/models';
+import {
+	validateStudioVisualAnnotations,
+	type StudioVisualAnnotationSummary,
+} from '@studio/agent/protocol/visual-annotations';
 import { getSkillsRoot, loadSkills } from '../skills';
+import { prepareClaudeAttachments, ClaudeAttachmentError } from './attachments';
 import { claudeAccountKey, compareClaudeExecutionAuth, isSameClaudeAccount } from './auth-status';
 import {
 	claudeConnectionRevision,
@@ -40,7 +47,11 @@ import { getClaudeSensitiveReadDenyRules, isBundledFolder } from './local-paths'
 import { nativeFileResultHook } from './native-file-results';
 import { isClaudeExecutableUnchanged } from './platform';
 import { askClaudeQuestions, type ClaudeQuestionAsker } from './questions';
-import { createNativeSessionStore, getClaudeGlobalWorkspace } from './sessions';
+import {
+	createNativeSessionStore,
+	getClaudeGlobalWorkspace,
+	getClaudeAttachmentDirectory,
+} from './sessions';
 import { prepareClaudeShell } from './shell';
 import { createShellDeadlines } from './shell-deadlines';
 import { createStudioClaudeDiscoveryServer, createStudioClaudeToolBridge } from './tool-bridge';
@@ -60,6 +71,7 @@ import type {
 	ClaudeRecoveryJournalEvent,
 	ClaudeTurnJournalEvent,
 } from '@studio/agent/protocol/backend-events';
+import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type { ClaudeModelOption, ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 import type {
@@ -68,6 +80,12 @@ import type {
 	ProcessIdentity,
 	ProcessOwner,
 } from '@studio/common/lib/owned-process';
+
+// The SDK discovers account model IDs and effort levels. Studio supplies the independently known image capabilities for exact models.
+function supportsClaudeImages( id: string ): boolean {
+	const model = AI_MODELS.find( ( item ) => item.id === id && item.family === 'anthropic' );
+	return !! model && aiModelSupportsImages( model.id );
+}
 
 interface StartupControl {
 	initializationResult(): Promise< {
@@ -167,6 +185,7 @@ export async function qualifyClaudeStartup(
 				catalog.set( id, {
 					id,
 					displayName: item.displayName,
+					...( supportsClaudeImages( id ) ? { imageInput: true, toolResultImages: true } : {} ),
 					efforts: ( item.supportedEffortLevels ?? [] ).filter( isClaudeEffort ),
 				} );
 		}
@@ -216,6 +235,9 @@ export function isQualifiedClaudeSpawn(
 
 interface RuntimeInput {
 	prompt: string;
+	displayMessage?: string;
+	files?: StudioChatFileAttachment[];
+	visualAnnotations?: StudioVisualAnnotationSummary[];
 	images?: StudioChatImage[];
 	signal: AbortSignal;
 	onEvent: ( event: BackendTurnEvent ) => void;
@@ -747,6 +769,8 @@ export async function runClaudeTurn(
 		}
 		journal = store.journal( workspace.conversationId, turnId );
 		const images = validateStudioChatImages( input.images );
+		const visualAnnotations =
+			validateStudioVisualAnnotations( input.visualAnnotations, images ) ?? [];
 		const findConnection = options.connection ?? findSavedConnection;
 		const connection = await findConnection( selection.connectionId );
 		if ( ! connection ) {
@@ -967,6 +991,29 @@ export async function runClaudeTurn(
 		const additionalDirectories =
 			targetSite && targetSite.path !== prepared.cwd ? [ targetSite.path ] : [];
 		const roots = [ prepared.cwd, ...additionalDirectories ];
+		const attachmentDirectory = getClaudeAttachmentDirectory(
+			await realpath( options.storeRoot ),
+			workspace.conversationId
+		);
+		const attachedFiles = await prepareClaudeAttachments(
+			input.files,
+			attachmentDirectory,
+			roots,
+			prepared.configDirectory
+		);
+		const submittedAttachments = new Set(
+			journals
+				.flat()
+				.flatMap( ( event ) =>
+					event.type === 'turn.prompt' && Array.isArray( event.stagedFiles )
+						? event.stagedFiles
+						: []
+				)
+		);
+		for ( const name of attachedFiles.stagedFiles ) submittedAttachments.add( name );
+		const canReadAttachments =
+			submittedAttachments.size > 0 &&
+			( await canonical( attachmentDirectory ) ) === attachmentDirectory;
 		if ( target.environment === 'local' || target.environment === 'global' ) {
 			shell = await ( options.prepareShell ?? prepareClaudeShell )( {
 				cwd: prepared.cwd,
@@ -992,6 +1039,8 @@ export async function runClaudeTurn(
 			},
 			targetSite,
 			localRoots: roots,
+			attachmentDirectory: canReadAttachments ? attachmentDirectory : undefined,
+			submittedAttachments,
 			isStudioSite: async ( folder ) => Boolean( await host.sites.findByFolder( folder ) ),
 			enabledTools: CLAUDE_ENABLED_TOOLS,
 			shellConfinement: confinement,
@@ -1063,15 +1112,20 @@ export async function runClaudeTurn(
 					...host,
 					ui: {
 						...ui,
+						reloadPreview() {
+							ui.reloadPreview();
+							emit( { type: 'preview.reload', runId, turnId, target } );
+						},
 						async showArtifact( artifact ) {
 							await ui.showArtifact( artifact );
-							emit( { type: 'chat.artifact', runId, turnId, artifact } );
+							emit( { type: 'chat.artifact', runId, turnId, artifact, target } );
 						},
 					},
 			  }
 			: host;
 		bridge = createStudioClaudeToolBridge( toolHost, { runId, turnId, policy: guard }, emit, {
 			imageGeneration,
+			toolResultImages: supportsClaudeImages( selection.model.modelId ),
 			designPreviews: Boolean( screenshotDirectory && path.isAbsolute( screenshotDirectory ) ),
 			bundled,
 			ask:
@@ -1103,7 +1157,11 @@ export async function runClaudeTurn(
 			target,
 			await readGlobalInstructions().catch( () => undefined )
 		);
-		const prompt = claudeSkillCommand( input.prompt, skills );
+		const message =
+			input.prompt.trim() ||
+			visualAnnotations.map( ( item ) => item.comment ).join( '\n' ) ||
+			'Use the attached files.';
+		const authoredPrompt = claudeSkillCommand( message, skills );
 		const watchConnection = async () => {
 			const unchanged = ( await verifyConnection() ) && ( await guard.refreshAccount() );
 			if ( controller.signal.aborted || ! unchanged ) return;
@@ -1114,6 +1172,7 @@ export async function runClaudeTurn(
 			// The recovery note goes to Claude with this prompt. It is marked as given
 			// only once Claude answers (`markNoteGiven`), so it may be given again,
 			// but is never lost to a turn that failed before Claude read it.
+			const prompt = authoredPrompt + attachedFiles.prompt;
 			yield {
 				type: 'user' as const,
 				message: {
@@ -1160,7 +1219,9 @@ export async function runClaudeTurn(
 				...nativeLaunchOptions( prepared, controller, {
 					owner: processOwner,
 					supervise: true,
-					additionalDirectories,
+					additionalDirectories: canReadAttachments
+						? [ ...additionalDirectories, attachmentDirectory ]
+						: additionalDirectories,
 					shell,
 					onRequested: () => {
 						spawnRequested = true;
@@ -1293,12 +1354,30 @@ export async function runClaudeTurn(
 			return;
 		}
 		if ( owning !== 'recorded' ) throw new Error();
+		if (
+			images.length &&
+			! qualification.models.some(
+				( model ) => qualification.acceptedModels.includes( model.id ) && model.imageInput
+			)
+		)
+			throw new ClaudeAttachmentError(
+				__( 'The selected Claude model has no verified image support.' )
+			);
 		if ( ! accountKey ) throw new Error();
 		if ( ! existing ) await store.create( session );
 		else if ( ! existing.accountKey )
 			await store.bindAccount( workspace.conversationId, accountKey );
 		if ( controller.signal.aborted || ! ( await stillConnected() ) ) throw new Error();
-		const submitted = { type: 'turn.prompt' as const, runId, turnId, text: input.prompt };
+		const attachments = buildChatAttachmentSummaries( images, input.files );
+		const submitted = {
+			type: 'turn.prompt' as const,
+			runId,
+			turnId,
+			text: input.displayMessage ?? input.prompt,
+			...( attachments ? { attachments } : {} ),
+			...( attachedFiles.stagedFiles.length ? { stagedFiles: attachedFiles.stagedFiles } : {} ),
+			...( visualAnnotations.length ? { visualAnnotations } : {} ),
+		};
 		await journal.append( submitted );
 		if ( controller.signal.aborted || ! ( await stillConnected() ) ) throw new Error();
 		input.onEvent( submitted );
@@ -1349,7 +1428,14 @@ export async function runClaudeTurn(
 			adapter.accept( message as unknown as Record< string, unknown > );
 			if ( terminal ) break;
 		}
-	} catch {
+	} catch ( error ) {
+		if ( error instanceof ClaudeAttachmentError && ! input.signal.aborted )
+			terminal = {
+				type: 'turn.terminal',
+				runId,
+				turnId,
+				outcome: { status: 'error', message: error.message },
+			};
 		terminal ??=
 			input.signal.aborted || stopReason
 				? { type: 'turn.terminal', runId, turnId, outcome: { status: 'interrupted' } }

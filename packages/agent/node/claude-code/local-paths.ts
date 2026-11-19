@@ -39,7 +39,7 @@ const sensitiveComponents = claudeSensitiveNames.map(
 		new RegExp( '^' + name.replace( /\./g, '\\.' ).replace( /\*/g, '[\\s\\S]*' ) + '$', 'i' )
 );
 
-function isSensitivePath( candidate: string ): boolean {
+export function isSensitivePath( candidate: string ): boolean {
 	return candidate
 		.split( /[\\/]/ )
 		.some( ( part ) => sensitiveComponents.some( ( name ) => name.test( part ) ) );

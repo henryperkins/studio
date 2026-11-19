@@ -857,6 +857,57 @@ it( 'sends the Claude selection captured at Send after a pending write and holds
 	await waitFor( () => expect( laterWrite ).toHaveBeenCalledOnce() );
 } );
 
+it.each( [ false, true ] )(
+	'checks the journal before keeping an unconfirmed Claude submission for review (recorded: %s)',
+	async ( recorded ) => {
+		const connector = createFakeConnector( { sessions: [ session() ] } );
+		connector.continueSession.mockResolvedValue( { runId: 'claude-run' } );
+		function ClaudeHarness() {
+			const run = useAgentRun( 'session-1' );
+			return (
+				<>
+					<button
+						onClick={ () =>
+							void run.sendMessage( 'Original prompt', {
+								claudeSelection: { model: 'claude', effort: 'medium' },
+								claudeContext: { connectionId: 'acc', target: { environment: 'global' } },
+								files: [ { id: 'picked', name: 'brief.md', path: '/owned/brief.md' } ],
+							} )
+						}
+					>
+						Send Claude
+					</button>
+					{ run.queuedPrompts.map( ( item ) => (
+						<span key={ item.id }>
+							{ item.prompt } { item.files?.[ 0 ].name } { item.failure }
+						</span>
+					) ) }
+				</>
+			);
+		}
+		await setup( { connector }, <ClaudeHarness /> );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Send Claude' } ) );
+		await waitFor( () => expect( connector.continueSession ).toHaveBeenCalledOnce() );
+		const turnId = connector.continueSession.mock.calls[ 0 ][ 2 ]!.turnId!;
+		const read = deferred< LoadedAiSession >();
+		connector.getSession.mockReturnValue( read.promise );
+		act( () => connector.emit( 'onAgentEvent', exited( 'claude-run' ) ) );
+		expect(
+			await screen.findByText( /Original prompt brief.md Studio could not confirm/ )
+		).toBeVisible();
+		await act( async () =>
+			read.resolve( {
+				...session(),
+				claudeJournal: recorded
+					? [ [ { type: 'turn.prompt', runId: 'claude-run', turnId, text: 'Original prompt' } ] ]
+					: [],
+			} )
+		);
+		expect( !! screen.queryByText( /Original prompt brief.md/ ) ).toBe( ! recorded );
+		expect( connector.continueSession ).toHaveBeenCalledOnce();
+	}
+);
+
 it( 'stores normalized Claude events only for the currently subscribed run', async () => {
 	const queryClient = createTestQueryClient();
 	queryClient.setQueryData( [ ...SESSIONS_QUERY_KEY, 'session-1' ], session() );

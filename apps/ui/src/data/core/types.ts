@@ -11,9 +11,12 @@ import type {
 } from '@studio/agent/protocol/chatgpt';
 import type {
 	ClaudeModelCatalog,
+	ClaudeRecoveryResult,
+	ClaudeSendContext,
 	ClaudeRuntimeAction,
 	ClaudeRuntimeState,
 	ClaudeSessionSelection,
+	ClaudeStudioTarget,
 	CreateClaudeSessionRequest,
 } from '@studio/agent/protocol/claude-code';
 import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
@@ -425,7 +428,15 @@ export interface Connector {
 	createSession( siteId?: string ): Promise< AiSessionSummary >;
 	getClaudeRuntimeState(): Promise< ClaudeRuntimeState >;
 	configureClaudeRuntime( action: ClaudeRuntimeAction ): Promise< void >;
-	getClaudeModelCatalog( connectionId: string, siteId: string ): Promise< ClaudeModelCatalog >;
+	getClaudeModelCatalog( connectionId: string, siteId?: string ): Promise< ClaudeModelCatalog >;
+	setClaudeSessionTarget(
+		sessionId: string,
+		expected: ClaudeStudioTarget,
+		target: ClaudeStudioTarget
+	): Promise< void >;
+	discardClaudeChatFile( sessionId: string, path: string ): Promise< void >;
+	stageClaudeChatFile( sessionId: string, file: File ): Promise< string >;
+	recoverClaudeSession( sessionId: string ): Promise< ClaudeRecoveryResult >;
 	createClaudeSession( request: CreateClaudeSessionRequest ): Promise< AiSessionSummary >;
 	setClaudeSessionSelection(
 		sessionId: string,
@@ -441,6 +452,7 @@ export interface Connector {
 		options?: {
 			turnId?: string;
 			claudeSelection?: ClaudeSessionSelection;
+			claudeContext?: ClaudeSendContext;
 			displayMessage?: string;
 			images?: StudioChatImage[];
 			files?: StudioChatFileAttachment[];

@@ -179,6 +179,21 @@ const api: IpcApi = {
 	configureClaudeRuntime: ( action ) => ipcRendererInvoke( 'configureClaudeRuntime', action ),
 	getClaudeModelCatalog: ( connectionId, siteId ) =>
 		ipcRendererInvoke( 'getClaudeModelCatalog', connectionId, siteId ),
+	setClaudeSessionTarget: ( id, expected, target ) =>
+		ipcRendererInvoke( 'setClaudeSessionTarget', id, expected, target ),
+	discardClaudeChatFile: ( sessionId, path ) =>
+		ipcRendererInvoke( 'discardClaudeChatFile', sessionId, path ),
+	stageClaudeChatFile: async ( sessionId, file ) => {
+		const picked = webUtils.getPathForFile( file );
+		return ipcRendererInvoke(
+			'stageClaudeChatFile',
+			sessionId,
+			file.name,
+			file.size,
+			picked || new Uint8Array( await file.arrayBuffer() )
+		);
+	},
+	recoverClaudeSession: ( sessionId ) => ipcRendererInvoke( 'recoverClaudeSession', sessionId ),
 	createClaudeSession: ( request ) => ipcRendererInvoke( 'createClaudeSession', request ),
 	setClaudeSessionSelection: ( sessionId, selection ) =>
 		ipcRendererInvoke( 'setClaudeSessionSelection', sessionId, selection ),

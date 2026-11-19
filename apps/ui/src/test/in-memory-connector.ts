@@ -339,13 +339,13 @@ export function createInMemoryConnector(
 				: { ok: false, blockers: [ 'experimental-feature-disabled' ] },
 		createClaudeSession: async ( { siteId, connectionId, selection } ) => {
 			const site = state.sites.find( ( entry ) => entry.id === siteId );
-			if ( ! site ) throw new Error( 'Site unavailable.' );
+			if ( siteId !== undefined && ! site ) throw new Error( 'Site unavailable.' );
 			const summary = makeSession( {
 				id: `session-${ nextId++ }`,
 				backend: 'claude-code',
-				ownerSiteId: site.id,
-				ownerSitePath: site.path,
-				ownerSiteName: site.name,
+				ownerSiteId: site?.id,
+				ownerSitePath: site?.path,
+				ownerSiteName: site?.name,
 			} );
 			const timestamp = new Date().toISOString();
 			state.sessions = [
@@ -362,8 +362,8 @@ export function createInMemoryConnector(
 							customType: 'studio.claude_binding',
 							data: {
 								connectionId,
-								siteId,
-								workingDirectory: site.path,
+								siteId: siteId ?? null,
+								workingDirectory: site?.path ?? '/.studio/claude/global',
 								configDirectory: '/.claude',
 							},
 						},
@@ -380,6 +380,52 @@ export function createInMemoryConnector(
 			];
 			return summary;
 		},
+		setClaudeSessionTarget: async ( id, _expected, target ) => {
+			const chat = findSession( id );
+			const site =
+				target.environment !== 'global'
+					? state.sites.find( ( item ) => item.id === target.siteId )
+					: undefined;
+			const entry =
+				target.environment === 'global'
+					? { customType: 'studio.claude_target_cleared', data: {} }
+					: {
+							customType: 'studio.site_selected',
+							data: {
+								siteName: site?.name,
+								sitePath: site?.path,
+								siteId: target.siteId,
+								...( target.environment === 'live' && {
+									remote: true,
+									wpcomSiteId: target.wpcomSiteId,
+								} ),
+							},
+					  };
+			state.sessions = state.sessions.map( ( item ) =>
+				item !== chat
+					? item
+					: {
+							...chat,
+							entries: [
+								...chat.entries,
+								{
+									type: 'custom',
+									id: `entry-${ nextId++ }`,
+									parentId: null,
+									timestamp: new Date().toISOString(),
+									...entry,
+								},
+							],
+					  }
+			);
+		},
+		discardClaudeChatFile: async () => {},
+		stageClaudeChatFile: async ( sessionId, file ) =>
+			'/sessions/' +
+			encodeURIComponent( sessionId ) +
+			'.attachments/' +
+			encodeURIComponent( file.name ),
+		recoverClaudeSession: async () => ( { status: 'blocked', reason: 'not-locked' } ),
 		setClaudeSessionSelection: async ( id, selection ) => {
 			const session = findSession( id );
 			session.entries = [

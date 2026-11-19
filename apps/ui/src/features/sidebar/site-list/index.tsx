@@ -54,6 +54,14 @@ export function SiteList( {
 	const pathname = useRouterState( { select: ( state ) => state.location.pathname } );
 	const activeSessionId = params.sessionId;
 	const sessions = useMemo( () => getListedSessions( allSessions ), [ allSessions ] );
+	const globalChats =
+		sessions?.filter(
+			( chat ) =>
+				chat.backend === 'claude-code' &&
+				! chat.archived &&
+				! chat.ownerSiteId &&
+				! chat.ownerSitePath
+		) ?? [];
 	const activeSiteId = params.siteId;
 	const chatNavigation = useRouterState( {
 		select: ( state ) => state.location.state.chatNavigation,
@@ -296,6 +304,15 @@ export function SiteList( {
 				>
 					{ listContent }
 				</SiteListGroup>
+				{ globalChats.length > 0 && (
+					<SiteListGroup
+						id="global-chats"
+						title={ __( 'Global chats' ) }
+						itemKeys={ globalChats.map( ( chat ) => chat.id ) }
+					>
+						<SidebarMenu>{ globalChats.map( ( chat ) => renderChat( chat ) ) }</SidebarMenu>
+					</SiteListGroup>
+				) }
 				{ showRecentChats ? (
 					<SiteListGroup
 						id="recent"

@@ -3,9 +3,11 @@ import { getAgentEndFailure } from '@studio/agent/protocol/json-events';
 import { getStudioToolProgress } from '@studio/agent/protocol/tool-progress';
 import { SKIPPED_QUESTION, STOPPED_WITHOUT_ANSWER } from '@studio/agent/protocol/tools';
 import { useQueryClient } from '@tanstack/react-query';
+import { __ } from '@wordpress/i18n';
 import { useCallback, useEffect, useMemo, useRef, useState, type PropsWithChildren } from 'react';
 import { getAccountJourney, completeAccountJourney } from '@/data/account-analytics';
 import { dismissToast, toast } from '@/data/app-messages';
+import { getComposerDraft } from '@/data/composer-drafts';
 import { useConnector } from '@/data/core';
 import { ASSISTANT_QUOTA_QUERY_KEY } from '@/data/queries/use-assistant-quota';
 import { SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
@@ -13,12 +15,14 @@ import {
 	holdSessionSettingChanges,
 	waitForSessionSettingChanges,
 } from '@/data/session-setting-changes';
+import { captureClaudeEventDuringRead, forgetClaudeStream } from './claude-journal-read';
 import { AgentRunContext, type AgentRunStore } from './context';
 import { QueueDispatchers } from './queue-dispatchers';
 import {
 	createSessionStateStore,
 	initialAgentRunState,
 	type AgentRunAction,
+	type QueuedPrompt,
 	type SendMessageOptions,
 	type SessionStateStore,
 } from './store';
@@ -85,6 +89,9 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 	const sessionRevisionsRef = useRef< Map< string, number > >( new Map() );
 	const refreshActiveRunsRef = useRef< ( () => void ) | null >( null );
 	const questionsDuringSnapshotRef = useRef< Set< string > | null >( null );
+	const unconfirmedClaudePrompts = useRef(
+		new Map< string, { prompt: QueuedPrompt; runId?: string } >()
+	);
 	const streamingRepliesRef = useRef< Map< string, StreamingReply > >( new Map() );
 
 	const dispatchSession = useCallback(
@@ -98,6 +105,43 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 			stateStore.dispatch( sessionId, action );
 		},
 		[ stateStore ]
+	);
+
+	const recoverUnconfirmedClaudePrompt = useCallback(
+		( sessionId: string, runId: string ) => {
+			const pending = unconfirmedClaudePrompts.current.get( sessionId );
+			if ( ! pending || pending.runId !== runId ) return;
+			unconfirmedClaudePrompts.current.delete( sessionId );
+			const { prompt } = pending;
+			dispatchSession( sessionId, {
+				type: 'queue_restore',
+				prompt: {
+					...prompt,
+					failure: __(
+						'Studio could not confirm this message was sent. Check the conversation before sending it again.'
+					),
+				},
+			} );
+			// The submission event may have been lost during reconnect. Its durable copy wins.
+			void connector
+				.getSession( sessionId )
+				.then( ( session ) => {
+					if (
+						session.claudeJournal?.some( ( turn ) =>
+							turn.some(
+								( event ) =>
+									event.type === 'turn.prompt' &&
+									event.turnId === prompt.id &&
+									event.runId === runId
+							)
+						)
+					) {
+						dispatchSession( sessionId, { type: 'queue_remove', id: prompt.id } );
+					}
+				} )
+				.catch( () => {} );
+		},
+		[ connector, dispatchSession ]
 	);
 
 	const updateCache = useCallback(
@@ -161,7 +205,9 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 				if ( ! state.runId || activeSessionIds.has( sessionId ) || ! unchanged( sessionId ) ) {
 					continue;
 				}
+				recoverUnconfirmedClaudePrompt( sessionId, state.runId );
 				subscribedRunIdsBySessionRef.current.delete( sessionId );
+				forgetClaudeStream( queryClient, sessionId, state.runId );
 				ignoredRunIdsRef.current.delete( state.runId );
 				dispatchSession( sessionId, { type: 'run_ended' } );
 			}
@@ -209,12 +255,14 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 			questionsDuringSnapshotRef.current = null;
 			unsubscribe?.();
 		};
-	}, [ connector, dispatchSession, queryClient, stateStore ] );
+	}, [ connector, dispatchSession, queryClient, recoverUnconfirmedClaudePrompt, stateStore ] );
 
 	useEffect( () => {
-		const endRun = ( sessionId: string ) => {
+		const endRun = ( sessionId: string, runId: string ) => {
+			forgetClaudeStream( queryClient, sessionId, runId );
 			const hasQueuedFollowUp =
 				( stateStore.getState()[ sessionId ] ?? initialAgentRunState ).queuedPrompts.length > 0;
+			recoverUnconfirmedClaudePrompt( sessionId, runId );
 			dispatchSession( sessionId, { type: 'run_ended' } );
 			subscribedRunIdsBySessionRef.current.delete( sessionId );
 			endStreamingReply( sessionId );
@@ -240,7 +288,7 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 				if ( exited ) {
 					ignoredRunIdsRef.current.delete( payload.runId );
 					if ( stateStore.getState()[ payload.sessionId ]?.runId === payload.runId ) {
-						endRun( payload.sessionId );
+						endRun( payload.sessionId, payload.runId );
 					}
 				}
 				return;
@@ -269,7 +317,9 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 			const event: AgentEvent = payload.event;
 
 			switch ( event.type ) {
-				case 'run.started':
+				case 'run.started': {
+					const pending = unconfirmedClaudePrompts.current.get( payload.sessionId );
+					if ( pending && ! pending.runId ) pending.runId = payload.runId;
 					dismissToast( `chat-error-${ payload.sessionId }` );
 					subscribedRunIdsBySessionRef.current.set( payload.sessionId, payload.runId );
 					dispatchSession( payload.sessionId, {
@@ -279,6 +329,7 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 						interrupting: false,
 					} );
 					return;
+				}
 				case 'error':
 					toast.error( event.message, { id: `chat-error-${ payload.sessionId }` } );
 					return;
@@ -323,11 +374,18 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 							} as SessionEntry,
 						] );
 					}
-					endRun( payload.sessionId );
+					endRun( payload.sessionId, payload.runId );
 					return;
 				}
 				case 'backend.event': {
 					if ( event.event.runId !== payload.runId ) return;
+					if (
+						event.event.type === 'turn.prompt' &&
+						unconfirmedClaudePrompts.current.get( payload.sessionId )?.prompt.id ===
+							event.event.turnId
+					) {
+						unconfirmedClaudePrompts.current.delete( payload.sessionId );
+					}
 					if (
 						stateStore.getState()[ payload.sessionId ]?.runId === payload.runId &&
 						( event.event.type === 'approval.requested' ||
@@ -338,13 +396,18 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					) {
 						dispatchSession( payload.sessionId, { type: 'claude_event', event: event.event } );
 					}
+					if ( event.event.type === 'approval.requested' || event.event.type === 'preview.reload' )
+						return;
+					if ( ! captureClaudeEventDuringRead( queryClient, payload.sessionId, event.event ) )
+						return;
 					queryClient.setQueryData< LoadedAiSession >(
 						[ ...SESSIONS_QUERY_KEY, payload.sessionId ],
 						( previous ) => {
 							if ( ! previous ) return previous;
 							const journal = previous.claudeJournal ?? [];
 							const index = journal.findIndex(
-								( turn ) => turn[ 0 ]?.turnId === event.event.turnId
+								( turn ) =>
+									turn[ 0 ]?.turnId === event.event.turnId && turn[ 0 ]?.runId === event.event.runId
 							);
 							if ( index < 0 )
 								return { ...previous, claudeJournal: [ ...journal, [ event.event ] ] };
@@ -489,7 +552,15 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					return;
 			}
 		} );
-	}, [ connector, dispatchSession, endStreamingReply, queryClient, stateStore, updateCache ] );
+	}, [
+		connector,
+		dispatchSession,
+		endStreamingReply,
+		queryClient,
+		recoverUnconfirmedClaudePrompt,
+		stateStore,
+		updateCache,
+	] );
 
 	const startRun = useCallback(
 		async ( sessionId: string, prompt: string, options: SendMessageOptions = {} ) => {
@@ -539,6 +610,10 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 
 			try {
 				dismissToast( `chat-send-${ sessionId }` );
+				if ( options.claudeContext )
+					unconfirmedClaudePrompts.current.set( sessionId, {
+						prompt: { ...options, id: turnId, prompt },
+					} );
 				await settingsSaved;
 				const { runId: newRunId } = await connector.continueSession( sessionId, prompt, {
 					turnId,
@@ -547,7 +622,10 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 					files,
 					visualAnnotations,
 					...( options.claudeSelection ? { claudeSelection: options.claudeSelection } : {} ),
+					...( options.claudeContext ? { claudeContext: options.claudeContext } : {} ),
 				} );
+				const pending = unconfirmedClaudePrompts.current.get( sessionId );
+				if ( pending?.prompt.id === turnId ) pending.runId = newRunId;
 				if ( interruptPendingStartSessionIdsRef.current.has( sessionId ) ) {
 					interruptPendingStartSessionIdsRef.current.delete( sessionId );
 					ignoredRunIdsRef.current.add( newRunId );
@@ -573,6 +651,8 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 				} );
 				subscribedRunIdsBySessionRef.current.set( sessionId, newRunId );
 			} catch ( err ) {
+				if ( unconfirmedClaudePrompts.current.get( sessionId )?.prompt.id === turnId )
+					unconfirmedClaudePrompts.current.delete( sessionId );
 				accountJourneysRef.current.delete( sessionId );
 				updateCache( sessionId, ( entries ) => {
 					const idx = entries.lastIndexOf( optimisticEntry );
@@ -727,6 +807,47 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 		[ connector, dispatchSession, setCachedSelectedLabel, stateStore ]
 	);
 
+	const discardClaudeFiles = useCallback(
+		( sessionId: string, paths: string[] ) => {
+			if ( ! paths.length ) return;
+			const retained = new Set(
+				getComposerDraft( sessionId ).attachments.flatMap( ( item ) =>
+					item.kind === 'file' ? [ item.path ] : []
+				)
+			);
+			const pending = unconfirmedClaudePrompts.current.get( sessionId )?.prompt;
+			for ( const item of [
+				pending,
+				...( stateStore.getState()[ sessionId ]?.queuedPrompts ?? [] ),
+			] ) {
+				for ( const file of item?.files ?? [] ) retained.add( file.path );
+			}
+			const session = queryClient.getQueryData< LoadedAiSession >( [
+				...SESSIONS_QUERY_KEY,
+				sessionId,
+			] );
+			const submitted = new Set(
+				session?.claudeJournal?.flatMap( ( turn ) =>
+					turn.flatMap( ( event ) =>
+						event.type === 'turn.prompt' ? event.stagedFiles ?? [] : []
+					)
+				)
+			);
+			const unused = [ ...new Set( paths ) ].filter(
+				( path ) =>
+					! retained.has( path ) && ! submitted.has( path.split( /[/\\]/ ).at( -1 ) ?? '' )
+			);
+			void Promise.all(
+				unused.map( ( path ) => connector.discardClaudeChatFile( sessionId, path ) )
+			).catch( () => {
+				toast.error(
+					__( 'Studio could not remove the unused attachment from this conversation.' )
+				);
+			} );
+		},
+		[ connector, queryClient, stateStore ]
+	);
+
 	const value = useMemo< AgentRunStore >(
 		() => ( {
 			stateStore,
@@ -735,8 +856,17 @@ export function AgentRunProvider( { children }: PropsWithChildren ) {
 			interrupt,
 			answerQuestion,
 			clearQuestionAnswer,
+			discardClaudeFiles,
 		} ),
-		[ answerQuestion, clearQuestionAnswer, dispatchSession, interrupt, startRun, stateStore ]
+		[
+			answerQuestion,
+			clearQuestionAnswer,
+			discardClaudeFiles,
+			dispatchSession,
+			interrupt,
+			startRun,
+			stateStore,
+		]
 	);
 
 	return (

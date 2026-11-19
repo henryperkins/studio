@@ -17,6 +17,11 @@ import {
 import {
 	configureClaudeRuntime,
 	createClaudeSession,
+	recoverClaudeSession,
+	discardClaudeChatFile,
+	startWithClaudeChatFiles,
+	stageClaudeChatFile,
+	setClaudeSessionTarget,
 	getClaudeModelCatalog,
 	getClaudeRuntimeState,
 	setClaudeSessionSelection,
@@ -2322,15 +2327,70 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 		} )
 	);
 	api.get(
-		'/claude-code/:connectionId/models/:siteId',
+		'/claude-code/:connectionId/models/:siteId?',
 		asyncHandler( async ( req: Request, res: Response ) => {
-			res.json( await getClaudeModelCatalog( req.params.connectionId, req.params.siteId ) );
+			res.json(
+				await getClaudeModelCatalog( req.params.connectionId, req.params.siteId, sessionsRoot )
+			);
 		} )
 	);
 	api.post(
 		'/claude-code/sessions',
 		asyncHandler( async ( req: Request, res: Response ) => {
 			res.json( await createClaudeSession( sessionsRoot, req.body ) );
+		} )
+	);
+	api.post(
+		'/sessions/:id/claude-target',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			await setClaudeSessionTarget(
+				sessionsRoot,
+				req.params.id,
+				req.body?.expected,
+				req.body?.target
+			);
+			res.sendStatus( 204 );
+		} )
+	);
+	api.delete(
+		'/sessions/:id/claude-attachments',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			if ( typeof req.body?.path !== 'string' ) {
+				res.status( 400 ).json( { error: 'An attachment path is required.' } );
+				return;
+			}
+			await discardClaudeChatFile( sessionsRoot, req.params.id, req.body.path );
+			res.sendStatus( 204 );
+		} )
+	);
+	api.post(
+		'/sessions/:id/claude-attachments',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			const { name, size } = req.query;
+			if (
+				req.get( 'Content-Type' )?.split( ';', 1 )[ 0 ]?.trim().toLowerCase() !==
+					'application/octet-stream' ||
+				typeof name !== 'string' ||
+				typeof size !== 'string' ||
+				! /^\d+$/.test( size )
+			) {
+				res.status( 400 ).json( { error: 'A selected file and its size are required.' } );
+				return;
+			}
+			const path = await stageClaudeChatFile(
+				sessionsRoot,
+				req.params.id,
+				name,
+				Number( size ),
+				req
+			);
+			res.json( { path } );
+		} )
+	);
+	api.post(
+		'/sessions/:id/claude-recovery',
+		asyncHandler( async ( req: Request, res: Response ) => {
+			res.json( await recoverClaudeSession( req.params.id, sessionsRoot ) );
 		} )
 	);
 	api.post(
@@ -2468,10 +2528,6 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 				displayMessage?: string;
 				visualAnnotations?: unknown;
 			};
-			if ( ! prompt ) {
-				res.status( 400 ).json( { error: 'prompt is required' } );
-				return;
-			}
 			let images: StudioChatImage[];
 			let files: StudioChatFileAttachment[];
 			let validatedVisualAnnotations: StudioVisualAnnotationSummary[] | undefined;
@@ -2483,10 +2539,23 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 				res.status( 400 ).json( { error: ( error as Error ).message } );
 				return;
 			}
+			if (
+				typeof prompt !== 'string' ||
+				( ! prompt &&
+					! (
+						req.body.claudeSelection &&
+						( images.length || files.length || validatedVisualAnnotations?.length )
+					) )
+			) {
+				res.status( 400 ).json( { error: 'prompt is required' } );
+				return;
+			}
 			const claudeSelection = await validateClaudeSendSelection(
 				sessionsRoot,
 				req.params.id,
-				req.body.claudeSelection
+				req.body.claudeSelection,
+				req.body.claudeContext,
+				images.length > 0
 			);
 			const clientId = req.body.clientId;
 			if (
@@ -2498,17 +2567,26 @@ export async function startLocalServer( options: LocalServerOptions ): Promise< 
 					.json( { error: 'Reconnect to Studio before sending a Claude Code message.' } );
 				return;
 			}
-			const { runId } = runManager.startAgentRun( {
-				sessionId: req.params.id,
-				prompt: claudeSelection ? prompt : expandSkillCommandPrompt( prompt ),
-				claudeSelection,
-				turnId: typeof req.body.turnId === 'string' ? req.body.turnId : undefined,
-				displayMessage,
-				images,
-				files,
-				visualAnnotations: validatedVisualAnnotations,
-			} );
-			if ( claudeSelection ) claudeRunClients.set( runId, clientId );
+			const { runId } = await startWithClaudeChatFiles(
+				sessionsRoot,
+				req.params.id,
+				claudeSelection ? files : undefined,
+				() => {
+					const started = runManager.startAgentRun( {
+						sessionId: req.params.id,
+						prompt: claudeSelection ? prompt : expandSkillCommandPrompt( prompt ),
+						claudeSelection,
+						claudeContext: req.body.claudeContext,
+						turnId: typeof req.body.turnId === 'string' ? req.body.turnId : undefined,
+						displayMessage,
+						images,
+						files,
+						visualAnnotations: validatedVisualAnnotations,
+					} );
+					if ( claudeSelection ) claudeRunClients.set( started.runId, clientId );
+					return started;
+				}
+			);
 			void recordAnnotationSubmitted( {
 				annotationCount: validatedVisualAnnotations?.length ?? 0,
 				sessionsRoot,

@@ -21,19 +21,28 @@ import type { AiOutputAdapter } from 'cli/ai/output-adapter';
 
 async function readInputPayload( path: string ): Promise< StudioAiSessionInputPayload > {
 	const parsed = JSON.parse( await fs.readFile( path, 'utf8' ) ) as StudioAiSessionInputPayload;
-	if ( ! parsed || typeof parsed.prompt !== 'string' || ! parsed.prompt.trim() ) {
+	if ( ! parsed || typeof parsed.prompt !== 'string' ) {
 		throw new Error( __( 'Invalid AI session input payload.' ) );
 	}
 	const images = validateStudioChatImages( parsed.images );
+	const files = validateStudioChatFiles( parsed.files );
+	const visualAnnotations = validateStudioVisualAnnotations( parsed.visualAnnotations, images );
+	if (
+		! parsed.prompt.trim() &&
+		! ( parsed.claudeSelection && ( images.length || files.length || visualAnnotations?.length ) )
+	) {
+		throw new Error( __( 'Invalid AI session input payload.' ) );
+	}
 	return {
 		prompt: parsed.prompt,
+		claudeContext: parsed.claudeContext,
 		turnId: parsed.turnId,
 		runId: parsed.runId,
 		claudeSelection: parsed.claudeSelection,
 		displayMessage: parsed.displayMessage,
 		images,
-		files: validateStudioChatFiles( parsed.files ),
-		visualAnnotations: validateStudioVisualAnnotations( parsed.visualAnnotations, images ),
+		files,
+		visualAnnotations,
 	};
 }
 
@@ -108,6 +117,7 @@ export async function runCommand(
 			initialTurnId: inputPayload?.turnId,
 			initialRunId: inputPayload?.runId,
 			claudeSelection: inputPayload?.claudeSelection,
+			claudeContext: inputPayload?.claudeContext,
 			initialDisplayMessage: inputPayload?.displayMessage ?? options.displayMessage,
 			initialImages: inputPayload?.images,
 			initialFiles: inputPayload?.files,

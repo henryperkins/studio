@@ -82,7 +82,7 @@ type IpcApi = {
 	// error. We use `undefined` instead because we need to be intentional about using
 	// `ipcRenderer.invoke` vs `ipcRenderer.send`. We make this work in `preload.ts` with the help
 	// of a utility function.
-	[ K in keyof IpcHandlers ]: (
+	[ K in Exclude< keyof IpcHandlers, 'stageClaudeChatFile' > ]: (
 		...args: WithoutIpcEvent< Parameters< IpcHandlers[ K ] > >
 	) => K extends IpcVoidHandlers ? undefined : ToPromise< ReturnType< IpcHandlers[ K ] > >;
 } & {
@@ -90,6 +90,7 @@ type IpcApi = {
 	// function is exception and need to be defined here manually. See
 	// https://www.electronjs.org/docs/latest/breaking-changes#planned-breaking-api-changes-320
 	getPathForFile: ( file: File ) => string;
+	stageClaudeChatFile: ( sessionId: string, file: File ) => Promise< string >;
 };
 
 interface AppGlobals {

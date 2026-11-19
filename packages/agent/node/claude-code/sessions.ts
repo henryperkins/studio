@@ -35,6 +35,18 @@ function key( conversationId: string ) {
 	return createHash( 'sha256' ).update( conversationId ).digest( 'hex' );
 }
 
+export function getClaudePromptLabel(
+	event: Extract< BackendTurnEvent, { type: 'turn.prompt' } >
+) {
+	return (
+		event.text.trim() || event.attachments?.[ 0 ]?.name || event.visualAnnotations?.[ 0 ]?.comment
+	);
+}
+
+export function getClaudeAttachmentDirectory( root: string, conversationId: string ) {
+	return path.join( root, key( conversationId ) + '.attachments' );
+}
+
 // An approval journaled before requests named their operation is kept for
 // display only, under its own type, so it can never be taken for a live request.
 function readJournalEvent( line: string ): ClaudeJournalEvent {
@@ -237,9 +249,41 @@ export function createNativeSessionStore( root: string ) {
 					...names.map( ( name ) => path.join( root, name ) ),
 				].map( ( file ) => rm( file, { force: true } ) )
 			);
+			await rm( getClaudeAttachmentDirectory( root, conversationId ), {
+				recursive: true,
+				force: true,
+			} );
 			await locks.removeLeftovers( conversationId, checkClaimant );
 			await removeSession();
 			await rm( marker, { force: true } );
+		},
+		async readChatActivity(
+			conversationId: string
+		): Promise< { firstPrompt?: string; updatedAt?: string } > {
+			const names = await orderedNames( conversationId );
+			const latest = names.at( -1 );
+			if ( ! latest ) return {};
+			const last = await stat( path.join( root, latest ) );
+			for ( const name of names ) {
+				const input = createReadStream( path.join( root, name ), { encoding: 'utf8' } );
+				try {
+					let partial = '';
+					for await ( const chunk of input ) {
+						const lines = ( partial + chunk ).split( '\n' );
+						partial = lines.pop() ?? '';
+						for ( const line of lines ) {
+							if ( ! line ) continue;
+							const event = readJournalEvent( line );
+							if ( event.type !== 'turn.prompt' ) continue;
+							const firstPrompt = getClaudePromptLabel( event );
+							if ( firstPrompt ) return { firstPrompt, updatedAt: last.mtime.toISOString() };
+						}
+					}
+				} finally {
+					input.destroy();
+				}
+			}
+			return { updatedAt: last.mtime.toISOString() };
 		},
 		async readJournals( conversationId: string ): Promise< ClaudeJournalEvent[][] > {
 			const names = await orderedNames( conversationId );

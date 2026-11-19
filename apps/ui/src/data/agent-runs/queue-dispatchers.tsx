@@ -1,13 +1,19 @@
 import { readChatGptSessionSelection } from '@studio/agent/protocol/chatgpt';
 import { resolveChatGptReasoning } from '@studio/agent/protocol/chatgpt-models';
+import { matchesClaudeSendContext, resolveClaudeSession } from '@studio/agent/protocol/claude-code';
 import { resolveConnectionSelection } from '@studio/agent/protocol/connections';
 import { getEffectiveSessionProvider } from '@studio/agent/protocol/providers';
+import { __ } from '@wordpress/i18n';
 import { useEffect, useSyncExternalStore } from 'react';
+import { useConnector } from '@/data/core';
 import { useAiSettings } from '@/data/queries/use-ai-settings';
 import { useChatGptModels, useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
 import { useIsOutOfAiCredits } from '@/data/queries/use-is-out-of-ai-credits';
 import { useSession } from '@/data/queries/use-sessions';
-import { useEntriesWithSettingChanges } from '@/data/session-setting-changes';
+import {
+	useEntriesWithSettingChanges,
+	waitForSessionSettingChanges,
+} from '@/data/session-setting-changes';
 import { useAgentRunStore } from './context';
 import { initialAgentRunState } from './store';
 
@@ -29,6 +35,97 @@ export function QueueDispatchers() {
 }
 
 function QueueDispatcher( { sessionId }: { sessionId: string } ) {
+	const { stateStore } = useAgentRunStore();
+	const next = useSyncExternalStore(
+		stateStore.subscribe,
+		() => stateStore.getState()[ sessionId ]?.queuedPrompts[ 0 ]
+	);
+	return next?.claudeSelection || next?.claudeContext ? (
+		<ClaudeQueueDispatcher sessionId={ sessionId } />
+	) : (
+		<StandardQueueDispatcher sessionId={ sessionId } />
+	);
+}
+
+function ClaudeQueueDispatcher( { sessionId }: { sessionId: string } ) {
+	const connector = useConnector();
+	const { stateStore, dispatchSession, startRun } = useAgentRunStore();
+	const state = useSyncExternalStore(
+		stateStore.subscribe,
+		() => stateStore.getState()[ sessionId ] ?? initialAgentRunState
+	);
+	const next = state.phase === 'idle' ? state.queuedPrompts[ 0 ] : undefined;
+	useEffect( () => {
+		if ( ! next || next.failure ) return;
+		let cancelled = false;
+		const current = () =>
+			! cancelled &&
+			stateStore.getState()[ sessionId ]?.phase === 'idle' &&
+			stateStore.getState()[ sessionId ]?.queuedPrompts[ 0 ] === next;
+		const paused = __( 'This queued message needs review. Edit it to send again.' );
+		const dispatch = async () => {
+			await waitForSessionSettingChanges( sessionId );
+			if ( ! current() ) return;
+			const saved = await connector.getSession( sessionId );
+			const context = resolveClaudeSession( saved.entries );
+			const captured = next.claudeContext;
+			const selected = next.claudeSelection;
+			if (
+				! context ||
+				! captured ||
+				! selected ||
+				saved.claudeRecovery ||
+				! matchesClaudeSendContext( context, captured ) ||
+				selected.model !== context.selection.model ||
+				selected.effort !== context.selection.effort
+			) {
+				throw new Error( paused );
+			}
+			const [ runtime, catalog ] = await Promise.all( [
+				connector.getClaudeRuntimeState(),
+				connector.getClaudeModelCatalog(
+					captured.connectionId,
+					context.binding.siteId ?? undefined
+				),
+			] );
+			const model = catalog.ok && catalog.models.find( ( item ) => item.id === selected.model );
+			if (
+				! runtime.enabled ||
+				! runtime.connections.some(
+					( connection ) =>
+						connection.id === captured.connectionId &&
+						! connection.blockers.length &&
+						( captured.revision === undefined ||
+							captured.revision === ( connection.revision ?? 1 ) )
+				) ||
+				! model ||
+				! model.efforts.includes( selected.effort ) ||
+				( next.images?.length && ! model.imageInput )
+			) {
+				throw new Error( paused );
+			}
+			if ( ! current() ) return;
+			dispatchSession( sessionId, { type: 'queue_shift' } );
+			const { id: _id, prompt, failure: _failure, ...options } = next;
+			await startRun( sessionId, prompt, options ).catch( () => {
+				dispatchSession( sessionId, {
+					type: 'queue_restore',
+					prompt: { ...next, failure: paused },
+				} );
+			} );
+		};
+		void dispatch().catch( () => {
+			if ( current() )
+				dispatchSession( sessionId, { type: 'queue_failed', id: next.id, failure: paused } );
+		} );
+		return () => {
+			cancelled = true;
+		};
+	}, [ connector, dispatchSession, next, sessionId, startRun, stateStore ] );
+	return null;
+}
+
+function StandardQueueDispatcher( { sessionId }: { sessionId: string } ) {
 	const { stateStore, dispatchSession, startRun } = useAgentRunStore();
 	const state = useSyncExternalStore(
 		stateStore.subscribe,

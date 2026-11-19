@@ -19,6 +19,11 @@ import { recordAnnotationSubmitted } from '@studio/agent/node/annotation-tracks'
 import {
 	configureClaudeRuntime as configureClaudeRuntimeOnHost,
 	createClaudeSession as createClaudeSessionOnHost,
+	discardClaudeChatFile as discardClaudeChatFileOnHost,
+	startWithClaudeChatFiles,
+	stageClaudeChatFile as stageClaudeChatFileOnHost,
+	setClaudeSessionTarget as setClaudeSessionTargetOnHost,
+	recoverClaudeSession as recoverClaudeSessionOnHost,
 	getClaudeModelCatalog as getClaudeModelCatalogOnHost,
 	getClaudeRuntimeState as getClaudeRuntimeStateOnHost,
 	setClaudeSessionSelection as setClaudeSessionSelectionOnHost,
@@ -204,7 +209,9 @@ import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type {
 	ClaudeRuntimeAction,
+	ClaudeSendContext,
 	ClaudeSessionSelection,
+	ClaudeStudioTarget,
 	CreateClaudeSessionRequest,
 } from '@studio/agent/protocol/claude-code';
 import type {
@@ -321,7 +328,7 @@ export async function configureClaudeRuntime(
 export async function getClaudeModelCatalog(
 	_event: IpcMainInvokeEvent,
 	connectionId: string,
-	siteId: string
+	siteId?: string
 ) {
 	return getClaudeModelCatalogOnHost( connectionId, siteId );
 }
@@ -331,6 +338,39 @@ export async function createClaudeSession(
 	request: CreateClaudeSessionRequest
 ) {
 	return createClaudeSessionOnHost( getSessionsDirectory(), request );
+}
+
+export async function setClaudeSessionTarget(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	expected: ClaudeStudioTarget,
+	target: ClaudeStudioTarget
+) {
+	await setClaudeSessionTargetOnHost( getSessionsDirectory(), sessionId, expected, target );
+}
+
+export async function discardClaudeChatFile(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	path: string
+) {
+	return discardClaudeChatFileOnHost( getSessionsDirectory(), sessionId, path );
+}
+
+export async function stageClaudeChatFile(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	name: string,
+	size: number,
+	picked: string | Uint8Array
+) {
+	if ( typeof picked !== 'string' && ! ( picked instanceof Uint8Array ) )
+		throw new Error( 'Invalid file selection.' );
+	return stageClaudeChatFileOnHost( getSessionsDirectory(), sessionId, name, size, picked );
+}
+
+export async function recoverClaudeSession( _event: IpcMainInvokeEvent, sessionId: string ) {
+	return recoverClaudeSessionOnHost( sessionId );
 }
 
 export async function setClaudeSessionSelection(
@@ -379,6 +419,7 @@ export async function continueAiSession(
 	prompt: string,
 	options: {
 		turnId?: string;
+		claudeContext?: ClaudeSendContext;
 		claudeSelection?: ClaudeSessionSelection;
 		displayMessage?: string;
 		images?: StudioChatImage[];
@@ -386,25 +427,34 @@ export async function continueAiSession(
 		visualAnnotations?: unknown;
 	} = {}
 ): Promise< { runId: string } > {
+	const images = validateStudioChatImages( options.images );
 	const claudeSelection = await validateClaudeSendSelection(
 		getSessionsDirectory(),
 		sessionId,
-		options.claudeSelection
+		options.claudeSelection,
+		options.claudeContext,
+		images.length > 0
 	);
-	const images = validateStudioChatImages( options.images );
 	const files = validateStudioChatFiles( options.files );
 	const visualAnnotations = validateStudioVisualAnnotations( options.visualAnnotations, images );
-	const result = startAgentRun( {
+	const result = await startWithClaudeChatFiles(
+		getSessionsDirectory(),
 		sessionId,
-		prompt: claudeSelection ? prompt : expandSkillCommandPrompt( prompt ),
-		claudeSelection,
-		turnId: options.turnId,
-		displayMessage: options.displayMessage,
-		images,
-		files,
-		visualAnnotations,
-		webContents: event.sender,
-	} );
+		claudeSelection ? files : undefined,
+		() =>
+			startAgentRun( {
+				sessionId,
+				prompt: claudeSelection ? prompt : expandSkillCommandPrompt( prompt ),
+				claudeSelection,
+				claudeContext: options.claudeContext,
+				turnId: options.turnId,
+				displayMessage: options.displayMessage,
+				images,
+				files,
+				visualAnnotations,
+				webContents: event.sender,
+			} )
+	);
 	void recordAnnotationSubmitted( {
 		annotationCount: visualAnnotations?.length ?? 0,
 		sessionsRoot: getSessionsDirectory(),

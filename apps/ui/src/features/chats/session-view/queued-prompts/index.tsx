@@ -44,6 +44,7 @@ export function QueuedPrompts( { prompts, onRemove, onEdit }: QueuedPromptsProps
 							</span>
 						</div>
 						{ attachmentNames ? <span>{ attachmentNames }</span> : null }
+						{ item.failure && <span role="alert">{ item.failure }</span> }
 					</li>
 				);
 			} ) }

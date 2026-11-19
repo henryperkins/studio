@@ -9,6 +9,7 @@ import {
 	saveClaudeConnection,
 } from '../connection';
 import { inspectClaudeExecutable } from '../discovery';
+import { getClaudeRuntimeState } from '../studio-surface';
 import { peBinary } from './fixtures/native-binaries';
 import type { ExecFileOptions } from 'child_process';
 
@@ -158,6 +159,36 @@ describe.runIf( process.platform === 'win32' && process.arch === 'x64' )(
 					reason: 'version-unqualified',
 					supportedRuntimeVersions: [ '2.1.319' ],
 				},
+			} );
+		} );
+
+		it( 'separates workspace discovery from a successful connection and reports a native update', async () => {
+			await saveClaudeConnection( {
+				id: 'test',
+				executablePath: executable,
+				configDirectory: config,
+			} );
+			await expect( getClaudeRuntimeState() ).resolves.toMatchObject( {
+				enabled: true,
+				connections: [
+					{
+						authMethod: 'claude.ai',
+						version: '2.1.319',
+						supportedVersions: [ '2.1.319' ],
+						blockers: [],
+						findings: expect.arrayContaining( [ 'workspace-model-check-required' ] ),
+					},
+				],
+			} );
+			version = '2.1.320 (Claude Code)';
+			await expect( getClaudeRuntimeState() ).resolves.toMatchObject( {
+				connections: [
+					{
+						version: '2.1.320',
+						supportedVersions: [ '2.1.319' ],
+						blockers: [ 'version-unqualified' ],
+					},
+				],
 			} );
 		} );
 

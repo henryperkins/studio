@@ -778,10 +778,34 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			} ),
 		getClaudeModelCatalog: ( connectionId, siteId ) =>
 			api(
-				`/claude-code/${ encodeURIComponent( connectionId ) }/models/${ encodeURIComponent(
-					siteId
-				) }`
+				`/claude-code/${ encodeURIComponent( connectionId ) }/models${
+					siteId === undefined ? '' : `/${ encodeURIComponent( siteId ) }`
+				}`
 			),
+		setClaudeSessionTarget: ( sessionId, expected, target ) =>
+			api( `/sessions/${ encodeURIComponent( sessionId ) }/claude-target`, {
+				method: 'POST',
+				body: JSON.stringify( { expected, target } ),
+			} ),
+		discardClaudeChatFile: ( sessionId, path ) =>
+			api< void >( `/sessions/${ encodeURIComponent( sessionId ) }/claude-attachments`, {
+				method: 'DELETE',
+				body: JSON.stringify( { path } ),
+			} ),
+		stageClaudeChatFile: async ( sessionId, file ) => {
+			const query = new URLSearchParams( { name: file.name, size: String( file.size ) } );
+			const result = await api< { path: string } >(
+				`/sessions/${ encodeURIComponent( sessionId ) }/claude-attachments?${ query }`,
+				{
+					method: 'POST',
+					headers: { 'Content-Type': 'application/octet-stream' },
+					body: file,
+				}
+			);
+			return result.path;
+		},
+		recoverClaudeSession: ( sessionId ) =>
+			api( `/sessions/${ encodeURIComponent( sessionId ) }/claude-recovery`, { method: 'POST' } ),
 		createClaudeSession: ( request ) =>
 			api( '/claude-code/sessions', {
 				method: 'POST',
@@ -802,6 +826,7 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 					images: options?.images,
 					files: options?.files,
 					visualAnnotations: options?.visualAnnotations,
+					claudeContext: options?.claudeContext,
 					...( options?.claudeSelection && { claudeSelection: options.claudeSelection, clientId } ),
 				} ),
 			} );

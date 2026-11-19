@@ -18,6 +18,7 @@ export type StudioCustomEntryType =
 	| 'studio.agent_question'
 	| 'studio.turn_closed'
 	| 'studio.session_context'
+	| 'studio.claude_target_cleared'
 	| 'studio.claude_binding'
 	| 'studio.claude_selection'
 	| 'studio.user_prompt'
@@ -118,6 +119,7 @@ export interface StudioMessageEditedData {
 }
 
 export interface StudioCustomEntryDataMap {
+	'studio.claude_target_cleared': Record< string, never >;
 	'studio.site_selected': StudioSiteSelectedData;
 	'studio.tool_progress': StudioToolProgressData;
 	'studio.chat_artifact': StudioChatArtifactData;

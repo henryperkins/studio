@@ -25,6 +25,7 @@ import {
 } from '@/features/settings/settings-view';
 import { SiteSettingsForm } from '@/features/settings/site-settings-view';
 import { readLastVisited } from '@/features/sidebar';
+import { useMediaQuery } from '@/lib/hooks';
 import {
 	AlertDialog,
 	Button,
@@ -137,6 +138,7 @@ function focusControl( row: HTMLElement ) {
  * than the current one, and `settingsFocus` a setting, by link id or title.
  */
 export function SettingsDialog() {
+	const compact = useMediaQuery( '(width < 640px)' );
 	const router = useRouter();
 	const navigate = useNavigate();
 	const connector = useConnector();
@@ -340,12 +342,13 @@ export function SettingsDialog() {
 			>
 				<DialogTitle render={ <VisuallyHidden /> }>{ __( 'Settings' ) }</DialogTitle>
 				<Tabs
-					orientation="vertical"
+					orientation={ compact ? 'horizontal' : 'vertical' }
+					className={ styles.layout }
 					layout="sidebar"
 					value={ searching ? null : section }
 					onValueChange={ ( next: SettingsSectionId ) => go( next ) }
 				>
-					<TabsSidebar>
+					<TabsSidebar className={ styles.navigation }>
 						<Tabs
 							value={ scope }
 							onValueChange={ ( next: SettingsScope ) =>
@@ -405,7 +408,7 @@ export function SettingsDialog() {
 							</TabsList>
 						) : results.length ? (
 							<Tabs
-								orientation="vertical"
+								orientation={ compact ? 'horizontal' : 'vertical' }
 								value={ null }
 								onValueChange={ ( index: number ) => open( results[ index ] ) }
 							>

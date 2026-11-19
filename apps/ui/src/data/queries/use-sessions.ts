@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { __ } from '@wordpress/i18n';
 import { useEffect } from 'react';
+import { readSessionWithClaudeEvents } from '@/data/agent-runs/claude-journal-read';
 import { toast } from '@/data/app-messages';
 import { useConnector } from '@/data/core';
 import { useConnectedWpcomSites } from '@/data/queries/use-connected-wpcom-sites';
@@ -93,9 +94,16 @@ export function useSessions() {
 
 export function useSession( sessionId: string | undefined ) {
 	const connector = useConnector();
+	const client = useQueryClient();
 	return useQuery( {
 		queryKey: [ ...SESSIONS_QUERY_KEY, sessionId ],
-		queryFn: () => connector.getSession( sessionId! ),
+		queryFn: ( { signal } ) =>
+			readSessionWithClaudeEvents(
+				client,
+				sessionId!,
+				() => connector.getSession( sessionId! ),
+				signal
+			),
 		enabled: !! sessionId,
 		// `useAgentRun` mutates the cache during a live run and invalidates
 		// explicitly on `run.exited`. Any implicit refetch would race those

@@ -120,15 +120,18 @@ const MarkdownBlock = memo( function MarkdownBlock( {
 export const Markdown = memo( function Markdown( {
 	children,
 	streaming = false,
+	inlineImages = true,
 }: {
 	children: string;
 	streaming?: boolean;
+	inlineImages?: boolean;
 } ) {
 	const connector = useConnector();
 
 	const components = useMemo< Components >( () => {
 		return {
 			...baseComponents,
+			...( inlineImages ? {} : { img: ( { alt }: { alt?: string } ) => <span>{ alt }</span> } ),
 			// Electron swallows plain `target="_blank"` navigations — route clicks
 			// through the connector so links open in the system browser.
 			a: ( { children: linkChildren, href } ) => {
@@ -163,7 +166,7 @@ export const Markdown = memo( function Markdown( {
 				);
 			},
 		};
-	}, [ connector ] );
+	}, [ connector, inlineImages ] );
 
 	const blocks = splitMarkdownBlocks( children );
 	return (

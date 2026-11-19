@@ -6,6 +6,7 @@ import type {
 } from './claude-code';
 import type { ConnectionBackend, ConnectionSelection } from './connections';
 import type { AiProviderId } from './providers';
+import type { StudioUserPromptData } from './sessions/entry-types';
 
 interface BackendTurnIds {
 	runId: string;
@@ -113,10 +114,18 @@ export interface BackendApprovalOperation {
 /** Events sent by a backend using Studio's display protocol. */
 export type BackendTurnEvent = BackendTurnIds &
 	// Cumulative text, ordered by sequence within the block.
-	( | { type: 'turn.prompt'; text: string }
+	( | ( { type: 'turn.prompt'; stagedFiles?: string[] } & Pick<
+				StudioUserPromptData,
+				'text' | 'attachments' | 'visualAnnotations'
+		  > )
 		| ( { type: 'content.provisional'; sequence: number } & ContentBlock )
 		// Authoritative replacement for any provisional text for this block.
 		| ( { type: 'content.confirmed' } & ContentBlock )
+		| ( {
+				type: 'native.call';
+				name: string;
+				state: 'started' | 'succeeded' | 'failed';
+		  } & ToolCall )
 		| ( { type: 'tool.started'; name: string; messageId?: string; blockId?: string } & ToolCall )
 		| ( {
 				type: 'tool.progress';
@@ -125,7 +134,13 @@ export type BackendTurnEvent = BackendTurnIds &
 				/** Set by Studio when cleanup of a Claude call's image reservations could not be confirmed. */
 				unsettledMediaReservations?: number;
 		  } & ToolCall )
-		| ( { type: 'tool.result'; message?: string; isError: boolean; skillName?: string } & ToolCall )
+		| ( {
+				type: 'tool.result';
+				message?: string;
+				isError: boolean;
+				skillName?: string;
+				imageService?: import('./image-service').ImageServiceRecord;
+		  } & ToolCall )
 		| ( {
 				type: 'approval.requested';
 				requestId: string;
@@ -151,8 +166,15 @@ export type BackendTurnEvent = BackendTurnIds &
 				requestId: string;
 				answers: Record< string, string > | null;
 		  }
-		| { type: 'chat.artifact'; artifact: StudioChatArtifactData }
-		| { type: 'preview.reload' }
+		| { type: 'chat.artifact'; artifact: StudioChatArtifactData; target?: ClaudeStudioTarget }
+		| { type: 'context.compacted'; eventId: string }
+		| {
+				type: 'task.status';
+				taskId: string;
+				taskRunId?: string;
+				status: 'running' | 'completed' | 'failed' | 'stopped';
+		  }
+		| { type: 'preview.reload'; target?: ClaudeStudioTarget }
 		| { type: 'turn.terminal'; outcome: BackendTurnOutcome }
 	);
 

@@ -1,8 +1,16 @@
 import { escapeClaudeApprovalText } from '@studio/agent/protocol/claude-code';
 import { SKIPPED_QUESTION } from '@studio/agent/protocol/tools';
 import { act, fireEvent, screen, waitFor, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { describeClaudeIssue } from '@/data/queries/claude-runtime';
 import { SESSIONS_QUERY_KEY } from '@/data/queries/use-sessions';
+import {
+	changeAnnotation,
+	getSiteAnnotations,
+	pickAnnotation,
+	requestAnnotationSend,
+} from '@/features/annotations';
+import { clearComposerDrafts } from '@/features/composer';
 import { createFakeConnector, makeSession, makeSite } from '@/test/fake-connector';
 import { renderApp } from '@/test/render';
 import type { Connector, LoadedAiSession, SessionEntry } from '@/data/core';
@@ -13,6 +21,7 @@ import type {
 import type { ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
 
 vi.setConfig( { testTimeout: 30_000 } );
+beforeEach( clearComposerDrafts );
 
 function deferred< T >() {
 	let resolve!: ( value: T ) => void;
@@ -65,7 +74,13 @@ async function setupSession(
 			claudeRuntime: {
 				enabled: true,
 				connections: [
-					{ id: 'c1', executablePath: 'C:\\Claude\\claude.exe', blockers: [], findings: [] },
+					{
+						id: 'c1',
+						executablePath: 'C:\\Claude\\claude.exe',
+						authMethod: 'claude.ai',
+						blockers: [],
+						findings: [ 'workspace-model-check-required' ],
+					},
 				],
 			},
 			claudeModels: [
@@ -75,9 +90,30 @@ async function setupSession(
 		},
 		overrides
 	);
-	connector.continueSession.mockResolvedValue( { runId: 'run-1' } );
+	let runCount = 0;
+	connector.continueSession.mockImplementation( async ( sessionId, text, options ) => {
+		const runId = `run-${ ++runCount }`;
+		const timestamp = new Date().toISOString();
+		connector.emit( 'onAgentEvent', {
+			sessionId,
+			runId,
+			event: { type: 'run.started', timestamp },
+		} );
+		if ( options?.turnId ) {
+			connector.emit( 'onAgentEvent', {
+				sessionId,
+				runId,
+				event: {
+					type: 'backend.event',
+					timestamp,
+					event: { type: 'turn.prompt', runId, turnId: options.turnId, text },
+				},
+			} );
+		}
+		return { runId };
+	} );
 	const view = renderApp( { connector, path: '/sessions/claude-matrix' } );
-	await screen.findByRole( 'textbox', { name: 'Message Claude' } );
+	await screen.findByRole( 'combobox', { name: 'Message Claude' } );
 	await waitFor( () =>
 		expect( screen.getByRole( 'combobox', { name: 'Claude model' } ) ).toHaveTextContent(
 			'Model A'
@@ -93,6 +129,53 @@ async function setupSession(
 }
 
 describe( 'Claude Code chat', () => {
+	it( 'renders a reopened prompt, Markdown, tool outcome and eligible preview without loading model-supplied image URLs', async () => {
+		const ids = { runId: 'r', turnId: 't' };
+		await setupSession( undefined, {}, [
+			[
+				{
+					...ids,
+					type: 'turn.prompt',
+					text: 'Use this brief',
+					attachments: [ { kind: 'file', name: 'brief.md' } ],
+				},
+				{
+					...ids,
+					type: 'content.confirmed',
+					messageId: 'm',
+					blockId: '0',
+					blockType: 'text',
+					text: '## Site review\n\n![remote](https://example.test/pixel)',
+				},
+				{ ...ids, type: 'tool.started', toolCallId: 'a', name: 'wp_cli' },
+				{
+					...ids,
+					type: 'tool.result',
+					toolCallId: 'a',
+					message: 'Site check failed',
+					isError: true,
+				},
+				{
+					...ids,
+					type: 'chat.artifact',
+					target: { environment: 'local', siteId: 'one' },
+					artifact: {
+						version: 1,
+						id: 'preview',
+						widgets: [ { type: 'site-preview', widgetProps: { path: 'studio:design-system' } } ],
+					},
+				},
+				{ ...ids, type: 'task.status', taskId: 'a', status: 'completed' },
+				{ ...ids, type: 'turn.terminal', outcome: { status: 'success' } },
+			],
+		] );
+		expect( screen.getByText( 'brief.md' ) ).toBeVisible();
+		expect( screen.getByRole( 'heading', { name: 'Site review' } ) ).toBeVisible();
+		expect( screen.getByText( 'Site check failed' ) ).toBeVisible();
+		expect( screen.getByRole( 'button', { name: 'Open design system' } ) ).toBeVisible();
+		expect( screen.getByText( 'Background task completed' ) ).toBeVisible();
+		expect( screen.queryByRole( 'img', { name: 'remote' } ) ).not.toBeInTheDocument();
+	} );
 	it( 'reopens only local screenshots in this conversation', async () => {
 		const media = ( source: string, alt: string ) => ( {
 			type: 'media',
@@ -194,6 +277,340 @@ describe( 'Claude Code chat', () => {
 		expect( screen.getByLabelText( 'Message Claude' ) ).toBeVisible();
 		expect( screen.queryByRole( 'combobox', { name: /environment/i } ) ).not.toBeInTheDocument();
 	} );
+} );
+
+describe( 'Claude composer', () => {
+	function edit( text: string ) {
+		const input = screen.getByRole( 'combobox', { name: 'Message Claude' } );
+		fireEvent.change( input, { target: { value: text } } );
+		return input;
+	}
+
+	async function startTurn() {
+		const setup = await setupSession();
+		fireEvent.keyDown( edit( 'First turn' ), { key: 'Enter' } );
+		await screen.findByRole( 'button', { name: 'Stop response' } );
+		await waitFor( () => expect( setup.connector.continueSession ).toHaveBeenCalledOnce() );
+		return setup;
+	}
+
+	function finishTurn( connector: Awaited< ReturnType< typeof setupSession > >[ 'connector' ] ) {
+		act( () =>
+			connector.emit( 'onAgentEvent', {
+				sessionId: 'claude-matrix',
+				runId: 'run-1',
+				event: {
+					type: 'run.exited',
+					timestamp: new Date().toISOString(),
+					status: 'success',
+					code: 0,
+				},
+			} )
+		);
+	}
+
+	it( 'holds a text draft across remount while its file is staging and lets the user resolve a failed upload', async () => {
+		const view = await setupSession();
+		const file = new File( [ 'notes' ], 'notes.txt', { type: 'text/plain' } );
+		const staging = deferred< string >();
+		view.connector.stageClaudeChatFile.mockReturnValueOnce( staging.promise );
+		fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
+			target: { files: [ file ] },
+		} );
+		fireEvent.keyDown( edit( 'Wait for my notes' ), { key: 'Enter' } );
+		expect( view.connector.continueSession ).not.toHaveBeenCalled();
+		view.unmount();
+		renderApp( { connector: view.connector, path: '/sessions/claude-matrix' } );
+		expect( await screen.findByText( 'Preparing attachments…' ) ).toBeVisible();
+		const input = screen.getByRole( 'combobox', { name: 'Message Claude' } );
+		expect( input ).toHaveValue( 'Wait for my notes' );
+		await act( async () => staging.reject( new Error( 'Upload interrupted' ) ) );
+		await screen.findByText( 'This file could not be attached' );
+		fireEvent.keyDown( input, { key: 'Enter' } );
+		expect( view.connector.continueSession ).not.toHaveBeenCalled();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Dismiss' } ) );
+		fireEvent.keyDown( input, { key: 'Enter' } );
+		await waitFor( () =>
+			expect( view.connector.continueSession ).toHaveBeenCalledWith(
+				'claude-matrix',
+				'Wait for my notes',
+				expect.objectContaining( { files: [] } )
+			)
+		);
+	} );
+
+	it( 'recovers a staged file into its own draft when it finishes while the chat is closed', async () => {
+		const view = await setupSession();
+		const staging = deferred< string >();
+		view.connector.stageClaudeChatFile.mockReturnValueOnce( staging.promise );
+		edit( 'Review the file' );
+		fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
+			target: {
+				files: [ new File( [ 'notes' ], 'notes.txt', { type: 'text/plain' } ) ],
+			},
+		} );
+		await screen.findByText( 'Preparing attachments…' );
+		view.unmount();
+		await act( async () => staging.resolve( '/sessions/claude-matrix.attachments/id/notes.txt' ) );
+		renderApp( { connector: view.connector, path: '/sessions/claude-matrix' } );
+		expect( await screen.findByText( 'notes.txt' ) ).toBeVisible();
+		expect( screen.getByRole( 'combobox', { name: 'Message Claude' } ) ).toHaveValue(
+			'Review the file'
+		);
+	} );
+
+	it( 'restores a rejected send alongside text entered after submission', async () => {
+		const { connector } = await setupSession();
+		const submission = deferred< { runId: string } >();
+		connector.continueSession.mockReturnValueOnce( submission.promise );
+		fireEvent.keyDown( edit( 'Original' ), { key: 'Enter' } );
+		await waitFor( () => expect( connector.continueSession ).toHaveBeenCalledTimes( 1 ) );
+		const input = edit( 'Follow-up draft' );
+		await act( async () => submission.reject( new Error( 'Connection changed' ) ) );
+		await waitFor( () => expect( input ).toHaveValue( 'Original\n\nFollow-up draft' ) );
+	} );
+
+	it( 'stages a picked file once and preserves its private reference through queue, edit and send', async () => {
+		const { connector } = await startTurn();
+		const staged = '/sessions/claude-matrix.attachments/attachment/notes.txt';
+		const file = new File( [ 'notes' ], 'notes.txt', { type: 'text/plain' } );
+		connector.stageClaudeChatFile.mockResolvedValue( staged );
+		fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
+			target: { files: [ file ] },
+		} );
+		await screen.findByText( 'notes.txt' );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Queue message' } ) );
+		fireEvent.click( await screen.findByRole( 'button', { name: 'Edit queued message' } ) );
+		await screen.findByText( 'notes.txt' );
+		finishTurn( connector );
+		const input = edit( 'Edited turn' );
+		await waitFor( () =>
+			expect( screen.getByRole( 'button', { name: 'Send message' } ) ).not.toHaveAttribute(
+				'aria-disabled',
+				'true'
+			)
+		);
+		fireEvent.keyDown( input, { key: 'Enter' } );
+		await waitFor( () =>
+			expect( connector.continueSession ).toHaveBeenCalledWith(
+				'claude-matrix',
+				'Edited turn',
+				expect.objectContaining( {
+					claudeContext: {
+						connectionId: 'c1',
+						revision: 1,
+						target: { environment: 'local', siteId: 'one' },
+					},
+					claudeSelection: { model: 'model-a', effort: 'medium' },
+					files: [
+						{
+							id: expect.any( String ),
+							name: 'notes.txt',
+							path: staged,
+							mimeType: 'text/plain',
+							size: file.size,
+						},
+					],
+				} )
+			)
+		);
+		expect( connector.stageClaudeChatFile ).toHaveBeenCalledExactlyOnceWith(
+			'claude-matrix',
+			file
+		);
+		expect( connector.discardClaudeChatFile ).not.toHaveBeenCalled();
+	} );
+
+	it( 'discards explicitly removed private files only after their final draft or queue reference is gone', async () => {
+		const { connector } = await startTurn();
+		const path = '/private/conversation/notes.txt';
+		const pick = async () => {
+			fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
+				target: { files: [ new File( [ 'draft' ], 'notes.txt', { type: 'text/plain' } ) ] },
+			} );
+			await screen.findByRole( 'button', { name: 'Remove attachment' } );
+		};
+		connector.stageClaudeChatFile.mockResolvedValue( path );
+		await pick();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Remove attachment' } ) );
+		await waitFor( () =>
+			expect( connector.discardClaudeChatFile ).toHaveBeenCalledExactlyOnceWith(
+				'claude-matrix',
+				path
+			)
+		);
+		connector.discardClaudeChatFile.mockClear();
+		await pick();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Queue message' } ) );
+		await screen.findByRole( 'button', { name: 'Remove queued message' } );
+		await pick();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Remove queued message' } ) );
+		expect( connector.discardClaudeChatFile ).not.toHaveBeenCalled();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Queue message' } ) );
+		fireEvent.click( await screen.findByRole( 'button', { name: 'Remove queued message' } ) );
+		await waitFor( () =>
+			expect( connector.discardClaudeChatFile ).toHaveBeenCalledExactlyOnceWith(
+				'claude-matrix',
+				path
+			)
+		);
+	} );
+
+	it( 'discards newly staged files rejected by a concurrent attachment merge', async () => {
+		const { connector } = await setupSession();
+		connector.stageClaudeChatFile.mockImplementation(
+			async ( _, file ) => '/private/' + file.name
+		);
+		const pick = ( names: string[] ) =>
+			fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
+				target: {
+					files: names.map( ( name ) => new File( [ 'a' ], name, { type: 'text/plain' } ) ),
+				},
+			} );
+		pick( Array.from( { length: 9 }, ( _, i ) => 'base' + i + '.txt' ) );
+		await screen.findByText( 'base8.txt' );
+		const stages = [ deferred< string >(), deferred< string >() ];
+		for ( const pending of stages )
+			connector.stageClaudeChatFile.mockReturnValueOnce( pending.promise );
+		pick( [ 'keep.txt' ] );
+		pick( [ 'excess.txt' ] );
+		await act( async () => stages[ 0 ].resolve( '/private/keep.txt' ) );
+		await screen.findByText( 'keep.txt' );
+		await act( async () => stages[ 1 ].resolve( '/private/excess.txt' ) );
+		await waitFor( () =>
+			expect( connector.discardClaudeChatFile ).toHaveBeenCalledExactlyOnceWith(
+				'claude-matrix',
+				'/private/excess.txt'
+			)
+		);
+		expect( screen.queryByText( 'excess.txt' ) ).not.toBeInTheDocument();
+		fireEvent.click( screen.getByRole( 'button', { name: 'Dismiss' } ) );
+	} );
+
+	it( 'holds an image without verified vision and checks it again when its queue dispatches', async () => {
+		const { connector, queryClient } = await startTurn();
+		fireEvent.change( screen.getByLabelText( 'Upload attachments' ), {
+			target: { files: [ new File( [ 'img' ], 'header.png', { type: 'image/png' } ) ] },
+		} );
+		await screen.findByText(
+			'Choose a model that supports images before sending these attachments'
+		);
+		const input = edit( 'Check this image' );
+		fireEvent.keyDown( input, { key: 'Enter' } );
+		expect( screen.queryByRole( 'list', { name: 'Queued messages' } ) ).not.toBeInTheDocument();
+		const option = { id: 'model-a', displayName: 'Model A', efforts: [ 'medium' as const ] };
+		connector.getClaudeModelCatalog.mockResolvedValue( {
+			ok: true,
+			models: [ { ...option, imageInput: true } ],
+		} );
+		await act( async () => {
+			await queryClient.invalidateQueries( { queryKey: [ 'claude-models' ] } );
+		} );
+		await waitFor( () =>
+			expect( screen.getByRole( 'button', { name: 'Queue message' } ) ).not.toHaveAttribute(
+				'aria-disabled',
+				'true'
+			)
+		);
+		fireEvent.keyDown( input, { key: 'Enter' } );
+		await screen.findByRole( 'list', { name: 'Queued messages' } );
+		connector.getClaudeModelCatalog.mockResolvedValue( { ok: true, models: [ option ] } );
+		finishTurn( connector );
+		await screen.findByText( 'This queued message needs review. Edit it to send again.' );
+		expect( connector.continueSession ).toHaveBeenCalledTimes( 1 );
+	} );
+
+	it( 'restores queued preview notes for editing with their original local target', async () => {
+		const { connector } = await startTurn();
+		act( () => {
+			const id = pickAnnotation( 'one', { tag: 'h1', selector: 'h1', path: '/' } )!;
+			changeAnnotation( 'one', id, { comment: 'Shorter heading' } );
+			requestAnnotationSend( { siteId: 'one', noteIds: [ id ] } );
+		} );
+		const editMessage = await screen.findByRole( 'button', { name: 'Edit queued message' } );
+		await waitFor( () => expect( getSiteAnnotations( 'one' ).notes ).toHaveLength( 0 ) );
+		fireEvent.click( editMessage );
+		expect( getSiteAnnotations( 'one' ).notes ).toEqual( [
+			expect.objectContaining( { selector: 'h1', comment: 'Shorter heading', staged: true } ),
+		] );
+		finishTurn( connector );
+		const input = edit( 'Keep this brief' );
+		await waitFor( () =>
+			expect( screen.getByRole( 'button', { name: 'Send message' } ) ).not.toHaveAttribute(
+				'aria-disabled',
+				'true'
+			)
+		);
+		fireEvent.keyDown( input, { key: 'Enter' } );
+		await waitFor( () =>
+			expect( connector.continueSession ).toHaveBeenCalledWith(
+				'claude-matrix',
+				expect.stringContaining( 'Shorter heading' ),
+				expect.objectContaining( {
+					displayMessage: 'Keep this brief',
+					visualAnnotations: expect.arrayContaining( [
+						expect.objectContaining( { comment: 'Shorter heading', tag: 'h1' } ),
+					] ),
+				} )
+			)
+		);
+	} );
+
+	it.each( [ 'unchanged', 'account changed', 'target changed' ] )(
+		'rechecks the connection and target before dispatch (%s)',
+		async ( condition ) => {
+			const { connector, session } = await startTurn();
+			fireEvent.keyDown( edit( 'Queued turn' ), { key: 'Enter' } );
+			await screen.findByRole( 'list', { name: 'Queued messages' } );
+			if ( condition === 'account changed' )
+				connector.getClaudeRuntimeState.mockResolvedValue( {
+					enabled: true,
+					connections: [
+						{ id: 'c1', executablePath: '/claude', blockers: [], findings: [], revision: 2 },
+					],
+				} );
+			if ( condition === 'target changed' ) {
+				connector.getSession.mockResolvedValue( {
+					...session,
+					entries: [
+						...session.entries,
+						{
+							id: 'site',
+							type: 'custom',
+							customType: 'studio.site_selected',
+							parentId: null,
+							timestamp: new Date().toISOString(),
+							data: { siteId: 'one', remote: true, wpcomSiteId: 22 },
+						},
+					],
+				} );
+			}
+			finishTurn( connector );
+			if ( condition !== 'unchanged' ) {
+				await screen.findByText( 'This queued message needs review. Edit it to send again.' );
+				expect( connector.continueSession ).toHaveBeenCalledTimes( 1 );
+				fireEvent.click( screen.getByRole( 'button', { name: 'Edit queued message' } ) );
+				expect( screen.getByRole( 'combobox', { name: 'Message Claude' } ) ).toHaveValue(
+					'Queued turn'
+				);
+			} else {
+				await waitFor( () =>
+					expect( connector.continueSession ).toHaveBeenCalledWith(
+						'claude-matrix',
+						'Queued turn',
+						expect.objectContaining( {
+							claudeSelection: { model: 'model-a', effort: 'medium' },
+							claudeContext: {
+								connectionId: 'c1',
+								revision: 1,
+								target: { environment: 'local', siteId: 'one' },
+							},
+						} )
+					)
+				);
+			}
+		}
+	);
 } );
 
 describe( 'Claude questions', () => {
@@ -308,7 +725,7 @@ describe( 'Claude questions', () => {
 		connector.getActiveAgentRuns.mockReturnValueOnce( snapshot.promise );
 		act( () => connector.emit( 'onConnectionRestored' ) );
 		fireEvent.click( screen.getByRole( 'checkbox', { name: 'News' } ) );
-		fireEvent.click( screen.getByRole( 'button', { name: 'Stop' } ) );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Stop response' } ) );
 		await waitFor( () =>
 			expect( connector.interruptAgentRun ).toHaveBeenCalledExactlyOnceWith( request.runId )
 		);
@@ -323,7 +740,7 @@ describe( 'Claude questions', () => {
 		connector.getActiveAgentRuns.mockResolvedValue( [] );
 		await act( async () => connector.emit( 'onConnectionRestored' ) );
 		await waitFor( () =>
-			expect( screen.queryByRole( 'button', { name: 'Stop' } ) ).not.toBeInTheDocument()
+			expect( screen.queryByRole( 'button', { name: 'Stop response' } ) ).not.toBeInTheDocument()
 		);
 		act( () => emit( request ) );
 		expect( screen.getByRole( 'checkbox', { name: 'News' } ) ).toBeDisabled();
@@ -405,12 +822,15 @@ describe( 'Claude questions', () => {
 describe( 'Claude selection and approval recovery', () => {
 	it( 'requires a supported effort when changing to an incompatible model', async () => {
 		const { connector } = await setupSession();
-		fireEvent.change( screen.getByRole( 'textbox', { name: 'Message Claude' } ), {
+		fireEvent.change( screen.getByRole( 'combobox', { name: 'Message Claude' } ), {
 			target: { value: 'Inspect the site' },
 		} );
 		await choose( 'Claude model', 'Model B' );
 		expect( screen.getByText( 'Choose an effort for the selected model.' ) ).toBeVisible();
-		expect( screen.getByRole( 'button', { name: 'Send' } ) ).toBeDisabled();
+		expect( screen.getByRole( 'button', { name: 'Send message' } ) ).toHaveAttribute(
+			'aria-disabled',
+			'true'
+		);
 		expect( connector.setClaudeSessionSelection ).not.toHaveBeenCalled();
 		fireEvent.click( screen.getByRole( 'combobox', { name: 'Claude effort' } ) );
 		const maximum = await screen.findByRole( 'option', { name: 'max' } );
@@ -423,16 +843,22 @@ describe( 'Claude selection and approval recovery', () => {
 				{ model: 'model-b', effort: 'max' }
 			)
 		);
-		expect( screen.getByRole( 'button', { name: 'Send' } ) ).toBeEnabled();
+		expect( screen.getByRole( 'button', { name: 'Send message' } ) ).not.toHaveAttribute(
+			'aria-disabled',
+			'true'
+		);
 		expect( screen.queryByRole( 'spinbutton' ) ).not.toBeInTheDocument();
 	} );
 
 	it( 'holds a saved unsupported effort until the user explicitly chooses a supported one', async () => {
 		const { connector } = await setupSession( { model: 'model-a', effort: 'max' } );
-		fireEvent.change( screen.getByRole( 'textbox', { name: 'Message Claude' } ), {
+		fireEvent.change( screen.getByRole( 'combobox', { name: 'Message Claude' } ), {
 			target: { value: 'Inspect the site' },
 		} );
-		expect( screen.getByRole( 'button', { name: 'Send' } ) ).toBeDisabled();
+		expect( screen.getByRole( 'button', { name: 'Send message' } ) ).toHaveAttribute(
+			'aria-disabled',
+			'true'
+		);
 		expect( connector.setClaudeSessionSelection ).not.toHaveBeenCalled();
 		await choose( 'Claude effort', 'high' );
 		await waitFor( () =>
@@ -441,7 +867,10 @@ describe( 'Claude selection and approval recovery', () => {
 				effort: 'high',
 			} )
 		);
-		expect( screen.getByRole( 'button', { name: 'Send' } ) ).toBeEnabled();
+		expect( screen.getByRole( 'button', { name: 'Send message' } ) ).not.toHaveAttribute(
+			'aria-disabled',
+			'true'
+		);
 	} );
 
 	it.each( [ 'model', 'effort' ] )(
@@ -454,7 +883,7 @@ describe( 'Claude selection and approval recovery', () => {
 			} else await choose( 'Claude effort', 'high' );
 			await waitFor( () => expect( connector.setClaudeSessionSelection ).toHaveBeenCalledOnce() );
 			connector.setClaudeSessionSelection.mockClear();
-			fireEvent.change( screen.getByRole( 'textbox', { name: 'Message Claude' } ), {
+			fireEvent.change( screen.getByRole( 'combobox', { name: 'Message Claude' } ), {
 				target: { value: 'Hold this until I choose again' },
 			} );
 			fireEvent.click( screen.getByRole( 'combobox', { name: `Claude ${ field }` } ) );
@@ -467,8 +896,11 @@ describe( 'Claude selection and approval recovery', () => {
 				await queryClient.invalidateQueries( { queryKey: [ 'claude-models' ] } );
 			} );
 			expect( connector.setClaudeSessionSelection ).not.toHaveBeenCalled();
-			expect( screen.getByRole( 'button', { name: 'Send' } ) ).toBeDisabled();
-			expect( screen.getByRole( 'textbox', { name: 'Message Claude' } ) ).toHaveValue(
+			expect( screen.getByRole( 'button', { name: 'Send message' } ) ).toHaveAttribute(
+				'aria-disabled',
+				'true'
+			);
+			expect( screen.getByRole( 'combobox', { name: 'Message Claude' } ) ).toHaveValue(
 				'Hold this until I choose again'
 			);
 			expect( connector.continueSession ).not.toHaveBeenCalled();
@@ -479,14 +911,17 @@ describe( 'Claude selection and approval recovery', () => {
 		'holds the prompt when rechecking the runtime reports %s',
 		async ( blocker ) => {
 			const { connector, queryClient } = await setupSession();
-			const prompt = screen.getByRole( 'textbox', { name: 'Message Claude' } );
+			const prompt = screen.getByRole( 'combobox', { name: 'Message Claude' } );
 			fireEvent.change( prompt, { target: { value: 'Private unsent prompt' } } );
 			connector.getClaudeModelCatalog.mockResolvedValue( { ok: false, blockers: [ blocker ] } );
 			await act( async () => {
 				await queryClient.invalidateQueries( { queryKey: [ 'claude-models' ] } );
 			} );
-			expect( await screen.findByText( new RegExp( blocker ) ) ).toBeVisible();
-			expect( screen.getByRole( 'button', { name: 'Send' } ) ).toBeDisabled();
+			expect( await screen.findByText( describeClaudeIssue( blocker ) ) ).toBeVisible();
+			expect( screen.getByRole( 'button', { name: 'Send message' } ) ).toHaveAttribute(
+				'aria-disabled',
+				'true'
+			);
 			expect( prompt ).toHaveValue( 'Private unsent prompt' );
 			expect( connector.setSessionProvider ).not.toHaveBeenCalled();
 			expect( connector.continueSession ).not.toHaveBeenCalled();
@@ -495,7 +930,7 @@ describe( 'Claude selection and approval recovery', () => {
 
 	it( 'holds the prompt after a failed catalog refresh instead of using stale capabilities', async () => {
 		const { connector, queryClient } = await setupSession();
-		fireEvent.change( screen.getByRole( 'textbox', { name: 'Message Claude' } ), {
+		fireEvent.change( screen.getByRole( 'combobox', { name: 'Message Claude' } ), {
 			target: { value: 'Private unsent prompt' },
 		} );
 		connector.getClaudeModelCatalog.mockRejectedValue( new Error( 'Runtime unavailable.' ) );
@@ -505,7 +940,10 @@ describe( 'Claude selection and approval recovery', () => {
 		expect(
 			await screen.findByText( 'Claude Code model capabilities could not be checked.' )
 		).toBeVisible();
-		expect( screen.getByRole( 'button', { name: 'Send' } ) ).toBeDisabled();
+		expect( screen.getByRole( 'button', { name: 'Send message' } ) ).toHaveAttribute(
+			'aria-disabled',
+			'true'
+		);
 		expect( connector.continueSession ).not.toHaveBeenCalled();
 	} );
 
@@ -513,7 +951,7 @@ describe( 'Claude selection and approval recovery', () => {
 		'holds the prompt when the selected connection becomes %s',
 		async ( condition ) => {
 			const { connector, queryClient } = await setupSession();
-			const prompt = screen.getByRole( 'textbox', { name: 'Message Claude' } );
+			const prompt = screen.getByRole( 'combobox', { name: 'Message Claude' } );
 			fireEvent.change( prompt, { target: { value: 'Keep this prompt' } } );
 			if ( condition === 'unreachable' )
 				connector.getClaudeRuntimeState.mockRejectedValue( new Error( 'Offline' ) );
@@ -538,7 +976,10 @@ describe( 'Claude selection and approval recovery', () => {
 			expect(
 				await screen.findByText( 'Claude Code is unavailable. Recheck its status in Settings.' )
 			).toBeVisible();
-			expect( screen.getByRole( 'button', { name: 'Send' } ) ).toBeDisabled();
+			expect( screen.getByRole( 'button', { name: 'Send message' } ) ).toHaveAttribute(
+				'aria-disabled',
+				'true'
+			);
 			expect( prompt ).toHaveValue( 'Keep this prompt' );
 			expect( connector.continueSession ).not.toHaveBeenCalled();
 		}
@@ -571,10 +1012,10 @@ describe( 'Claude selection and approval recovery', () => {
 			await refresh;
 		} );
 		expect( screen.getByRole( 'combobox', { name: 'Claude effort' } ) ).toHaveTextContent( 'low' );
-		fireEvent.change( screen.getByRole( 'textbox', { name: 'Message Claude' } ), {
+		fireEvent.change( screen.getByRole( 'combobox', { name: 'Message Claude' } ), {
 			target: { value: 'Use the saved choice' },
 		} );
-		fireEvent.click( screen.getByRole( 'button', { name: 'Send' } ) );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Send message' } ) );
 		await waitFor( () =>
 			expect( connector.continueSession ).toHaveBeenCalledWith(
 				'claude-matrix',
@@ -589,9 +1030,9 @@ describe( 'Claude selection and approval recovery', () => {
 		const save = deferred< void >();
 		connector.setClaudeSessionSelection.mockImplementationOnce( () => save.promise );
 		await choose( 'Claude effort', 'high' );
-		const prompt = screen.getByRole( 'textbox', { name: 'Message Claude' } );
+		const prompt = screen.getByRole( 'combobox', { name: 'Message Claude' } );
 		fireEvent.change( prompt, { target: { value: 'Do not send with the old effort' } } );
-		fireEvent.click( screen.getByRole( 'button', { name: 'Send' } ) );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Send message' } ) );
 		await act( async () => save.reject( new Error( 'Latest save failed.' ) ) );
 		await waitFor( () => expect( prompt ).toHaveValue( 'Do not send with the old effort' ) );
 		expect( screen.getByRole( 'combobox', { name: 'Claude effort' } ) ).toHaveTextContent(
@@ -602,9 +1043,9 @@ describe( 'Claude selection and approval recovery', () => {
 
 	it( 'holds setting changes during an active tool and uses them only for the next turn', async () => {
 		const { connector, emit } = await setupSession();
-		const prompt = screen.getByRole( 'textbox', { name: 'Message Claude' } );
+		const prompt = screen.getByRole( 'combobox', { name: 'Message Claude' } );
 		fireEvent.change( prompt, { target: { value: 'First turn' } } );
-		fireEvent.click( screen.getByRole( 'button', { name: 'Send' } ) );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Send message' } ) );
 		await waitFor( () => expect( connector.continueSession ).toHaveBeenCalledOnce() );
 		act( () =>
 			emit( {
@@ -641,7 +1082,7 @@ describe( 'Claude selection and approval recovery', () => {
 			} )
 		);
 		fireEvent.change( prompt, { target: { value: 'Second turn' } } );
-		fireEvent.click( screen.getByRole( 'button', { name: 'Send' } ) );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Send message' } ) );
 		await waitFor( () =>
 			expect( connector.continueSession ).toHaveBeenLastCalledWith(
 				'claude-matrix',
@@ -1158,7 +1599,7 @@ describe( 'what a Claude approval card shows', () => {
 		expect(
 			await screen.findByText( 'Claude Code is unavailable. Recheck its status in Settings.' )
 		).toBeVisible();
-		expect( await screen.findByRole( 'button', { name: 'Stop' } ) ).toBeVisible();
+		expect( await screen.findByRole( 'button', { name: 'Stop response' } ) ).toBeVisible();
 		expect( screen.queryByRole( 'button', { name: 'Allow' } ) ).not.toBeInTheDocument();
 	} );
 
@@ -1213,7 +1654,7 @@ describe( 'what a Claude approval card shows', () => {
 		const { connector, emit } = await setupSession( undefined, {
 			getSites: async () => [ makeSite( { id: 'one', name: 'موقع\u202e' } ) ],
 		} );
-		const composer = screen.getByRole( 'textbox', { name: 'Message Claude' } );
+		const composer = screen.getByRole( 'combobox', { name: 'Message Claude' } );
 		composer.focus();
 		act( () => {
 			connector.emit( 'onAgentEvent', {

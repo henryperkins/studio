@@ -584,6 +584,13 @@ export function createIpcConnector(): Connector {
 		configureClaudeRuntime: ( action ) => unwrapIpcError( ipcApi.configureClaudeRuntime( action ) ),
 		getClaudeModelCatalog: ( connectionId, siteId ) =>
 			ipcApi.getClaudeModelCatalog( connectionId, siteId ),
+		setClaudeSessionTarget: ( id, expected, target ) =>
+			unwrapIpcError( ipcApi.setClaudeSessionTarget( id, expected, target ) ),
+		discardClaudeChatFile: ( sessionId, path ) =>
+			unwrapIpcError( ipcApi.discardClaudeChatFile( sessionId, path ) ),
+		stageClaudeChatFile: ( sessionId, file ) =>
+			unwrapIpcError( ipcApi.stageClaudeChatFile( sessionId, file ) ),
+		recoverClaudeSession: ( sessionId ) => ipcApi.recoverClaudeSession( sessionId ),
 		createClaudeSession: ( request ) => unwrapIpcError( ipcApi.createClaudeSession( request ) ),
 		setClaudeSessionSelection: ( sessionId, selection ) =>
 			unwrapIpcError( ipcApi.setClaudeSessionSelection( sessionId, selection ) ),

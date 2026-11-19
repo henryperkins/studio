@@ -2,6 +2,9 @@ import { randomUUID } from 'crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk/core';
 import { z } from 'zod';
+import { stripMediaWidgetPayloadLines } from '@studio/agent/protocol/chat-artifacts';
+import { escapeClaudeApprovalText } from '@studio/agent/protocol/claude-code';
+import { getToolResultImageService } from '@studio/agent/protocol/image-service';
 import { resolveStudioToolDefinitions } from '../tools';
 import { createAskUserQuestionTool } from '../tools/ask-user-question';
 import { bindTool } from '../tools/define-tool';
@@ -41,6 +44,7 @@ type Present = (
 ) => Promise< Record< string, string > >;
 
 export interface ClaudeStudioToolCapabilities {
+	toolResultImages?: boolean;
 	bundled?: boolean;
 	onAskUser?: Present;
 	designPreviews?: boolean;
@@ -69,7 +73,8 @@ export function claudeStudioToolCandidates(
 			  } );
 	return [
 		...resolveStudioToolDefinitions( host, {
-			visionEnabled: true,
+			visionEnabled: capabilities.toolResultImages === true,
+			toolImagesUnavailable: capabilities.toolResultImages !== true,
 			wpcomRequest: true,
 			imageGeneration,
 			canAskUser,
@@ -285,32 +290,50 @@ export function createStudioClaudeToolBridge(
 		}
 		const refused = policy.takeRefusals( toolCallId );
 		if ( run?.status !== 'completed' ) {
-			onEvent( { type: 'tool.result', runId, turnId, toolCallId, isError: true } );
+			const message = describeNotRun( name, run, refused );
+			onEvent( { type: 'tool.result', runId, turnId, toolCallId, isError: true, message } );
 			return {
 				isError: true,
-				content: [ { type: 'text', text: describeNotRun( name, run, refused ) } ],
+				content: [ { type: 'text', text: message } ],
 			};
 		}
+		const content = run.result.content
+			.filter( ( part ) => part.type !== 'image' || options.toolResultImages === true )
+			.map( ( part ) =>
+				part.type === 'text' ? { ...part, text: claudeResultText( name, args, part.text ) } : part
+			);
+		if ( content.length !== run.result.content.length )
+			content.push( {
+				type: 'text',
+				text: 'This model has no verified support for images in tool results.',
+			} );
+		if ( refused.length )
+			content.push( { type: 'text', text: `Studio note: ${ refused.join( ' ' ) }` } );
+		const skillName =
+			name === 'Skill' && isRecord( args ) && typeof args.name === 'string' ? args.name : undefined;
+		// The transcript receives printable Studio tool output. The MCP envelope, model images
+		// and service account stay with their owning channel.
+		const message = skillName
+			? undefined
+			: stripMediaWidgetPayloadLines(
+					content
+						.filter( ( part ) => part.type === 'text' )
+						.map( ( part ) => part.text )
+						.join( '\n' )
+			  );
 		onEvent( {
 			type: 'tool.result',
 			runId,
 			turnId,
 			toolCallId,
 			isError: false,
-			// Only a successful Skill call has passed the installed catalog's enum.
-			...( name === 'Skill' && isRecord( args ) && typeof args.name === 'string'
-				? { skillName: args.name }
+			...( message ? { message: escapeClaudeApprovalText( message ) } : {} ),
+			...( skillName ? { skillName } : {} ),
+			...( run.result.studioService
+				? { imageService: getToolResultImageService( run.result ) }
 				: {} ),
 		} );
-		const content = run.result.content.map( ( part ) =>
-			part.type === 'text' ? { ...part, text: claudeResultText( name, args, part.text ) } : part
-		);
-		return {
-			isError: false,
-			content: refused.length
-				? [ ...content, { type: 'text', text: `Studio note: ${ refused.join( ' ' ) }` } ]
-				: content,
-		};
+		return { isError: false, content };
 	}
 	// `signal` is the MCP call's own: the SDK aborts it when the native runtime
 	// gives up on the call, which cancels its approval and anything not yet started.

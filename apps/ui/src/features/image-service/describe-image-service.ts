@@ -6,7 +6,7 @@ import type {
 } from '@studio/agent/protocol/image-service';
 
 /** The subscription plan a chat's model runs on. Each says its own sentences, translated whole. */
-export type SubscriptionPlan = 'chatgpt';
+export type SubscriptionPlan = 'chatgpt' | 'claude';
 
 /** The account as Studio's account menu names it. */
 function formatImageServiceAccount( { displayName, email }: ImageServiceAccount ): string {
@@ -29,6 +29,24 @@ const SETTINGS_SENTENCES: Record<
 	SubscriptionPlan,
 	{ signedOut: () => string; token: () => string; account: ( account: string ) => string }
 > = {
+	claude: {
+		signedOut: () =>
+			__(
+				'Log in to WordPress.com to generate images in Claude chats. Image generation uses Studio’s separate WordPress.com service.'
+			),
+		token: () =>
+			__(
+				'Claude chats generate images with Studio’s separate WordPress.com image-service token.'
+			),
+		account: ( account ) =>
+			sprintf(
+				/* translators: %s is a WordPress.com account. */
+				__(
+					'Claude chats generate images with Studio’s separate WordPress.com image service as %s.'
+				),
+				account
+			),
+	},
 	chatgpt: {
 		signedOut: () =>
 			__(
@@ -67,6 +85,16 @@ const NOTE_SENTENCES: Record<
 	SubscriptionPlan,
 	{ off: () => string; token: () => string; account: ( account: string ) => string }
 > = {
+	claude: {
+		off: () => __( 'Log in to Studio’s WordPress.com image service to generate images.' ),
+		token: () => __( 'Images use Studio’s WordPress.com image-service token.' ),
+		account: ( account ) =>
+			sprintf(
+				/* translators: %s is the WordPress.com account used to generate images. */
+				__( 'Images use Studio’s WordPress.com image service as %s.' ),
+				account
+			),
+	},
 	chatgpt: {
 		off: () =>
 			__( 'Images: off. They need Studio’s WordPress.com image service, not your ChatGPT plan.' ),

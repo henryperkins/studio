@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { setSessionEnvironment } from '@studio/agent/node/sessions/manage';
+import { setSessionEnvironment, setClaudeSessionTarget } from '@studio/agent/node/sessions/manage';
 import { createAiSession, loadAiSession } from '@studio/agent/node/sessions/store';
 import { resolveClaudeSession } from '@studio/agent/protocol/claude-code';
 
@@ -90,6 +90,27 @@ describe( 'setSessionEnvironment', () => {
 		expect( resolveClaudeSession( loaded.entries ) ).toMatchObject( {
 			binding: options.claude.binding,
 			target: { environment: 'local', siteId: SITE.id },
+		} );
+	} );
+
+	it( 'returns a global chat from a chosen live site to Studio and refuses stale target choices', async () => {
+		const { id } = await createAiSession( root, { claude: claude( null ) } );
+		const initial = { environment: 'global' } as const;
+		const local = { environment: 'local', siteId: SITE.id } as const;
+		const live = { environment: 'live', siteId: SITE.id, wpcomSiteId: 7 } as const;
+		await setClaudeSessionTarget( root, id, initial, local );
+		await expect( setClaudeSessionTarget( root, id, initial, live ) ).rejects.toThrow( 'changed' );
+		await expect(
+			setClaudeSessionTarget( root, id, local, { ...live, wpcomSiteId: 1234 } )
+		).rejects.toThrow( 'no longer connected' );
+		await setClaudeSessionTarget( root, id, local, live );
+		let chat = await loadAiSession( root, id );
+		expect( resolveClaudeSession( chat.entries )?.target ).toEqual( live );
+		await setClaudeSessionTarget( root, id, live, initial );
+		chat = await loadAiSession( root, id );
+		expect( resolveClaudeSession( chat.entries ) ).toMatchObject( {
+			target: initial,
+			binding: claude( null ).binding,
 		} );
 	} );
 

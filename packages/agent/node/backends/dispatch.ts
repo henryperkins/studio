@@ -7,11 +7,16 @@ import type {
 	ClaudeBackendTurnSnapshot,
 	PiBackendTurnSnapshot,
 } from '@studio/agent/protocol/backend-events';
+import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
 import type { ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
+import type { StudioVisualAnnotationSummary } from '@studio/agent/protocol/visual-annotations';
 
 interface ClaudeBackendTurnInput {
 	prompt: string;
+	displayMessage?: string;
+	files?: StudioChatFileAttachment[];
+	visualAnnotations?: StudioVisualAnnotationSummary[];
 	images?: StudioChatImage[];
 	onEvent: ( event: BackendTurnEvent ) => void;
 }
@@ -83,7 +88,7 @@ function freezeClaudeTurn( snapshot: ClaudeBackendTurnSnapshot ): ClaudeBackendT
 
 function runClaudeBackendTurn(
 	selection: ClaudeBackendTurnSnapshot,
-	{ onEvent, prompt, images }: ClaudeBackendTurnHandlers,
+	{ onEvent, prompt, images, files, visualAnnotations, displayMessage }: ClaudeBackendTurnHandlers,
 	claudeCode: ClaudeCodeBackend | undefined
 ): BackendTurnHandle {
 	const snapshot = freezeClaudeTurn( selection );
@@ -126,7 +131,15 @@ function runClaudeBackendTurn(
 				terminal = { status: 'error', message: 'Claude Code is unavailable.' };
 			} else {
 				try {
-					await claudeCode( snapshot, { prompt, images, signal, onEvent: receiveEvent } );
+					await claudeCode( snapshot, {
+						prompt,
+						images,
+						files,
+						visualAnnotations,
+						displayMessage,
+						signal,
+						onEvent: receiveEvent,
+					} );
 				} catch {
 					if ( ! signal.aborted ) {
 						terminal ??= { status: 'error', message: 'Claude Code could not complete the turn.' };

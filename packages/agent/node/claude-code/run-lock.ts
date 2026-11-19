@@ -60,6 +60,7 @@ export type ClaudeLockInspection =
 	| { state: 'none' }
 	| { state: 'legacy' }
 	| { state: 'held' }
+	| { state: 'changing-target' }
 	| { state: 'unreadable' }
 	| { state: 'run'; record: ClaudeRunLockRecord; raw: string };
 
@@ -164,6 +165,7 @@ function inspectLockContent( raw: string ): ClaudeLockInspection {
 		! data.conversationId
 	)
 		return { state: 'unreadable' };
+	if ( data.purpose === 'target' ) return { state: 'changing-target' };
 	if ( data.purpose === 'delete' ) return { state: 'held' };
 	const record = runLockOf( data );
 	return record ? { state: 'run', record, raw } : { state: 'unreadable' };
@@ -294,7 +296,7 @@ export function createRunLocks( root: string, lockPath: ( conversationId: string
 			);
 		},
 		/** Holds the conversation for something other than a turn, such as its deletion. */
-		async lockTurn( conversationId: string ) {
+		async lockTurn( conversationId: string, purpose: 'delete' | 'target' = 'delete' ) {
 			await mkdir( root, { recursive: true } );
 			const lock = lockPath( conversationId );
 			const token = randomUUID();
@@ -302,7 +304,7 @@ export function createRunLocks( root: string, lockPath: ( conversationId: string
 				lock,
 				JSON.stringify( {
 					version: 2,
-					purpose: 'delete',
+					purpose,
 					token,
 					conversationId,
 					createdAt: new Date().toISOString(),

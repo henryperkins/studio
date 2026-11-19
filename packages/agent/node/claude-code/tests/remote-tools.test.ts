@@ -6,6 +6,7 @@ import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected
 import { getCurrentUserId, readAuthToken } from '@studio/common/lib/shared-config';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fakeRemoteSite, fakePreview } from '../../tests/fake-host';
+import { CLAUDE_APPROVAL_TIMEOUT_MS } from '../execution-rules';
 import { createStudioClaudeToolBridge } from '../tool-bridge';
 import { createPolicyFixture } from './fixtures/execution-policy';
 import type { ClaudeExecutionContext } from '../execution-policy';
@@ -1841,7 +1842,11 @@ describe( 'wpcom_request on the Claude route', () => {
 		} );
 
 		it( 'are checked again once the user has answered, so a link planted while the user reads the approval sends nothing', async () => {
-			const { context, bridge, site } = await setup( live );
+			const { context, bridge, site } = await setup( () => ( {
+				...live(),
+				// The simulated answer waits for real filesystem operations before it grants approval.
+				approvalTimeoutMs: CLAUDE_APPROVAL_TIMEOUT_MS,
+			} ) );
 			const staged = path.join( payloads(), 'staged' );
 			await mkdir( staged, { recursive: true } );
 			await writeFile( path.join( staged, 'page.html' ), '<p>Staged</p>' );

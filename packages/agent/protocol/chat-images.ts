@@ -1,5 +1,5 @@
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
-import type { ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
+import type { ClaudeSendContext, ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
 import type { StudioVisualAnnotationSummary } from '@studio/agent/protocol/visual-annotations';
 
 // Image types the model accepts as multimodal content blocks (matches the
@@ -28,6 +28,7 @@ export interface StudioChatImage extends StudioChatImageAttachment {
 
 export interface StudioAiSessionInputPayload {
 	runId?: string;
+	claudeContext?: ClaudeSendContext;
 	claudeSelection?: ClaudeSessionSelection;
 	turnId?: string;
 	prompt: string;

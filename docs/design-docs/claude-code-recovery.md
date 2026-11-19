@@ -17,6 +17,7 @@ When Studio cannot prove that the turn has ended, it changes nothing and says wh
 Wait first for the reasons that can resolve on their own, then try `recover` again:
 
 - `owner-alive`, `native-alive`, `guardian-alive`, `descendants-alive`: a process of the last turn is still running. Wait for the turn to end, or quit the Studio app that ran it.
+- `target-change-in-progress`: wait for Studio to finish changing the target. If the app quit during the change, use the manual recovery procedure below.
 - `recovery-in-progress`: another Studio app is recovering the chat, or may be.
 - `deletion-pending`, `lock-not-a-run`: Studio is deleting the chat, or was.
 - `owner-unverifiable`, `native-unverifiable`, `guardian-unverifiable`, `descendants-unverifiable`, `lock-unreadable`, `recovery-failed`, `journal-unreadable`: Studio could not read something it needs. This is often momentary.

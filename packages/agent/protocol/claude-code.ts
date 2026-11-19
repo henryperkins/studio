@@ -114,6 +114,7 @@ export const CLAUDE_RECOVERY_BLOCKED_REASONS = [
 	'lock-unreadable',
 	/** The lock is held for something other than a turn, such as a deletion. */
 	'lock-not-a-run',
+	'target-change-in-progress',
 	/** The lock names another conversation. */
 	'lock-other-conversation',
 	/** The lock was written on another operating system. */
@@ -275,6 +276,8 @@ export function getClaudeRecoveryBlockedMessage( reason: ClaudeRecoveryBlockedRe
 			return retryThenByHand(
 				__( 'Studio could not read the lock on this chat, or does not recognize it.' )
 			);
+		case 'target-change-in-progress':
+			return retryThenByHand( __( 'Studio is changing the site this chat works on.' ) );
 		case 'lock-not-a-run':
 			return sprintf(
 				/* translators: %s: a documentation file in the Studio repository. */
@@ -370,6 +373,38 @@ export function getClaudeRecoveryBlockedMessage( reason: ClaudeRecoveryBlockedRe
 	}
 }
 
+export interface ClaudeSendContext {
+	connectionId: string;
+	revision?: number;
+	target: ClaudeStudioTarget;
+}
+
+type ClaudeBoundTarget = { binding: { connectionId: string }; target: ClaudeStudioTarget };
+
+export function matchesClaudeSendContext(
+	context: ClaudeBoundTarget,
+	expected: ClaudeSendContext
+): boolean {
+	return (
+		context.binding.connectionId === expected.connectionId &&
+		isSameClaudeTarget( context.target, expected.target )
+	);
+}
+
+export function assertClaudeSendContext(
+	expected: ClaudeSendContext | undefined,
+	context: ClaudeBoundTarget
+): void {
+	if (
+		expected !== undefined &&
+		( ! expected?.target || ! matchesClaudeSendContext( context, expected ) )
+	) {
+		throw new Error(
+			__( 'The account or site for this message changed. Review the target and send it again.' )
+		);
+	}
+}
+
 export function isSameClaudeTarget( a: ClaudeStudioTarget, b: ClaudeStudioTarget ): boolean {
 	if ( a.environment === 'global' || b.environment === 'global' )
 		return a.environment === b.environment;
@@ -387,6 +422,7 @@ export function isClaudeTargetAllowed(
 	workspaceSiteId: string | null,
 	target: ClaudeStudioTarget
 ): boolean {
+	if ( ! target || ! [ 'global', 'local', 'live' ].includes( target.environment ) ) return false;
 	if ( target.environment !== 'global' ) {
 		if ( typeof target.siteId !== 'string' || ! target.siteId ) return false;
 		if (
@@ -413,11 +449,17 @@ export function resolveClaudeTarget(
 ): ClaudeStudioTarget {
 	let data: StudioSiteSelectedData | undefined;
 	let selected = false;
-	for ( const item of entries )
+	for ( const item of entries ) {
+		if ( isStudioCustomEntryOfType( item, 'studio.claude_target_cleared' ) ) {
+			if ( binding.siteId !== null ) throw new Error( 'Invalid Claude Code target.' );
+			selected = false;
+			data = undefined;
+		}
 		if ( isStudioCustomEntryOfType( item, 'studio.site_selected' ) ) {
 			selected = true;
 			data = item.data;
 		}
+	}
 	let target: ClaudeStudioTarget;
 	if ( ! selected ) {
 		target =
@@ -441,9 +483,11 @@ export interface ClaudeRuntimeState {
 	enabled: boolean;
 	connections: Array< {
 		id: string;
+		revision?: number;
 		executablePath: string;
 		configDirectory?: string;
 		version?: string;
+		supportedVersions?: string[];
 		authMethod?: string;
 		blockers: string[];
 		findings: string[];
@@ -455,6 +499,8 @@ export type ClaudeRuntimeAction =
 	| { type: 'sign-in' | 'disconnect'; connectionId: string };
 
 export interface ClaudeModelOption {
+	imageInput?: boolean;
+	toolResultImages?: boolean;
 	id: string;
 	displayName: string;
 	efforts: ClaudeEffort[];

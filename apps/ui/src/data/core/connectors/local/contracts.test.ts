@@ -15,6 +15,53 @@ describe( 'createLocalConnector server contracts', () => {
 		vi.unstubAllGlobals();
 	} );
 
+	it( 'streams only the picked File to its conversation-specific upload', async () => {
+		const local = connector();
+		const file = new File( [ 'notes' ], 'large notes.txt' );
+		fetchMock.mockResolvedValueOnce(
+			new Response( JSON.stringify( { path: '/studio/session/file.txt' } ) )
+		);
+		await expect( local.stageClaudeChatFile( 'chat one', file ) ).resolves.toBe(
+			'/studio/session/file.txt'
+		);
+		expect( fetchMock ).toHaveBeenCalledWith(
+			'http://localhost:8081/api/sessions/chat%20one/claude-attachments?name=large+notes.txt&size=5',
+			expect.objectContaining( {
+				method: 'POST',
+				body: file,
+				headers: expect.objectContaining( { 'Content-Type': 'application/octet-stream' } ),
+			} )
+		);
+		fetchMock.mockResolvedValueOnce( new Response( null, { status: 204 } ) );
+		await local.discardClaudeChatFile( 'chat one', '/studio/session/file.txt' );
+		expect( fetchMock ).toHaveBeenLastCalledWith(
+			'http://localhost:8081/api/sessions/chat%20one/claude-attachments',
+			expect.objectContaining( {
+				method: 'DELETE',
+				body: JSON.stringify( { path: '/studio/session/file.txt' } ),
+			} )
+		);
+	} );
+
+	it( 'distinguishes global and site catalogs and recovers the requested Claude chat', async () => {
+		fetchMock.mockImplementation(
+			async () => new Response( JSON.stringify( { status: 'blocked', reason: 'owner-alive' } ) )
+		);
+		const local = connector();
+		await local.getClaudeModelCatalog( 'test account' );
+		await local.getClaudeModelCatalog( 'test account', 'local site' );
+		await expect( local.recoverClaudeSession( 'chat one' ) ).resolves.toEqual( {
+			status: 'blocked',
+			reason: 'owner-alive',
+		} );
+		expect( fetchMock.mock.calls.map( ( [ url ] ) => url ) ).toEqual( [
+			'http://localhost:8081/api/claude-code/test%20account/models',
+			'http://localhost:8081/api/claude-code/test%20account/models/local%20site',
+			'http://localhost:8081/api/sessions/chat%20one/claude-recovery',
+		] );
+		expect( fetchMock.mock.calls[ 2 ][ 1 ].method ).toBe( 'POST' );
+	} );
+
 	it( 'waits for the server to delete all previews and propagates failures', async () => {
 		fetchMock.mockResolvedValueOnce( new Response( null, { status: 204 } ) );
 		await expect( connector().deleteAllSnapshots() ).resolves.toBeUndefined();

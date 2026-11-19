@@ -6,7 +6,7 @@ import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected
 import { readSite } from '@studio/common/sites/site-path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { resolveClaudeSession } from '@studio/agent/protocol/claude-code';
-import { loadHydratedAiSession } from '../../sessions/manage';
+import { loadHydratedAiSession, listHydratedAiSessions } from '../../sessions/manage';
 import {
 	appendStudioEntry,
 	createAiSession,
@@ -38,7 +38,8 @@ vi.mock( '@studio/common/sites/site-path', () => ( { readSite: vi.fn() } ) );
 vi.mock( '@studio/common/lib/connected-sites', () => ( {
 	getConnectedWpcomSitesForLocalSite: vi.fn(),
 } ) );
-vi.mock( '../connection', () => ( {
+vi.mock( '../connection', async ( importOriginal ) => ( {
+	...( await importOriginal< typeof import('../connection') >() ),
 	getClaudeConnections: vi.fn(),
 	openClaudeNativeSignIn: vi.fn(),
 } ) );
@@ -191,6 +192,44 @@ it.runIf( surfaceTarget )(
 );
 
 it.runIf( surfaceTarget )(
+	'rechecks image capability before a host starts an image turn',
+	async () => {
+		const { root, config } = await createFixture();
+		const { id } = await createClaudeSession( root, request );
+		vi.mocked( getClaudeConnections ).mockResolvedValue( [
+			{ id: request.connectionId, executablePath: '/fixture', revision: 2 },
+		] );
+		const queued = {
+			connectionId: request.connectionId,
+			revision: 1,
+			target: { environment: 'local' as const, siteId: request.siteId },
+		};
+		await expect( validateClaudeSendSelection( root, id, selection, queued ) ).rejects.toThrow(
+			'connection changed'
+		);
+		await expect(
+			validateClaudeSendSelection( root, id, selection, undefined, true )
+		).rejects.toThrow( 'supports images' );
+		vi.mocked( discoverClaudeModels ).mockResolvedValueOnce( {
+			ok: true,
+			models: [
+				{
+					id: selection.model,
+					displayName: 'Model',
+					efforts: [ selection.effort ],
+					imageInput: true,
+				},
+			],
+			workingDirectory: config,
+			configDirectory: config,
+		} );
+		await expect(
+			validateClaudeSendSelection( root, id, selection, undefined, true )
+		).resolves.toEqual( selection );
+	}
+);
+
+it.runIf( surfaceTarget )(
 	'creates a global conversation in the dedicated global workspace',
 	async () => {
 		const { root, config } = await createFixture();
@@ -205,6 +244,22 @@ it.runIf( surfaceTarget )(
 		expect( discoverClaudeModels ).toHaveBeenCalledWith( 'connection', workspace );
 		expect( readSite ).not.toHaveBeenCalled();
 		expect( ( await stat( workspace ) ).isDirectory() ).toBe( true );
+		const journal = createNativeSessionStore( getClaudeSessionStoreRoot( root ) ).journal(
+			summary.id,
+			'turn-1'
+		);
+		await journal.append( {
+			type: 'turn.prompt',
+			runId: 'run',
+			turnId: 'turn-1',
+			text: 'Saved global prompt',
+		} );
+		await expect( listHydratedAiSessions( root ) ).resolves.toEqual( [
+			expect.objectContaining( { id: summary.id, firstPrompt: 'Saved global prompt' } ),
+		] );
+		expect( ( await loadHydratedAiSession( root, summary.id ) ).summary.firstPrompt ).toBe(
+			'Saved global prompt'
+		);
 		const { entries } = await loadAiSession( root, summary.id );
 		expect( resolveClaudeSession( entries ) ).toEqual( {
 			binding: {
@@ -224,6 +279,10 @@ it.runIf( surfaceTarget )(
 	async () => {
 		const { root, config } = await createFixture();
 		const summary = await createClaudeSession( root, request );
+		vi.mocked( readSite ).mockResolvedValueOnce( null );
+		await expect( validateClaudeSendSelection( root, summary.id, selection ) ).rejects.toThrow(
+			'local site this chat works on is unavailable'
+		);
 		const live = { siteName: 'Local site', sitePath: config, siteId: request.siteId };
 		await appendStudioEntry( root, summary.id, 'studio.site_selected', {
 			...live,
@@ -258,9 +317,28 @@ it.runIf( surfaceTarget )(
 			},
 			target: { environment: 'live', siteId: request.siteId, wpcomSiteId: 42 },
 		};
+		const expected = { connectionId: request.connectionId, target: turn.target };
+		await expect(
+			validateClaudeSendSelection( root, summary.id, selection, expected )
+		).resolves.toEqual( selection );
+		await expect(
+			validateClaudeSendSelection( root, summary.id, selection, {
+				...expected,
+				connectionId: 'changed',
+			} )
+		).rejects.toThrow( 'account or site' );
+		await expect(
+			validateClaudeSendSelection( root, summary.id, selection, {
+				...expected,
+				target: { environment: 'live', siteId: request.siteId, wpcomSiteId: 43 },
+			} )
+		).rejects.toThrow( 'account or site' );
 		await expect( verifyClaudeTurnSession( root, turn ) ).resolves.toBe( true );
 		await expect( verifyClaudeTurnTarget( root, turn, turn.target ) ).resolves.toBe( true );
 		await appendStudioEntry( root, summary.id, 'studio.site_selected', live );
+		await expect(
+			validateClaudeSendSelection( root, summary.id, selection, expected )
+		).rejects.toThrow( 'account or site' );
 		await expect( verifyClaudeTurnTarget( root, turn, turn.target ) ).resolves.toBe( false );
 		await expect( verifyClaudeTurnSession( root, turn ) ).resolves.toBe( false );
 		await expect(

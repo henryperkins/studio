@@ -1,69 +1,59 @@
 import {
-	getLocalMediaPath,
-	isRenderableMediaWidget,
-	isStudioChatArtifactData,
-	type StudioChatArtifactData,
-} from '@studio/agent/protocol/chat-artifacts';
-import {
 	resolveClaudeSession,
+	isSameClaudeTarget,
 	type ClaudeEffort,
 	type ClaudeSessionSelection,
 	type ClaudeStudioTarget,
 } from '@studio/agent/protocol/claude-code';
+import { findAiSessionOwnerSite } from '@studio/agent/protocol/sessions/owner-site';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { __ } from '@wordpress/i18n';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
+import { claudeDisplayEventKey } from '@/data/agent-runs/claude-journal-read';
 import { useAgentRun } from '@/data/agent-runs/use-agent-run';
+import { toast } from '@/data/app-messages';
 import { useConnector } from '@/data/core';
+import { describeClaudeIssue } from '@/data/queries/claude-runtime';
 import { useSites } from '@/data/queries/use-sites';
 import {
 	saveSessionSettingChange,
 	useEntriesWithSettingChanges,
 } from '@/data/session-setting-changes';
-import {
-	Button,
-	Select,
-	SelectContent,
-	SelectItem,
-	SelectTrigger,
-	SelectValue,
-	Textarea,
-} from '@/lib/ui';
+import { useOptionalSessionPreviewUI } from '@/data/use-session-ui';
+import { restoreStagedAnnotations } from '@/features/annotations';
+import { Composer, type ComposerHandle } from '@/features/composer';
+import { Button, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/lib/ui';
 import { ClaudeApprovalCard } from './claude-approval-card';
-import { claudeMediaPath } from './claude-media-path';
-import { ClaudeNewChat } from './claude-new-chat';
+import { ClaudeConnectionActions, ClaudeRecoveryAction } from './claude-conversation-actions';
 import { ClaudeQuestionBatch } from './claude-question-batch';
-import { ChatArtifact } from './conversation';
+import { ClaudeTargetControls, useClaudeTargetChange } from './claude-target-controls';
+import { ClaudeTranscriptEvent, projectClaudeTranscript } from './claude-transcript';
+import { QueuedPrompts } from './queued-prompts';
 import { SessionFrame } from './session-frame';
+import { SessionHeader } from './session-header';
 import styles from './style.module.css';
+import { useComposerPreviewActions } from './use-composer-preview-actions';
+import { useSessionCommands } from './use-session-commands';
+import type { QueuedPrompt, SendMessageOptions } from '@/data/agent-runs/store';
 import type { LoadedAiSession, SessionEntry } from '@/data/core';
 import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
+import type { ReactNode } from 'react';
 
-function screenshotWidgets( artifact: StudioChatArtifactData, sessionFile: string ) {
-	return artifact.widgets.flatMap( ( widget ) => {
-		const path = claudeMediaPath( sessionFile, getLocalMediaPath( widget ) );
-		if ( ! isRenderableMediaWidget( widget ) || ! path ) return [];
-		return [
-			{
-				...widget,
-				widgetProps: {
-					...widget.widgetProps,
-					source: {
-						type: 'local',
-						path,
-					},
-				},
-			},
-		];
-	} );
-}
-
-export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
+export function ClaudeSessionView( {
+	data,
+	headerStart,
+	hideHeader,
+}: {
+	data: LoadedAiSession;
+	headerStart?: ReactNode;
+	hideHeader?: boolean;
+} ) {
 	const sessionId = data.summary.id;
 	const connector = useConnector();
 	const client = useQueryClient();
 	const entries = useEntriesWithSettingChanges( sessionId, data.entries ) ?? [];
-	const [ prompt, setPrompt ] = useState( '' );
+	const composerRef = useRef< ComposerHandle >( null );
+	const [ frameNode, setFrameNode ] = useState< HTMLDivElement | null >( null );
 	const [ error, setError ] = useState( '' );
 	const [ pendingModel, setPendingModel ] = useState< string >();
 	const [ answered, setAnswered ] = useState< string[] >( [] );
@@ -75,13 +65,14 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 	} catch {
 		session = undefined;
 	}
-	// A global chat has no site; this view only offers site chats for now.
 	const workspaceSiteId = session?.binding.siteId ?? undefined;
+	const ownerSite = findAiSessionOwnerSite( sites.data, data.summary );
+	const changeTarget = useClaudeTargetChange( sessionId );
 	const catalog = useQuery( {
 		queryKey: [ 'claude-models', session?.binding.connectionId, workspaceSiteId ],
 		queryFn: () =>
-			connector.getClaudeModelCatalog( session!.binding.connectionId, workspaceSiteId! ),
-		enabled: !! session && !! workspaceSiteId,
+			connector.getClaudeModelCatalog( session!.binding.connectionId, workspaceSiteId ),
+		enabled: !! session,
 	} );
 	const state = useQuery( {
 		queryKey: [ 'claude-runtime' ],
@@ -100,7 +91,6 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 	const events = ( data.claudeJournal ?? [] ).flat();
 	const questionKey = ( event: { runId: string; turnId: string; requestId: string } ) =>
 		JSON.stringify( [ event.runId, event.turnId, event.requestId ] );
-	const asked = new Set< string >();
 	const liveQuestions = new Set( run.pendingClaudeQuestions.map( questionKey ) );
 	const resolutions = new Map<
 		string,
@@ -111,29 +101,11 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 		Extract< BackendTurnEvent, { type: 'turn.terminal' } >[ 'outcome' ][ 'status' ]
 	>();
 	const transcript = [ ...events, ...run.pendingClaudeQuestions ];
-	const content = new Map< string, { index: number; sequence: number } >();
-	const visible = new Set< number >();
-	for ( const [ index, event ] of transcript.entries() ) {
-		if ( event.type === 'question.asked' ) {
-			const key = questionKey( event );
-			if ( asked.has( key ) ) continue;
-			asked.add( key );
-		}
+	const { rows: visibleEvents, results, replies } = projectClaudeTranscript( transcript );
+	for ( const event of visibleEvents ) {
 		if ( event.type === 'question.resolved' ) resolutions.set( questionKey( event ), event );
 		if ( event.type === 'turn.terminal' ) terminal.set( event.runId, event.outcome.status );
-		if ( event.type !== 'content.provisional' && event.type !== 'content.confirmed' ) {
-			visible.add( index );
-			continue;
-		}
-		const key = JSON.stringify( [ event.runId, event.turnId, event.messageId, event.blockId ] );
-		const sequence = event.type === 'content.confirmed' ? Infinity : event.sequence;
-		const current = content.get( key );
-		if ( current && current.sequence >= sequence ) continue;
-		if ( current ) visible.delete( current.index );
-		visible.add( index );
-		content.set( key, { index, sequence } );
 	}
-	const visibleEvents = transcript.filter( ( _event, index ) => visible.has( index ) );
 	const pending = run.pendingClaudeApprovals.filter(
 		( event ) =>
 			state.data?.enabled &&
@@ -157,6 +129,63 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 		events.some(
 			( event ) => event.type === 'turn.terminal' && event.outcome.code === 'rebind_required'
 		);
+	const ready = !! (
+		available &&
+		! rebindRequired &&
+		! pendingModel &&
+		! changeTarget.isPending &&
+		selection &&
+		selectedModel?.efforts.includes( selection.effort )
+	);
+	const annotationSiteId =
+		session?.target.environment === 'local' ? session.target.siteId : undefined;
+	const { sendMessage } = run;
+	const send = async ( text: string, options?: SendMessageOptions ) => {
+		if ( ! ready || ! session )
+			throw new Error( __( 'Check the Claude connection, target and model before sending.' ) );
+		if ( options?.images?.length && selectedModel?.imageInput !== true ) {
+			const message = __( 'Choose a model that supports images before sending these attachments' );
+			toast.error( message );
+			throw new Error( message );
+		}
+		await sendMessage( text, {
+			...options,
+			claudeSelection: session.selection,
+			claudeContext: {
+				connectionId: session.binding.connectionId,
+				revision: connection?.revision ?? 1,
+				target: session.target,
+			},
+		} );
+	};
+	useComposerPreviewActions( composerRef, annotationSiteId, run.hasActiveRun, ready, send, true );
+	const visibleSiteId = useOptionalSessionPreviewUI()?.siteId;
+	const previewSiteId =
+		annotationSiteId && annotationSiteId === visibleSiteId ? annotationSiteId : null;
+	useSessionCommands( sessionId, previewSiteId );
+	const editQueued = ( item: QueuedPrompt ) => {
+		const notes = item.annotationDraft?.notes ?? [];
+		if ( notes.length ) {
+			const previous = item.claudeContext?.target;
+			if (
+				! annotationSiteId ||
+				previous?.environment !== 'local' ||
+				previous.siteId !== annotationSiteId
+			) {
+				toast.error( __( 'Switch back to the annotated local site to edit this message.' ) );
+				return;
+			}
+			if ( ! restoreStagedAnnotations( annotationSiteId, notes ) ) return;
+		}
+		const noteImages = new Set(
+			notes.flatMap( ( note ) => note.images.map( ( image ) => image.id ) )
+		);
+		composerRef.current?.replaceDraft( item.annotationDraft?.text ?? item.prompt, {
+			files: item.files,
+			images: item.images?.filter( ( image ) => ! noteImages.has( image.id ) ),
+		} );
+		run.removeQueuedPrompt( item.id );
+	};
 	const save = ( next: ClaudeSessionSelection ) => {
 		setPendingModel( undefined );
 		const entry = {
@@ -189,15 +218,37 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 	};
 	return (
 		<SessionFrame
+			rootRef={ setFrameNode }
 			session={ data.summary }
-			header={ <div className={ styles.header }>{ __( 'Claude Code Runtime' ) }</div> }
+			header={
+				hideHeader ? null : (
+					<SessionHeader
+						start={ headerStart }
+						site={ ownerSite }
+						siteName={ data.summary.ownerSiteName ?? __( 'Global chat' ) }
+					/>
+				)
+			}
 			composer={
-				<div className={ styles.column }>
+				<div className={ `${ styles.column } ${ styles.claudeComposer }` }>
 					{ session ? (
 						<>
 							<p>
-								{ __( 'Local workspace:' ) } { session.binding.workingDirectory }
+								{ workspaceSiteId ? __( 'Local workspace:' ) : __( 'Global workspace:' ) }{ ' ' }
+								{ session.binding.workingDirectory }
 							</p>
+							{ ! rebindRequired && (
+								<ClaudeTargetControls
+									workspaceSiteId={ workspaceSiteId }
+									target={ session.target }
+									sites={ sites.data ?? [] }
+									sitesPending={ sites.isPending }
+									disabled={ run.hasActiveRun || changeTarget.isPending }
+									onChange={ ( next ) =>
+										changeTarget.mutate( { expected: session.target, target: next } )
+									}
+								/>
+							) }
 							<Select
 								items={ models.map( ( item ) => ( { value: item.id, label: item.displayName } ) ) }
 								value={ pendingModel ?? selection?.model ?? null }
@@ -254,12 +305,19 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 								</SelectContent>
 							</Select>
 							{ catalog.data?.ok === false && (
-								<p role="alert">
-									{ __( 'Claude Code is unavailable.' ) } { catalog.data.blockers.join( ', ' ) }
-								</p>
+								<p role="alert">{ catalog.data.blockers.map( describeClaudeIssue ).join( ' ' ) }</p>
 							) }
 							{ catalog.isError && (
 								<p role="alert">{ __( 'Claude Code model capabilities could not be checked.' ) }</p>
+							) }
+							{ ( catalog.isError || catalog.data?.ok === false ) && (
+								<Button
+									variant="outline"
+									disabled={ catalog.isFetching }
+									onClick={ () => void catalog.refetch() }
+								>
+									{ __( 'Recheck models' ) }
+								</Button>
 							) }
 							{ state.isError ||
 							( state.isSuccess && ( ! connection || connection.blockers.length > 0 ) ) ? (
@@ -268,43 +326,26 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 								</p>
 							) : null }
 							{ pendingModel && <p>{ __( 'Choose an effort for the selected model.' ) }</p> }
-							<Textarea
-								aria-label={ __( 'Message Claude' ) }
-								value={ prompt }
-								onChange={ ( event ) => setPrompt( event.target.value ) }
+							<QueuedPrompts
+								prompts={ run.queuedPrompts }
+								onEdit={ editQueued }
+								onRemove={ ( id ) => run.removeQueuedPrompt( id, true ) }
 							/>
-							<Button
-								disabled={
-									! available ||
-									run.hasActiveRun ||
-									rebindRequired ||
-									!! pendingModel ||
-									! prompt.trim() ||
-									! selection ||
-									! models.some(
-										( item ) =>
-											item.id === selection.model && item.efforts.includes( selection.effort )
-									)
-								}
-								onClick={ () => {
-									const text = prompt;
-									const snapshot = selection!;
-									setPrompt( '' );
-									void run
-										.sendMessage( text, { claudeSelection: snapshot } )
-										.catch( ( failure: Error ) => {
-											setPrompt( text );
-											setError( failure.message );
-										} );
-								} }
-							>
-								{ __( 'Send' ) }
-							</Button>
-							{ run.hasActiveRun ? (
-								<Button variant="outline" onClick={ () => void run.interrupt() }>
-									{ __( 'Stop' ) }
-								</Button>
-							) : null }
+							<Composer
+								ref={ composerRef }
+								draftKey={ sessionId }
+								sessionId={ sessionId }
+								ariaLabel={ __( 'Message Claude' ) }
+								placeholder={ __( 'Message Claude' ) }
+								busy={ run.hasActiveRun }
+								isInterrupting={ run.isInterrupting }
+								claude={ { model: selectedModel, canSend: ready } }
+								onSend={ send }
+								onInterrupt={ run.interrupt }
+								ownerSiteId={ workspaceSiteId }
+								dropTarget={ frameNode }
+								annotationSiteId={ annotationSiteId }
+							/>
 						</>
 					) : (
 						<p role="alert">{ __( 'The Claude workspace binding could not be loaded.' ) }</p>
@@ -314,7 +355,7 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 			}
 		>
 			<div className={ styles.column } data-chat-transcript>
-				{ visibleEvents.map( ( event, index ) => {
+				{ visibleEvents.map( ( event ) => {
 					if ( event.type === 'question.asked' ) {
 						const key = questionKey( event );
 						return (
@@ -339,31 +380,28 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 							/>
 						);
 					}
-					if ( event.type === 'chat.artifact' && isStudioChatArtifactData( event.artifact ) ) {
-						return (
-							<ChatArtifact
-								key={ event.artifact.id }
-								claudeSessionId={ sessionId }
-								widgets={ screenshotWidgets( event.artifact, data.summary.filePath ) }
-							/>
-						);
-					}
-					if ( event.type === 'turn.prompt' ) return <p key={ index }>{ event.text }</p>;
-					if ( event.type === 'content.confirmed' || event.type === 'content.provisional' )
-						return <p key={ index }>{ event.text }</p>;
-					if ( event.type === 'tool.started' ) return <p key={ index }>{ event.name }</p>;
-					if ( event.type === 'tool.progress' || event.type === 'tool.result' )
-						return <p key={ index }>{ event.message }</p>;
-					if ( event.type === 'turn.terminal' )
-						return (
-							<p role="alert" key={ index }>
-								{ event.outcome.message ??
-									( event.outcome.status === 'success'
-										? __( 'Completed' )
-										: event.outcome.status ) }
-							</p>
-						);
-					return null;
+					return (
+						<ClaudeTranscriptEvent
+							key={ claudeDisplayEventKey( event ) }
+							event={ event }
+							reply={ replies.get( event ) }
+							results={ results }
+							sessionId={ sessionId }
+							sessionFile={ data.summary.filePath }
+							sitePreview={
+								session &&
+								event.type === 'chat.artifact' &&
+								( event.target
+									? isSameClaudeTarget( event.target, session.target )
+									: session.binding.siteId === previewSiteId )
+									? previewSiteId
+									: null
+							}
+							running={
+								run.isRunning && run.runId === event.runId && ! terminal.has( event.runId )
+							}
+						/>
+					);
 				} ) }
 				{ pending.map( ( event ) => (
 					<ClaudeApprovalCard
@@ -379,7 +417,7 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 						<p role="alert">
 							{ recovery === 'run-locked'
 								? __(
-										'A previous Claude run still holds the workspace lock. Confirm its native process has exited before starting a new chat.'
+										'A previous Claude run still holds the workspace lock. Recover this chat to check whether the run has ended.'
 								  )
 								: recovery === 'journal-unreadable'
 								? __( 'Studio could not read this chat’s journal. Start a new chat to reconnect.' )
@@ -389,11 +427,12 @@ export function ClaudeSessionView( { data }: { data: LoadedAiSession } ) {
 										'The native session is unavailable. Start a new conversation to reconnect; this history will remain available.'
 								  ) }
 						</p>
-						{ recovery !== 'deletion-pending' && workspaceSiteId && (
-							<ClaudeNewChat siteId={ workspaceSiteId } />
-						) }
+						{ recovery === 'run-locked' && <ClaudeRecoveryAction sessionId={ sessionId } /> }
 					</>
 				) : null }
+				{ session && ! run.hasActiveRun && recovery !== 'deletion-pending' && (
+					<ClaudeConnectionActions siteId={ workspaceSiteId } expanded={ rebindRequired } />
+				) }
 			</div>
 		</SessionFrame>
 	);

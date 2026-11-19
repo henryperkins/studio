@@ -23,6 +23,40 @@ describe( 'createIpcConnector exports', () => {
 		vi.unstubAllGlobals();
 	} );
 
+	it( 'preserves global catalog scope and the typed recovery result over IPC', async () => {
+		const getClaudeModelCatalog = vi.fn().mockResolvedValue( { ok: true, models: [] } );
+		const blocked = { status: 'blocked', reason: 'owner-alive' };
+		const recoverClaudeSession = vi.fn().mockResolvedValue( blocked );
+		const setClaudeSessionTarget = vi.fn();
+		const discardClaudeChatFile = vi.fn().mockResolvedValue( undefined );
+		const stageClaudeChatFile = vi.fn().mockResolvedValue( '/studio/session/file.txt' );
+		vi.stubGlobal( 'ipcApi', {
+			getClaudeModelCatalog,
+			recoverClaudeSession,
+			setClaudeSessionTarget,
+			stageClaudeChatFile,
+			discardClaudeChatFile,
+		} );
+		const ipc = createIpcConnector();
+		await ipc.getClaudeModelCatalog( 'account' );
+		expect( getClaudeModelCatalog ).toHaveBeenCalledWith( 'account', undefined );
+		await ipc.getClaudeModelCatalog( 'account', 'site' );
+		expect( getClaudeModelCatalog ).toHaveBeenCalledWith( 'account', 'site' );
+		await expect( ipc.recoverClaudeSession( 'chat' ) ).resolves.toEqual( blocked );
+		expect( recoverClaudeSession ).toHaveBeenCalledWith( 'chat' );
+		const from = { environment: 'global' } as const;
+		const to = { environment: 'local', siteId: 'site' } as const;
+		await ipc.setClaudeSessionTarget( 'chat', from, to );
+		expect( setClaudeSessionTarget ).toHaveBeenCalledWith( 'chat', from, to );
+		const picked = new File( [ 'contents' ], 'notes.txt' );
+		await expect( ipc.stageClaudeChatFile( 'chat', picked ) ).resolves.toBe(
+			'/studio/session/file.txt'
+		);
+		expect( stageClaudeChatFile ).toHaveBeenCalledWith( 'chat', picked );
+		await ipc.discardClaudeChatFile( 'chat', '/studio/session/file.txt' );
+		expect( discardClaudeChatFile ).toHaveBeenCalledWith( 'chat', '/studio/session/file.txt' );
+	} );
+
 	it( 'exports the full site through the main-process handler signature', async () => {
 		showSaveAsDialog.mockResolvedValue( '/tmp/demo-backup.zip' );
 
