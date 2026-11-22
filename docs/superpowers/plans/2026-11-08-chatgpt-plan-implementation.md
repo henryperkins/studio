@@ -16,7 +16,15 @@ Tasks 1–3 and Task 4's implementation and offline qualification are complete o
 
 The offline follow-up to `1feb4ba11` rejects `chatgpt-oauth` as a global default before writing settings, with settings-store, HTTP (400) and Desktop IPC regressions. Settings also covers local sign-out when remote revocation is unconfirmed. Verification: modified-file ESLint, repository typecheck, CLI build, and 127 tests across the settings-store, OpenAI settings, ChatGPT HTTP/IPC/Settings/CLI, and CLI auth suites.
 
-Still required with quota and explicit authorization: successful inference, disposable-site read/draft/readback, effort changes across turns, restart/resume, and session-only sign-out/revocation-race acceptance. Earlier live sign-in, model discovery, refresh and vault sign-out passed; the attempted turn stopped at the account's usage limit. Keep `STUDIO_EXPERIMENTAL_CHATGPT` default-off until acceptance passes.
+The explicitly authorized live Windows x64 run on November 10, 2026 (November 11 UTC), using PR #2 at `4ae1e38da`, passes these checks:
+
+- Returning system-browser sign-in preserves the original test registration. Live model discovery selects `gpt-6-luna` and its supported reasoning efforts.
+- A real Pi turn at `low` effort reads the disposable site's details, creates one draft and reads it back: **five successful model requests and six tool calls**. Independent WP-CLI verification confirms post `5`, its exact title/content and draft status, with all other posts unchanged.
+- The shared selection setter changes the same conversation to `medium`. A fresh CLI process resumes its persisted history, reads the same post and recovers the prior continuity marker: **two successful model requests and two read-only tool calls**.
+- Request observation confirms the selected model/effort, `stream: true`, `store: false`, no output cap or top-level tools, and OAuth-shaped bearer credentials. An existing OpenAI API key remains available in the machine's vault; these turns use the ChatGPT connection. The observer rejects a paid-API-key-shaped bearer before transmission. The output and session audits detect no credential leakage.
+- Vault sign-out reports `{ localCleared: true, remoteRevocationConfirmed: true }`; subsequent CLI use fails before starting an agent.
+
+Session-only live inference and sign-out/refresh-race qualification are in progress. The earlier quota-limited turn remains evidence for `subscription_sharing_usage_limit_exceeded` handling; it executed no tools or retries. Local live evidence is retained under `%LOCALAPPDATA%\Temp\opencode\studio-chatgpt-acceptance-20261110\`. Keep `STUDIO_EXPERIMENTAL_CHATGPT` default-off while the remaining acceptance and review gates are open.
 
 See [ChatGPT provider behavior](../../design-docs/chatgpt-provider.md). PR #3 receives these fixes by merge; merge PR #2 into `trunk` before retargeting PR #3.
 

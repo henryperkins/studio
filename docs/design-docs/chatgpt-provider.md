@@ -1,6 +1,6 @@
 # Experimental ChatGPT plan connection
 
-Set `STUDIO_EXPERIMENTAL_CHATGPT=1` before launching Studio or `studio ui` to enable the local proof of concept. It remains disabled by default while authenticated acceptance is pending.
+Set `STUDIO_EXPERIMENTAL_CHATGPT=1` before launching Studio or `studio ui` to enable the local proof of concept. It remains disabled by default during qualification and review.
 
 In **Settings → Providers → ChatGPT plan**, start or cancel browser sign-in, select a saved account, sign in again, refresh its model list, or sign out. `studio ui` offers sign-in only on `localhost`, `127.0.0.1`, `[::1]`, or `studio.local`, where the local callback can be reached. Secure storage keeps the connection across restarts; **This app session** is an explicit alternative when secure storage is unavailable.
 
@@ -10,4 +10,4 @@ Studio's existing Pi agent loop uses a dedicated ChatGPT Responses transport. Mo
 
 The backend owns OAuth, ID-token verification, refresh and revocation. Returning authorization URLs, credentials and token material do not cross the renderer boundary. Forked turns use scoped IPC with opaque generations. Sign-out ends active turns and clears the local connection; Settings reports remote revocation separately when it cannot be confirmed.
 
-See the [implementation plan](../superpowers/plans/2026-11-08-chatgpt-plan-implementation.md) for verification evidence and the deferred authenticated acceptance checklist.
+See the [implementation plan](../superpowers/plans/2026-11-08-chatgpt-plan-implementation.md) for observed verification results and the authenticated acceptance requirements.
