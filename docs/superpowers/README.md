@@ -12,4 +12,4 @@ Read in order:
 
 ChatGPT stays on Studio's Pi runtime with direct OpenAI OAuth and a dedicated transport. Claude uses its official runtime and sign-in through the Agent SDK, with a separate backend adapter. Existing API-key providers remain intact.
 
-Both features remain disabled by default. Authenticated acceptance is deferred pending quota and explicit local authorization. Merge PR #2 first, then retarget PR #3 to `trunk`; neither draft is merge-ready. Refresh repository state before continuing and keep credentials out of chat, commits and test fixtures.
+Both features remain disabled by default. ChatGPT's explicitly authorized live qualification is recorded in its implementation plan; Claude's authenticated acceptance remains deferred. Merge PR #2 first, then retarget PR #3 to `trunk`; neither draft is merge-ready. Refresh repository state before continuing and keep credentials out of chat, commits and test fixtures.
