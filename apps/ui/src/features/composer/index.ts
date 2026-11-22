@@ -1,3 +1,4 @@
+export { ConnectionSwitchDialog } from './connection-switch-dialog';
 export { Composer, ComposerSkeleton } from './composer';
 export { clearComposerDrafts, getComposerDraft, saveComposerDraft } from './draft-store';
 export { pendingPromptSlot } from './pending-prompt';

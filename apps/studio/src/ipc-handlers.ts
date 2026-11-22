@@ -17,16 +17,24 @@ import nodePath from 'path';
 import * as Sentry from '@sentry/electron/main';
 import { recordAnnotationSubmitted } from '@studio/agent/node/annotation-tracks';
 import {
+	configureClaudeRuntime as configureClaudeRuntimeOnHost,
+	discardClaudeChatFile as discardClaudeChatFileOnHost,
+	startWithClaudeChatFiles,
+	stageClaudeChatFile as stageClaudeChatFileOnHost,
+	setClaudeSessionTarget as setClaudeSessionTargetOnHost,
+	getClaudeRuntimeState as getClaudeRuntimeStateOnHost,
+	validateClaudeSendWithCatalog,
+} from '@studio/agent/node/claude-code/studio-host';
+import {
 	getGlobalInstructionsEnabled as readGlobalInstructionsEnabled,
 	setGlobalInstructionsEnabled as writeGlobalInstructionsEnabled,
 } from '@studio/agent/node/global-instructions';
-import { resolveLocalMediaFile } from '@studio/agent/node/local-media';
+import { openClaudeScreenshot, openLocalMediaFile } from '@studio/agent/node/local-media';
 import { setSessionChatGptSelection } from '@studio/agent/node/sessions/chatgpt-selection';
 import {
 	createHydratedAiSession,
 	listHydratedAiSessions,
 	loadHydratedAiSession,
-	reconcileSessionEnvironment,
 	setSessionEnvironment,
 	updateHydratedAiSessionMetadata,
 } from '@studio/agent/node/sessions/manage';
@@ -176,6 +184,12 @@ import {
 } from 'src/main-window';
 import { popupMenu, setupMenu } from 'src/menu';
 import {
+	createClaudeSessionViaCli,
+	recoverClaudeSessionViaCli,
+	getClaudeModelCatalogViaCli,
+	setClaudeSelectionViaCli,
+} from 'src/modules/ai-agent/claude-commands';
+import {
 	answerAgentRun,
 	interruptAgentRun,
 	listActiveAgentRuns,
@@ -195,6 +209,13 @@ import { captureSiteThumbnail } from './lib/capture-site-thumbnail';
 import type { ActiveAgentRun } from '@studio/agent/protocol/agent-events';
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
+import type {
+	ClaudeRuntimeAction,
+	ClaudeSendContext,
+	ClaudeSessionSelection,
+	ClaudeStudioTarget,
+	CreateClaudeSessionRequest,
+} from '@studio/agent/protocol/claude-code';
 import type {
 	AiSessionMetadata,
 	AiSessionSummary,
@@ -295,6 +316,73 @@ export async function loadAiSession(
 	return loadHydratedAiSession( getSessionsDirectory(), sessionIdOrPrefix );
 }
 
+export async function getClaudeRuntimeState( _event: IpcMainInvokeEvent ) {
+	return getClaudeRuntimeStateOnHost();
+}
+
+export async function configureClaudeRuntime(
+	_event: IpcMainInvokeEvent,
+	action: ClaudeRuntimeAction
+) {
+	await configureClaudeRuntimeOnHost( action );
+}
+
+export async function getClaudeModelCatalog(
+	_event: IpcMainInvokeEvent,
+	connectionId: string,
+	siteId?: string
+) {
+	return getClaudeModelCatalogViaCli( connectionId, siteId );
+}
+
+export async function createClaudeSession(
+	_event: IpcMainInvokeEvent,
+	request: CreateClaudeSessionRequest
+) {
+	return createClaudeSessionViaCli( request );
+}
+
+export async function setClaudeSessionTarget(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	expected: ClaudeStudioTarget,
+	target: ClaudeStudioTarget
+) {
+	await setClaudeSessionTargetOnHost( getSessionsDirectory(), sessionId, expected, target );
+}
+
+export async function discardClaudeChatFile(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	path: string
+) {
+	return discardClaudeChatFileOnHost( getSessionsDirectory(), sessionId, path );
+}
+
+export async function stageClaudeChatFile(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	name: string,
+	size: number,
+	picked: string | Uint8Array
+) {
+	if ( typeof picked !== 'string' && ! ( picked instanceof Uint8Array ) )
+		throw new Error( 'Invalid file selection.' );
+	return stageClaudeChatFileOnHost( getSessionsDirectory(), sessionId, name, size, picked );
+}
+
+export async function recoverClaudeSession( _event: IpcMainInvokeEvent, sessionId: string ) {
+	return recoverClaudeSessionViaCli( sessionId );
+}
+
+export async function setClaudeSessionSelection(
+	_event: IpcMainInvokeEvent,
+	sessionId: string,
+	selection: ClaudeSessionSelection
+) {
+	await setClaudeSelectionViaCli( sessionId, selection );
+}
+
 export async function createAiSession(
 	_event: IpcMainInvokeEvent,
 	siteId?: string
@@ -333,26 +421,42 @@ export async function continueAiSession(
 	prompt: string,
 	options: {
 		turnId?: string;
+		claudeContext?: ClaudeSendContext;
+		claudeSelection?: ClaudeSessionSelection;
 		displayMessage?: string;
 		images?: StudioChatImage[];
 		files?: StudioChatFileAttachment[];
 		visualAnnotations?: unknown;
 	} = {}
 ): Promise< { runId: string } > {
-	await reconcileSessionEnvironment( getSessionsDirectory(), sessionId );
 	const images = validateStudioChatImages( options.images );
+	const claudeSelection = await validateClaudeSendWithCatalog(
+		getSessionsDirectory(),
+		sessionId,
+		options.claudeSelection,
+		options.claudeContext,
+		images.length > 0 ? getClaudeModelCatalogViaCli : undefined
+	);
 	const files = validateStudioChatFiles( options.files );
 	const visualAnnotations = validateStudioVisualAnnotations( options.visualAnnotations, images );
-	const result = startAgentRun( {
+	const result = await startWithClaudeChatFiles(
+		getSessionsDirectory(),
 		sessionId,
-		prompt: expandSkillCommandPrompt( prompt ),
-		turnId: options.turnId,
-		displayMessage: options.displayMessage,
-		images,
-		files,
-		visualAnnotations,
-		webContents: event.sender,
-	} );
+		claudeSelection ? files : undefined,
+		() =>
+			startAgentRun( {
+				sessionId,
+				prompt: claudeSelection ? prompt : expandSkillCommandPrompt( prompt ),
+				claudeSelection,
+				claudeContext: options.claudeContext,
+				turnId: options.turnId,
+				displayMessage: options.displayMessage,
+				images,
+				files,
+				visualAnnotations,
+				webContents: event.sender,
+			} )
+	);
 	void recordAnnotationSubmitted( {
 		annotationCount: visualAnnotations?.length ?? 0,
 		sessionsRoot: getSessionsDirectory(),
@@ -363,9 +467,9 @@ export async function continueAiSession(
 }
 
 export async function listActiveAiAgentRuns(
-	_event: IpcMainInvokeEvent
+	event: IpcMainInvokeEvent
 ): Promise< ActiveAgentRun[] > {
-	return listActiveAgentRuns();
+	return listActiveAgentRuns( event.sender );
 }
 
 export async function setAiSessionModel(
@@ -410,18 +514,21 @@ export async function setAiSessionEnvironment(
 }
 
 export async function interruptAiAgentRun(
-	_event: IpcMainInvokeEvent,
+	event: IpcMainInvokeEvent,
 	runId: string
 ): Promise< void > {
-	interruptAgentRun( runId );
+	interruptAgentRun( runId, event.sender );
 }
 
 export async function answerAiAgentQuestion(
-	_event: IpcMainInvokeEvent,
+	event: IpcMainInvokeEvent,
 	runId: string,
-	answers: Record< string, string >
+	answers: Record< string, string >,
+	requestId?: string
 ): Promise< void > {
-	answerAgentRun( runId, answers );
+	const accepted = answerAgentRun( runId, answers, event.sender, requestId );
+	if ( requestId !== undefined && ! accepted )
+		throw new Error( __( 'This question is no longer waiting for that answer.' ) );
 }
 
 export async function getWordPressSkillsStatusAllSites(
@@ -1168,16 +1275,18 @@ export async function openStudioLogs( _event: IpcMainInvokeEvent ) {
 
 export async function readLocalMediaFile(
 	_event: IpcMainInvokeEvent,
-	path: string
+	path: string,
+	claudeSessionId?: string
 ): Promise< { name: string; mimeType: string; data: ArrayBuffer } > {
-	const media = await resolveLocalMediaFile( path, [
-		getSessionsDirectory(),
-		...( await readSitePaths() ),
-	] );
+	const media =
+		claudeSessionId !== undefined
+			? await openClaudeScreenshot( getSessionsDirectory(), claudeSessionId, path )
+			: await openLocalMediaFile( path, [ getSessionsDirectory(), ...( await readSitePaths() ) ] );
 	if ( ! media ) {
 		throw new Error( 'Local media file not found.' );
 	}
-	const buffer = await fsPromises.readFile( media.path );
+	await using file = media.handle;
+	const buffer = await file.readFile();
 	return {
 		name: nodePath.basename( path ),
 		mimeType: media.mimeType,

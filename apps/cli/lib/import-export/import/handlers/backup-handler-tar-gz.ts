@@ -3,6 +3,7 @@ import zlib from 'zlib';
 import { isGzipFile } from '@studio/common/lib/archive-format';
 import { ImportEvents } from '@studio/common/lib/import-export-events';
 import * as tar from 'tar';
+import { isPlainTransferEntry, unsafeTransfer } from 'cli/lib/site-transfer-paths';
 import { ImportExportEventEmitter } from '../../events';
 import { BackupArchiveInfo } from '../types';
 import { BackupHandler, isFileAllowed } from './backup-handler-factory';
@@ -10,9 +11,19 @@ import { BackupHandler, isFileAllowed } from './backup-handler-factory';
 export class BackupHandlerTarGz extends ImportExportEventEmitter implements BackupHandler {
 	async listFiles( backup: BackupArchiveInfo ): Promise< string[] > {
 		const filesSet = new Set< string >();
+		let invalidEntry = false;
 		await tar.t( {
 			file: backup.path,
 			onReadEntry: ( entry ) => {
+				if (
+					! isPlainTransferEntry(
+						entry.path,
+						[ 'File', 'OldFile', 'Directory', 'ContiguousFile' ].includes( entry.type )
+					)
+				) {
+					invalidEntry = true;
+					return;
+				}
 				if ( isFileAllowed( entry.path ) ) {
 					let path = entry.path;
 					if ( entry.path.startsWith( '/' ) ) {
@@ -22,6 +33,7 @@ export class BackupHandlerTarGz extends ImportExportEventEmitter implements Back
 				}
 			},
 		} );
+		if ( invalidEntry ) throw unsafeTransfer();
 		return Array.from( filesSet );
 	}
 
@@ -40,6 +52,7 @@ export class BackupHandlerTarGz extends ImportExportEventEmitter implements Back
 
 		const fileList = await this.listFiles( file );
 		const totalFiles = fileList.length;
+		let invalidEntry = false;
 
 		return new Promise< void >( ( resolve, reject ) => {
 			this.emit( ImportEvents.BACKUP_EXTRACT_START );
@@ -74,6 +87,17 @@ export class BackupHandlerTarGz extends ImportExportEventEmitter implements Back
 				.pipe(
 					tar.extract( {
 						cwd: extractionDirectory,
+						filter: ( name, entry ) => {
+							if (
+								! isPlainTransferEntry(
+									name,
+									'type' in entry &&
+										[ 'File', 'OldFile', 'Directory', 'ContiguousFile' ].includes( entry.type )
+								)
+							)
+								invalidEntry = true;
+							return ! invalidEntry;
+						},
 						onwarn: ( _code, message ) => {
 							this.emit( ImportEvents.BACKUP_EXTRACT_WARNING, message );
 						},
@@ -90,7 +114,12 @@ export class BackupHandlerTarGz extends ImportExportEventEmitter implements Back
 						},
 					} )
 				)
+				.on( 'error', reject )
 				.on( 'finish', () => {
+					if ( invalidEntry ) {
+						reject( unsafeTransfer() );
+						return;
+					}
 					this.emit( ImportEvents.BACKUP_EXTRACT_COMPLETE );
 					resolve();
 				} );

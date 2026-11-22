@@ -1,0 +1,130 @@
+.card {
+	--surface: light-dark( var( --surface-1 ), var( --surface-2 ) );
+	display: flex;
+	flex-direction: column;
+	gap: var( --space-3 );
+	min-width: 0;
+	padding: var( --space-3 ) var( --space-4 );
+	border: 1px solid var( --border );
+	border-radius: var( --radius-2xl );
+	background-color: var( --surface );
+	color: var( --foreground );
+}
+
+.title {
+	margin: 0;
+	font-weight: var( --font-weight-semibold );
+}
+
+.description {
+	margin: 0;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	text-wrap: pretty;
+}
+
+.fields,
+.nested {
+	display: grid;
+	gap: var( --space-2 );
+	min-width: 0;
+	margin: 0;
+}
+
+.nested {
+	padding-inline-start: var( --space-3 );
+	border-inline-start: 1px solid var( --border );
+}
+
+.field {
+	display: grid;
+	gap: var( --space-0_5 );
+	min-width: 0;
+}
+
+.label {
+	color: var( --foreground );
+	font-size: var( --text-xs );
+	line-height: var( --text-xs--line-height );
+}
+
+.value {
+	min-width: 0;
+	margin: 0;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	unicode-bidi: isolate;
+}
+
+.text {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.quotation {
+	min-width: 0;
+	margin: 0;
+	padding: var( --space-2 ) var( --space-3 );
+	border: 1px solid var( --border );
+	border-radius: var( --radius-md );
+	background: var( --muted );
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+	unicode-bidi: isolate;
+}
+
+.code,
+.raw {
+	font-family: var( --font-mono );
+	font-size: var( --text-xs );
+	line-height: var( --text-xs--line-height );
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+.raw {
+	margin: 0;
+}
+
+.none {
+	color: var( --foreground );
+}
+
+.items,
+.paths {
+	display: grid;
+	gap: var( --space-1_5 );
+	min-width: 0;
+	margin: 0;
+	padding-inline-start: var( --space-5 );
+}
+
+.items {
+	list-style: decimal;
+}
+
+.items > li {
+	min-width: 0;
+}
+
+.items > li + li,
+.paths > li + li {
+	padding-top: var( --space-1_5 );
+	border-top: 1px solid var( --border );
+}
+
+.items > li::marker {
+	color: var( --foreground );
+	font-size: var( --text-xs );
+}
+
+.paths {
+	padding-inline-start: 0;
+	list-style: none;
+}
+
+.actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: var( --space-2 );
+}

@@ -2,8 +2,9 @@ import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { setSessionEnvironment } from '@studio/agent/node/sessions/manage';
+import { setSessionEnvironment, setClaudeSessionTarget } from '@studio/agent/node/sessions/manage';
 import { createAiSession, loadAiSession } from '@studio/agent/node/sessions/store';
+import { resolveClaudeSession } from '@studio/agent/protocol/claude-code';
 
 const SITE = { id: 'site-1', name: 'My Site', path: '/tmp/my-site' };
 
@@ -59,5 +60,71 @@ describe( 'setSessionEnvironment', () => {
 		await expect( setSessionEnvironment( root, id, 'live' ) ).rejects.toThrow(
 			'This site is not connected to a WordPress.com site.'
 		);
+	} );
+
+	const claude = ( siteId: string | null ) => ( {
+		binding: {
+			connectionId: 'connection',
+			siteId,
+			workingDirectory: SITE.path,
+			configDirectory: '/config',
+		},
+		selection: { model: 'model', effort: 'medium' as const },
+	} );
+
+	it( 'switches a Claude conversation between its site and the live site, keeping its native binding', async () => {
+		const options = { site: SITE, claude: claude( SITE.id ) };
+		const { id } = await createAiSession( root, options );
+
+		await setSessionEnvironment( root, id, 'live' );
+		let loaded = await loadAiSession( root, id );
+		expect( loaded.summary.activeEnvironment ).toBe( 'live' );
+		expect( resolveClaudeSession( loaded.entries ) ).toMatchObject( {
+			binding: options.claude.binding,
+			target: { environment: 'live', siteId: SITE.id, wpcomSiteId: 42 },
+		} );
+
+		await setSessionEnvironment( root, id, 'local' );
+		loaded = await loadAiSession( root, id );
+		expect( loaded.summary.activeEnvironment ).toBe( 'local' );
+		expect( resolveClaudeSession( loaded.entries ) ).toMatchObject( {
+			binding: options.claude.binding,
+			target: { environment: 'local', siteId: SITE.id },
+		} );
+	} );
+
+	it( 'returns a global chat from a chosen live site to Studio and refuses stale target choices', async () => {
+		const { id } = await createAiSession( root, { claude: claude( null ) } );
+		const initial = { environment: 'global' } as const;
+		const local = { environment: 'local', siteId: SITE.id } as const;
+		const live = { environment: 'live', siteId: SITE.id, wpcomSiteId: 7 } as const;
+		await setClaudeSessionTarget( root, id, initial, local );
+		await expect( setClaudeSessionTarget( root, id, initial, live ) ).rejects.toThrow( 'changed' );
+		await expect(
+			setClaudeSessionTarget( root, id, local, { ...live, wpcomSiteId: 1234 } )
+		).rejects.toThrow( 'no longer connected' );
+		await setClaudeSessionTarget( root, id, local, live );
+		let chat = await loadAiSession( root, id );
+		expect( resolveClaudeSession( chat.entries )?.target ).toEqual( live );
+		await setClaudeSessionTarget( root, id, live, initial );
+		chat = await loadAiSession( root, id );
+		expect( resolveClaudeSession( chat.entries ) ).toMatchObject( {
+			target: initial,
+			binding: claude( null ).binding,
+		} );
+	} );
+
+	it( 'refuses to point a Claude conversation at a site other than the one it works in', async () => {
+		const other = { id: 'site-2', name: 'Other', path: '/tmp/other' };
+		const { id } = await createAiSession( root, { site: other, claude: claude( other.id ) } );
+
+		await expect( setSessionEnvironment( root, id, 'local' ) ).rejects.toThrow(
+			'Start a new chat'
+		);
+		const loaded = await loadAiSession( root, id );
+		expect( resolveClaudeSession( loaded.entries )?.target ).toEqual( {
+			environment: 'local',
+			siteId: other.id,
+		} );
 	} );
 } );

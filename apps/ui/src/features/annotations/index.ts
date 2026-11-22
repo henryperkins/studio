@@ -12,6 +12,7 @@ export {
 	isBatchedAnnotation,
 	pickAnnotation,
 	removeAnnotations,
+	restoreStagedAnnotations,
 	requestAnnotationSend,
 	requestAnnotationReview,
 	subscribeAnnotationReview,

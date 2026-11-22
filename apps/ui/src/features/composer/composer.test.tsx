@@ -22,7 +22,9 @@ import type { LoadedAiSession, SessionEntry } from '@/data/core';
 import type { ComposerImageAttachment } from '@studio/agent/protocol/composer-attachments';
 import type { StudioAssistantQuota } from '@studio/common/lib/studio-assistant-quota';
 
-type Props = Partial< ComponentProps< typeof Composer > > & { ref?: React.Ref< ComposerHandle > };
+type Props = Partial< Extract< ComponentProps< typeof Composer >, { claude?: never } > > & {
+	ref?: React.Ref< ComposerHandle >;
+};
 
 const SITE = 'composer-site';
 const interrupt = vi.fn( async () => {} );

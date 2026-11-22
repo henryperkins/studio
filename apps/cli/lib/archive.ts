@@ -7,6 +7,13 @@ import { ZipArchive, type ZipEntryData } from 'archiver';
 import { glob } from 'glob';
 import { readActiveThemes } from 'cli/lib/active-themes';
 import { isHostManagedPullFile } from 'cli/lib/pull/pull-session';
+import {
+	appendTransferFile,
+	checkSiteTransferTree,
+	checkTransferFile,
+	hasSiteTransferScope,
+	openTransferFile,
+} from 'cli/lib/site-transfer-paths';
 import { LoggerError } from 'cli/logger';
 
 const ZIP_COMPRESSION_LEVEL = 9;
@@ -56,6 +63,7 @@ export async function listArchiveEntries(
 	siteFolder: string,
 	{ onWpcom }: PreviewArchiveOptions
 ): Promise< ArchiveEntry[] > {
+	await checkSiteTransferTree( siteFolder );
 	const deployIgnore = await createDeployIgnoreFilter( siteFolder );
 	const activeThemes = await readActiveThemes( siteFolder );
 	// Files inside a theme folder (not `themes/index.php`) that belong to no active theme.
@@ -76,7 +84,7 @@ export async function listArchiveEntries(
 	const relativePaths = await glob( '**/*', {
 		cwd: wpContentPath,
 		dot: true,
-		follow: true,
+		follow: ! hasSiteTransferScope(),
 		nodir: true,
 		// Keep entry names forward-slashed on Windows
 		posix: true,
@@ -98,6 +106,13 @@ export async function listArchiveEntries(
 		// realpath first, we ensure the source file data is always appended. This
 		// is preferable to passing readable streams to `Archiver.append()`, which
 		// can lead to EMFILE errors.
+		const fullPath = path.join( wpContentPath, relativePath );
+		if ( hasSiteTransferScope() ) {
+			await checkTransferFile( fullPath );
+			if ( ! onWpcom || ! isHostManagedPullFile( fullPath ) )
+				entries.push( { name, sourcePath: fullPath } );
+			continue;
+		}
 		try {
 			const sourcePath = fs.realpathSync( path.join( wpContentPath, relativePath ) );
 			if ( ! onWpcom || ! isHostManagedPullFile( sourcePath ) ) {
@@ -110,6 +125,7 @@ export async function listArchiveEntries(
 	}
 
 	const wpConfigPath = path.join( siteFolder, 'wp-config.php' );
+	await checkTransferFile( wpConfigPath, true );
 	if ( fs.existsSync( wpConfigPath ) ) {
 		entries.push( { name: 'wp-config.php', sourcePath: wpConfigPath } );
 	}
@@ -136,8 +152,10 @@ export async function archiveSiteContent(
 ): Promise< ZipArchive > {
 	const entries = await listArchiveEntries( siteFolder, options );
 
+	const output = hasSiteTransferScope()
+		? ( await openTransferFile( archivePath, true ) ).createWriteStream()
+		: fs.createWriteStream( archivePath );
 	return new Promise( ( resolve, reject ) => {
-		const output = fs.createWriteStream( archivePath );
 		const archiveBuilder = new ZipArchive( {
 			zlib: { level: ZIP_COMPRESSION_LEVEL },
 		} );
@@ -147,17 +165,27 @@ export async function archiveSiteContent(
 		} );
 		archiveBuilder.on( 'error', ( error: Error ) => {
 			reject( new LoggerError( __( 'Failed to create archive' ), error ) );
+			output.destroy();
+		} );
+		output.on( 'error', ( error ) => {
+			reject( error );
+			if ( hasSiteTransferScope() ) archiveBuilder.destroy( error );
 		} );
 
 		archiveBuilder.pipe( output );
 
-		for ( const { name, sourcePath } of entries ) {
-			// `file()` passes the zip-only `store` option through, though its types omit it.
-			const entry: ZipEntryData = { name, store: ALREADY_COMPRESSED_FILE.test( name ) };
-			archiveBuilder.file( sourcePath, entry );
+		async function writeEntries() {
+			for ( const { name, sourcePath } of entries ) {
+				const entry: ZipEntryData = { name, store: ALREADY_COMPRESSED_FILE.test( name ) };
+				await appendTransferFile( archiveBuilder, sourcePath, entry );
+			}
+			await archiveBuilder.finalize();
 		}
-
-		archiveBuilder.finalize().catch( reject );
+		writeEntries().catch( ( error ) => {
+			reject( error );
+			archiveBuilder.abort();
+			output.destroy();
+		} );
 	} );
 }
 

@@ -1,3 +1,4 @@
+import { resolveClaudeSession, type ClaudeStudioTarget } from '@studio/agent/protocol/claude-code';
 import { findAiSessionOwnerSite } from '@studio/agent/protocol/sessions/owner-site';
 import { useQueryClient } from '@tanstack/react-query';
 import { createRoute, Outlet, useNavigate, useRouterState } from '@tanstack/react-router';
@@ -83,11 +84,6 @@ function DashboardLayout() {
 	const { data: authUser } = useAuthUser();
 	const { data: aiSettings } = useAiSettings();
 	const [ providerPromptOpen, setProviderPromptOpen ] = useState( false );
-	const hasProvider =
-		!! authUser || !! aiSettings?.hasAnthropicApiKey || !! aiSettings?.hasOpenAiApiKey;
-	useEffect( () => {
-		if ( hasProvider ) setProviderPromptOpen( false );
-	}, [ hasProvider ] );
 	const routePreviewContext = useRouterState( {
 		select: ( state ) => ( {
 			pathname: state.location.pathname,
@@ -111,7 +107,27 @@ function DashboardLayout() {
 	useWhatsNewReplay();
 	const preview = useSessionPreviewUI();
 	const { data: preferences } = useUserPreferences();
-	const sessionSite = findAiSessionOwnerSite( sites, sessionSummary );
+	const ownerSite = findAiSessionOwnerSite( sites, sessionSummary );
+	const isClaude = sessionSummary?.backend === 'claude-code';
+	let claudeTarget: ClaudeStudioTarget | undefined;
+	if ( isClaude && sessionData ) {
+		try {
+			claudeTarget = resolveClaudeSession( sessionData.entries )?.target;
+		} catch {
+			// An unreadable binding cannot select a site to preview.
+		}
+	}
+	const hasProvider =
+		!! claudeTarget ||
+		!! authUser ||
+		!! aiSettings?.hasAnthropicApiKey ||
+		!! aiSettings?.hasOpenAiApiKey;
+	useEffect( () => {
+		if ( hasProvider ) setProviderPromptOpen( false );
+	}, [ hasProvider ] );
+	const actingSiteId =
+		claudeTarget && claudeTarget.environment !== 'global' ? claudeTarget.siteId : undefined;
+	const sessionSite = isClaude ? sites?.find( ( site ) => site.id === actingSiteId ) : ownerSite;
 	// A chat switched to Live previews its remote instead of the local site.
 	const { draft } = useSiteChatDraft( newSessionSiteId );
 	const liveUrl = useSessionLiveSite(
@@ -122,7 +138,10 @@ function DashboardLayout() {
 	const newSessionSite = newSessionSiteId
 		? sites?.find( ( site ) => site.id === newSessionSiteId )
 		: undefined;
-	const routeSite = homeSite ?? newSessionSite ?? sessionSite;
+	const routeSite =
+		homeSite ??
+		newSessionSite ??
+		( claudeTarget?.environment === 'live' && ! liveUrl ? undefined : sessionSite );
 	// While session or site data is still loading, preview-capable routes stay
 	// preview-capable so navigation doesn't close and reopen the panel around
 	// the fetch.
@@ -141,7 +160,7 @@ function DashboardLayout() {
 	}, [ routeSite ] );
 	// Remember the user's site and its open chat, so the `/` index route and
 	// the sidebar return here instead of defaulting to the first site.
-	const sessionSiteId = sessionSite?.id;
+	const sessionSiteId = ownerSite?.id;
 	useEffect( () => {
 		if ( sessionSiteId ) {
 			rememberVisit( sessionSiteId, sessionId );

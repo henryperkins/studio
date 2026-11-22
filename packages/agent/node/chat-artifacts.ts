@@ -51,6 +51,23 @@ interface FileWritingTool {
 	): Promise< AgentToolResult< unknown > >;
 }
 
+/** Offers the same preview and result note to each runtime after a file change. */
+export async function offerDesignSystemPreview(
+	filePath: string,
+	ui?: StudioAgentUi
+): Promise< string | undefined > {
+	if (
+		! ui ||
+		path.basename( filePath ) !== 'DESIGN.md' ||
+		! existsSync( path.join( path.dirname( filePath ), 'wp-content' ) )
+	)
+		return;
+	await emitChatArtifactWidgets( ui, [
+		{ type: 'site-preview', widgetProps: { path: DESIGN_SYSTEM_PREVIEW_PATH } },
+	] ).catch( () => undefined );
+	return `The updated design system is available at [Design System](${ DESIGN_SYSTEM_PREVIEW_PATH }). Include this link within a natural sentence in your final reply.`;
+}
+
 /**
  * Wraps a file-writing tool so that writing a site's DESIGN.md offers the design
  * system view from the chat.
@@ -72,26 +89,10 @@ export function withDesignSystemPreview< TTool extends FileWritingTool >(
 		async execute( toolCallId: string, params: { path?: unknown }, ...rest: unknown[] ) {
 			const result = await tool.execute( toolCallId, params, ...rest );
 			const filePath = path.resolve( cwd, String( params.path ) );
-			if (
-				! result.isError &&
-				path.basename( filePath ) === 'DESIGN.md' &&
-				existsSync( path.join( path.dirname( filePath ), 'wp-content' ) )
-			) {
-				await emitChatArtifactWidgets( ui, [
-					{ type: 'site-preview', widgetProps: { path: DESIGN_SYSTEM_PREVIEW_PATH } },
-				] ).catch( () => undefined );
-				return {
-					...result,
-					content: [
-						...result.content,
-						{
-							type: 'text' as const,
-							text: `The updated design system is available at [Design System](${ DESIGN_SYSTEM_PREVIEW_PATH }). Include this link within a natural sentence in your final reply.`,
-						},
-					],
-				};
-			}
-			return result;
+			const note = ! result.isError && ( await offerDesignSystemPreview( filePath, ui ) );
+			return note
+				? { ...result, content: [ ...result.content, { type: 'text' as const, text: note } ] }
+				: result;
 		},
 	};
 }

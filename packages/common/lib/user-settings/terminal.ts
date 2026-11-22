@@ -122,3 +122,54 @@ export function resolveLinuxTerminalLaunch(
 
 	return null;
 }
+
+// Terminals, in the same order as `LINUX_SYSTEM_TERMINALS`, that run a command given as separate
+// arguments without parsing it as one string. GNOME Console, Ptyxis, Tilix, LXTerminal and
+// QTerminal are left out: their documented forms take a single command string or are unconfirmed.
+const LINUX_COMMAND_TERMINALS: {
+	command: string;
+	args: ( cwd: string, argv: string[] ) => string[];
+}[] = [
+	{ command: 'xdg-terminal-exec', args: ( cwd, argv ) => argv },
+	{ command: 'x-terminal-emulator', args: ( cwd, argv ) => [ '-e', ...argv ] },
+	{
+		command: 'gnome-terminal',
+		args: ( cwd, argv ) => [ `--working-directory=${ cwd }`, '--', ...argv ],
+	},
+	{ command: 'konsole', args: ( cwd, argv ) => [ '--workdir', cwd, '-e', ...argv ] },
+	{
+		command: 'xfce4-terminal',
+		args: ( cwd, argv ) => [ `--working-directory=${ cwd }`, '-x', ...argv ],
+	},
+	{
+		command: 'mate-terminal',
+		args: ( cwd, argv ) => [ `--working-directory=${ cwd }`, '-x', ...argv ],
+	},
+	{
+		command: 'terminator',
+		args: ( cwd, argv ) => [ `--working-directory=${ cwd }`, '-x', ...argv ],
+	},
+	{ command: 'alacritty', args: ( cwd, argv ) => [ '--working-directory', cwd, '-e', ...argv ] },
+	{ command: 'kitty', args: ( cwd, argv ) => [ '--directory', cwd, ...argv ] },
+	{ command: 'foot', args: ( cwd, argv ) => [ `--working-directory=${ cwd }`, ...argv ] },
+	{ command: 'wezterm', args: ( cwd, argv ) => [ 'start', '--cwd', cwd, '--', ...argv ] },
+	{ command: 'xterm', args: ( cwd, argv ) => [ '-e', ...argv ] },
+];
+
+/**
+ * Resolves how to run `argv` in a new terminal window on Linux, in `cwd`: the first installed
+ * terminal that takes the command as separate arguments. Returns `null` when there is none.
+ */
+export function resolveLinuxTerminalCommandLaunch(
+	cwd: string,
+	argv: string[],
+	findOnPath: ( command: string ) => string | null
+): LinuxTerminalLaunch | null {
+	for ( const { command, args } of LINUX_COMMAND_TERMINALS ) {
+		const file = findOnPath( command );
+		if ( file ) {
+			return { file, args: args( cwd, [ ...argv ] ), cwd };
+		}
+	}
+	return null;
+}

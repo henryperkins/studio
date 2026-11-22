@@ -1,5 +1,5 @@
 import { Type } from 'typebox';
-import { getSharedBrowser } from '@studio/agent/node/browser-utils';
+import { openToolPage } from '../browser-page';
 import { defineTool, READ_ONLY } from './define-tool';
 import {
 	applyScreenshotMediaEmulation,
@@ -122,11 +122,7 @@ export function createInspectDesignTool( { visionEnabled }: { visionEnabled: boo
 				})…`
 			);
 
-			const browser = await getSharedBrowser();
-			const page = await browser.newPage( {
-				viewport: INSPECT_VIEWPORTS[ viewport ],
-				ignoreHTTPSErrors: true,
-			} );
+			const page = await openToolPage( { viewport: INSPECT_VIEWPORTS[ viewport ] } );
 
 			try {
 				await applyScreenshotMediaEmulation( page, args.colorScheme );

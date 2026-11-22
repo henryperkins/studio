@@ -6,87 +6,128 @@ import { resolveActiveSiteFromEntries } from '@studio/agent/protocol/sessions/ac
 import { validateStudioVisualAnnotations } from '@studio/agent/protocol/visual-annotations';
 import { getSessionsDirectory } from '@studio/common/lib/well-known-paths';
 import { __ } from '@wordpress/i18n';
+import { getTerminalClaudeApprover } from 'cli/ai/claude-approval';
+import { getTerminalClaudeQuestionAsker } from 'cli/ai/claude-questions';
 import { JsonAdapter } from 'cli/ai/output-adapter';
 import { AiChatUI } from 'cli/ai/ui';
 import { runCommand as runAiCommand } from 'cli/commands/ai';
 import { chooseSessionForAction } from 'cli/commands/ai/sessions/helpers';
 import { Logger, LoggerError } from 'cli/logger';
 import { StudioArgv } from 'cli/types';
+import type { ClaudeApprover } from '@studio/agent/node/claude-code/execution-policy';
+import type { ClaudeQuestionAsker } from '@studio/agent/node/claude-code/questions';
 import type { StudioAiSessionInputPayload } from '@studio/agent/protocol/chat-images';
 import type { AiOutputAdapter } from 'cli/ai/output-adapter';
 
 async function readInputPayload( path: string ): Promise< StudioAiSessionInputPayload > {
 	const parsed = JSON.parse( await fs.readFile( path, 'utf8' ) ) as StudioAiSessionInputPayload;
-	if ( ! parsed || typeof parsed.prompt !== 'string' || ! parsed.prompt.trim() ) {
+	if ( ! parsed || typeof parsed.prompt !== 'string' ) {
 		throw new Error( __( 'Invalid AI session input payload.' ) );
 	}
 	const images = validateStudioChatImages( parsed.images );
+	const files = validateStudioChatFiles( parsed.files );
+	const visualAnnotations = validateStudioVisualAnnotations( parsed.visualAnnotations, images );
+	if (
+		! parsed.prompt.trim() &&
+		! ( parsed.claudeSelection && ( images.length || files.length || visualAnnotations?.length ) )
+	) {
+		throw new Error( __( 'Invalid AI session input payload.' ) );
+	}
 	return {
 		prompt: parsed.prompt,
+		claudeContext: parsed.claudeContext,
 		turnId: parsed.turnId,
+		runId: parsed.runId,
+		claudeSelection: parsed.claudeSelection,
 		displayMessage: parsed.displayMessage,
 		images,
-		files: validateStudioChatFiles( parsed.files ),
-		visualAnnotations: validateStudioVisualAnnotations( parsed.visualAnnotations, images ),
+		files,
+		visualAnnotations,
 	};
 }
 
 export async function runCommand(
 	sessionIdOrPrefix?: string,
 	options: {
+		approveClaude?: ClaudeApprover;
+		askClaude?: ClaudeQuestionAsker;
 		message?: string;
 		displayMessage?: string;
 		inputPayloadPath?: string;
 		json?: boolean;
 	} = {}
 ): Promise< void > {
-	let resolvedSessionIdOrPrefix = sessionIdOrPrefix?.trim();
+	const startup = new AbortController();
+	const onMessage = ( message: unknown ) => {
+		if (
+			message &&
+			typeof message === 'object' &&
+			'type' in message &&
+			message.type === 'interrupt'
+		)
+			startup.abort();
+	};
+	const onDisconnect = () => startup.abort();
+	process.on( 'message', onMessage );
+	process.on( 'disconnect', onDisconnect );
+	try {
+		let resolvedSessionIdOrPrefix = sessionIdOrPrefix?.trim();
 
-	if ( ! resolvedSessionIdOrPrefix ) {
-		const selectedSession = await chooseSessionForAction(
-			__( 'Select a session to resume:' ),
-			__( 'No code sessions found' )
-		);
-		if ( ! selectedSession ) {
-			return;
+		if ( ! resolvedSessionIdOrPrefix ) {
+			const selectedSession = await chooseSessionForAction(
+				__( 'Select a session to resume:' ),
+				__( 'No code sessions found' )
+			);
+			if ( ! selectedSession ) {
+				return;
+			}
+
+			resolvedSessionIdOrPrefix = selectedSession.id;
 		}
 
-		resolvedSessionIdOrPrefix = selectedSession.id;
-	}
+		if ( resolvedSessionIdOrPrefix.toLowerCase() === 'latest' ) {
+			const sessions = await listAiSessions( getSessionsDirectory() );
+			if ( sessions.length === 0 ) {
+				throw new Error( __( 'No code sessions found' ) );
+			}
 
-	if ( resolvedSessionIdOrPrefix.toLowerCase() === 'latest' ) {
-		const sessions = await listAiSessions( getSessionsDirectory() );
-		if ( sessions.length === 0 ) {
-			throw new Error( __( 'No code sessions found' ) );
+			resolvedSessionIdOrPrefix = sessions[ 0 ].id;
 		}
 
-		resolvedSessionIdOrPrefix = sessions[ 0 ].id;
+		const session = await loadAiSession( getSessionsDirectory(), resolvedSessionIdOrPrefix );
+		const adapter: AiOutputAdapter = options.json ? new JsonAdapter() : new AiChatUI();
+		const inputPayload = options.inputPayloadPath
+			? await readInputPayload( options.inputPayloadPath )
+			: undefined;
+
+		// JSON-mode resume has no replay loop (that only runs for AiChatUI), so the
+		// active site would stay null and the agent would fall back to local tools
+		// even if the session was flipped to live. Hydrate it explicitly from the
+		// event log instead.
+		const resolvedSite =
+			adapter instanceof JsonAdapter ? resolveActiveSiteFromEntries( session.entries ) : undefined;
+
+		await runAiCommand( {
+			adapter,
+			approveClaude: options.approveClaude,
+			askClaude: options.askClaude,
+			startupSignal: startup.signal,
+			resumeSession: session,
+			initialMessage: inputPayload?.prompt ?? options.message,
+			initialTurnId: inputPayload?.turnId,
+			initialRunId: inputPayload?.runId,
+			claudeSelection: inputPayload?.claudeSelection,
+			claudeContext: inputPayload?.claudeContext,
+			initialDisplayMessage: inputPayload?.displayMessage ?? options.displayMessage,
+			initialImages: inputPayload?.images,
+			initialFiles: inputPayload?.files,
+			initialVisualAnnotations: inputPayload?.visualAnnotations,
+			activeSite: resolvedSite,
+		} );
+	} finally {
+		process.off( 'message', onMessage );
+		process.off( 'disconnect', onDisconnect );
 	}
-
-	const session = await loadAiSession( getSessionsDirectory(), resolvedSessionIdOrPrefix );
-	const adapter: AiOutputAdapter = options.json ? new JsonAdapter() : new AiChatUI();
-	const inputPayload = options.inputPayloadPath
-		? await readInputPayload( options.inputPayloadPath )
-		: undefined;
-
-	// JSON-mode resume has no replay loop (that only runs for AiChatUI), so the
-	// active site would stay null and the agent would fall back to local tools
-	// even if the session was flipped to live. Hydrate it explicitly from the
-	// event log instead.
-	const resolvedSite =
-		adapter instanceof JsonAdapter ? resolveActiveSiteFromEntries( session.entries ) : undefined;
-
-	await runAiCommand( {
-		adapter,
-		resumeSession: session,
-		initialMessage: inputPayload?.prompt ?? options.message,
-		initialTurnId: inputPayload?.turnId,
-		initialDisplayMessage: inputPayload?.displayMessage ?? options.displayMessage,
-		initialImages: inputPayload?.images,
-		initialFiles: inputPayload?.files,
-		initialVisualAnnotations: inputPayload?.visualAnnotations,
-		activeSite: resolvedSite,
-	} );
 }
 
 const logger = new Logger< string >();
@@ -137,6 +178,8 @@ export const registerCommand = ( yargs: StudioArgv ) => {
 					json?: boolean;
 				};
 				await runCommand( typedArgv.id, {
+					approveClaude: typedArgv.json ? undefined : getTerminalClaudeApprover(),
+					askClaude: typedArgv.json ? undefined : getTerminalClaudeQuestionAsker(),
 					message: typedArgv.message,
 					displayMessage: typedArgv.displayMessage,
 					inputPayloadPath: typedArgv.inputPayload,

@@ -1,0 +1,977 @@
+import { execFile, spawn } from 'child_process';
+import { createHash } from 'crypto';
+import { constants as fsConstants, createReadStream, statSync } from 'fs';
+import { lstat, mkdir, open, realpath, rm, stat } from 'fs/promises';
+import os from 'os';
+import path from 'path';
+import { promisify } from 'util';
+import { linuxAdapter } from './platforms/linux';
+import { macosAdapter } from './platforms/macos';
+import { windowsAdapter } from './platforms/windows';
+import type { BigIntStats } from 'fs';
+import type { PlatformPath } from 'path';
+
+export type ClaudeOs = 'windows' | 'macos' | 'linux';
+export type ClaudeArch = 'x64' | 'arm64';
+export type ClaudePlatformTarget = `${ ClaudeOs }-${ ClaudeArch }`;
+
+/** The OS and architecture Studio runs as: `process.platform` and `process.arch`. */
+export interface ClaudeHost {
+	platform: string;
+	arch: string;
+}
+
+/** The Agent SDK version Studio installs; `packages/agent/package.json` pins the same. */
+export const CLAUDE_AGENT_SDK_VERSION = '0.3.319';
+
+/** How a target proves a selected executable is the vendor's published binary. */
+export type ClaudeBinaryVerification =
+	| 'authenticode'
+	| 'apple-code-signature'
+	| 'signed-manifest-checksum';
+
+/** The vendor's name for a platform in its release manifest (`platforms.<name>`). */
+export type ClaudeVendorPlatform =
+	| 'win32-x64'
+	| 'win32-arm64'
+	| 'darwin-x64'
+	| 'darwin-arm64'
+	| 'linux-x64'
+	| 'linux-arm64';
+
+/**
+ * A behavior Studio relies on that only a native run on the target can
+ * confirm: how the machine-architecture probe answers there, including under
+ * translation, and where macOS keeps managed preferences.
+ */
+export type ClaudeNativeConfirmation =
+	| 'machine-architecture-probe'
+	| 'managed-preferences-locations';
+
+interface ClaudeQualificationFacts {
+	sdkVersion: string;
+	runtimeVersion: string;
+	target: ClaudePlatformTarget;
+	vendorPlatform: ClaudeVendorPlatform;
+	verification: ClaudeBinaryVerification;
+	/** What this target's native qualification run must confirm before the record can be qualified. */
+	confirmationsRequired?: readonly ClaudeNativeConfirmation[];
+	/** Linux only: the C library the qualified binary and host use. */
+	libc?: 'glibc';
+	/**
+	 * Linux only: the binary's SHA-256 from the vendor's release manifest, copied
+	 * here only after the manifest's GPG signature was verified during the
+	 * target's native qualification. Without it a Linux binary cannot be verified.
+	 */
+	manifestSha256?: string;
+}
+
+export type ClaudeQualificationRecord = Readonly<
+	ClaudeQualificationFacts &
+		( { state: 'qualified' } | { state: 'unqualified'; reason: 'no-native-qualification-run' } )
+>;
+
+function record( value: ClaudeQualificationRecord ): ClaudeQualificationRecord {
+	return Object.freeze( {
+		...value,
+		...( value.confirmationsRequired
+			? { confirmationsRequired: Object.freeze( [ ...value.confirmationsRequired ] ) }
+			: {} ),
+	} );
+}
+
+const unqualified = { state: 'unqualified', reason: 'no-native-qualification-run' } as const;
+
+/**
+ * Every SDK/runtime/platform pair Studio knows about. A pair becomes qualified
+ * only after its native qualification run passes on that platform.
+ */
+export const CLAUDE_QUALIFICATION_MATRIX: readonly ClaudeQualificationRecord[] = Object.freeze( [
+	record( {
+		sdkVersion: '0.3.319',
+		runtimeVersion: '2.1.319',
+		target: 'windows-x64',
+		vendorPlatform: 'win32-x64',
+		verification: 'authenticode',
+		state: 'qualified',
+	} ),
+	record( {
+		sdkVersion: '0.3.319',
+		runtimeVersion: '2.1.319',
+		target: 'windows-arm64',
+		vendorPlatform: 'win32-arm64',
+		verification: 'authenticode',
+		confirmationsRequired: [ 'machine-architecture-probe' ],
+		...unqualified,
+	} ),
+	record( {
+		sdkVersion: '0.3.319',
+		runtimeVersion: '2.1.319',
+		target: 'macos-x64',
+		vendorPlatform: 'darwin-x64',
+		verification: 'apple-code-signature',
+		confirmationsRequired: [ 'machine-architecture-probe', 'managed-preferences-locations' ],
+		...unqualified,
+	} ),
+	record( {
+		sdkVersion: '0.3.319',
+		runtimeVersion: '2.1.319',
+		target: 'macos-arm64',
+		vendorPlatform: 'darwin-arm64',
+		verification: 'apple-code-signature',
+		confirmationsRequired: [ 'machine-architecture-probe', 'managed-preferences-locations' ],
+		...unqualified,
+	} ),
+	record( {
+		sdkVersion: '0.3.319',
+		runtimeVersion: '2.1.319',
+		target: 'linux-x64',
+		vendorPlatform: 'linux-x64',
+		verification: 'signed-manifest-checksum',
+		libc: 'glibc',
+		confirmationsRequired: [ 'machine-architecture-probe' ],
+		...unqualified,
+	} ),
+	record( {
+		sdkVersion: '0.3.319',
+		runtimeVersion: '2.1.319',
+		target: 'linux-arm64',
+		vendorPlatform: 'linux-arm64',
+		verification: 'signed-manifest-checksum',
+		libc: 'glibc',
+		confirmationsRequired: [ 'machine-architecture-probe' ],
+		...unqualified,
+	} ),
+] );
+
+const OS_BY_PLATFORM: Readonly< Record< string, ClaudeOs > > = Object.freeze( {
+	win32: 'windows',
+	darwin: 'macos',
+	linux: 'linux',
+} );
+
+export function claudePlatformTarget( host: ClaudeHost ): ClaudePlatformTarget | undefined {
+	const os = Object.prototype.hasOwnProperty.call( OS_BY_PLATFORM, host.platform )
+		? OS_BY_PLATFORM[ host.platform ]
+		: undefined;
+	if ( ! os || ( host.arch !== 'x64' && host.arch !== 'arm64' ) ) return;
+	return `${ os }-${ host.arch }`;
+}
+
+export type ClaudeQualificationReason =
+	| 'platform-unsupported'
+	| 'platform-unqualified'
+	| 'sdk-unqualified'
+	| 'version-unqualified';
+
+export type ClaudeQualificationResult =
+	| { state: 'qualified'; record: ClaudeQualificationRecord }
+	| {
+			state: 'unqualified';
+			reason: ClaudeQualificationReason;
+			/** For `platform-unqualified`: the target's record and why it is unqualified. */
+			record?: ClaudeQualificationRecord;
+			/** The runtime versions qualified for this target and SDK. */
+			supportedRuntimeVersions: string[];
+	  };
+
+export function qualifyClaudeRuntime( input: {
+	target: ClaudePlatformTarget | undefined;
+	runtimeVersion: string | undefined;
+	sdkVersion: string;
+} ): ClaudeQualificationResult {
+	const { target, runtimeVersion, sdkVersion } = input;
+	if ( ! target )
+		return { state: 'unqualified', reason: 'platform-unsupported', supportedRuntimeVersions: [] };
+	const records = CLAUDE_QUALIFICATION_MATRIX.filter( ( item ) => item.target === target );
+	const qualified = records.filter( ( item ) => item.state === 'qualified' );
+	if ( ! qualified.length )
+		return {
+			state: 'unqualified',
+			reason: 'platform-unqualified',
+			record:
+				records.find(
+					( item ) => item.sdkVersion === sdkVersion && item.runtimeVersion === runtimeVersion
+				) ?? records[ 0 ],
+			supportedRuntimeVersions: [],
+		};
+	const forSdk = qualified.filter( ( item ) => item.sdkVersion === sdkVersion );
+	const supportedRuntimeVersions = [
+		...new Set( ( forSdk.length ? forSdk : qualified ).map( ( item ) => item.runtimeVersion ) ),
+	];
+	if ( ! forSdk.length )
+		return { state: 'unqualified', reason: 'sdk-unqualified', supportedRuntimeVersions };
+	const match = forSdk.find( ( item ) => item.runtimeVersion === runtimeVersion );
+	if ( ! match )
+		return { state: 'unqualified', reason: 'version-unqualified', supportedRuntimeVersions };
+	return { state: 'qualified', record: match };
+}
+
+/**
+ * Whether the experimental Claude surface is offered: the flag is on and the
+ * host is one of the matrix's targets. Qualification is decided per executable.
+ */
+export function isClaudeRuntimeSurfaceEnabled( host: ClaudeHost, env: NodeJS.ProcessEnv ): boolean {
+	return env.STUDIO_EXPERIMENTAL_CLAUDE_CODE === '1' && !! claudePlatformTarget( host );
+}
+
+export function currentClaudeHost(): ClaudeHost {
+	return { platform: process.platform, arch: process.arch };
+}
+
+export type ClaudeExecutableFormat = 'pe' | 'mach-o' | 'mach-o-universal' | 'elf';
+
+/** What a binary's header says about it, before anything runs it. */
+export interface ClaudeBinaryHeader {
+	format: ClaudeExecutableFormat;
+	/** The architectures it has code for; empty when none Studio knows. */
+	architectures: ClaudeArch[];
+	/** ELF only: the C library its program interpreter belongs to. */
+	libc?: 'glibc' | 'musl' | 'static' | 'unknown';
+}
+
+export type ClaudeByteReader = ( position: number, length: number ) => Promise< Buffer >;
+
+export interface ClaudeFileStat {
+	kind: 'file' | 'directory' | 'symlink' | 'other';
+	size: number;
+	device: string;
+	inode: string;
+	/** Modification and status-change times, as nanosecond strings. */
+	modified: string;
+	changed: string;
+	/** Whether any execute permission bit is set (always true where the OS has none). */
+	executable: boolean;
+}
+
+/** The filesystem as platform code sees it, so other OSes' layouts can be simulated. */
+export interface ClaudeFileAccess {
+	realpath( target: string ): Promise< string >;
+	stat( target: string ): Promise< ClaudeFileStat >;
+	lstat( target: string ): Promise< ClaudeFileStat >;
+	statSync( target: string ): ClaudeFileStat;
+	read( target: string, position: number, length: number ): Promise< Buffer >;
+	sha256( target: string ): Promise< string >;
+}
+
+/** Runs a native command without a shell and returns its output; it rejects on a non-zero exit. */
+export type ClaudeCommandRunner = (
+	file: string,
+	args: string[],
+	options: {
+		env: NodeJS.ProcessEnv;
+		timeout: number;
+		windowsHide: boolean;
+		maxBuffer?: number;
+		cwd?: string;
+	}
+) => Promise< { stdout: string } >;
+
+/** Starts a long-lived program without a shell or waiting for it, settling once it has started. */
+export type ClaudeDetachedLauncher = (
+	file: string,
+	args: string[],
+	options: { env: NodeJS.ProcessEnv; cwd: string }
+) => Promise< void >;
+
+/** Everything platform code reads from or does to the machine, injectable for tests. */
+export interface ClaudePlatformSeams {
+	host: ClaudeHost;
+	env: NodeJS.ProcessEnv;
+	files: ClaudeFileAccess;
+	run: ClaudeCommandRunner;
+	launchDetached: ClaudeDetachedLauncher;
+	findOnPath( command: string ): string | null;
+	username(): string;
+	hostLibc(): 'glibc' | 'musl' | 'unknown';
+	/** The kernel's machine name, `uname -m` (`os.machine()`). */
+	osMachine(): string;
+	/** The per-user temporary directory (`os.tmpdir()`). */
+	tempDirectory(): string;
+	/**
+	 * Creates the script's directory, mode 0700, failing if anything is at that
+	 * path, then the script inside it, mode 0700 and also exclusively.
+	 */
+	writePrivateScript( script: ClaudePrivateScript ): Promise< void >;
+	removePrivateScript( directory: string ): Promise< void >;
+	/**
+	 * The hardware architecture under Studio's process, from the OS's own probe,
+	 * or undefined when it cannot be established. It differs from `host.arch`
+	 * when the process runs translated.
+	 */
+	machineArchitecture(): Promise< ClaudeArch | undefined >;
+}
+
+/** Why the machine under Studio's process rules out every target. */
+export type ClaudeHostCheck = 'process-translated' | 'machine-architecture-unknown';
+
+export interface ClaudeHostFinding {
+	check: ClaudeHostCheck;
+	/** The architecture Studio's process was built for. */
+	processArchitecture: string;
+	/** The hardware architecture, where the probe established it. */
+	machineArchitecture?: ClaudeArch;
+}
+
+/** The file inspection qualified: what sign-in and execution check again before using it. */
+export interface ClaudeExecutableIdentity {
+	path: string;
+	size: number;
+	device: string;
+	inode: string;
+	modified: string;
+	changed: string;
+	sha256: string;
+}
+
+export interface ClaudeProvenance {
+	verification: ClaudeBinaryVerification;
+	vendorPlatform?: ClaudeVendorPlatform;
+	/** The signer the platform's code signature names. */
+	signer?: string;
+	libc?: 'glibc';
+	/** For a manifest checksum: the release the matching manifest describes. */
+	manifestRuntimeVersion?: string;
+}
+
+export type ClaudeBinaryVerificationResult =
+	| { ok: true; provenance: ClaudeProvenance }
+	| { ok: false; reason: 'signature-invalid' | 'signature-unverifiable' | 'libc-unsupported' };
+
+export interface ClaudeBinaryVerificationInput {
+	executablePath: string;
+	sha256: string;
+	header: ClaudeBinaryHeader;
+	/** The matrix records for the host's target. */
+	records: readonly ClaudeQualificationRecord[];
+	/** The minimal environment any helper command runs with. */
+	env: NodeJS.ProcessEnv;
+}
+
+/** What differs between Windows, macOS and Linux. */
+export interface ClaudePlatformAdapter {
+	readonly os: ClaudeOs;
+	readonly path: PlatformPath;
+	/** Whether the OS has execute permission bits a native executable must carry. */
+	readonly requiresExecutePermission: boolean;
+	/** The only inherited variables a native Claude process receives. */
+	readonly environment: ClaudeEnvironmentRules;
+	/** Whether a selected path can name a native executable at all, before touching the file. */
+	isSelectablePath( selected: string ): boolean;
+	readBinaryHeader( read: ClaudeByteReader ): Promise< ClaudeBinaryHeader | undefined >;
+	/**
+	 * The hardware architecture, from a probe that an emulated or translated
+	 * process cannot mistake for its own; undefined when the answer is not one
+	 * Studio knows. It may throw.
+	 */
+	probeMachineArchitecture( seams: ClaudePlatformSeams ): Promise< ClaudeArch | undefined >;
+	/** Proves the binary is the vendor's published one, without running it. */
+	verifyBinary(
+		input: ClaudeBinaryVerificationInput,
+		seams: ClaudePlatformSeams
+	): Promise< ClaudeBinaryVerificationResult >;
+	/** Looks for the vendor's documented managed policy sources, never reading their contents. */
+	inspectManagedPolicy( seams: ClaudePlatformSeams ): Promise< ClaudeManagedPolicyFinding >;
+	/**
+	 * How to open the vendor's own command in a real interactive terminal,
+	 * passing every path as a separate argument and never through a shell
+	 * string Studio builds; or why the user has to act instead.
+	 */
+	planSignIn(
+		request: ClaudeSignInRequest,
+		seams: ClaudePlatformSeams
+	): Promise< ClaudeSignInPlan >;
+	/** Whether this OS can confine shell commands in an OS-level sandbox, from the vendor's sources. */
+	readonly shellSandbox: ClaudeShellSandboxFact;
+}
+
+export interface ClaudeSignInRequest {
+	/** The inspected executable's real path. */
+	executablePath: string;
+	/** The vendor's own subcommand, `auth login`. */
+	args: readonly string[];
+	cwd: string;
+	/** The allowlisted environment, with the selected configuration directory. */
+	env: NodeJS.ProcessEnv;
+}
+
+/**
+ * A POSIX sh script in a fresh directory of its own, at a path made only of
+ * characters no shell treats specially, so a terminal's login shell is asked
+ * to parse nothing that came from the user.
+ */
+export interface ClaudePrivateScript {
+	directory: string;
+	path: string;
+	contents: string;
+}
+
+export interface ClaudeSignInLaunch {
+	/** `run` waits for a launcher that returns once the window is open; `detached` starts a terminal. */
+	mode: 'run' | 'detached';
+	file: string;
+	args: string[];
+	env: NodeJS.ProcessEnv;
+	cwd: string;
+	/** Written right before launch; it removes itself when it runs, or Studio removes it if launch fails. */
+	script?: ClaudePrivateScript;
+}
+
+/** Why sign-in cannot open a terminal here, so the user must run the vendor's login themselves. */
+export type ClaudeSignInActionReason =
+	| 'no-interactive-desktop'
+	| 'no-display'
+	| 'no-terminal'
+	| 'no-browser'
+	| 'terminal-permission-denied'
+	| 'executable-path-unsupported';
+
+export type ClaudeSignInPlan =
+	| { state: 'ready'; launch: ClaudeSignInLaunch }
+	| { state: 'user-action-needed'; reason: ClaudeSignInActionReason };
+
+export type ClaudeSignInResult =
+	| { state: 'launched' }
+	| { state: 'user-action-needed'; reason: ClaudeSignInActionReason };
+
+export async function planClaudeSignIn(
+	request: ClaudeSignInRequest,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudeSignInPlan > {
+	const seams = defaultClaudePlatformSeams( overrides );
+	const adapter = selectClaudePlatformAdapter( seams.host );
+	if ( ! adapter ) throw new Error( 'Claude sign-in is not supported on this platform' );
+	return adapter.planSignIn( request, seams );
+}
+
+// AppleScript's error when the user has not let Studio control Terminal.
+const APPLE_EVENTS_DENIED = '(-1743)';
+
+export async function executeClaudeSignIn(
+	launch: ClaudeSignInLaunch,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudeSignInResult > {
+	const seams = defaultClaudePlatformSeams( overrides );
+	const { script } = launch;
+	if ( script ) await seams.writePrivateScript( script );
+	try {
+		if ( launch.mode === 'detached' )
+			await seams.launchDetached( launch.file, launch.args, { env: launch.env, cwd: launch.cwd } );
+		else
+			await seams.run( launch.file, launch.args, {
+				env: launch.env,
+				cwd: launch.cwd,
+				timeout: 30000,
+				windowsHide: true,
+			} );
+	} catch ( error ) {
+		if ( script ) await seams.removePrivateScript( script.directory ).catch( () => {} );
+		const detail = `${ ( error as { stderr?: unknown } ).stderr ?? '' }`;
+		if ( launch.mode === 'run' && detail.includes( APPLE_EVENTS_DENIED ) )
+			return { state: 'user-action-needed', reason: 'terminal-permission-denied' };
+		throw error;
+	}
+	return { state: 'launched' };
+}
+
+/**
+ * Plain data for choosing a shell confinement: whether the vendor runtime can
+ * sandbox shell commands on an OS, what it needs, and where that is stated.
+ * Nothing reads this to enable a tool.
+ */
+export interface ClaudeShellSandboxFact {
+	readonly available: boolean;
+	readonly mechanism?: 'seatbelt' | 'bubblewrap';
+	/** System packages the vendor documents as required. */
+	readonly requires: readonly string[];
+	/** Additions the vendor documents as optional. */
+	readonly optional: readonly string[];
+	/** Documented conditions that stop it or weaken it. */
+	readonly limitations: readonly string[];
+	readonly sources: readonly string[];
+}
+
+export function claudeShellSandbox( host: ClaudeHost ): ClaudeShellSandboxFact | undefined {
+	return selectClaudePlatformAdapter( host )?.shellSandbox;
+}
+
+/** A place the vendor documents for organization-managed Claude Code policy. */
+export interface ClaudeManagedPolicySource {
+	kind: 'settings-file' | 'settings-directory' | 'mcp-file' | 'registry' | 'managed-preferences';
+	scope: 'machine' | 'user';
+	location: string;
+}
+
+/**
+ * Whether managed policy applies here. Studio cannot tell what a policy would
+ * allow, so only `absent` lets it run; `unverifiable` means a location could
+ * not be checked.
+ */
+export interface ClaudeManagedPolicyFinding {
+	state: 'absent' | 'present' | 'unverifiable';
+	present: ClaudeManagedPolicySource[];
+	unreadable: ClaudeManagedPolicySource[];
+	checked: ClaudeManagedPolicySource[];
+}
+
+export async function inspectClaudeManagedPolicy(
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudeManagedPolicyFinding > {
+	const seams = defaultClaudePlatformSeams( overrides );
+	const adapter = selectClaudePlatformAdapter( seams.host );
+	const unverifiable: ClaudeManagedPolicyFinding = {
+		state: 'unverifiable',
+		present: [],
+		unreadable: [],
+		checked: [],
+	};
+	if ( ! adapter ) return unverifiable;
+	try {
+		return await adapter.inspectManagedPolicy( seams );
+	} catch {
+		return unverifiable;
+	}
+}
+
+export interface ClaudeEnvironmentRules {
+	/** Variable names passed through, upper-case where names ignore case. */
+	readonly allowed: readonly string[];
+	/** Whether the OS treats `Path` and `PATH` as one variable. */
+	readonly caseInsensitiveNames: boolean;
+}
+
+export function selectClaudePlatformAdapter( host: ClaudeHost ): ClaudePlatformAdapter | undefined {
+	const target = claudePlatformTarget( host );
+	if ( ! target ) return;
+	if ( target.startsWith( 'windows-' ) ) return windowsAdapter;
+	if ( target.startsWith( 'macos-' ) ) return macosAdapter;
+	return linuxAdapter;
+}
+
+/** The environment rules for an OS; any other Unix gets Linux's, the strictest session set. */
+export function claudeEnvironmentRules( platform: string ): ClaudeEnvironmentRules {
+	if ( platform === 'win32' ) return windowsAdapter.environment;
+	if ( platform === 'darwin' ) return macosAdapter.environment;
+	return linuxAdapter.environment;
+}
+
+function fileStat( value: BigIntStats ): ClaudeFileStat {
+	let kind: ClaudeFileStat[ 'kind' ] = 'other';
+	if ( value.isFile() ) kind = 'file';
+	else if ( value.isDirectory() ) kind = 'directory';
+	else if ( value.isSymbolicLink() ) kind = 'symlink';
+	return {
+		kind,
+		size: Number( value.size ),
+		device: value.dev.toString(),
+		inode: value.ino.toString(),
+		modified: value.mtimeNs.toString(),
+		changed: value.ctimeNs.toString(),
+		executable: process.platform === 'win32' || ( Number( value.mode ) & 0o111 ) !== 0,
+	};
+}
+
+const nodeFiles: ClaudeFileAccess = {
+	realpath: ( target ) => realpath( target ),
+	stat: async ( target ) => fileStat( await stat( target, { bigint: true } ) ),
+	lstat: async ( target ) => fileStat( await lstat( target, { bigint: true } ) ),
+	statSync: ( target ) => fileStat( statSync( target, { bigint: true } ) ),
+	async read( target, position, length ) {
+		const handle = await open( target, 'r' );
+		try {
+			const buffer = Buffer.alloc( length );
+			const { bytesRead } = await handle.read( buffer, 0, length, position );
+			return buffer.subarray( 0, bytesRead );
+		} finally {
+			await handle.close();
+		}
+	},
+	sha256: ( target ) =>
+		new Promise( ( resolve, reject ) => {
+			const hash = createHash( 'sha256' );
+			createReadStream( target )
+				.on( 'error', reject )
+				.on( 'data', ( chunk ) => hash.update( chunk ) )
+				.on( 'end', () => resolve( hash.digest( 'hex' ) ) );
+		} ),
+};
+
+const execFileAsync = promisify( execFile );
+
+const nodeRun: ClaudeCommandRunner = async ( file, args, options ) => {
+	const { stdout } = await execFileAsync( file, args, { ...options, encoding: 'utf8' } );
+	return { stdout };
+};
+
+const nodeLaunchDetached: ClaudeDetachedLauncher = ( file, args, options ) =>
+	new Promise( ( resolve, reject ) => {
+		const child = spawn( file, args, {
+			cwd: options.cwd,
+			env: options.env,
+			detached: true,
+			stdio: 'ignore',
+		} );
+		child.once( 'error', reject );
+		child.once( 'spawn', () => {
+			child.unref();
+			resolve();
+		} );
+	} );
+
+function findOnSearchPath( command: string, env: NodeJS.ProcessEnv ): string | null {
+	for ( const directory of ( env.PATH ?? '' ).split( path.posix.delimiter ) ) {
+		if ( ! path.posix.isAbsolute( directory ) ) continue;
+		const candidate = path.posix.join( directory, command );
+		try {
+			const found = statSync( candidate );
+			if ( found.isFile() && ( found.mode & 0o111 ) !== 0 ) return candidate;
+		} catch {
+			// Not in this directory.
+		}
+	}
+	return null;
+}
+
+let libc: 'glibc' | 'musl' | 'unknown' | undefined;
+function nodeHostLibc(): 'glibc' | 'musl' | 'unknown' {
+	if ( libc ) return libc;
+	const header = ( process.report?.getReport() as { header?: { glibcVersionRuntime?: string } } )
+		?.header;
+	libc = header?.glibcVersionRuntime ? 'glibc' : 'unknown';
+	return libc;
+}
+
+// mkdir fails on anything already at the path, a symlink included, and
+// O_CREAT | O_EXCL never follows one, so nothing planted there is written through.
+async function writePrivateScript( script: ClaudePrivateScript ): Promise< void > {
+	await mkdir( script.directory, { mode: 0o700 } );
+	try {
+		const handle = await open(
+			script.path,
+			fsConstants.O_WRONLY |
+				fsConstants.O_CREAT |
+				fsConstants.O_EXCL |
+				( fsConstants.O_NOFOLLOW ?? 0 ),
+			0o700
+		);
+		try {
+			await handle.writeFile( script.contents, 'utf8' );
+		} finally {
+			await handle.close();
+		}
+	} catch ( error ) {
+		await rm( script.directory, { recursive: true, force: true } ).catch( () => {} );
+		throw error;
+	}
+}
+
+async function probeMachine( seams: ClaudePlatformSeams ): Promise< ClaudeArch | undefined > {
+	const adapter = selectClaudePlatformAdapter( seams.host );
+	try {
+		return await adapter?.probeMachineArchitecture( seams );
+	} catch {
+		return undefined;
+	}
+}
+
+// The machine does not change while Studio runs, so this process's first
+// established answer is kept; a failed probe is tried again next time.
+let thisMachine: Promise< ClaudeArch | undefined > | undefined;
+function probeThisMachine( seams: ClaudePlatformSeams ): Promise< ClaudeArch | undefined > {
+	thisMachine ??= probeMachine( seams ).then( ( architecture ) => {
+		if ( ! architecture ) thisMachine = undefined;
+		return architecture;
+	} );
+	return thisMachine;
+}
+
+export function defaultClaudePlatformSeams(
+	overrides: Partial< ClaudePlatformSeams > = {}
+): ClaudePlatformSeams {
+	const env = overrides.env ?? process.env;
+	const real = ! overrides.host && ! overrides.env && ! overrides.run && ! overrides.osMachine;
+	const seams: ClaudePlatformSeams = {
+		host: currentClaudeHost(),
+		env,
+		files: nodeFiles,
+		run: nodeRun,
+		launchDetached: nodeLaunchDetached,
+		findOnPath: ( command ) => findOnSearchPath( command, env ),
+		username: () => {
+			try {
+				return os.userInfo().username;
+			} catch {
+				return env.USER ?? '';
+			}
+		},
+		hostLibc: nodeHostLibc,
+		osMachine: () => os.machine(),
+		tempDirectory: () => os.tmpdir(),
+		writePrivateScript,
+		removePrivateScript: ( directory ) => rm( directory, { recursive: true, force: true } ),
+		...overrides,
+		machineArchitecture:
+			overrides.machineArchitecture ??
+			( () => ( real ? probeThisMachine( seams ) : probeMachine( seams ) ) ),
+	};
+	return seams;
+}
+
+/**
+ * The hardware architecture under Studio's process, from the OS's own probe:
+ * IsWow64Process2 on Windows, `hw.optional.arm64` on macOS and uname on
+ * Linux. Undefined when it cannot be established.
+ */
+export function probeClaudeMachineArchitecture(
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudeArch | undefined > {
+	return defaultClaudePlatformSeams( overrides ).machineArchitecture();
+}
+
+/**
+ * The target the machine itself is: the process's own target when it runs
+ * natively; otherwise the finding that rules every target out, with the
+ * machine's target where the probe established it.
+ */
+export async function resolveClaudeMachineTarget(
+	seams: ClaudePlatformSeams
+): Promise<
+	| { ok: true; target: ClaudePlatformTarget }
+	| { ok: false; host: ClaudeHostFinding; target?: ClaudePlatformTarget }
+> {
+	const machine = await seams.machineArchitecture().catch( () => undefined );
+	const processArchitecture = seams.host.arch;
+	if ( ! machine )
+		return { ok: false, host: { check: 'machine-architecture-unknown', processArchitecture } };
+	const target = claudePlatformTarget( { platform: seams.host.platform, arch: machine } );
+	if ( machine !== processArchitecture || ! target )
+		return {
+			ok: false,
+			host: { check: 'process-translated', processArchitecture, machineArchitecture: machine },
+			target,
+		};
+	return { ok: true, target };
+}
+
+function sameFile( identity: ClaudeExecutableIdentity, current: ClaudeFileStat ): boolean {
+	return (
+		current.kind === 'file' &&
+		current.size === identity.size &&
+		current.device === identity.device &&
+		current.inode === identity.inode &&
+		current.modified === identity.modified &&
+		current.changed === identity.changed
+	);
+}
+
+/**
+ * Whether the file inspection qualified is still there unchanged, judged by
+ * metadata alone so it can run synchronously right before a process is spawned.
+ */
+export function isClaudeExecutableUnchanged(
+	identity: ClaudeExecutableIdentity,
+	files: ClaudeFileAccess = nodeFiles
+): boolean {
+	try {
+		return sameFile( identity, files.statSync( identity.path ) );
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Whether the selected path still resolves to the file inspection qualified,
+ * with the same metadata and, unless `content` is false, the same contents.
+ */
+export async function verifyClaudeExecutableIdentity(
+	identity: ClaudeExecutableIdentity,
+	options: { selectedPath?: string; files?: ClaudeFileAccess; content?: boolean } = {}
+): Promise< boolean > {
+	const files = options.files ?? nodeFiles;
+	try {
+		if (
+			options.selectedPath !== undefined &&
+			( await files.realpath( options.selectedPath ) ) !== identity.path
+		)
+			return false;
+		if ( ! sameFile( identity, await files.stat( identity.path ) ) ) return false;
+		if ( options.content === false ) return true;
+		if ( ( await files.sha256( identity.path ) ) !== identity.sha256 ) return false;
+		return sameFile( identity, await files.stat( identity.path ) );
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The distinct non-empty values an environment gives a variable. Windows names
+ * ignore case, so `Path` and `PATH` are one variable there; elsewhere only the
+ * exact name counts.
+ */
+export function claudeEnvironmentValues(
+	env: NodeJS.ProcessEnv,
+	name: string,
+	host: ClaudeHost = currentClaudeHost()
+): string[] {
+	const values = Object.entries( env )
+		.filter(
+			( [ key, value ] ) =>
+				!! value && ( host.platform === 'win32' ? key.toUpperCase() === name : key === name )
+		)
+		.map( ( [ , value ] ) => value as string );
+	return [ ...new Set( values ) ];
+}
+
+export function claudePathModule( host: ClaudeHost ): PlatformPath {
+	return host.platform === 'win32' ? path.win32 : path.posix;
+}
+
+/** A path's identity on its filesystem, for comparisons that must not collapse distinct folders. */
+export interface ClaudePathKey {
+	/** The deepest existing ancestor, resolved through symlinks, with the rest of the path appended. */
+	canonical: string;
+	/** That ancestor's device and inode, or its folded canonical text where the filesystem has no inodes. */
+	anchor: string;
+	/** The part of the path that does not exist yet, folded when its volume ignores case. */
+	rest: string;
+	caseSensitive: boolean;
+	caseSource: 'probed' | 'os-default';
+}
+
+const MISSING = new Set( [ 'ENOENT', 'ENOTDIR' ] );
+
+function errorCode( error: unknown ): unknown {
+	return ( error as { code?: unknown } )?.code;
+}
+
+/** Changes the case of each character whose other case is a single character. */
+function mapCase( value: string, change: ( character: string ) => string ): string {
+	return Array.from( value, ( character ) => {
+		const changed = change( character );
+		return changed.length === character.length ? changed : character;
+	} ).join( '' );
+}
+
+function foldCase( value: string, host: ClaudeHost ): string {
+	// APFS also ignores Unicode normalization; NTFS does not.
+	return mapCase( host.platform === 'darwin' ? value.normalize( 'NFC' ) : value, ( character ) =>
+		character.toLowerCase()
+	);
+}
+
+/** Whether two texts name the same path on a volume with the given case sensitivity. */
+export function isSameClaudePathText(
+	a: string,
+	b: string,
+	caseSensitive: boolean,
+	host: ClaudeHost = currentClaudeHost()
+): boolean {
+	const pathModule = claudePathModule( host );
+	const left = pathModule.normalize( a );
+	const right = pathModule.normalize( b );
+	return caseSensitive ? left === right : foldCase( left, host ) === foldCase( right, host );
+}
+
+/**
+ * Asks the filesystem whether the volume holding `existing` ignores case: it
+ * looks up a name next to it with its letters' case swapped. Linux is never
+ * folded: its filesystems are case-sensitive apart from opt-in casefold
+ * folders, where existing aliases still resolve to one device and inode.
+ */
+async function probeCaseSensitivity(
+	existing: string,
+	host: ClaudeHost,
+	files: ClaudeFileAccess
+): Promise< Pick< ClaudePathKey, 'caseSensitive' | 'caseSource' > > {
+	if ( host.platform !== 'win32' && host.platform !== 'darwin' )
+		return { caseSensitive: true, caseSource: 'os-default' };
+	const pathModule = claudePathModule( host );
+	let candidate = existing;
+	for (;;) {
+		const name = pathModule.basename( candidate );
+		const swapped = mapCase( name, ( character ) =>
+			character === character.toLowerCase() ? character.toUpperCase() : character.toLowerCase()
+		);
+		if ( name && swapped !== name ) {
+			try {
+				const [ alias, original ] = await Promise.all( [
+					files.stat( pathModule.join( pathModule.dirname( candidate ), swapped ) ),
+					files.stat( candidate ),
+				] );
+				if ( alias.inode !== '0' && original.inode !== '0' )
+					return {
+						caseSensitive: alias.device !== original.device || alias.inode !== original.inode,
+						caseSource: 'probed',
+					};
+				break;
+			} catch ( error ) {
+				if ( MISSING.has( errorCode( error ) as string ) )
+					return { caseSensitive: true, caseSource: 'probed' };
+				break;
+			}
+		}
+		const parent = pathModule.dirname( candidate );
+		if ( parent === candidate ) break;
+		candidate = parent;
+	}
+	// Nothing on the way to the root has a letter to swap, or the filesystem
+	// cannot say: NTFS and APFS ignore case unless formatted otherwise.
+	return { caseSensitive: false, caseSource: 'os-default' };
+}
+
+export async function resolveClaudePathKey(
+	target: string,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< ClaudePathKey > {
+	const { host, files } = defaultClaudePlatformSeams( overrides );
+	const pathModule = claudePathModule( host );
+	let current = pathModule.resolve( target );
+	const missing: string[] = [];
+	for (;;) {
+		let real: string;
+		let found: ClaudeFileStat;
+		try {
+			real = await files.realpath( current );
+			found = await files.stat( real );
+		} catch ( error ) {
+			const parent = pathModule.dirname( current );
+			if ( ! MISSING.has( errorCode( error ) as string ) || parent === current ) throw error;
+			missing.unshift( pathModule.basename( current ) );
+			current = parent;
+			continue;
+		}
+		if ( missing.length && found.kind !== 'directory' )
+			throw Object.assign( new Error( 'Not a directory' ), { code: 'ENOTDIR' } );
+		const { caseSensitive, caseSource } = await probeCaseSensitivity( real, host, files );
+		const fold = ( value: string ) => ( caseSensitive ? value : foldCase( value, host ) );
+		const rest = missing.join( pathModule.sep );
+		return {
+			canonical: rest ? pathModule.join( real, rest ) : real,
+			anchor: found.inode !== '0' ? `${ found.device }:${ found.inode }` : fold( real ),
+			rest: fold( rest ),
+			caseSensitive,
+			caseSource,
+		};
+	}
+}
+
+/**
+ * Whether two paths name the same file or folder: the same device and inode
+ * after symlinks, with any part that does not exist yet compared as the
+ * volume compares names. Anything that cannot be resolved is not the same.
+ */
+export async function isSameClaudePath(
+	a: string,
+	b: string,
+	overrides: Partial< ClaudePlatformSeams > = {}
+): Promise< boolean > {
+	try {
+		const [ left, right ] = await Promise.all( [
+			resolveClaudePathKey( a, overrides ),
+			resolveClaudePathKey( b, overrides ),
+		] );
+		return left.anchor === right.anchor && left.rest === right.rest;
+	} catch {
+		return false;
+	}
+}

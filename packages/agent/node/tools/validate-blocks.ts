@@ -4,6 +4,8 @@ import { generateUnifiedPatch } from '@earendil-works/pi-coding-agent';
 import { Type } from 'typebox';
 import { validateHtmlBlockPolicy } from '@studio/agent/node/block-content-policy';
 import { validateBlocks, type ValidationReportBase } from '@studio/agent/node/block-validator';
+import { readBrowserToolFile, writeBrowserToolFile } from '../claude-code/browser-tool-files';
+import { currentClaudeWebCall } from '../claude-code/web-call';
 import { defineTool, LOCAL_OVERWRITE } from './define-tool';
 import { textResult } from './utils';
 
@@ -63,10 +65,22 @@ export const validateBlocksTool = defineTool(
 			let blockContent: string;
 			let fileName = 'inline content';
 			let filePath: string | undefined;
+			const web = currentClaudeWebCall();
+			let previous: Awaited< ReturnType< typeof readBrowserToolFile > > | undefined;
+			if (
+				web &&
+				( ! web.sitePath ||
+					path.relative( web.sitePath, site.path ) !== '' ||
+					new URL( site.url ).origin !== web.targetOrigin )
+			)
+				throw new Error( 'Validate blocks on the selected local site.' );
 
 			if ( args.filePath ) {
 				filePath = path.resolve( site.path, args.filePath );
-				blockContent = await readFile( filePath, 'utf-8' );
+				if ( web ) previous = await readBrowserToolFile( site.path, filePath );
+				blockContent = previous
+					? previous.bytes.toString( 'utf8' )
+					: await readFile( filePath, 'utf-8' );
 				fileName = filePath.split( path.sep ).slice( -2 ).join( '/' );
 			} else if ( args.content !== undefined ) {
 				blockContent = args.content;
@@ -150,7 +164,17 @@ export const validateBlocksTool = defineTool(
 					const fixedContent = report.proposedFix.fixedContent;
 					const diff = generateUnifiedPatch( fileName, blockContent, fixedContent );
 					if ( filePath ) {
-						await writeFile( filePath, fixedContent, 'utf-8' );
+						if ( web ) {
+							await writeBrowserToolFile(
+								site.path,
+								filePath,
+								fixedContent,
+								() => web.check(),
+								previous
+							);
+						} else {
+							await writeFile( filePath, fixedContent, 'utf-8' );
+						}
 						context.onProgress( `${ fileName }: editor serialization fix applied` );
 						lines.push(
 							'',

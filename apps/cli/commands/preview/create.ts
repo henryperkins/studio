@@ -1,15 +1,14 @@
 import fs from 'fs';
-import os from 'os';
-import path from 'path';
 import { SNAPSHOT_EVENTS } from '@studio/common/lib/cli-events';
 import { PreviewCommandLoggerAction as LoggerAction } from '@studio/common/logger-actions';
 import { type Snapshot } from '@studio/common/types/snapshot';
 import { type SyncSite } from '@studio/common/types/sync';
 import { __, sprintf } from '@wordpress/i18n';
-import { archiveSiteContent, cleanup } from 'cli/lib/archive';
+import { archiveSiteContent } from 'cli/lib/archive';
 import { getSiteByFolder } from 'cli/lib/cli-config/sites';
 import { countSitePreviews, getNextSnapshotSequence } from 'cli/lib/cli-config/snapshots';
 import { emitCliEvent } from 'cli/lib/daemon-client';
+import { preparePreviewArchive } from 'cli/lib/preview-archive';
 import {
 	createPreviewSite,
 	getLivePreviewSite,
@@ -86,10 +85,8 @@ export async function runCommand(
 	name?: string,
 	logger: Logger< LoggerAction > = new Logger< LoggerAction >()
 ): Promise< Snapshot > {
-	const archivePath = path.join(
-		os.tmpdir(),
-		`${ path.basename( siteFolder ) }-${ Date.now() }.zip`
-	);
+	await using archive = await preparePreviewArchive( siteFolder );
+	const archivePath = archive.path;
 	const startedAt = Date.now();
 	let siteId: string | undefined;
 	let snapshot: Snapshot | undefined;
@@ -189,8 +186,6 @@ export async function runCommand(
 		throw error instanceof LoggerError
 			? error
 			: new LoggerError( __( 'Failed to create preview site' ), error );
-	} finally {
-		void cleanup( archivePath );
 	}
 }
 

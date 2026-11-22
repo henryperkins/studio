@@ -4,6 +4,7 @@ import { getBundledNodeBinaryPath, getCliPath } from 'src/storage/paths';
 import type { ActiveAgentRun } from '@studio/agent/protocol/agent-events';
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
+import type { ClaudeSendContext, ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
 import type { StudioVisualAnnotationSummary } from '@studio/agent/protocol/visual-annotations';
 import type { WebContents } from 'electron';
 
@@ -20,6 +21,7 @@ import type { WebContents } from 'electron';
 // runs on the same session (interrupt-then-restart, or a rejected double-send)
 // never clobber each other's routing.
 const runWebContents = new Map< string, WebContents >();
+const claudeRunCleanup = new Map< string, () => void >();
 
 const runManager = createAgentRunManager( {
 	cliBinary: getCliPath(),
@@ -40,12 +42,16 @@ const runManager = createAgentRunManager( {
 		// doesn't linger.
 		if ( output.kind === 'agent' && output.event.event.type === 'run.exited' ) {
 			runWebContents.delete( output.runId );
+			claudeRunCleanup.get( output.runId )?.();
+			claudeRunCleanup.delete( output.runId );
 		}
 	},
 } );
 
 export interface StartAgentRunOptions {
 	turnId?: string;
+	claudeContext?: ClaudeSendContext;
+	claudeSelection?: ClaudeSessionSelection;
 	sessionId: string;
 	prompt: string;
 	displayMessage?: string;
@@ -65,6 +71,8 @@ export function startAgentRun( options: StartAgentRunOptions ): { runId: string 
 		visualAnnotations,
 		webContents,
 		turnId,
+		claudeSelection,
+		claudeContext,
 	} = options;
 	// `startAgentRun` forks the child and returns its id synchronously; the
 	// child's first event arrives async (next tick), so registering the route
@@ -79,21 +87,44 @@ export function startAgentRun( options: StartAgentRunOptions ): { runId: string 
 		files,
 		visualAnnotations,
 		turnId,
+		claudeSelection,
+		claudeContext,
 	} );
 	runWebContents.set( result.runId, webContents );
 	// Abort the run if the window that started it goes away.
-	webContents.once( 'destroyed', () => runManager.interruptAgentRun( result.runId ) );
+	const abort = () => runManager.interruptAgentRun( result.runId );
+	webContents.once( 'destroyed', abort );
+	if ( claudeSelection ) {
+		webContents.once( 'render-process-gone', abort );
+		claudeRunCleanup.set( result.runId, () => {
+			webContents.removeListener( 'destroyed', abort );
+			webContents.removeListener( 'render-process-gone', abort );
+		} );
+		if ( webContents.isDestroyed() ) abort();
+	}
 	return result;
 }
 
-export function listActiveAgentRuns(): ActiveAgentRun[] {
-	return runManager.listActiveAgentRuns();
+export function listActiveAgentRuns( requester?: WebContents ): ActiveAgentRun[] {
+	return runManager
+		.listActiveAgentRuns()
+		.filter(
+			( run ) =>
+				! claudeRunCleanup.has( run.runId ) || runWebContents.get( run.runId ) === requester
+		);
 }
 
-export function interruptAgentRun( runId: string ): void {
+export function interruptAgentRun( runId: string, requester?: WebContents ): void {
+	if ( claudeRunCleanup.has( runId ) && runWebContents.get( runId ) !== requester ) return;
 	runManager.interruptAgentRun( runId );
 }
 
-export function answerAgentRun( runId: string, answers: Record< string, string > ): void {
-	runManager.answerAgentRun( runId, answers );
+export function answerAgentRun(
+	runId: string,
+	answers: Record< string, string >,
+	requester?: WebContents,
+	requestId?: string
+): boolean {
+	if ( claudeRunCleanup.has( runId ) && runWebContents.get( runId ) !== requester ) return false;
+	return runManager.answerAgentRun( runId, answers, requestId );
 }

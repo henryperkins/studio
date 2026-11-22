@@ -4,6 +4,7 @@ import * as path from 'path';
 import { ImportEvents } from '@studio/common/lib/import-export-events';
 import { __, sprintf } from '@wordpress/i18n';
 import * as fse from 'fs-extra';
+import { requirePlainTransferEntry } from 'cli/lib/site-transfer-paths';
 import { LoggerError } from 'cli/logger';
 import { ImportExportEventEmitter } from '../../events';
 import { BackupArchiveInfo } from '../types';
@@ -122,6 +123,7 @@ async function readHeader(
 		);
 	}
 
+	requirePlainTransferEntry( prefix ? prefix + '/' + name : name );
 	return {
 		name,
 		size,

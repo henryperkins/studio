@@ -56,6 +56,30 @@ export function getStagedAnnotations( siteId: string | undefined ) {
 	return getSiteAnnotations( siteId ).notes.filter( isStagedAnnotation );
 }
 
+export function restoreStagedAnnotations( siteId: string, notes: PreviewAnnotation[] ): boolean {
+	const existing = getSiteAnnotations( siteId ).notes;
+	if ( existing.length + notes.length > MAX_VISUAL_ANNOTATIONS ) {
+		toast.info( __( 'Send or delete some annotations before adding more' ), {
+			id: `annotation-limit-${ siteId }`,
+		} );
+		return false;
+	}
+	const lastNumber = Math.max( 0, ...existing.map( ( note ) => note.number ) );
+	update( siteId, ( current ) => ( {
+		...current,
+		notes: [
+			...existing,
+			...notes.map( ( note, index ) => ( {
+				...note,
+				id: crypto.randomUUID(),
+				number: lastNumber + index + 1,
+				staged: true,
+			} ) ),
+		],
+	} ) );
+	return true;
+}
+
 function update( siteId: string, change: ( current: SiteAnnotations ) => SiteAnnotations ) {
 	const current = getSiteAnnotations( siteId );
 	const next = change( current );

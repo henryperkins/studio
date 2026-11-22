@@ -25,6 +25,7 @@ import { ImportExportEventEmitter } from 'cli/lib/import-export/events';
 import { DEFAULT_IMPORTER_OPTIONS, getImporter } from 'cli/lib/import-export/import/import-manager';
 import { getBackupFileType } from 'cli/lib/import-export/utils';
 import { withSiteOperation } from 'cli/lib/site-operations';
+import { checkSiteTransferTree } from 'cli/lib/site-transfer-paths';
 import { keepSqliteIntegrationUpdated } from 'cli/lib/sqlite-integration';
 import { reportSyncActivity } from 'cli/lib/sync-activity';
 import { getTracksOrigin, recordTracksEvent, TRACKS_EVENTS } from 'cli/lib/tracks';
@@ -60,6 +61,7 @@ async function setupWordPressFilesOnly( sitePath: string ): Promise< void > {
 		);
 	}
 
+	await checkSiteTransferTree( sitePath, true );
 	await recursiveCopyDirectory( bundledWpPath, sitePath );
 }
 

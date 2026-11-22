@@ -47,6 +47,82 @@ it( 'adds the declared settings of the core blocks a result shows, from the site
 	expect( await notes( { nameOrPath: 'My Site' } ) ).toEqual( [] );
 } );
 
+it( 'gives the client the text and image blocks, then the work the tool left running, with the MCP App data beside them', async () => {
+	const image = { type: 'image' as const, data: 'aGVsbG8=', mimeType: 'image/png' };
+	const progress: string[] = [];
+	const tool = defineTool(
+		'show_page',
+		'Shows a page.',
+		{},
+		async ( _args, context ) => {
+			context.onProgress( 'Rendering' );
+			progress.push( 'reported' );
+			return {
+				content: [ { type: 'text', text: 'Rendered.' }, image ],
+				_meta: { page: 'for the app' },
+				studioArtifacts: [ { type: 'media', widgetProps: { mediaKind: 'image' } } ],
+				pending: Promise.resolve( 'Finished later.' ),
+			};
+		},
+		{ annotations: READ_ONLY }
+	);
+
+	const served = await runServedTool(
+		cliAgentHost,
+		bindTool( tool, cliAgentHost ),
+		{},
+		createResultNotes()
+	);
+
+	expect( progress ).toEqual( [ 'reported' ] );
+	expect( served ).toEqual( {
+		content: [
+			{ type: 'text', text: 'Rendered.' },
+			image,
+			{ type: 'text', text: 'Finished later.' },
+		],
+		_meta: { page: 'for the app' },
+		isError: false,
+	} );
+} );
+
+it( 'reports a failure, or failed work the tool left running, by its message', async () => {
+	const failing = ( name: string, fail: () => Promise< never > | never, pending?: boolean ) =>
+		bindTool(
+			defineTool(
+				name,
+				'Fails.',
+				{},
+				async () =>
+					pending ? { content: [ { type: 'text', text: 'Started.' } ], pending: fail() } : fail(),
+				{ annotations: READ_ONLY }
+			),
+			cliAgentHost
+		);
+	const serve = ( tool: ReturnType< typeof failing > ) =>
+		runServedTool( cliAgentHost, tool, {}, createResultNotes() );
+
+	expect(
+		await serve(
+			failing( 'thrown', () => {
+				throw new Error( 'The site is not running.' );
+			} )
+		)
+	).toEqual( { content: [ { type: 'text', text: 'The site is not running.' } ], isError: true } );
+	expect(
+		await serve(
+			failing( 'plain', () => {
+				throw 'plain failure';
+			} )
+		)
+	).toEqual( { content: [ { type: 'text', text: 'plain failure' } ], isError: true } );
+	expect(
+		await serve(
+			failing( 'background', () => Promise.reject( new Error( 'Generation failed.' ) ), true )
+		)
+	).toEqual( { content: [ { type: 'text', text: 'Generation failed.' } ], isError: true } );
+} );
+
 it( 'never hands an MCP client the image service account a result was made with', async () => {
 	const tool = defineTool(
 		'make_images',
@@ -71,4 +147,28 @@ it( 'never hands an MCP client the image service account a result was made with'
 	);
 
 	expect( JSON.stringify( served ) ).not.toMatch( /Someone|someone@example|wordpress-com/ );
+} );
+
+it( 'refuses arguments the tool’s schema refuses, naming at most three problems, before the tool runs', async () => {
+	const handler = vi.fn( async () => ( { content: [ { type: 'text' as const, text: 'Ran.' } ] } ) );
+	const tool = defineTool(
+		'show_site',
+		'Shows a site.',
+		{ nameOrPath: Type.String(), a: Type.String(), b: Type.String(), c: Type.String() },
+		handler,
+		{ annotations: READ_ONLY }
+	);
+	const serve = ( args: Record< string, unknown > ) =>
+		runServedTool( cliAgentHost, bindTool( tool, cliAgentHost ), args, createResultNotes() );
+
+	expect( await serve( { nameOrPath: 7, a: 'x', b: 'x', c: 'x' } ) ).toEqual( {
+		content: [
+			{ type: 'text', text: 'Invalid arguments for show_site: /nameOrPath must be string.' },
+		],
+		isError: true,
+	} );
+	const many = await serve( { nameOrPath: 1, a: 2, b: 3, c: 4 } );
+	expect( many.isError ).toBe( true );
+	expect( ( many.content[ 0 ] as { text: string } ).text.split( '; ' ) ).toHaveLength( 3 );
+	expect( handler ).not.toHaveBeenCalled();
 } );

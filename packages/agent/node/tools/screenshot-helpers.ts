@@ -2,12 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { getSharedBrowser } from '@studio/agent/node/browser-utils';
 import { resolveScreenshotDirectory } from '@studio/agent/node/screenshot-storage';
+import { openToolPage } from '../browser-page';
+import { createBrowserFile } from '../claude-code/browser-tool-files';
+import { currentClaudeWebCall } from '../claude-code/web-call';
 import type { StudioAgentHost } from '@studio/agent/node/host';
-
-type Browser = Awaited< ReturnType< typeof getSharedBrowser > >;
-type Page = Awaited< ReturnType< Browser[ 'newPage' ] > >;
+import type { Page } from 'playwright';
 
 /**
  * Tall portrait viewport used by `take_screenshot` for full-page captures
@@ -94,26 +94,32 @@ async function scaleForModel(
 	}
 	const size = { width: Math.round( width * scale ), height: Math.round( height * scale ) };
 	// Not a data: URL, which the site's Content-Security-Policy could block.
-	const base64 = await page.evaluate(
-		async ( { source, width, height, quality } ) => {
-			const bytes = Uint8Array.from( atob( source ), ( char ) => char.charCodeAt( 0 ) );
-			const bitmap = await createImageBitmap( new Blob( [ bytes ] ), {
-				resizeWidth: width,
-				resizeHeight: height,
-				resizeQuality: 'high',
-			} );
-			const canvas = new OffscreenCanvas( width, height );
-			canvas.getContext( '2d' )!.drawImage( bitmap, 0, 0 );
-			const jpeg = await canvas.convertToBlob( { type: 'image/jpeg', quality } );
-			let binary = '';
-			for ( const byte of new Uint8Array( await jpeg.arrayBuffer() ) ) {
-				binary += String.fromCharCode( byte );
-			}
-			return btoa( binary );
-		},
-		{ source: capture.toString( 'base64' ), ...size, quality: MODEL_JPEG_QUALITY / 100 }
-	);
-	return { buffer: Buffer.from( base64, 'base64' ), ...size };
+	const call = currentClaudeWebCall();
+	const encoder = call ? await call.newPage( {}, { trustedEditor: true } ) : page;
+	try {
+		const base64 = await encoder.evaluate(
+			async ( { source, width, height, quality } ) => {
+				const bytes = Uint8Array.from( atob( source ), ( char ) => char.charCodeAt( 0 ) );
+				const bitmap = await createImageBitmap( new Blob( [ bytes ] ), {
+					resizeWidth: width,
+					resizeHeight: height,
+					resizeQuality: 'high',
+				} );
+				const canvas = new OffscreenCanvas( width, height );
+				canvas.getContext( '2d' )!.drawImage( bitmap, 0, 0 );
+				const jpeg = await canvas.convertToBlob( { type: 'image/jpeg', quality } );
+				let binary = '';
+				for ( const byte of new Uint8Array( await jpeg.arrayBuffer() ) ) {
+					binary += String.fromCharCode( byte );
+				}
+				return btoa( binary );
+			},
+			{ source: capture.toString( 'base64' ), ...size, quality: MODEL_JPEG_QUALITY / 100 }
+		);
+		return { buffer: Buffer.from( base64, 'base64' ), ...size };
+	} finally {
+		if ( call ) await encoder.close();
+	}
 }
 
 /**
@@ -140,8 +146,7 @@ export async function captureScreenshotBuffer(
 	}
 ): Promise< ScreenshotCapture > {
 	const format = options.format ?? 'png';
-	const browser = await getSharedBrowser();
-	const page = await browser.newPage( {
+	const page = await openToolPage( {
 		viewport,
 		deviceScaleFactor: options.deviceScaleFactor,
 	} );
@@ -290,6 +295,7 @@ export async function saveScreenshotFile(
 ): Promise< {
 	path: string;
 	fileUrl: string;
+	discard?: () => Promise< void >;
 	name: string;
 	mimeType: 'image/png' | 'image/jpeg';
 } > {
@@ -306,10 +312,15 @@ export async function saveScreenshotFile(
 	) }.${ extension }`;
 	const filePath = path.join( directory, name );
 
-	await writeFile( filePath, buffer );
+	const call = currentClaudeWebCall();
+	call?.check();
+	const discard = call
+		? await createBrowserFile( directory, filePath, buffer, () => call.check() )
+		: await writeFile( filePath, buffer );
 
 	return {
 		path: filePath,
+		...( discard && { discard } ),
 		fileUrl: pathToFileURL( filePath ).href,
 		name,
 		mimeType,

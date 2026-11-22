@@ -11,6 +11,7 @@ import { QuestionOptionViewer } from '@/features/chats/session-view/conversation
 import { joinedAttributes, type Joined } from '@/features/chats/session-view/conversation/joined';
 import {
 	Button,
+	Textarea,
 	IconButton,
 	Questionnaire,
 	QuestionnaireAnswer,
@@ -21,6 +22,10 @@ import {
 } from '@/lib/ui';
 import styles from './style.module.css';
 import type { AgentQuestionRenderItem } from '@/features/chats/session-view/conversation/transcript-items';
+
+function focusAnswerInput( node: HTMLTextAreaElement | null ) {
+	node?.focus();
+}
 
 function getAnswerLetter(
 	options: AgentQuestionRenderItem[ 'options' ],
@@ -45,6 +50,8 @@ export function AgentQuestion( {
 	freeFormActive = false,
 	onAnswer,
 	onChooseFreeForm,
+	onTypedAnswer,
+	claudeSessionId,
 	ref,
 	tabIndex,
 	...joined
@@ -63,6 +70,8 @@ export function AgentQuestion( {
 	freeFormActive?: boolean;
 	onAnswer?: () => void;
 	onChooseFreeForm: () => void;
+	onTypedAnswer?: ( answer: string ) => void;
+	claudeSessionId?: string;
 	ref?: Ref< HTMLFieldSetElement >;
 	tabIndex?: number;
 } & Joined ) {
@@ -82,15 +91,21 @@ export function AgentQuestion( {
 		selectedOptions.map( ( option ) => option.label ).join( ', ' ) === pickedLabel
 			? selectedOptions
 			: [];
-	const ownFreeFormLabel = findOwnFreeFormOptionLabel( options );
+	const ownFreeFormLabel =
+		claudeSessionId && ! onTypedAnswer ? undefined : findOwnFreeFormOptionLabel( options );
 	const viewable = options.filter( ( option ) => option.image );
 	const hasImages = viewable.length > 0;
 	const [ viewing, setViewing ] = useState< number | null >( null );
+	const [ typing, setTyping ] = useState( false );
+	const [ draft, setDraft ] = useState( '' );
+	const canViewHistory = !! claudeSessionId && hasImages && ! isInteractive;
 	const choose = ( label: string ) => {
 		if ( label === ownFreeFormLabel ) {
 			onSelectionChange?.( [] );
-			onChooseFreeForm();
+			if ( onTypedAnswer ) setTyping( true );
+			else onChooseFreeForm();
 		} else {
+			setTyping( false );
 			onSelectionChange?.(
 				multiSelect
 					? options
@@ -106,18 +121,19 @@ export function AgentQuestion( {
 		<div
 			className={ styles.questionCard }
 			data-state={ inactive ? 'inactive' : undefined }
+			data-viewable-history={ canViewHistory || undefined }
 			{ ...joinedAttributes( joined ) }
 		>
 			<Questionnaire
 				ref={ ref }
 				tabIndex={ tabIndex }
 				multiple={ multiSelect }
-				shortcuts={ isInteractive }
-				disabled={ inactive }
+				shortcuts={ isInteractive && ! typing }
+				disabled={ inactive && ! canViewHistory }
 				className={ styles.questionnaire }
 			>
 				<QuestionnaireTitle>{ question }</QuestionnaireTitle>
-				{ answered ? (
+				{ answered && ! canViewHistory ? (
 					answerOptions.length ? (
 						<QuestionnaireChoices>
 							{ answerOptions.map( ( option ) => (
@@ -134,7 +150,7 @@ export function AgentQuestion( {
 					)
 				) : (
 					<>
-						{ multiSelect ? (
+						{ multiSelect && isInteractive ? (
 							<QuestionnaireDescription>
 								{ __( 'Select all that apply.' ) }
 							</QuestionnaireDescription>
@@ -146,16 +162,26 @@ export function AgentQuestion( {
 									<QuestionnaireChoice
 										key={ index }
 										label={ option.label }
+										description={ claudeSessionId ? option.description : undefined }
 										shortcut={ letter( index ) }
 										checked={
-											isOwnFreeForm
-												? freeFormActive && selectedLabels.length === 0
+											canViewHistory
+												? answerOptions.includes( option )
+												: isOwnFreeForm
+												? ( freeFormActive || typing ) && selectedLabels.length === 0
 												: selectedLabels.includes( option.label )
 										}
 										disabled={ ! isInteractive }
 										muted={ isOwnFreeForm }
 										wide={ hasImages && ! option.image }
-										media={ option.image ? <QuestionOptionImage path={ option.image } /> : null }
+										media={
+											option.image ? (
+												<QuestionOptionImage
+													path={ option.image }
+													claudeSessionId={ claudeSessionId }
+												/>
+											) : null
+										}
 										action={
 											option.image ? (
 												<IconButton
@@ -179,6 +205,7 @@ export function AgentQuestion( {
 						{ hasImages ? (
 							<QuestionOptionViewer
 								options={ viewable }
+								claudeSessionId={ claudeSessionId }
 								index={ viewing }
 								onIndexChange={ setViewing }
 								onChoose={ isInteractive && ! multiSelect ? choose : undefined }
@@ -186,9 +213,28 @@ export function AgentQuestion( {
 						) : null }
 					</>
 				) }
+				{ canViewHistory && answered && ! answerOptions.length && (
+					<QuestionnaireAnswer>{ pickedLabel }</QuestionnaireAnswer>
+				) }
+				{ claudeSessionId && pickedLabel === SKIPPED_QUESTION && (
+					<QuestionnaireDescription>{ __( 'Skipped' ) }</QuestionnaireDescription>
+				) }
+				{ isInteractive && onTypedAnswer && typing && (
+					<Textarea
+						aria-label={ __( 'Your answer' ) }
+						value={ draft }
+						onChange={ ( event ) => setDraft( event.target.value ) }
+						ref={ focusAnswerInput }
+					/>
+				) }
 				{ isInteractive ? (
 					<div className={ styles.questionFooter }>
 						{ pager }
+						{ onTypedAnswer && ! typing && ! ownFreeFormLabel && (
+							<Button variant="ghost" onClick={ () => setTyping( true ) }>
+								{ __( 'Write an answer' ) }
+							</Button>
+						) }
 						<div className={ styles.questionActions }>
 							{ onBack ? (
 								<Button variant="outline" onClick={ onBack }>
@@ -198,7 +244,11 @@ export function AgentQuestion( {
 							<Button variant="outline" onClick={ onSkip }>
 								{ __( 'Skip' ) }
 							</Button>
-							<Button variant="accent" onClick={ onAnswer }>
+							<Button
+								variant="accent"
+								disabled={ typing && ! draft.trim() }
+								onClick={ typing ? () => onTypedAnswer?.( draft.trim() ) : onAnswer }
+							>
 								{ submitLabel }
 							</Button>
 						</div>
@@ -209,8 +259,14 @@ export function AgentQuestion( {
 	);
 }
 
-function QuestionOptionImage( { path }: { path: string } ) {
-	const localFileQuery = useLocalMediaDataUrl( path );
+function QuestionOptionImage( {
+	path,
+	claudeSessionId,
+}: {
+	path: string;
+	claudeSessionId?: string;
+} ) {
+	const localFileQuery = useLocalMediaDataUrl( path, claudeSessionId );
 
 	if ( localFileQuery.isError ) {
 		return (

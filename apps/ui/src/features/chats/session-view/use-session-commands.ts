@@ -3,20 +3,50 @@ import {
 	isStudioChatArtifactData,
 } from '@studio/agent/protocol/chat-artifacts';
 import { useEffect } from 'react';
+import { useAgentRunStore } from '@/data/agent-runs/context';
 import { useConnector } from '@/data/core';
 import { useSessionUIDispatch } from '@/data/use-session-ui';
+import { claudeSitePreviewPaths } from './claude-preview-path';
 
 // Bridge from the chat event stream to SessionUI state. Add a new agent → UI
 // behavior by handling its event type here and dispatching the matching
 // action defined in `use-session-ui`.
-export function useSessionCommands( sessionId: string | undefined ): void {
+export function useSessionCommands(
+	sessionId: string | undefined,
+	claudeSiteId?: string | null
+): void {
 	const connector = useConnector();
+	const { stateStore } = useAgentRunStore();
 	const dispatch = useSessionUIDispatch();
 
 	useEffect( () => {
 		return connector.onAgentEvent( ( payload ) => {
 			if ( payload.sessionId !== sessionId ) return;
 			const event = payload.event;
+			if ( claudeSiteId !== undefined ) {
+				if ( ! claudeSiteId || ! sessionId || event.type !== 'backend.event' ) return;
+				const command = event.event;
+				if ( command.type !== 'preview.reload' && command.type !== 'chat.artifact' ) return;
+				const owner = stateStore.getState()[ sessionId ];
+				if (
+					owner?.phase !== 'running' ||
+					owner.isInterrupting ||
+					owner.runId !== payload.runId ||
+					command.runId !== payload.runId ||
+					command.target?.environment !== 'local' ||
+					command.target.siteId !== claudeSiteId
+				)
+					return;
+				if ( command.type === 'preview.reload' ) {
+					dispatch( { type: 'preview/reload' } );
+				} else if ( isStudioChatArtifactData( command.artifact ) ) {
+					const [ path ] = claudeSitePreviewPaths( command.artifact.widgets, claudeSiteId );
+					if ( path && path !== DESIGN_SYSTEM_PREVIEW_PATH ) {
+						dispatch( { type: 'preview/navigate', path } );
+					}
+				}
+				return;
+			}
 			// The preview is a browser: it shows a page as it loaded, so it shows
 			// the agent's changes once the agent asks for a reload.
 			if ( event.type === 'preview.reload' ) {
@@ -32,7 +62,7 @@ export function useSessionCommands( sessionId: string | undefined ): void {
 				}
 			}
 		} );
-	}, [ connector, sessionId, dispatch ] );
+	}, [ connector, sessionId, dispatch, claudeSiteId, stateStore ] );
 }
 
 function getSitePreviewArtifactPath( artifact: {

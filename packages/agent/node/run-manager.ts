@@ -16,6 +16,7 @@ import {
 	listChatGptConnections,
 	type ChatGptTurnHandle,
 } from '@studio/agent/node/chatgpt/credential-broker';
+import { isCompleteClaudeAnswer } from '@studio/agent/node/claude-code/questions';
 import {
 	answerOpenAiSessionKeyRequest,
 	getOpenAiSessionKeyForkEnvironment,
@@ -28,11 +29,13 @@ import {
 import { loadAiSession } from '@studio/agent/node/sessions/store';
 import { resolveConnectionSelection } from '@studio/agent/protocol/connections';
 import type { ActiveAgentRun, AgentRunEvent } from '@studio/agent/protocol/agent-events';
+import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 import type { StudioChatFileAttachment } from '@studio/agent/protocol/chat-files';
 import type {
 	StudioAiSessionInputPayload,
 	StudioChatImage,
 } from '@studio/agent/protocol/chat-images';
+import type { ClaudeSendContext, ClaudeSessionSelection } from '@studio/agent/protocol/claude-code';
 import type { JsonEvent } from '@studio/agent/protocol/json-events';
 import type { StudioVisualAnnotationSummary } from '@studio/agent/protocol/visual-annotations';
 
@@ -55,6 +58,13 @@ interface AgentRun {
 	interruptAttempts: number;
 	eventQueue: Promise< void >;
 	startedAt: number;
+	turnId?: string;
+	claude: boolean;
+	terminal?: Extract< BackendTurnEvent, { type: 'turn.terminal' } >;
+	pendingClaudeApprovals: Extract< BackendTurnEvent, { type: 'approval.requested' } >[];
+	seenClaudeApprovals: Set< string >;
+	pendingClaudeQuestions: NonNullable< ActiveAgentRun[ 'pendingClaudeQuestions' ] >;
+	seenClaudeQuestions: Set< string >;
 	pendingQuestions: NonNullable< ActiveAgentRun[ 'pendingQuestions' ] >;
 	chatGptTurn: Pick< ChatGptTurnHandle, 'signal' | 'end' > | null;
 }
@@ -91,6 +101,8 @@ export interface AgentRunManagerConfig {
 }
 
 export interface StartAgentRunOptions {
+	claudeContext?: ClaudeSendContext;
+	claudeSelection?: ClaudeSessionSelection;
 	turnId?: string;
 	sessionId: string;
 	prompt: string;
@@ -104,7 +116,7 @@ export interface AgentRunManager {
 	startAgentRun( options: StartAgentRunOptions ): { runId: string };
 	listActiveAgentRuns(): ActiveAgentRun[];
 	interruptAgentRun( runId: string ): void;
-	answerAgentRun( runId: string, answers: Record< string, string > ): void;
+	answerAgentRun( runId: string, answers: Record< string, string >, requestId?: string ): boolean;
 }
 
 const INTERRUPT_FORCE_KILL_TIMEOUT_MS = 2000;
@@ -160,6 +172,9 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 	// alone — the forked turn itself fails closed for a disconnected ChatGPT
 	// connection.
 	async function watchChatGptTurn( run: AgentRun ): Promise< void > {
+		if ( run.claude ) {
+			return;
+		}
 		try {
 			const resolveConnectionId =
 				config.resolveChatGptConnectionId ?? resolveRecordedChatGptConnectionId;
@@ -247,8 +262,10 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			images = [],
 			files = [],
 			visualAnnotations,
-			turnId,
+			claudeSelection,
+			claudeContext,
 		} = options;
+		const turnId = options.turnId ?? ( claudeSelection ? crypto.randomUUID() : undefined );
 
 		if ( runsBySessionId.has( sessionId ) ) {
 			throw new Error( `A run is already in progress for session ${ sessionId }` );
@@ -257,7 +274,11 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 		const runId = crypto.randomUUID();
 		const startedAt = Date.now();
 		const inputPayload =
-			turnId || images.length > 0 || files.length > 0 || ( visualAnnotations?.length ?? 0 ) > 0
+			claudeSelection ||
+			turnId ||
+			images.length > 0 ||
+			files.length > 0 ||
+			( visualAnnotations?.length ?? 0 ) > 0
 				? writeInputPayloadFile( {
 						prompt,
 						displayMessage,
@@ -265,6 +286,9 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 						files,
 						visualAnnotations,
 						turnId,
+						runId,
+						claudeSelection,
+						claudeContext,
 				  } )
 				: undefined;
 		const args = [ 'code', 'sessions', 'resume', sessionId ];
@@ -294,10 +318,10 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 				...( getTracksOrigin ? { STUDIO_TRACKS_ORIGIN: getTracksOrigin() } : {} ),
 				// Tells the turn it may ask for an OpenAI key kept for this app
 				// session; the key itself only goes over the IPC channel.
-				...getOpenAiSessionKeyForkEnvironment(),
+				...( claudeSelection ? {} : getOpenAiSessionKeyForkEnvironment() ),
 				// The registrations whose session-only ChatGPT tokens this app
 				// holds and may hand over on request; ids only, never a token.
-				...getChatGptSessionForkEnvironment(),
+				...( claudeSelection ? {} : getChatGptSessionForkEnvironment() ),
 			},
 		} );
 
@@ -310,6 +334,12 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			eventQueue: Promise.resolve(),
 			startedAt,
 			pendingQuestions: [],
+			pendingClaudeApprovals: [],
+			seenClaudeApprovals: new Set(),
+			pendingClaudeQuestions: [],
+			seenClaudeQuestions: new Set(),
+			claude: !! claudeSelection,
+			turnId,
 			chatGptTurn: null,
 		};
 
@@ -326,6 +356,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 
 		child.on( 'message', ( message ) => {
 			if (
+				! run.claude &&
 				answerOpenAiSessionKeyRequest( message, ( reply ) => {
 					if ( child.connected ) {
 						child.send( reply );
@@ -335,6 +366,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 				return;
 			}
 			if (
+				! run.claude &&
 				answerChatGptSessionTokenRequest( message, ( reply ) => {
 					if ( child.connected ) {
 						child.send( reply as { type: string } );
@@ -343,18 +375,70 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			) {
 				return;
 			}
-			if ( answerChatGptSessionTokenInvalidation( message ) ) {
+			if ( ! run.claude && answerChatGptSessionTokenInvalidation( message ) ) {
 				return;
 			}
 			// The CLI's `Logger` also writes to this IPC channel with a different
 			// shape (`{ action, status, message }`) on error paths. Forward only
 			// messages that look like the CLI JSON transport envelope.
 			if ( message && typeof message === 'object' && 'type' in message ) {
-				enqueueJsonEvent( run, message as JsonEvent );
+				const event = message as JsonEvent;
+				if ( run.claude && event.type !== 'backend.event' ) return;
+				if ( event.type === 'backend.event' ) {
+					if (
+						! run.claude ||
+						! event.event ||
+						event.event.runId !== runId ||
+						event.event.turnId !== turnId ||
+						run.terminal ||
+						( run.interrupted && event.event.type !== 'turn.terminal' )
+					)
+						return;
+					if ( event.event.type === 'approval.requested' ) {
+						const approval = event.event;
+						// A request that does not name its operation can never be answered.
+						if (
+							! approval.operation ||
+							typeof approval.operation !== 'object' ||
+							typeof approval.operation.tool !== 'string' ||
+							run.seenClaudeApprovals.has( approval.requestId )
+						)
+							return;
+						run.seenClaudeApprovals.add( approval.requestId );
+						run.pendingClaudeApprovals.push( event.event );
+					}
+					if ( event.event.type === 'approval.resolved' ) {
+						const requestId = event.event.requestId;
+						run.pendingClaudeApprovals = run.pendingClaudeApprovals.filter(
+							( item ) => item.requestId !== requestId
+						);
+					}
+					if ( event.event.type === 'turn.terminal' ) {
+						run.terminal = event.event;
+						run.pendingClaudeApprovals = [];
+						run.pendingClaudeQuestions = [];
+					}
+					if ( event.event.type === 'question.asked' ) {
+						const request = event.event;
+						if ( run.seenClaudeQuestions.has( request.requestId ) ) return;
+						run.seenClaudeQuestions.add( request.requestId );
+						run.pendingClaudeQuestions.push( request );
+					}
+					if ( event.event.type === 'question.resolved' ) {
+						const { requestId } = event.event;
+						run.pendingClaudeQuestions = run.pendingClaudeQuestions.filter(
+							( request ) => request.requestId !== requestId
+						);
+					}
+				}
+				enqueueJsonEvent( run, event );
 			}
 		} );
 
+		let cleanedUp = false;
 		const cleanup = ( code: number | null ) => {
+			if ( cleanedUp ) return;
+			cleanedUp = true;
 			runsBySessionId.delete( sessionId );
 			runsById.delete( runId );
 			run.chatGptTurn?.end();
@@ -370,6 +454,18 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 				} );
 			}
 
+			if ( run.claude && ! run.terminal ) {
+				enqueueJsonEvent( run, {
+					type: 'backend.event',
+					timestamp: nowIso(),
+					event: {
+						type: 'turn.terminal',
+						runId,
+						turnId: turnId!,
+						outcome: { status: 'unknown_process_exit' },
+					},
+				} );
+			}
 			void run.eventQueue.finally( async () => {
 				// Opening the chat in any Studio app clears it. Written before
 				// `run.exited` so the refetch that event triggers sees it.
@@ -382,7 +478,13 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 				sendEvent( run, {
 					type: 'run.exited',
 					timestamp: nowIso(),
-					status: code === 0 ? 'success' : 'error',
+					status: run.claude
+						? run.terminal?.outcome.status === 'success'
+							? 'success'
+							: 'error'
+						: code === 0
+						? 'success'
+						: 'error',
 					code,
 				} );
 			} );
@@ -395,6 +497,7 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 				timestamp: nowIso(),
 				message: error.message || 'CLI subprocess failed to start',
 			} );
+			if ( ! child.pid ) cleanup( null );
 		} );
 
 		child.on( 'exit', cleanup );
@@ -409,6 +512,8 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			startedAt: run.startedAt,
 			phase: run.interrupted ? 'interrupting' : 'running',
 			pendingQuestions: run.pendingQuestions,
+			pendingClaudeApprovals: run.claude ? run.pendingClaudeApprovals : undefined,
+			pendingClaudeQuestions: run.claude ? run.pendingClaudeQuestions : undefined,
 		} ) );
 	}
 
@@ -418,14 +523,17 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			return;
 		}
 		run.interrupted = true;
+		run.pendingClaudeApprovals = [];
+		run.pendingClaudeQuestions = [];
 		run.interruptAttempts += 1;
-		if ( runsBySessionId.get( run.sessionId ) === run ) {
+		if ( ! run.claude && runsBySessionId.get( run.sessionId ) === run ) {
 			runsBySessionId.delete( run.sessionId );
 		}
 
 		// Second click escalates: the graceful path is in flight but evidently
 		// not landing fast enough, so skip the grace period.
 		if ( run.interruptAttempts > 1 ) {
+			if ( run.claude ) return;
 			run.child.kill( 'SIGKILL' );
 			return;
 		}
@@ -438,24 +546,60 @@ export function createAgentRunManager( config: AgentRunManagerConfig ): AgentRun
 			sendEvent( run, { type: 'run.interrupting', timestamp: nowIso() } );
 			// Safety net: if the graceful path doesn't land quickly, force-kill
 			// so the renderer can't get stuck in a busy state.
-			setTimeout( () => {
-				if ( runsById.get( runId ) === run && ! run.child.killed ) {
-					run.child.kill( 'SIGKILL' );
-				}
-			}, INTERRUPT_FORCE_KILL_TIMEOUT_MS ).unref();
+			if ( ! run.claude )
+				setTimeout( () => {
+					if ( runsById.get( runId ) === run && ! run.child.killed ) {
+						run.child.kill( 'SIGKILL' );
+					}
+				}, INTERRUPT_FORCE_KILL_TIMEOUT_MS ).unref();
 			return;
 		}
 
-		run.child.kill( 'SIGKILL' );
+		if ( ! run.claude ) run.child.kill( 'SIGKILL' );
 	}
 
-	function answerAgentRun( runId: string, answers: Record< string, string > ): void {
+	function answerAgentRun(
+		runId: string,
+		answers: Record< string, string >,
+		requestId?: string
+	): boolean {
 		const run = runsById.get( runId );
 		if ( ! run || ! run.child.connected ) {
-			return;
+			return false;
+		}
+		if ( requestId !== undefined ) {
+			if ( ! run.claude || run.interrupted || run.terminal ) return false;
+			const pending = run.pendingClaudeQuestions.find( ( item ) => item.requestId === requestId );
+			if ( ! pending || ! isCompleteClaudeAnswer( pending, answers ) ) return false;
+			run.child.send( {
+				type: 'question.answer',
+				runId,
+				turnId: pending.turnId,
+				requestId,
+				answers,
+			} );
+			run.pendingClaudeQuestions = run.pendingClaudeQuestions.filter(
+				( item ) => item !== pending
+			);
+			return true;
+		}
+		if ( run.claude ) {
+			if ( run.interrupted || run.terminal ) return false;
+			const accepted: Record< string, string > = {};
+			for ( const pending of run.pendingClaudeApprovals ) {
+				if ( answers[ pending.requestId ] === 'allow' || answers[ pending.requestId ] === 'deny' )
+					accepted[ pending.requestId ] = answers[ pending.requestId ];
+			}
+			run.pendingClaudeApprovals = run.pendingClaudeApprovals.filter(
+				( pending ) => ! ( pending.requestId in accepted )
+			);
+			if ( ! Object.keys( accepted ).length ) return false;
+			run.child.send( { type: 'answer', answers: accepted } );
+			return true;
 		}
 		run.child.send( { type: 'answer', answers } );
 		run.pendingQuestions = [];
+		return true;
 	}
 
 	return { startAgentRun, listActiveAgentRuns, interruptAgentRun, answerAgentRun };

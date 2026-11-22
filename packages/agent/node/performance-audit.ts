@@ -5,7 +5,9 @@
  * composition metrics via the native Performance API and PerformanceObserver.
  */
 
-import { getSharedBrowser } from './browser-utils';
+import { openToolPage } from './browser-page';
+import { currentClaudeWebCall } from './claude-code/web-call';
+import type { ClaudeWebMeasurement } from './claude-code/web-call';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -42,6 +44,7 @@ export interface AuditResult {
 	url: string;
 	timestamp: string;
 	metrics: AuditMetrics | null;
+	measurementNote?: string;
 	error?: string;
 }
 
@@ -102,14 +105,17 @@ function observerSetupScript() {
 // Metric collection — runs after page load
 // ---------------------------------------------------------------------------
 
-function collectMetricsScript(): AuditMetrics {
+function collectMetricsScript( samples: readonly ClaudeWebMeasurement[] | null ): AuditMetrics {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const audit = ( window as any ).__auditMetrics ?? { lcpValue: 0, clsValue: 0, fcpValue: 0 };
 
 	const navEntries = performance.getEntriesByType( 'navigation' );
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const nav = navEntries[ 0 ] as any;
-	const ttfb = nav ? nav.responseStart - nav.requestStart : 0;
+	const mainDocument = samples?.filter( ( entry ) => entry.mainDocument ).pop();
+	if ( samples && ! mainDocument )
+		throw new Error( 'The guarded audit did not measure the main document.' );
+	const ttfb = mainDocument?.firstByteMs ?? ( nav ? nav.responseStart - nav.requestStart : 0 );
 
 	const resources = performance.getEntriesByType( 'resource' );
 
@@ -147,24 +153,39 @@ function collectMetricsScript(): AuditMetrics {
 	};
 	const images = { count: 0, totalBytes: 0 };
 	const fonts = { count: 0, totalBytes: 0 };
-	let pageWeightBytes = 0;
-
-	for ( const entry of resources ) {
-		const res = entry as PerformanceResourceTiming;
-		const size = getSize( res );
+	const assets = samples
+		? samples
+				.filter( ( entry ) => entry.resourceType !== 'Document' )
+				.map( ( entry ) => ( {
+					url: entry.url,
+					size: entry.wireBytes,
+					category: entry.resourceType.toLowerCase(),
+				} ) )
+		: resources.map( ( entry ) => {
+				const timing = entry as PerformanceResourceTiming;
+				return { url: entry.name, size: getSize( timing ), category: categorize( timing ) };
+		  } );
+	let pageWeightBytes = samples
+		? samples.reduce(
+				( total, entry ) => total + ( entry.resourceType === 'Document' ? entry.wireBytes : 0 ),
+				0
+		  )
+		: nav
+		? getSize( nav )
+		: 0;
+	for ( const { url, size, category } of assets ) {
 		pageWeightBytes += size;
 
-		const category = categorize( res );
 		switch ( category ) {
 			case 'script':
 				scripts.count++;
 				scripts.totalBytes += size;
-				scripts.urls.push( res.name );
+				scripts.urls.push( url );
 				break;
 			case 'stylesheet':
 				stylesheets.count++;
 				stylesheets.totalBytes += size;
-				stylesheets.urls.push( res.name );
+				stylesheets.urls.push( url );
 				break;
 			case 'image':
 				images.count++;
@@ -177,18 +198,13 @@ function collectMetricsScript(): AuditMetrics {
 		}
 	}
 
-	// Add the document itself to page weight
-	if ( nav ) {
-		pageWeightBytes += getSize( nav );
-	}
-
 	return {
 		ttfb: Math.round( ttfb ),
 		fcp: Math.round( audit.fcpValue ),
 		lcp: Math.round( audit.lcpValue ),
 		cls: Math.round( audit.clsValue * 1000 ) / 1000,
 		domElements: document.querySelectorAll( '*' ).length,
-		totalRequests: resources.length,
+		totalRequests: assets.length,
 		pageWeightBytes,
 		scripts,
 		stylesheets,
@@ -208,14 +224,14 @@ const POST_LOAD_DELAY_MS = 2000;
 
 export async function auditPerformance( siteUrl: string, urlPath = '/' ): Promise< AuditResult > {
 	const targetUrl = `${ siteUrl.replace( /\/+$/, '' ) }${ urlPath }`;
-	const isAdminPath = urlPath.startsWith( '/wp-admin' );
+	const isAdminPath = /^\/wp-admin(?:[/?#]|$)/.test( urlPath );
 
 	try {
-		const browser = await getSharedBrowser();
-		const page = await browser.newPage( {
-			viewport: AUDIT_VIEWPORT,
-			ignoreHTTPSErrors: true,
-		} );
+		const page = await openToolPage(
+			{ viewport: AUDIT_VIEWPORT },
+			new URL( siteUrl ).origin,
+			isAdminPath
+		);
 
 		try {
 			// Inject observers before any navigation so FCP/LCP/CLS are captured from the start.
@@ -235,12 +251,17 @@ export async function auditPerformance( siteUrl: string, urlPath = '/' ): Promis
 			// Wait for late LCP candidates and layout shifts to settle.
 			await page.waitForTimeout( POST_LOAD_DELAY_MS );
 
-			const metrics = await page.evaluate( collectMetricsScript );
+			const samples = currentClaudeWebCall()?.networkMeasurements?.();
+			const metrics = await page.evaluate( collectMetricsScript, samples ?? null );
 
 			return {
 				url: targetUrl,
 				timestamp: new Date().toISOString(),
 				metrics,
+				...( samples && {
+					measurementNote:
+						'TTFB measures the guarded HTTP request through response headers. Weights count encoded response body bytes. Paint and layout metrics reflect Chromium rendering the buffered responses.',
+				} ),
 			};
 		} finally {
 			await page.close();

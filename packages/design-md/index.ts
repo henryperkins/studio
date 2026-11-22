@@ -125,8 +125,9 @@ export function googleFontsUrl(
 		)
 		.map(
 			( [ family, { weights } ] ) =>
-				`family=${ family.replace( / /g, '+' ) }:wght@${ [ ...weights ]
+				`family=${ encodeURIComponent( family ).replace( /%20/g, '+' ) }:wght@${ [ ...weights ]
 					.sort( ( a, b ) => Number( a ) - Number( b ) )
+					.map( ( weight ) => encodeURIComponent( weight ) )
 					.join( ';' ) }`
 		)
 		.join( '&' );

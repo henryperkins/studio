@@ -5,6 +5,7 @@ import { useEffect, useRef } from 'react';
 import { useTrafficLightSpace } from '@/data/host/use-traffic-light-space';
 import { useSites } from '@/data/queries/use-sites';
 import { useSidebarCollapsed } from '@/data/use-sidebar-collapsed';
+import { ClaudeNewChat } from '@/features/chats';
 import { HeaderSidebarToggle } from '@/features/sidebar';
 import { PreviewParticles, useOpenAddSite } from '@/features/sites';
 import {
@@ -101,6 +102,7 @@ function NoSitesContent() {
 				<Button variant="accent" size="lg" data-add-first-site onClick={ () => openAddSite() }>
 					{ __( 'Start here' ) }
 				</Button>
+				<ClaudeNewChat />
 			</EmptyContent>
 		</Empty>
 	);

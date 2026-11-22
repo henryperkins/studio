@@ -6,7 +6,7 @@
  * script runs will exactly match the backup.
  *
  * Usage:
- *   TAXONOMIST_BACKUP=/path/to/backup.json studio wp eval-file restore.php
+ *   studio wp eval-file restore.php backup.json
  *
  * Environment variables:
  *   TAXONOMIST_BACKUP  Path to the backup JSON file created by backup.php.
@@ -15,9 +15,9 @@
  * @package Taxonomist
  */
 
-$backup_file = getenv( 'TAXONOMIST_BACKUP' );
+$backup_file = $args[0] ?? getenv( 'TAXONOMIST_BACKUP' );
 if ( ! $backup_file || ! file_exists( $backup_file ) ) {
-	WP_CLI::error( 'Set TAXONOMIST_BACKUP env var to the backup file path' );
+	WP_CLI::error( 'Pass the path to an existing taxonomy backup file.' );
 }
 
 $backup = json_decode( file_get_contents( $backup_file ), true ); // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents

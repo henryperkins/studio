@@ -5,12 +5,16 @@ import { createBlockSettingsNotes } from './block-settings';
 // what the result shows, each stated once per tracker. Every surface that runs
 // Studio's tools adds them, so a new kind of note is added here and reaches
 // all of them.
-export function createResultNotes(): ( sitePath: string, text: string ) => Promise< string > {
+export function createResultNotes(
+	readText?: ( file: string ) => string
+): ( sitePath: string, text: string ) => Promise< string > {
 	const trackers = new Map< string, Array< ( text: string ) => string | Promise< string > > >();
 	return async ( sitePath, text ) => {
 		let notes = trackers.get( sitePath );
 		if ( ! notes ) {
-			notes = [ createBlockSettingsNotes( path.join( sitePath, 'wp-includes', 'blocks' ) ) ];
+			notes = [
+				createBlockSettingsNotes( path.join( sitePath, 'wp-includes', 'blocks' ), readText ),
+			];
 			trackers.set( sitePath, notes );
 		}
 		const stated = await Promise.all( notes.map( ( note ) => note( text ) ) );

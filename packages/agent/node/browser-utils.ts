@@ -11,6 +11,7 @@ import { existsSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { promisify } from 'util';
+import { currentClaudeWebCall } from './claude-code/web-call';
 
 type Browser = Awaited< ReturnType< ( typeof import('playwright') )[ 'chromium' ][ 'launch' ] > >;
 type Page = Awaited< ReturnType< Browser[ 'newPage' ] > >;
@@ -274,10 +275,13 @@ export class EditorPage {
 	}
 
 	private async load(): Promise< Page > {
-		const browser = await getSharedBrowser();
-		const page = await browser.newPage( {
-			ignoreHTTPSErrors: true,
-		} );
+		const web = currentClaudeWebCall();
+		const page = web
+			? await web.newPage(
+					{},
+					{ documentOrigin: new URL( this.siteUrl ).origin, allowAutoLogin: true }
+			  )
+			: await ( await getSharedBrowser() ).newPage( { ignoreHTTPSErrors: true } );
 
 		const loginUrl = `${ this.siteUrl }/studio-auto-login?redirect_to=/wp-admin/post-new.php`;
 		await page.goto( loginUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 } );
@@ -301,6 +305,7 @@ export class EditorPage {
 						return false;
 					}
 				},
+				undefined,
 				{ timeout: 30_000 }
 			);
 		} catch ( error ) {
@@ -313,6 +318,10 @@ export class EditorPage {
 			);
 		}
 
+		if ( web && new URL( page.url() ).origin !== new URL( this.siteUrl ).origin ) {
+			await page.close();
+			throw new Error( 'The editor left the selected site.' );
+		}
 		this.page = page;
 		return page;
 	}

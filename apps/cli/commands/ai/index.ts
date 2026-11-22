@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { stripVTControlCharacters } from 'node:util';
 import {
 	closeSharedBrowser,
 	createAgent,
@@ -12,7 +14,17 @@ import {
 	chatGptSettingsAction,
 	validateChatGptSelection,
 } from '@studio/agent/node/chatgpt/settings';
+import { CLAUDE_EXECUTION_POLICY_REVISION } from '@studio/agent/node/claude-code/execution-policy';
+import { claudeScreenshotDirectory } from '@studio/agent/node/claude-code/screenshot-directory';
+import {
+	getClaudeSessionStoreRoot,
+	getClaudeTurnConnectionRevision,
+	validateClaudeSendSelection,
+	verifyClaudeTurnSession,
+	verifyClaudeTurnTarget,
+} from '@studio/agent/node/claude-code/studio-surface';
 import { assertSessionSelection } from '@studio/agent/node/sessions/selection';
+import { appendStudioEntry as appendSavedEntry } from '@studio/agent/node/sessions/store';
 import {
 	readAiSettings,
 	readAnthropicApiKey,
@@ -33,6 +45,12 @@ import {
 	getDefaultChatGptReasoningEffort,
 	resolveChatGptReasoning,
 } from '@studio/agent/protocol/chatgpt-models';
+import {
+	resolveClaudeSession,
+	assertClaudeSendContext,
+	type ClaudeSendContext,
+	type ClaudeSessionSelection,
+} from '@studio/agent/protocol/claude-code';
 import {
 	describeConnectionSelectionError,
 	resolveConnectionSelection,
@@ -75,6 +93,11 @@ import {
 	saveSelectedAiProvider,
 } from 'cli/ai/auth';
 import { runsOnChatGpt } from 'cli/ai/chatgpt';
+import { createClaudeApprovalRouter, getTerminalClaudeApprover } from 'cli/ai/claude-approval';
+import {
+	createClaudeQuestionRouter,
+	getTerminalClaudeQuestionAsker,
+} from 'cli/ai/claude-questions';
 import { cliAgentHost } from 'cli/ai/host';
 import { emitEvent } from 'cli/ai/json-events';
 import { type AiOutputAdapter, JsonAdapter } from 'cli/ai/output-adapter';
@@ -103,6 +126,8 @@ import {
 import { Logger, LoggerError } from 'cli/logger';
 import { StudioArgv } from 'cli/types';
 import type { SessionManager } from '@earendil-works/pi-coding-agent';
+import type { ClaudeApprover } from '@studio/agent/node/claude-code/execution-policy';
+import type { ClaudeQuestionAsker } from '@studio/agent/node/claude-code/questions';
 import type {
 	StudioCustomEntryDataMap,
 	StudioCustomEntryType,
@@ -290,8 +315,14 @@ async function resolveChatGptConnection( sm: SessionManager ): Promise< Connecti
 
 export async function runCommand( options: {
 	adapter: AiOutputAdapter;
+	approveClaude?: ClaudeApprover;
+	askClaude?: ClaudeQuestionAsker;
+	startupSignal?: AbortSignal;
 	initialMessage?: string;
 	initialTurnId?: string;
+	initialRunId?: string;
+	claudeSelection?: ClaudeSessionSelection;
+	claudeContext?: ClaudeSendContext;
 	initialDisplayMessage?: string;
 	initialImages?: StudioChatImage[];
 	initialFiles?: StudioChatFileAttachment[];
@@ -310,12 +341,15 @@ export async function runCommand( options: {
 } ): Promise< void > {
 	const ui = options.adapter;
 	const isJsonMode = ui instanceof JsonAdapter;
+	let claudeConversationId: string | undefined;
 	const host: StudioAgentHost = {
 		...cliAgentHost,
 		// Persist screenshots next to the session file (`<session>.screenshots/`)
 		// so artifacts in the transcript keep rendering after OS temp cleanup;
 		// `deleteAiSession` removes the sidecar together with the session.
 		screenshotsDirectory: async () => {
+			if ( claudeConversationId )
+				return claudeScreenshotDirectory( getSessionsDirectory(), claudeConversationId );
 			const sm = await ensureSession();
 			const sessionFile = sm.getSessionFile();
 			if ( ! sessionFile?.endsWith( '.jsonl' ) ) {
@@ -327,13 +361,21 @@ export async function runCommand( options: {
 			ui instanceof JsonAdapter
 				? async ( site ) => {
 						ui.activeSite = site;
-						await append( ( sm ) =>
-							appendStudioEntry( sm, 'studio.site_selected', {
-								siteName: site.name,
-								sitePath: site.path,
-								siteId: site.id,
-							} )
-						);
+						const selected = {
+							siteName: site.name,
+							sitePath: site.path,
+							siteId: site.id,
+						};
+						if ( claudeConversationId ) {
+							await appendSavedEntry(
+								getSessionsDirectory(),
+								claudeConversationId,
+								'studio.site_selected',
+								selected
+							);
+						} else {
+							await append( ( sm ) => appendStudioEntry( sm, 'studio.site_selected', selected ) );
+						}
 				  }
 				: undefined,
 		// Forked by a Studio app, which shows the conversation.
@@ -341,7 +383,9 @@ export async function runCommand( options: {
 			typeof process.send === 'function'
 				? {
 						showArtifact: async ( artifact ) => {
-							await append( ( sm ) => appendStudioEntry( sm, 'studio.chat_artifact', artifact ) );
+							// Claude persists this event in its ordered turn journal.
+							if ( ! claudeConversationId )
+								await append( ( sm ) => appendStudioEntry( sm, 'studio.chat_artifact', artifact ) );
 							emitEvent( { type: 'chat.artifact', timestamp: new Date().toISOString(), artifact } );
 						},
 						reloadPreview: () =>
@@ -366,6 +410,152 @@ export async function runCommand( options: {
 			ui.emitTurnCompleted( 'error', '' );
 			return;
 		}
+	}
+	const entries = options.resumeSession?.entries ?? resumedById?.getEntries();
+	const claude = entries && resolveClaudeSession( entries );
+	const savedHeader = resumedById?.getHeader?.();
+	if (
+		! claude &&
+		( options.claudeSelection !== undefined ||
+			options.claudeContext !== undefined ||
+			options.resumeSession?.summary.backend === 'claude-code' ||
+			( savedHeader &&
+				'studioBackend' in savedHeader &&
+				savedHeader.studioBackend === 'claude-code' ) )
+	) {
+		throw new Error( 'The Claude Code workspace binding is missing.' );
+	}
+	if ( claude ) {
+		assertClaudeSendContext( options.claudeContext, claude );
+		const selection = options.claudeSelection ?? claude.selection;
+		if (
+			selection.model !== claude.selection.model ||
+			selection.effort !== claude.selection.effort
+		) {
+			throw new Error( 'Claude session settings changed before the turn started.' );
+		}
+		if (
+			! options.initialMessage?.trim() &&
+			! options.initialImages?.length &&
+			! options.initialFiles?.length &&
+			! options.initialVisualAnnotations?.length
+		)
+			throw new Error( __( 'A message or attachment is required for a Claude turn.' ) );
+		const runId = options.initialRunId ?? randomUUID();
+		const turnId = options.initialTurnId ?? randomUUID();
+		const conversationId = options.resumeSession?.summary.id ?? resumedById!.getSessionId();
+		await validateClaudeSendSelection(
+			getSessionsDirectory(),
+			conversationId,
+			selection,
+			options.claudeContext,
+			Boolean( options.initialImages?.length )
+		);
+		claudeConversationId = conversationId;
+		const connectionRevision = await getClaudeTurnConnectionRevision( claude.binding.connectionId );
+		if (
+			options.claudeContext?.revision !== undefined &&
+			options.claudeContext.revision !== connectionRevision
+		)
+			throw new Error( __( 'The Claude connection changed. Review the account and send again.' ) );
+		const approvals = createClaudeApprovalRouter( {
+			viaIpc: typeof process.send === 'function',
+			local: options.approveClaude,
+		} );
+		const preAnswered: ClaudeQuestionAsker | undefined =
+			ui instanceof JsonAdapter && ui.permissionResponse
+				? async () => {
+						const answers = ui.permissionResponse;
+						ui.permissionResponse = null;
+						if ( ! answers ) throw new Error( 'No further answers were supplied for this turn.' );
+						return answers;
+				  }
+				: undefined;
+		const questions = createClaudeQuestionRouter(
+			typeof process.send === 'function',
+			options.askClaude ?? preAnswered
+		);
+		const { runClaudeTurn } = await import( '@studio/agent/node/claude-code/runtime' );
+		const claudeAgent = createAgent( {
+			host,
+			claudeCode: ( snapshot, input ) =>
+				runClaudeTurn( snapshot, host, input, {
+					storeRoot: getClaudeSessionStoreRoot( getSessionsDirectory() ),
+					approve: approvals.approve,
+					askUser: questions.ask,
+					verifySession: ( turn ) => verifyClaudeTurnSession( getSessionsDirectory(), turn ),
+					verifyTarget: ( turn, expected ) =>
+						verifyClaudeTurnTarget( getSessionsDirectory(), turn, expected ),
+				} ),
+		} );
+		const turn = claudeAgent.runBackendTurn(
+			{
+				backend: 'claude-code',
+				runId,
+				turnId,
+				effort: selection.effort,
+				permissionPolicyRevision: CLAUDE_EXECUTION_POLICY_REVISION,
+				selection: {
+					connectionId: claude.binding.connectionId,
+					revision: connectionRevision,
+					model: { providerId: 'claude-code', modelId: selection.model },
+				},
+				workspace: { ...claude.binding, conversationId },
+				target: claude.target,
+			},
+			{
+				backend: 'claude-code',
+				prompt: options.initialMessage ?? '',
+				displayMessage: options.initialDisplayMessage,
+				files: options.initialFiles,
+				visualAnnotations: options.initialVisualAnnotations,
+				images: options.initialImages,
+				onEvent: ( event ) => {
+					if ( isJsonMode )
+						emitEvent( { type: 'backend.event', timestamp: new Date().toISOString(), event } );
+					else if ( event.type === 'content.confirmed' && event.blockType === 'text' )
+						process.stdout.write( stripVTControlCharacters( event.text ) + '\n' );
+					else if ( event.type === 'turn.terminal' && event.outcome.status !== 'success' )
+						process.stderr.write( ( event.outcome.message ?? event.outcome.status ) + '\n' );
+				},
+			}
+		);
+		const onMessage = ( value: unknown ) => {
+			if ( ! value || typeof value !== 'object' ) return;
+			const message = value as {
+				type?: string;
+				answers?: unknown;
+				requestId?: unknown;
+				runId?: unknown;
+				turnId?: unknown;
+			};
+			if ( message.type === 'interrupt' ) interrupt();
+			if ( message.type === 'question.answer' ) questions.answer( message );
+			if ( message.type === 'answer' && message.answers && typeof message.answers === 'object' )
+				approvals.answer( message.answers as Record< string, unknown > );
+		};
+		const interrupt = () => {
+			void turn.interrupt();
+			questions.cancelAll();
+			approvals.cancelAll();
+		};
+		process.on( 'message', onMessage );
+		process.on( 'disconnect', interrupt );
+		process.on( 'SIGINT', interrupt );
+		options.startupSignal?.addEventListener( 'abort', interrupt, { once: true } );
+		if ( options.startupSignal?.aborted ) interrupt();
+		try {
+			const result = await turn.result;
+			if ( result.status !== 'success' ) process.exitCode = 1;
+		} finally {
+			process.off( 'message', onMessage );
+			process.off( 'disconnect', interrupt );
+			process.off( 'SIGINT', interrupt );
+			options.startupSignal?.removeEventListener( 'abort', interrupt );
+			approvals.cancelAll();
+			questions.cancelAll();
+		}
+		return;
 	}
 	const resumeContext = resolveResumeSessionContext(
 		options.resumeSession ??
@@ -1296,6 +1486,8 @@ export const registerCommand = ( yargs: StudioArgv ) => {
 				}
 				await runCommand( {
 					adapter,
+					approveClaude: typedArgv.json ? undefined : getTerminalClaudeApprover(),
+					askClaude: typedArgv.json ? undefined : getTerminalClaudeQuestionAsker(),
 					initialMessage,
 					resumeSessionId: typedArgv.resumeSession,
 					showLegacyCommandNotice: argv._[ 0 ] === 'ai',

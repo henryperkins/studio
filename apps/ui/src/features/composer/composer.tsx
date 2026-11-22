@@ -18,6 +18,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { toast } from '@/data/app-messages';
+import { publishComposerDraft, subscribeToComposerDraft } from '@/data/composer-drafts';
 import { nameChatGptAccount, useChatGptSettings } from '@/data/queries/use-chatgpt-settings';
 import { useImageService } from '@/data/queries/use-image-service';
 import { useIsOutOfAiCredits } from '@/data/queries/use-is-out-of-ai-credits';
@@ -67,6 +68,7 @@ import type { ComposerAttachment, ComposerSendAttachments } from '@/data/use-com
 import type { ChatGptConversation } from '@/features/composer/use-chatgpt-conversation';
 import type { OpenAiConversation } from '@/features/composer/use-openai-conversation';
 import type { ChatGptAccountView } from '@studio/agent/protocol/chatgpt';
+import type { ClaudeModelOption } from '@studio/agent/protocol/claude-code';
 import type { AiProviderId } from '@studio/agent/protocol/providers';
 
 /**
@@ -86,15 +88,21 @@ export function ComposerSkeleton() {
 	);
 }
 
-interface ComposerProps {
+type ComposerProps = (
+	| { model: AiModelId; claude?: never }
+	| {
+			model?: never;
+			claude: { model?: ClaudeModelOption; canSend: boolean };
+	  }
+) & {
 	busy: boolean;
 	isInterrupting?: boolean;
-	model: AiModelId;
 	onSend: (
 		prompt: string,
 		options?: ComposerSendAttachments & {
 			displayMessage?: string;
 			visualAnnotations?: StudioVisualAnnotationSummary[];
+			annotationDraft?: { text: string; notes: PreviewAnnotation[] };
 		}
 	) => Promise< void >;
 	onAnswer?: ( answer: string ) => void;
@@ -134,7 +142,7 @@ interface ComposerProps {
 	// The reasoning of a chat on OpenAI.
 	openAi?: OpenAiConversation;
 	chatGpt?: ChatGptConversation;
-}
+};
 
 function shouldShellFocusTextarea( target: EventTarget ) {
 	if ( ! ( target instanceof Element ) ) {
@@ -177,6 +185,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		notice: blockingNotice,
 		openAi,
 		chatGpt,
+		claude,
 	},
 	ref
 ) {
@@ -196,7 +205,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 	const [ validationError, setValidationError ] = useState< {
 		message: string;
 		value: string;
-		model: AiModelId;
+		model?: string;
 		attachments: ComposerAttachment[];
 		notes: PreviewAnnotation[];
 	} | null >( null );
@@ -220,10 +229,11 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 	} );
 	const { data: chatGptSettings } = useChatGptSettings();
 	// Only a chat on a subscription plan says which service makes its images.
-	const { data: imageService } = useImageService( !! chatGpt );
+	const { data: imageService } = useImageService( !! chatGpt || !! claude );
 	const chatGptAccounts =
 		chatGptSettings?.enabled && onSwitchSession && ! isField ? chatGptSettings.accounts : [];
-	const canChooseModel = providers.length > 0 || chatGptAccounts.length > 0 || !! chatGpt;
+	const canChooseModel =
+		!! model && ( providers.length > 0 || chatGptAccounts.length > 0 || !! chatGpt );
 	const connectionSwitch = useConnectionSwitch( ownerSiteId, onSwitchSession );
 	// Until the site's new chat is on the chosen ChatGPT account, nothing is sent
 	// and no other model is chosen: the composer still shows the previous one.
@@ -251,7 +261,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 				chatGptAccountName
 		  )
 		: undefined;
-	const isWpcom = sessionProvider === 'wpcom';
+	const isWpcom = ! claude && sessionProvider === 'wpcom';
 	const isOutOfCredits = useIsOutOfAiCredits() && isWpcom;
 	const { openAddCredits, purchase, closePurchase } = useAddCredits();
 	const blockingComposerNotice =
@@ -332,6 +342,8 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 	const fileDropTarget = dropTarget ?? shellNode;
 	const {
 		attachmentError,
+		preparing,
+		clearError,
 		attachments,
 		restoreAttachments,
 		pasteHandlers,
@@ -343,31 +355,56 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		onFileInputChange,
 	} = useDraftAttachments( {
 		initialAttachments: initialDraft.attachments,
+		claudeSessionId: claude ? sessionId : undefined,
 		annotationSiteId,
 		dropTarget: fileDropTarget,
 		textareaRef,
 	} );
 	const hasAttachments = attachments.length > 0;
+	const uploadBlocked = !! claude && ( preparing || !! attachmentError );
+	const uploadNotice = uploadBlocked
+		? preparing
+			? { message: __( 'Preparing attachments…' ) }
+			: { message: attachmentError!, action: { label: __( 'Dismiss' ), onClick: clearError } }
+		: undefined;
+	const modelId = claude?.model?.id ?? model;
+	const heldImages =
+		!! claude &&
+		claude.model?.imageInput !== true &&
+		( attachments.some( ( attachment ) => attachment.kind === 'image' ) ||
+			( ! busy && stagedNotes.some( ( note ) => note.images.length > 0 ) ) );
 	const currentValidationError =
 		validationError?.value === value &&
-		validationError.model === model &&
+		validationError.model === modelId &&
 		validationError.attachments === attachments &&
 		validationError.notes === stagedNotes
 			? validationError.message
 			: null;
 	const notice =
 		blockingComposerNotice ??
+		uploadNotice ??
+		( heldImages
+			? { message: __( 'Choose a model that supports images before sending these attachments' ) }
+			: undefined ) ??
 		( attachmentError || currentValidationError
 			? { message: attachmentError || currentValidationError! }
 			: undefined );
 
-	useEffect( () => {
+	useLayoutEffect( () => {
 		if ( draftEffectInitializedRef.current ) {
 			saveComposerDraft( draftKey, { text: value, attachments } );
 		} else {
 			draftEffectInitializedRef.current = true;
 		}
 	}, [ attachments, draftKey, value ] );
+
+	useLayoutEffect( () => {
+		if ( ! draftKey ) return;
+		return subscribeToComposerDraft( draftKey, ( draft ) => {
+			setValue( draft.text );
+			restoreAttachments( draft.attachments );
+		} );
+	}, [ draftKey, restoreAttachments ] );
 
 	const {
 		changeModel: changeLegacyModel,
@@ -465,7 +502,13 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		) {
 			return;
 		}
-		if ( blockingNotice || isOutOfCredits ) {
+		if (
+			blockingNotice ||
+			isOutOfCredits ||
+			( claude && ! claude.canSend ) ||
+			heldImages ||
+			uploadBlocked
+		) {
 			shake();
 			return;
 		}
@@ -481,7 +524,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 			setValidationError( {
 				message: ( error as Error ).message.replace( /\.$/, '' ),
 				value,
-				model,
+				model: modelId,
 				attachments,
 				notes: stagedNotes,
 			} );
@@ -489,12 +532,16 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		}
 		if (
 			submission.options.images?.length &&
-			! ( chatGpt ? chatGpt.capabilities?.imageInput : aiModelSupportsImages( model ) )
+			! ( claude
+				? claude.model?.imageInput
+				: chatGpt
+				? chatGpt.capabilities?.imageInput
+				: model && aiModelSupportsImages( model ) )
 		) {
 			setValidationError( {
 				message: __( 'Choose a model that supports images before sending these attachments' ),
 				value,
-				model,
+				model: modelId,
 				attachments,
 				notes: stagedNotes,
 			} );
@@ -503,21 +550,32 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		// Cleared up front so a composer remounted before the send is accepted
 		// doesn't bring the sent draft back; a failed send restores it.
 		setValidationError( null );
+		saveComposerDraft( draftKey, { text: '', attachments: [] } );
 		setValue( '' );
 		restoreAttachments( [] );
 		setSending( true );
 		try {
-			await onSend( submission.prompt, submission.options );
+			await onSend(
+				submission.prompt,
+				claude && sentNotes.length
+					? { ...submission.options, annotationDraft: { text: trimmed, notes: sentNotes } }
+					: submission.options
+			);
 		} catch {
 			// The parent reports the failure in a toast. Keep the draft even if
 			// its site was closed while the request was pending.
-			const currentDraft = getComposerDraft( draftKey );
-			saveComposerDraft( draftKey, {
-				text: currentDraft.text || value,
-				attachments: [ ...attachments, ...currentDraft.attachments ],
-			} );
-			setValue( ( current ) => current || value );
-			restoreAttachments( ( current ) => [ ...attachments, ...current ] );
+			const restoreText = ( current: string ) =>
+				claude && value && current ? `${ value }\n\n${ current }` : current || value;
+			if ( draftKey ) {
+				const currentDraft = getComposerDraft( draftKey );
+				publishComposerDraft( draftKey, {
+					text: restoreText( currentDraft.text ),
+					attachments: [ ...attachments, ...currentDraft.attachments ],
+				} );
+			} else {
+				setValue( restoreText );
+				restoreAttachments( ( current ) => [ ...attachments, ...current ] );
+			}
 			return;
 		} finally {
 			setSending( false );
@@ -543,6 +601,10 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 		restoreAttachments,
 		annotationSiteId,
 		model,
+		modelId,
+		claude,
+		heldImages,
+		uploadBlocked,
 		stagedNotes,
 		chatGpt,
 	] );
@@ -566,7 +628,13 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 
 	const showStop = ! isField && busy && ( sending || ! hasContent );
 	const showStart = ! busy && ! sending && ! hasContent && !! onStartSite;
-	const canSend = hasContent && ! sending && ! startingChat;
+	const canSend =
+		hasContent &&
+		! sending &&
+		! startingChat &&
+		( ! claude || claude.canSend ) &&
+		! heldImages &&
+		! uploadBlocked;
 	const placeholder = answerQuestion
 		? __( 'Your answer' )
 		: placeholderOverride ??
@@ -711,7 +779,7 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 							/>
 						</div>
 						<div className={ styles.rightActions }>
-							{ canChooseModel ? (
+							{ canChooseModel && model ? (
 								<ModelPicker
 									open={ modelOpen }
 									onOpenChange={ setModelOpen }
@@ -753,6 +821,9 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 									}
 								/>
 							) : null }
+							{ claude && busy && ! showStop && (
+								<StopButton isInterrupting={ isInterrupting } onStop={ () => void onInterrupt() } />
+							) }
 							{ isField ? null : showStop ? (
 								<StopButton isInterrupting={ isInterrupting } onStop={ () => void onInterrupt() } />
 							) : showStart ? (
@@ -771,14 +842,14 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 							) }
 						</div>
 					</div>
-					{ chatGpt ? (
+					{ chatGpt || claude ? (
 						<div className={ styles.connectionLabel }>
 							{ chatGptConnection }
 							{ imageService ? (
 								<ImageServiceNote
 									className={ styles.imageServiceNote }
 									state={ imageService }
-									plan="chatgpt"
+									plan={ claude ? 'claude' : 'chatgpt' }
 									onSetUp={ () => openSettings( 'ai' ) }
 								/>
 							) : null }
@@ -798,13 +869,15 @@ const ComposerContent = forwardRef< ComposerHandle, ComposerProps >( function Co
 				initialFocus={ () => ( sheet.addOpen ? commandListRef.current : false ) }
 				finalFocus={ () => ( pendingCommandRef.current ? false : textareaRef.current ) }
 			/>
-			<FamilySwitchConfirmDialog
-				currentModel={ model }
-				pendingModel={ pendingModel }
-				inFlight={ familySwitchInFlight }
-				onCancel={ cancelFamilyChange }
-				onConfirm={ () => void confirmFamilyChange() }
-			/>
+			{ model && (
+				<FamilySwitchConfirmDialog
+					currentModel={ model }
+					pendingModel={ pendingModel }
+					inFlight={ familySwitchInFlight }
+					onCancel={ cancelFamilyChange }
+					onConfirm={ () => void confirmFamilyChange() }
+				/>
+			) }
 			{ connectionSwitch.target ? (
 				<ConnectionSwitchDialog
 					target={ connectionSwitch.target }

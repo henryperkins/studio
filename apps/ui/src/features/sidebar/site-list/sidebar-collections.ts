@@ -19,7 +19,6 @@ export type PinnedItem =
 	| { key: string; row: SiteRow; session?: undefined; siteName?: undefined }
 	| { key: string; row?: undefined; session: AiSessionSummary; siteName?: string };
 
-// Recent is a shortcut to the latest chats; every chat is also under its site.
 const RECENT_CHATS_LIMIT = 10;
 
 function getTimestamp( session: AiSessionSummary | undefined ): number {
@@ -30,11 +29,13 @@ function byMostRecent( a: AiSessionSummary, b: AiSessionSummary ): number {
 	return getTimestamp( b ) - getTimestamp( a );
 }
 
-// Drafts stay in the site's workspace until the first message is sent.
+// Claude chats are explicitly created. Studio drafts appear after their first message.
 export function getListedSessions(
 	sessions: AiSessionSummary[] | undefined
 ): AiSessionSummary[] | undefined {
-	return sessions?.filter( ( session ) => session.firstPrompt );
+	return sessions?.filter(
+		( session ) => session.backend === 'claude-code' || session.firstPrompt
+	);
 }
 
 export function createSiteRows(

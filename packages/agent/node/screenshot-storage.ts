@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp } from 'fs/promises';
 import os from 'os';
 import path from 'path';
+import { currentClaudeWebCall } from './claude-code/web-call';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 
 /**
@@ -11,6 +12,14 @@ import type { StudioAgentHost } from '@studio/agent/node/host';
  * Hosts without one fall back to a throwaway temp directory.
  */
 export async function resolveScreenshotDirectory( host: StudioAgentHost ): Promise< string > {
+	const call = currentClaudeWebCall();
+	if ( call ) {
+		call.check();
+		const directory = await host.screenshotsDirectory?.();
+		if ( ! directory || ! path.isAbsolute( directory ) )
+			throw new Error( 'The screenshot directory for this conversation is unavailable.' );
+		return directory;
+	}
 	try {
 		const directory = await host.screenshotsDirectory?.();
 		if ( directory ) {

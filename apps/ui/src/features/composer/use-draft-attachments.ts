@@ -17,23 +17,27 @@ import {
 // staged annotations show first, as one file.
 export function useDraftAttachments( {
 	initialAttachments,
+	claudeSessionId,
 	annotationSiteId,
 	dropTarget,
 	textareaRef,
 }: {
 	initialAttachments: ComposerAttachment[];
+	claudeSessionId?: string;
 	annotationSiteId?: string;
 	dropTarget: HTMLElement | null;
 	textareaRef: RefObject< HTMLTextAreaElement | null >;
 } ) {
 	const {
 		error: attachmentError,
+		preparing,
+		clearError,
 		attachments,
 		addFiles,
 		removeAttachment,
 		restore: restoreAttachments,
 		pasteHandlers,
-	} = useComposerAttachments( initialAttachments );
+	} = useComposerAttachments( initialAttachments, claudeSessionId );
 	const { notes } = useSiteAnnotations( annotationSiteId );
 	const stagedNotes = useMemo( () => notes.filter( isStagedAnnotation ), [ notes ] );
 	const annotationsAttachment = stagedNotes.length ? getAnnotationsAttachment( stagedNotes ) : null;
@@ -77,6 +81,8 @@ export function useDraftAttachments( {
 
 	return {
 		attachmentError,
+		preparing,
+		clearError,
 		attachments,
 		restoreAttachments,
 		pasteHandlers,

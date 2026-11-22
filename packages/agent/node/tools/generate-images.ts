@@ -10,8 +10,9 @@ import {
 	resolveImageService,
 } from '@studio/agent/node/image-generation';
 import { defineTool, REMOTE_CHANGE } from './define-tool';
-import { runWpCli, textResult } from './utils';
-import type { HostSite, StudioAgentHost } from '@studio/agent/node/host';
+import { wpCliMediaLibrary } from './media-library';
+import { textResult } from './utils';
+import type { MediaAttachment } from '@studio/agent/node/host';
 
 const MAX_IMAGES_PER_CALL = 20;
 const UPLOADS_DIR = path.sep + path.join( 'wp-content', 'uploads' ) + path.sep;
@@ -30,61 +31,6 @@ export function resolveImageFilePath( sitesRoot: string, filePath: string ): str
 	}
 	return resolved;
 }
-
-async function findSiteContaining(
-	host: StudioAgentHost,
-	filePaths: string[]
-): Promise< HostSite > {
-	const sites = await host.sites.all();
-	const site = sites.find( ( candidate ) =>
-		filePaths.every( ( filePath ) =>
-			filePath.startsWith( path.resolve( candidate.path ) + path.sep )
-		)
-	);
-	if ( ! site ) {
-		throw new Error( 'Images under wp-content/uploads must all be inside one Studio site.' );
-	}
-	return site;
-}
-
-interface Attachment {
-	id: number;
-	file: string;
-	url: string;
-}
-
-// Runs `php` through WP-CLI with `data` decoded into `$data`.
-async function evalWithData(
-	host: StudioAgentHost,
-	site: HostSite,
-	php: string,
-	data: unknown
-): Promise< string > {
-	const encoded = Buffer.from( JSON.stringify( data ) ).toString( 'base64' );
-	return runWpCli( host, site, [
-		'eval',
-		`$data = json_decode( base64_decode( '${ encoded }' ), true );\n${ php }`,
-	] );
-}
-
-// Media-library images get their attachment before they are generated, so the
-// result can give their IDs and URLs right away.
-const RESERVE_ATTACHMENTS = `$upload = wp_upload_dir();
-$reserved = array();
-foreach ( $data as $name ) {
-	$filename = wp_unique_filename( $upload['path'], $name );
-	$id = wp_insert_attachment( array( 'guid' => $upload['url'] . '/' . $filename, 'post_mime_type' => 'image/png', 'post_title' => pathinfo( $filename, PATHINFO_FILENAME ), 'post_content' => '', 'post_status' => 'inherit' ), $upload['path'] . '/' . $filename );
-	$reserved[] = array( 'id' => $id, 'file' => substr( $upload['path'], strlen( ABSPATH ) ) . '/' . $filename, 'url' => wp_get_attachment_url( $id ) );
-}
-echo wp_json_encode( $reserved );`;
-
-const FINALIZE_ATTACHMENTS = `require_once ABSPATH . 'wp-admin/includes/image.php';
-foreach ( $data['ready'] as $id ) {
-	wp_update_attachment_metadata( $id, wp_generate_attachment_metadata( $id, get_attached_file( $id ) ) );
-}
-foreach ( $data['failed'] as $id ) {
-	wp_delete_attachment( $id, true );
-}`;
 
 export const generateImagesTool = defineTool(
 	'generate_images',
@@ -156,21 +102,16 @@ export const generateImagesTool = defineTool(
 		const libraryTargets = targets.filter( ( target ) =>
 			target.resolvedPath.includes( UPLOADS_DIR )
 		);
+		const media = host.media ?? wpCliMediaLibrary( host );
 		const site = libraryTargets.length
-			? await findSiteContaining(
-					host,
-					libraryTargets.map( ( target ) => target.resolvedPath )
-			  )
+			? await media.siteContaining( libraryTargets.map( ( target ) => target.resolvedPath ) )
 			: undefined;
-		const attachments = new Map< string, Attachment >();
+		const attachments = new Map< string, MediaAttachment >();
 		if ( site ) {
-			const output = await evalWithData(
-				host,
+			const reserved = await media.reserve(
 				site,
-				RESERVE_ATTACHMENTS,
 				libraryTargets.map( ( target ) => path.basename( target.resolvedPath ) )
 			);
-			const reserved: Attachment[] = JSON.parse( output.trim().split( '\n' ).pop() ?? '[]' );
 			libraryTargets.forEach( ( target, index ) =>
 				attachments.set( target.resolvedPath, {
 					...reserved[ index ],
@@ -187,12 +128,21 @@ export const generateImagesTool = defineTool(
 			aspectRatio: image.aspectRatio,
 		} ) );
 
-		const generation = generateImages( host.userAgent, imageService.token, requests )
+		// A host made for one call stops the requests once that call is cancelled;
+		// what was reserved is still completed or deleted below.
+		const signal = host.callSignal;
+		const generating = signal
+			? generateImages( host.userAgent, imageService.token, requests, undefined, signal )
+			: generateImages( host.userAgent, imageService.token, requests );
+		const generation = generating
 			.catch( ( error ): GenerateImageResult[] =>
 				requests.map( () => ( { ok: false, error: String( error ) } ) )
 			)
 			.then( async ( results ) => {
 				const failures: string[] = [];
+				// A write that fails is reported, as the first to fail, only once every
+				// other write has settled, so none lands after the work has ended.
+				let failedWrite: { error: unknown } | undefined;
 				await Promise.all(
 					results.map( async ( result, index ) => {
 						const target = targets[ index ];
@@ -204,19 +154,21 @@ export const generateImagesTool = defineTool(
 							return;
 						}
 						const file = attachments.get( target.resolvedPath )?.file ?? target.resolvedPath;
-						await fs.mkdir( path.dirname( file ), { recursive: true } );
-						await fs.writeFile( file, result.bytes );
+						try {
+							await fs.mkdir( path.dirname( file ), { recursive: true } );
+							await fs.writeFile( file, result.bytes );
+						} catch ( error ) {
+							failedWrite ??= { error };
+						}
 					} )
 				);
+				if ( failedWrite ) throw failedWrite.error;
 				if ( site ) {
 					const ids = ( ok: boolean ) =>
 						libraryTargets
 							.filter( ( target ) => results[ targets.indexOf( target ) ].ok === ok )
 							.map( ( target ) => attachments.get( target.resolvedPath )!.id );
-					await evalWithData( host, site, FINALIZE_ATTACHMENTS, {
-						ready: ids( true ),
-						failed: ids( false ),
-					} );
+					await media.finalize( site, ids( true ), ids( false ) );
 				}
 				return failures.length
 					? `These images failed, and any attachment reserved for them was removed. Drop them from the markup or generate them again:\n${ failures.join(

@@ -6,6 +6,7 @@ export interface AgentRunStore {
 	dispatchSession: ( sessionId: string, action: AgentRunAction ) => void;
 	startRun: ( sessionId: string, prompt: string, options?: SendMessageOptions ) => Promise< void >;
 	interrupt: ( sessionId: string ) => Promise< void >;
+	discardClaudeFiles: ( sessionId: string, paths: string[] ) => void;
 	answerQuestion: ( sessionId: string, question: string, answer: string ) => void;
 	clearQuestionAnswer: ( sessionId: string, question: string ) => void;
 }

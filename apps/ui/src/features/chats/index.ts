@@ -1,6 +1,7 @@
 export { ChatActionsMenuItems, useChatActions, useLeaveArchivedChat } from './chat-actions';
 export { CopyButton } from './copy-button';
 export { SessionView } from './session-view';
+export { ClaudeNewChat } from './session-view/claude-new-chat';
 export {
 	entriesToTranscriptItems,
 	type TranscriptItem,

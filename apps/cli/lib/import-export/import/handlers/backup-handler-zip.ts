@@ -4,11 +4,17 @@ import { promisify } from 'util';
 import { ImportEvents } from '@studio/common/lib/import-export-events';
 import fse from 'fs-extra';
 import yauzl from 'yauzl';
+import { requirePlainTransferEntry } from 'cli/lib/site-transfer-paths';
 import { ImportExportEventEmitter } from '../../events';
 import { BackupArchiveInfo } from '../types';
 import { BackupHandler, isFileAllowed } from './backup-handler-factory';
 
 const openZip = promisify< string, yauzl.Options, yauzl.ZipFile >( yauzl.open );
+
+function checkEntry( entry: yauzl.Entry ): void {
+	const type = ( entry.externalFileAttributes >>> 16 ) & 0o170000;
+	requirePlainTransferEntry( entry.fileName, type === 0 || type === 0o100000 || type === 0o040000 );
+}
 
 export class BackupHandlerZip extends ImportExportEventEmitter implements BackupHandler {
 	async listFiles( backup: BackupArchiveInfo ): Promise< string[] > {
@@ -17,6 +23,13 @@ export class BackupHandlerZip extends ImportExportEventEmitter implements Backup
 
 		return new Promise( ( resolve, reject ) => {
 			zipFile.on( 'entry', ( entry ) => {
+				try {
+					checkEntry( entry );
+				} catch ( error ) {
+					zipFile.close();
+					reject( error );
+					return;
+				}
 				if ( isFileAllowed( entry.fileName ) ) {
 					fileNames.push( entry.fileName );
 				}
@@ -47,21 +60,32 @@ export class BackupHandlerZip extends ImportExportEventEmitter implements Backup
 			const failOnce = ( err: Error ) => {
 				if ( ! extractionFailed ) {
 					extractionFailed = true;
+					zipFile.close();
 					reject( err );
 				}
 			};
 
 			zipFile.on( 'entry', async ( entry ) => {
+				try {
+					checkEntry( entry );
+				} catch ( error ) {
+					failOnce( error as Error );
+					return;
+				}
 				if ( ! isFileAllowed( entry.fileName ) ) {
 					zipFile.readEntry();
 					return;
 				}
 
 				const fullPath = path.join( extractionDirectory, entry.fileName );
-				await fse.ensureDir( path.dirname( fullPath ) );
-
-				if ( entry.fileName.endsWith( '/' ) ) {
-					zipFile.readEntry();
+				try {
+					await fse.ensureDir( path.dirname( fullPath ) );
+					if ( entry.fileName.endsWith( '/' ) ) {
+						zipFile.readEntry();
+						return;
+					}
+				} catch ( error ) {
+					failOnce( error as Error );
 					return;
 				}
 

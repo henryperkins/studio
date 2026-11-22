@@ -18,12 +18,14 @@ import styles from './style.module.css';
 export function ConnectionSwitchDialog( {
 	target,
 	inFlight,
+	confirmDisabled,
 	error,
 	onCancel,
 	onConfirm,
 }: {
 	target: string;
 	inFlight: boolean;
+	confirmDisabled?: boolean;
 	error?: string;
 	onCancel: () => void;
 	onConfirm: ( summary: string ) => void;
@@ -70,7 +72,7 @@ export function ConnectionSwitchDialog( {
 					</DialogClose>
 					<Button
 						variant="accent"
-						disabled={ inFlight }
+						disabled={ inFlight || confirmDisabled }
 						loading={ inFlight }
 						loadingAnnouncement={ __( 'Starting new chat' ) }
 						onClick={ () => onConfirm( summary ) }

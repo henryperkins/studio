@@ -1,3 +1,4 @@
+import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 import type { JsonEvent } from '@studio/agent/protocol/json-events';
 
 export type AgentEvent =
@@ -18,5 +19,7 @@ export interface ActiveAgentRun {
 	sessionId: string;
 	startedAt: number;
 	phase: 'running' | 'interrupting';
+	pendingClaudeApprovals?: Extract< BackendTurnEvent, { type: 'approval.requested' } >[];
+	pendingClaudeQuestions?: Extract< BackendTurnEvent, { type: 'question.asked' } >[];
 	pendingQuestions?: Extract< JsonEvent, { type: 'question.asked' } >[ 'questions' ];
 }

@@ -103,6 +103,7 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 	// The server namespaces its API under /api so the SPA's real-path routes
 	// (also /sessions/:id, /sites/:id) can share the same origin.
 	const base = `${ apiBaseUrl.replace( /\/$/, '' ) }/api`;
+	const clientId = crypto.randomUUID();
 	const callbackHosts = new Set( [ 'localhost', '127.0.0.1', '[::1]', 'studio.local' ] );
 	const chatGptSignInSupported =
 		callbackHosts.has( window.location.hostname ) &&
@@ -225,7 +226,7 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 		async init() {
 			// The browser's EventSource reconnects automatically.
 			eventSource?.close();
-			eventSource = new EventSource( `${ base }/events` );
+			eventSource = new EventSource( `${ base }/events?clientId=${ clientId }` );
 			let hasConnected = false;
 			eventSource.onopen = () => {
 				if ( hasConnected ) {
@@ -546,10 +547,10 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			// back the server-side temp path the path-based operations expect.
 			return uploadFile( file );
 		},
-		async readLocalMediaFile( filePath ): Promise< LocalMediaFile > {
-			const response = await fetch(
-				`${ base }/media/read?path=${ encodeURIComponent( filePath ) }`
-			);
+		async readLocalMediaFile( filePath, claudeSessionId ): Promise< LocalMediaFile > {
+			const query = new URLSearchParams( { path: filePath } );
+			if ( claudeSessionId !== undefined ) query.set( 'claudeSessionId', claudeSessionId );
+			const response = await fetch( `${ base }/media/read?${ query }` );
 			if ( ! response.ok ) {
 				const text = await response.text().catch( () => '' );
 				throw new Error( `GET /media/read failed (${ response.status }): ${ text }` );
@@ -769,6 +770,52 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 				body: JSON.stringify( { siteId } ),
 			} );
 		},
+		getClaudeRuntimeState: () => api( '/claude-code' ),
+		configureClaudeRuntime: ( action ) =>
+			api( '/claude-code/connection', {
+				method: 'POST',
+				body: JSON.stringify( action ),
+			} ),
+		getClaudeModelCatalog: ( connectionId, siteId ) =>
+			api(
+				`/claude-code/${ encodeURIComponent( connectionId ) }/models${
+					siteId === undefined ? '' : `/${ encodeURIComponent( siteId ) }`
+				}`
+			),
+		setClaudeSessionTarget: ( sessionId, expected, target ) =>
+			api( `/sessions/${ encodeURIComponent( sessionId ) }/claude-target`, {
+				method: 'POST',
+				body: JSON.stringify( { expected, target } ),
+			} ),
+		discardClaudeChatFile: ( sessionId, path ) =>
+			api< void >( `/sessions/${ encodeURIComponent( sessionId ) }/claude-attachments`, {
+				method: 'DELETE',
+				body: JSON.stringify( { path } ),
+			} ),
+		stageClaudeChatFile: async ( sessionId, file ) => {
+			const query = new URLSearchParams( { name: file.name, size: String( file.size ) } );
+			const result = await api< { path: string } >(
+				`/sessions/${ encodeURIComponent( sessionId ) }/claude-attachments?${ query }`,
+				{
+					method: 'POST',
+					headers: { 'Content-Type': 'application/octet-stream' },
+					body: file,
+				}
+			);
+			return result.path;
+		},
+		recoverClaudeSession: ( sessionId ) =>
+			api( `/sessions/${ encodeURIComponent( sessionId ) }/claude-recovery`, { method: 'POST' } ),
+		createClaudeSession: ( request ) =>
+			api( '/claude-code/sessions', {
+				method: 'POST',
+				body: JSON.stringify( request ),
+			} ),
+		setClaudeSessionSelection: ( sessionId, selection ) =>
+			api( `/sessions/${ encodeURIComponent( sessionId ) }/claude-selection`, {
+				method: 'POST',
+				body: JSON.stringify( selection ),
+			} ),
 		async continueSession( sessionId, prompt, options ): Promise< { runId: string } > {
 			return api< { runId: string } >( `/sessions/${ encodeURIComponent( sessionId ) }/messages`, {
 				method: 'POST',
@@ -779,11 +826,13 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 					images: options?.images,
 					files: options?.files,
 					visualAnnotations: options?.visualAnnotations,
+					claudeContext: options?.claudeContext,
+					...( options?.claudeSelection && { claudeSelection: options.claudeSelection, clientId } ),
 				} ),
 			} );
 		},
 		async getActiveAgentRuns(): Promise< ActiveAgentRun[] > {
-			return api< ActiveAgentRun[] >( '/runs/active' );
+			return api< ActiveAgentRun[] >( `/runs/active?clientId=${ clientId }` );
 		},
 		async setSessionModel( sessionId, model ) {
 			await api( `/sessions/${ encodeURIComponent( sessionId ) }/model`, {
@@ -816,12 +865,15 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			} );
 		},
 		async interruptAgentRun( runId ) {
-			await api( `/runs/${ encodeURIComponent( runId ) }/interrupt`, { method: 'POST' } );
+			await api( `/runs/${ encodeURIComponent( runId ) }/interrupt`, {
+				method: 'POST',
+				body: JSON.stringify( { clientId } ),
+			} );
 		},
-		async answerAgentQuestion( runId, answers ) {
+		async answerAgentQuestion( runId, answers, requestId ) {
 			await api( `/runs/${ encodeURIComponent( runId ) }/answer`, {
 				method: 'POST',
-				body: JSON.stringify( { answers } ),
+				body: JSON.stringify( { answers, requestId, clientId } ),
 			} );
 		},
 		onAgentEvent( listener ) {

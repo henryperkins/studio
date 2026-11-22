@@ -9,6 +9,16 @@ import type {
 	ChatGptSignInStart,
 	ChatGptSignOutResult,
 } from '@studio/agent/protocol/chatgpt';
+import type {
+	ClaudeModelCatalog,
+	ClaudeRecoveryResult,
+	ClaudeSendContext,
+	ClaudeRuntimeAction,
+	ClaudeRuntimeState,
+	ClaudeSessionSelection,
+	ClaudeStudioTarget,
+	CreateClaudeSessionRequest,
+} from '@studio/agent/protocol/claude-code';
 import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
 import type { ImageServiceState } from '@studio/agent/protocol/image-service';
 import type { AiModelId } from '@studio/agent/protocol/models';
@@ -275,7 +285,7 @@ export interface Connector {
 	// in the renderer. Returns an empty string when the underlying file lacks
 	// a real path (synthetic blobs, non-Electron environments).
 	getFilePath( file: File ): Promise< string >;
-	readLocalMediaFile( path: string ): Promise< LocalMediaFile >;
+	readLocalMediaFile( path: string, claudeSessionId?: string ): Promise< LocalMediaFile >;
 
 	// Uploads and extracts a Blueprint ZIP bundle to a temp directory and returns the
 	// parsed `blueprint.json`. The caller is responsible for calling
@@ -416,6 +426,22 @@ export interface Connector {
 	// Create an empty session file so it appears immediately. When `siteId`
 	// is omitted, the session is a user chat with no owner site.
 	createSession( siteId?: string ): Promise< AiSessionSummary >;
+	getClaudeRuntimeState(): Promise< ClaudeRuntimeState >;
+	configureClaudeRuntime( action: ClaudeRuntimeAction ): Promise< void >;
+	getClaudeModelCatalog( connectionId: string, siteId?: string ): Promise< ClaudeModelCatalog >;
+	setClaudeSessionTarget(
+		sessionId: string,
+		expected: ClaudeStudioTarget,
+		target: ClaudeStudioTarget
+	): Promise< void >;
+	discardClaudeChatFile( sessionId: string, path: string ): Promise< void >;
+	stageClaudeChatFile( sessionId: string, file: File ): Promise< string >;
+	recoverClaudeSession( sessionId: string ): Promise< ClaudeRecoveryResult >;
+	createClaudeSession( request: CreateClaudeSessionRequest ): Promise< AiSessionSummary >;
+	setClaudeSessionSelection(
+		sessionId: string,
+		selection: ClaudeSessionSelection
+	): Promise< void >;
 
 	// Continue an existing session by sending a new prompt. Returns a `runId`
 	// that identifies the in-flight agent run; live events for that run stream
@@ -425,6 +451,8 @@ export interface Connector {
 		prompt: string,
 		options?: {
 			turnId?: string;
+			claudeSelection?: ClaudeSessionSelection;
+			claudeContext?: ClaudeSendContext;
 			displayMessage?: string;
 			images?: StudioChatImage[];
 			files?: StudioChatFileAttachment[];
@@ -458,7 +486,11 @@ export interface Connector {
 	// Point the session's next turn at its local site or its connected live site.
 	setSessionEnvironment( sessionId: string, environment: 'local' | 'live' ): Promise< void >;
 	interruptAgentRun( runId: string ): Promise< void >;
-	answerAgentQuestion( runId: string, answers: Record< string, string > ): Promise< void >;
+	answerAgentQuestion(
+		runId: string,
+		answers: Record< string, string >,
+		requestId?: string
+	): Promise< void >;
 	onAgentEvent( listener: ( event: AgentRunEvent ) => void ): () => void;
 	// Fires when a dropped event stream reconnects, so listeners can re-read what they missed.
 	onConnectionRestored?( listener: () => void ): () => void;

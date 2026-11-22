@@ -32,6 +32,11 @@ export async function withSessionSelection< T >(
 ): Promise< T > {
 	try {
 		const { summary } = await loadAiSession( sessionsRoot, sessionId );
+		if ( summary.backend === 'claude-code' ) {
+			throw new ChatGptSettingsError(
+				__( 'Start a new chat to change the runtime or billing connection.' )
+			);
+		}
 		// Retried while Windows refuses a lockfile another process is letting go.
 		const release = await lockChatGptFile( `${ summary.filePath }.settings.lock`, {
 			stale: LOCKFILE_STALE_TIME,

@@ -100,6 +100,31 @@ describe( 'createLocalConnector Connect contracts', () => {
 		} );
 	} );
 
+	it( 'carries the captured Claude selection and browser owner with a turn', async () => {
+		fetchMock.mockResolvedValue( new Response( JSON.stringify( { runId: 'run-a' } ) ) );
+		const connector = createLocalConnector( { apiBaseUrl: 'http://localhost:8081' } );
+		const claudeSelection = { model: 'claude-model', effort: 'medium' } as const;
+		await connector.continueSession( 'session-a', 'hello', { claudeSelection } );
+		expect( JSON.parse( String( fetchMock.mock.calls[ 0 ][ 1 ]?.body ) ) ).toMatchObject( {
+			claudeSelection,
+			clientId: expect.stringMatching( /^[a-f0-9-]{36}$/ ),
+		} );
+	} );
+
+	it( 'includes the same browser owner on a correlated answer and Stop', async () => {
+		fetchMock.mockResolvedValue( new Response( null, { status: 204 } ) );
+		const connector = createLocalConnector( { apiBaseUrl: 'http://localhost:8081' } );
+		await connector.answerAgentQuestion( 'run-a', { 'Which?': 'A' }, 'request-a' );
+		await connector.interruptAgentRun( 'run-a' );
+		const bodies = fetchMock.mock.calls.map( ( [ , init ] ) => JSON.parse( String( init?.body ) ) );
+		expect( bodies[ 0 ] ).toEqual( {
+			answers: { 'Which?': 'A' },
+			requestId: 'request-a',
+			clientId: expect.stringMatching( /^[a-f0-9-]{36}$/ ),
+		} );
+		expect( bodies[ 1 ] ).toEqual( { clientId: bodies[ 0 ].clientId } );
+	} );
+
 	it( 'requests the signup-aware login URL', async () => {
 		fetchMock.mockResolvedValue(
 			new Response( JSON.stringify( { url: 'https://wordpress.com/start' } ) )

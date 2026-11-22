@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
+import { writeFile as atomicWriteFile } from 'atomically';
 import {
 	buildAiSessionFileName,
 	extractAiSessionIdFromFilePath,
@@ -8,7 +9,12 @@ import {
 import { migrateLegacyFileInPlace } from '@studio/agent/node/sessions/migration';
 import { getAiSessionsDirectoryForDate } from '@studio/agent/node/sessions/paths';
 import { readAiSessionSummaryFromEntries } from '@studio/agent/node/sessions/summary';
+import { createNativeSessionStore, getClaudeSessionStoreRoot } from '../claude-code/sessions';
 import type { SessionEntry } from '@earendil-works/pi-coding-agent';
+import type {
+	ClaudeSessionSelection,
+	ClaudeWorkspaceBinding,
+} from '@studio/agent/protocol/claude-code';
 import type {
 	StudioCustomEntryDataMap,
 	StudioCustomEntryType,
@@ -173,6 +179,7 @@ export async function loadAiSession(
 }
 
 export interface CreateAiSessionOptions {
+	claude?: { binding: ClaudeWorkspaceBinding; selection: ClaudeSessionSelection };
 	site?: {
 		id?: string;
 		name: string;
@@ -210,6 +217,7 @@ export async function createAiSession(
 			id: sessionId,
 			timestamp: isoTs,
 			cwd: PI_SESSION_CWD,
+			...( options.claude && { studioBackend: 'claude-code' } ),
 		} ),
 	];
 	const entries: SessionEntry[] = [];
@@ -232,8 +240,29 @@ export async function createAiSession(
 		entries.push( entry as SessionEntry );
 		lines.push( JSON.stringify( entry ) );
 	}
+	if ( options.claude ) {
+		let parentId = entries.at( -1 )?.id ?? null;
+		for ( const [ customType, data ] of [
+			[ 'studio.claude_binding', options.claude.binding ],
+			[ 'studio.claude_selection', options.claude.selection ],
+		] as const ) {
+			const entry = {
+				type: 'custom' as const,
+				id: shortId(),
+				parentId,
+				timestamp: isoTs,
+				customType,
+				data,
+			};
+			parentId = entry.id;
+			entries.push( entry );
+			lines.push( JSON.stringify( entry ) );
+		}
+	}
 
-	await fs.writeFile( filePath, lines.join( '\n' ) + '\n', { encoding: 'utf8' } );
+	const content = lines.join( '\n' ) + '\n';
+	if ( options.claude ) await atomicWriteFile( filePath, content, { mode: 0o600 } );
+	else await fs.writeFile( filePath, content, { encoding: 'utf8' } );
 
 	const allEntries = [
 		{
@@ -305,7 +334,18 @@ export async function deleteAiSession(
 	sessionIdOrPrefix: string
 ): Promise< AiSessionSummary > {
 	const sessionToDelete = await resolveSessionByIdOrPrefix( rootDirectory, sessionIdOrPrefix );
-	await fs.rm( sessionToDelete.filePath, { force: false } );
+	const claude =
+		sessionToDelete.backend === 'claude-code'
+			? createNativeSessionStore( getClaudeSessionStoreRoot( rootDirectory ) )
+			: undefined;
+	const release = await claude?.lockTurn( sessionToDelete.id );
+	try {
+		const removeSession = () => fs.rm( sessionToDelete.filePath, { force: false } );
+		if ( claude ) await claude.clearConversation( sessionToDelete.id, removeSession );
+		else await removeSession();
+	} finally {
+		await release?.();
+	}
 
 	// Sweep sidecars sharing the JSONL's stem: legacy files like
 	// `.openai-state.json` and directories like `.screenshots`. Best-effort.

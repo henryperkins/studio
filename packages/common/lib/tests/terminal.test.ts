@@ -1,9 +1,56 @@
 /**
  * @vitest-environment node
  */
-import { resolveLinuxTerminalLaunch } from '../user-settings/terminal';
+import {
+	resolveLinuxTerminalCommandLaunch,
+	resolveLinuxTerminalLaunch,
+} from '../user-settings/terminal';
 
 const SITE = '/home/user/Studio/my site';
+
+describe( 'resolveLinuxTerminalCommandLaunch', () => {
+	const argv = [ '/opt/My Tools/$HOME `x` "q" \'s\'/tool', 'auth', 'login' ];
+
+	it( 'runs the command as separate arguments in the desktop default terminal first', () => {
+		expect(
+			resolveLinuxTerminalCommandLaunch(
+				SITE,
+				argv,
+				findIn( 'xdg-terminal-exec', 'x-terminal-emulator' )
+			)
+		).toEqual( { file: '/usr/bin/xdg-terminal-exec', args: argv, cwd: SITE } );
+		expect(
+			resolveLinuxTerminalCommandLaunch( SITE, argv, findIn( 'x-terminal-emulator', 'xterm' ) )
+		).toEqual( { file: '/usr/bin/x-terminal-emulator', args: [ '-e', ...argv ], cwd: SITE } );
+	} );
+
+	it( 'uses each terminal’s own argument-preserving form', () => {
+		const expected: Record< string, string[] > = {
+			'gnome-terminal': [ `--working-directory=${ SITE }`, '--', ...argv ],
+			konsole: [ '--workdir', SITE, '-e', ...argv ],
+			'xfce4-terminal': [ `--working-directory=${ SITE }`, '-x', ...argv ],
+			'mate-terminal': [ `--working-directory=${ SITE }`, '-x', ...argv ],
+			terminator: [ `--working-directory=${ SITE }`, '-x', ...argv ],
+			alacritty: [ '--working-directory', SITE, '-e', ...argv ],
+			kitty: [ '--directory', SITE, ...argv ],
+			foot: [ `--working-directory=${ SITE }`, ...argv ],
+			wezterm: [ 'start', '--cwd', SITE, '--', ...argv ],
+			xterm: [ '-e', ...argv ],
+		};
+		for ( const [ command, args ] of Object.entries( expected ) )
+			expect( resolveLinuxTerminalCommandLaunch( SITE, argv, findIn( command ) ), command ).toEqual(
+				{ file: `/usr/bin/${ command }`, args, cwd: SITE }
+			);
+	} );
+
+	it( 'never uses a terminal that would parse the command as one string', () => {
+		for ( const command of [ 'ptyxis', 'kgx', 'tilix', 'lxterminal', 'qterminal' ] )
+			expect(
+				resolveLinuxTerminalCommandLaunch( SITE, argv, findIn( command ) ),
+				command
+			).toBeNull();
+	} );
+} );
 
 function findIn( ...commands: string[] ) {
 	return ( command: string ) => ( commands.includes( command ) ? `/usr/bin/${ command }` : null );

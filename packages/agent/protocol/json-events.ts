@@ -1,4 +1,5 @@
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
+import type { BackendTurnEvent } from '@studio/agent/protocol/backend-events';
 import type { StudioChatArtifactData } from '@studio/agent/protocol/chat-artifacts';
 
 export type TurnCompletedStatus = 'success' | 'error' | 'paused' | 'max_turns';
@@ -11,6 +12,7 @@ export interface AgentMessageJsonEvent {
 
 export type JsonEvent =
 	| AgentMessageJsonEvent
+	| { type: 'backend.event'; timestamp: string; event: BackendTurnEvent }
 	| { type: 'info'; timestamp: string; message: string }
 	| { type: 'error'; timestamp: string; message: string }
 	| { type: 'chat.artifact'; timestamp: string; artifact: StudioChatArtifactData }

@@ -17,14 +17,16 @@ export function QuestionOptionViewer( {
 	index,
 	onIndexChange,
 	onChoose,
+	claudeSessionId,
 }: {
 	options: Array< { label: string; description: string; image?: string } >;
 	index: number | null;
 	onIndexChange: ( index: number | null ) => void;
 	onChoose?: ( label: string ) => void;
+	claudeSessionId?: string;
 } ) {
 	const option = index === null ? undefined : options[ index ];
-	const localFileQuery = useLocalMediaDataUrl( option?.image ?? null );
+	const localFileQuery = useLocalMediaDataUrl( option?.image ?? null, claudeSessionId );
 	const step = ( delta: number ) =>
 		index !== null && onIndexChange( ( index + delta + options.length ) % options.length );
 	const previousIcon = isRTL() ? <ChevronRightIcon /> : <ChevronLeftIcon />;

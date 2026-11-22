@@ -113,7 +113,8 @@ const api: IpcApi = {
 	getDirectorySize: ( id, subdir ) => ipcRendererInvoke( 'getDirectorySize', id, subdir ),
 	getFileSize: ( id, filePath ) => ipcRendererInvoke( 'getFileSize', id, filePath ),
 	getPathForFile: ( file ) => webUtils.getPathForFile( file ),
-	readLocalMediaFile: ( path ) => ipcRendererInvoke( 'readLocalMediaFile', path ),
+	readLocalMediaFile: ( path, claudeSessionId ) =>
+		ipcRendererInvoke( 'readLocalMediaFile', path, claudeSessionId ),
 	openWebviewDevTools: ( webContentsId ) =>
 		ipcRendererInvoke( 'openWebviewDevTools', webContentsId ),
 	setWebviewColorScheme: ( webContentsId, colorScheme ) =>
@@ -174,6 +175,28 @@ const api: IpcApi = {
 	listAiSessions: () => ipcRendererInvoke( 'listAiSessions' ),
 	loadAiSession: ( sessionIdOrPrefix ) => ipcRendererInvoke( 'loadAiSession', sessionIdOrPrefix ),
 	createAiSession: ( siteId ) => ipcRendererInvoke( 'createAiSession', siteId ),
+	getClaudeRuntimeState: () => ipcRendererInvoke( 'getClaudeRuntimeState' ),
+	configureClaudeRuntime: ( action ) => ipcRendererInvoke( 'configureClaudeRuntime', action ),
+	getClaudeModelCatalog: ( connectionId, siteId ) =>
+		ipcRendererInvoke( 'getClaudeModelCatalog', connectionId, siteId ),
+	setClaudeSessionTarget: ( id, expected, target ) =>
+		ipcRendererInvoke( 'setClaudeSessionTarget', id, expected, target ),
+	discardClaudeChatFile: ( sessionId, path ) =>
+		ipcRendererInvoke( 'discardClaudeChatFile', sessionId, path ),
+	stageClaudeChatFile: async ( sessionId, file ) => {
+		const picked = webUtils.getPathForFile( file );
+		return ipcRendererInvoke(
+			'stageClaudeChatFile',
+			sessionId,
+			file.name,
+			file.size,
+			picked || new Uint8Array( await file.arrayBuffer() )
+		);
+	},
+	recoverClaudeSession: ( sessionId ) => ipcRendererInvoke( 'recoverClaudeSession', sessionId ),
+	createClaudeSession: ( request ) => ipcRendererInvoke( 'createClaudeSession', request ),
+	setClaudeSessionSelection: ( sessionId, selection ) =>
+		ipcRendererInvoke( 'setClaudeSessionSelection', sessionId, selection ),
 	updateAiSessionMetadata: ( sessionIdOrPrefix, patch ) =>
 		ipcRendererInvoke( 'updateAiSessionMetadata', sessionIdOrPrefix, patch ),
 	continueAiSession: ( sessionId, prompt, options ) =>
@@ -200,8 +223,8 @@ const api: IpcApi = {
 	setAiSessionEnvironment: ( sessionId, environment ) =>
 		ipcRendererInvoke( 'setAiSessionEnvironment', sessionId, environment ),
 	interruptAiAgentRun: ( runId ) => ipcRendererInvoke( 'interruptAiAgentRun', runId ),
-	answerAiAgentQuestion: ( runId, answers ) =>
-		ipcRendererInvoke( 'answerAiAgentQuestion', runId, answers ),
+	answerAiAgentQuestion: ( runId, answers, requestId ) =>
+		ipcRendererInvoke( 'answerAiAgentQuestion', runId, answers, requestId ),
 	sendFeedback: ( feedback ) => ipcRendererInvoke( 'sendFeedback', feedback ),
 };
 

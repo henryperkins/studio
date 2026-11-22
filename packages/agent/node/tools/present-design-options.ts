@@ -10,11 +10,15 @@ import {
 	type DesignTracksContext,
 } from '@studio/agent/node/design-tracks';
 import { resolveScreenshotDirectory } from '@studio/agent/node/screenshot-storage';
+import { currentClaudeWebCall } from '../claude-code/web-call';
+import { captureClaudeDesignPreview, DesignPreviewInputError } from './claude-design-preview';
 import { defineTool, LOCAL_CHANGE, type ToolResult } from './define-tool';
 import { captureScreenshotBuffer, saveScreenshotFile } from './screenshot-helpers';
 import { textResult } from './utils';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 import type { AskUserQuestion } from '@studio/agent/node/types';
+
+export { DesignPreviewInputError };
 
 const PREVIEW_VIEWPORT = { width: 1200, height: 900 } as const;
 
@@ -174,7 +178,10 @@ export function createPresentDesignOptionsTool( {
 }: {
 	// Asks the user in Studio's own UI and waits for the pick. Without it, the
 	// options go back to the agent to show.
-	onAskUser?: ( questions: AskUserQuestion[] ) => Promise< Record< string, string > >;
+	onAskUser?: (
+		questions: AskUserQuestion[],
+		onPresented?: () => void
+	) => Promise< Record< string, string > >;
 	tracks?: DesignTracksContext;
 	// How a local image is linked in the agent's reply so the host shows it to the user.
 	imageLink?: ( file: string ) => string;
@@ -233,79 +240,132 @@ export function createPresentDesignOptionsTool( {
 		},
 		async ( args, context ) => {
 			if ( args.options.length < 2 || args.options.length > DESIGN_OPTIONS ) {
-				throw new Error( `Present between 2 and ${ DESIGN_OPTIONS } options.` );
+				throw new DesignPreviewInputError( `Present between 2 and ${ DESIGN_OPTIONS } options.` );
 			}
 			context.onProgress( `Rendering ${ args.options.length } previews…` );
 			const directory = await resolveScreenshotDirectory( context.host );
-			const options = await Promise.all(
-				args.options.map( async ( option, index ) => {
-					const slug =
-						option.label
-							.toLowerCase()
-							.replace( /[^a-z0-9]+/g, '-' )
-							.replace( /^-+|-+$/g, '' )
-							.slice( 0, 40 ) || `option-${ index + 1 }`;
-					const htmlPath = path.join( directory, `preview-${ index + 1 }-${ slug }.html` );
-					let capture;
-					try {
-						const isDesignBoard = option.preview.trimStart().startsWith( '---' );
-						const html = isDesignBoard
-							? renderDesignBoard( option.preview, option.image )
-							: option.preview;
+			const call = currentClaudeWebCall();
+			if ( call && ( ! onAskUser || picker ) )
+				throw new Error( 'Design previews require an attached Studio question channel.' );
+			let presented = false;
+			const renderOption = async ( option: ( typeof args.options )[ number ], index: number ) => {
+				const slug =
+					option.label
+						.toLowerCase()
+						.replace( /[^a-z0-9]+/g, '-' )
+						.replace( /^-+|-+$/g, '' )
+						.slice( 0, 40 ) || `option-${ index + 1 }`;
+				const htmlPath = path.join( directory, `preview-${ index + 1 }-${ slug }.html` );
+				let capture;
+				const isDesignBoard = option.preview.trimStart().startsWith( '---' );
+				try {
+					if ( call && Buffer.byteLength( option.preview ) > 256 * 1024 )
+						throw new DesignPreviewInputError( 'The design preview is too large.' );
+					if (
+						call &&
+						option.image &&
+						! ( path.isAbsolute( option.image ) || option.image.startsWith( 'file://' ) )
+					) {
+						throw new DesignPreviewInputError(
+							'Choose an image file from the selected site or this conversation.'
+						);
+					}
+					const html = isDesignBoard
+						? renderDesignBoard( option.preview, option.image )
+						: option.preview;
+					if ( call ) {
+						capture = await captureClaudeDesignPreview( call, html, directory, PREVIEW_VIEWPORT );
+					} else {
 						// The BOM makes the browser read the file as UTF-8 even when the
 						// sneak peek does not declare a charset.
 						await writeFile( htmlPath, `\ufeff${ await inlineLocalImages( html ) }` );
-						capture = await captureScreenshotBuffer(
-							pathToFileURL( htmlPath ).href,
-							PREVIEW_VIEWPORT,
-							{
-								fullPage: false,
-								format: previewFormat,
-								deviceScaleFactor: picker ? 0.5 : undefined,
-							}
-						);
-						await unlink( htmlPath );
-						if ( ! isDesignBoard && capture.contentHeight < PREVIEW_VIEWPORT.height ) {
-							throw new Error(
-								`the sneak peek's content ends at ${ capture.contentHeight }px of the ${ PREVIEW_VIEWPORT.height }px frame, leaving the bottom empty. Fix it and present the options again: ${ FRAME_FILL_RECIPE }, or add the next section.`
+						try {
+							capture = await captureScreenshotBuffer(
+								pathToFileURL( htmlPath ).href,
+								PREVIEW_VIEWPORT,
+								{
+									fullPage: false,
+									format: previewFormat,
+									deviceScaleFactor: picker ? 0.5 : undefined,
+								}
 							);
+						} finally {
+							await unlink( htmlPath );
 						}
-					} catch ( error ) {
-						throw new Error(
-							`Option ${ index + 1 } ("${ option.label }"): ${
-								error instanceof Error ? error.message : String( error )
+					}
+					if ( ! isDesignBoard && capture.contentHeight < PREVIEW_VIEWPORT.height ) {
+						throw new DesignPreviewInputError(
+							`the sneak peek's content ends at ${ capture.contentHeight }px of the ${ PREVIEW_VIEWPORT.height }px frame, leaving the bottom empty. Fix it and present the options again: ${ FRAME_FILL_RECIPE }, or add the next section.`
+						);
+					}
+				} catch ( error ) {
+					if ( call ) {
+						call.check();
+						throw new DesignPreviewInputError(
+							`Option ${ index + 1 }: ${
+								error instanceof DesignPreviewInputError
+									? error.message
+									: isDesignBoard
+									? 'Check the DESIGN.md draft. Include YAML front matter between --- lines, at least two quoted hex colors and a typography style.'
+									: 'Studio could not render this preview. Use a self-contained HTML layout.'
 							}`
 						);
 					}
-					const file = await saveScreenshotFile( context.host, capture.buffer, {
-						viewportType: `preview-${ index + 1 }`,
-						format: previewFormat,
+					throw new Error(
+						`Option ${ index + 1 } ("${ option.label }"): ${
+							error instanceof Error ? error.message : String( error )
+						}`
+					);
+				}
+				const file = await saveScreenshotFile( context.host, capture.buffer, {
+					viewportType: `preview-${ index + 1 }`,
+					format: previewFormat,
+				} );
+				if ( file.discard && call ) {
+					const discard = file.discard;
+					call.onDiscard( async () => {
+						if ( ! presented ) await discard();
 					} );
-					return {
-						label: option.label,
-						description: option.description,
-						image: file.path,
-						buffer: capture.buffer,
-					};
-				} )
-			);
+				}
+				return {
+					label: option.label,
+					description: option.description,
+					image: file.path,
+					buffer: capture.buffer,
+				};
+			};
+			const options = [];
+			if ( call ) {
+				// Complete each guarded save and register its rollback before starting the next.
+				for ( const [ index, option ] of args.options.entries() )
+					options.push( await renderOption( option, index ) );
+			} else {
+				options.push( ...( await Promise.all( args.options.map( renderOption ) ) ) );
+			}
 			if ( ! onAskUser ) {
 				return handOverOptions( context.host, args.question, options, imageLink, picker );
 			}
-			const answers = await onAskUser( [
-				{
-					question: args.question,
-					options: [
-						...options.map( ( { label, description, image } ) => ( {
-							label,
-							description,
-							image,
-						} ) ),
-						{ label: OTHER_OPTIONS, description: 'New ones, none of these again.' },
-					],
-					allowFreeForm: true,
-				},
-			] );
+			call?.check();
+			const answers = await onAskUser(
+				[
+					{
+						question: args.question,
+						options: [
+							...options.map( ( { label, description, image } ) => ( {
+								label,
+								description,
+								image,
+							} ) ),
+							{ label: OTHER_OPTIONS, description: 'New ones, none of these again.' },
+						],
+						allowFreeForm: true,
+					},
+				],
+				() => {
+					presented = true;
+				}
+			);
+			presented = true;
 			const answer = answers[ args.question ];
 			const picked = answer ? options.findIndex( ( option ) => option.label === answer ) : -1;
 			await recordDesignTracksEvent(

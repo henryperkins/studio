@@ -15,7 +15,7 @@ import {
 } from '@/test/fake-connector';
 import { createTestQueryClient, renderWithProviders } from '@/test/render';
 import { useAgentRun, useSiteAgentActivity } from './use-agent-run';
-import type { AgentRunEvent, Connector, LoadedAiSession } from '@/data/core';
+import type { AgentRunEvent, Connector, LoadedAiSession, SessionEntry } from '@/data/core';
 import type { QueryClient } from '@tanstack/react-query';
 
 type Runs = Awaited< ReturnType< Connector[ 'getActiveAgentRuns' ] > >;
@@ -800,4 +800,139 @@ it( 'does not cross attribution between overlapping sessions', async () => {
 		turn_id: idA,
 		completion_kind: 'ai_edit',
 	} );
+} );
+
+it( 'sends the Claude selection captured at Send after a pending write and holds later changes until the run ends', async () => {
+	const { saveSessionSettingChange } = await import( '@/data/session-setting-changes' );
+	const first = deferred< void >();
+	const laterWrite = vi.fn( async () => {} );
+	const connector = createFakeConnector( { sessions: [ session() ] } );
+	connector.continueSession.mockResolvedValue( { runId: 'claude-run' } );
+	const queryClient = createTestQueryClient();
+	const entry = {
+		type: 'custom',
+		id: 'setting',
+		parentId: null,
+		timestamp: new Date().toISOString(),
+		customType: 'studio.claude_selection',
+		data: { model: 'a', effort: 'medium' },
+	} as SessionEntry;
+	function ClaudeHarness() {
+		const run = useAgentRun( 'session-1' );
+		return (
+			<button
+				onClick={ () =>
+					void run.sendMessage( 'hello', { claudeSelection: { model: 'a', effort: 'medium' } } )
+				}
+			>
+				Send Claude
+			</button>
+		);
+	}
+	await setup( { connector, queryClient }, <ClaudeHarness /> );
+	void saveSessionSettingChange( {
+		sessionId: 'session-1',
+		queryClient,
+		entry,
+		write: () => first.promise,
+	} );
+	fireEvent.click( screen.getByRole( 'button', { name: 'Send Claude' } ) );
+	void saveSessionSettingChange( {
+		sessionId: 'session-1',
+		queryClient,
+		entry,
+		write: laterWrite,
+	} );
+	expect( connector.continueSession ).not.toHaveBeenCalled();
+	await act( async () => first.resolve() );
+	await waitFor( () =>
+		expect( connector.continueSession ).toHaveBeenCalledWith(
+			'session-1',
+			'hello',
+			expect.objectContaining( { claudeSelection: { model: 'a', effort: 'medium' } } )
+		)
+	);
+	expect( laterWrite ).not.toHaveBeenCalled();
+	act( () => connector.emit( 'onAgentEvent', exited( 'claude-run' ) ) );
+	await waitFor( () => expect( laterWrite ).toHaveBeenCalledOnce() );
+} );
+
+it.each( [ false, true ] )(
+	'checks the journal before keeping an unconfirmed Claude submission for review (recorded: %s)',
+	async ( recorded ) => {
+		const connector = createFakeConnector( { sessions: [ session() ] } );
+		connector.continueSession.mockResolvedValue( { runId: 'claude-run' } );
+		function ClaudeHarness() {
+			const run = useAgentRun( 'session-1' );
+			return (
+				<>
+					<button
+						onClick={ () =>
+							void run.sendMessage( 'Original prompt', {
+								claudeSelection: { model: 'claude', effort: 'medium' },
+								claudeContext: { connectionId: 'acc', target: { environment: 'global' } },
+								files: [ { id: 'picked', name: 'brief.md', path: '/owned/brief.md' } ],
+							} )
+						}
+					>
+						Send Claude
+					</button>
+					{ run.queuedPrompts.map( ( item ) => (
+						<span key={ item.id }>
+							{ item.prompt } { item.files?.[ 0 ].name } { item.failure }
+						</span>
+					) ) }
+				</>
+			);
+		}
+		await setup( { connector }, <ClaudeHarness /> );
+		fireEvent.click( screen.getByRole( 'button', { name: 'Send Claude' } ) );
+		await waitFor( () => expect( connector.continueSession ).toHaveBeenCalledOnce() );
+		const turnId = connector.continueSession.mock.calls[ 0 ][ 2 ]!.turnId!;
+		const read = deferred< LoadedAiSession >();
+		connector.getSession.mockReturnValue( read.promise );
+		act( () => connector.emit( 'onAgentEvent', exited( 'claude-run' ) ) );
+		expect(
+			await screen.findByText( /Original prompt brief.md Studio could not confirm/ )
+		).toBeVisible();
+		await act( async () =>
+			read.resolve( {
+				...session(),
+				claudeJournal: recorded
+					? [ [ { type: 'turn.prompt', runId: 'claude-run', turnId, text: 'Original prompt' } ] ]
+					: [],
+			} )
+		);
+		expect( !! screen.queryByText( /Original prompt brief.md/ ) ).toBe( ! recorded );
+		expect( connector.continueSession ).toHaveBeenCalledOnce();
+	}
+);
+
+it( 'stores normalized Claude events only for the currently subscribed run', async () => {
+	const queryClient = createTestQueryClient();
+	queryClient.setQueryData( [ ...SESSIONS_QUERY_KEY, 'session-1' ], session() );
+	const { connector } = await setup( { queryClient } );
+	act( () => {
+		connector.emit( 'onAgentEvent', started( 'current' ) );
+		connector.emit(
+			'onAgentEvent',
+			event( 'old', {
+				type: 'backend.event',
+				timestamp: new Date().toISOString(),
+				event: { type: 'turn.prompt', runId: 'old', turnId: 'old-turn', text: 'stale' },
+			} )
+		);
+		connector.emit(
+			'onAgentEvent',
+			event( 'current', {
+				type: 'backend.event',
+				timestamp: new Date().toISOString(),
+				event: { type: 'turn.prompt', runId: 'current', turnId: 'turn', text: 'current' },
+			} )
+		);
+	} );
+	expect(
+		queryClient.getQueryData< LoadedAiSession >( [ ...SESSIONS_QUERY_KEY, 'session-1' ] )
+			?.claudeJournal
+	).toEqual( [ [ expect.objectContaining( { text: 'current' } ) ] ] );
 } );

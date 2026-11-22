@@ -290,19 +290,33 @@ export interface GenerateImageResult {
 	filtered?: boolean;
 }
 
-const sleep = ( seconds: number ) =>
-	new Promise< void >( ( resolve ) => setTimeout( resolve, seconds * 1000 ) );
+// Waits, or less once `signal` aborts.
+const sleep = ( seconds: number, signal?: AbortSignal ) =>
+	new Promise< void >( ( resolve ) => {
+		const done = () => {
+			clearTimeout( timer );
+			signal?.removeEventListener( 'abort', done );
+			resolve();
+		};
+		const timer = setTimeout( done, seconds * 1000 );
+		signal?.addEventListener( 'abort', done, { once: true } );
+	} );
+
+/** What an image the batch's signal stopped is reported as. */
+export const IMAGE_NOT_GENERATED_CANCELLED = 'Not generated: the call was cancelled.';
 
 async function generateOne(
 	userAgent: string,
 	endpoint: string,
 	authToken: string,
-	request: GenerateImageRequest
+	request: GenerateImageRequest,
+	signal?: AbortSignal
 ): Promise< GenerateImageResult > {
 	const body = JSON.stringify( buildImageRequestBody( request.prompt, request.aspectRatio ) );
 	// Transient transport errors AND safety-filtered prompts retry: the
 	// non-deterministic filter can pass the same prompt on a later attempt.
 	for ( let attempt = 0; ; attempt++ ) {
+		if ( signal?.aborted ) return { ok: false, error: IMAGE_NOT_GENERATED_CANCELLED };
 		try {
 			const response = await fetch( endpoint, {
 				method: 'POST',
@@ -313,17 +327,19 @@ async function generateOne(
 					'user-agent': userAgent,
 				},
 				body,
+				...( signal ? { signal } : {} ),
 			} );
 			const raw = await response.text();
 			return { ok: true, bytes: interpretImageResponse( raw, response.status ) };
 		} catch ( error ) {
+			if ( signal?.aborted ) return { ok: false, error: IMAGE_NOT_GENERATED_CANCELLED };
 			const transient =
 				error instanceof TransientImageError ||
 				error instanceof ImageFilteredError ||
 				// fetch network failures (DNS, reset, timeout) surface as TypeError.
 				error instanceof TypeError;
 			if ( transient && attempt < RETRY_DELAYS_SECONDS.length ) {
-				await sleep( RETRY_DELAYS_SECONDS[ attempt ] );
+				await sleep( RETRY_DELAYS_SECONDS[ attempt ], signal );
 				continue;
 			}
 			return {
@@ -338,13 +354,16 @@ async function generateOne(
 /**
  * Generate a batch of images concurrently (bounded pool) with the image
  * service's token (`resolveImageService`). Results are keyed by the same index
- * as the requests; a failure never aborts the rest.
+ * as the requests; a failure never aborts the rest. Once `signal` aborts, no
+ * request or retry starts and the ones in flight are aborted; each image not
+ * made is reported as `IMAGE_NOT_GENERATED_CANCELLED`.
  */
 export async function generateImages(
 	userAgent: string,
 	authToken: string,
 	requests: GenerateImageRequest[],
-	onResult?: ( index: number, result: GenerateImageResult ) => void
+	onResult?: ( index: number, result: GenerateImageResult ) => void,
+	signal?: AbortSignal
 ): Promise< GenerateImageResult[] > {
 	const endpoint = getImageEndpoint();
 	const results: GenerateImageResult[] = new Array( requests.length );
@@ -353,7 +372,7 @@ export async function generateImages(
 	const worker = async () => {
 		while ( next < requests.length ) {
 			const index = next++;
-			const result = await generateOne( userAgent, endpoint, authToken, requests[ index ] );
+			const result = await generateOne( userAgent, endpoint, authToken, requests[ index ], signal );
 			results[ index ] = result;
 			onResult?.( index, result );
 		}

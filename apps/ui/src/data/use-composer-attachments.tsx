@@ -9,14 +9,43 @@ import {
 	type ComposerSendAttachments,
 } from '@studio/agent/protocol/composer-attachments';
 import { __, sprintf } from '@wordpress/i18n';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { AgentRunContext } from '@/data/agent-runs/context';
+import { getComposerDraft, publishComposerDraft } from '@/data/composer-drafts';
 import { useConnector } from '@/data/core';
 
 export { toComposerSendAttachments };
 export type { ComposerAttachment, ComposerSendAttachments };
 
-export function useComposerAttachments( initialAttachments: ComposerAttachment[] = [] ) {
+interface UploadStatus {
+	pending: number;
+	error: string | null;
+}
+const idle: UploadStatus = { pending: 0, error: null };
+const uploads = new Map< string, UploadStatus >();
+const uploadListeners = new Set< () => void >();
+function subscribeUpload( notify: () => void ) {
+	uploadListeners.add( notify );
+	return () => {
+		uploadListeners.delete( notify );
+	};
+}
+function updateUpload( sessionId: string, change: ( current: UploadStatus ) => UploadStatus ) {
+	const next = change( uploads.get( sessionId ) ?? idle );
+	if ( next.pending || next.error ) uploads.set( sessionId, next );
+	else uploads.delete( sessionId );
+	uploadListeners.forEach( ( notify ) => notify() );
+}
+
+export function useComposerAttachments(
+	initialAttachments: ComposerAttachment[] = [],
+	claudeSessionId?: string
+) {
 	const connector = useConnector();
+	const discardClaudeFiles = useContext( AgentRunContext )?.discardClaudeFiles;
+	const status = useSyncExternalStore( subscribeUpload, () =>
+		claudeSessionId ? uploads.get( claudeSessionId ) ?? idle : idle
+	);
 	const [ error, setError ] = useState< string | null >( null );
 	const [ attachments, setAttachments ] = useState< ComposerAttachment[] >( initialAttachments );
 	const attachmentsRef = useRef< ComposerAttachment[] >( initialAttachments );
@@ -26,14 +55,23 @@ export function useComposerAttachments( initialAttachments: ComposerAttachment[]
 		setAttachments( next );
 	}, [] );
 
-	const removeAttachment = useCallback( ( id: string ) => {
-		setError( null );
-		setAttachments( ( current ) => {
+	const removeAttachment = useCallback(
+		( id: string ) => {
+			setError( null );
+			const current = attachmentsRef.current;
 			const next = current.filter( ( item ) => item.id !== id );
-			attachmentsRef.current = next;
-			return next;
-		} );
-	}, [] );
+			setTrackedAttachments( next );
+			if ( claudeSessionId ) {
+				publishComposerDraft( claudeSessionId, {
+					...getComposerDraft( claudeSessionId ),
+					attachments: next,
+				} );
+				const removed = current.find( ( item ) => item.id === id );
+				if ( removed?.kind === 'file' ) discardClaudeFiles?.( claudeSessionId, [ removed.path ] );
+			}
+		},
+		[ claudeSessionId, discardClaudeFiles, setTrackedAttachments ]
+	);
 
 	const restore = useCallback(
 		(
@@ -72,27 +110,56 @@ export function useComposerAttachments( initialAttachments: ComposerAttachment[]
 				),
 			};
 
-			const prepared = await prepareComposerAttachments( list, {
-				resolveFilePath: ( file ) => connector.getFilePath( file ),
-				messages,
-				existingAttachments: [ ...reserved, ...attachmentsRef.current ],
-			} );
-			if ( prepared.error ) {
-				setError( prepared.error );
+			if ( claudeSessionId )
+				updateUpload( claudeSessionId, ( current ) => ( {
+					pending: current.pending + 1,
+					error: current.pending ? current.error : null,
+				} ) );
+			let failure: string | null = null;
+			const staged: string[] = [];
+			const existing = () =>
+				claudeSessionId ? getComposerDraft( claudeSessionId ).attachments : attachmentsRef.current;
+			try {
+				const prepared = await prepareComposerAttachments( list, {
+					resolveFilePath: async ( file ) => {
+						if ( ! claudeSessionId ) return connector.getFilePath( file );
+						const path = await connector.stageClaudeChatFile( claudeSessionId, file );
+						staged.push( path );
+						return path;
+					},
+					messages,
+					existingAttachments: [ ...reserved, ...existing() ],
+				} );
+				failure = prepared.error ?? null;
+				if ( ! prepared.attachments.length ) return;
+				const merged = mergeComposerAttachments(
+					[ ...reserved, ...existing() ],
+					prepared.attachments,
+					messages
+				);
+				failure = merged.error ?? failure;
+				const attachments = merged.attachments.slice( reserved.length );
+				if ( claudeSessionId ) {
+					publishComposerDraft( claudeSessionId, {
+						...getComposerDraft( claudeSessionId ),
+						attachments,
+					} );
+				} else {
+					setTrackedAttachments( attachments );
+				}
+			} catch {
+				failure = messages.fileAttachFailed;
+			} finally {
+				if ( claudeSessionId && staged.length ) discardClaudeFiles?.( claudeSessionId, staged );
+				if ( claudeSessionId )
+					updateUpload( claudeSessionId, ( current ) => ( {
+						pending: current.pending - 1,
+						error: failure ?? current.error,
+					} ) );
+				else setError( failure );
 			}
-			if ( prepared.attachments.length === 0 ) {
-				return;
-			}
-
-			const merged = mergeComposerAttachments(
-				[ ...reserved, ...attachmentsRef.current ],
-				prepared.attachments,
-				messages
-			);
-			setError( merged.error ?? prepared.error ?? null );
-			setTrackedAttachments( merged.attachments.slice( reserved.length ) );
 		},
-		[ connector, setTrackedAttachments ]
+		[ connector, claudeSessionId, discardClaudeFiles, setTrackedAttachments ]
 	);
 
 	const onPaste = useCallback(
@@ -108,7 +175,12 @@ export function useComposerAttachments( initialAttachments: ComposerAttachment[]
 	);
 
 	return {
-		error,
+		error: claudeSessionId ? status.error : error,
+		preparing: status.pending > 0,
+		clearError: () =>
+			claudeSessionId
+				? updateUpload( claudeSessionId, ( current ) => ( { ...current, error: null } ) )
+				: setError( null ),
 		setError,
 		attachments,
 		addFiles,

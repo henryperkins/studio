@@ -27,8 +27,7 @@ import {
 	type StudioAgentHost,
 	type StudioAgentTool,
 } from '@studio/agent/node';
-import { Type, type TSchema } from 'typebox';
-import { Value } from 'typebox/value';
+import { Type } from 'typebox';
 import { cliAgentHost } from 'cli/ai/host';
 import {
 	DESIGN_PICKER_HTML,
@@ -197,23 +196,7 @@ export async function startMcpStdioServer(): Promise< void > {
 		if ( ! tool ) {
 			throw new Error( `Unknown tool: ${ request.params.name }` );
 		}
-		const args = request.params.arguments ?? {};
-		const schema = tool.parameters as TSchema;
-		if ( ! Value.Check( schema, args ) ) {
-			const problems = [ ...Value.Errors( schema, args ) ]
-				.slice( 0, 3 )
-				.map( ( error ) => `${ error.instancePath || 'arguments' } ${ error.message }` );
-			return {
-				content: [
-					{
-						type: 'text' as const,
-						text: `Invalid arguments for ${ tool.name }: ${ problems.join( '; ' ) }.`,
-					},
-				],
-				isError: true,
-			};
-		}
-		return runServedTool( host, tool, args, resultNotes );
+		return runServedTool( host, tool, request.params.arguments ?? {}, resultNotes );
 	} );
 
 	// Only clients that render MCP Apps get the pages listed.

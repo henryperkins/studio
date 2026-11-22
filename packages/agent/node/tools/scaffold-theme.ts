@@ -1,9 +1,11 @@
-import { mkdir, readFile, stat, writeFile } from 'fs/promises';
+import { mkdir, readFile, realpath, stat, writeFile } from 'fs/promises';
 import path from 'path';
 import { downloadThemeFonts } from '@studio/common/lib/theme-fonts';
 import { parseDesignMd, ThemeJson, themeJsonFromDesign } from '@studio/design-md';
 import { Type } from 'typebox';
+import { currentClaudeWebCall } from '../claude-code/web-call';
 import { defineTool, LOCAL_CHANGE } from './define-tool';
+import { readThemeInput, stageClaudeTheme } from './scaffold-theme-files';
 import { runWpCli, textResult } from './utils';
 import type { HostSite, StudioAgentHost } from '@studio/agent/node/host';
 
@@ -29,11 +31,14 @@ async function activateTheme(
 	}
 }
 
-function deriveSlug( input: string ): string {
-	return input
-		.toLowerCase()
-		.replace( /[^a-z0-9]+/g, '-' )
-		.replace( /^-+|-+$/g, '' );
+export function scaffoldThemeSlug( name: string, slug?: string ): string {
+	return slug !== undefined
+		? slug.trim()
+		: name
+				.trim()
+				.toLowerCase()
+				.replace( /[^a-z0-9]+/g, '-' )
+				.replace( /^-+|-+$/g, '' );
 }
 
 async function pathExists( p: string ): Promise< boolean > {
@@ -420,20 +425,40 @@ export const scaffoldThemeTool = defineTool(
 	async ( args, context ) => {
 		try {
 			const site = await context.host.sites.resolve( args.nameOrPath );
+			const web = currentClaudeWebCall();
+			web?.check();
+			const sitePath = web ? await realpath( site.path ) : site.path;
+			if ( web && ( ! web.sitePath || path.relative( web.sitePath, sitePath ) !== '' ) ) {
+				throw new Error( 'Select the local site before scaffolding its theme.' );
+			}
+			const readInput = async ( file: string ) =>
+				web
+					? readThemeInput( sitePath, file )
+					: ( await pathExists( file ) )
+					? readFile( file, 'utf8' )
+					: undefined;
 
 			const trimmedName = args.name.trim();
 			if ( ! trimmedName ) {
 				throw new Error( 'Theme name must not be empty.' );
 			}
 
-			const slug = ( args.slug ?? deriveSlug( trimmedName ) ).trim();
+			if (
+				web &&
+				( /[\r\n]/.test( trimmedName ) ||
+					trimmedName.includes( '\0' ) ||
+					trimmedName.includes( '*/' ) )
+			) {
+				throw new Error( 'Use a single-line theme name suitable for a WordPress theme header.' );
+			}
+			const slug = scaffoldThemeSlug( trimmedName, args.slug );
 			if ( ! slug || ! /^[a-z0-9][a-z0-9-]*$/.test( slug ) ) {
 				throw new Error(
 					'Theme slug must contain only lowercase letters, digits and dashes, and start with a letter or digit.'
 				);
 			}
 
-			const themesDir = path.join( site.path, 'wp-content', 'themes' );
+			const themesDir = path.join( sitePath, 'wp-content', 'themes' );
 			if ( ! ( await pathExists( themesDir ) ) ) {
 				throw new Error( `wp-content/themes directory not found in site: ${ themesDir }` );
 			}
@@ -454,14 +479,13 @@ export const scaffoldThemeTool = defineTool(
 					);
 				}
 				const parentStyleCssPath = path.join( themesDir, parentSlug, 'style.css' );
-				if ( ! ( await pathExists( parentStyleCssPath ) ) ) {
+				const parentCss = await readInput( parentStyleCssPath );
+				if ( parentCss === undefined ) {
 					throw new Error(
 						`Parent theme '${ parentSlug }' is not installed at wp-content/themes/${ parentSlug }/.`
 					);
 				}
-				const grandparentMatch = ( await readFile( parentStyleCssPath, 'utf8' ) ).match(
-					/^[ \t/*#@]*Template:[ \t]*(\S+)/im
-				);
+				const grandparentMatch = parentCss.match( /^[ \t/*#@]*Template:[ \t]*(\S+)/im );
 				if ( grandparentMatch ) {
 					throw new Error(
 						`'${ parentSlug }' is itself a child theme of '${ grandparentMatch[ 1 ] }' — WordPress does not support grandchild themes. Use parentTheme: '${ grandparentMatch[ 1 ] }' instead.`
@@ -477,21 +501,35 @@ export const scaffoldThemeTool = defineTool(
 			}
 
 			const baseJson = parentSlug !== undefined ? childThemeJson() : baseThemeJson();
-			const designPath = path.join( site.path, 'DESIGN.md' );
-			const tokens = ( await pathExists( designPath ) )
-				? parseDesignMd( await readFile( designPath, 'utf8' ) )
+			const designPath = path.join( sitePath, 'DESIGN.md' );
+			const designInput = await readInput( designPath );
+			const tokens = designInput === undefined ? undefined : parseDesignMd( designInput );
+			await using stage = web
+				? await stageClaudeTheme( sitePath, slug, () => web.check() )
 				: undefined;
+			const ensureDirectory = ( relative: string ) =>
+				stage
+					? stage.directory( relative )
+					: mkdir( path.join( themeDir, relative ), { recursive: true } );
 			let design = tokens && themeJsonFromDesign( tokens, baseJson );
 			let fontsError: string | undefined;
 			if ( tokens && design?.fontsUrl ) {
+				const guard = web && { get: web.get.bind( web ), files: new Map< string, Buffer >() };
 				try {
-					design = themeJsonFromDesign(
-						tokens,
-						baseJson,
-						await downloadThemeFonts( design.fontsUrl, themeDir )
-					);
+					const faces = await downloadThemeFonts( design.fontsUrl, themeDir, guard );
+					design = themeJsonFromDesign( tokens, baseJson, faces );
 				} catch ( error ) {
-					fontsError = error instanceof Error ? error.message : String( error );
+					web?.check();
+					fontsError = web
+						? 'Font data unavailable'
+						: error instanceof Error
+						? error.message
+						: String( error );
+				}
+				if ( guard && stage && ! fontsError ) {
+					for ( const [ relative, data ] of guard.files ) {
+						await stage.write( relative, data );
+					}
 				}
 			}
 			const themeJson = design?.themeJson ?? baseJson;
@@ -501,17 +539,16 @@ export const scaffoldThemeTool = defineTool(
 				// A block child theme inherits templates, parts, patterns, theme.json
 				// settings, and styles from the parent by path resolution — the child
 				// only needs the three root files until the agent adds overrides.
-				await mkdir( themeDir, { recursive: true } );
+				await ensureDirectory( '' );
 				files = [
 					[ 'style.css', renderChildStyleCss( trimmedName, slug, parentSlug ) ],
 					[ 'theme.json', renderThemeJson( themeJson ) ],
 					[ 'functions.php', renderChildFunctionsPhp( trimmedName, slug, parentSlug ) ],
 				];
 			} else {
-				await mkdir( path.join( themeDir, 'templates' ), { recursive: true } );
-				await mkdir( path.join( themeDir, 'parts' ), { recursive: true } );
-				await mkdir( path.join( themeDir, 'assets', 'fonts' ), { recursive: true } );
-				await mkdir( path.join( themeDir, 'patterns' ), { recursive: true } );
+				for ( const dir of [ 'templates', 'parts', 'assets/fonts', 'patterns' ] ) {
+					await ensureDirectory( dir );
+				}
 
 				files = [
 					[ 'style.css', renderStyleCss( trimmedName, slug ) ],
@@ -529,11 +566,18 @@ export const scaffoldThemeTool = defineTool(
 			}
 
 			for ( const [ relPath, content ] of files ) {
-				await writeFile( path.join( themeDir, relPath ), content, 'utf8' );
+				if ( stage ) {
+					await stage.write( relPath, content );
+				} else {
+					await writeFile( path.join( themeDir, relPath ), content, 'utf8' );
+				}
 			}
+			await stage?.publish();
+			web?.check();
 
 			const shouldActivate = args.activate ?? true;
 			const activation = shouldActivate ? await activateTheme( context.host, site, slug ) : null;
+			web?.check();
 
 			const summaryLines =
 				parentSlug !== undefined

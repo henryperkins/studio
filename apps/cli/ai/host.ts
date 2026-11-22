@@ -29,12 +29,13 @@ import { connectToDaemon, disconnectFromDaemon } from 'cli/lib/daemon-client';
 import { pullSelectionFromSyncOptions } from 'cli/lib/pull/pull-selection';
 import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
 import { STUDIO_SITES_ROOT } from 'cli/lib/site-paths';
+import { withSiteTransfer } from 'cli/lib/site-transfer-paths';
 import { getSnapshotsFromConfig } from 'cli/lib/snapshots';
 import { parseSyncOptions } from 'cli/lib/sync-api';
 import { getTracksOrigin, recordTracksEvent } from 'cli/lib/tracks';
 import { isServerRunning } from 'cli/lib/wordpress-server-manager';
 import { Logger, LoggerError } from 'cli/logger';
-import type { HostSite, StudioAgentHost } from '@studio/agent/node';
+import type { HostOperationOptions, HostSite, StudioAgentHost } from '@studio/agent/node';
 
 function toHostSite( site: SiteData ): HostSite {
 	return {
@@ -78,6 +79,22 @@ async function resolveSite( nameOrPath: string ): Promise< SiteData > {
 	return getSiteByFolder( nameOrPath );
 }
 
+// Runs a site operation's command only once its fence passes, immediately before it starts.
+async function fenced< T >(
+	options: HostOperationOptions | undefined,
+	run: () => Promise< T >
+): Promise< T > {
+	options?.signal?.throwIfAborted();
+	const start = async () => {
+		await options?.beforeSpawn?.();
+		options?.signal?.throwIfAborted();
+		return run();
+	};
+	return options?.siteTransfer
+		? withSiteTransfer( { ...options.siteTransfer, signal: options.signal }, start )
+		: start();
+}
+
 async function withDaemon< T >( fn: () => Promise< T > ): Promise< T > {
 	await connectToDaemon();
 	try {
@@ -102,44 +119,59 @@ export const cliAgentHost: StudioAgentHost = {
 		list: () => listSites(),
 		status: ( site ) =>
 			withDaemon( async () => getSiteStatus( await getSiteByFolder( site.path ) ) ),
-		create: ( name, sitePath, onProgress ) =>
-			runCreateSiteCommand(
-				sitePath,
-				{
-					name,
-					wpVersion: 'latest',
-					phpVersion: DEFAULT_PHP_VERSION,
-					fileAccess: SITE_FILE_ACCESS_SITE_DIRECTORY,
-					enableHttps: false,
-					noStart: false,
-					skipBrowser: true,
-					skipLogDetails: true,
-				},
-				new Logger( { onProgress } )
+		create: ( name, sitePath, onProgress, options ) =>
+			fenced( options, () =>
+				runCreateSiteCommand(
+					sitePath,
+					{
+						name,
+						wpVersion: 'latest',
+						phpVersion: DEFAULT_PHP_VERSION,
+						fileAccess: SITE_FILE_ACCESS_SITE_DIRECTORY,
+						enableHttps: false,
+						noStart: false,
+						skipBrowser: true,
+						skipLogDetails: true,
+					},
+					new Logger( { onProgress } )
+				)
 			),
-		start: ( site, onProgress ) =>
-			runStartSiteCommand( site.path, true, true, new Logger( { onProgress } ) ),
-		stop: ( site, onProgress ) =>
-			runStopSiteCommand( StopMode.STOP_SINGLE_SITE, site.path, new Logger( { onProgress } ) ),
-		delete: ( site, deleteFiles, onProgress ) =>
-			runDeleteSiteCommand( site.path, deleteFiles, new Logger( { onProgress } ) ),
+		start: ( site, onProgress, options ) =>
+			fenced( options, () =>
+				runStartSiteCommand( site.path, true, true, new Logger( { onProgress } ) )
+			),
+		stop: ( site, onProgress, options ) =>
+			fenced( options, () =>
+				runStopSiteCommand( StopMode.STOP_SINGLE_SITE, site.path, new Logger( { onProgress } ) )
+			),
+		delete: ( site, deleteFiles, onProgress, options ) =>
+			fenced( options, () =>
+				runDeleteSiteCommand( site.path, deleteFiles, new Logger( { onProgress } ) )
+			),
 		isRunning: ( site ) => withDaemon( async () => Boolean( await isServerRunning( site.id ) ) ),
-		import: ( site, file, onProgress ) =>
-			runImportCommand( site.path, file, false, false, new Logger( { onProgress } ) ),
-		export: ( site, file, mode, onProgress ) =>
-			runExportCommand(
-				site.path,
-				file,
-				mode,
-				false,
-				undefined,
-				false,
-				false,
-				new Logger( { onProgress } )
+		import: ( site, file, onProgress, options ) =>
+			fenced( options, () =>
+				runImportCommand( site.path, file, false, false, new Logger( { onProgress } ) )
 			),
-		wpCli: ( site, args ) =>
+		export: ( site, file, mode, onProgress, options ) =>
+			fenced( options, () =>
+				runExportCommand(
+					site.path,
+					file,
+					mode,
+					false,
+					undefined,
+					false,
+					false,
+					new Logger( { onProgress } )
+				)
+			),
+		wpCli: ( site, args, options ) =>
 			withDaemon( async () => {
-				await using command = await runWpCliCommand( await getSiteByFolder( site.path ), args );
+				const localSite = await getSiteByFolder( site.path );
+				await using command = options
+					? await runWpCliCommand( localSite, args, options )
+					: await runWpCliCommand( localSite, args );
 				return {
 					exitCode: await command.response.exitCode,
 					stdout: await command.response.stdoutText,
@@ -158,41 +190,51 @@ export const cliAgentHost: StudioAgentHost = {
 			}
 			return getSnapshotsFromConfig( token.id, site.path );
 		},
-		create: ( site, onProgress ) =>
-			runCreatePreviewCommand( site.path, undefined, new Logger( { onProgress } ) ),
-		update: ( site, hostname, overwrite, onProgress ) =>
-			runUpdatePreviewCommand( site.path, hostname, overwrite, new Logger( { onProgress } ) ),
-		delete: ( hostname, onProgress ) =>
-			runDeletePreviewCommand(
-				PreviewDeleteMode.DELETE_SINGLE_SNAPSHOT,
-				hostname,
-				new Logger( { onProgress } )
+		create: ( site, onProgress, options ) =>
+			fenced( options, () =>
+				runCreatePreviewCommand( site.path, undefined, new Logger( { onProgress } ) )
+			),
+		update: ( site, hostname, overwrite, onProgress, options ) =>
+			fenced( options, () =>
+				runUpdatePreviewCommand( site.path, hostname, overwrite, new Logger( { onProgress } ) )
+			),
+		delete: ( hostname, onProgress, options ) =>
+			fenced( options, () =>
+				runDeletePreviewCommand(
+					PreviewDeleteMode.DELETE_SINGLE_SNAPSHOT,
+					hostname,
+					new Logger( { onProgress } )
+				)
 			),
 	},
 	sync: {
-		push: async ( site, options, remoteSite, onProgress ) =>
-			runPushCommand(
-				site.path,
-				parseSyncOptions( options ),
-				remoteSite,
-				new Logger( { onProgress } )
+		push: async ( site, options, remoteSite, onProgress, fence ) =>
+			fenced( fence, () =>
+				runPushCommand(
+					site.path,
+					parseSyncOptions( options ),
+					remoteSite,
+					new Logger( { onProgress } )
+				)
 			),
-		pull: async ( site, options, remoteSite, onProgress ) =>
-			isReprintPullEnabled()
-				? runPullCommand(
-						site.path,
-						remoteSite,
-						false,
-						pullSelectionFromSyncOptions( parseSyncOptions( options ) ),
-						onProgress
-				  )
-				: runLegacyPullCommand(
-						site.path,
-						parseSyncOptions( options ),
-						remoteSite,
-						undefined,
-						new Logger( { onProgress } )
-				  ),
+		pull: async ( site, options, remoteSite, onProgress, fence ) =>
+			fenced( fence, () =>
+				isReprintPullEnabled()
+					? runPullCommand(
+							site.path,
+							remoteSite,
+							false,
+							pullSelectionFromSyncOptions( parseSyncOptions( options ) ),
+							onProgress
+					  )
+					: runLegacyPullCommand(
+							site.path,
+							parseSyncOptions( options ),
+							remoteSite,
+							undefined,
+							new Logger( { onProgress } )
+					  )
+			),
 	},
 	wpcom: {
 		sites: ( accessToken ) => getWpComSites( accessToken ),

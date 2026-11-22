@@ -1,4 +1,14 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'fs/promises';
+import {
+	link,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	realpath,
+	rm,
+	stat,
+	writeFile,
+} from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import { getConnectedWpcomSitesForLocalSite } from '@studio/common/lib/connected-sites';
@@ -7,14 +17,13 @@ import { fetchSyncableSites } from '@studio/common/lib/sync/sync-api';
 import { vi } from 'vitest';
 import { validateBlocks } from '@studio/agent/node/block-validator';
 import { getSharedBrowser } from '@studio/agent/node/browser-utils';
+import { runInClaudeWebCall, type ClaudeWebCall } from '@studio/agent/node/claude-code/web-call';
 import { generateImages, resolveImageService } from '@studio/agent/node/image-generation';
 import {
 	resolveStudioTools,
 	studioToolDefinitions,
-	withChatArtifactEmission,
 	type StudioToolsOptions,
 } from '@studio/agent/node/tools';
-import { createSiteTool } from '@studio/agent/node/tools/create-site';
 import {
 	bindTool,
 	LOCAL_CHANGE,
@@ -556,70 +565,6 @@ describe( 'Studio AI MCP tools', () => {
 		expect( getTextContent( result ) ).toContain( '"name": "My Site"' );
 	} );
 
-	describe( 'withChatArtifactEmission', () => {
-		const widget = { type: 'media', widgetProps: { mediaKind: 'image' } };
-		const makeFakeTool = () => {
-			const execute = vi.fn().mockResolvedValue( {
-				content: [ { type: 'text', text: 'ok' } ],
-				details: { studioArtifacts: [ widget ] },
-			} );
-			return {
-				tool: { name: 'fake_tool', execute } as unknown as AnyStudioAgentTool,
-				execute,
-			};
-		};
-
-		it( 'returns the tool unchanged without a UI', () => {
-			const { tool } = makeFakeTool();
-			expect( withChatArtifactEmission( tool, undefined ) ).toBe( tool );
-		} );
-
-		it( 'does not fail the tool result when artifact emission throws', async () => {
-			const { tool } = makeFakeTool();
-			const warnSpy = vi.spyOn( console, 'warn' ).mockImplementation( () => {} );
-			const ui = withUi();
-			ui.showArtifact.mockImplementation( () => {
-				throw new Error( 'disk full' );
-			} );
-
-			try {
-				const wrapped = withChatArtifactEmission( tool, ui );
-				const result = await wrapped.execute(
-					'tool-call-9',
-					{} as never,
-					new AbortController().signal,
-					() => {}
-				);
-
-				expect( result.content ).toEqual( [ { type: 'text', text: 'ok' } ] );
-				expect( warnSpy ).toHaveBeenCalledWith(
-					expect.stringContaining( '[chat-artifacts] failed to emit artifact for fake_tool' ),
-					expect.any( Error )
-				);
-			} finally {
-				warnSpy.mockRestore();
-			}
-		} );
-
-		it( 'emits site_create artifacts when wrapped directly (remote tool list)', async () => {
-			const ui = withUi();
-			const wrapped = withChatArtifactEmission( bindTool( createSiteTool, host ), ui );
-
-			await executeTool( wrapped, { name: 'My Site' } );
-
-			expect( ui.showArtifact ).toHaveBeenCalledWith(
-				expect.objectContaining( {
-					widgets: [
-						expect.objectContaining( {
-							type: 'site-preview',
-							widgetProps: expect.objectContaining( { siteId: 'site-123' } ),
-						} ),
-					],
-				} )
-			);
-		} );
-	} );
-
 	it( 'makes the created site the conversation site', async () => {
 		const selectSite = vi.fn();
 		host.selectSite = selectSite;
@@ -940,6 +885,55 @@ describe( 'Studio AI MCP tools', () => {
 		}
 	} );
 
+	it( 'fails its pending work with the error of an image it could not write, still writes the others, and completes or deletes no attachment', async () => {
+		const sitePath = await mkdtemp( path.join( os.tmpdir(), 'studio-generate-images-' ) );
+		const site = { ...mockSite, path: sitePath };
+		const uploads = path.join( sitePath, 'wp-content', 'uploads' );
+		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );
+		// A folder where the reserved file goes: the image cannot be written there.
+		const blocked = path.join( uploads, '2026', '09', 'hero.png' );
+		await mkdir( blocked, { recursive: true } );
+		vi.mocked( host.sites.all ).mockResolvedValue( [ mockSite, site ] );
+		vi.mocked( resolveImageService ).mockResolvedValue( {
+			token: 'test-image-service-token',
+			use: { service: 'wordpress-com', credential: 'environment-token', account: null },
+		} );
+		vi.mocked( generateImages ).mockResolvedValue( [
+			{ ok: true, bytes: Buffer.from( 'jpeg' ) },
+			{ ok: true, bytes: Buffer.from( 'jpeg' ) },
+		] );
+		vi.mocked( host.sites.wpCli ).mockResolvedValueOnce( {
+			exitCode: 0,
+			stdout: JSON.stringify( [
+				{
+					id: 7,
+					file: 'wp-content/uploads/2026/09/hero.png',
+					url: 'http://localhost:8888/wp-content/uploads/2026/09/hero.png',
+				},
+			] ),
+			stderr: '',
+		} );
+
+		try {
+			const result = await getTool( 'generate_images' ).rawHandler( {
+				images: [
+					{ path: path.join( uploads, 'hero.png' ), subject: 'A café counter at dawn' },
+					{ path: themeImage, subject: 'Pebbles on a beach' },
+				],
+			} as never );
+			const failure = await result.pending?.then(
+				() => undefined,
+				( error: unknown ) => error
+			);
+			expect( failure ).toMatchObject( { code: expect.stringMatching( /^E[A-Z]+$/ ) } );
+			expect( ( failure as Error ).message ).toContain( blocked );
+			await vi.waitFor( async () => expect( await readFile( themeImage, 'utf8' ) ).toBe( 'jpeg' ) );
+			expect( host.sites.wpCli ).toHaveBeenCalledOnce();
+		} finally {
+			await rm( sitePath, { recursive: true, force: true } );
+		}
+	} );
+
 	it( 'keeps only which image service made the images and how Studio signed in to it with the result, never the account, out of what the model reads', async () => {
 		const sitePath = await mkdtemp( path.join( os.tmpdir(), 'studio-generate-images-' ) );
 		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );
@@ -993,7 +987,9 @@ describe( 'Studio AI MCP tools', () => {
 		let scaffoldSite: typeof mockSite;
 
 		beforeEach( async () => {
-			tempSiteRoot = await mkdtemp( path.join( os.tmpdir(), 'studio-scaffold-theme-' ) );
+			tempSiteRoot = await realpath(
+				await mkdtemp( path.join( os.tmpdir(), 'studio-scaffold-theme-' ) )
+			);
 			await mkdir( path.join( tempSiteRoot, 'wp-content', 'themes' ), { recursive: true } );
 			scaffoldSite = { ...mockSite, path: tempSiteRoot };
 			vi.mocked( host.sites.resolve ).mockResolvedValue( scaffoldSite );
@@ -1131,6 +1127,91 @@ describe( 'Studio AI MCP tools', () => {
 			expect( getTextContent( result ) ).toContain(
 				'theme.json carries the DESIGN.md tokens under the same names (1 color, 1 font family, 2 text styles, 0 spacing steps), with its fonts downloaded to assets/fonts and declared as fontFace.'
 			);
+		} );
+
+		const guardedScaffold = (
+			get: ClaudeWebCall[ 'get' ],
+			signal = new AbortController().signal
+		) =>
+			runInClaudeWebCall(
+				{
+					get,
+					signal,
+					sitePath: tempSiteRoot,
+					targetOrigin: null,
+					onDiscard: vi.fn(),
+					check: () => signal.throwIfAborted(),
+					newPage: vi.fn(),
+				},
+				() =>
+					getTool( 'scaffold_theme' ).rawHandler( {
+						nameOrPath: scaffoldSite.name,
+						name: 'Example',
+					} as never )
+			);
+
+		it( 'uses scoped CSS and font reads, publishes once, then activates its own slug', async () => {
+			await writeNunitoDesign();
+			vi.mocked( host.sites.isRunning ).mockResolvedValue( true );
+			const font = Buffer.alloc( 48 );
+			font.write( 'wOF2' );
+			font.writeUInt32BE( font.length, 8 );
+			const css =
+				"@font-face {font-family:'Nunito'; font-weight:400; src:url(https://fonts.gstatic.com/s/nunito/v1/example.woff2);}";
+			const get = vi
+				.fn< ClaudeWebCall[ 'get' ] >()
+				.mockResolvedValueOnce( new Response( css ) )
+				.mockResolvedValueOnce( new Response( new Uint8Array( font ) ) );
+			await guardedScaffold( get );
+			expect( get.mock.calls ).toEqual( [
+				[
+					'https://fonts.googleapis.com/css2?family=Nunito:wght@400;700&display=swap',
+					{ purpose: 'font-css', userAgent: expect.any( String ) },
+				],
+				[ 'https://fonts.gstatic.com/s/nunito/v1/example.woff2', { purpose: 'font-file' } ],
+			] );
+			const themes = path.join( tempSiteRoot, 'wp-content/themes' );
+			expect( await readdir( themes ) ).toEqual( [ 'example' ] );
+			expect(
+				await readFile( path.join( themes, 'example/assets/fonts/nunito/nunito-400.woff2' ) )
+			).toEqual( font );
+			expect( host.sites.wpCli ).toHaveBeenCalledWith( scaffoldSite, [
+				'theme',
+				'activate',
+				'example',
+			] );
+		} );
+
+		it( 'removes its staging directory on Stop and preserves the unpublished destination', async () => {
+			await writeNunitoDesign();
+			const controller = new AbortController();
+			const get = async () => {
+				controller.abort( new Error( 'Stopped' ) );
+				controller.signal.throwIfAborted();
+				return new Response();
+			};
+			await expect( guardedScaffold( get, controller.signal ) ).rejects.toThrow( 'Stopped' );
+			expect( await readdir( path.join( tempSiteRoot, 'wp-content/themes' ) ) ).toEqual( [] );
+			expect( host.sites.wpCli ).not.toHaveBeenCalled();
+		} );
+
+		it( 'retains font family settings when Google Fonts is unavailable', async () => {
+			await writeNunitoDesign();
+			const result = await guardedScaffold( async () => new Response( null, { status: 503 } ) );
+			expect( getTextContent( result ) ).toContain( 'without font files' );
+			const theme = path.join( tempSiteRoot, 'wp-content/themes/example' );
+			const json = JSON.parse( await readFile( path.join( theme, 'theme.json' ), 'utf8' ) );
+			expect( json.settings.typography.fontFamilies[ 0 ].fontFace ).toBeUndefined();
+			expect( await readdir( path.join( theme, 'assets/fonts' ) ) ).toEqual( [] );
+		} );
+
+		it( 'refuses linked design input before downloading fonts or creating a theme', async () => {
+			await writeNunitoDesign();
+			await link( path.join( tempSiteRoot, 'DESIGN.md' ), path.join( tempSiteRoot, 'linked.md' ) );
+			const get = vi.fn();
+			await expect( guardedScaffold( get ) ).rejects.toThrow( /ordinary theme files/ );
+			expect( get ).not.toHaveBeenCalled();
+			expect( await readdir( path.join( tempSiteRoot, 'wp-content/themes' ) ) ).toEqual( [] );
 		} );
 
 		it( 'honors an explicit slug argument over the derived one', async () => {

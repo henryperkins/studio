@@ -19,6 +19,14 @@ interface StylesheetFace {
 	subset?: string;
 }
 
+interface GuardedFontDownload {
+	get(
+		url: string,
+		options: { purpose: 'font-css' | 'font-file'; userAgent?: string }
+	): Promise< Response >;
+	files: Map< string, Buffer >;
+}
+
 // Google Fonts only serves woff2 files split into unicode-range subsets to
 // browsers it recognizes; other clients get one full TrueType file per weight.
 const BROWSER_USER_AGENT =
@@ -80,15 +88,30 @@ function parseFontFaces( css: string ): StylesheetFace[] {
  */
 export async function downloadThemeFonts(
 	stylesheetUrl: string,
-	themeDir: string
+	themeDir: string,
+	guard?: GuardedFontDownload
 ): Promise< Record< string, ThemeFontFace[] > > {
-	const response = await fetchOk( stylesheetUrl, {
-		headers: { 'User-Agent': BROWSER_USER_AGENT },
-	} );
+	const response = guard
+		? await guard.get( stylesheetUrl, { purpose: 'font-css', userAgent: BROWSER_USER_AGENT } )
+		: await fetchOk( stylesheetUrl, {
+				headers: { 'User-Agent': BROWSER_USER_AGENT },
+		  } );
+	if ( ! response.ok ) throw new Error( 'The font stylesheet is unavailable.' );
 	const faces = parseFontFaces( await response.text() ).map( ( face ) => {
 		const min = Math.min( ...face.weights );
 		const max = Math.max( ...face.weights );
 		const familySlug = slugify( face.family );
+		if (
+			guard &&
+			( ! familySlug ||
+				/^(?:con|prn|aux|nul|(?:com|lpt)[1-9])$/i.test( familySlug ) ||
+				! /^(normal|italic|oblique)$/.test( face.style ) ||
+				face.weights.some(
+					( weight ) => ! Number.isInteger( weight ) || weight < 1 || weight > 1000
+				) )
+		) {
+			throw new Error( 'The font stylesheet contains an unsupported face.' );
+		}
 		const fileName = [
 			familySlug,
 			min === max ? min : `${ min }-${ max }`,
@@ -107,15 +130,39 @@ export async function downloadThemeFonts(
 		throw new Error( `${ stylesheetUrl } declares no font files` );
 	}
 
-	await Promise.all(
-		faces.map( async ( face ) => {
-			const data = Buffer.from( await ( await fetchOk( face.url ) ).arrayBuffer() );
-			await mkdir( path.join( themeDir, path.dirname( face.file ) ), { recursive: true } );
-			await writeFile( path.join( themeDir, face.file ), data );
-		} )
-	);
+	if ( guard ) {
+		if (
+			faces.length > 96 ||
+			new Set( faces.map( ( face ) => face.file.toLowerCase() ) ).size !== faces.length
+		) {
+			throw new Error( 'The font stylesheet exceeds its supported file set.' );
+		}
+		let bytes = 0;
+		for ( const face of faces ) {
+			const font = await guard.get( face.url, { purpose: 'font-file' } );
+			if ( ! font.ok ) throw new Error( 'A font file is unavailable.' );
+			const data = Buffer.from( await font.arrayBuffer() );
+			bytes += data.byteLength;
+			if (
+				data.length < 48 ||
+				data.toString( 'ascii', 0, 4 ) !== 'wOF2' ||
+				data.readUInt32BE( 8 ) !== data.length ||
+				bytes > 32 * 1024 * 1024
+			) {
+				throw new Error( 'The downloaded font data is unsupported.' );
+			}
+			guard.files.set( face.file, data );
+		}
+	} else
+		await Promise.all(
+			faces.map( async ( face ) => {
+				const data = Buffer.from( await ( await fetchOk( face.url ) ).arrayBuffer() );
+				await mkdir( path.join( themeDir, path.dirname( face.file ) ), { recursive: true } );
+				await writeFile( path.join( themeDir, face.file ), data );
+			} )
+		);
 
-	const fonts: Record< string, ThemeFontFace[] > = {};
+	const fonts: Record< string, ThemeFontFace[] > = Object.create( null );
 	for ( const face of faces ) {
 		( fonts[ face.family ] ??= [] ).push( {
 			fontFamily: face.family,

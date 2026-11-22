@@ -168,4 +168,33 @@ describe( 'cliAgentHost', () => {
 		expect( connectToDaemon ).toHaveBeenCalled();
 		expect( disconnectFromDaemon ).toHaveBeenCalled();
 	} );
+
+	it( 'fences a site operation immediately before its CLI command', async () => {
+		const order: string[] = [];
+		vi.mocked( runCreateSiteCommand ).mockImplementation( async () => {
+			order.push( 'command' );
+		} );
+		await cliAgentHost.sites.create( 'My Site', '/sites/my-site', () => {}, {
+			beforeSpawn: async () => {
+				order.push( 'fence' );
+			},
+		} );
+		expect( order ).toEqual( [ 'fence', 'command' ] );
+
+		const cancelled = new AbortController();
+		cancelled.abort();
+		await expect(
+			cliAgentHost.sites.create( 'My Site', '/sites/my-site', () => {}, {
+				signal: cancelled.signal,
+			} )
+		).rejects.toThrow();
+		await expect(
+			cliAgentHost.sites.create( 'My Site', '/sites/my-site', () => {}, {
+				beforeSpawn: async () => {
+					throw new Error( 'Denied' );
+				},
+			} )
+		).rejects.toThrow( 'Denied' );
+		expect( runCreateSiteCommand ).toHaveBeenCalledOnce();
+	} );
 } );

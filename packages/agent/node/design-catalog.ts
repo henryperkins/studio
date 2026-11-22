@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { parse } from 'yaml';
-import { getSkillPath } from './skills';
+import { getSkillPath, readBundledMarkdown } from './skills';
 
 export type DesignCatalogKind = 'directions' | 'layouts';
 
@@ -49,7 +49,7 @@ export function loadDesignCatalog( kind: DesignCatalogKind ): DesignEntry[] {
 	if ( fs.existsSync( folder ) ) {
 		for ( const file of fs.readdirSync( folder ).sort() ) {
 			if ( ! file.endsWith( '.md' ) || file === 'README.md' ) continue;
-			const entry = parseDesignEntry( fs.readFileSync( path.join( folder, file ), 'utf-8' ) );
+			const entry = parseDesignEntry( readBundledMarkdown( path.join( folder, file ) ) );
 			if ( entry ) entries.push( entry );
 		}
 	}

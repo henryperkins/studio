@@ -57,13 +57,13 @@ A full-bleed cover BACKGROUND must be `landscape` or `ultrawide` — never squar
 - `siteContext`: one sentence of subject matter ("A neighborhood bakery selling sourdough and pastries."). **NEVER include the site or business name** — a name in the prompt is what painted-in fake wordmarks stand in for.
 - `imageGrade`: ONE site-wide photographic treatment (e.g. "warm natural window light, soft muted color, gentle film grain"), derived from the visual direction. Use the identical grade in every call for the site so all imagery reads as one photographic series.
 
-## Images for design options
+{{#designPreviews}}## Images for design options
 
 The look is picked on one image and the layout on a set, both from the `build-site` skill's design steps:
 
 - **The look image**: before the look options, one `generate_images` call with a single image, the site's first-screen scene in `landscape`, at `<site>/wp-content/uploads/<scene>.png`, with the call-wide `imageGrade` left out and a neutral, versatile grade in `pageContext` ("natural light, true color, moderate contrast"). Pass the path it reports as each look's `image`. Every look's board shows this same photo under that look's `imagery` treatment from its `DESIGN.md` draft, so the user compares looks rather than photo content. A direction that rejects photography (its Imagery line says none, or type-only) passes no image: its board shows a pattern.
 - **The site's set**: once `DESIGN.md` is written, one `generate_images` call with 3–4 images in the picked look, with its Imagery section as the call-wide `imageGrade` and its `style` if it is not photographic: the first-screen scene again plus distinct supporting subjects (a detail, a place or a person, a product), each in the aspect ratio of the slot it is most likely to fill, at `<site>/wp-content/uploads/<name>.png`. The set is content imagery: the layout sneak peeks use the paths it reports, and the build starts from its attachment IDs and URLs. When a template or template part needs one of its images, copy that file into the theme's `assets/images` and reference the copy. Generate more only for slots the set cannot fill, with the same `imageGrade`. The look image is in the media library too, for a look its treatment reproduced.
-- **A failed or unavailable image** is not a blocker: the board shows a pattern, and a sneak-peek slot a solid color shape.
+- **A failed or unavailable image** is not a blocker: the board shows a pattern, and a sneak-peek slot a solid color shape.{{/designPreviews}}
 
 ## Without generate_images
 
@@ -86,4 +86,4 @@ For `wp:cover` backgrounds, set the same image URL on BOTH the block's `url` att
 
 - **Safety-filtered image**: rewrite that image's subject to avoid the flagged element and call `generate_images` again for just that image. One retry; if it fails again, treat as a permanent failure.
 - **Permanent failure**: adapt the layout to work without that image (a color/gradient background, a text-led card). NEVER substitute an unrelated image, source an image from a web URL, or leave a reference to a file that does not exist.
-- Failures arrive after the call returns, with a later tool result; `take_screenshot`, `inspect_design`, and `present_design_options` wait for the images.
+- Failures arrive after the call returns, with a later tool result.{{#browserTools}} `take_screenshot` and `inspect_design` wait for the images.{{/browserTools}}{{#designPreviews}} `present_design_options` waits for the images before rendering previews.{{/designPreviews}}

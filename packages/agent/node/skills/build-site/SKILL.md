@@ -13,17 +13,17 @@ Follow these steps in order. Run every step even when the prompt already answers
 The build works on exactly one site, settled before anything else: do not plan a design or write files until it is. The active site is the one announced at the top of the user's message.
 
 - **Active site, and the prompt gives no site or business name, or gives the active site's name** (including "redesign" / "update" / "change this site"): Build on the active site. Do not ask whether to create a new one.
-- **Active site, and the prompt gives a site or business name that differs from the active site's name** (e.g. active site "Test" and "build a site for Joe's Bakery" or "a site named Joe's Bakery"): STOP and ask before doing anything else. The name may be the brand for the active site or a request for a second site, and only the user can tell you which. Never resolve this yourself, and never call site_create or start building before the answer. Use AskUserQuestion when available with options like "Use current site" and "Create new site"; otherwise ask in your text output and end your turn.
+- **Active site, and the prompt gives a site or business name that differs from the active site's name** (e.g. active site "Test" and "build a site for Joe's Bakery" or "a site named Joe's Bakery"): STOP and ask before doing anything else. The name may be the brand for the active site or a request for a second site, and only the user can tell you which. Never resolve this yourself, and never call site_create or start building before the answer. {{#canAskUser}}Use AskUserQuestion when available with options like "Use current site" and "Create new site"; otherwise ask in your text output and end your turn.{{else}}Ask in your reply and wait for the user.{{/canAskUser}}
 - **Explicit "new" / "separate" / "another" site, or no active site**: Call site_create. If the prompt gives no name, ask for one in your text output and wait for the reply.
 
 ## 2. Site Spec
 
 Before building, gather the user's basic preferences through a short interactive discovery phase. This produces a **Site Spec** that guides all subsequent design and development decisions.
 
-**AskUserQuestion constraints**: Each call supports 1-4 questions, each with 2-4 options. An "Other" free-form option is automatically provided by the system — do NOT add one yourself. Keep option labels short (1-5 words). Only use AskUserQuestion for questions that have meaningful predefined options. For open-ended questions, just ask in your text output — the user will type their answer in the prompt.
+{{#canAskUser}}**AskUserQuestion constraints**: Each call supports 1-4 questions, each with 2-4 options. An "Other" free-form option is automatically provided by the system — do NOT add one yourself. Keep option labels short (1-5 words). Only use AskUserQuestion for questions that have meaningful predefined options. For open-ended questions, just ask in your text output — the user will type their answer in the prompt.
 
 Use AskUserQuestion for:
-- One-page site or multi-page site? (e.g., single scrollable page with sections vs. separate pages for each area)
+- One-page site or multi-page site? (e.g., single scrollable page with sections vs. separate pages for each area){{else}}Ask any necessary discovery questions in your reply and wait for the answer.{{/canAskUser}}
 
 The business/brand name is the active site's name unless the prompt gives a different one. Do not ask for it. The one exception: when the site name is clearly a placeholder (e.g. "test", "Site 1") and the prompt gives no brand, ask for the brand name in your text output and **stop and wait for the reply** — do NOT call any tools in that turn.
 
@@ -33,16 +33,17 @@ A new site's spec needs nothing from the site itself: do not search its files or
 
 Load the `visual-design` skill first — the catalogs, the DESIGN.md format, and the sneak-peek rules live there — and follow its "Concept and Direction" runbook. The design is settled in two steps, the look and then the layout, each with one `pick_design` call, repeated only when the user asks for other options:
 
-- Pass `options: 4` so the user picks, or `options: 1` when there is nothing to pick — the user asked to be surprised or to skip the questions, or the brief names that step's catalog entry. Neither a page count ("one page") nor adjectives ("elegant", "warm") pick an entry: ask, and apply them to the options you choose. For a reference site, look at it once with `take_screenshot` (`display: false`) and choose its closest entries, with `options` set to their number: two when `present_design_options` is available, otherwise one.
-- With one entry, use it without asking. With more, ask once, one option per entry in the order returned, labelled with the entry's name, without describing the options in prose first. A typed answer ("2 but darker") is a preference to apply to the closest option; asking for other options, as a choice or in their own words, means drawing that step again and asking the same way.
+{{#canAskUser}}- Pass `options: 4` so the user picks, or `options: 1` when there is nothing to pick — the user asked to be surprised or to skip the questions, or the brief names that step's catalog entry. Neither a page count ("one page") nor adjectives ("elegant", "warm") pick an entry: ask, and apply them to the options you choose.
+- With one entry, use it without asking. With more, ask once, one option per entry in the order returned, labelled with the entry's name, without describing the options in prose first. A typed answer ("2 but darker") is a preference to apply to the closest option; asking for other options, as a choice or in their own words, means drawing that step again and asking the same way.{{else}}- Pass `options: 1` for each catalog. Select the entry that best fits the brief and use its notes to build.{{/canAskUser}}
+{{#browserTools}}- For a reference site, look at it once with `take_screenshot` (`display: false`) and choose its closest entries, with two options when the user can pick from rendered previews, otherwise one.{{/browserTools}}
 
 1. **The look**: `catalog: "directions"`, asking "Which look should I build?". Skip this step when the Active site section names a design system and the user did not ask for a new look.
-   - If `present_design_options` is available: when you can make images (`generate_images`, or an image tool of your own), load the `imagery` skill and make the look image first. Pass each option's `DESIGN.md` draft (see the `visual-design` skill) as its `preview`, with that image and a one-line description of the feel.
-   - Otherwise use `AskUserQuestion`, each option with a one-line description of the look.
-   - Write the picked look to `DESIGN.md` at the site root: the draft's front matter exactly as the user saw it, then every section. Then, when you can make images (`generate_images`, or an image tool of your own), load the `imagery` skill and make the site's image set in that look so the layout previews and the build have it.
+   {{#designPreviews}}- If `present_design_options` is available: {{#imageGeneration}}when you can make images (`generate_images`, or an image tool of your own), load the `imagery` skill and make the look image first. {{/imageGeneration}}Pass each option's `DESIGN.md` draft (see the `visual-design` skill) as its `preview`, with a one-line description of the feel and an existing look image if available.{{/designPreviews}}
+   {{#canAskUser}}- Without rendered previews, use `AskUserQuestion` to present the options with a one-line description of each look.{{/canAskUser}}
+   - Write the picked look to `DESIGN.md` at the site root: the draft's front matter unchanged, then every section. {{#imageGeneration}}Then, when you can make images (`generate_images`, or an image tool of your own), load the `imagery` skill and make the site's image set in that look so the build has it.{{/imageGeneration}}
 2. **The layout**: `catalog: "layouts"`, asking "Which layout should I build?".
-   - If `present_design_options` is available: pass one sneak peek per option, in the picked look and with the site's image set (see the `visual-design` skill), as its `preview`, with a one-line description of the layout.
-   - Otherwise use `AskUserQuestion`, each option with a one-line description of how its first screen would look.
+   {{#designPreviews}}- If `present_design_options` is available: pass one sneak peek per option, in the picked look and with the site's image set (see the `visual-design` skill), as its `preview`, with a one-line description of the layout.{{/designPreviews}}
+   {{#canAskUser}}- Without rendered previews, use `AskUserQuestion` to present the options with a one-line description of each first screen.{{/canAskUser}}
    - Add the picked layout to the Layout section of `DESIGN.md`, then build it.
 
 ### The Site Spec
@@ -65,7 +66,7 @@ Use wp_cli to activate the theme, install and activate the plugins the Site Spec
 
 ## 5. Validate and publish the content
 
-Validate each template and part with validate_blocks right after writing it, and validate page and post content before it reaches the site. Then create or update the pages and posts with the validated content. A build that skips validate_blocks is incomplete.
+{{#browserTools}}Validate each template and part with validate_blocks right after writing it, and validate page and post content before it reaches the site. Then create or update the pages and posts with the validated content. A build that skips validate_blocks is incomplete.
 
 ## 6. Check and polish the result
 
@@ -73,11 +74,11 @@ You MUST load the `visual-polish` skill and follow its instructions. The design 
 
 ## 7. Set the theme screenshot
 
-When the active theme was scaffolded by Studio Code, pass its directory as `themeScreenshot` on every desktop take_screenshot of the home page: the last capture becomes the theme's thumbnail in Appearance → Themes.
+When the active theme was scaffolded by Studio Code, pass its directory as `themeScreenshot` on every desktop take_screenshot of the home page: the last capture becomes the theme's thumbnail in Appearance → Themes.{{else}}Live block validation and visual inspection are unavailable in this session. Review the saved markup and explain which editor and visual checks still need to run.{{/browserTools}}
 
 ## 8. Close with next steps
 
-End your closing message with a short **Next steps** list. Put first whatever the site still needs from the user, such as content to confirm or pages left to build, then offer what they can ask for now:
+{{#browserTools}}End your closing message with a short **Next steps** list. Put first whatever the site still needs from the user, such as content to confirm or pages left to build, then offer what they can ask for now:
 
 - A performance audit (`/need-for-speed`): Core Web Vitals, page weight, and what to fix first.
-- An SEO audit (`/rank-me-up`): titles, meta tags, headings, structured data, and what to fix first.
+- An SEO audit (`/rank-me-up`): titles, meta tags, headings, structured data, and what to fix first.{{else}}Summarize what was built and any remaining checks.{{/browserTools}}

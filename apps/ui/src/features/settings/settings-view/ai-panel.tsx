@@ -13,6 +13,7 @@ import { LearnMoreLink } from '@/features/onboarding';
 import { useOffline } from '@/lib/hooks';
 import { Button, Input } from '@/lib/ui';
 import { ChatGptSettingsGroup } from './chatgpt-settings';
+import { ClaudeRuntimeSettings } from './claude-runtime';
 import { OpenAiProviderRow, OpenAiSettingsGroup } from './openai-settings';
 import { connectedBadge, SettingsGroup, SettingsRow, SettingsSelect } from './rows';
 import styles from './style.module.css';
@@ -218,6 +219,7 @@ export function AiPanel( { onManageCredits }: { onManageCredits: () => void } ) 
 			<ProvidersSection onManageCredits={ onManageCredits } />
 			<OpenAiSettingsGroup />
 			<ChatGptSettingsGroup />
+			<ClaudeRuntimeSettings />
 		</div>
 	);
 }

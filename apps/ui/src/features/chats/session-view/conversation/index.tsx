@@ -31,10 +31,12 @@ import styles from './style.module.css';
 import type { LoadedAiSession } from '@/data/core';
 import type { TranscriptItem } from '@/features/chats/session-view/conversation/transcript-items';
 
-const ChatArtifact = memo( function ChatArtifact( {
+export const ChatArtifact = memo( function ChatArtifact( {
 	widgets,
+	claudeSessionId,
 }: {
 	widgets: StudioChatArtifactWidgetDraft[];
+	claudeSessionId?: string;
 } ) {
 	const mediaWidgets = widgets.filter( ( widget ) => ! isDesignSystemPreviewWidget( widget ) );
 	if ( ! mediaWidgets.length ) {
@@ -43,16 +45,26 @@ const ChatArtifact = memo( function ChatArtifact( {
 	return (
 		<div className={ styles.mediaArtifacts }>
 			{ mediaWidgets.map( ( widget, index ) => (
-				<MediaArtifactImage key={ `${ widget.type }:${ index }` } widget={ widget } />
+				<MediaArtifactImage
+					key={ `${ widget.type }:${ index }` }
+					widget={ widget }
+					claudeSessionId={ claudeSessionId }
+				/>
 			) ) }
 		</div>
 	);
 } );
 
-function MediaArtifactImage( { widget }: { widget: StudioChatArtifactWidgetDraft } ) {
+function MediaArtifactImage( {
+	widget,
+	claudeSessionId,
+}: {
+	widget: StudioChatArtifactWidgetDraft;
+	claudeSessionId?: string;
+} ) {
 	const localPath = getLocalMediaPath( widget );
 	const safeUrl = getSafeMediaUrl( widget );
-	const localFileQuery = useLocalMediaDataUrl( localPath );
+	const localFileQuery = useLocalMediaDataUrl( localPath, claudeSessionId );
 
 	const src = localPath ? localFileQuery.data ?? null : safeUrl;
 

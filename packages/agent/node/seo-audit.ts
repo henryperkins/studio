@@ -9,7 +9,9 @@
  * data or rank tracking. Focus on structural fixes the user can apply.
  */
 
+import { openToolPage } from './browser-page';
 import { getSharedBrowser } from './browser-utils';
+import { currentClaudeWebCall } from './claude-code/web-call';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -291,10 +293,13 @@ function collectSeoScript( origin: string ) {
 // Robots.txt and sitemap detection
 // ---------------------------------------------------------------------------
 
-async function checkResource(
-	browser: Awaited< ReturnType< typeof getSharedBrowser > >,
-	url: string
-): Promise< { ok: boolean; body: string } > {
+async function checkResource( url: string ): Promise< { ok: boolean; body: string } > {
+	const call = currentClaudeWebCall();
+	if ( call ) {
+		const response = await call.get( url, { purpose: 'seo' } );
+		return { ok: response.ok, body: response.ok ? await response.text() : '' };
+	}
+	const browser = await getSharedBrowser();
 	const context = await browser.newContext( { ignoreHTTPSErrors: true } );
 	try {
 		const response = await context.request.get( url, {
@@ -342,11 +347,7 @@ export async function auditSeo( siteUrl: string, urlPath = '/' ): Promise< SeoAu
 	const targetUrl = `${ origin }${ urlPath }`;
 
 	try {
-		const browser = await getSharedBrowser();
-		const page = await browser.newPage( {
-			viewport: AUDIT_VIEWPORT,
-			ignoreHTTPSErrors: true,
-		} );
+		const page = await openToolPage( { viewport: AUDIT_VIEWPORT }, new URL( origin ).origin );
 
 		try {
 			const response = await page.goto( targetUrl, {
@@ -358,9 +359,9 @@ export async function auditSeo( siteUrl: string, urlPath = '/' ): Promise< SeoAu
 			const collected = await page.evaluate( collectSeoScript, origin );
 
 			const [ robotsResult, sitemapAtRoot, sitemapIndex ] = await Promise.all( [
-				checkResource( browser, `${ origin }/robots.txt` ),
-				checkResource( browser, `${ origin }/sitemap.xml` ),
-				checkResource( browser, `${ origin }/sitemap_index.xml` ),
+				checkResource( `${ origin }/robots.txt` ),
+				checkResource( `${ origin }/sitemap.xml` ),
+				checkResource( `${ origin }/sitemap_index.xml` ),
 			] );
 
 			let sitemapUrl: string | null = null;

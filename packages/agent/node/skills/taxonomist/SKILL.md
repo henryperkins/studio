@@ -85,12 +85,7 @@ Save the output to `taxonomist-data/export/categories.json`.
 
 Use `wp_cli`:
 ```
-eval-file tmp/taxonomist/export-posts.php
-```
-
-With the environment variable:
-```
-TAXONOMIST_OUTPUT={site_path}/taxonomist-data/export/posts.json
+eval-file tmp/taxonomist/export-posts.php taxonomist-data/export/posts.json
 ```
 
 ### Post-export summary
@@ -108,12 +103,7 @@ Create a full taxonomy snapshot before any analysis.
 
 Use `wp_cli`:
 ```
-eval-file tmp/taxonomist/backup.php
-```
-
-With the environment variable:
-```
-TAXONOMIST_OUTPUT={site_path}/taxonomist-data/backups/pre-analysis-{timestamp}.json
+eval-file tmp/taxonomist/backup.php taxonomist-data/backups/pre-analysis-{timestamp}.json
 ```
 
 ## Step 4: Analyze
@@ -192,14 +182,14 @@ Then show the **full dry run** — a table of every post that would change, show
 
 ## Step 6: Review
 
-**CRITICAL: You MUST use the `AskUserQuestion` tool here to get explicit approval before proceeding.** Do NOT continue to Step 7 without the user's explicit "yes" or approval.
+**CRITICAL: You MUST {{#canAskUser}}use the `AskUserQuestion` tool here{{else}}ask in your reply and wait{{/canAskUser}} to get explicit approval before proceeding.** Do NOT continue to Step 7 without the user's explicit "yes" or approval.
 
-Present the plan, then use `AskUserQuestion` with options like:
+Present the plan, then {{#canAskUser}}use `AskUserQuestion`{{else}}ask in your reply{{/canAskUser}} with options like:
 - "Approve and apply changes"
 - "I want to adjust some categories first"
 - "Cancel — don't make any changes"
 
-If the user wants adjustments, iterate on the plan and use `AskUserQuestion` again for each revision until they approve.
+If the user wants adjustments, iterate on the plan and {{#canAskUser}}use `AskUserQuestion` again{{else}}ask again in your reply{{/canAskUser}} for each revision until they approve.
 
 ## Step 7: Apply Descriptions
 
@@ -220,24 +210,16 @@ Prepare the suggestions JSON file from the approved plan, then run the apply scr
 First, do a **preview** (dry run) using `wp_cli`:
 
 ```
-eval-file tmp/taxonomist/apply-changes.php
+eval-file tmp/taxonomist/apply-changes.php taxonomist-data/results/suggestions.json taxonomist-data/logs/preview-{timestamp}.tsv preview
 ```
 
-With environment variables:
-```
-TAXONOMIST_SUGGESTIONS={site_path}/taxonomist-data/results/suggestions.json
-TAXONOMIST_LOG={site_path}/taxonomist-data/logs/changes-{timestamp}.tsv
-TAXONOMIST_MODE=preview
-```
-
-Show the user the preview results. **Use `AskUserQuestion` to confirm** before applying. After they confirm, run again with:
+Show the user the preview results. **{{#canAskUser}}Use `AskUserQuestion` to confirm{{else}}Ask for confirmation in your reply and wait{{/canAskUser}}** before applying. After they confirm, run again with:
 
 ```
-TAXONOMIST_SUGGESTIONS={site_path}/taxonomist-data/results/suggestions.json
-TAXONOMIST_LOG={site_path}/taxonomist-data/logs/changes-{timestamp}.tsv
-TAXONOMIST_MODE=apply
-TAXONOMIST_REMOVE_CATS=uncategorized
+eval-file tmp/taxonomist/apply-changes.php taxonomist-data/results/suggestions.json taxonomist-data/logs/changes-{timestamp}.tsv apply
 ```
+
+If the plan includes removing categories from posts, append the same comma-separated list of category slugs to both commands. Check the site's default category first and leave it out of the list.
 
 ## Step 9: Verify
 
@@ -253,12 +235,7 @@ After applying changes:
 If the user wants to undo all changes, use `wp_cli`:
 
 ```
-eval-file tmp/taxonomist/restore.php
-```
-
-With environment variable:
-```
-TAXONOMIST_BACKUP={site_path}/taxonomist-data/backups/pre-analysis-{timestamp}.json
+eval-file tmp/taxonomist/restore.php taxonomist-data/backups/pre-analysis-{timestamp}.json
 ```
 
 ## Important Notes

@@ -3,6 +3,7 @@ import { useAgentRunStore } from './context';
 import {
 	hasUnansweredQuestion,
 	initialAgentRunState,
+	type AgentRunState,
 	type PendingQuestion,
 	type QueuedPrompt,
 	type SendMessageOptions,
@@ -11,6 +12,9 @@ import {
 export type { QueuedPrompt } from './store';
 
 interface LiveAgentEvents {
+	runId: string | null;
+	pendingClaudeApprovals: AgentRunState[ 'pendingClaudeApprovals' ];
+	pendingClaudeQuestions: AgentRunState[ 'pendingClaudeQuestions' ];
 	// Agent loop is working - drives the thinking indicator. Clears at
 	// `turn.completed`, before the subprocess has finished winding down.
 	isRunning: boolean;
@@ -34,7 +38,7 @@ interface LiveAgentEvents {
 	interrupt: () => Promise< void >;
 	answerQuestion: ( question: string, answer: string ) => void;
 	clearQuestionAnswer: ( question: string ) => void;
-	removeQueuedPrompt: ( id: string ) => void;
+	removeQueuedPrompt: ( id: string, discardFiles?: boolean ) => void;
 }
 
 type SiteAgentActivity = 'idle' | 'working' | 'pending-question';
@@ -51,6 +55,7 @@ export function useAgentRun( sessionId: string | undefined ): LiveAgentEvents {
 		interrupt: interruptRun,
 		answerQuestion: answerRunQuestion,
 		clearQuestionAnswer: clearRunQuestionAnswer,
+		discardClaudeFiles,
 	} = useAgentRunStore();
 	// Per-session slices keep their identity while other sessions update, so
 	// this only re-renders when this session's state actually changes.
@@ -68,23 +73,25 @@ export function useAgentRun( sessionId: string | undefined ): LiveAgentEvents {
 			// Queue if anything is in flight, if we're waiting on question
 			// answers, or if earlier queued prompts haven't been dispatched yet
 			// (preserves FIFO order).
-			if ( phase !== 'idle' || pendingQuestions.length > 0 || queuedPrompts.length > 0 ) {
+			const live = stateStore.getState()[ sessionId ] ?? initialAgentRunState;
+			if (
+				live.phase !== 'idle' ||
+				live.pendingQuestions.length > 0 ||
+				live.queuedPrompts.length > 0
+			) {
 				dispatchSession( sessionId, {
 					type: 'queue_append',
 					prompt: {
 						id: newId(),
 						prompt,
-						displayMessage: options.displayMessage,
-						images: options.images,
-						files: options.files,
-						visualAnnotations: options.visualAnnotations,
+						...options,
 					},
 				} );
 				return;
 			}
 			await startRun( sessionId, prompt, options );
 		},
-		[ dispatchSession, phase, pendingQuestions.length, queuedPrompts.length, sessionId, startRun ]
+		[ dispatchSession, stateStore, sessionId, startRun ]
 	);
 
 	const interrupt = useCallback( async () => {
@@ -115,16 +122,28 @@ export function useAgentRun( sessionId: string | undefined ): LiveAgentEvents {
 	);
 
 	const removeQueuedPrompt = useCallback(
-		( id: string ) => {
+		( id: string, discardFiles = false ) => {
 			if ( ! sessionId ) {
 				return;
 			}
+			const item = stateStore
+				.getState()
+				[ sessionId ]?.queuedPrompts.find( ( prompt ) => prompt.id === id );
 			dispatchSession( sessionId, { type: 'queue_remove', id } );
+			if ( discardFiles && item?.claudeContext && item.files?.length ) {
+				discardClaudeFiles(
+					sessionId,
+					item.files.map( ( file ) => file.path )
+				);
+			}
 		},
-		[ dispatchSession, sessionId ]
+		[ discardClaudeFiles, dispatchSession, sessionId, stateStore ]
 	);
 
 	return {
+		runId: state.runId,
+		pendingClaudeApprovals: state.pendingClaudeApprovals,
+		pendingClaudeQuestions: state.pendingClaudeQuestions,
 		isRunning: phase === 'starting' || phase === 'running',
 		hasActiveRun: phase !== 'idle',
 		isInterrupting,

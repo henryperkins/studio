@@ -28,7 +28,7 @@ function createSessionContextEntry( provider: AiProviderId, model: AiModelId ): 
 }
 
 interface ModelSwitchOptions {
-	model: AiModelId;
+	model?: AiModelId;
 	sessionId?: string;
 	entries?: SessionEntry[];
 	sessionProvider: AiProviderId;
@@ -105,6 +105,7 @@ export function useModelSwitch( {
 	const handleProviderChange = useCallback(
 		( picked: AiProviderId, nextModel: AiModelId ) => {
 			if (
+				model &&
 				getAiModelFamily( model ) !== getAiModelFamily( nextModel ) &&
 				onSwitchSession &&
 				sessionHasTurns
@@ -121,7 +122,7 @@ export function useModelSwitch( {
 
 	const changeModel = useCallback(
 		( provider: AiProviderId, picked: AiModelId ) => {
-			if ( picked === model || isModelLocked( picked ) ) {
+			if ( ! model || picked === model || isModelLocked( picked ) ) {
 				return;
 			}
 			if ( onModelChange ) {

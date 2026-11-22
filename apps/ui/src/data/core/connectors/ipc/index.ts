@@ -307,8 +307,8 @@ export function createIpcConnector(): Connector {
 			return ( ipcApi.getPathForFile( file ) as string ) ?? '';
 		},
 
-		async readLocalMediaFile( path ): Promise< LocalMediaFile > {
-			return ( await ipcApi.readLocalMediaFile( path ) ) as LocalMediaFile;
+		async readLocalMediaFile( path, claudeSessionId ): Promise< LocalMediaFile > {
+			return ( await ipcApi.readLocalMediaFile( path, claudeSessionId ) ) as LocalMediaFile;
 		},
 
 		async extractBlueprintBundle( file ): Promise< ExtractedBlueprintBundle > {
@@ -580,6 +580,20 @@ export function createIpcConnector(): Connector {
 		async createSession( siteId ): Promise< AiSessionSummary > {
 			return ( await ipcApi.createAiSession( siteId ) ) as AiSessionSummary;
 		},
+		getClaudeRuntimeState: () => ipcApi.getClaudeRuntimeState(),
+		configureClaudeRuntime: ( action ) => unwrapIpcError( ipcApi.configureClaudeRuntime( action ) ),
+		getClaudeModelCatalog: ( connectionId, siteId ) =>
+			ipcApi.getClaudeModelCatalog( connectionId, siteId ),
+		setClaudeSessionTarget: ( id, expected, target ) =>
+			unwrapIpcError( ipcApi.setClaudeSessionTarget( id, expected, target ) ),
+		discardClaudeChatFile: ( sessionId, path ) =>
+			unwrapIpcError( ipcApi.discardClaudeChatFile( sessionId, path ) ),
+		stageClaudeChatFile: ( sessionId, file ) =>
+			unwrapIpcError( ipcApi.stageClaudeChatFile( sessionId, file ) ),
+		recoverClaudeSession: ( sessionId ) => ipcApi.recoverClaudeSession( sessionId ),
+		createClaudeSession: ( request ) => unwrapIpcError( ipcApi.createClaudeSession( request ) ),
+		setClaudeSessionSelection: ( sessionId, selection ) =>
+			unwrapIpcError( ipcApi.setClaudeSessionSelection( sessionId, selection ) ),
 
 		async continueSession( sessionId, prompt, options ): Promise< { runId: string } > {
 			return ( await ipcApi.continueAiSession( sessionId, prompt, options ) ) as {
@@ -614,8 +628,8 @@ export function createIpcConnector(): Connector {
 			await ipcApi.interruptAiAgentRun( runId );
 		},
 
-		async answerAgentQuestion( runId, answers ) {
-			await ipcApi.answerAiAgentQuestion( runId, answers );
+		async answerAgentQuestion( runId, answers, requestId ) {
+			await ipcApi.answerAiAgentQuestion( runId, answers, requestId );
 		},
 
 		onAgentEvent( listener ) {

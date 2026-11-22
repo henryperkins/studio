@@ -48,7 +48,13 @@ export const UserTurn = memo( function UserTurn( {
 								{ attachments.map( ( attachment, index ) => (
 									<li key={ `${ attachment.name }:${ index }` } className={ styles.userAttachment }>
 										<span className={ styles.userAttachmentPreview }>
-											{ attachment.kind === 'image' && attachment.previewDataUrl ? (
+											{ attachment.kind === 'image' &&
+											attachment.previewDataUrl?.startsWith(
+												'data:' + attachment.mimeType + ';base64,'
+											) &&
+											[ 'image/png', 'image/jpeg', 'image/gif', 'image/webp' ].includes(
+												attachment.mimeType
+											) ? (
 												<img src={ attachment.previewDataUrl } alt="" />
 											) : attachment.kind === 'image' ? (
 												<ImageIcon />
@@ -92,12 +98,14 @@ export const AssistantText = memo( function AssistantText( {
 	messageText,
 	copyText,
 	streaming,
+	inlineImages,
 	...joined
 }: {
 	text: string;
 	messageText: string;
 	copyText?: string;
 	streaming?: boolean;
+	inlineImages?: boolean;
 } & Joined ) {
 	return (
 		<div
@@ -109,7 +117,9 @@ export const AssistantText = memo( function AssistantText( {
 			} }
 		>
 			<div className={ styles.assistantBubble } { ...joinedAttributes( joined ) }>
-				<Markdown streaming={ streaming }>{ text }</Markdown>
+				<Markdown streaming={ streaming } inlineImages={ inlineImages }>
+					{ text }
+				</Markdown>
 			</div>
 			{ copyText ? (
 				<CopyButton

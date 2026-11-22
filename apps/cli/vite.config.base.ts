@@ -14,7 +14,7 @@ const packageJson = createRequire( import.meta.url )( './package.json' ) as {
 
 const nodeBuiltinExternals: RegExp[] = [
 	/^node:/,
-	/^(path|fs|os|child_process|crypto|http|https|http2|url|querystring|stream|util|events|buffer|assert|net|tty|readline|zlib|constants|tls|domain|dns|async_hooks)$/,
+	/^(path|fs|os|child_process|crypto|http|https|http2|url|querystring|stream|util|events|buffer|assert|net|tty|readline|zlib|constants|tls|domain|dns|async_hooks|module)$/,
 	/^fs\/promises$/,
 	/^dns\/promises$/,
 ];

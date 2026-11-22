@@ -1,4 +1,5 @@
 import { EditorPage, withTimeout } from './browser-utils';
+import { currentClaudeWebCall } from './claude-code/web-call';
 
 const BLOCK_EVALUATION_TIMEOUT_MS = 60_000;
 
@@ -54,12 +55,17 @@ export async function validateBlocks(
 	content: string,
 	siteUrl: string
 ): Promise< ValidationReport > {
-	const editorPage = getEditorPage( siteUrl );
+	const web = currentClaudeWebCall();
+	const editorPage = web ? new EditorPage( siteUrl ) : getEditorPage( siteUrl );
 
 	try {
 		const page = await editorPage.getPage();
 
-		const evaluation = page.evaluate( ( html: string ) => {
+		web?.check();
+		const input = { html: content, editorOrigin: web?.targetOrigin };
+		const evaluation = page.evaluate( ( { html, editorOrigin } ) => {
+			if ( editorOrigin && window.location.origin !== editorOrigin )
+				throw new Error( 'The editor left the selected site.' );
 			/* eslint-disable @typescript-eslint/no-explicit-any */
 			const wpBlocks = ( window as any ).wp?.blocks;
 			if ( ! wpBlocks ) {
@@ -307,7 +313,7 @@ export async function validateBlocks(
 				},
 			};
 			/* eslint-enable @typescript-eslint/no-explicit-any */
-		}, content );
+		}, input );
 		const validation = await withTimeout(
 			evaluation,
 			BLOCK_EVALUATION_TIMEOUT_MS,
@@ -328,7 +334,7 @@ export async function validateBlocks(
 		// If navigation or evaluation failed, discard the cached page so the
 		// next call gets a fresh one.
 		await editorPage.close();
-		editorPages.delete( siteUrl );
+		if ( ! web ) editorPages.delete( siteUrl );
 
 		return {
 			totalBlocks: 0,
@@ -337,5 +343,7 @@ export async function validateBlocks(
 			results: [],
 			error: error instanceof Error ? error.message : String( error ),
 		};
+	} finally {
+		if ( web ) await editorPage.close();
 	}
 }

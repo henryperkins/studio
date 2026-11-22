@@ -7,12 +7,12 @@ const LOCAL_MEDIA_QUERY_KEY = [ 'local-media' ] as const;
 // Resolves a local media file to a `data:` URL. A data URL needs no
 // revocation lifecycle (unlike object URLs, which break under StrictMode's
 // double-invoked effects) and is allowed by the desktop renderer CSP.
-export function useLocalMediaDataUrl( path: string | null ) {
+export function useLocalMediaDataUrl( path: string | null, claudeSessionId?: string ) {
 	const connector = useConnector();
 	return useQuery( {
-		queryKey: [ ...LOCAL_MEDIA_QUERY_KEY, path ],
+		queryKey: [ ...LOCAL_MEDIA_QUERY_KEY, path, claudeSessionId ],
 		queryFn: async () => {
-			const file = await connector.readLocalMediaFile( path! );
+			const file = await connector.readLocalMediaFile( path!, claudeSessionId );
 			return readBlobAsDataUrl( new Blob( [ file.data ], { type: file.mimeType } ) );
 		},
 		enabled: !! path,

@@ -18,10 +18,41 @@ export interface HostSite {
 	adminPassword?: string;
 }
 
+// Fences the start of a host operation: `beforeSpawn` runs and `signal` is
+// checked immediately before its CLI command starts, so a cancelled or no longer
+// authorized operation never starts. Commands that can stop part-way, such as
+// WP-CLI, also stop when `signal` aborts.
+export interface HostOperationOptions {
+	signal?: AbortSignal;
+	beforeSpawn?: () => Promise< void >;
+	/** When set, archive and copy operations refuse filesystem and archive links. */
+	siteTransfer?: { site: string; archive?: string };
+}
+
 export interface WpCliOutput {
 	exitCode: number;
 	stdout: string;
 	stderr: string;
+}
+
+// An attachment reserved in a site's media library for an image about to be
+// written: its ID, where its file goes relative to the site's folder, and its URL.
+export interface MediaAttachment {
+	id: number;
+	file: string;
+	url: string;
+}
+
+// The fixed operations the image tool adds images to a site's media library
+// with. None of them runs anything composed from the model's text.
+export interface StudioAgentMediaLibrary {
+	// The site whose folder holds every file named; throws when no one site does.
+	siteContaining( files: string[] ): Promise< HostSite >;
+	// Reserves an attachment for each file name, in the uploads folder WordPress
+	// picks, under a name WordPress makes unique there.
+	reserve( site: HostSite, names: string[] ): Promise< MediaAttachment[] >;
+	// Completes the attachments whose images were written and deletes the others.
+	finalize( site: HostSite, ready: number[], failed: number[] ): Promise< void >;
 }
 
 // What an app that shows the conversation does for the agent.
@@ -47,30 +78,63 @@ export interface StudioAgentHost {
 		all(): Promise< HostSite[] >;
 		list(): Promise< Omit< SiteListItem, 'adminPassword' >[] >;
 		status( site: HostSite ): Promise< SiteStatus >;
-		create( name: string, sitePath: string, onProgress: ProgressCallback ): Promise< void >;
-		start( site: HostSite, onProgress: ProgressCallback ): Promise< void >;
-		stop( site: HostSite, onProgress: ProgressCallback ): Promise< void >;
-		delete( site: HostSite, deleteFiles: boolean, onProgress: ProgressCallback ): Promise< void >;
+		create(
+			name: string,
+			sitePath: string,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
+		start(
+			site: HostSite,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
+		stop(
+			site: HostSite,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
+		delete(
+			site: HostSite,
+			deleteFiles: boolean,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
 		isRunning( site: HostSite ): Promise< boolean >;
-		import( site: HostSite, file: string, onProgress: ProgressCallback ): Promise< void >;
+		import(
+			site: HostSite,
+			file: string,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
 		export(
 			site: HostSite,
 			file: string,
 			mode: 'full' | 'db',
-			onProgress: ProgressCallback
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
 		): Promise< void >;
-		wpCli( site: HostSite, args: string[] ): Promise< WpCliOutput >;
+		wpCli( site: HostSite, args: string[], options?: HostOperationOptions ): Promise< WpCliOutput >;
 	};
 	previews: {
 		list( site: HostSite ): Promise< Snapshot[] >;
-		create( site: HostSite, onProgress: ProgressCallback ): Promise< Snapshot >;
+		create(
+			site: HostSite,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< Snapshot >;
 		update(
 			site: HostSite,
 			hostname: string,
 			overwrite: boolean,
-			onProgress: ProgressCallback
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
 		): Promise< Snapshot >;
-		delete( hostname: string, onProgress: ProgressCallback ): Promise< void >;
+		delete(
+			hostname: string,
+			onProgress: ProgressCallback,
+			options?: HostOperationOptions
+		): Promise< void >;
 	};
 	// Push and pull return the WordPress.com site they synced with, or nothing when
 	// the user backed out.
@@ -79,13 +143,15 @@ export interface StudioAgentHost {
 			site: HostSite,
 			options: string,
 			remoteSite: string | undefined,
-			onProgress: ProgressCallback
+			onProgress: ProgressCallback,
+			fence?: HostOperationOptions
 		): Promise< SyncSite | undefined >;
 		pull(
 			site: HostSite,
 			options: string,
 			remoteSite: string | undefined,
-			onProgress: ProgressCallback
+			onProgress: ProgressCallback,
+			fence?: HostOperationOptions
 		): Promise< SyncSite | undefined >;
 	};
 	wpcom: {
@@ -98,6 +164,15 @@ export interface StudioAgentHost {
 	selectSite?( site: SiteInfo ): Promise< void > | void;
 	// Where screenshots are saved; a temporary folder when absent or null.
 	screenshotsDirectory?(): Promise< string | null > | string | null;
+	// Set by a host that runs the media library's fixed operations as operations
+	// of its own, as the Claude route's guarded host does. Without it, the image
+	// tool runs them as WP-CLI `eval` commands through `sites.wpCli`.
+	media?: StudioAgentMediaLibrary;
+	// Set by a host made for one call, as the Claude route's guarded host is: it
+	// aborts once that call is cancelled or its turn ends. A tool that leaves
+	// work running starts nothing new after that, and still settles what it
+	// began. Without it a tool's work runs as it always has.
+	callSignal?: AbortSignal;
 	// Present when an app shows the conversation. Tools that only make sense
 	// there, and their mentions in the prompt, depend on it.
 	ui?: StudioAgentUi;

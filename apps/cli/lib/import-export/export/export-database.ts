@@ -5,6 +5,12 @@ import { parseJsonFromPhpOutput } from '@studio/common/lib/php-output-parser';
 import { __, sprintf } from '@wordpress/i18n';
 import { move } from 'fs-extra';
 import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
+import {
+	checkTransferFile,
+	createTransferDirectory,
+	hasSiteTransferScope,
+	requirePlainTransferEntry,
+} from 'cli/lib/site-transfer-paths';
 import { replaceMysql8OnlyCollations } from 'cli/lib/sqlite-collations';
 import { summarizeWpCliStderr } from 'cli/lib/wp-cli-stderr';
 import { LoggerError } from 'cli/logger';
@@ -26,12 +32,19 @@ export async function exportDatabaseToFile(
 	site: SiteData,
 	finalDestination: string
 ): Promise< void > {
-	const tempFileName = `${ generateBackupFilename( 'db-export' ) }.sql`;
+	await using scratch = hasSiteTransferScope()
+		? await createTransferDirectory( site.path, '.studio-sql-' )
+		: undefined;
+	const tempFileName = scratch
+		? path.posix.join( path.basename( scratch.path ), 'database.sql' )
+		: `${ generateBackupFilename( 'db-export' ) }.sql`;
+	const tempFilePath = path.join( site.path, tempFileName );
 
 	// Exports don't start the site, so the start-time collation fix may not have run yet.
 	await replaceMysql8OnlyCollations( site.path );
 
 	// Execute the command to export directly to a temp file in the site directory (cwd).
+	await checkTransferFile( tempFilePath, true );
 	await using command = await runWpCliCommand(
 		site,
 		[ 'sqlite', 'export', tempFileName, '--enable-ast-driver', '--skip-plugins', '--skip-themes' ],
@@ -49,7 +62,8 @@ export async function exportDatabaseToFile(
 		);
 	}
 
-	const tempFilePath = path.join( site.path, tempFileName );
+	await checkTransferFile( tempFilePath );
+	await checkTransferFile( finalDestination, true );
 	await move( tempFilePath, finalDestination );
 }
 
@@ -100,6 +114,9 @@ export async function exportDatabaseToMultipleFiles(
 	}
 
 	const tmpFiles: string[] = [];
+	await using scratch = hasSiteTransferScope()
+		? await createTransferDirectory( site.path, '.studio-sql-' )
+		: undefined;
 
 	for ( const table of tables ) {
 		if ( table === 'wp_users' || table === 'wp_usermeta' ) {
@@ -108,6 +125,12 @@ export async function exportDatabaseToMultipleFiles(
 		}
 
 		const fileName = `${ table }.sql`;
+		requirePlainTransferEntry( fileName, ! fileName.includes( '/' ) );
+		const tempFileName = scratch
+			? path.posix.join( path.basename( scratch.path ), fileName )
+			: fileName;
+		const tempFilePath = path.join( site.path, tempFileName );
+		await checkTransferFile( tempFilePath, true );
 
 		// Execute the command to export directly to a temporary file in the project directory
 		await using command = await runWpCliCommand(
@@ -115,7 +138,7 @@ export async function exportDatabaseToMultipleFiles(
 			[
 				'sqlite',
 				'export',
-				fileName,
+				tempFileName,
 				`--tables=${ table }`,
 				'--enable-ast-driver',
 				'--skip-plugins',
@@ -135,8 +158,9 @@ export async function exportDatabaseToMultipleFiles(
 			);
 		}
 
-		const tempFilePath = path.join( site.path, fileName );
 		const finalDestination = path.join( finalDestinationDir, fileName );
+		await checkTransferFile( tempFilePath );
+		await checkTransferFile( finalDestination, true );
 		await move( tempFilePath, finalDestination );
 
 		tmpFiles.push( finalDestination );

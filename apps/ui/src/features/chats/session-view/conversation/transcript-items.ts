@@ -21,6 +21,7 @@ export interface AgentQuestionRenderItem {
 	question: string;
 	options: Array< { label: string; description: string; image?: string } >;
 	multiSelect?: boolean;
+	allowFreeForm?: boolean;
 	pickedLabel?: string;
 }
 
