@@ -26,7 +26,12 @@ const settings = (
 
 describe( 'OpenAI provider identity', () => {
 	it( 'is appended to the persisted provider list', () => {
-		expect( AI_PROVIDER_IDS ).toEqual( [ 'wpcom', 'anthropic-api-key', 'openai-api-key' ] );
+		expect( AI_PROVIDER_IDS ).toEqual( [
+			'wpcom',
+			'anthropic-api-key',
+			'openai-api-key',
+			'chatgpt-oauth',
+		] );
 	} );
 
 	it( 'serves only the OpenAI family', () => {

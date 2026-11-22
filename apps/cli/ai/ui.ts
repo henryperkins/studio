@@ -1197,6 +1197,10 @@ export class AiChatUI implements AiOutputAdapter {
 	}
 
 	set onInterrupt( fn: ( () => void ) | null ) {
+		if ( fn && ! this.interruptCallback ) {
+			this.wasInterrupted = false;
+			this.interruptionNoticeShown = false;
+		}
 		this.interruptCallback = fn;
 		this.updateHints();
 	}

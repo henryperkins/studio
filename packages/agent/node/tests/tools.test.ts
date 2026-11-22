@@ -7,7 +7,7 @@ import { fetchSyncableSites } from '@studio/common/lib/sync/sync-api';
 import { vi } from 'vitest';
 import { validateBlocks } from '@studio/agent/node/block-validator';
 import { getSharedBrowser } from '@studio/agent/node/browser-utils';
-import { generateImages, isImageGenerationAvailable } from '@studio/agent/node/image-generation';
+import { generateImages, resolveImageService } from '@studio/agent/node/image-generation';
 import {
 	resolveStudioTools,
 	studioToolDefinitions,
@@ -25,6 +25,7 @@ import {
 import { enrichPreviewListOutput } from '@studio/agent/node/tools/list-previews';
 import { createTakeScreenshotTool } from '@studio/agent/node/tools/take-screenshot';
 import { splitCommandArgs } from '@studio/agent/node/tools/wp-cli';
+import { getToolResultImageService } from '@studio/agent/protocol/image-service';
 import { createFakeHost, fakeSite } from './fake-host';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 
@@ -39,7 +40,7 @@ vi.mock( '@studio/agent/node/browser-utils', () => ( {
 vi.mock( '@studio/agent/node/image-generation', async () => ( {
 	...( await vi.importActual( '@studio/agent/node/image-generation' ) ),
 	generateImages: vi.fn(),
-	isImageGenerationAvailable: vi.fn(),
+	resolveImageService: vi.fn(),
 } ) );
 
 vi.mock( '@studio/common/lib/connected-sites', () => ( {
@@ -326,6 +327,66 @@ describe( 'Studio AI MCP tools', () => {
 
 			expect( result.content.map( ( block ) => block.type ) ).toEqual( [ 'text' ] );
 			expect( result.studioArtifacts ).toBeUndefined();
+		} );
+
+		it( 'says the connection doesn’t take images from tools only where it is told so, keeping every other route’s text', async () => {
+			const MODEL_NOTE =
+				'This model cannot view images, so the capture is not shown to you: verify the rendered page with inspect_design.';
+			// How to read a skill's "if you can view images" there, since the model does see a user's images.
+			const READING =
+				'Where a skill or instruction asks whether you can view images, treat screenshots and other images in tool results as not viewable on this connection; images the user attaches remain visible to you.';
+			const CONNECTION_NOTE = `Images in tool results are not available on this connection yet, so the capture is not shown to you: verify the rendered page with inspect_design. ${ READING }`;
+			const screenshotWith = async ( options: StudioToolsOptions ) => {
+				mockScreenshotBrowser(
+					createMockPage( { buffer: Buffer.from( 'jpeg' ), documentHeight: 900 } )
+				);
+				const tool = resolveStudioTools( host, options ).find(
+					( definition ) => definition.name === 'take_screenshot'
+				)!;
+				const result = await tool.rawHandler( { url: 'http://localhost:8903/' } as never );
+				return {
+					description: tool.description,
+					snippet: tool.promptSnippet,
+					text: result.content.find( ( block ) => block.type === 'text' )?.text ?? '',
+					images: result.content.filter( ( block ) => block.type === 'image' ).length,
+				};
+			};
+
+			// A model that can't view images, as on trunk.
+			const model = await screenshotWith( { visionEnabled: false } );
+			expect( model.description ).toContain( `${ MODEL_NOTE } Supports desktop and mobile` );
+			expect( model.snippet ).toBe(
+				'Save a full-page screenshot of a URL to a file (supports desktop, mobile, or `viewport: "all"` for both). You cannot view the image, but it still sets the theme screenshot.'
+			);
+			expect( model.text ).toContain( MODEL_NOTE );
+			expect( model.images ).toBe( 0 );
+			for ( const text of [ model.description, model.snippet, model.text ] ) {
+				expect( text ).not.toContain( 'asks whether you can view images' );
+			}
+
+			// One that can, as on trunk: the reason is never read then.
+			const vision = await screenshotWith( { visionEnabled: true, toolImagesUnavailable: true } );
+			expect( vision.description ).toContain( 'analyze visually' );
+			expect( vision.description ).not.toContain( 'this connection' );
+			expect( vision.images ).toBe( 1 );
+			for ( const text of [ vision.description, vision.snippet, vision.text ] ) {
+				expect( text ).not.toContain( 'asks whether you can view images' );
+			}
+
+			// A connection that doesn't take images from tools yet.
+			const connection = await screenshotWith( {
+				visionEnabled: false,
+				toolImagesUnavailable: true,
+			} );
+			expect( connection.description ).toBe(
+				model.description.replace( MODEL_NOTE, CONNECTION_NOTE )
+			);
+			expect( connection.snippet ).toBe(
+				`Save a full-page screenshot of a URL to a file (supports desktop, mobile, or \`viewport: "all"\` for both). Images in tool results are not available on this connection yet, so the capture is not shown to you, but it still sets the theme screenshot. ${ READING }`
+			);
+			expect( connection.text ).toContain( CONNECTION_NOTE );
+			expect( connection.text ).not.toContain( 'cannot view images' );
+			expect( connection.images ).toBe( 0 );
 		} );
 
 		it( 'says when the user sees only the saved file path', async () => {
@@ -822,7 +883,10 @@ describe( 'Studio AI MCP tools', () => {
 		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );
 		const urlOf = ( name: string ) => `http://localhost:8888/wp-content/uploads/2026/09/${ name }`;
 		vi.mocked( host.sites.all ).mockResolvedValue( [ mockSite, site ] );
-		vi.mocked( isImageGenerationAvailable ).mockResolvedValue( true );
+		vi.mocked( resolveImageService ).mockResolvedValue( {
+			token: 'test-image-service-token',
+			use: { service: 'wordpress-com', credential: 'environment-token', account: null },
+		} );
 		vi.mocked( generateImages ).mockResolvedValue( [
 			{ ok: true, bytes: Buffer.from( 'jpeg' ) },
 			{ ok: false, error: 'Timed out' },
@@ -866,9 +930,62 @@ describe( 'Studio AI MCP tools', () => {
 					Buffer.from( finalize.match( /base64_decode\( '([^']+)' \)/ )![ 1 ], 'base64' ).toString()
 				)
 			).toEqual( { ready: [ 7 ], failed: [ 8 ] } );
+			expect( generateImages ).toHaveBeenCalledWith(
+				expect.any( String ),
+				'test-image-service-token',
+				expect.any( Array )
+			);
 		} finally {
 			await rm( sitePath, { recursive: true, force: true } );
 		}
+	} );
+
+	it( 'keeps only which image service made the images and how Studio signed in to it with the result, never the account, out of what the model reads', async () => {
+		const sitePath = await mkdtemp( path.join( os.tmpdir(), 'studio-generate-images-' ) );
+		const themeImage = path.join( sitePath, 'wp-content/themes/acme/assets/images/band.png' );
+		const use = {
+			service: 'wordpress-com' as const,
+			credential: 'wordpress-com-login' as const,
+			account: { displayName: 'Someone', email: 'someone@example.test' },
+		};
+		vi.mocked( resolveImageService ).mockResolvedValue( { token: 'test-wpcom-login-token', use } );
+		vi.mocked( generateImages ).mockResolvedValue( [ { ok: true, bytes: Buffer.from( 'png' ) } ] );
+		const args = { images: [ { path: themeImage, subject: 'Pebbles on a beach' } ] };
+
+		try {
+			const raw = await getTool( 'generate_images' ).rawHandler( args as never );
+			await raw.pending;
+			const executed = await executeTool( getTool( 'generate_images' ), args );
+			await ( executed.details as { pending?: Promise< unknown > } ).pending;
+
+			const record = { service: 'wordpress-com', credential: 'wordpress-com-login' };
+			expect( raw.studioService ).toEqual( record );
+			expect( getToolResultImageService( executed.details ) ).toEqual( record );
+			expect(
+				JSON.stringify( { ...( executed.details as object ), pending: undefined } )
+			).not.toMatch( /Someone|someone@example|account/ );
+			for ( const content of [ raw.content, executed.content ] ) {
+				expect( JSON.stringify( content ) ).not.toMatch( /Someone|someone@example|wordpress-com/ );
+			}
+			// A record written before kept the account too: it is read without it.
+			expect(
+				getToolResultImageService( { studioService: { ...record, account: use.account } } )
+			).toEqual( record );
+		} finally {
+			await rm( sitePath, { recursive: true, force: true } );
+		}
+	} );
+
+	it( 'gives other tools’ results no image service', async () => {
+		vi.mocked( host.sites.resolve ).mockResolvedValue( mockSite );
+		vi.mocked( host.sites.wpCli ).mockResolvedValue( { exitCode: 0, stdout: 'ok', stderr: '' } );
+
+		const executed = await executeTool( getTool( 'wp_cli' ), {
+			nameOrPath: mockSite.name,
+			command: 'option get blogname',
+		} );
+
+		expect( getToolResultImageService( executed.details ) ).toBeUndefined();
 	} );
 
 	describe( 'scaffold_theme', () => {

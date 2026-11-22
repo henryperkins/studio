@@ -17,6 +17,9 @@ interface SiteChatDraft {
 	lastSelectedWpcomSiteId?: number;
 	sessionId?: string;
 	pendingPrompt?: string;
+	// The chat is being started on a ChatGPT account: until that ends, nothing
+	// is sent from it on the provider it had.
+	startingChatGpt?: boolean;
 }
 
 const EMPTY_DRAFT: SiteChatDraft = { activeEnvironment: 'local' };
@@ -39,5 +42,10 @@ export function useSiteChatDraft( siteId: string | undefined ) {
 			} ) ),
 		[ queryClient, siteId ]
 	);
-	return { draft: draft ?? EMPTY_DRAFT, update };
+	// The draft as it is now, for a callback that may run before the next render.
+	const current = useCallback(
+		() => queryClient.getQueryData< SiteChatDraft >( [ 'site-chat-draft', siteId ] ) ?? EMPTY_DRAFT,
+		[ queryClient, siteId ]
+	);
+	return { draft: draft ?? EMPTY_DRAFT, update, current };
 }

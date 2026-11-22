@@ -13,6 +13,9 @@ import {
 } from 'electron';
 import path from 'path';
 import * as Sentry from '@sentry/electron/main';
+import { setChatGptTokenClient } from '@studio/agent/node/chatgpt/credential-broker';
+import { setChatGptBrowserOpener } from '@studio/agent/node/chatgpt/oauth';
+import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { PROTOCOL_PREFIX } from '@studio/common/constants';
 import { refreshAgentPlugins } from '@studio/common/lib/connect-agent-app';
 import { runMigrations } from '@studio/common/lib/migration';
@@ -227,6 +230,14 @@ function launchExtensionBackgroundWorkers( appSession = session.defaultSession )
 
 async function appBoot() {
 	app.setName( packageJson.productName );
+
+	// Main holds any session-only ChatGPT state: turns renew and revoke
+	// through the token service, and a sign-in opens in the system browser.
+	// The authorize URL goes to the browser only, never to a renderer.
+	setChatGptTokenClient( createChatGptTokenClient() );
+	setChatGptBrowserOpener( async ( url ) => {
+		await shell.openExternal( url );
+	} );
 
 	Menu.setApplicationMenu( null );
 

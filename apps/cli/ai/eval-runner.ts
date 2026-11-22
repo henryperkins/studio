@@ -7,12 +7,9 @@
  */
 
 import {
-	existsSync,
 	mkdirSync,
 	mkdtempSync,
-	readdirSync,
-	readFileSync,
-	symlinkSync,
+	rmdirSync,
 	writeFileSync,
 	writeSync as fsWriteSync,
 } from 'node:fs';
@@ -26,8 +23,18 @@ import {
 	createTokenUsage,
 	type AskUserHandler,
 	type SiteInfo,
+	type StudioAgentHost,
 } from '@studio/agent/node';
+import {
+	listChatGptConnections,
+	setChatGptTokenClient,
+} from '@studio/agent/node/chatgpt/credential-broker';
+import { isChatGptEnabled } from '@studio/agent/node/chatgpt/settings';
+import { setChatGptStateDirectory } from '@studio/agent/node/chatgpt/state-directory';
+import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { writeGlobalInstructions } from '@studio/agent/node/global-instructions';
+import { isImageGenerationAvailable } from '@studio/agent/node/image-generation';
+import { getChatGptModelCapabilities } from '@studio/agent/protocol/chatgpt-models';
 import { DEFAULT_MODEL, isAiModelId, type AiModelId } from '@studio/agent/protocol/models';
 import { findLastAssistant } from '@studio/agent/protocol/session-events';
 import { DEFAULT_PHP_VERSION } from '@studio/common/constants';
@@ -35,19 +42,70 @@ import { addConnectedWpcomSite } from '@studio/common/lib/connected-sites';
 import { portFinder } from '@studio/common/lib/port-finder';
 import { readAuthToken } from '@studio/common/lib/shared-config';
 import { SITE_FILE_ACCESS_SITE_DIRECTORY } from '@studio/common/lib/site-file-access';
-import { getConfigDirectory, getSharedConfigPath } from '@studio/common/lib/well-known-paths';
-import { snapshotSchema } from '@studio/common/types/snapshot';
-import { syncSiteSchema } from '@studio/common/types/sync';
-import { z } from 'zod';
+import { fetchSyncableSites } from '@studio/common/lib/sync/sync-api';
+import {
+	getAiPayloadsPath,
+	getCertificatesPath,
+	getCliConfigPath,
+	getConfigDirectory,
+} from '@studio/common/lib/well-known-paths';
 import {
 	resolveAiEnvironment,
 	resolveInitialAiProvider,
 	resolveUnavailableAiProvider,
 } from 'cli/ai/auth';
+import {
+	installAcceptanceObserver,
+	readObservedLines,
+	type ObservedRequest,
+} from 'cli/ai/chatgpt-acceptance-observer';
+import { caseProcessManagerHome, stopCaseProcessManager } from 'cli/ai/eval-case-daemon';
+import {
+	caseProfile,
+	removeCaseProfile,
+	withdrawCaseLogin,
+	type CaseProfile,
+} from 'cli/ai/eval-case-profile';
+import { pathsFixedAtLoad } from 'cli/ai/eval-fixed-paths';
+import {
+	evalHistoryMessages,
+	findEvalFixturesDir,
+	installWpcomWriteGuard,
+	loadEvalAttachments,
+	withMockedRemote,
+	withMockedWpcomRequest,
+	withStagingRemote,
+	type EvalAttachments,
+	type RemoteCall,
+	type StagingSite,
+	type WpcomWriteAttempt,
+	type WpcomWriteGuard,
+} from 'cli/ai/eval-harness';
+import { parseEvalRunnerVars, type EvalRunnerVars, type EvalSeed } from 'cli/ai/eval-input';
 import { captureTurnOutcome, fingerprintSites, type TurnOutcome } from 'cli/ai/eval-outcome';
-import { matchesStopRule, stopRuleSchema, type StopRule } from 'cli/ai/eval-stop';
+import {
+	readEvalProviderRequest,
+	resolveEvalProviderPlan,
+	summarizeExecutedRoute,
+	type EvalProviderDeps,
+	type EvalProviderFailure,
+	type EvalProviderPlan,
+	type EvalProviderRequestResult,
+	type ExecutedRoute,
+	type RequestedRoute,
+} from 'cli/ai/eval-provider';
+import { liveEvalRunFacts } from 'cli/ai/eval-run-facts';
+import { matchesStopRule } from 'cli/ai/eval-stop';
+import {
+	evalSummaryDirectory,
+	writeEvalCaseSummary,
+	type EvalRunFacts,
+	type EvalSummaryLocation,
+	type EvalSummarySource,
+} from 'cli/ai/eval-summary';
 import { summarizeTiming, type ModelRequestRecord } from 'cli/ai/eval-timing';
 import { cliAgentHost } from 'cli/ai/host';
+import { getAiProviderDefinition } from 'cli/ai/providers';
 import { runCommand as runCreateSiteCommand } from 'cli/commands/site/create';
 import { runCommand as runDeleteSiteCommand } from 'cli/commands/site/delete';
 import {
@@ -57,77 +115,17 @@ import {
 	unlockCliConfig,
 } from 'cli/lib/cli-config/core';
 import { getSiteByFolder } from 'cli/lib/cli-config/sites';
+import { disconnectFromDaemon, killDaemonAndChildren } from 'cli/lib/daemon-client';
+import { PROCESS_MANAGER_HOME } from 'cli/lib/paths';
 import { runWpCliCommand } from 'cli/lib/run-wp-cli-command';
 import { STUDIO_SITES_ROOT } from 'cli/lib/site-paths';
 import { Logger } from 'cli/logger';
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
+import type { StudioChatArtifactData } from '@studio/agent/protocol/chat-artifacts';
+import type { StudioChatImage } from '@studio/agent/protocol/chat-images';
+import type { SyncSite } from '@studio/common/types/sync';
+import type { StageRecord } from 'cli/ai/acceptance-evidence';
 import type { AiProviderId } from 'cli/ai/providers';
-
-// Optional fixtures a test can pre-seed before the agent turn, so flows that
-// depend on connected remote sites and/or preview sites can be exercised
-// deterministically and offline (no real WordPress.com connection/preview).
-const evalSeedSchema = z.object( {
-	localSite: z
-		.object( {
-			id: z.string(),
-			name: z.string(),
-			path: z.string(),
-			port: z.number().default( 8881 ),
-			url: z.string().optional(),
-			phpVersion: z.string().default( '8.2' ),
-		} )
-		.optional(),
-	connectedWpcomSites: z.array( syncSiteSchema ).optional(),
-	snapshots: z.array( snapshotSchema ).optional(),
-	globalInstructions: z.string().optional(),
-	// A real (stopped) site under STUDIO_SITES_ROOT, active for the turn, with
-	// `files` written relative to its root, then each `wpCli` argv run in order
-	// (e.g. to activate a theme or seed database rows). Each `inspect` argv runs
-	// after the turn and its output lands in the result's `inspections`, so
-	// assertions can check site state before the site is deleted.
-	activeSite: z
-		.object( {
-			name: z.string(),
-			files: z.record( z.string(), z.string() ).optional(),
-			wpCli: z.array( z.array( z.string() ) ).optional(),
-			inspect: z.array( z.array( z.string() ) ).optional(),
-			// WordPress.com sites connected to this site, whose id is only known
-			// once it exists.
-			connectedWpcomSites: z.array( syncSiteSchema.omit( { localSiteId: true } ) ).optional(),
-		} )
-		.optional(),
-	// One of the user's WordPress.com sites, active for the turn as when it is
-	// picked in the app or CLI. Nothing is created; the site must exist.
-	remoteActiveSite: z
-		.object( {
-			name: z.string(),
-			url: z.string(),
-			wpcomSiteId: z.number(),
-		} )
-		.optional(),
-} );
-type EvalSeed = z.infer< typeof evalSeedSchema >;
-
-interface EvalRunnerInput {
-	ui?: boolean;
-	prompt: string;
-	// Sent in order, each as a new user message in the same session once the
-	// previous one finishes, so a case can measure a multi-message conversation.
-	// Objects rather than strings: promptfoo expands an array of strings into
-	// one test case per element.
-	followUps?: Array< { prompt: string } >;
-	// Scripted replies for the questions the agent asks the user, in order:
-	// each question takes the next label. With answers set, the turn runs with
-	// Studio chat's ask-the-user handler, so AskUserQuestion and tools that
-	// confirm with the user work; once they run out, the user cancels.
-	answers?: Array< { label: string } >;
-	timeoutMs?: number;
-	model?: AiModelId;
-	seed?: EvalSeed;
-	// Ends the run at the first tool call matching one of these rules, before
-	// any follow-ups; the result's `stoppedAt` names it.
-	stopAt?: StopRule[];
-}
 
 interface Inspection {
 	args: string[];
@@ -143,13 +141,6 @@ interface SeededFixtures {
 	activeSitePath?: string;
 }
 
-/**
- * Writes the requested fixtures into cli.json (local site + snapshots) and
- * shared.json (connected WordPress.com sites). Returns a cleanup function that
- * removes exactly what was added, so reruns start from a clean slate.
- * `globalInstructions` is the exception: it overwrites the user's real
- * instructions file, so cleanup restores the prior content instead.
- */
 // The folder site_create gives a site of this name.
 function siteSlug( name: string ): string {
 	return name
@@ -158,56 +149,94 @@ function siteSlug( name: string ): string {
 		.replace( /^-|-$/g, '' );
 }
 
-const REGISTRY_PREFIX = 'studio-eval-registry-';
+const sameFolder = ( a: string, b: string ) => path.relative( a, b ) === '';
+const isInside = ( folder: string, file: string ) => {
+	const relative = path.relative( folder, file );
+	return relative !== '' && ! relative.startsWith( '..' ) && ! path.isAbsolute( relative );
+};
 
-// Each eval runs against its own Studio site registry (cli.json), so sites that
-// other Studio sessions on this machine create never enter the turn, and
-// concurrent cases do not see each other's sites. Ports already given to the
-// user's sites and to other eval registries stay reserved.
-async function isolateSiteRegistry() {
-	const ports = ( await readCliConfig() ).sites.map( ( site ) => site.port );
-	for ( const entry of readdirSync( os.tmpdir() ) ) {
-		if ( ! entry.startsWith( REGISTRY_PREFIX ) ) continue;
-		try {
-			const registry = JSON.parse(
-				readFileSync( path.join( os.tmpdir(), entry, 'cli.json' ), 'utf8' )
-			) as { sites?: Array< { port: number } > };
-			ports.push( ...( registry.sites ?? [] ).map( ( site ) => site.port ) );
-		} catch {
-			// A registry with no sites yet.
+/**
+ * Whether this process runs the case on the Studio profile and site registry
+ * its entry made for it (`eval-case-profile.ts`) and, for a case that names a
+ * provider, on its own process manager: as the path helpers resolve them now,
+ * and as the modules that fix a path when they load fixed it. A bundler can
+ * evaluate a module before the entry's overrides, so this is checked before
+ * the first site or turn, and the case never proceeds on the owner's profile
+ * or the owner's process manager.
+ */
+function caseIsolationRefusal( namesProvider: boolean ): EvalRefusal | null {
+	const own = caseProfile();
+	const refusal = ( reason: string ): EvalRefusal => ( {
+		code: 'case-profile-not-isolated',
+		message: `This case runs only on a Studio profile of its own, made before the runner loads, and ${ reason }, so nothing ran.`,
+	} );
+	if ( ! own.ok ) {
+		return refusal( own.problem );
+	}
+	const { profile, registry } = own.profile;
+	const fixed = pathsFixedAtLoad();
+	if (
+		! sameFolder( getConfigDirectory(), profile ) ||
+		! sameFolder( path.dirname( getCliConfigPath() ), registry )
+	) {
+		return refusal( 'Studio’s paths resolve to another profile now' );
+	}
+	const payloads = getAiPayloadsPath();
+	if (
+		! isInside( profile, payloads ) ||
+		! fixed.payloadDescriptions.some( ( text ) => text.includes( payloads ) )
+	) {
+		return refusal( 'wpcom_request names a payload folder outside it' );
+	}
+	if (
+		! isInside( profile, fixed.rootCaCertificate ) ||
+		! sameFolder( path.dirname( fixed.rootCaCertificate ), getCertificatesPath() )
+	) {
+		return refusal( 'Studio’s certificates folder was fixed outside it when it loaded' );
+	}
+	if ( namesProvider ) {
+		const home = caseProcessManagerHome( process.env );
+		if ( ! home || ! sameFolder( home, fixed.processManagerHome ) ) {
+			return {
+				code: 'process-manager-not-isolated',
+				message:
+					'A case that names a provider runs its sites only under a process manager of its own, which is not the one this process’s daemon client loaded with, so nothing ran.',
+			};
 		}
 	}
-	for ( const port of ports ) {
-		portFinder.addUnavailablePort( port );
-	}
-	process.env.E2E = '1';
-	process.env.E2E_CLI_CONFIG_PATH = mkdtempSync( path.join( os.tmpdir(), REGISTRY_PREFIX ) );
+	return null;
 }
 
-// What Studio downloads once per machine, which every eval reads as the user's
-// Studio does.
-const STUDIO_DOWNLOADS = [ 'server-files', 'php-bin', 'import-runtime', 'mu-plugins' ];
-
-// Each eval runs against its own Studio config directory, signed in as the
-// user, so what a case seeds (global instructions, WordPress.com connections)
-// and what its turn changes stay in the case: concurrent cases and the user's
-// own Studio never see them.
-function isolateStudioConfig() {
-	const userDir = getConfigDirectory();
-	const { version, authToken, aiProvider } = JSON.parse(
-		readFileSync( getSharedConfigPath(), 'utf8' )
-	) as Record< string, unknown >;
-	const dir = mkdtempSync( path.join( os.tmpdir(), 'studio-eval-config-' ) );
-	for ( const name of STUDIO_DOWNLOADS ) {
-		if ( existsSync( path.join( userDir, name ) ) ) {
-			symlinkSync( path.join( userDir, name ), path.join( dir, name ) );
-		}
-	}
-	writeFileSync(
-		path.join( dir, 'shared.json' ),
-		JSON.stringify( { version, authToken, aiProvider } )
+// A teardown failure never changes the case's outcome, but is never silent:
+// the case profile holds a copy of the owner's login.
+function warnTeardown( what: string, error: unknown ): void {
+	const code = ( error as { code?: unknown } )?.code;
+	process.stderr.write(
+		`studio-eval warning: ${ what }${ typeof code === 'string' ? ` (${ code })` : '' }
+`
 	);
-	process.env.E2E_SHARED_CONFIG_PATH = dir;
+}
+
+// The environment that points the case at its own folders, as the entry set
+// it: put back as it was when the case started, whatever the case did to it.
+const CASE_ENVIRONMENT = [
+	'E2E',
+	'E2E_CLI_CONFIG_PATH',
+	'E2E_SHARED_CONFIG_PATH',
+	'DEV_CONFIG_DIR',
+] as const;
+
+function saveCaseEnvironment(): () => void {
+	const saved = CASE_ENVIRONMENT.map( ( name ) => [ name, process.env[ name ] ] as const );
+	return () => {
+		for ( const [ name, value ] of saved ) {
+			if ( value === undefined ) {
+				delete process.env[ name ];
+			} else {
+				process.env[ name ] = value;
+			}
+		}
+	};
 }
 
 // Stopped sites the request is not about, as a user with a few sites has, so
@@ -249,6 +278,12 @@ async function deleteSites( sitePaths: string[] ): Promise< void > {
 	}
 }
 
+/**
+ * Writes the requested fixtures into the case's own profile: cli.json (local
+ * site and snapshots, in the case's registry), shared.json (connected
+ * WordPress.com sites) and the global instructions file, all removed with the
+ * case. Returns a cleanup function that deletes the seeded active site.
+ */
 async function seedFixtures( seed: EvalSeed ): Promise< SeededFixtures > {
 	const {
 		localSite,
@@ -489,74 +524,347 @@ function extractToolResult( event: AgentSessionEvent ): {
 	};
 }
 
-function readInput(): EvalRunnerInput {
-	const prompt = process.argv[ 2 ];
+interface EvalRunnerInput extends EvalRunnerVars {
+	prompt: string;
+	model?: AiModelId;
+	/** An explicit provider selection, or null for the default path. */
+	provider: EvalProviderRequestResult | null;
+}
+
+export function readEvalRunnerInput(
+	argv: readonly string[] = process.argv,
+	env: NodeJS.ProcessEnv = process.env
+): EvalRunnerInput {
+	const prompt = argv[ 2 ];
 	if ( ! prompt ) {
 		throw new Error( 'Missing prompt argument' );
 	}
 
 	let vars: Record< string, unknown > = {};
-	if ( process.argv[ 4 ] ) {
+	if ( argv[ 4 ] ) {
 		try {
-			vars = JSON.parse( process.argv[ 4 ] )?.vars ?? {};
+			vars = JSON.parse( argv[ 4 ] )?.vars ?? {};
 		} catch {
 			// ignore
 		}
 	}
 
-	const envModel = process.env.STUDIO_EVAL_MODEL?.trim();
+	const envModel = env.STUDIO_EVAL_MODEL?.trim();
 	const varModel = typeof vars.model === 'string' ? vars.model.trim() : undefined;
 	const rawModel = varModel || envModel;
 	const model = rawModel && isAiModelId( rawModel ) ? rawModel : undefined;
 
-	let seed: EvalSeed | undefined;
-	if ( vars.seed ) {
-		seed = evalSeedSchema.parse( vars.seed );
-	}
-
-	const followUps = vars.followUps
-		? z.array( z.object( { prompt: z.string() } ) ).parse( vars.followUps )
-		: undefined;
-
-	const answers = vars.answers
-		? z.array( z.object( { label: z.string() } ) ).parse( vars.answers )
-		: undefined;
-
+	const parsed = parseEvalRunnerVars( vars );
 	return {
-		ui: vars.ui === true,
-		prompt: ( vars.prompt as string ) ?? prompt,
-		followUps,
-		answers,
-		timeoutMs: typeof vars.timeoutMs === 'number' ? vars.timeoutMs : undefined,
-		stopAt: vars.stopAt ? z.array( stopRuleSchema ).parse( vars.stopAt ) : undefined,
+		...parsed,
+		prompt: parsed.prompt ?? prompt,
 		model,
-		seed,
+		provider: readEvalProviderRequest( { env, vars } ),
 	};
 }
 
-async function runEval( input: EvalRunnerInput ) {
-	const agent = createAgent( {
-		host: input.ui
-			? { ...cliAgentHost, ui: { showArtifact: () => {}, reloadPreview: () => {} } }
-			: cliAgentHost,
-	} );
-	// Mirrors the fallback in the agent runtime (packages/agent/node/runtime) — keep in sync.
-	const resolvedModel = input.model ?? DEFAULT_MODEL;
+const liveProviderDeps: EvalProviderDeps = {
+	isChatGptEnabled,
+	listChatGptConnections,
+	provider: ( id ) => getAiProviderDefinition( id ),
+	get home() {
+		return os.homedir();
+	},
+	// The profile the eval process started with, which the case reads, never the case's own.
+	configDirectory: () => {
+		const own = caseProfile();
+		return own.ok ? own.profile.source : getConfigDirectory();
+	},
+	useChatGptProfile: setChatGptStateDirectory,
+};
+
+interface EvalRefusal {
+	code: EvalProviderFailure[ 'code' ] | EvalSetupRefusalCode;
+	message: string;
+}
+
+type EvalSetupRefusalCode =
+	| 'case-profile-not-isolated'
+	| 'process-manager-not-isolated'
+	| 'staging-not-designated'
+	| 'staging-not-confirmed'
+	| 'staging-needs-active-site'
+	| 'history-needs-provider'
+	| 'fixture-missing'
+	| 'image-service-not-configured'
+	| 'image-service-still-configured';
+
+interface ProviderRouteReport {
+	requested: RequestedRoute | null;
+	executed?: ExecutedRoute;
+	failure?: EvalRefusal;
+	blocked?: EvalBlock;
+}
+
+/**
+ * A case that can't pass on the selected route yet, by what the route is
+ * qualified for: neither run nor failed, and never silently skipped.
+ */
+interface EvalBlock {
+	code: 'tool-images-not-qualified';
+	message: string;
+}
+
+function blockedRun( block: EvalBlock, requested: RequestedRoute ) {
+	return {
+		success: false,
+		error: block.message,
+		blocked: block,
+		providerRoute: { requested, blocked: block } satisfies ProviderRouteReport,
+	};
+}
+
+/**
+ * A run refused before any site, turn or model request, with its typed code:
+ * in `providerRoute` too when a provider was selected or its selection failed.
+ */
+function refusedRun( failure: EvalRefusal, route?: { requested: RequestedRoute | null } ) {
+	return {
+		success: false,
+		error: failure.message,
+		refusal: failure,
+		...( route
+			? { providerRoute: { requested: route.requested, failure } satisfies ProviderRouteReport }
+			: {} ),
+	};
+}
+
+const STAGING_SITE_ID_ENV = 'STUDIO_EVAL_STAGING_SITE_ID';
+const STAGING_SITE_URL_ENV = 'STUDIO_EVAL_STAGING_SITE_URL';
+
+/**
+ * The WordPress.com site the person running the eval named for this run as the
+ * disposable staging site a `remote: staging` case may change, never one a
+ * config names. It says which site, not that the site is staging.
+ */
+function designatedStagingSite(): { id: number; url: string } | null {
+	const id = Number( process.env[ STAGING_SITE_ID_ENV ] );
+	const url = process.env[ STAGING_SITE_URL_ENV ]?.trim();
+	if ( ! Number.isSafeInteger( id ) || id <= 0 || ! url || ! /^https:\/\//.test( url ) ) {
+		return null;
+	}
+	return { id, url };
+}
+
+const comparableSiteUrl = ( url: string ) => {
+	try {
+		const parsed = new URL( url );
+		return `${ parsed.origin }${ parsed.pathname.replace( /\/+$/, '' ) }`.toLowerCase();
+	} catch {
+		return null;
+	}
+};
+
+/**
+ * The designated site as WordPress.com lists it among the account's sites,
+ * when it lists it at that address and as a staging site: whether the site is
+ * staging comes from WordPress.com, never from the environment. A read only.
+ */
+async function confirmStagingSite( designated: {
+	id: number;
+	url: string;
+} ): Promise< { site: Omit< SyncSite, 'localSiteId' > } | { problem: string } > {
+	const login = await readAuthToken();
+	if ( ! login ) {
+		return { problem: 'no WordPress.com login to ask WordPress.com with' };
+	}
+	let sites: SyncSite[];
+	try {
+		sites = await fetchSyncableSites( login.accessToken );
+	} catch {
+		return { problem: 'WordPress.com could not list the account’s sites' };
+	}
+	const listed = sites.find( ( site ) => site.id === designated.id );
+	if ( ! listed ) {
+		return { problem: 'the account has no site with that id' };
+	}
+	if ( ! listed.isStaging ) {
+		return { problem: 'WordPress.com does not list that site as a staging site' };
+	}
+	const address = comparableSiteUrl( designated.url );
+	if ( ! address || comparableSiteUrl( listed.url ) !== address ) {
+		return { problem: 'WordPress.com lists that site at another address' };
+	}
+	const { localSiteId: _unused, ...site } = listed;
+	return { site: { ...site, syncSupport: 'already-connected' } };
+}
+
+interface UiEvents {
+	artifacts: Array< { id: string; widgets: string[] } >;
+	previewReloads: number;
+}
+
+/**
+ * Runs one case on the profile, registry and (for a case that names a
+ * provider) process manager its entry made for it, refused before anything
+ * else when it isn't on them, and removes the profile and registry when it
+ * ends, whatever the outcome.
+ */
+export async function runEval( input: EvalRunnerInput ) {
+	const restoreCaseEnvironment = saveCaseEnvironment();
+	try {
+		const isolation = caseIsolationRefusal( input.provider?.ok === true );
+		const own = caseProfile();
+		if ( isolation || ! own.ok ) {
+			return refusedRun(
+				isolation ?? { code: 'case-profile-not-isolated', message: own.ok ? '' : own.problem },
+				input.provider ? { requested: null } : undefined
+			);
+		}
+		return await runCase( input, own.profile );
+	} finally {
+		restoreCaseEnvironment();
+		removeCaseProfile( warnTeardown );
+	}
+}
+
+async function runCase( input: EvalRunnerInput, own: CaseProfile ) {
 	const evalStartedAt = Date.now();
 	const elapsed = () => Date.now() - evalStartedAt;
 	const phaseTimingsMs: Record< string, number > = {};
 	let phaseStartedAt = Date.now();
 
-	let aiProvider: AiProviderId = await resolveInitialAiProvider();
-	phaseTimingsMs.resolve_initial_provider_ms = Date.now() - phaseStartedAt;
+	let plan: EvalProviderPlan | null = null;
+	let runProvider: AiProviderId;
+	let aiEnvironment: Record< string, string >;
+	if ( input.provider ) {
+		if ( ! input.provider.ok ) {
+			return refusedRun( input.provider.failure, { requested: null } );
+		}
+		const resolved = await resolveEvalProviderPlan( input.provider.request, liveProviderDeps );
+		phaseTimingsMs.resolve_selected_provider_ms = Date.now() - phaseStartedAt;
+		if ( ! resolved.ok ) {
+			return refusedRun( resolved.failure, { requested: null } );
+		}
+		plan = resolved.plan;
+		runProvider = plan.requested.kind;
+		aiEnvironment = plan.env;
+		if ( plan.requested.kind === 'chatgpt-oauth' ) {
+			setChatGptTokenClient( createChatGptTokenClient() );
+		}
+	} else {
+		let aiProvider: AiProviderId = await resolveInitialAiProvider();
+		phaseTimingsMs.resolve_initial_provider_ms = Date.now() - phaseStartedAt;
 
-	phaseStartedAt = Date.now();
-	aiProvider = ( await resolveUnavailableAiProvider( aiProvider ) ) ?? aiProvider;
-	phaseTimingsMs.resolve_unavailable_provider_ms = Date.now() - phaseStartedAt;
+		phaseStartedAt = Date.now();
+		aiProvider = ( await resolveUnavailableAiProvider( aiProvider ) ) ?? aiProvider;
+		phaseTimingsMs.resolve_unavailable_provider_ms = Date.now() - phaseStartedAt;
 
-	phaseStartedAt = Date.now();
-	const aiEnvironment = await resolveAiEnvironment( aiProvider );
-	phaseTimingsMs.resolve_ai_environment_ms = Date.now() - phaseStartedAt;
+		phaseStartedAt = Date.now();
+		aiEnvironment = await resolveAiEnvironment( aiProvider );
+		phaseTimingsMs.resolve_ai_environment_ms = Date.now() - phaseStartedAt;
+		runProvider = aiProvider;
+	}
+	// A selected case never changes anything on WordPress.com unless it is a
+	// staging case: without a `remote` var it runs as `remote: mock`.
+	const remote = input.remote ?? ( plan ? 'mock' : undefined );
+	// Mirrors the fallback in the agent runtime (packages/agent/node/runtime) — keep in sync.
+	const resolvedModel = plan ? plan.requested.model : input.model ?? DEFAULT_MODEL;
+	const providerRefusal = ( failure: EvalRefusal ) =>
+		refusedRun( failure, plan ? { requested: plan.requested } : undefined );
+	// Decided by the route's capability table alone, so the case runs as soon as the table qualifies it.
+	if (
+		input.needsToolImages &&
+		plan?.requested.kind === 'chatgpt-oauth' &&
+		getChatGptModelCapabilities( plan.requested.model )?.toolImageInput !== true
+	) {
+		return blockedRun(
+			{
+				code: 'tool-images-not-qualified',
+				message: `This case is judged on images a tool returns to the model, and the ChatGPT route isn't qualified for them on ${ plan.requested.model } yet (gate T1), so it was not run.`,
+			},
+			plan.requested
+		);
+	}
+
+	let seed = input.seed;
+	let stagingSite: StagingSite | null = null;
+	if ( input.remote === 'staging' ) {
+		const designated = designatedStagingSite();
+		if ( ! designated ) {
+			return providerRefusal( {
+				code: 'staging-not-designated',
+				message: `A remote: staging case changes a real WordPress.com site, so it runs only against a disposable staging site you name for this run: set ${ STAGING_SITE_ID_ENV } and ${ STAGING_SITE_URL_ENV } (https) on the command that runs it.`,
+			} );
+		}
+		const confirmed = await confirmStagingSite( designated );
+		if ( 'problem' in confirmed ) {
+			return providerRefusal( {
+				code: 'staging-not-confirmed',
+				message: `The designated staging site was not confirmed by WordPress.com: ${ confirmed.problem }.`,
+			} );
+		}
+		const staging = confirmed.site;
+		stagingSite = { id: staging.id, url: staging.url };
+		if ( ! seed?.activeSite ) {
+			return providerRefusal( {
+				code: 'staging-needs-active-site',
+				message: 'A remote: staging case connects the staging site to its seeded active site.',
+			} );
+		}
+		seed = {
+			...seed,
+			activeSite: {
+				...seed.activeSite,
+				connectedWpcomSites: [ ...( seed.activeSite.connectedWpcomSites ?? [] ), staging ],
+			},
+		};
+	}
+	if ( seed?.history?.length && ! plan ) {
+		return providerRefusal( {
+			code: 'history-needs-provider',
+			message:
+				'Seeded history is recorded as replies on the selected route, so it needs STUDIO_EVAL_PROVIDER.',
+		} );
+	}
+	let attachments: EvalAttachments | null = null;
+	if ( input.attachments?.length ) {
+		const fixturesDir = findEvalFixturesDir( import.meta.dirname, process.env );
+		const loaded = fixturesDir
+			? loadEvalAttachments( input.attachments, fixturesDir )
+			: { missing: input.attachments[ 0 ].fixture };
+		if ( 'missing' in loaded ) {
+			return providerRefusal( {
+				code: 'fixture-missing',
+				message: `The attachment fixture ${ loaded.missing } is not in scripts/eval/fixtures (or STUDIO_EVAL_FIXTURES_DIR).`,
+			} );
+		}
+		attachments = loaded;
+	}
+
+	const remoteCalls: RemoteCall[] = [];
+	// Every request and remote operation the case's guards refused, in order.
+	const refusedWrites: WpcomWriteAttempt[] = [];
+	const uiEvents: UiEvents = { artifacts: [], previewReloads: 0 };
+	let baseHost: StudioAgentHost = cliAgentHost;
+	if ( remote === 'mock' ) {
+		baseHost = withMockedRemote( cliAgentHost, remoteCalls );
+	} else if ( stagingSite ) {
+		baseHost = withStagingRemote( cliAgentHost, remoteCalls, stagingSite, refusedWrites );
+	}
+	const guarded = remote === 'mock' || stagingSite !== null;
+	const host = input.ui
+		? {
+				...baseHost,
+				ui: {
+					showArtifact: ( artifact: StudioChatArtifactData ) => {
+						uiEvents.artifacts.push( {
+							id: artifact.id,
+							widgets: artifact.widgets.map( ( widget ) => widget.type ),
+						} );
+					},
+					reloadPreview: () => {
+						uiEvents.previewReloads += 1;
+					},
+				},
+		  }
+		: baseHost;
+	let agent = createAgent( { host } );
 
 	const env = {
 		...( process.env as Record< string, string > ),
@@ -564,6 +872,12 @@ async function runEval( input: EvalRunnerInput ) {
 	};
 	// Allow running inside a Claude Code session
 	delete env.CLAUDECODE;
+	if ( input.imageService === 'off' ) {
+		// The image service's own token; its other credential, the WordPress.com
+		// login, is left out of the case's profile below.
+		delete process.env.STUDIO_IMAGE_API_TOKEN;
+		delete env.STUDIO_IMAGE_API_TOKEN;
+	}
 
 	const toolCalls: ToolCallRecord[] = [];
 	const toolResults: {
@@ -583,7 +897,8 @@ async function runEval( input: EvalRunnerInput ) {
 		? async ( asked ) =>
 				Object.fromEntries(
 					asked.map( ( { question, options } ) => {
-						const answer = pendingAnswers.shift()?.label ?? 'Cancel';
+						const label = pendingAnswers.shift()?.label;
+						const answer = ( label === '@first' ? options[ 0 ]?.label : label ) ?? 'Cancel';
 						questions.push( {
 							question,
 							options: options.map( ( option ) => option.label ),
@@ -613,195 +928,404 @@ async function runEval( input: EvalRunnerInput ) {
 	// token cost of prompt variants, not just their outcomes.
 	const usage = createTokenUsage();
 
-	await isolateSiteRegistry();
-	isolateStudioConfig();
-	const bystanderPaths = await createBystanderSites();
-
+	let observerFile: string | null = null;
+	// What the case swaps in for its turns, put back in reverse order.
+	const restorers: Array< () => void > = [];
+	const restore = () => {
+		while ( restorers.length ) {
+			restorers.pop()?.();
+		}
+	};
+	let wpcomGuard: WpcomWriteGuard | null = null;
+	let bystanderPaths: string[] = [];
 	let seeded: SeededFixtures | null = null;
-	let inspections: Inspection[] = [];
-	let outcome: TurnOutcome | { error: string } | null = null;
-	const prompt = input.prompt.trim();
-	if ( input.seed ) {
-		seeded = await seedFixtures( input.seed );
-	}
-
-	phaseStartedAt = Date.now();
-	// Every run keeps its session JSONL (the full transcript) and reports its
-	// path as `sessionFile`; STUDIO_EVAL_SESSION_DIR picks the directory.
-	const sessionDir =
-		process.env.STUDIO_EVAL_SESSION_DIR?.trim() || path.join( os.tmpdir(), 'studio-eval-sessions' );
-	mkdirSync( sessionDir, { recursive: true } );
-	const session = SessionManager.create( STUDIO_SITES_ROOT, sessionDir );
-	const queryStartedAt = Date.now();
-	let turnStart = queryStartedAt;
-
-	const handleEvent = ( event: AgentSessionEvent ): void => {
-		if ( event.type === 'message_end' && event.message.role === 'assistant' ) {
-			const messageUsage = addAssistantMessageUsage( usage, event );
-			const now = Date.now();
-			// pi stamps the assistant message just before it sends the request.
-			const requestStartedAt = event.message.timestamp || turnStart;
-			requests.push( {
-				startedAtMs: requestStartedAt - evalStartedAt,
-				endedAtMs: now - evalStartedAt,
-				durationMs: now - requestStartedAt,
-				contextTokens: messageUsage
-					? messageUsage.input + messageUsage.cacheRead + messageUsage.cacheWrite
-					: 0,
-				outputTokens: messageUsage?.output ?? 0,
-				stopReason: event.message.stopReason,
-				...( event.message.errorMessage ? { errorMessage: event.message.errorMessage } : {} ),
-				hasText: event.message.content.some(
-					( block ) => block.type === 'text' && block.text.trim() !== ''
-				),
-				toolCalls: event.message.content.filter( ( block ) => block.type === 'toolCall' ).length,
+	let sitesDeleted = false;
+	try {
+		// The case's sites never take a port the user's sites or another case's have.
+		for ( const port of own.reservedPorts ) {
+			portFinder.addUnavailablePort( port );
+		}
+		if ( input.imageService === 'off' ) {
+			// Without the login, Studio's image service, which signs with it, is off.
+			withdrawCaseLogin( own );
+		}
+		// As the runtime decides it: whether this run offers generate_images.
+		const imageServiceConfigured = input.imageService
+			? await isImageGenerationAvailable()
+			: undefined;
+		if ( input.imageService === 'off' && imageServiceConfigured ) {
+			return providerRefusal( {
+				code: 'image-service-still-configured',
+				message:
+					'This case needs Studio’s image service off, but the case’s own profile still configures it, so nothing ran.',
 			} );
-			turnDurationsMs.push( now - turnStart );
-			turnIndex += 1;
-			if ( turnIndex === 1 ) {
-				phaseTimingsMs.first_assistant_message_ms = now - queryStartedAt;
-			}
-			turnStart = now;
 		}
-		for ( const tc of extractToolCalls( event ) ) {
-			if ( input.stopAt && ! stoppedAt && matchesStopRule( tc, input.stopAt ) ) {
-				stoppedAt = { toolUseId: tc.id, toolName: tc.name, index: toolCalls.length };
-				void query.interrupt();
-			}
-			toolCalls.push( tc );
-			toolNameById.set( tc.id, tc.name );
-			const evt: ToolEvent = {
-				toolUseId: tc.id,
-				toolName: tc.name,
-				input: tc.input,
-				startedAtMs: elapsed(),
-				turnIndex,
-			};
-			toolEvents.push( evt );
-			toolEventById.set( tc.id, evt );
+		if ( input.imageService === 'required' && ! imageServiceConfigured ) {
+			return providerRefusal( {
+				code: 'image-service-not-configured',
+				message:
+					'This case needs Studio’s separate WordPress.com image service: log in to WordPress.com or set STUDIO_IMAGE_API_TOKEN.',
+			} );
 		}
-		textSegments.push( ...extractTextSegments( event ) );
+		// What the run's model requests really were, read back into `providerRoute.executed`.
+		observerFile = plan
+			? path.join( os.tmpdir(), `studio-eval-requests-${ Date.now() }-${ process.pid }.ndjson` )
+			: null;
+		if ( observerFile ) {
+			restorers.push(
+				installAcceptanceObserver( observerFile, globalThis, {
+					bearerIdentity: plan?.bearerIdentity,
+				} )
+			);
+		}
+		if ( guarded ) {
+			restorers.push(
+				withMockedWpcomRequest(
+					remoteCalls,
+					stagingSite ? { site: stagingSite, refused: refusedWrites } : undefined
+				)
+			);
+			wpcomGuard = installWpcomWriteGuard( {
+				allowImageService: input.imageService === 'required',
+				allowProxyInference: runProvider === 'wpcom',
+				...( stagingSite ? { stagingSite } : {} ),
+				attempts: refusedWrites,
+			} );
+			restorers.push( wpcomGuard.uninstall );
+		}
+		const replies: Array< { provider?: unknown; model?: unknown } > = [];
 
-		if ( event.type === 'tool_execution_end' ) {
-			const tr = extractToolResult( event );
-			if ( tr ) {
-				const id = tr.toolUseId;
-				const evt = toolEventById.get( id );
-				if ( evt ) {
-					evt.endedAtMs = elapsed();
-					evt.durationMs = evt.endedAtMs - evt.startedAtMs;
-					evt.isError = tr.isError;
-					evt.outputChars = tr.text?.length ?? 0;
+		let inspections: Inspection[] = [];
+		let outcome: TurnOutcome | { error: string } | null = null;
+		const prompt = `${ input.prompt.trim() }${ attachments?.promptBlock ?? '' }`;
+		bystanderPaths = await createBystanderSites();
+		if ( seed ) {
+			seeded = await seedFixtures( seed );
+		}
+
+		phaseStartedAt = Date.now();
+		// Every run keeps its session JSONL (the full transcript) and reports its
+		// path as `sessionFile`; STUDIO_EVAL_SESSION_DIR picks the directory.
+		const sessionDir =
+			process.env.STUDIO_EVAL_SESSION_DIR?.trim() ||
+			path.join( os.tmpdir(), 'studio-eval-sessions' );
+		mkdirSync( sessionDir, { recursive: true } );
+		let session = SessionManager.create( STUDIO_SITES_ROOT, sessionDir );
+		if ( plan && seed?.history?.length ) {
+			for ( const message of evalHistoryMessages( seed.history, plan.reply ) ) {
+				session.appendMessage( message );
+			}
+		}
+		// Where each user message's turn starts in the run's records.
+		const turns: Array< {
+			reopened: boolean;
+			startedAtMs: number;
+			toolCallsStart: number;
+			textSegmentsStart: number;
+			questionsStart: number;
+		} > = [];
+		const queryStartedAt = Date.now();
+		let turnStart = queryStartedAt;
+
+		const handleEvent = ( event: AgentSessionEvent ): void => {
+			if ( event.type === 'message_end' && event.message.role === 'assistant' ) {
+				replies.push( { provider: event.message.provider, model: event.message.model } );
+				const messageUsage = addAssistantMessageUsage( usage, event );
+				const now = Date.now();
+				// pi stamps the assistant message just before it sends the request.
+				const requestStartedAt = event.message.timestamp || turnStart;
+				requests.push( {
+					startedAtMs: requestStartedAt - evalStartedAt,
+					endedAtMs: now - evalStartedAt,
+					durationMs: now - requestStartedAt,
+					contextTokens: messageUsage
+						? messageUsage.input + messageUsage.cacheRead + messageUsage.cacheWrite
+						: 0,
+					outputTokens: messageUsage?.output ?? 0,
+					stopReason: event.message.stopReason,
+					...( event.message.errorMessage ? { errorMessage: event.message.errorMessage } : {} ),
+					hasText: event.message.content.some(
+						( block ) => block.type === 'text' && block.text.trim() !== ''
+					),
+					toolCalls: event.message.content.filter( ( block ) => block.type === 'toolCall' ).length,
+				} );
+				turnDurationsMs.push( now - turnStart );
+				turnIndex += 1;
+				if ( turnIndex === 1 ) {
+					phaseTimingsMs.first_assistant_message_ms = now - queryStartedAt;
 				}
-				if ( tr.isError && ! firstToolError ) {
-					firstToolError = {
+				turnStart = now;
+			}
+			for ( const tc of extractToolCalls( event ) ) {
+				if ( input.stopAt && ! stoppedAt && matchesStopRule( tc, input.stopAt ) ) {
+					stoppedAt = { toolUseId: tc.id, toolName: tc.name, index: toolCalls.length };
+					void query.interrupt();
+				}
+				toolCalls.push( tc );
+				toolNameById.set( tc.id, tc.name );
+				const evt: ToolEvent = {
+					toolUseId: tc.id,
+					toolName: tc.name,
+					input: tc.input,
+					startedAtMs: elapsed(),
+					turnIndex,
+				};
+				toolEvents.push( evt );
+				toolEventById.set( tc.id, evt );
+			}
+			textSegments.push( ...extractTextSegments( event ) );
+
+			if ( event.type === 'tool_execution_end' ) {
+				const tr = extractToolResult( event );
+				if ( tr ) {
+					const id = tr.toolUseId;
+					const evt = toolEventById.get( id );
+					if ( evt ) {
+						evt.endedAtMs = elapsed();
+						evt.durationMs = evt.endedAtMs - evt.startedAtMs;
+						evt.isError = tr.isError;
+						evt.outputChars = tr.text?.length ?? 0;
+					}
+					if ( tr.isError && ! firstToolError ) {
+						firstToolError = {
+							toolUseId: id,
+							toolName: toolNameById.get( id ) ?? null,
+							...( evt?.input ? { input: evt.input } : {} ),
+							error: tr.text ?? 'Tool returned an error result.',
+							turnIndex,
+						};
+					}
+					toolResults.push( {
 						toolUseId: id,
 						toolName: toolNameById.get( id ) ?? null,
-						...( evt?.input ? { input: evt.input } : {} ),
-						error: tr.text ?? 'Tool returned an error result.',
-						turnIndex,
-					};
+						isError: tr.isError,
+						...( tr.text ? { text: tr.text } : {} ),
+						...( tr.images ? { images: tr.images } : {} ),
+						...( tr.details !== undefined ? { details: tr.details } : {} ),
+					} );
 				}
-				toolResults.push( {
-					toolUseId: id,
-					toolName: toolNameById.get( id ) ?? null,
-					isError: tr.isError,
-					...( tr.text ? { text: tr.text } : {} ),
-					...( tr.images ? { images: tr.images } : {} ),
-					...( tr.details !== undefined ? { details: tr.details } : {} ),
-				} );
 			}
-		}
 
-		if ( event.type === 'turn_end' ) {
-			numTurns += 1;
-		}
-
-		if ( event.type === 'agent_end' ) {
-			const lastAssistant = findLastAssistant( event.messages );
-			success =
-				! lastAssistant ||
-				( lastAssistant.stopReason !== 'error' && lastAssistant.stopReason !== 'aborted' );
-			numTurnsResult = numTurns;
-			stopReason = lastAssistant?.stopReason ?? null;
-			errorMessage = lastAssistant?.errorMessage ?? null;
-		}
-	};
-
-	const runTurn = ( turnPrompt: string ) =>
-		agent.runTurn( {
-			prompt: turnPrompt,
-			env,
-			session,
-			activeSite: seeded?.activeSite,
-			onEvent: handleEvent,
-			onAskUser,
-			...( input.model ? { model: input.model } : {} ),
-		} );
-	const sitesBeforeTurn = await fingerprintSites();
-	let query = runTurn( prompt );
-	phaseTimingsMs.start_ai_agent_ms = Date.now() - phaseStartedAt;
-
-	const timeout = setTimeout( () => {
-		timedOut = true;
-		void query.interrupt();
-	}, input.timeoutMs ?? 300000 );
-
-	try {
-		await query.result;
-		for ( const followUp of input.followUps ?? [] ) {
-			if ( timedOut || stoppedAt ) {
-				break;
+			if ( event.type === 'turn_end' ) {
+				numTurns += 1;
 			}
-			query = runTurn( followUp.prompt );
+
+			if ( event.type === 'agent_end' ) {
+				const lastAssistant = findLastAssistant( event.messages );
+				success =
+					! lastAssistant ||
+					( lastAssistant.stopReason !== 'error' && lastAssistant.stopReason !== 'aborted' );
+				numTurnsResult = numTurns;
+				stopReason = lastAssistant?.stopReason ?? null;
+				errorMessage = lastAssistant?.errorMessage ?? null;
+			}
+		};
+
+		const runTurn = (
+			turnPrompt: string,
+			{ images, reopen = false }: { images?: StudioChatImage[]; reopen?: boolean } = {}
+		) => {
+			const sessionFile = session.getSessionFile();
+			if ( reopen && sessionFile ) {
+				// As a resumed chat: the conversation read back from its file, in a fresh agent.
+				session = SessionManager.open( sessionFile, sessionDir );
+				agent = createAgent( { host } );
+			}
+			turns.push( {
+				reopened: reopen,
+				startedAtMs: elapsed(),
+				toolCallsStart: toolCalls.length,
+				textSegmentsStart: textSegments.length,
+				questionsStart: questions.length,
+			} );
+			// As the CLI does before each turn: the conversation names the connection it runs on.
+			if ( plan?.sessionContext ) {
+				session.appendCustomEntry( 'studio.session_context', plan.sessionContext );
+			}
+			return agent.runTurn( {
+				prompt: turnPrompt,
+				...( images?.length ? { images } : {} ),
+				env,
+				session,
+				activeSite: seeded?.activeSite,
+				onEvent: handleEvent,
+				onAskUser,
+				...( plan ? plan.turn : input.model ? { model: input.model } : {} ),
+			} );
+		};
+		const sitesBeforeTurn = await fingerprintSites();
+		let query = runTurn( prompt, { images: attachments?.images } );
+		phaseTimingsMs.start_ai_agent_ms = Date.now() - phaseStartedAt;
+
+		const timeout = setTimeout( () => {
+			timedOut = true;
+			void query.interrupt();
+		}, input.timeoutMs ?? 300000 );
+
+		try {
 			await query.result;
+			for ( const followUp of input.followUps ?? [] ) {
+				if ( timedOut || ( stoppedAt && ! input.resumeAfterStop ) ) {
+					break;
+				}
+				query = runTurn( followUp.prompt, { reopen: followUp.reopen } );
+				await query.result;
+			}
+		} catch ( caught ) {
+			error = caught instanceof Error ? caught.message : String( caught );
+		} finally {
+			clearTimeout( timeout );
+			// The turns are over: the route report and the guard cover theirs only.
+			restore();
+			outcome = await captureTurnOutcome(
+				sitesBeforeTurn,
+				seeded?.activeSitePath,
+				mkdtempSync( path.join( os.tmpdir(), 'studio-eval-outcome-' ) )
+			).catch( ( caught ) => ( {
+				error: caught instanceof Error ? caught.message : String( caught ),
+			} ) );
+			sitesDeleted = true;
+			if ( seeded ) {
+				inspections = await seeded.inspect().catch( () => [] );
+				await seeded.cleanup().catch( () => undefined );
+			}
+			await deleteSites( bystanderPaths );
 		}
-	} catch ( caught ) {
-		error = caught instanceof Error ? caught.message : String( caught );
-	} finally {
-		clearTimeout( timeout );
-		outcome = await captureTurnOutcome(
-			sitesBeforeTurn,
-			seeded?.activeSitePath,
-			mkdtempSync( path.join( os.tmpdir(), 'studio-eval-outcome-' ) )
-		).catch( ( caught ) => ( {
-			error: caught instanceof Error ? caught.message : String( caught ),
-		} ) );
-		if ( seeded ) {
-			inspections = await seeded.inspect().catch( () => [] );
-			await seeded.cleanup().catch( () => undefined );
+		phaseTimingsMs.total_eval_ms = elapsed();
+		const blockedWrites = wpcomGuard?.attempts ?? [];
+		const guardCode = stagingSite ? 'wpcom-write-outside-staging' : 'wpcom-write-under-mock';
+		if ( blockedWrites.length ) {
+			success = false;
+			error = `${ guardCode }: the case tried ${
+				blockedWrites.length
+			} request(s) that could change WordPress.com ${
+				stagingSite ? 'outside its designated staging site' : 'under remote: mock'
+			}; none was sent.${ error ? ` ${ error }` : '' }`;
 		}
-		await deleteSites( bystanderPaths );
-	}
-	phaseTimingsMs.total_eval_ms = elapsed();
 
-	return {
-		success,
-		error,
-		timedOut,
-		stoppedAt,
-		model: resolvedModel,
-		numTurns: numTurnsResult,
-		stopReason,
-		errorMessage,
-		usage,
-		sessionFile: session.getSessionFile() ?? null,
-		phaseTimingsMs,
-		timing: summarizeTiming( requests, toolEvents ),
-		requests,
-		turnDurationsMs,
-		toolCalls,
-		toolResults,
-		toolEvents,
-		firstToolError,
-		textSegments,
-		questions,
-		inspections,
-		outcome,
-	};
+		const providerRoute: ProviderRouteReport | null =
+			plan && observerFile
+				? {
+						requested: plan.requested,
+						executed: summarizeExecutedRoute( {
+							requests: readObservedLines( observerFile ).filter(
+								( line ): line is ObservedRequest => line.kind === 'request'
+							),
+							replies,
+							entries: session.getEntries(),
+							turnStartedAt: turns.map( ( turn ) => evalStartedAt + turn.startedAtMs ),
+						} ),
+				  }
+				: null;
+
+		return {
+			...( providerRoute ? { providerRoute } : {} ),
+			...( guarded ? { remoteCalls } : {} ),
+			...( wpcomGuard
+				? {
+						remoteGuard: {
+							code: blockedWrites.length ? guardCode : null,
+							blocked: blockedWrites,
+							...( stagingSite ? { allowed: wpcomGuard.allowed } : {} ),
+						},
+				  }
+				: {} ),
+			...( input.ui ? { uiEvents } : {} ),
+			...( input.imageService ? { imageService: { configured: imageServiceConfigured } } : {} ),
+			...( attachments ? { attachments: attachments.summary } : {} ),
+			turns,
+			compactions: session.getEntries().filter( ( entry ) => entry.type === 'compaction' ).length,
+			success,
+			error,
+			timedOut,
+			stoppedAt,
+			model: resolvedModel,
+			numTurns: numTurnsResult,
+			stopReason,
+			errorMessage,
+			usage,
+			sessionFile: session.getSessionFile() ?? null,
+			phaseTimingsMs,
+			timing: summarizeTiming( requests, toolEvents ),
+			requests,
+			turnDurationsMs,
+			toolCalls,
+			toolResults,
+			toolEvents,
+			firstToolError,
+			textSegments,
+			questions,
+			inspections,
+			outcome,
+		};
+	} finally {
+		try {
+			restore();
+		} catch ( error ) {
+			warnTeardown( 'could not restore the case’s swapped-in functions', error );
+		}
+		if ( ! sitesDeleted ) {
+			await seeded?.cleanup().catch( () => undefined );
+			await deleteSites( bystanderPaths ).catch( () => undefined );
+		}
+		if ( observerFile ) {
+			try {
+				await rm( observerFile, { force: true } );
+			} catch ( error ) {
+				warnTeardown( 'could not remove the request observer file', error );
+			}
+		}
+	}
+}
+
+/**
+ * For a case that selects a provider (or must), its sanitized summary
+ * (`eval-summary.ts`): the one output of the case that may leave the machine,
+ * a new run with the case's route record, which its checks then append to.
+ * Never fails the case; the evidence writer's guards decide what it holds.
+ */
+export function writeCaseSummary(
+	input: EvalRunnerInput,
+	result: unknown,
+	{
+		env = process.env,
+		threw = false,
+		facts = liveEvalRunFacts,
+	}: { env?: NodeJS.ProcessEnv; threw?: boolean; facts?: () => EvalRunFacts } = {}
+): { location: EvalSummaryLocation; record: StageRecord } | null {
+	if ( ! input.provider ) {
+		return null;
+	}
+	try {
+		return writeEvalCaseSummary( ( result ?? {} ) as EvalSummarySource, {
+			caseId: input.caseId,
+			provider: input.provider.ok ? input.provider.request.provider : undefined,
+			directory: evalSummaryDirectory( env ),
+			threw,
+			everyCheckRecorded: input.everyCheckRecorded,
+			selection: input.provider.ok ? input.provider.request : undefined,
+			facts: facts(),
+		} );
+	} catch ( error ) {
+		warnTeardown( 'could not write the case’s sanitized summary', error );
+		return null;
+	}
 }
 
 const RESULT_PREFIX = 'EVAL_RUNNER_RESULT_FILE=';
+
+// The folder the entry made for this case's sites, once nothing is left in it.
+// A site the turn created and kept stays, with its folder.
+function removeEmptySitesRoot(): void {
+	const sitesRoot = process.env.E2E_SITES_ROOT;
+	if ( sitesRoot && path.basename( sitesRoot ).startsWith( 'studio-eval-sites-' ) ) {
+		try {
+			rmdirSync( sitesRoot );
+		} catch {
+			// Not empty, or already gone.
+		}
+	}
+}
 
 // Studio tools and the Agent SDK freely print to stdout (pi-tui spinners,
 // daemon status, …). promptfoo's `exec:` provider wraps us in
@@ -809,7 +1333,7 @@ const RESULT_PREFIX = 'EVAL_RUNNER_RESULT_FILE=';
 // Redirect stdout writes to stderr during the run, serialize the result to a
 // tmp file, and emit only `EVAL_RUNNER_RESULT_FILE=<path>` via a raw
 // `fs.writeSync(1, …)` that bypasses the wrapper.
-async function main() {
+export async function main() {
 	const filePath = path.join( os.tmpdir(), `studio-eval-${ Date.now() }-${ process.pid }.json` );
 
 	( process.stdout as unknown as { write: ( ...args: unknown[] ) => boolean } ).write = (
@@ -830,15 +1354,29 @@ async function main() {
 	};
 
 	let exitCode = 0;
+	let input: EvalRunnerInput | null = null;
+	let result: unknown;
 	try {
-		emit( await runEval( readInput() ) );
+		input = readEvalRunnerInput();
+		result = await runEval( input );
 	} catch ( error ) {
-		emit( { success: false, error: error instanceof Error ? error.message : String( error ) } );
+		result = { success: false, error: error instanceof Error ? error.message : String( error ) };
 		exitCode = 1;
 	}
+	// Also when the case never started: its input was unreadable.
+	removeCaseProfile( warnTeardown );
+	// Its location goes with the result, as the result's own goes on stdout, for the checks' records.
+	const summary = input ? writeCaseSummary( input, result, { threw: exitCode !== 0 } ) : null;
+	emit( summary ? { ...( result as object ), evalSummary: summary.location } : result );
+	await stopCaseProcessManager( {
+		home: caseProcessManagerHome( process.env ),
+		processManagerHome: PROCESS_MANAGER_HOME,
+		kill: killDaemonAndChildren,
+		disconnect: disconnectFromDaemon,
+		warn: warnTeardown,
+	} );
+	removeEmptySitesRoot();
 	// The Agent SDK keeps internal handles open past conversation end; bail out
 	// rather than leaving promptfoo waiting on its exec child.
 	process.exit( exitCode );
 }
-
-void main();

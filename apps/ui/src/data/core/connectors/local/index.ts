@@ -4,6 +4,7 @@ import { SyncCancelledError } from '@studio/common/lib/sync/cancel';
 import { fetchWordPressVersions } from '@studio/common/lib/wordpress-versions';
 import { __ } from '@wordpress/i18n';
 import { isShortcut } from '@/lib/keyboard';
+import { ChatGptSettingsError } from '../chatgpt-settings-error';
 import { buildPublishCheckoutUrl } from '../publish-checkout-url';
 import { UnsupportedError } from '../unsupported-error';
 import { readWapuuScore, writeWapuuScore } from '../wapuu-score-storage';
@@ -34,6 +35,14 @@ import type {
 	UserPreferences,
 } from '../../types';
 import type { AgentRunEvent } from '@studio/agent/protocol/agent-events';
+import type {
+	ChatGptSettings,
+	ChatGptSignInStart,
+	ChatGptSignInOutcome,
+	ChatGptSignOutResult,
+} from '@studio/agent/protocol/chatgpt';
+import type { ChatGptModelAvailability } from '@studio/agent/protocol/connections';
+import type { ImageServiceState } from '@studio/agent/protocol/image-service';
 import type { AiSettings } from '@studio/agent/protocol/providers';
 import type { AuthAnalytics, OnboardingAnalytics } from '@studio/common/lib/auth-tracks';
 import type { SiteEvent, SiteListItem, SnapshotEvent } from '@studio/common/lib/cli-events';
@@ -94,6 +103,10 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 	// The server namespaces its API under /api so the SPA's real-path routes
 	// (also /sessions/:id, /sites/:id) can share the same origin.
 	const base = `${ apiBaseUrl.replace( /\/$/, '' ) }/api`;
+	const callbackHosts = new Set( [ 'localhost', '127.0.0.1', '[::1]', 'studio.local' ] );
+	const chatGptSignInSupported =
+		callbackHosts.has( window.location.hostname ) &&
+		callbackHosts.has( new URL( apiBaseUrl, window.location.href ).hostname );
 
 	const agentListeners = new Set< ( event: AgentRunEvent ) => void >();
 	const placementListeners = new Set< ( event: AiSessionPlacementUpdatedEvent ) => void >();
@@ -138,6 +151,35 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 			return undefined as T;
 		}
 		return ( await response.json() ) as T;
+	}
+
+	// A ChatGPT settings read, as `api` makes it, except that it carries the shared
+	// module's own message only when the server answered with its `{ error }` at
+	// 400, the status it gives a known message. Any other failure (its catch-all's
+	// raw 500, the server not answering, a proxy's page) is a plain error, without
+	// the body.
+	async function readChatGptSettings( path: string, init?: RequestInit ) {
+		const response = await fetch( `${ base }${ path }`, {
+			...init,
+			headers: { 'Content-Type': 'application/json' },
+		} );
+		if ( ! response.ok ) {
+			let reason: unknown;
+			if ( response.status === 400 ) {
+				const text = await response.text().catch( () => '' );
+				try {
+					reason = ( JSON.parse( text ) as { error?: unknown } | null )?.error;
+				} catch {
+					// Not JSON: not the server's own answer.
+				}
+			}
+			if ( typeof reason === 'string' ) {
+				throw new ChatGptSettingsError( stripCliErrorEnvelope( reason ) );
+			}
+			throw new Error( `${ init?.method ?? 'GET' } ${ path } failed (${ response.status })` );
+		}
+		const settings = ( await response.json() ) as ChatGptSettings;
+		return { ...settings, signInSupported: settings.signInSupported && chatGptSignInSupported };
 	}
 
 	// Fetch a server endpoint that returns a file and save it via the browser's
@@ -761,6 +803,12 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 				body: JSON.stringify( selection ),
 			} );
 		},
+		async setSessionChatGptSelection( sessionId, selection ) {
+			await api( `/sessions/${ encodeURIComponent( sessionId ) }/chatgpt-selection`, {
+				method: 'POST',
+				body: JSON.stringify( selection ),
+			} );
+		},
 		async setSessionEnvironment( sessionId, environment ) {
 			await api( `/sessions/${ encodeURIComponent( sessionId ) }/environment`, {
 				method: 'POST',
@@ -853,6 +901,44 @@ export function createLocalConnector( { apiBaseUrl }: LocalConnectorOptions ): C
 
 		async getAiSettings(): Promise< AiSettings > {
 			return api< AiSettings >( '/ai-settings' );
+		},
+		async getChatGptSettings() {
+			return readChatGptSettings( '/chatgpt' );
+		},
+		async recheckChatGptSettings() {
+			return readChatGptSettings( '/chatgpt/recheck', { method: 'POST' } );
+		},
+		async beginChatGptSignIn( registrationId, options ) {
+			if ( ! chatGptSignInSupported ) {
+				throw new Error( __( 'Open Studio on localhost to sign in to ChatGPT on this computer.' ) );
+			}
+			return api< ChatGptSignInStart >( '/chatgpt/sign-in', {
+				method: 'POST',
+				body: JSON.stringify( { registrationId, options } ),
+			} );
+		},
+		async waitForChatGptSignIn( attemptId ) {
+			return api< ChatGptSignInOutcome >( `/chatgpt/sign-in/${ encodeURIComponent( attemptId ) }` );
+		},
+		async cancelChatGptSignIn( attemptId ) {
+			return api< boolean >( `/chatgpt/sign-in/${ encodeURIComponent( attemptId ) }`, {
+				method: 'DELETE',
+			} );
+		},
+		async signOutChatGpt( connectionId ) {
+			return api< ChatGptSignOutResult >( '/chatgpt/sign-out', {
+				method: 'POST',
+				body: JSON.stringify( { connectionId } ),
+			} );
+		},
+		async getChatGptModels( connectionId, revision ) {
+			return api< ChatGptModelAvailability >( '/chatgpt/models', {
+				method: 'POST',
+				body: JSON.stringify( { connectionId, revision } ),
+			} );
+		},
+		async getImageServiceState() {
+			return api< ImageServiceState >( '/image-service' );
 		},
 		async saveAnthropicApiKey( key: string | null ): Promise< AiSettings > {
 			return api< AiSettings >( '/ai-settings', {

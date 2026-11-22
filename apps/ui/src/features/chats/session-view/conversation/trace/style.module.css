@@ -107,6 +107,10 @@
 	white-space: pre-wrap;
 }
 
+.toolService {
+	margin: 0;
+}
+
 .activityContent {
 	display: flex;
 	flex-direction: column;

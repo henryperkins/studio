@@ -228,4 +228,28 @@ describe( 'resolveOpenAiSessionSelection', () => {
 		const entries = [ contextEntry( { provider: 'openai-api-key', model: 'gpt-5.6-sol' } ) ];
 		expect( resolveOpenAiSessionSelection( entries, defaults ).model ).toBe( 'gpt-5.6-sol' );
 	} );
+
+	it( 'never reads a ChatGPT record as an OpenAI selection', () => {
+		const entries = [
+			contextEntry( {
+				provider: 'openai-api-key',
+				model: 'gpt-6-astra',
+				reasoningEffort: 'high',
+				reasoningMode: 'pro',
+			} ),
+			contextEntry( {
+				provider: 'chatgpt-oauth',
+				connectionId: 'conn-1',
+				revision: 1,
+				model: 'gpt-6-luna',
+				reasoningEffort: 'none',
+				reasoningMode: 'standard',
+			} ),
+		];
+		expect( resolveOpenAiSessionSelection( entries, defaults ) ).toEqual( {
+			model: 'gpt-6-astra',
+			reasoningEffort: 'high',
+			reasoningMode: 'pro',
+		} );
+	} );
 } );

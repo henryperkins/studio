@@ -136,6 +136,18 @@ beforeEach( () => {
 } );
 
 describe( 'Chat composer', () => {
+	it.each( [ 'wpcom', 'anthropic-api-key', 'openai-api-key' ] as const )(
+		'keeps a %s chat’s composer as it was, with no image service line',
+		async ( provider ) => {
+			const connector = createFakeConnector();
+			await setup( { provider }, connector );
+
+			await modelButton();
+			expect( screen.queryByText( /^Images:/ ) ).not.toBeInTheDocument();
+			expect( connector.getImageServiceState ).not.toHaveBeenCalled();
+		}
+	);
+
 	it( 'preserves edits and new attachments while a send is accepted', async () => {
 		let resolve!: () => void;
 		const onSend = vi.fn(

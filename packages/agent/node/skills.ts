@@ -10,9 +10,8 @@ export interface Skill {
 	userInvokable: boolean;
 }
 
-function parseSkillFile( filePath: string ): Skill | null {
-	const contents = fs.readFileSync( filePath, 'utf-8' );
-	const match = contents.match( /^---\n([\s\S]*?)\n---\n([\s\S]*)$/ );
+export function parseSkillContents( contents: string ): Skill | null {
+	const match = contents.replace( /\r\n/g, '\n' ).match( /^---\n([\s\S]*?)\n---\n([\s\S]*)$/ );
 	if ( ! match ) return null;
 	const [ , frontmatter, body ] = match;
 
@@ -22,6 +21,10 @@ function parseSkillFile( filePath: string ): Skill | null {
 
 	const userInvokable = /^user-invokable:\s*true\s*$/m.test( frontmatter );
 	return { name, description, body: body.trim(), userInvokable };
+}
+
+function parseSkillFile( filePath: string ): Skill | null {
+	return parseSkillContents( fs.readFileSync( filePath, 'utf-8' ) );
 }
 
 let cachedSkills: Skill[] | null = null;

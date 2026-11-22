@@ -114,7 +114,10 @@ function createTools(
 			textResult(
 				args.skill
 					? renderSkill( args.skill )
-					: buildSystemPrompt( { external: true, tools: [ ...definitions, designOptions ] } )
+					: buildSystemPrompt( {
+							external: true,
+							tools: [ ...definitions, designOptions ],
+					  } )
 			),
 		{ annotations: READ_ONLY }
 	);

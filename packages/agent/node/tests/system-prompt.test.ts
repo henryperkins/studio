@@ -123,6 +123,81 @@ describe( 'buildSystemPrompt', () => {
 		expect( textOnly ).not.toContain( 'Pair with take_screenshot' );
 	} );
 
+	describe( 'imagery guidance', () => {
+		const IMAGERY_ROUTING =
+			'and you can make images (generate_images, or an image tool of your own), load the `imagery` skill';
+
+		it( 'routes imagery to the imagery skill when generate_images is registered', () => {
+			const prompt = buildSystemPrompt( { tools: toolsFor( { imageGeneration: true } ) } );
+
+			expect( prompt ).toContain( '- generate_images:' );
+			expect( prompt ).toContain( IMAGERY_ROUTING );
+			expect( prompt ).not.toContain( 'cannot make images' );
+		} );
+
+		it( 'on the ChatGPT route, gives no image-generation guidance without the image service, only how to do without images', () => {
+			const prompt = buildSystemPrompt( {
+				tools: toolsFor( { imageGeneration: false } ),
+				chatGptRoute: true,
+			} );
+
+			expect( prompt ).not.toContain( 'generate_images' );
+			expect( prompt ).not.toContain( '`imagery` skill' );
+			expect( prompt ).toContain( 'You cannot make images in this conversation' );
+			expect( prompt ).toContain( 'never source images from web URLs' );
+			expect(
+				buildSystemPrompt( { tools: toolsFor( { imageGeneration: true } ), chatGptRoute: true } )
+			).toContain( IMAGERY_ROUTING );
+		} );
+
+		// Trunk's section before this branch (merge base 8672a64e7), byte for byte.
+		const TRUNK_SKILL_ROUTING = `## Skill routing
+
+When the request is to create, build, make, design, redesign, or rebuild a site, load the \`build-site\` skill first — it starts by picking or creating the site — and follow it to the end, even when the prompt already answers its questions. Any other work on an existing local site — answering questions about it, adding a page or section, adjusting styles, plugin work — loads the \`edit-manage-site\` skill first.
+
+For any site creation, redesign, landing page, homepage, layout, style, CSS, typography, color, or motion work, load the \`visual-design\` skill before writing design files or block markup.
+
+For any page/post content, template or template-part content, change to an existing theme's files, block markup, block-theme layout, full-width section, or \`core/html\` use, load the \`block-content\` skill before writing markup or validating block content. For long CSS or page-content files (>~200 lines), use its skeleton-first recipes instead of writing the full payload at once.
+
+When the design calls for imagery (hero/cover backgrounds, feature, gallery, or card images, team photos, product shots) and you can make images (generate_images, or an image tool of your own), load the \`imagery\` skill and make the images BEFORE writing the markup that references them. Never source images from web URLs and never leave a broken image reference — if an image cannot be generated, adapt the layout instead.
+
+For verifying and polishing a built or redesigned site — checking the rendered result against intent and diagnosing layout/width, spacing, button, background, or hover issues — load the \`visual-polish\` skill and use \`inspect_design\` to root-cause from the rendered DOM before fixing.
+
+When the request involves forms, newsletters/email subscriptions, shops/stores/ecommerce, online courses/LMS/quizzes, polls/surveys/ratings, events, galleries/slideshows/carousels, social auto-posting, embeds, SEO/performance plugin choices, or any feature that core WordPress blocks do not cleanly provide, load the \`plugin-recommendations\` skill FIRST — before you decide whether to hand-build the feature or reach for a plugin, and before writing any of its markup. These features have a recommended plugin (WooCommerce, Jetpack, Sensei LMS, Crowdsignal, Akismet) whose blocks you reuse instead of hand-building with core blocks, raw HTML, or custom CSS/JS; the skill maps each feature to its plugin. Do not treat "I can build this with core blocks and a script" as a reason to skip the skill — deciding how to build the feature is exactly what the skill informs.`;
+
+		it.each( [
+			[ 'with a WordPress.com login (the image service)', { imageGeneration: true }, {} ],
+			[ 'on an API key without a WordPress.com login', { imageGeneration: false }, {} ],
+			[ 'for an MCP client', { imageGeneration: false }, { external: true } ],
+		] as const )(
+			'off the ChatGPT route, %s, is trunk’s prompt: its skill routing byte for byte, whatever image tool there is',
+			( _context, toolOptions, promptOptions ) => {
+				const tools = toolsFor( toolOptions );
+				const prompt = buildSystemPrompt( { ...promptOptions, tools } );
+
+				expect( prompt ).toContain( `\n\n${ TRUNK_SKILL_ROUTING }\n` );
+				expect( prompt ).not.toContain( 'cannot make images' );
+				// The image service changes nothing but the tool list, as on trunk.
+				const withService = buildSystemPrompt( {
+					...promptOptions,
+					tools: toolsFor( { ...toolOptions, imageGeneration: true } ),
+				} );
+				const serviceLine = withService
+					.split( '\n' )
+					.find( ( line ) => line.startsWith( '- generate_images:' ) );
+				expect( serviceLine ).toBeDefined();
+				expect( withService.split( `${ serviceLine }\n` ).join( '' ) ).toBe(
+					tools.some( ( tool ) => tool.name === 'generate_images' )
+						? buildSystemPrompt( {
+								...promptOptions,
+								tools: tools.filter( ( tool ) => tool.name !== 'generate_images' ),
+						  } )
+						: prompt
+				);
+			}
+		);
+	} );
+
 	it( 'lists refresh_browser only when a Studio UI is attached', () => {
 		const ui = { showArtifact: () => {}, reloadPreview: () => {} };
 		expect( buildSystemPrompt( { tools: toolsFor( {}, { ...createFakeHost(), ui } ) } ) ).toContain(

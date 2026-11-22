@@ -299,6 +299,11 @@ export function resolveOpenAiSessionSelection(
 		}
 		if ( isStudioCustomEntryOfType( entry, 'studio.session_context' ) ) {
 			const data = entry.data;
+			// A ChatGPT record names its own connection's model and effort:
+			// never the OpenAI API selection, even for the same slug.
+			if ( data?.provider === 'chatgpt-oauth' ) {
+				continue;
+			}
 			if ( model === undefined && typeof data?.model === 'string' ) {
 				model = data.model;
 			}

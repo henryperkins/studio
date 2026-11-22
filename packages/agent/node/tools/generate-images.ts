@@ -7,7 +7,7 @@ import {
 	type GenerateImageResult,
 	IMAGE_ASPECT_RATIOS,
 	IMAGE_STYLES,
-	isImageGenerationAvailable,
+	resolveImageService,
 } from '@studio/agent/node/image-generation';
 import { defineTool, REMOTE_CHANGE } from './define-tool';
 import { runWpCli, textResult } from './utils';
@@ -142,7 +142,8 @@ export const generateImagesTool = defineTool(
 		),
 	},
 	async ( args, { host } ) => {
-		if ( ! ( await isImageGenerationAvailable() ) ) {
+		const imageService = await resolveImageService();
+		if ( ! imageService ) {
 			throw new Error(
 				'Image generation is not available in this session. Build the site without generated imagery.'
 			);
@@ -186,7 +187,7 @@ export const generateImagesTool = defineTool(
 			aspectRatio: image.aspectRatio,
 		} ) );
 
-		const generation = generateImages( host.userAgent, requests )
+		const generation = generateImages( host.userAgent, imageService.token, requests )
 			.catch( ( error ): GenerateImageResult[] =>
 				requests.map( () => ( { ok: false, error: String( error ) } ) )
 			)
@@ -239,6 +240,7 @@ export const generateImagesTool = defineTool(
 				].join( '\n' )
 			),
 			pending: generation,
+			studioService: { service: imageService.use.service, credential: imageService.use.credential },
 		};
 	},
 	{

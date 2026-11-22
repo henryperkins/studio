@@ -11,6 +11,7 @@ import {
 	type ComponentProps,
 } from 'react';
 import { getToolDisplay } from '@/features/chats/session-view/conversation/trace/tool-display';
+import { describeImageServiceUse } from '@/features/image-service';
 import { ChevronDownIcon, CircleCheckIcon } from '@/lib/icons';
 import { Button, CodeBlock, CollapsiblePanel, Spinner } from '@/lib/ui';
 import styles from './style.module.css';
@@ -43,7 +44,8 @@ export const ToolUseRow = memo( function ToolUseRow( {
 	const hasOutput = resultText.length > 0;
 	const hasInput = display.inputText.length > 0;
 	const hasDiff = Boolean( result?.diff );
-	const hasExpandableDetails = hasInput || hasOutput || hasDiff;
+	const imageService = result?.imageService;
+	const hasExpandableDetails = hasInput || hasOutput || hasDiff || Boolean( imageService );
 	const [ toggledOpen, setToggledOpen ] = useState< boolean | null >( null );
 	const expanded = toggledOpen ?? result?.isError === true;
 	const running = isRunning && ! result;
@@ -87,6 +89,9 @@ export const ToolUseRow = memo( function ToolUseRow( {
 						/>
 					) : null }
 					{ hasOutput ? <pre className={ styles.toolOutput }>{ resultText }</pre> : null }
+					{ imageService ? (
+						<p className={ styles.toolService }>{ describeImageServiceUse( imageService ) }</p>
+					) : null }
 					{ hasDiff ? (
 						<CodeBlock
 							className={ styles.toolCode }

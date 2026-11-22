@@ -26,13 +26,16 @@
 				"proxy-daemon.ts",
 				"logger.ts",
 				"ai/eval-runner-entry.ts",
+				"ai/chatgpt-acceptance-entry.ts",
+				"ai/chatgpt-acceptance-observer.ts",
+				"ai/chatgpt-acceptance-tool-images.ts",
 				"commands/**/*.ts",
 				"vite.config.*.ts"
 			],
 			"project": "**/*.ts"
 		},
 		"apps/ui": {
-			"entry": ["src/main.local.tsx", "src/dev/{chat,animation,annotate-tip,update-preview,email-preview,sidebar-preview}.tsx"],
+			"entry": ["src/main.local.tsx", "src/dev/{chat,animation,annotate-tip,update-preview,email-preview,sidebar-preview,image-service-preview}.tsx"],
 			"project": "src/**/*.{ts,tsx}"
 		},
 		"apps/local": {

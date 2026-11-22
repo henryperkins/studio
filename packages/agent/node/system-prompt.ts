@@ -21,6 +21,9 @@ export interface BuildSystemPromptOptions {
 	// Another agent (Codex, Claude Code, …) drives the Studio tools over MCP,
 	// with its own file tools and conversation.
 	external?: boolean;
+	// The conversation runs on the ChatGPT route, where the prompt says when
+	// no image tool is available. Every other prompt is as it was before it.
+	chatGptRoute?: boolean;
 	// The site this turn works on. The prompt is rebuilt every turn, so this
 	// always reflects the current site, also after compaction.
 	activeSite?: SiteInfo | null;
@@ -30,6 +33,12 @@ export function buildSystemPrompt( options: BuildSystemPromptOptions = {} ): str
 	const intro = options.external
 		? EXTERNAL_INTRO
 		: `${ AGENT_IDENTITY } You manage and modify local WordPress sites and the user's WordPress.com sites using your Studio tools, and generate content for these sites.`;
+	// generate_images is registered only with Studio's image service. On the
+	// ChatGPT route its guidance follows the tool rather than being stated to a
+	// model that can't act on it.
+	const imageryRouting =
+		! options.chatGptRoute ||
+		( options.tools ?? [] ).some( ( tool ) => tool.name === 'generate_images' );
 
 	return `${ intro }
 
@@ -44,9 +53,9 @@ ${ options.external ? '' : `${ WORKING_CADENCE }\n\n` }${ renderToolSections(
 		options.tools ?? []
 	) }
 
-${ SKILL_ROUTING }${ buildActiveSiteSection( options.activeSite ) }${ buildUserInstructionsSection(
-		options.userInstructions
-	) }
+${ buildSkillRouting( imageryRouting ) }${ buildActiveSiteSection(
+		options.activeSite
+	) }${ buildUserInstructionsSection( options.userInstructions ) }
 `;
 }
 
@@ -104,7 +113,8 @@ const WORKING_CADENCE = `## Working cadence
 
 - One file per turn: a single \`Write\`, or a single \`Edit\` call (read-only \`site_info\`, \`site_list\`, \`wp_cli\` queries may be combined). Short prose between tools — no long design-plan essays. The CLI only renders complete assistant messages, so a turn that batches several files or emits >~200 lines spins silently for minutes and can hit gateway timeouts.`;
 
-const SKILL_ROUTING = `## Skill routing
+function buildSkillRouting( imageryRouting: boolean ): string {
+	return `## Skill routing
 
 When the request is to create, build, make, design, redesign, or rebuild a site, load the \`build-site\` skill first — it starts by picking or creating the site — and follow it to the end, even when the prompt already answers its questions. Any other work on an existing local site — answering questions about it, adding a page or section, adjusting styles, plugin work — loads the \`edit-manage-site\` skill first.
 
@@ -112,8 +122,15 @@ For any site creation, redesign, landing page, homepage, layout, style, CSS, typ
 
 For any page/post content, template or template-part content, change to an existing theme's files, block markup, block-theme layout, full-width section, or \`core/html\` use, load the \`block-content\` skill before writing markup or validating block content. For long CSS or page-content files (>~200 lines), use its skeleton-first recipes instead of writing the full payload at once.
 
-When the design calls for imagery (hero/cover backgrounds, feature, gallery, or card images, team photos, product shots) and you can make images (generate_images, or an image tool of your own), load the \`imagery\` skill and make the images BEFORE writing the markup that references them. Never source images from web URLs and never leave a broken image reference — if an image cannot be generated, adapt the layout instead.
+${ imageryRouting ? IMAGERY_ROUTING : NO_IMAGES }
 
-For verifying and polishing a built or redesigned site — checking the rendered result against intent and diagnosing layout/width, spacing, button, background, or hover issues — load the \`visual-polish\` skill and use \`inspect_design\` to root-cause from the rendered DOM before fixing.
+${ SKILL_ROUTING_REST }`;
+}
+
+const IMAGERY_ROUTING = `When the design calls for imagery (hero/cover backgrounds, feature, gallery, or card images, team photos, product shots) and you can make images (generate_images, or an image tool of your own), load the \`imagery\` skill and make the images BEFORE writing the markup that references them. Never source images from web URLs and never leave a broken image reference — if an image cannot be generated, adapt the layout instead.`;
+
+const NO_IMAGES = `You cannot make images in this conversation: no image tool is available. When the design calls for imagery, never source images from web URLs and never leave a broken image reference — adapt the layout instead. If the user asks for generated images, tell them Studio makes them with its WordPress.com image service, which needs a WordPress.com login in Studio.`;
+
+const SKILL_ROUTING_REST = `For verifying and polishing a built or redesigned site — checking the rendered result against intent and diagnosing layout/width, spacing, button, background, or hover issues — load the \`visual-polish\` skill and use \`inspect_design\` to root-cause from the rendered DOM before fixing.
 
 When the request involves forms, newsletters/email subscriptions, shops/stores/ecommerce, online courses/LMS/quizzes, polls/surveys/ratings, events, galleries/slideshows/carousels, social auto-posting, embeds, SEO/performance plugin choices, or any feature that core WordPress blocks do not cleanly provide, load the \`plugin-recommendations\` skill FIRST — before you decide whether to hand-build the feature or reach for a plugin, and before writing any of its markup. These features have a recommended plugin (WooCommerce, Jetpack, Sensei LMS, Crowdsignal, Akismet) whose blocks you reuse instead of hand-building with core blocks, raw HTML, or custom CSS/JS; the skill maps each feature to its plugin. Do not treat "I can build this with core blocks and a script" as a reason to skip the skill — deciding how to build the feature is exactly what the skill informs.`;

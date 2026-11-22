@@ -1,5 +1,6 @@
 import { useQueryClient } from '@tanstack/react-query';
 import { useRouter } from '@tanstack/react-router';
+import { __ } from '@wordpress/i18n';
 import { useCallback } from 'react';
 import { useAgentRunStore } from '@/data/agent-runs/context';
 import { toast } from '@/data/app-messages';
@@ -15,7 +16,7 @@ export function useSendSiteDraft( siteId: string | undefined ) {
 	const queryClient = useQueryClient();
 	const router = useRouter();
 	const { startRun } = useAgentRunStore();
-	const { draft, update } = useSiteChatDraft( siteId );
+	const { draft, update, current } = useSiteChatDraft( siteId );
 	return useCallback(
 		async (
 			prompt: string,
@@ -26,6 +27,15 @@ export function useSendSiteDraft( siteId: string | undefined ) {
 			openAiSelection?: OpenAiSessionSelection
 		) => {
 			if ( ! siteId ) return;
+			// Every send from the site's new chat comes here: while the chat starts on
+			// a ChatGPT account, none leaves on the provider it had.
+			if ( current().startingChatGpt ) {
+				const message = __(
+					'This wasn’t sent while the chat starts on ChatGPT. Send it again once it has started.'
+				);
+				toast.error( message );
+				throw new Error( message );
+			}
 			const pathname = router.state.location.pathname;
 			update( { pendingPrompt: options?.displayMessage ?? prompt } );
 			try {
@@ -47,13 +57,13 @@ export function useSendSiteDraft( siteId: string | undefined ) {
 				}
 				const { id: sessionId } = session.summary;
 				await startRun( sessionId, prompt, options );
-				const current = queryClient.getQueryData< LoadedAiSession >( [
+				const cached = queryClient.getQueryData< LoadedAiSession >( [
 					...SESSIONS_QUERY_KEY,
 					sessionId,
 				] )?.summary;
 				primeSessionQueryData( queryClient, {
-					...( current ?? session.summary ),
-					firstPrompt: current?.firstPrompt || options?.displayMessage || prompt,
+					...( cached ?? session.summary ),
+					firstPrompt: cached?.firstPrompt || options?.displayMessage || prompt,
 					updatedAt: new Date().toISOString(),
 				} );
 				if ( router.state.location.pathname === pathname ) {
@@ -66,6 +76,7 @@ export function useSendSiteDraft( siteId: string | undefined ) {
 		},
 		[
 			connector,
+			current,
 			draft.activeEnvironment,
 			draft.sessionId,
 			queryClient,

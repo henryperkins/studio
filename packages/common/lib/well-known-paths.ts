@@ -9,6 +9,11 @@ export function getConfigDirectory(): string {
 	if ( process.env.E2E && process.env.E2E_SHARED_CONFIG_PATH ) {
 		return process.env.E2E_SHARED_CONFIG_PATH;
 	}
+	return getDefaultConfigDirectory();
+}
+
+/** The config directory when no development or test override is in effect. */
+export function getDefaultConfigDirectory(): string {
 	return path.join( os.homedir(), '.studio' );
 }
 

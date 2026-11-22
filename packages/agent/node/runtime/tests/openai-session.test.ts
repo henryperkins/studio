@@ -155,6 +155,40 @@ type RequestBody = Record< string, unknown > & {
 	reasoning?: Record< string, unknown >;
 };
 
+const TINY_PNG_BASE64 =
+	'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+// Asks generate_images for one image at `file`.
+const generateCallReply = ( file: string ) => {
+	const call = {
+		type: 'function_call',
+		id: 'fc_generate',
+		call_id: 'call_generate_1',
+		name: 'generate_images',
+		arguments: JSON.stringify( { images: [ { path: file, subject: 'A loaf on a board.' } ] } ),
+		status: 'completed',
+	};
+	return sse( [
+		{ type: 'response.created', response: { id: 'resp_g', status: 'in_progress', output: [] } },
+		{
+			type: 'response.output_item.added',
+			output_index: 0,
+			item: { ...call, arguments: '', status: 'in_progress' },
+		},
+		{
+			type: 'response.function_call_arguments.done',
+			output_index: 0,
+			item_id: call.id,
+			arguments: call.arguments,
+		},
+		{ type: 'response.output_item.done', output_index: 0, item: call },
+		{
+			type: 'response.completed',
+			response: { id: 'resp_g', status: 'completed', output: [ call ], usage: usage() },
+		},
+	] );
+};
+
 describe( 'an OpenAI conversation in a real agent session', () => {
 	let sitesRoot: string;
 	let sessionDir: string;
@@ -176,6 +210,10 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 		replyCount = 0;
 		vi.spyOn( globalThis, 'fetch' ).mockImplementation( async ( input, init ) => {
 			const url = input instanceof Request ? input.url : String( input );
+			// Studio's image service, for generate_images.
+			if ( url.endsWith( '/v1/images/generations' ) ) {
+				return new Response( JSON.stringify( { data: [ { b64_json: TINY_PNG_BASE64 } ] } ) );
+			}
 			if ( url !== RESPONSES_URL ) {
 				return new Response( null, { status: 404 } );
 			}
@@ -190,6 +228,7 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 
 	afterEach( () => {
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 		fs.rmSync( paths.root, { recursive: true, force: true } );
 	} );
 
@@ -225,6 +264,34 @@ describe( 'an OpenAI conversation in a real agent session', () => {
 
 	const itemsOfType = ( request: RequestBody, type: string ) =>
 		request.input.filter( ( item ) => item.type === type );
+
+	// Off a subscription route a generate_images result records nothing of the
+	// image service: its details are what trunk recorded, byte for byte.
+	it.each( [ '', '1' ] )(
+		'keeps a generate_images result’s details as trunk’s, with STUDIO_EXPERIMENTAL_CHATGPT=%j',
+		async ( flag ) => {
+			vi.stubEnv( 'STUDIO_EXPERIMENTAL_CHATGPT', flag );
+			vi.stubEnv( 'STUDIO_IMAGE_API_TOKEN', 'test-image-service-token' );
+			const hero = path.join( sitesRoot, 'bakery', 'wp-content', 'themes', 'b', 'hero.png' );
+			replies.push(
+				() => generateCallReply( hero ),
+				() => textReply( 'Done.' )
+			);
+
+			const turn = await runTurn( undefined, 'Add a hero image.', 'medium' );
+
+			expect( turn.error ).toBeUndefined();
+			const result = turn.entries
+				.map( ( entry ) => ( entry as { message?: Record< string, unknown > } ).message )
+				.find(
+					( message ) => message?.role === 'toolResult' && message.toolName === 'generate_images'
+				);
+			expect( result ).toBeDefined();
+			expect( JSON.stringify( result?.details ) ).toBe( '{}' );
+			expect( fs.readFileSync( turn.sessionFile, 'utf8' ) ).not.toContain( 'studioService' );
+			expect( fs.existsSync( hero ) ).toBe( true );
+		}
+	);
 
 	it( 'keeps reasoning, tool calls and settings straight across tool use, reopened sessions and compaction', async () => {
 		// Turn 1, Medium: the model reasons, reads a file, then answers.

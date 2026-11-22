@@ -1,8 +1,12 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { ANTHROPIC_MODELS } from '@earendil-works/pi-ai/providers/anthropic.models';
 import { ModelRegistry, SessionManager } from '@earendil-works/pi-coding-agent';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAgent } from '@studio/agent/node/agent';
 import { AI_MODELS } from '@studio/agent/protocol/models';
+import { OPENAI_MODEL_CAPABILITIES } from '@studio/agent/protocol/openai-models';
 import { createFakeHost } from '../../tests/fake-host';
 import type { AgentSessionEvent, CreateAgentSessionOptions } from '@earendil-works/pi-coding-agent';
 import type { StudioAgentTurnConfig } from '@studio/agent/node/runtime';
@@ -409,6 +413,67 @@ describe( 'pi runtime', () => {
 		expect( mocks.createdSessions[ 1 ].options.model?.input ).toEqual( [ 'text' ] );
 	} );
 
+	// The existing providers keep image generation exactly as it was: the tool
+	// and its guidance come with Studio's image service and leave with it.
+	describe.each( [
+		[ 'WordPress.com', { model: 'balanced', env: WPCOM_ENV } ],
+		[
+			'an Anthropic API key',
+			{ model: 'claude-sonnet-5', env: { ANTHROPIC_API_KEY: 'sk-ant-test' } },
+		],
+		[
+			'an OpenAI API key',
+			{
+				model: 'gpt-6.1-sol',
+				env: { STUDIO_OPENAI_API_KEY: 'sk-proj-TESTONLY_pi_runtime_dddddddddddddddddddd' },
+				openAi: {
+					model: 'gpt-6.1-sol',
+					apiModelId: OPENAI_MODEL_CAPABILITIES[ 'gpt-6.1-sol' ].apiModelId,
+					reasoningEffort: 'medium',
+					reasoningMode: 'standard',
+					maxOutputTokens: 32_000,
+				},
+			},
+		],
+	] as const )( 'image generation on %s', ( _name, turn ) => {
+		const run = async ( imageToken: string ) => {
+			// No WordPress.com login: the image service has only the token, if any.
+			const configDir = fs.mkdtempSync( path.join( os.tmpdir(), 'studio-pi-runtime-images-' ) );
+			vi.stubEnv( 'DEV_CONFIG_DIR', configDir );
+			vi.stubEnv( 'STUDIO_IMAGE_API_TOKEN', imageToken );
+			try {
+				await runRuntime( { prompt: 'hello', session: newSession(), ...turn } as never );
+			} finally {
+				vi.unstubAllEnvs();
+				fs.rmSync( configDir, { recursive: true, force: true } );
+			}
+			const { options } = mocks.createdSessions[ 0 ];
+			return {
+				tools: ( ( options.customTools ?? [] ) as Array< { name: string } > ).map(
+					( tool ) => tool.name
+				),
+				prompt: options.resourceLoader?.getSystemPrompt() ?? '',
+			};
+		};
+
+		it( 'offers generate_images and routes imagery to it with the image service', async () => {
+			const { tools, prompt } = await run( 'test-image-service-token' );
+
+			expect( tools ).toContain( 'generate_images' );
+			expect( prompt ).toContain( '- generate_images:' );
+			expect( prompt ).toContain( 'load the `imagery` skill and make the images' );
+		} );
+
+		it( 'leaves the tool out without it, with trunk’s guidance unchanged off the ChatGPT route', async () => {
+			const { tools, prompt } = await run( '' );
+
+			expect( tools ).not.toContain( 'generate_images' );
+			expect( prompt ).not.toContain( '- generate_images:' );
+			expect( prompt ).not.toContain( 'You cannot make images in this conversation' );
+			expect( prompt ).toContain( 'load the `imagery` skill and make the images' );
+		} );
+	} );
+
 	it( 'keeps take_screenshot for models that cannot see images, without the image', async () => {
 		await runRuntime( {
 			prompt: 'hello',
@@ -433,6 +498,8 @@ describe( 'pi runtime', () => {
 		expect( takeScreenshot( 0 )?.description ).toContain( 'analyze visually' );
 		expect( takeScreenshot( 1 )?.description ).toContain( 'This model cannot view images' );
 		expect( takeScreenshot( 1 )?.description ).not.toContain( 'analyze visually' );
+		// Only the ChatGPT route says its connection doesn't take tool images yet.
+		expect( takeScreenshot( 1 )?.description ).not.toContain( 'this connection' );
 	} );
 
 	it( 'rejects oversized direct Write, Edit, and Bash payloads', async () => {

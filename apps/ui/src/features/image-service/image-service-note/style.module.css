@@ -1,0 +1,5 @@
+.note {
+	color: var( --muted-foreground );
+	font-size: var( --text-xs );
+	overflow-wrap: anywhere;
+}

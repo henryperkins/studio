@@ -5,6 +5,7 @@ import {
 	stripMediaWidgetPayloadLines,
 	type StudioChatArtifactWidgetDraft,
 } from '@studio/agent/protocol/chat-artifacts';
+import { getToolResultImageService } from '@studio/agent/protocol/image-service';
 import {
 	isStudioCustomEntryOfType,
 	type StudioChatAttachmentSummary,
@@ -171,6 +172,7 @@ export function entriesToRenderItems( entries: SessionEntry[] ): RenderItem[] {
 			text: stripMediaWidgetPayloadLines( text ).replace( ANSI_STYLE_SEQUENCE, '' ),
 			isError: message.isError === true,
 			diff: message.isError === true ? undefined : getToolResultDiff( message.details ),
+			imageService: getToolResultImageService( message.details ),
 		} );
 	}
 

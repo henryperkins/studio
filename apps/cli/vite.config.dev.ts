@@ -11,6 +11,12 @@ export default mergeConfig(
 			lib: {
 				entry: {
 					'eval-runner': resolve( __dirname, 'ai/eval-runner-entry.ts' ),
+					'chatgpt-acceptance': resolve( __dirname, 'ai/chatgpt-acceptance-entry.ts' ),
+					'chatgpt-acceptance-observer': resolve( __dirname, 'ai/chatgpt-acceptance-observer.ts' ),
+					'chatgpt-acceptance-tool-images': resolve(
+						__dirname,
+						'ai/chatgpt-acceptance-tool-images.ts'
+					),
 				},
 			},
 		},

@@ -15,10 +15,9 @@ describe( 'wp-studio plugin skills', () => {
 			[ ...topLevel.map( ( skill ) => skill.name ), 'wordpress-studio' ].sort()
 		);
 		for ( const skill of topLevel ) {
-			const stub = fs.readFileSync(
-				path.join( pluginSkillsRoot, skill.name, 'SKILL.md' ),
-				'utf-8'
-			);
+			const stub = fs
+				.readFileSync( path.join( pluginSkillsRoot, skill.name, 'SKILL.md' ), 'utf-8' )
+				.replace( /\r\n/g, '\n' );
 			expect( stub ).toContain( `\nname: ${ skill.name }\n` );
 			expect( stub ).toContain( `\ndescription: ${ skill.description }\n` );
 			expect( stub ).toContain( `\`skill: "${ skill.name }"\`` );

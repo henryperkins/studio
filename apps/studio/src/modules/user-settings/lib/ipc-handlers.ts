@@ -1,8 +1,18 @@
 import { IpcMainInvokeEvent, nativeTheme, shell } from 'electron';
 import {
+	disconnectChatGpt,
+	finishChatGptSignIn,
+	readChatGptModels,
+	readChatGptSettings,
+	recheckChatGptSettings as recheckChatGptSettingsInHost,
+	startChatGptSignIn,
+	stopChatGptSignIn,
+} from '@studio/agent/node/chatgpt/settings';
+import {
 	readGlobalInstructionsFile,
 	writeGlobalInstructions,
 } from '@studio/agent/node/global-instructions';
+import { readImageServiceState } from '@studio/agent/node/image-generation';
 import {
 	readAiSettings,
 	refreshOpenAiModels as refreshOpenAiModelsInConfig,
@@ -133,6 +143,46 @@ export async function getGlobalAgentInstructions(): Promise< string > {
 
 export async function getAiSettings() {
 	return readAiSettings();
+}
+
+export async function getChatGptSettings() {
+	return readChatGptSettings();
+}
+
+export async function recheckChatGptSettings() {
+	return recheckChatGptSettingsInHost();
+}
+
+export async function getImageServiceState() {
+	return readImageServiceState();
+}
+
+export async function beginChatGptSignIn(
+	_event: IpcMainInvokeEvent,
+	registrationId?: unknown,
+	options?: unknown
+) {
+	return startChatGptSignIn( registrationId, options );
+}
+
+export async function waitForChatGptSignIn( _event: IpcMainInvokeEvent, attemptId: unknown ) {
+	return finishChatGptSignIn( attemptId );
+}
+
+export async function cancelChatGptSignIn( _event: IpcMainInvokeEvent, attemptId: unknown ) {
+	return stopChatGptSignIn( attemptId );
+}
+
+export async function signOutChatGpt( _event: IpcMainInvokeEvent, connectionId: unknown ) {
+	return disconnectChatGpt( connectionId );
+}
+
+export async function getChatGptModels(
+	_event: IpcMainInvokeEvent,
+	connectionId: unknown,
+	revision: unknown
+) {
+	return readChatGptModels( connectionId, revision );
 }
 
 // One event for both handlers: clearing the key also moves the provider back to WordPress.com.

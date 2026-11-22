@@ -2,6 +2,7 @@ import { Type, type Static, type TObject, type TProperties } from 'typebox';
 import type { AgentTool, AgentToolUpdateCallback } from '@earendil-works/pi-agent-core';
 import type { StudioAgentHost } from '@studio/agent/node/host';
 import type { StudioChatArtifactWidgetDraft } from '@studio/agent/protocol/chat-artifacts';
+import type { ImageServiceRecord } from '@studio/agent/protocol/image-service';
 import type { StudioToolProgressUpdate } from '@studio/agent/protocol/tool-progress';
 
 /**
@@ -34,11 +35,17 @@ export interface ToolResult {
 	// report for the agent. A runtime that cannot wait for it later awaits it
 	// before answering.
 	pending?: Promise< string | undefined >;
+	// The separately signed-in Studio service that did the work, and how Studio
+	// signed in to it, never the account. Kept with the result, on a
+	// subscription plan's route only, for Studio to show like the artifacts:
+	// never sent to the model, nor to an MCP client.
+	studioService?: ImageServiceRecord;
 }
 
 export interface StudioToolResultDetails {
 	studioArtifacts?: StudioChatArtifactWidgetDraft[];
 	pending?: Promise< string | undefined >;
+	studioService?: ImageServiceRecord;
 }
 
 export interface ToolContext {
@@ -182,8 +189,12 @@ export function bindTool< TProps extends TProperties >(
 			};
 			const result = await handler( params as never, context );
 			const details: StudioToolResultDetails | undefined =
-				result.studioArtifacts?.length || result.pending
-					? { studioArtifacts: result.studioArtifacts, pending: result.pending }
+				result.studioArtifacts?.length || result.pending || result.studioService
+					? {
+							studioArtifacts: result.studioArtifacts,
+							pending: result.pending,
+							...( result.studioService ? { studioService: result.studioService } : {} ),
+					  }
 					: undefined;
 			return { content: result.content, details };
 		},

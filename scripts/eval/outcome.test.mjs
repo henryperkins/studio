@@ -1,13 +1,17 @@
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, test } from 'vitest';
+import { afterAll, describe, expect, test } from 'vitest';
 import { parse } from 'yaml';
+import { findUnsafeRecord, openAcceptanceEvidence } from '../../apps/cli/ai/acceptance-evidence.ts';
+import { writeEvalCaseSummary } from '../../apps/cli/ai/eval-summary.ts';
 import * as checks from './outcome.mjs';
 
 // Each check reads the runner's result file named on stdout, as promptfoo
 // hands it over. These results carry only the fields a check reads.
 const dir = mkdtempSync( path.join( tmpdir(), 'studio-eval-outcome-test-' ) );
+afterAll( () => rmSync( dir, { recursive: true, force: true } ) );
 let count = 0;
 function run( check, result, vars = {} ) {
 	const file = path.join( dir, `result-${ count++ }.json` );
@@ -73,6 +77,555 @@ test( 'the config only names existing checks', () => {
 
 test( 'a missing result file fails instead of throwing', () => {
 	expect( checks.siteWorks( 'no marker here', { vars: {} } ).pass ).toBe( false );
+} );
+
+test( 'every check reports a case the runner blocked as BLOCKED with its code, never as passed', () => {
+	const blocked = {
+		success: false,
+		error: 'not run',
+		blocked: { code: 'tool-images-not-qualified', message: 'not run' },
+		providerRoute: {
+			requested: { kind: 'chatgpt-oauth' },
+			blocked: { code: 'tool-images-not-qualified', message: 'not run' },
+		},
+	};
+	const names = Object.keys( checks ).filter( ( name ) => typeof checks[ name ] === 'function' );
+	expect( names.length ).toBeGreaterThan( 20 );
+	for ( const name of names ) {
+		expect( run( checks[ name ], blocked, { requireProvider: true } ), name ).toMatchObject( {
+			pass: false,
+			reason: expect.stringMatching( /^BLOCKED \(tool-images-not-qualified\): / ),
+		} );
+	}
+} );
+
+// A provider-qualified case's reasons hold no account, address, site id or
+// path, whatever the run produced: every check of every parity case, run on a
+// result whose every free-text field carries them.
+describe( 'reasons of a provider-qualified case', () => {
+	const NAME = 'Jordan Q. Example';
+	const EMAIL = 'jordan.example@example.org';
+	const SITE_URL = 'https://jordans-site.wordpress.com';
+	const SITE_ID = '987654';
+	const HOME = 'C:\\Users\\jordan\\Studio\\parity';
+	const POSIX_HOME = '/Users/jordan/Studio/parity';
+	const leak = `${ NAME } <${ EMAIL }> at ${ SITE_URL } (site ${ SITE_ID }) in ${ HOME } and ${ POSIX_HOME }`;
+	const seeded = {
+		providerRoute: {
+			requested: {
+				kind: 'chatgpt-oauth',
+				backend: 'chatgpt-route',
+				subscription: true,
+				connectionRef: 'conn-0123456789ab',
+				model: 'gpt-6-luna',
+				wireModel: 'gpt-6-luna',
+				effort: 'medium',
+			},
+			executed: {
+				kind: 'chatgpt-oauth',
+				backend: 'chatgpt-route',
+				connectionRef: 'conn-0123456789ab',
+				modelRequests: 2,
+				apiKeyBearers: 0,
+				imageServiceRequests: 1,
+				models: [ 'gpt-6-luna' ],
+				efforts: [ 'medium' ],
+				replyKinds: [ 'chatgpt-oauth' ],
+				replyModels: [ 'gpt-6-luna' ],
+				connectionMatchesBearer: true,
+				requests: [ { imageInputs: 1, turn: 0 } ],
+			},
+		},
+		success: false,
+		error: leak,
+		errorMessage: leak,
+		stopReason: 'error',
+		textSegments: [ leak, `${ leak }?` ],
+		questions: [ { question: leak, options: [ leak, 'Second' ], answer: leak } ],
+		toolCalls: [
+			{ id: 'c0', name: 'site_push', input: { remoteSite: SITE_URL } },
+			{ id: 'c1', name: 'Skill', input: { name: leak } },
+			{ id: 'c2', name: 'send_feedback', input: { message: leak } },
+		],
+		toolResults: [
+			{ toolUseId: 'c0', toolName: 'site_push', isError: false, text: leak },
+			{
+				toolUseId: 'c3',
+				toolName: 'generate_images',
+				isError: false,
+				details: {
+					studioService: {
+						service: 'wordpress-com',
+						credential: 'wordpress-com-login',
+						account: { displayName: NAME, email: EMAIL },
+					},
+				},
+			},
+		],
+		inspections: [ { args: [], exitCode: 0, stdout: leak } ],
+		remoteCalls: [ { operation: 'push', site: NAME, target: SITE_URL, options: 'all' } ],
+		remoteGuard: { code: null, blocked: [] },
+		uiEvents: { artifacts: [ { id: leak, widgets: [ 'gallery' ] } ], previewReloads: 0 },
+		imageService: { configured: true },
+		turns: [
+			{ reopened: false, toolCallsStart: 0, textSegmentsStart: 0, questionsStart: 0 },
+			{ reopened: true, toolCallsStart: 1, textSegmentsStart: 1, questionsStart: 1 },
+		],
+		stoppedAt: { toolName: 'wp_cli', index: 0 },
+		compactions: 0,
+		outcome: {
+			sites: [
+				{
+					name: NAME,
+					url: SITE_URL,
+					created: true,
+					theme: { stylesheet: leak },
+					themeFiles: { 'style.css': leak },
+					home: { status: 500, error: leak, phpErrors: [ leak ], navHrefs: [ SITE_URL ], ids: [] },
+					invalidBlocks: [ { type: 'page', slug: leak, blocks: [ leak ] } ],
+					designMd: leak,
+					palette: [],
+					content: [],
+				},
+			],
+			otherSitesChanged: [ NAME ],
+			otherSitesRemoved: [ SITE_URL ],
+			requestSiteChanged: true,
+		},
+	};
+	const parity = parse(
+		readFileSync( new URL( './subscription-parity.config.yaml', import.meta.url ), 'utf8' )
+	);
+	const named = ( assertions = [] ) =>
+		assertions.map( ( { value } ) => value.match( /^file:\/\/outcome\.mjs:(\w+)$/ )[ 1 ] );
+	const cases = parity.tests.map( ( test ) => ( {
+		vars: { ...parity.defaultTest.vars, ...test.vars },
+		names: [ ...named( parity.defaultTest.assert ), ...named( test.assert ) ],
+	} ) );
+	const leaked = ( reason ) =>
+		[ NAME, EMAIL, 'jordans-site', SITE_ID, 'jordan', 'Users', 'example.org' ].filter( ( value ) =>
+			reason.toLowerCase().includes( value.toLowerCase() )
+		);
+
+	test.each( cases.map( ( { vars, names } ) => [ vars.caseId, vars, names ] ) )(
+		'%s: no reason names the account, an address, a site id or a path',
+		( _caseId, vars, names ) => {
+			for ( const name of names ) {
+				for ( const variant of [
+					seeded,
+					{ ...seeded, success: true, outcome: { ...seeded.outcome, sites: [] } },
+				] ) {
+					const { reason } = run( checks[ name ], variant, vars );
+					expect( leaked( reason ), `${ name }: ${ reason }` ).toEqual( [] );
+				}
+			}
+		}
+	);
+
+	// The main suite's checks, run with a provider selected, on results whose
+	// every value the run produced is a word nothing else would withhold: a
+	// name, a page title, a theme or a class the model wrote.
+	const MARK = 'quillonbarrowmere';
+	const mainSuite = parse(
+		readFileSync( new URL( './promptfoo.config.yaml', import.meta.url ), 'utf8' )
+	);
+	const outcomeChecks = ( assertions = [] ) =>
+		assertions
+			.map( ( { value } ) => String( value ).match( /^file:\/\/outcome\.mjs:(\w+)$/ )?.[ 1 ] )
+			.filter( Boolean );
+	const mainCases = mainSuite.tests
+		.map( ( test ) => ( { vars: test.vars, names: outcomeChecks( test.assert ) } ) )
+		.filter( ( { names } ) => names.length );
+	const markedSite = ( vars, overrides = {} ) => ( {
+		name: vars.siteName ?? MARK,
+		url: MARK,
+		created: true,
+		showOnFront: MARK,
+		theme: { stylesheet: MARK, template: vars.parentTheme ?? MARK },
+		themeChanges: [ `${ MARK }.css`, `${ MARK }.json` ],
+		parentThemeChanges: [ `${ MARK }.php` ],
+		themeFiles: {
+			'style.css': `.${ MARK } { display: inline-block; color: #${ 'a1b2c3' } }`,
+			'theme.json': JSON.stringify( {
+				settings: { typography: { fontFamilies: [ { src: [ `file:./${ MARK }.woff2` ] } ] } },
+			} ),
+			[ `${ MARK }.css` ]: `.x { color: #123abc } /* ${ MARK } */`,
+		},
+		themeFileList: [],
+		themeScreenshot: MARK,
+		home: {
+			status: 200,
+			phpErrors: [],
+			navHrefs: [ `#${ MARK }`, `/#${ MARK }`, `/#${ MARK }-two` ],
+			ids: [],
+		},
+		invalidBlocks: [],
+		designMd: `primary: "#a1b2c3"\n${ MARK }: #abcdef`,
+		palette: [],
+		plugins: [ MARK ],
+		products: 0,
+		blockStyles: { 'core/group': [ MARK ] },
+		mergedStyles: { elements: { heading: { typography: { fontFamily: MARK } } } },
+		userGlobalStyles: { styles: { elements: { heading: { typography: { fontFamily: MARK } } } } },
+		customCss: `.${ MARK } { display: inline }`,
+		content: [
+			{
+				type: 'page',
+				isFront: true,
+				title: MARK,
+				blocks: { [ `${ MARK }/block` ]: 2, [ `${ vars.blockPrefix ?? 'core/' }${ MARK }` ]: 1 },
+				content: `<!-- wp:group {"className":"${ MARK }","backgroundColor":"${ MARK }"} --><div class="is-style-${ MARK }"></div><div class="is-style-${ MARK }"></div> "fontSize":"1${ MARK }" "fontSize":"1${ MARK }" "fontSize":"1${ MARK }" #a1b2c3`,
+			},
+		],
+		...overrides,
+	} );
+	// Each result reaches other branches: what fails first, and what passes.
+	const markedResults = ( vars ) => {
+		const site = markedSite( vars );
+		const base = {
+			providerRoute: seeded.providerRoute,
+			success: true,
+			textSegments: [ MARK, `${ MARK }?` ],
+			questions: [ { question: MARK, options: [ MARK, MARK ], answer: MARK } ],
+			toolCalls: [ { id: 'c0', name: MARK, input: { name: MARK } } ],
+			toolResults: [ { toolUseId: 'c0', toolName: 'take_screenshot', isError: false, text: MARK } ],
+			toolEvents: [ { toolName: MARK, input: { message: MARK }, durationMs: 1 } ],
+			turnDurationsMs: [ 1 ],
+			stoppedAt: { toolName: MARK, index: 1 },
+			inspections: [ { args: [], exitCode: 0, stdout: MARK } ],
+		};
+		const outcome = ( sites ) => ( {
+			sites,
+			otherSitesChanged: [ MARK ],
+			otherSitesRemoved: [ MARK ],
+			requestSiteChanged: true,
+		} );
+		const passing = markedSite( vars, {
+			showOnFront: 'page',
+			themeChanges: null,
+			themeFileList: [ `${ MARK }.woff2` ],
+			themeScreenshot: `jpeg:${ MARK }`,
+			parentThemeChanges: [],
+			theme: { stylesheet: MARK, template: vars.parentTheme ?? MARK },
+			designMd: `${ vars.token ?? 'primary' }: "#a1b2c3"`,
+			palette: [ { color: '#a1b2c3' } ],
+			plugins: [ vars.plugin ?? MARK, 'woocommerce' ],
+			products: 2,
+			home: {
+				status: 200,
+				phpErrors: [],
+				navHrefs: [ `/#${ MARK }`, `/#${ MARK }-two` ],
+				ids: [ MARK, `${ MARK }-two` ],
+			},
+		} );
+		return [
+			{ ...base, outcome: outcome( [ site ] ) },
+			{
+				...base,
+				outcome: outcome( [ { ...site, home: { ...site.home, status: 500, error: MARK } } ] ),
+			},
+			{ ...base, outcome: outcome( [ passing ] ), textSegments: [ `WordPress Studio ${ MARK }` ] },
+			{ ...base, outcome: outcome( [] ) },
+		];
+	};
+
+	test.each( mainCases.map( ( { vars, names } ) => [ vars.caseId, vars, names ] ) )(
+		'main suite, %s: with a provider selected, no reason names what the run wrote',
+		( _caseId, vars, names ) => {
+			for ( const name of names ) {
+				for ( const result of markedResults( vars ) ) {
+					const { reason } = run( checks[ name ], result, { ...vars, provider: 'chatgpt-oauth' } );
+					expect( reason, `${ name }: ${ reason }` ).not.toContain( MARK );
+				}
+			}
+		}
+	);
+
+	test( 'a selection made only in the environment counts too, even when the result can’t be loaded', () => {
+		const saved = process.env.STUDIO_EVAL_PROVIDER;
+		process.env.STUDIO_EVAL_PROVIDER = 'chatgpt-oauth';
+		try {
+			const missing = checks.siteWorks(
+				`EVAL_RUNNER_RESULT_FILE=${ path.join( dir, 'jordan-no-such-result.json' ) }`,
+				{ vars: {} }
+			);
+			expect( missing.pass ).toBe( false );
+			expect( missing.reason ).toMatch( /reason withheld: it held what looked like a local path/ );
+			expect( missing.reason ).not.toContain( 'jordan' );
+			const { reason } = run(
+				checks.replyIncludes,
+				{ textSegments: [ NAME ] },
+				{ expectedText: 'X' }
+			);
+			expect( reason ).not.toContain( NAME );
+		} finally {
+			if ( saved === undefined ) {
+				delete process.env.STUDIO_EVAL_PROVIDER;
+			} else {
+				process.env.STUDIO_EVAL_PROVIDER = saved;
+			}
+		}
+	} );
+
+	test( 'a run’s output is still quoted in the reasons of a case that selects no provider', () => {
+		const { reason } = run(
+			checks.replyIncludes,
+			{ ...seeded, providerRoute: undefined },
+			{ expectedText: 'X' }
+		);
+		expect( reason ).toContain( EMAIL );
+		expect( reason ).not.toMatch( /[]/ );
+	} );
+
+	test( 'a reason left with an address-shaped value keeps only its leading code', () => {
+		const verdict = run(
+			checks.ranOnRequestedRoute,
+			{ providerRoute: { requested: null, failure: { code: 'provider-unknown', message: leak } } },
+			{ requireProvider: true }
+		);
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( /^refused before any model request \(provider-unknown\)/ );
+		expect( leaked( verdict.reason ) ).toEqual( [] );
+		const missing = checks.siteWorks(
+			`EVAL_RUNNER_RESULT_FILE=${ path.join( dir, 'no-such-result.json' ) }`,
+			{ vars: { requireProvider: true } }
+		);
+		expect( missing.pass ).toBe( false );
+		expect( missing.reason ).toMatch( /reason withheld: it held what looked like a local path/ );
+	} );
+
+	test( 'imageGenerated names only the service and the credential kind, never the account', () => {
+		const verdict = run( checks.imageGenerated, { ...seeded, success: true } );
+		expect( verdict.pass ).toBe( true );
+		expect( verdict.reason ).toBe(
+			'generate_images ran 1 time(s) on the wordpress-com image service, signed in with its wordpress-com-login'
+		);
+	} );
+} );
+
+describe( 'outcome.mjs as promptfoo loads it', () => {
+	// promptfoo imports the checks with plain Node, not through this test
+	// runner's transform: a short-lived Node that only imports the file and exits.
+	test( 'loads with plain Node, its TypeScript import included', () => {
+		const loaded = spawnSync(
+			process.execPath,
+			[
+				'--input-type=module',
+				'-e',
+				'const m = await import( process.env.OUTCOME_URL ); process.stdout.write( String( Object.keys( m ).length ) );',
+			],
+			{
+				env: { ...process.env, OUTCOME_URL: new URL( './outcome.mjs', import.meta.url ).href },
+				encoding: 'utf8',
+				timeout: 60_000,
+			}
+		);
+		expect( loaded.stderr ).not.toMatch( /Error/ );
+		expect( loaded.status ).toBe( 0 );
+		expect( Number( loaded.stdout ) ).toBe( Object.keys( checks ).length );
+	} );
+} );
+
+describe( 'the records a provider-qualified case’s checks add to its summary', () => {
+	const FACTS = {
+		source: { sha: '0123456789abcdef0123456789abcdef01234567', dirty: false },
+		platform: { os: 'linux', release: null, arch: 'x64' },
+		runtime: { node: '24.22.1', npm: null },
+		build: { cliVersion: '0.0.0', buildId: null },
+	};
+	const route = {
+		requested: {
+			kind: 'chatgpt-oauth',
+			backend: 'chatgpt-route',
+			subscription: true,
+			connectionRef: 'conn-0123456789ab',
+			model: 'gpt-6-luna',
+			wireModel: 'gpt-6-luna',
+			effort: 'medium',
+		},
+		executed: {
+			kind: 'chatgpt-oauth',
+			backend: 'chatgpt-route',
+			connectionRef: 'conn-0123456789ab',
+			modelRequests: 2,
+			apiKeyBearers: 0,
+			imageServiceRequests: 0,
+			models: [ 'gpt-6-luna' ],
+			efforts: [ 'medium' ],
+			replyKinds: [ 'chatgpt-oauth' ],
+			replyModels: [ 'gpt-6-luna' ],
+			connectionMatchesBearer: true,
+			requests: [],
+		},
+	};
+	const vars = { caseId: 'parity-identity', requireProvider: true, expectedText: 'READY' };
+	const summaryOf = ( summaries ) => {
+		const runDirectory = path.join( summaries, 'chatgpt-oauth', 'parity-identity' );
+		return {
+			records: openAcceptanceEvidence( runDirectory, 'chatgpt-oauth' ).readRecords(),
+			text: readFileSync( path.join( runDirectory, 'evidence.ndjson' ), 'utf8' ),
+		};
+	};
+	const startRun = ( summaries, result ) =>
+		writeEvalCaseSummary( result, {
+			caseId: 'parity-identity',
+			provider: 'chatgpt-oauth',
+			directory: summaries,
+			facts: FACTS,
+		} ).location;
+
+	test( 'a case whose route passed and whose checks failed: the summary shows both, and nothing in it reads as the case passing', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const result = {
+			success: true,
+			providerRoute: route,
+			textSegments: [ 'I am Claude, a large language model.' ],
+		};
+		const evalSummary = startRun( summaries, result );
+		const routeVerdict = run( checks.ranOnRequestedRoute, { ...result, evalSummary }, vars );
+		const identity = run( checks.identifiesAsStudio, { ...result, evalSummary }, vars );
+		const replied = run( checks.replyIncludes, { ...result, evalSummary }, vars );
+		expect( [ routeVerdict.pass, identity.pass, replied.pass ] ).toEqual( [ true, false, false ] );
+
+		const { records } = summaryOf( summaries );
+		expect( records.map( ( r ) => [ r.scenario, r.stage, r.run, r.status ] ) ).toEqual( [
+			[ 'eval-route-chatgpt-oauth', 'parity-identity', 1, 'passed' ],
+			[ 'eval-check-ran-on-requested-route', 'parity-identity', 1, 'passed' ],
+			[ 'eval-check-identifies-as-studio', 'parity-identity', 1, 'failed' ],
+			[ 'eval-check-reply-includes', 'parity-identity', 1, 'failed' ],
+		] );
+		for ( const record of records ) {
+			expect( findUnsafeRecord( record ) ).toBeNull();
+			// Every record names what it judges: the route, or one check.
+			expect( record.scenario ).toMatch( /^eval-(route-chatgpt-oauth|check-[a-z-]+)$/ );
+		}
+		expect( records[ 0 ].observations.judgesCaseChecks ).toBe( false );
+		// A check record holds the case, the check and its verdict, nothing else.
+		for ( const record of records.slice( 1 ) ) {
+			expect( record ).toEqual( {
+				schemaVersion: 1,
+				run: 1,
+				scenario: record.scenario,
+				stage: 'parity-identity',
+				status: record.status,
+				durationS: 0,
+				observations: {},
+			} );
+		}
+	} );
+
+	test( 'a case refused or blocked before it ran: each check is recorded as blocked', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const result = {
+			success: false,
+			blocked: { code: 'tool-images-not-qualified', message: 'x' },
+			providerRoute: { requested: route.requested, blocked: { code: 'tool-images-not-qualified' } },
+		};
+		const evalSummary = startRun( summaries, result );
+		run( checks.sawDesktopAndMobile, { ...result, evalSummary }, vars );
+		expect(
+			summaryOf( summaries ).records.map( ( r ) => [ r.scenario, r.status, r.code ] )
+		).toEqual( [
+			[ 'eval-route-chatgpt-oauth', 'blocked', 'tool-images-not-qualified' ],
+			[ 'eval-check-saw-desktop-and-mobile', 'blocked', undefined ],
+		] );
+	} );
+
+	test.each( [
+		[ 'a name', 'Jordan Q. Example' ],
+		[ 'an email address', 'jordan.example@example.org' ],
+		[ 'an address', 'https://jordans-site.wordpress.com' ],
+		[ 'an identifier', '7c1e8a41-6d3b-4c55-9b8e-3f2d7c1eb2f0' ],
+		[ 'a Windows path', 'C:\\Users\\jordan\\Studio' ],
+		[ 'a POSIX path', '/Users/jordan/Studio' ],
+	] )(
+		'the guard refuses %s seeded into a check record, which is written as unsafe evidence',
+		( _kind, value ) => {
+			const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+			const result = { success: true, providerRoute: route, textSegments: [ 'WordPress Studio' ] };
+			const evalSummary = { ...startRun( summaries, result ), stage: value };
+			const verdict = run( checks.identifiesAsStudio, { ...result, evalSummary }, vars );
+			expect( verdict.pass ).toBe( true );
+			const { records, text } = summaryOf( summaries );
+			expect( records.at( -1 ) ).toEqual( {
+				schemaVersion: 1,
+				run: 1,
+				scenario: 'eval-check-identifies-as-studio',
+				stage: 'unnamed-case',
+				status: 'failed',
+				code: 'unsafe-evidence',
+				durationS: 0,
+				observations: {},
+			} );
+			expect( text ).not.toContain( value );
+			expect( text.toLowerCase() ).not.toMatch( /jordan|example/ );
+		}
+	);
+
+	test( 'every check records itself under its own fixed name', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const result = { success: true, providerRoute: route };
+		const evalSummary = startRun( summaries, result );
+		const names = Object.keys( checks ).filter( ( name ) => name !== 'default' );
+		expect( names.length ).toBeGreaterThan( 40 );
+		for ( const name of names ) {
+			run( checks[ name ], { ...result, evalSummary }, vars );
+		}
+		const scenarios = summaryOf( summaries )
+			.records.slice( 1 )
+			.map( ( r ) => r.scenario );
+		expect( scenarios ).toEqual(
+			names.map(
+				( name ) => `eval-check-${ name.replace( /[A-Z]/g, ( c ) => `-${ c.toLowerCase() }` ) }`
+			)
+		);
+	} );
+
+	test( 'a result that predates this run, as promptfoo’s cache would serve it, fails its check and records nothing', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const result = { success: true, providerRoute: route, textSegments: [ 'WordPress Studio' ] };
+		const evalSummary = startRun( summaries, result );
+		const file = path.join( dir, `result-${ count++ }.json` );
+		writeFileSync( file, JSON.stringify( { ...result, evalSummary } ) );
+		const output = `EVAL_RUNNER_RESULT_FILE=${ file }`;
+		// The result of an earlier invocation: older than this process.
+		const earlier = new Date( Date.now() - 3 * 24 * 3600 * 1000 );
+		utimesSync( file, earlier, earlier );
+
+		for ( const check of [ checks.identifiesAsStudio, checks.ranOnRequestedRoute ] ) {
+			const verdict = check( output, { vars } );
+			expect( verdict.pass ).toBe( false );
+			expect( verdict.reason ).toMatch( /^result-not-from-this-run: .*not from this run/ );
+		}
+		// Only the route record the earlier run wrote: the checks appended nothing to it.
+		expect( summaryOf( summaries ).records ).toHaveLength( 1 );
+
+		// The same result made by this run is recorded.
+		const now = new Date();
+		utimesSync( file, now, now );
+		expect( checks.identifiesAsStudio( output, { vars } ).pass ).toBe( true );
+		expect( summaryOf( summaries ).records ).toHaveLength( 2 );
+	} );
+
+	test( 'a case that selects no provider is judged as before, whatever the age of its result file', () => {
+		const file = path.join( dir, `result-${ count++ }.json` );
+		writeFileSync(
+			file,
+			JSON.stringify( { success: true, textSegments: [ 'WordPress Studio' ] } )
+		);
+		const earlier = new Date( Date.now() - 3 * 24 * 3600 * 1000 );
+		utimesSync( file, earlier, earlier );
+		const verdict = checks.identifiesAsStudio( `EVAL_RUNNER_RESULT_FILE=${ file }`, { vars: {} } );
+		expect( verdict.pass ).toBe( true );
+		expect( verdict.reason ).not.toMatch( /result-not-from-this-run/ );
+	} );
+
+	test( 'a case that selects no provider adds nothing', () => {
+		const summaries = mkdtempSync( path.join( dir, 'summary-' ) );
+		const evalSummary = startRun( summaries, { success: true, providerRoute: route } );
+		run( checks.identifiesAsStudio, { success: true, textSegments: [ 'x' ], evalSummary }, {} );
+		expect( summaryOf( summaries ).records ).toHaveLength( 1 );
+	} );
 } );
 
 describe( 'shared checks', () => {
@@ -692,4 +1245,571 @@ test( 'list vars in the config are lists of objects', () => {
 			.map( ( [ name ] ) => `${ vars.caseId }.${ name }` )
 	);
 	expect( scalarLists ).toEqual( [] );
+} );
+
+describe( 'provider route checks', () => {
+	const ref = 'conn-0123456789ab';
+	const requested = {
+		kind: 'chatgpt-oauth',
+		backend: 'chatgpt-route',
+		subscription: true,
+		connectionRef: ref,
+		model: 'gpt-6-luna',
+		wireModel: 'gpt-6-luna',
+		effort: 'low',
+	};
+	const executed = ( overrides = {} ) => ( {
+		kind: 'chatgpt-oauth',
+		backend: 'chatgpt-route',
+		modelRequests: 3,
+		apiKeyBearers: 0,
+		imageServiceRequests: 0,
+		models: [ 'gpt-6-luna' ],
+		efforts: [ 'low' ],
+		replyKinds: [ 'chatgpt-oauth' ],
+		replyModels: [ 'gpt-6-luna' ],
+		connectionRef: ref,
+		connectionMatchesBearer: true,
+		requests: [],
+		...overrides,
+	} );
+	const routed = ( overrides = {}, route = {} ) => ( {
+		providerRoute: { requested, executed: executed( overrides ), ...route },
+	} );
+
+	test( 'ranOnRequestedRoute passes only on the selected route, connection, model and effort', () => {
+		const ok = run( checks.ranOnRequestedRoute, routed() );
+		expect( ok.pass ).toBe( true );
+		expect( ok.reason ).toMatch( /3 model request/ );
+		// The separate image service is not inference and doesn't count against the route.
+		expect( run( checks.ranOnRequestedRoute, routed( { imageServiceRequests: 2 } ) ).pass ).toBe(
+			true
+		);
+	} );
+
+	test.each( [
+		[ 'a run on the default provider', { textSegments: [ 'Hi' ] }, /regression evidence only/ ],
+		[
+			'a refused run',
+			{
+				providerRoute: {
+					requested: null,
+					failure: { code: 'connection-signed-out', message: 'Not signed in.' },
+				},
+			},
+			/connection-signed-out/,
+		],
+		[
+			'no model request',
+			routed( { modelRequests: 0, kind: 'none', backend: 'none' } ),
+			/no model request/,
+		],
+		[
+			'the API route',
+			routed( {
+				kind: 'openai-api-key',
+				backend: 'openai-api',
+				apiKeyBearers: 3,
+				replyKinds: [ 'openai-api-key' ],
+				connectionRef: 'openai-api-key',
+			} ),
+			/openai-api-key/,
+		],
+		[
+			'a mix of routes',
+			routed( { kind: 'mixed', backend: 'mixed', connectionRef: null } ),
+			/mixed/,
+		],
+		[ 'another connection', routed( { connectionRef: 'conn-ffffffffffff' } ), /connection/ ],
+		[
+			'a bearer for another identity than the selected connection',
+			routed( { connectionMatchesBearer: false } ),
+			/^connection-mismatch:/,
+		],
+		[
+			'a bearer whose identity could not be compared',
+			routed( { connectionMatchesBearer: 'unverified' } ),
+			/^connection-unverified:/,
+		],
+		[
+			'a report without the comparison',
+			routed( { connectionMatchesBearer: undefined } ),
+			/^connection-unverified:/,
+		],
+		[ 'an API-key bearer', routed( { apiKeyBearers: 1 } ), /API-key/ ],
+		[ 'another model', routed( { models: [ 'gpt-6-luna', 'gpt-6.1-sol' ] } ), /gpt-6\.1-sol/ ],
+		[ 'another effort', routed( { efforts: [ 'low', 'medium' ] } ), /medium/ ],
+		[
+			'replies another runtime recorded',
+			routed( { replyKinds: [ 'chatgpt-oauth', 'unknown' ] } ),
+			/unknown/,
+		],
+	] )( 'ranOnRequestedRoute fails %s', ( _name, result, reason ) => {
+		const verdict = run( checks.ranOnRequestedRoute, result );
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( reason );
+	} );
+} );
+
+describe( 'WordPress.com writes under remote: mock', () => {
+	const guarded = ( blocked = [] ) => ( {
+		remoteGuard: { code: blocked.length ? 'wpcom-write-under-mock' : null, blocked },
+	} );
+
+	test( 'noWordPressComWrites passes when the guard refused nothing', () => {
+		expect( run( checks.noWordPressComWrites, guarded(), { remote: 'mock' } ).pass ).toBe( true );
+	} );
+
+	test( 'noWordPressComWrites fails with its code on a refused write', () => {
+		const verdict = run(
+			checks.noWordPressComWrites,
+			guarded( [ { method: 'POST', host: 'wpcom', endpoint: 'other', via: 'http' } ] ),
+			{ remote: 'mock' }
+		);
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( /^wpcom-write-under-mock:.*POST/ );
+	} );
+
+	test( 'noWordPressComWrites fails a mocked case that ran without the guard', () => {
+		const verdict = run( checks.noWordPressComWrites, { textSegments: [] }, { remote: 'mock' } );
+		expect( verdict.pass ).toBe( false );
+		expect( verdict.reason ).toMatch( /^remote-guard-missing:/ );
+	} );
+
+	test( 'noWordPressComWrites judges a staging case on its guard’s record: no write outside the designated site', () => {
+		const staging = { remote: 'staging' };
+		const recorded = ( blocked, allowed ) => ( {
+			remoteGuard: {
+				code: blocked.length ? 'wpcom-write-outside-staging' : null,
+				blocked,
+				allowed,
+			},
+		} );
+		const passed = run(
+			checks.noWordPressComWrites,
+			recorded( [], [ { method: 'POST', via: 'http' } ] ),
+			staging
+		);
+		expect( passed.pass ).toBe( true );
+		expect( passed.reason ).toMatch( /1 write\(s\) to the designated staging site/ );
+		const refused = run(
+			checks.noWordPressComWrites,
+			recorded(
+				[
+					{
+						code: 'wpcom-write-outside-staging',
+						method: 'OTHER',
+						host: 'wpcom',
+						endpoint: 'other',
+						via: 'remote-operation',
+						operation: 'push',
+					},
+				],
+				[]
+			),
+			staging
+		);
+		expect( refused.pass ).toBe( false );
+		expect( refused.reason ).toMatch( /^wpcom-write-outside-staging:.*push/ );
+		// Never passed without the record.
+		const unguarded = run( checks.noWordPressComWrites, {}, staging );
+		expect( unguarded.pass ).toBe( false );
+		expect( unguarded.reason ).toMatch( /^remote-guard-missing:/ );
+	} );
+} );
+
+describe( 'parity checks', () => {
+	const site = ( extra = {} ) => outcome( { ...workingSite, ...extra } );
+	const turns = ( ...starts ) =>
+		starts.map( ( toolCallsStart, index ) => ( {
+			reopened: false,
+			toolCallsStart,
+			textSegmentsStart: index,
+			questionsStart: 0,
+		} ) );
+
+	test( 'themeFileIncludes', () => {
+		const vars = { file: 'style.css', expectedText: 'PARITY-THEME-5521' };
+		expect(
+			run(
+				checks.themeFileIncludes,
+				site( { themeFiles: { 'style.css': '/* parity-marker: PARITY-THEME-5521 */' } } ),
+				vars
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.themeFileIncludes, site( { themeFiles: { 'style.css': 'body{}' } } ), vars ).pass
+		).toBe( false );
+		expect( run( checks.themeFileIncludes, site( { themeFiles: {} } ), vars ).pass ).toBe( false );
+	} );
+
+	test( 'inspectionIncludes', () => {
+		const vars = { expectedText: 'Parity Preview 3318' };
+		const inspected = ( stdout ) => ( { inspections: [ { args: [], exitCode: 0, stdout } ] } );
+		expect(
+			run( checks.inspectionIncludes, inspected( 'Parity Preview 3318\n' ), vars ).pass
+		).toBe( true );
+		expect( run( checks.inspectionIncludes, inspected( 'My WordPress' ), vars ).pass ).toBe(
+			false
+		);
+		expect( run( checks.inspectionIncludes, { inspections: [] }, vars ).pass ).toBe( false );
+	} );
+
+	test( 'previewRefreshed and artifactShown', () => {
+		const ui = ( artifacts, previewReloads ) => ( { uiEvents: { artifacts, previewReloads } } );
+		expect( run( checks.previewRefreshed, ui( [], 1 ) ).pass ).toBe( true );
+		expect( run( checks.previewRefreshed, ui( [], 0 ) ).pass ).toBe( false );
+		expect( run( checks.previewRefreshed, {} ).pass ).toBe( false );
+		const media = [ { id: 'a', widgets: [ 'media' ] } ];
+		expect( run( checks.artifactShown, ui( media, 0 ), { widgetType: 'media' } ).pass ).toBe(
+			true
+		);
+		expect(
+			run( checks.artifactShown, ui( [ { id: 'b', widgets: [ 'site-preview' ] } ], 0 ), {
+				widgetType: 'media',
+			} ).pass
+		).toBe( false );
+		expect( run( checks.artifactShown, ui( [], 0 ) ).pass ).toBe( false );
+	} );
+
+	test( 'finalReplyIncludes', () => {
+		const vars = { expectedTexts: [ { text: 'red' }, { text: 'PARITY-BRIEF-2207' } ] };
+		expect(
+			run(
+				checks.finalReplyIncludes,
+				reply( 'Reading it.', 'The image is Red; the code is PARITY-BRIEF-2207.' ),
+				vars
+			).pass
+		).toBe( true );
+		// Only the last reply counts: what the first turn said is not recalled.
+		expect(
+			run(
+				checks.finalReplyIncludes,
+				reply( 'Red, PARITY-BRIEF-2207.', 'I do not remember.' ),
+				vars
+			).pass
+		).toBe( false );
+	} );
+
+	test( 'lastTurnUsedNoTools and usedOnlyTools', () => {
+		const calls = ( ...names ) => names.map( ( name ) => ( { name, input: {} } ) );
+		expect(
+			run( checks.lastTurnUsedNoTools, { toolCalls: calls( 'Read' ), turns: turns( 0, 1 ) } ).pass
+		).toBe( true );
+		expect(
+			run( checks.lastTurnUsedNoTools, {
+				toolCalls: calls( 'Read', 'Read' ),
+				turns: turns( 0, 1 ),
+			} ).pass
+		).toBe( false );
+		const vars = { allowedTools: [ { name: 'take_screenshot' } ] };
+		expect(
+			run( checks.usedOnlyTools, { toolCalls: calls( 'take_screenshot' ) }, vars ).pass
+		).toBe( true );
+		expect(
+			run( checks.usedOnlyTools, { toolCalls: calls( 'take_screenshot', 'wp_cli' ) }, vars ).pass
+		).toBe( false );
+		expect( run( checks.usedOnlyTools, { toolCalls: [] }, vars ).pass ).toBe( false );
+	} );
+
+	test( 'attachmentReachedModel', () => {
+		const routed = ( requests ) => ( {
+			attachments: [ { fixture: 'red-swatch.png', kind: 'image' } ],
+			providerRoute: { requested: {}, executed: { requests } },
+		} );
+		expect(
+			run( checks.attachmentReachedModel, routed( [ { imageInputs: 1, turn: 0 } ] ) ).pass
+		).toBe( true );
+		expect(
+			run( checks.attachmentReachedModel, routed( [ { imageInputs: 0, turn: 0 } ] ) ).pass
+		).toBe( false );
+		// Replayed: a later turn's request still carries the image.
+		const replayed = { replayed: true };
+		expect(
+			run(
+				checks.attachmentReachedModel,
+				routed( [
+					{ imageInputs: 1, turn: 0 },
+					{ imageInputs: 1, turn: 1 },
+				] ),
+				replayed
+			).pass
+		).toBe( true );
+		expect(
+			run(
+				checks.attachmentReachedModel,
+				routed( [
+					{ imageInputs: 1, turn: 0 },
+					{ imageInputs: 0, turn: 1 },
+				] ),
+				replayed
+			).pass
+		).toBe( false );
+		expect( run( checks.attachmentReachedModel, { providerRoute: null } ).pass ).toBe( false );
+	} );
+
+	test( 'remoteOperationRan and noRemoteOperation', () => {
+		const push = {
+			operation: 'push',
+			site: 'Eval Site Push',
+			target: 'https://myprod.wordpress.com',
+		};
+		const mock = { remote: 'mock', operation: 'push', target: 'myprod.wordpress.com' };
+		expect( run( checks.remoteOperationRan, { remoteCalls: [ push ] }, mock ).pass ).toBe( true );
+		expect(
+			run(
+				checks.remoteOperationRan,
+				{ remoteCalls: [ { ...push, target: 'https://other.wordpress.com' } ] },
+				mock
+			).pass
+		).toBe( false );
+		expect( run( checks.remoteOperationRan, { remoteCalls: [] }, mock ).pass ).toBe( false );
+		// On a designated staging site the push really ran: recorded against the
+		// designated site, and the tool's own result says it succeeded.
+		const staging = { remote: 'staging', operation: 'push' };
+		const toDesignated = { operation: 'push', site: 'A', target: '4242', designated: true };
+		const staged = ( isError, text, remoteCalls = [ toDesignated ] ) => ( {
+			toolResults: [ { toolName: 'site_push', isError, text } ],
+			remoteCalls,
+		} );
+		const ran = run(
+			checks.remoteOperationRan,
+			staged( false, 'Pushed "A" to Staging (https://staging-4242.wpcomstaging.com).' ),
+			staging
+		);
+		expect( ran.pass ).toBe( true );
+		expect( ran.reason ).not.toMatch( /4242|https?:/ );
+		expect(
+			run( checks.remoteOperationRan, staged( true, 'Failed to push site' ), staging ).pass
+		).toBe( false );
+		// A push that succeeded somewhere the runner didn't record as the designated site fails.
+		const elsewhere = run(
+			checks.remoteOperationRan,
+			staged( false, 'Pushed "A" to My Production Site (https://myprod.wordpress.com).', [
+				{ ...toDesignated, target: 'https://myprod.wordpress.com', designated: false },
+			] ),
+			staging
+		);
+		expect( elsewhere.pass ).toBe( false );
+		expect( elsewhere.reason ).toMatch( /^staging-target-not-designated/ );
+		expect( elsewhere.reason ).not.toMatch( /myprod|https?:/ );
+		expect(
+			run( checks.remoteOperationRan, staged( false, 'Pushed "A".', [] ), staging ).pass
+		).toBe( false );
+		// A mocked case is never judged on a real tool result, and a case must declare its mode.
+		expect( run( checks.remoteOperationRan, staged( false, 'Pushed "A".', [] ), mock ).pass ).toBe(
+			false
+		);
+		const undeclared = run(
+			checks.remoteOperationRan,
+			{ remoteCalls: [ push ] },
+			{
+				operation: 'push',
+			}
+		);
+		expect( undeclared.pass ).toBe( false );
+		expect( undeclared.reason ).toMatch( /remote: mock or remote: staging/ );
+
+		expect( run( checks.noRemoteOperation, { remoteCalls: [] }, { remote: 'mock' } ).pass ).toBe(
+			true
+		);
+		expect(
+			run( checks.noRemoteOperation, { remoteCalls: [ push ] }, { remote: 'mock' } ).pass
+		).toBe( false );
+		// Without the mock nothing says no remote operation ran.
+		expect( run( checks.noRemoteOperation, { remoteCalls: [] }, {} ).pass ).toBe( false );
+		expect( run( checks.noRemoteOperation, {}, { remote: 'mock' } ).pass ).toBe( false );
+	} );
+
+	test( 'toolsInOrder', () => {
+		const order = { toolOrder: [ { name: 'generate_images' }, { name: 'take_screenshot' } ] };
+		const ran = ( ...calls ) => ( {
+			toolCalls: calls.map( ( [ name ], index ) => ( { id: `c${ index }`, name } ) ),
+			toolResults: calls.map( ( [ name, isError ], index ) => ( {
+				toolUseId: `c${ index }`,
+				toolName: name,
+				isError: Boolean( isError ),
+			} ) ),
+		} );
+		expect(
+			run(
+				checks.toolsInOrder,
+				ran( [ 'generate_images' ], [ 'Read' ], [ 'take_screenshot' ] ),
+				order
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.toolsInOrder, ran( [ 'take_screenshot' ], [ 'generate_images' ] ), order ).pass
+		).toBe( false );
+		expect(
+			run( checks.toolsInOrder, ran( [ 'generate_images', true ], [ 'take_screenshot' ] ), order )
+				.pass
+		).toBe( false );
+		expect( run( checks.toolsInOrder, ran( [ 'generate_images' ] ), order ).reason ).toMatch(
+			/take_screenshot/
+		);
+	} );
+
+	test( 'imageGenerated and imageGenerationUnavailable', () => {
+		const generated = {
+			imageService: { configured: true },
+			toolResults: [
+				{
+					toolName: 'generate_images',
+					isError: false,
+					details: {
+						studioService: { service: 'wordpress-com', credential: 'environment-token' },
+					},
+				},
+			],
+			providerRoute: { executed: { imageServiceRequests: 1 } },
+		};
+		expect( run( checks.imageGenerated, generated ).pass ).toBe( true );
+		expect(
+			run( checks.imageGenerated, { ...generated, imageService: { configured: false } } ).pass
+		).toBe( false );
+		expect(
+			run( checks.imageGenerated, {
+				...generated,
+				toolResults: [ { toolName: 'generate_images', isError: false, details: {} } ],
+			} ).pass
+		).toBe( false );
+		expect(
+			run( checks.imageGenerated, {
+				...generated,
+				providerRoute: { executed: { imageServiceRequests: 0 } },
+			} ).pass
+		).toBe( false );
+
+		const unavailable = ( text, extra = {} ) => ( {
+			imageService: { configured: false },
+			toolEvents: [],
+			textSegments: [ text ],
+			...extra,
+		} );
+		expect(
+			run(
+				checks.imageGenerationUnavailable,
+				unavailable(
+					'I can’t generate images here: image generation isn’t set up. Log in to WordPress.com to turn it on.'
+				)
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.imageGenerationUnavailable, unavailable( 'Here is your apple.' ) ).pass
+		).toBe( false );
+		expect(
+			run(
+				checks.imageGenerationUnavailable,
+				unavailable( 'I can’t generate images.', {
+					toolEvents: [ { toolName: 'generate_images' } ],
+				} )
+			).pass
+		).toBe( false );
+		expect(
+			run(
+				checks.imageGenerationUnavailable,
+				unavailable( 'I can’t generate images.', { imageService: { configured: true } } )
+			).pass
+		).toBe( false );
+	} );
+
+	test( 'cancelledThenContinued', () => {
+		const vars = {
+			expectedText: 'STOPPED',
+			inspectPattern: 'Parity [ABC]',
+			maxInspectMatches: 1,
+		};
+		const base = {
+			stoppedAt: { toolName: 'wp_cli', index: 0 },
+			toolCalls: [ { name: 'wp_cli', input: {} } ],
+			turns: turns( 0, 1 ),
+			textSegments: [ 'Creating…', 'STOPPED' ],
+			inspections: [ { stdout: '[{"post_title":"Parity A"}]' } ],
+		};
+		expect( run( checks.cancelledThenContinued, base, vars ).pass ).toBe( true );
+		expect( run( checks.cancelledThenContinued, { ...base, stoppedAt: null }, vars ).pass ).toBe(
+			false
+		);
+		// A tool call that started after the stop, still in the cancelled turn.
+		expect(
+			run(
+				checks.cancelledThenContinued,
+				{
+					...base,
+					toolCalls: [ ...base.toolCalls, { name: 'wp_cli', input: {} } ],
+					turns: turns( 0, 2 ),
+				},
+				vars
+			).pass
+		).toBe( false );
+		expect(
+			run(
+				checks.cancelledThenContinued,
+				{
+					...base,
+					inspections: [ { stdout: '[{"post_title":"Parity A"},{"post_title":"Parity B"}]' } ],
+				},
+				vars
+			).pass
+		).toBe( false );
+		expect(
+			run(
+				checks.cancelledThenContinued,
+				{ ...base, textSegments: [ 'Creating…', 'Done.' ] },
+				vars
+			).pass
+		).toBe( false );
+	} );
+
+	test( 'resumedFromDisk and compacted', () => {
+		const reopened = [
+			{ reopened: false, toolCallsStart: 0 },
+			{ reopened: true, toolCallsStart: 0 },
+		];
+		expect( run( checks.resumedFromDisk, { turns: reopened, success: true } ).pass ).toBe( true );
+		expect( run( checks.resumedFromDisk, { turns: turns( 0, 0 ), success: true } ).pass ).toBe(
+			false
+		);
+		expect( run( checks.resumedFromDisk, { turns: reopened, success: false } ).pass ).toBe( false );
+		expect( run( checks.compacted, { compactions: 1 } ).pass ).toBe( true );
+		expect( run( checks.compacted, { compactions: 0 } ).pass ).toBe( false );
+	} );
+
+	test( 'designChosen', () => {
+		const asked = ( answer, finalText ) => ( {
+			questions: [
+				{
+					question: 'Which direction?',
+					options: [ 'Warm rustic bakery', 'Cool minimal studio' ],
+					answer,
+				},
+			],
+			textSegments: [ finalText ],
+		} );
+		expect(
+			run(
+				checks.designChosen,
+				asked( 'Warm rustic bakery', 'Going with the warm, rustic bakery direction.' )
+			).pass
+		).toBe( true );
+		expect(
+			run( checks.designChosen, asked( 'Warm rustic bakery', 'Going with the minimal look.' ) ).pass
+		).toBe( false );
+		expect( run( checks.designChosen, { questions: [], textSegments: [ 'Hi' ] } ).pass ).toBe(
+			false
+		);
+	} );
+} );
+
+test( 'inspectionMatches', () => {
+	const vars = { inspectPattern: 'UPLOADED_IMAGES=[1-9]' };
+	const inspected = ( stdout ) => ( { inspections: [ { args: [], exitCode: 0, stdout } ] } );
+	expect( run( checks.inspectionMatches, inspected( 'UPLOADED_IMAGES=2\n' ), vars ).pass ).toBe(
+		true
+	);
+	expect( run( checks.inspectionMatches, inspected( 'UPLOADED_IMAGES=0\n' ), vars ).pass ).toBe(
+		false
+	);
+	expect( run( checks.inspectionMatches, { inspections: [] }, vars ).pass ).toBe( false );
 } );

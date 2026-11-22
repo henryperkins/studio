@@ -34,4 +34,45 @@ describe( 'tool trace', () => {
 		await user.keyboard( ' ' );
 		expect( trigger ).toHaveAttribute( 'aria-expanded', 'false' );
 	} );
+
+	it.each( [ 'wordpress-com-login', 'environment-token' ] as const )(
+		'names only the image service that made generated images, signed in with %s',
+		async ( credential ) => {
+			const user = userEvent.setup();
+			render(
+				<ToolUseRow
+					name="generate_images"
+					input={ { images: [ { path: '/sites/a/hero.png', subject: 'A loaf' } ] } }
+					result={ {
+						text: 'Generating 1 image in the background.',
+						isError: false,
+						imageService: { service: 'wordpress-com', credential },
+					} }
+					isRunning={ false }
+				/>
+			);
+
+			await user.click( screen.getByRole( 'button', { name: /1 image/ } ) );
+
+			expect( screen.getByText( 'Made with Studio’s WordPress.com image service.' ) ).toBeVisible();
+			expect( screen.queryByText( /someone|token/i ) ).not.toBeInTheDocument();
+		}
+	);
+
+	it( 'shows no image service line for a generate_images row without one', async () => {
+		const user = userEvent.setup();
+		render(
+			<ToolUseRow
+				name="generate_images"
+				input={ { images: [ { path: '/sites/a/hero.png', subject: 'A loaf' } ] } }
+				result={ { text: 'Generating 1 image in the background.', isError: false } }
+				isRunning={ false }
+			/>
+		);
+
+		await user.click( screen.getByRole( 'button', { name: /1 image/ } ) );
+
+		expect( screen.getByText( 'Generating 1 image in the background.' ) ).toBeVisible();
+		expect( screen.queryByText( /image service/ ) ).not.toBeInTheDocument();
+	} );
 } );

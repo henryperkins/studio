@@ -1,0 +1,396 @@
+import { useQueryClient } from '@tanstack/react-query';
+import { __, sprintf } from '@wordpress/i18n';
+import { useEffect, useRef, useState } from 'react';
+import { useConnector } from '@/data/core';
+import {
+	describeChatGptSettingsError,
+	holdChatGptConnection,
+	nameChatGptAccount,
+	refreshChatGptSettings,
+	useChatGptAccountToOpen,
+	useChatGptModels,
+	useChatGptSettings,
+	useRecheckChatGptSettings,
+} from '@/data/queries/use-chatgpt-settings';
+import { useOffline } from '@/lib/hooks';
+import { Badge, Button } from '@/lib/ui';
+import { ImageServiceSettingsRow } from './image-service-row';
+import { connectedBadge, SettingsGroup, SettingsRow, SettingsSelect } from './rows';
+import styles from './style.module.css';
+import type { ChatGptCredentialStorage } from '@studio/agent/protocol/chatgpt';
+
+interface SignInAttempt {
+	id?: string;
+	cancelled: boolean;
+	// Its outcome has arrived, or it failed: there is nothing left to cancel.
+	ended?: boolean;
+}
+
+export function ChatGptSettingsGroup() {
+	const connector = useConnector();
+	const queryClient = useQueryClient();
+	const settings = useChatGptSettings();
+	const offline = useOffline();
+	const accountToOpen = useChatGptAccountToOpen();
+	const [ selectedId, setSelectedId ] = useState( accountToOpen );
+	const [ storage, setStorage ] = useState< ChatGptCredentialStorage >( 'vault' );
+	const [ pending, setPending ] = useState( false );
+	const [ signingOut, setSigningOut ] = useState( false );
+	const [ message, setMessage ] = useState( '' );
+	const [ error, setError ] = useState( '' );
+	const [ reconsent, setReconsent ] = useState( false );
+	const attempt = useRef< SignInAttempt | null >( null );
+	const mounted = useRef( true );
+	const accounts = settings.data?.accounts ?? [];
+	const account = selectedId
+		? accounts.find( ( item ) => item.connectionId === selectedId )
+		: accounts[ 0 ];
+	const models = useChatGptModels( account, false );
+	const rechecking = useRecheckChatGptSettings();
+	const { mutate: recheck } = rechecking;
+	const enabled = !! settings.data?.enabled;
+	const rechecked = useRef( false );
+
+	// Once the provider is known to be on: polled reads don't check the keychain.
+	useEffect( () => {
+		if ( enabled && ! rechecked.current ) {
+			rechecked.current = true;
+			recheck();
+		}
+	}, [ enabled, recheck ] );
+
+	useEffect( () => {
+		mounted.current = true;
+		return () => {
+			mounted.current = false;
+			const active = attempt.current;
+			if ( active ) {
+				active.cancelled = true;
+				if ( active.id ) {
+					void connector.cancelChatGptSignIn( active.id ).catch( () => {} );
+				}
+			}
+		};
+	}, [ connector ] );
+
+	const signIn = async ( registrationId?: string ) => {
+		const active: SignInAttempt = { cancelled: false };
+		attempt.current = active;
+		setPending( true );
+		setMessage( '' );
+		setError( '' );
+		// The account whose model list the sign-in may change: none yet for a new one.
+		let signedIn = registrationId;
+		try {
+			const started = await connector.beginChatGptSignIn( registrationId, {
+				storage,
+				...( reconsent ? { reconsent: true } : {} ),
+			} );
+			active.id = started.attemptId;
+			if ( active.cancelled ) {
+				await connector.cancelChatGptSignIn( active.id );
+				if ( mounted.current ) setError( __( 'Signing in was cancelled.' ) );
+				return;
+			}
+			const outcome = await connector.waitForChatGptSignIn( active.id );
+			if ( ! mounted.current || attempt.current !== active ) {
+				return;
+			}
+			if ( outcome.ok ) {
+				signedIn = outcome.registrationId;
+				setSelectedId( outcome.registrationId );
+				// Including a failed cancel's: the attempt it couldn't stop succeeded.
+				setError( '' );
+				setMessage( __( 'ChatGPT account connected.' ) );
+				setReconsent( false );
+			} else {
+				// Cancelled, timed out, denied…: said once, as the attempt's outcome.
+				setError( outcome.message );
+				setReconsent( outcome.code === 'permission-missing' );
+			}
+		} catch ( failure ) {
+			if ( mounted.current ) {
+				setError(
+					failure instanceof Error ? failure.message : __( 'ChatGPT sign-in failed. Try again.' )
+				);
+			}
+		} finally {
+			active.ended = true;
+			await refreshChatGptSettings( queryClient, signedIn );
+			if ( mounted.current && attempt.current === active ) {
+				attempt.current = null;
+				setPending( false );
+			}
+		}
+	};
+
+	// The attempt then ends as cancelled, which `signIn` says.
+	const cancel = async () => {
+		const active = attempt.current;
+		if ( ! active ) return;
+		active.cancelled = true;
+		if ( ! active.id ) return;
+		try {
+			await connector.cancelChatGptSignIn( active.id );
+		} catch ( failure ) {
+			// Too late to matter once the attempt has ended: its outcome is what's said.
+			if ( ! mounted.current || attempt.current !== active || active.ended ) return;
+			setError(
+				failure instanceof Error ? failure.message : __( 'Couldn’t cancel sign-in. Try again.' )
+			);
+		}
+	};
+
+	const signOut = async () => {
+		if ( ! account ) return;
+		const { connectionId } = account;
+		setSigningOut( true );
+		setError( '' );
+		setMessage( '' );
+		try {
+			await holdChatGptConnection( queryClient, connectionId );
+			const result = await connector.signOutChatGpt( connectionId );
+			if ( mounted.current && ! result.localCleared ) {
+				setError( __( 'Studio couldn’t clear this sign-in. Try signing out again.' ) );
+			} else if ( mounted.current ) {
+				setMessage(
+					result.remoteRevocationConfirmed
+						? __( 'Signed out locally. Remote revocation confirmed.' )
+						: __(
+								'Signed out locally. Remote revocation wasn’t confirmed; you can remove Studio in your ChatGPT account settings.'
+						  )
+				);
+			}
+		} catch ( failure ) {
+			if ( mounted.current )
+				setError(
+					failure instanceof Error ? failure.message : __( 'Couldn’t sign out. Try again.' )
+				);
+		} finally {
+			await refreshChatGptSettings( queryClient, connectionId );
+			if ( mounted.current ) setSigningOut( false );
+		}
+	};
+
+	// Nothing about ChatGPT shows until a read has said it is on, whatever a failed read says.
+	if ( ! settings.data?.enabled ) {
+		return null;
+	}
+	const busy = pending || signingOut;
+	const canSignIn =
+		! busy &&
+		! offline &&
+		settings.data.signInSupported &&
+		( storage === 'session' || settings.data.secureStorage === 'available' );
+	const connected = account?.authStatus === 'connected';
+	// Signing in again keeps an account's chats going, which a new account can't.
+	const signInAgainFirst = !! account && ! connected;
+	const signInAgain = account ? (
+		<Button
+			variant={ signInAgainFirst ? 'accent' : 'outline' }
+			disabled={ ! canSignIn }
+			onClick={ () => void signIn( account.connectionId ) }
+		>
+			{ __( 'Sign in again' ) }
+		</Button>
+	) : null;
+	const availability = models.data?.models;
+	const listsUnqualified = !! models.data?.listsUnqualifiedModels;
+	const availabilityDescription = () => {
+		if ( ! availability ) {
+			return __( 'Check which supported models this account can use.' );
+		}
+		const names = availability.map( ( model ) => model.label ).join( ', ' );
+		if ( availability.length ) {
+			return listsUnqualified
+				? sprintf(
+						/* translators: %s: comma-separated model names. */
+						__(
+							'This account lists %s. Some models this account offers aren’t supported in Studio yet.'
+						),
+						names
+				  )
+				: sprintf(
+						/* translators: %s: comma-separated model names. */
+						__( 'This account lists %s.' ),
+						names
+				  );
+		}
+		return listsUnqualified
+			? __(
+					'This account lists none of the models Studio supports. Some models this account offers aren’t supported in Studio yet.'
+			  )
+			: __( 'This account lists none of the models Studio supports.' );
+	};
+
+	return (
+		<SettingsGroup
+			title={ __( 'ChatGPT plan' ) }
+			description={ __(
+				'Use your ChatGPT plan in Studio. Choose the account and model in each chat; usage counts toward that account’s plan limits.'
+			) }
+		>
+			{ settings.isError ? (
+				<SettingsRow
+					title={ __( 'ChatGPT accounts' ) }
+					error={ describeChatGptSettingsError( settings.error ) }
+				>
+					<Button
+						variant="outline"
+						loading={ rechecking.isPending }
+						loadingAnnouncement={ __( 'Checking ChatGPT accounts' ) }
+						onClick={ () => recheck() }
+					>
+						{ __( 'Retry' ) }
+					</Button>
+				</SettingsRow>
+			) : null }
+			{ accounts.length > 0 ? (
+				<SettingsRow
+					title={ __( 'Saved ChatGPT account' ) }
+					description={
+						// The list names an account by its label, which is usually its email already.
+						account
+							? account.email !== account.label
+								? account.email
+								: undefined
+							: __( 'Choose a saved account.' )
+					}
+					additionalContent={
+						settings.isError ? __( 'This status may be out of date.' ) : undefined
+					}
+					badge={
+						connected ? (
+							connectedBadge()
+						) : (
+							<Badge size="xs" variant="muted">
+								{ account?.state === 'signed-out' ? __( 'Signed out' ) : __( 'Needs sign-in' ) }
+							</Badge>
+						)
+					}
+				>
+					<SettingsSelect
+						label={ __( 'Saved ChatGPT account' ) }
+						value={ account?.connectionId ?? '' }
+						disabled={ busy }
+						options={ accounts.map( ( item ) => ( {
+							value: item.connectionId,
+							label: nameChatGptAccount( item, accounts ),
+						} ) ) }
+						onChange={ ( id ) => {
+							setSelectedId( id );
+							setMessage( '' );
+							setError( '' );
+						} }
+					/>
+				</SettingsRow>
+			) : null }
+			<SettingsRow
+				title={ __( 'Keep ChatGPT sign-in' ) }
+				description={
+					settings.data.secureStorage === 'unavailable'
+						? __(
+								'Secure storage is unavailable. Choose “This app session” to keep the sign-in only until this Studio app closes.'
+						  )
+						: account?.storage === 'session'
+						? __(
+								'This account is signed in only for this app session. Choose where to keep your next sign-in.'
+						  )
+						: __(
+								'Secure storage keeps your sign-in across restarts. This app session keeps it only until this Studio app closes.'
+						  )
+				}
+			>
+				<SettingsSelect< ChatGptCredentialStorage >
+					label={ __( 'Keep ChatGPT sign-in' ) }
+					value={ storage }
+					disabled={ busy }
+					onChange={ setStorage }
+					options={ [
+						{
+							value: 'vault',
+							label: __( 'Secure storage' ),
+							disabled: settings.data.secureStorage === 'unavailable',
+						},
+						{ value: 'session', label: __( 'This app session' ) },
+					] }
+				/>
+			</SettingsRow>
+			<SettingsRow
+				title={ __( 'ChatGPT sign-in' ) }
+				stacked
+				error={ error || undefined }
+				description={
+					settings.data.signInSupported
+						? __(
+								'Sign-in opens in your system browser. Grant permission to use models with your ChatGPT plan.'
+						  )
+						: __( 'Open Studio on localhost to sign in to ChatGPT on this computer.' )
+				}
+			>
+				<div className={ styles.signInControl }>
+					<div className={ styles.keyForm }>
+						{ pending ? (
+							<Button variant="outline" onClick={ () => void cancel() }>
+								{ __( 'Cancel sign-in' ) }
+							</Button>
+						) : (
+							<>
+								{ signInAgainFirst ? signInAgain : null }
+								<Button
+									variant={ signInAgainFirst ? 'outline' : 'accent' }
+									disabled={ ! canSignIn }
+									onClick={ () => void signIn() }
+								>
+									{ accounts.length ? __( 'Add account' ) : __( 'Start sign-in' ) }
+								</Button>
+								{ account ? (
+									<>
+										{ signInAgainFirst ? null : signInAgain }
+										<Button
+											variant="outline"
+											disabled={ busy }
+											loading={ signingOut }
+											loadingAnnouncement={ __( 'Signing out' ) }
+											onClick={ () => void signOut() }
+										>
+											{ __( 'Sign out' ) }
+										</Button>
+									</>
+								) : null }
+							</>
+						) }
+					</div>
+					{ /* Mounted before it has anything to say, so its first message is announced. */ }
+					<p
+						role="status"
+						aria-label={ __( 'ChatGPT sign-in status' ) }
+						className={ styles.signInStatus }
+					>
+						{ pending
+							? __( 'Complete sign-in in your browser. You can cancel here.' )
+							: message || null }
+					</p>
+				</div>
+			</SettingsRow>
+			{ account ? (
+				<SettingsRow
+					title={ __( 'Available ChatGPT models' ) }
+					error={ models.error?.message }
+					description={ availabilityDescription() }
+				>
+					<Button
+						variant="outline"
+						disabled={ busy || ! connected || offline || models.isFetching }
+						loading={ models.isFetching }
+						loadingAnnouncement={ __( 'Checking models' ) }
+						onClick={ () => void models.refetch() }
+					>
+						{ __( 'Refresh models' ) }
+					</Button>
+				</SettingsRow>
+			) : null }
+			<ImageServiceSettingsRow plan="chatgpt" />
+		</SettingsGroup>
+	);
+}

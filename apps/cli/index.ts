@@ -1,4 +1,10 @@
 import path from 'node:path';
+import {
+	acceptChatGptSessionTokensFromParent,
+	setChatGptTokenClient,
+} from '@studio/agent/node/chatgpt/credential-broker';
+import { setChatGptBrowserOpener } from '@studio/agent/node/chatgpt/oauth';
+import { createChatGptTokenClient } from '@studio/agent/node/chatgpt/token-client';
 import { acceptOpenAiSessionKeyFromParent } from '@studio/agent/node/openai-credentials';
 import { suppressPunycodeWarning } from '@studio/common/lib/suppress-punycode-warning';
 import { __, sprintf } from '@wordpress/i18n';
@@ -17,6 +23,7 @@ import { registerCommand as registerSiteStatusCommand } from 'cli/commands/site/
 import { registerCommand as registerSiteStopCommand } from 'cli/commands/site/stop.command';
 import { registerCommand as registerUiCommand } from 'cli/commands/ui.command';
 import { registerCommand as registerUninstallCommand } from 'cli/commands/uninstall.command';
+import { openBrowser } from 'cli/lib/browser';
 import {
 	bumpAggregatedUniqueStat,
 	bumpStat,
@@ -36,6 +43,13 @@ const version = __STUDIO_CLI_VERSION__;
 // A Studio app that forked this process may keep an OpenAI key for its
 // session; this lets a turn ask for it over IPC when it needs it.
 acceptOpenAiSessionKeyFromParent();
+// ChatGPT turns renew and revoke through the token service, a Studio app
+// that forked this process may hold a session-only token a turn may ask
+// for over IPC, and a sign-in opens in the system browser. This one
+// process also serves `studio ui`, so its server's broker is covered too.
+setChatGptTokenClient( createChatGptTokenClient() );
+acceptChatGptSessionTokensFromParent();
+setChatGptBrowserOpener( openBrowser );
 suppressPunycodeWarning();
 
 async function main() {
